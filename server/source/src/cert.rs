@@ -1023,8 +1023,11 @@ mod bench {
     use super::*;
     use std::time::{Duration, Instant};
 
-    const WARMUP: usize = 3;
-    const ITERATIONS: usize = 100;
+    const WARMUP: usize = 2;
+    // 10 samples is enough for a rough latency figure; with 100 samples the
+    // RSA-2048 keygen bench alone stalls a normal `cargo test` for minutes in
+    // the unoptimized debug build. Run with `-- --ignored` for real numbers.
+    const ITERATIONS: usize = 10;
 
     fn run_bench<F>(name: &str, mut f: F)
     where
@@ -1061,6 +1064,7 @@ mod bench {
     }
 
     #[test]
+    #[ignore = "crypto benchmark (slow: regenerates RSA-2048 keys per iteration; in debug this stalls a normal cargo test). Run explicitly: cargo test -- --ignored bench"]
     fn bench_sign_verify() {
         println!("\n===== 签名/验签延迟基准测试 ({} 次迭代) =====\n", ITERATIONS);
 

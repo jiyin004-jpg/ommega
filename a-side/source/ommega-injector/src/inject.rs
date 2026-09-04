@@ -21,7 +21,9 @@ use crate::{sys, utils};
 
 const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
 const REMOTE_PAYLOAD_STATE_PATH: &str = "/data/adb/ommega/injector.payload";
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
+// 30s so an injection racing keystore2/keymint (re)start after boot has time
+// for keymint to (re)bind rpc.sock instead of timing out after 10s.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 #[repr(C)]
@@ -82,15 +84,30 @@ fn persist_remote_payload_state(pid: Pid, payload_identifier: &str) -> Result<()
 
 fn wait_for_rpc_socket() -> Result<()> {
     let start = Instant::now();
+    // Whether we already warned about the stat error, so a persistent
+    // permission/traversal denial (e.g. SELinux on newer Android blocking the
+    // keystore dir) is reported once instead of looking like "not ready yet".
+    let mut warned = false;
 
     while start.elapsed() < READY_TIMEOUT {
-        if Path::new(rpc::SOCKET).exists() {
-            return Ok(());
+        match std::fs::metadata(rpc::SOCKET) {
+            Ok(_) => return Ok(()),
+            Err(err) if !warned => {
+                // Log the real reason (EACCES vs ENOENT etc.) so an Android-17
+                // SELinux denial surfaces clearly instead of a bare timeout.
+                warn!(
+                    "waiting for ommega RPC socket {}: stat error: {err}; retrying until {}s",
+                    rpc::SOCKET,
+                    READY_TIMEOUT.as_secs()
+                );
+                warned = true;
+            }
+            Err(_) => {}
         }
         thread::sleep(READY_RETRY_DELAY);
     }
 
-    bail!("ommega RPC socket did not appear in time");
+    bail!("ommega RPC socket did not appear in time (socket={})", rpc::SOCKET);
 }
 
 pub fn inject_library(pid: Pid) -> Result<()> {

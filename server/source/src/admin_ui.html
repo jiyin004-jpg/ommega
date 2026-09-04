@@ -68,6 +68,17 @@ header {
 .switch input:checked + .track::after { left: 23px; background: #fff; }
 .switch .mode-label { font-weight: 600; color: var(--text); min-width: 130px; }
 
+/* Three-state segmented control (StrongBox mode) */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--panel2); }
+.seg-btn {
+  border: none; background: transparent; color: var(--muted); font-size: 13px;
+  font-weight: 600; padding: 8px 16px; cursor: pointer; transition: .2s;
+  border-right: 1px solid var(--border);
+}
+.seg-btn:last-child { border-right: none; }
+.seg-btn:hover { color: var(--text); background: rgba(79,124,255,.08); }
+.seg-btn.active { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; }
+
 /* Cards */
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-bottom: 24px; }
 .card {
@@ -428,6 +439,18 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
       <span class="hint" id="akbStatus" style="flex:1;">加载中…</span>
       <button class="btn primary" onclick="refreshAutoKeybox()">立即刷新</button>
     </div>
+    <div class="token-gen" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+      <div class="switch" style="margin:0;">
+        <span>自动覆盖（serverbox：覆盖在线 B 端设备）</span>
+        <input type="checkbox" id="coverSwitch" onchange="toggleAutoCover(this.checked)">
+        <label for="coverSwitch" class="track"></label>
+      </div>
+      <span class="hint" id="coverStatus" style="flex:1;min-width:150px;">加载中…</span>
+      <span class="hint" style="white-space:nowrap;">覆盖源</span>
+      <select id="coverSource" onchange="setCoverSource(this.value)" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:6px 10px;font-size:13px;"></select>
+      <button class="btn" onclick="clearAutoCover()">清除在线覆盖密钥</button>
+    </div>
+    <p class="hint" id="coverDesc" style="margin:0 0 14px;line-height:1.6;">加载中…</p>
     <div class="table-wrap">
     <table>
       <thead><tr><th>源</th><th>目标设备 ID</th><th>主 URL</th><th>镜像 URL</th><th>HEX 解码</th></tr></thead>
@@ -458,19 +481,19 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
   </div>
 </div>
 
-<!-- StrongBox robustness mode -->
+<!-- StrongBox mode (three-state: off | smart | robust) -->
 <div class="panel">
-  <h2>StrongBox 强健模式 <span class="hint">B 端无 StrongBox 能力时自动降级为 B 端 TEE 出证（Android 标准静默降级行为）</span></h2>
+  <h2>StrongBox 强健模式 <span class="hint">三段可选：关闭（原生语义）· 智能（按 B 端真实 StrongBox 能力择优）· 强健（降级 B 端 TEE 出证）</span></h2>
   <div class="body">
-    <div class="token-gen" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px;">
-      <div class="switch" style="margin:0;">
-        <span>启用强健模式</span>
-        <input type="checkbox" id="sbrSwitch" onchange="toggleStrongbox(this.checked)">
-        <label for="sbrSwitch" class="track"></label>
+    <div class="token-gen" style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
+      <div class="seg" id="sbrSeg" style="margin:0;">
+        <button type="button" class="seg-btn" data-mode="off" onclick="setStrongboxMode('off')">关闭</button>
+        <button type="button" class="seg-btn" data-mode="smart" onclick="setStrongboxMode('smart')">智能</button>
+        <button type="button" class="seg-btn" data-mode="robust" onclick="setStrongboxMode('robust')">强健</button>
       </div>
-      <span class="hint" id="sbrStatus" style="flex:1;">加载中…</span>
+      <span class="hint" id="sbrStatus" style="flex:1;min-width:220px;">加载中…</span>
     </div>
-    <p class="hint" style="margin:0;line-height:1.6;">开启后：B 端设备返回 StrongBox 不支持 / 未预制密钥时，服务端自动把该请求降级为 TEE 级别重新发给 B 端，降级链如实标记 TRUSTED_ENVIRONMENT（不冒充 StrongBox）；关闭后保持严格原生语义，StrongBox 失败按 server 三层回退处理。</p>
+    <p class="hint" id="sbrDesc" style="margin:0;line-height:1.7;">—</p>
   </div>
 </div>
 
@@ -921,7 +944,19 @@ async function loadAutoKeybox() {
     $('#akbStatus').textContent = d.enabled
       ? `已开启 · 每 ${Math.round((d.interval_secs || 7200) / 3600)} 小时刷新一次`
       : '已关闭';
+    const covOn = !!d.cover_enabled;
+    const coverSrc = d.cover_source || 'auto';
+    $('#coverSwitch').checked = covOn;
+    $('#coverStatus').textContent = covOn ? '已开启' : '已关闭';
     const srcs = d.sources || [];
+    const coverOpts = ['auto'].concat(srcs.map(s => s.name));
+    const coverSel = $('#coverSource');
+    coverSel.innerHTML = coverOpts.map(n =>
+      `<option value="${esc(n)}" ${coverSrc === n ? 'selected' : ''}>${n === 'auto' ? '全部源（按序，后源赢）' : esc(n)}</option>`).join('');
+    const srcTxt = coverSrc === 'auto' ? '全部源' : `「${coverSrc}」`;
+    $('#coverDesc').textContent = covOn
+      ? `已开启：覆盖源=${srcTxt} —— 每次 Auto Keybox 拉取/刷新（含立即刷新）后，把该源本次拉取的密钥无条件写入所有在线 B 设备 ID 的服务端密钥；关闭时自动清除这些覆盖密钥。`
+      : '已关闭：不覆盖在线 B 端设备服务端密钥；可点“清除在线覆盖密钥”清理历史覆盖数据。';
     $('#akbBody').innerHTML = srcs.length
       ? srcs.map(s => `<tr>
           <td><b>${esc(s.name)}</b></td>
@@ -938,6 +973,31 @@ async function toggleAutoKeybox(on) {
   try {
     await api('/api/admin/autokeybox/', { method: 'POST', body: JSON.stringify({ enabled: on }) });
     toast(on ? 'Auto Keybox 已开启' : 'Auto Keybox 已关闭');
+    loadAutoKeybox();
+  } catch (e) { toast(e.message, 'err'); loadAutoKeybox(); }
+}
+
+async function toggleAutoCover(on) {
+  try {
+    await api('/api/admin/autokeybox/cover/', { method: 'POST', body: JSON.stringify({ enabled: on }) });
+    toast(on ? '自动覆盖已开启（已触发一次拉取+覆盖）' : '自动覆盖已关闭（已自动清除覆盖密钥）');
+    loadAutoKeybox();
+  } catch (e) { toast(e.message, 'err'); loadAutoKeybox(); }
+}
+
+async function clearAutoCover() {
+  if (!confirm('确认清除所有“自动覆盖”写入的服务端密钥（machine_id=auto-cover:*）？手动上传 / Auto Keybox 常规存储的密钥不受影响。')) return;
+  try {
+    const d = await api('/api/admin/autokeybox/cover/clear/', { method: 'POST' });
+    toast(`已清除 ${d.cleared ?? 0} 条自动覆盖密钥`);
+    loadAutoKeybox();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function setCoverSource(v) {
+  try {
+    const d = await api('/api/admin/autokeybox/cover/source/', { method: 'POST', body: JSON.stringify({ source: v }) });
+    toast(`覆盖源已设为 ${v === 'auto' ? '全部源（按序，后源赢）' : v}`);
     loadAutoKeybox();
   } catch (e) { toast(e.message, 'err'); loadAutoKeybox(); }
 }
@@ -1018,18 +1078,31 @@ async function removeIpFilter(ip) {
 async function loadStrongbox() {
   try {
     const d = await api('/api/admin/strongbox/');
-    $('#sbrSwitch').checked = !!d.enabled;
-    $('#sbrStatus').textContent = d.enabled
-      ? '已开启：B 端 StrongBox 不可用/未预制时，自动用 B 端 TEE 出证并如实标记降级'
-      : '已关闭：B 端 StrongBox 失败按原生语义回退（server 三层回退）';
+    const mode = d.mode || (d.enabled ? 'robust' : 'off');
+    setStrongboxUI(mode);
   } catch (e) {}
 }
 
-async function toggleStrongbox(on) {
+const STRONGBOX_DESC = {
+  off: '关闭：StrongBox 失败按原生语义三层回退（server 三层回退），不自动降级、不替设备出证。',
+  smart: '智能：B 真 StrongBox 可用→直连回传；B 支持但未预制/不可用→原样回传错误给 A 端应用；B 无 StrongBox→服务端用该设备存储密钥出 StrongBox 级证书链；服务端也无此设备密钥→交还 A 端本地出 StrongBox 级。',
+  robust: '强健：B 端 StrongBox 失败自动降级为 B 端 TEE 出证（Android 标准静默降级，降级链如实标记 TRUSTED_ENVIRONMENT，不冒充 StrongBox）。'
+};
+
+function setStrongboxUI(mode) {
+  document.querySelectorAll('#sbrSeg .seg-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  $('#sbrStatus').textContent = mode === 'off' ? '关闭（默认）' : mode === 'smart' ? '智能档' : '强健档';
+  $('#sbrDesc').textContent = STRONGBOX_DESC[mode] || STRONGBOX_DESC.off;
+}
+
+async function setStrongboxMode(mode) {
   try {
-    await api('/api/admin/strongbox/', { method: 'POST', body: JSON.stringify({ enabled: on }) });
-    toast(on ? 'StrongBox 强健模式已开启' : 'StrongBox 强健模式已关闭');
-    loadStrongbox();
+    await api('/api/admin/strongbox/', { method: 'POST', body: JSON.stringify({ mode }) });
+    const names = { off: '关闭', smart: '智能', robust: '强健' };
+    toast(`StrongBox 模式已切换为「${names[mode] || mode}」`);
+    setStrongboxUI(mode);
   } catch (e) { toast(e.message, 'err'); loadStrongbox(); }
 }
 

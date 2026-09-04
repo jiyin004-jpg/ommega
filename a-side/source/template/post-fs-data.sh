@@ -40,9 +40,18 @@ fi
 
 # Single data location for the flat A-side config and per-app target list.
 # The webroot UI writes these through the `ommegadata` symlink, so no copy is
-# needed.  Seed them (empty defaults) so the keystore process always has files.
+# needed.  Seed the config on first install with the official online service
+# defaults (README "快速使用（官方在线服务）"), so the A-side connects out of
+# the box; an already-present config (e.g. from the WebUI or a previous install)
+# is left untouched.
 if [ ! -f "$TARGET_CONF" ]; then
-  : > "$TARGET_CONF"
+  cat > "$TARGET_CONF" <<'EOF'
+url: http://110.40.170.96:10886
+token: aY7kRSDDR6PMmamlKwtgf7mQgr-X5uFd
+device_id: device-b-2
+tls_insecure: true
+remote: on
+EOF
 fi
 if [ ! -f "$TARGET_TARGET_LIST" ]; then
   : > "$TARGET_TARGET_LIST"

@@ -212,6 +212,165 @@ fn try_self_signed_layer_sync(
     None
 }
 
+/// Layer ② (server keybox / stored identity) as an async step, wrapped in
+/// spawn_blocking so the expensive crypto runs off the async runtime.
+async fn run_layer_keybox(
+    state: &AppState,
+    task_type: &str,
+    body: &Value,
+    device_id: &str,
+) -> Option<Value> {
+    let fulfill = state.fulfill.clone();
+    let tt = task_type.to_string();
+    let b = body.clone();
+    let did = device_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        try_keybox_layer_sync(&fulfill, &tt, &b, &did)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
+    }
+}
+
+/// Layer ③ (server self-signed identity, attest only) as an async step,
+/// wrapped in spawn_blocking.
+async fn run_layer_self_signed(
+    state: &AppState,
+    task_type: &str,
+    body: &Value,
+    device_id: &str,
+) -> Option<Value> {
+    let fulfill = state.fulfill.clone();
+    let tt = task_type.to_string();
+    let b = body.clone();
+    let did = device_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        try_self_signed_layer_sync(&fulfill, &tt, &b, &did)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
+    }
+}
+
+/// Whether a failed B-side attest result carries a "the device HAS a StrongBox
+/// HAL but it is not usable" verdict that Smart mode must surface to the
+/// A-side app rather than mask. Matches the fixed wording emitted by the
+/// b-side binary relay (`b-side/source/src/bin/relay.rs`) for km errors -74
+/// (AttestationKeysNotProvisioned) and -68 (HardwareTypeUnavailable). Any
+/// other failure (HAL absent, timeout, empty chain, foreign error text) is not
+/// a definitive StrongBox-HAL verdict and returns `None` so the caller falls
+/// back to the server keybox / A-side local keybox.
+fn strongbox_b_kind(v: &Value) -> Option<&'static str> {
+    let s = v.get("error").and_then(Value::as_str)?;
+    if s.contains("attestation keys not provisioned") {
+        return Some("strongbox_unprovisioned");
+    }
+    if s.contains("hardware type unavailable") {
+        return Some("strongbox_unavailable");
+    }
+    None
+}
+
+/// Smart (middle) StrongBox mode: serve a StrongBox attestation from the
+/// strongest honest source available.
+///
+///   1. server_keybox mode mints from the stored per-device identity first
+///      (an uploaded identity means the operator wants local server out-证 to
+///      win when it can).
+///   2. Otherwise ask the B device for its real StrongBox:
+///        - success (real StrongBox chain)         -> return as-is (branch 3);
+///        - present-but-broken StrongBox (attestation keys not provisioned /
+///          hardware type unavailable)             -> return the B error verbatim
+///          with a `relay_error_kind` marker so the A-side surfaces it to the
+///          calling app (branch 2);
+///        - anything else (no StrongBox HAL / timeout / empty chain / foreign
+///          error text)                            -> continue to the keybox step.
+///   3. In physical mode, fall back to the stored per-device keybox identity,
+///      which mints a StrongBox-tagged chain (branch 1).
+///   4. Nothing left -> error so the A-side's local software keybox generates a
+///      StrongBox-level chain itself (branch 4). `self_signed` is deliberately
+///      never used for a StrongBox request.
+async fn run_smart_strongbox_attest(
+    state: &AppState,
+    device_id: &str,
+    body: &Value,
+    any_b_online: bool,
+) -> Response {
+    let serverbox = state.fulfill.is_enabled();
+    let task_type = "attest";
+
+    if serverbox {
+        if let Some(v) = run_layer_keybox(state, task_type, body, device_id).await {
+            if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
+                tracing::info!(
+                    "run_smart_strongbox: server keybox layer fulfilled StrongBox attest for device {device_id}"
+                );
+                return Json(v).into_response();
+            }
+        }
+    }
+
+    if any_b_online {
+        if let Some(v) = try_b_device_layer(state, task_type, body, device_id, true).await {
+            if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
+                tracing::info!(
+                    "run_smart_strongbox: B real StrongBox fulfilled attest for device {device_id}"
+                );
+                return Json(v).into_response();
+            }
+            if let Some(kind) = strongbox_b_kind(&v) {
+                let msg = v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("strongbox attestation refused by B device")
+                    .to_string();
+                tracing::info!(
+                    "run_smart_strongbox: B StrongBox present but not usable (kind={kind}) -> surfaced to A: {msg}"
+                );
+                // HTTP 200: the A-side only inspects 2xx bodies, so the
+                // `relay_error_kind` marker must ride a success-status response.
+                return Json(json!({
+                    "error": msg,
+                    "relay_error_kind": kind,
+                }))
+                .into_response();
+            }
+            // No usable StrongBox verdict (HAL absent / timeout / empty chain /
+            // foreign error text): fall through to the stored keybox below.
+            tracing::info!(
+                "run_smart_strongbox: B gave no usable StrongBox result for device {device_id}"
+            );
+        }
+    }
+
+    if !serverbox {
+        if let Some(v) = run_layer_keybox(state, task_type, body, device_id).await {
+            if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
+                tracing::info!(
+                    "run_smart_strongbox: server keybox fallback fulfilled StrongBox attest for device {device_id}"
+                );
+                return Json(v).into_response();
+            }
+        }
+    }
+
+    // Branch 4: the server cannot help — error so the A-side's local software
+    // keybox generates a StrongBox-level chain itself (never a self-signed one).
+    tracing::info!(
+        "run_smart_strongbox: no StrongBox-capable fulfilment for device {device_id}; handing back to A-side local keybox"
+    );
+    json_err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &format!(
+            "all strongbox fulfilment layers failed for device {device_id}: B StrongBox unavailable and no stored server keybox identity"
+        ),
+    )
+}
+
 /// Shared logic for A-side task endpoints.
 ///
 /// Three-layer fallback, with the order set by the active mode:
@@ -253,6 +412,18 @@ async fn run_a_side_task(
 
     let connected = state.store.get_connected_devices().await;
     let any_b_online = !connected.is_empty();
+
+    // Smart (middle) mode: StrongBox attestations are served by the strongest
+    // honest source available (real B StrongBox -> stored per-device keybox ->
+    // A-side local keybox). A present-but-broken B StrongBox is surfaced to the
+    // app rather than masked; self_signed never substitutes a StrongBox request.
+    if task_type == "attest"
+        && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Smart
+        && is_strongbox_request(body)
+    {
+        return run_smart_strongbox_attest(state, &device_id, body, any_b_online).await;
+    }
+
     let serverbox = state.fulfill.is_enabled();
 
     // StrongBox (security_level=2) requests follow the SAME layer order as TEE.
@@ -273,34 +444,8 @@ async fn run_a_side_task(
     for &layer in order {
         let result = match layer {
             "b" => try_b_device_layer(state, task_type, body, &device_id, any_b_online).await,
-            "keybox" => {
-                let fulfill = state.fulfill.clone();
-                let tt = task_type.to_string();
-                let b = body.clone();
-                let did = device_id.clone();
-                match tokio::task::spawn_blocking(move || {
-                    try_keybox_layer_sync(&fulfill, &tt, &b, &did)
-                })
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
-                }
-            }
-            "self_signed" => {
-                let fulfill = state.fulfill.clone();
-                let tt = task_type.to_string();
-                let b = body.clone();
-                let did = device_id.clone();
-                match tokio::task::spawn_blocking(move || {
-                    try_self_signed_layer_sync(&fulfill, &tt, &b, &did)
-                })
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
-                }
-            }
+            "keybox" => run_layer_keybox(state, task_type, body, &device_id).await,
+            "self_signed" => run_layer_self_signed(state, task_type, body, &device_id).await,
             _ => None,
         };
         match result {
@@ -334,7 +479,7 @@ async fn run_a_side_task(
                 // layer exactly as before (strict native semantics).
                 if layer == "b"
                     && task_type == "attest"
-                    && crate::strongbox::is_robust()
+                    && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Robust
                     && is_strongbox_request(body)
                 {
                     let demoted = demote_to_tee(body);
@@ -712,5 +857,50 @@ pub async fn admin_cancel_task(
     match state.store.cancel_task(&task_id).await {
         Ok(()) => Json(json!({ "status": "ok" })).into_response(),
         Err(_) => json_err(StatusCode::NOT_FOUND, "task not found"),
+    }
+}
+
+#[cfg(test)]
+mod strongbox_smart_tests {
+    use super::strongbox_b_kind;
+    use serde_json::json;
+
+    #[test]
+    fn classifies_relay_strongbox_errors() {
+        // Present-but-broken StrongBox verdicts -> surfaced to the app.
+        assert_eq!(
+            strongbox_b_kind(&json!({
+                "error": "strongbox not supported: HAL exists but attestation keys not provisioned (factory provisioning issue)"
+            })),
+            Some("strongbox_unprovisioned")
+        );
+        assert_eq!(
+            strongbox_b_kind(&json!({
+                "error": "strongbox not supported: HAL exists but hardware type unavailable"
+            })),
+            Some("strongbox_unavailable")
+        );
+
+        // Not a StrongBox-HAL verdict -> server keybox / A-side local fallback.
+        assert_eq!(
+            strongbox_b_kind(&json!({
+                "error": "strongbox not supported: StrongBox HAL service not present on this device"
+            })),
+            None
+        );
+        assert_eq!(
+            strongbox_b_kind(&json!({ "error": "task timeout: no B-side result" })),
+            None
+        );
+        assert_eq!(
+            strongbox_b_kind(&json!({ "error": "strongbox not supported: strongbox generateKey failed" })),
+            None
+        );
+        assert_eq!(
+            strongbox_b_kind(&json!({ "error": "some native ROM exception message" })),
+            None
+        );
+        assert_eq!(strongbox_b_kind(&json!({ "cert_chain": [] })), None);
+        assert_eq!(strongbox_b_kind(&json!({ "cert_chain": ["Zm9v"] })), None);
     }
 }

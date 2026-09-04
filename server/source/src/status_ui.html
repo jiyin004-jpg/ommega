@@ -89,8 +89,8 @@ td.id-cell { padding: 6px 18px; }
   <div class="panel">
     <h2>在线 B 端设备<span>按负载升序排列</span></h2>
     <div class="table-wrap"><table>
-      <thead><tr><th>设备 ID</th><th>负载</th><th>最后在线</th></tr></thead>
-      <tbody id="bBody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>设备 ID</th><th>机型</th><th>负载</th><th>最后在线</th></tr></thead>
+      <tbody id="bBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
     </table></div>
   </div>
 
@@ -126,8 +126,8 @@ async function load() {
     const b = d.online_b_devices || [];
     $('#onlineBadge').textContent = '在线设备：' + b.length;
     $('#bBody').innerHTML = b.length
-      ? b.map(x => `<tr><td class="id-cell"><input class="id-box" type="text" value="${esc(x.device_id)}" readonly onclick="this.select()"></td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
-      : '<tr><td colspan="3" class="empty">暂无 B 端设备在线</td></tr>';
+      ? b.map(x => `<tr><td class="id-cell"><input class="id-box" type="text" value="${esc(x.device_id)}" readonly onclick="this.select()"></td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="empty">暂无 B 端设备在线</td></tr>';
 
     const c = d.cert_devices || [];
     $('#certBadge').textContent = '证书设备：' + c.length;

@@ -66,9 +66,15 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val savedUrl = prefs.getString(PREF_URL, "http://your-server.example.com:10886")!!
-        val savedDeviceId = prefs.getString(PREF_DEVICE_ID, "device-b-1")!!
-        val savedToken = prefs.getString(PREF_TOKEN, "change-me-strong-token")!!
+        val savedUrl = prefs.getString(PREF_URL, "http://110.40.170.96:10886")!!
+        val savedToken = prefs.getString(PREF_TOKEN, "Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0")!!
+        // First launch (or cleared prefs): mint a fresh random device id so each
+        // install registers uniquely on the relay_server.
+        var savedDeviceId = prefs.getString(PREF_DEVICE_ID, null)
+        if (savedDeviceId.isNullOrEmpty()) {
+            savedDeviceId = randomDeviceId()
+            prefs.edit().putString(PREF_DEVICE_ID, savedDeviceId).apply()
+        }
         val savedTlsInsecure = prefs.getBoolean(PREF_TLS_INSECURE, true)
 
         ServerClient.serverUrl = savedUrl
@@ -198,8 +204,17 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
-    private fun getMachineId(): String =
-        android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: ""
+    /** Machine id reported to the relay_server: the current device model. */
+    private fun getMachineId(): String = Build.MODEL
+
+    /** Fresh random device id (device-b-<8 hex>) for the first launch of an install. */
+    private fun randomDeviceId(): String {
+        val hex = "0123456789abcdef"
+        val rand = SecureRandom()
+        val sb = StringBuilder("device-b-")
+        repeat(8) { sb.append(hex[rand.nextInt(hex.length)]) }
+        return sb.toString()
+    }
 
     override fun onDestroy() {
         RelayService.uiListener = null

@@ -718,6 +718,8 @@ pub async fn admin_autokeybox_status(
     Json(json!({
         "status": "ok",
         "enabled": crate::autokeybox::is_enabled(),
+        "cover_enabled": crate::autokeybox::cover_enabled(),
+        "cover_source": crate::autokeybox::cover_source(),
         "interval_secs": state.cfg.keybox_refresh_interval_secs,
         "sources": sources,
     }))
@@ -753,17 +755,128 @@ pub async fn admin_autokeybox_refresh(
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
+    let store = state.store.clone();
     // Run in a detached thread to avoid blocking the request.
     std::thread::spawn(move || {
-        crate::autokeybox::refresh_all(&db);
+        crate::autokeybox::refresh_all(&db, Some(store.as_ref()));
     });
     Json(json!({ "status": "ok", "message": "refresh triggered" })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct AutoKeyboxCoverBody {
+    pub enabled: bool,
+}
+
+/// POST /api/admin/autokeybox/cover/ — enable/disable the auto-cover mode.
+///
+/// Enabling sets the flag and triggers an immediate refresh+cover (fetch keys,
+/// then write them into every online B device id's server identity). Disabling
+/// clears the flag and deletes the rows auto-cover wrote (`machine_id
+/// auto-cover:*`) so the affected devices fall back to pure A/B forwarding.
+pub async fn admin_autokeybox_cover_toggle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AutoKeyboxCoverBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "DB not enabled (RELAY_DB_PATH is empty) — cannot manage auto-cover identities",
+        );
+    };
+    if body.enabled {
+        crate::autokeybox::set_cover_enabled(true);
+        let store = state.store.clone();
+        std::thread::spawn(move || {
+            crate::autokeybox::refresh_all(&db, Some(store.as_ref()));
+        });
+        Json(json!({
+            "status": "ok",
+            "cover_enabled": true,
+            "message": "auto-cover enabled; immediate refresh+cover triggered",
+        }))
+        .into_response()
+    } else {
+        crate::autokeybox::set_cover_enabled(false);
+        let result = tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db))
+            .await;
+        match result {
+            Ok(Ok(cleared)) => Json(json!({
+                "status": "ok",
+                "cover_enabled": false,
+                "cleared": cleared,
+            }))
+            .into_response(),
+            Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        }
+    }
+}
+
+/// POST /api/admin/autokeybox/cover/clear/ — manually delete the identities the
+/// auto-cover mode wrote (`machine_id auto-cover:*`), regardless of the flag.
+pub async fn admin_autokeybox_cover_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    let result = tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db)).await;
+    match result {
+        Ok(Ok(cleared)) => Json(json!({ "status": "ok", "cleared": cleared })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+    }
 }
 
 #[derive(serde::Deserialize)]
 pub struct AutoKeyboxDeviceBody {
     pub name: String,
     pub device_id: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AutoKeyboxCoverSourceBody {
+    pub source: String,
+}
+
+/// POST /api/admin/autokeybox/cover/source/ — choose which Auto Keybox source
+/// feeds the auto-cover step: `"auto"` (all sources, later wins per algorithm)
+/// or a configured source name such as `"yurikey"` / `"kow"`.
+pub async fn admin_autokeybox_cover_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AutoKeyboxCoverSourceBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return r;
+    }
+    if !crate::autokeybox::set_cover_source(&body.source) {
+        let names: Vec<String> = crate::autokeybox::configured_sources()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "invalid cover source {:?}: expected \"auto\" or one of {:?}",
+                body.source, names
+            ),
+        );
+    }
+    Json(json!({
+        "status": "ok",
+        "cover_source": crate::autokeybox::cover_source(),
+    }))
+    .into_response()
 }
 
 /// POST /api/admin/autokeybox/device/ — override a source's target device_id.
@@ -913,10 +1026,14 @@ pub async fn admin_ipfilter_remove(
 }
 
 // ---------------------------------------------------------------------------
-// StrongBox robustness mode.
+// StrongBox handling mode (three-state: off | smart | robust).
 // ---------------------------------------------------------------------------
 
-/// GET /api/admin/strongbox/ — current StrongBox robustness-mode switch state.
+/// GET /api/admin/strongbox/ — current StrongBox handling-mode switch state.
+///
+/// `mode` is the three-state token (`"off" | "smart" | "robust"`); `enabled`
+/// is kept for backwards compatibility and reports only whether the Robust
+/// (original "强健/降级") mode is active.
 pub async fn admin_strongbox_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -924,20 +1041,36 @@ pub async fn admin_strongbox_status(
     if let Err(r) = check_auth(&state, &headers) {
         return r;
     }
-    Json(json!({ "status": "ok", "enabled": crate::strongbox::is_robust() })).into_response()
+    let m = crate::strongbox::mode();
+    Json(json!({
+        "status": "ok",
+        "mode": m.as_str(),
+        "enabled": m == crate::strongbox::StrongboxMode::Robust,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
 pub struct StrongboxToggleBody {
-    pub enabled: bool,
+    /// Three-state mode token: `"off" | "smart" | "robust"`. Preferred field.
+    pub mode: Option<String>,
+    /// Legacy boolean switch (robustness on/off). Honoured only when `mode`
+    /// is absent: `true` → `"robust"`, `false` → `"off"`.
+    pub enabled: Option<bool>,
 }
 
-/// POST /api/admin/strongbox/ — enable/disable StrongBox robustness mode.
+/// POST /api/admin/strongbox/ — set the StrongBox handling mode.
 ///
-/// Enabled: a B-side StrongBox capability error (not supported / no provisioned
-/// attestation keys) is transparently retried as a TEE request on the same B
-/// device — the Android-standard silent fallback. Disabled: strict native
-/// semantics, StrongBox errors propagate to the next fulfilment layer.
+/// Modes:
+///   - off (default): strict native semantics — StrongBox errors propagate to
+///     the next fulfilment layer exactly as before.
+///   - smart: StrongBox-fidelity orchestration — serve from the B device's real
+///     StrongBox when it works; surface a present-but-broken StrongBox
+///     (keys not provisioned / hardware type unavailable) verbatim to the A-side
+///     app; fall back to the stored per-device keybox identity when the B device
+///     has no StrongBox; otherwise hand back to the A-side local keybox.
+///   - robust: Android-standard silent fallback — a B-side StrongBox capability
+///     error is transparently retried as a TEE request on the same B device.
 pub async fn admin_strongbox_toggle(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -946,8 +1079,28 @@ pub async fn admin_strongbox_toggle(
     if let Err(r) = check_auth(&state, &headers) {
         return r;
     }
-    crate::strongbox::set_robust(body.enabled);
-    Json(json!({ "status": "ok", "enabled": body.enabled })).into_response()
+    let next = if let Some(tok) = body.mode.as_deref() {
+        match crate::strongbox::StrongboxMode::from_str(tok) {
+            Some(m) => m,
+            None => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid mode {tok:?}: expected \"off\" | \"smart\" | \"robust\""),
+                );
+            }
+        }
+    } else if body.enabled == Some(true) {
+        crate::strongbox::StrongboxMode::Robust
+    } else {
+        crate::strongbox::StrongboxMode::Off
+    };
+    crate::strongbox::set_mode(next);
+    Json(json!({
+        "status": "ok",
+        "mode": next.as_str(),
+        "enabled": next == crate::strongbox::StrongboxMode::Robust,
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1123,7 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
         connected.push((
             json!({
                 "device_id": d.device_id,
+                "machine_id": d.machine_id,
                 "load": load,
                 "last_seen_ms": d.last_seen_ms,
             }),

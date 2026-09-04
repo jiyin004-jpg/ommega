@@ -19,10 +19,10 @@ object ServerClient {
     private const val POST_RESULT_MAX_RETRY = 3
     private const val POST_RESULT_MAX_BACKOFF_MS = 5_000L
 
-    /** Default relay endpoint; can be overridden from UI. */
-    var serverUrl: String = "http://your-server.example.com:10886"
+    /** Default relay endpoint; can be overridden from UI. Official service default. */
+    var serverUrl: String = "http://110.40.170.96:10886"
     var deviceId: String = "device-b-1"
-    var relayToken: String = "change-me-strong-token"
+    var relayToken: String = "Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0"
 
     /** Debug only: skip TLS validation when true. */
     var tlsInsecure: Boolean = false

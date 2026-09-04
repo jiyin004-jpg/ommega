@@ -408,9 +408,17 @@ keysttestation 等开源项目源码，主要基于 OhMyKeymint
                  IP 使用记录查询
    5. Keybox     上传/查看/删除服务器 keybox（server_keybox 模式）
    6. 自动Keybox 定时拉取上游 keybox，可开关、手动刷新
-   7. StrongBox强健模式
-                 开: B 端 StrongBox 失败自动降级 TEE 重试
-                 关: 失败直接回退下一层（默认）
+      自动覆盖（serverbox）：开启后每次拉取/刷新，把所选覆盖源本次拉取
+      的密钥无条件写入所有在线 B 端设备 ID 的服务端密钥（覆盖源可后台选
+      「全部/具体源」，全部=按序后源赢）；关闭时自动清除这些覆盖密钥
+      （另有「清除在线覆盖密钥」按钮兜底）
+   7. StrongBox强健模式（三段：关闭 / 智能 / 强健）
+                 关:  失败直接回退下一层，不自动降级、不替设备出证（默认）
+                 智能: B 真 StrongBox 可用→直连；B 支持但未预制密钥/硬件
+                       不可用→原样回传错误给 A 端应用；B 无 StrongBox→
+                       服务端用该设备存储密钥出 StrongBox 级证书链；服务端
+                       也无此设备密钥→交还 A 端本地出 StrongBox 级
+                 开:  B 端 StrongBox 失败自动降级 TEE 重试（强健/静默降级）
    8. IP过滤     限制访问来源 IP
    9. 客户端报告 A 端诊断信息，用于认证失败排查
 
@@ -420,7 +428,10 @@ keysttestation 等开源项目源码，主要基于 OhMyKeymint
   Q: A端搭配B端模块版，环境校验不通过？
      多为 StrongBox 兼容性问题。解决:
      1. 更换原生支持 StrongBox、可返回完整证书链的 B 端机型
-     2. 或在后台开启「StrongBox强健模式」降级为 TEE
+     2. 或后台把「StrongBox强健模式」切到「强健」档，降级为 B 端 TEE
+        出证（Android 标准静默降级）
+     3. 若 B 端无 StrongBox 且服务器已存有该设备 keybox，切到「智能」档，
+        由服务端用该设备存储密钥出 StrongBox 级证书链
      验证: 查看密钥认证页面安全模块选项是否全部正常
 
   Q: A端 WebUI 无法打开？

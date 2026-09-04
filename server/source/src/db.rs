@@ -315,6 +315,21 @@ impl Db {
         Ok(())
     }
 
+    /// Delete every identity row whose `machine_id` starts with `prefix`
+    /// (e.g. `"auto-cover"`), returning the number of deleted rows. Used to
+    /// clear the identities that the auto-cover mode wrote, without touching
+    /// manually-uploaded or ordinary auto-keybox (`auto:<source>`) rows.
+    pub fn delete_device_identities_by_machine_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "DELETE FROM device_server_identity WHERE machine_id LIKE CONCAT(:prefix, '%')",
+            params! {
+                "prefix" => prefix,
+            },
+        )?;
+        Ok(conn.affected_rows())
+    }
+
     // ---- ApiToken ----
 
     fn api_token_from_row(row: mysql::Row) -> anyhow::Result<ApiTokenRow> {

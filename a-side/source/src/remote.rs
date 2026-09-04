@@ -461,6 +461,32 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         };
         // The relay wraps the result as `{ result: { cert_chain: [...] } }`.
         let result = resp.get("result").cloned().unwrap_or(resp);
+        // Smart-mode StrongBox policy: when the relay decides the B device HAS a
+        // StrongBox HAL but cannot deliver (attestation keys not provisioned /
+        // hardware type unavailable), it returns a 200 body carrying the B error
+        // verbatim plus a `relay_error_kind` marker. That must reach the calling
+        // app as a real KeyMint error — NOT fall back to the local software
+        // keybox, which would mint a StrongBox-level chain from the A-side's own
+        // keybox and hide the true device state. Only these marked responses
+        // error out; every other failure keeps returning `Ok(None)` so the local
+        // fallback path (incl. Smart-mode branch 4) is unchanged.
+        let kind = result.get("relay_error_kind").and_then(Value::as_str);
+        if let Some(kind) = kind {
+            let msg = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("relay: StrongBox attestation refused by B device");
+            log::warn!("remote StrongBox attestation refused by B device (kind={kind}): {msg}");
+            return Err(match kind {
+                "strongbox_unprovisioned" => {
+                    kmr_common::km_err!(AttestationKeysNotProvisioned, "{msg}")
+                }
+                "strongbox_unavailable" => {
+                    kmr_common::km_err!(HardwareTypeUnavailable, "{msg}")
+                }
+                _ => kmr_common::km_err!(UnknownError, "{msg}"),
+            });
+        }
         let chain = match result.get("cert_chain") {
             Some(Value::Array(certs)) => certs
                 .iter()

@@ -19,7 +19,9 @@ use crate::top::jiyin004::ommega::IAuthorizationService::IAuthorizationService;
 use crate::top::jiyin004::ommega::IKeymintService::IKeymintService;
 use crate::top::jiyin004::ommega::IMaintenanceService::IMaintenanceService;
 
-const RPC_READY_TIMEOUT: Duration = Duration::from_secs(10);
+// 30s, matching inject.rs: tolerate keymint rebinding rpc.sock across a
+// keystore2 restart instead of giving up after 10s.
+const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
 const PM_SERVICE: &str = "sec_key_att_app_id_provider";
 

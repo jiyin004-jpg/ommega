@@ -84,6 +84,10 @@ pub struct TaskStore {
     inner: Mutex<Inner>,
     /// Woken whenever a new pending task appears (long-poll support).
     notify: Notify,
+    /// Sync snapshot of recently-polling device ids (seen within the online
+    /// window) so blocking threads (e.g. the auto-keybox loop) can read "who is
+    /// online" without taking the async `inner` lock.
+    online_seen: std::sync::RwLock<HashMap<String, u64>>,
     assignment_timeout: Duration,
     /// How long a pending task may wait before being marked as failed (timeout).
     pending_ttl: Duration,
@@ -103,6 +107,7 @@ impl TaskStore {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             notify: Notify::new(),
+            online_seen: std::sync::RwLock::new(HashMap::new()),
             assignment_timeout: Duration::from_secs(assignment_timeout_secs),
             pending_ttl: Duration::from_secs(pending_ttl_secs),
             completed_max,
@@ -184,19 +189,21 @@ impl TaskStore {
             {
                 let mut inner = self.inner.lock().await;
                 // Register the device as connected.
+                let hb_now = Self::now_ms();
                 inner.devices.insert(
                     device_id.to_string(),
                     DeviceEntry {
                         device_id: device_id.to_string(),
                         machine_id: machine_id.to_string(),
-                        last_seen_ms: Self::now_ms(),
+                        last_seen_ms: hb_now,
                         connected: true,
                     },
                 );
+                self.mark_online_sync(device_id, hb_now);
                 if !machine_id.is_empty() {
                     inner.active_machine.insert(
                         device_id.to_string(),
-                        (machine_id.to_string(), Self::now_ms()),
+                        (machine_id.to_string(), hb_now),
                     );
                 }
                 // Reclaim timed-out assignments first.
@@ -484,6 +491,27 @@ impl TaskStore {
             .collect()
     }
 
+    /// Record a B-side heartbeat in the synchronous online snapshot. Called from
+    /// `pop_for_b` (the B long-poll heartbeat), never from an async lock scope.
+    fn mark_online_sync(&self, device_id: &str, now_ms: u64) {
+        if let Ok(mut m) = self.online_seen.write() {
+            m.insert(device_id.to_string(), now_ms);
+        }
+    }
+
+    /// Unique device ids whose B side polled within the online window (120 s),
+    /// readable from blocking threads (no async lock). Stale entries are evicted
+    /// on read; mirrors the 120 s window of `get_connected_devices`.
+    pub fn connected_device_ids_sync(&self) -> Vec<String> {
+        let now = Self::now_ms();
+        let mut guard = match self.online_seen.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.retain(|_, ts| now.saturating_sub(*ts) < 120_000);
+        guard.keys().cloned().collect()
+    }
+
     pub async fn get_device_load(&self, device_id: &str) -> u64 {
         let inner = self.inner.lock().await;
         inner
@@ -561,5 +589,22 @@ impl TaskStore {
             return tied[i].0.clone();
         }
         candidates[0].0.clone()
+    }
+}
+
+#[cfg(test)]
+mod online_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn connected_device_ids_sync_evicts_stale() {
+        let store = TaskStore::new(30, 60, 100, 60);
+        let now = TaskStore::now_ms();
+        store.mark_online_sync("fresh", now);
+        store.mark_online_sync("stale", now.saturating_sub(200_000));
+
+        let ids = store.connected_device_ids_sync();
+        assert_eq!(ids.len(), 1, "stale device must be evicted on read");
+        assert_eq!(ids[0], "fresh");
     }
 }

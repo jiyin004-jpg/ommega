@@ -115,11 +115,13 @@ fn build_router(cfg: &Arc<Config>) -> Router {
     }
 
     // Start the auto keybox refresh loop (background thread) when enabled.
+    // `store` is passed so the auto-cover step can snapshot online B device ids.
     if cfg.keybox_refresh_enabled {
         if let Some(db_ref) = db.clone() {
             crate::autokeybox::set_enabled(true);
             crate::autokeybox::start_background(
                 db_ref,
+                store.clone(),
                 std::time::Duration::from_secs(cfg.keybox_refresh_interval_secs),
             );
         }
@@ -199,6 +201,18 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .route(
             "/api/admin/autokeybox/device/",
             post(admin::admin_autokeybox_set_device),
+        )
+        .route(
+            "/api/admin/autokeybox/cover/",
+            post(admin::admin_autokeybox_cover_toggle),
+        )
+        .route(
+            "/api/admin/autokeybox/cover/clear/",
+            post(admin::admin_autokeybox_cover_clear),
+        )
+        .route(
+            "/api/admin/autokeybox/cover/source/",
+            post(admin::admin_autokeybox_cover_source),
         )
         .route("/api/admin/cards/", get(admin::admin_card_orders))
         .route("/api/admin/ipfilter/", get(admin::admin_ipfilter_status))
