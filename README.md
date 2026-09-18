@@ -2,7 +2,7 @@
 
 Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真实硬件 TEE 能力通过网络提供给另一台设备（A 端）使用。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经过 server 中转调度，由 B 端设备的真实硬件 TEE（KeyMint / StrongBox）执行并返回结果，从而为 A 端应用提供真实可信的硬件级安全认证。
 
-源码版本：1.3.0（打包日期：2026-08-22）
+源码版本：1.3.1（打包日期：2026-09-18）
 
 ## 系统组成
 
@@ -50,7 +50,7 @@ OMMEGA_RELAY_TOKEN=Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0
 
 ### A 端配置（a-side 模块）
 
-1. 刷入 `ommega-a-release-arm64-v8a-1.3.0.zip` 并重启
+1. 刷入 `ommega-a-release-arm64-v8a-1.3.1.zip` 并重启
 2. 编辑 `/data/adb/ommega/ommegadata/config`（或模块 WebUI 中配置），填入官方配置：
 
 ```
@@ -67,7 +67,9 @@ remote: on
 
 配置后 A 端认证/签名/解密请求即通过官方 server 中转，由在线 B 端设备的真实 TEE 执行。
 `device_id` 必须是**当前在线**那台 B 端的设备 ID（在 `/status/` 页面的「在线 B 端设备」里核对；
-只在「已保存证书的设备」里出现不算在线）——指定的 B 端不在线时，服务器不会拿别的 B 端顶替。
+只在「已保存证书的设备」里出现不算在线）。指定设备不在线时，服务器会把任务派给**当前最闲的在线 B 端**
+（真机层允许由别的 B 端顶替），并把实际派发写进日志——这时你拿到的证书链就是那台顶替设备的，
+所以别拿一个离线 ID 当目标。
 
 ## 自行部署
 
@@ -77,7 +79,7 @@ remote: on
 ommega/
 ├── a-side/                  # A 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（keymint 守护进程 + ommega-inject 注入器）
-│   └── build/               #   ommega-a-release-arm64-v8a-1.3.0.zip 安装包
+│   └── build/               #   ommega-a-release-arm64-v8a-1.3.1.zip 安装包
 ├── b-side/                  # B 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（relay 守护进程）
 │   └── build/               #   ommegaclient-b-release-arm64-v8a-1.3.0.zip 安装包
