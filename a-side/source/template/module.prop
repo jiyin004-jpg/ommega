@@ -4,3 +4,4 @@ version=${versionName}
 versionCode=${versionCode}
 author=jiyin004
 description=Ommega A-side relay: remote TEE attestation via real hardware TEE
+updateJson=https://raw.githubusercontent.com/jiyin004-jpg/ommega/master/update.json

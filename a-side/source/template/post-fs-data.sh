@@ -21,7 +21,7 @@ resetprop ro.secure 1
 resetprop ro.adb.secure 1
 resetprop ro.debuggable 0
 resetprop sys.oem_unlock_allowed 0
-resetprop sys.oem_unlock_allowed ""
+resetprop ro.secureboot.devicelock 1
 mkdir -p "$TARGET_DIR"
 chmod 0770 "$TARGET_DIR"
 chown 1017:1017 "$TARGET_DIR"
