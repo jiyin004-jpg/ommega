@@ -114,29 +114,36 @@ unload_pathmask() {
   return 0
 }
 
+# Binder names belonging to the SoterService package.  Matched against the
+# package name on purpose: unrelated vendor HALs (e.g. Qualcomm's
+# vendor.qti.hardware.soter) merely contain "soter" and say nothing about
+# whether the SoterService app works.
+soter_binder_names() {
+  local explicit
+  explicit=$(conf_get soter_service)
+  if [ -n "$explicit" ]; then
+    echo "$explicit" | tr ',' ' '
+    return 0
+  fi
+  service list 2>/dev/null | grep -F "$SOTER_PKG" \
+    | sed 's/^[0-9]*[[:space:]]*//; s/:.*$//' | tr '\n' ' '
+}
+
 # 0 = reachable (healthy), 1 = not reachable within the budget.
 soter_service_available() {
-  local deadline names name out
+  local deadline names name
   deadline=$(( $(now_ms) + PROBE_BUDGET_MS ))
-  names=$(conf_get soter_service)
-  if [ -z "$names" ]; then
-    # Discover the registered binder names instead of hardcoding one vendor.
-    names=$(service list 2>/dev/null | grep -i soter \
-      | sed 's/^[0-9]*[[:space:]]*//; s/:.*$//' | tr '\n' ',')
-  fi
   while :; do
-    if [ -n "$names" ]; then
-      for name in $(echo "$names" | tr ',' ' '); do
-        [ -n "$name" ] || continue
-        out=$(service check "$name" 2>/dev/null)
-        # `service check` exits 0 even for "not found" - the text is the signal.
-        case "$out" in
-          *": found"*) return 0 ;;
-        esac
-      done
-    else
-      pidof "$SOTER_PKG" >/dev/null 2>&1 && return 0
-    fi
+    names=$(soter_binder_names)
+    for name in $names; do
+      [ -n "$name" ] || continue
+      # `service check` exits 0 even for "not found" - the text is the signal.
+      case "$(service check "$name" 2>/dev/null)" in
+        *": found"*) return 0 ;;
+      esac
+    done
+    # A running (or on-demand started) SoterService process counts as healthy.
+    pidof "$SOTER_PKG" >/dev/null 2>&1 && return 0
     [ "$(now_ms)" -ge "$deadline" ] && return 1
     sleep 0.2
   done
