@@ -173,19 +173,80 @@ fn global_scope_intercepts_unresolvable_packages_on_app_uids() {
 }
 
 #[test]
-fn global_scope_also_covers_non_app_uids() {
+fn global_scope_keeps_non_app_uids_on_the_system_backend() {
+    // Intercepting system_server/keystore/root keystore traffic under global
+    // scope made the device restart right after boot; these callers must keep
+    // reaching the real backend.
     let mut config = base_config();
     config.global_scope = true;
 
     for uid in [0, 1_000, 1_017, 2_000] {
         let decision = evaluate(&[], &config, uid, PackageResolution::Unknown);
-        assert!(decision.allowed, "uid {uid} should be handled under global scope");
+        assert!(!decision.allowed, "uid {uid} must stay on the system backend");
+        assert_eq!(decision.reason, FilterReason::RejectedAndroidPackage);
+    }
+}
+
+#[test]
+fn global_scope_leaves_unlisted_rom_packages_alone() {
+    // A ROM service holds keys minted before ommega ran; taking it over broke
+    // the device (com.zte.usebalance -> boot loop), so global scope skips it.
+    let mut config = base_config();
+    config.global_scope = true;
+
+    let decision = evaluate(
+        &[],
+        &config,
+        10_342,
+        PackageResolution::Known(vec!["com.zte.usebalance".to_string()]),
+    );
+    assert!(!decision.allowed);
+    assert_eq!(decision.reason, FilterReason::RejectedSystemPackage);
+}
+
+#[test]
+fn global_scope_intercepts_google_components_even_when_unlisted() {
+    // Play / GMS are ROM components, but users expect them spoofed on every
+    // device, so global scope intercepts them without a scoop entry.
+    let mut config = base_config();
+    config.global_scope = true;
+
+    for package in [
+        "com.google.android.gms",
+        "com.google.android.gsf",
+        "com.android.vending",
+    ] {
+        let decision = evaluate(
+            &[],
+            &config,
+            10_123,
+            PackageResolution::Known(vec![package.to_string()]),
+        );
+        assert!(decision.allowed, "{package} should be handled");
         assert_eq!(decision.reason, FilterReason::GlobalScope);
     }
 }
 
 #[test]
-fn global_scope_ignores_the_denylist_and_android_package() {
+fn global_scope_still_intercepts_listed_rom_components() {
+    // An explicit scoop entry also covers ROM components that the heuristic
+    // would otherwise leave alone.
+    let mut config = base_config();
+    config.global_scope = true;
+
+    let decision = evaluate(
+        &["com.zte.somecomponent".to_string()],
+        &config,
+        10_400,
+        PackageResolution::Known(vec!["com.zte.somecomponent".to_string()]),
+    );
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, FilterReason::GlobalScope);
+}
+
+#[test]
+fn global_scope_still_honours_the_denylist() {
+    // The denylist stays the escape hatch even in global scope.
     let mut config = base_config();
     config.global_scope = true;
     config.deny_packages = vec!["com.blocked".to_string()];
@@ -196,17 +257,8 @@ fn global_scope_ignores_the_denylist_and_android_package() {
         10_000,
         PackageResolution::Known(vec!["com.blocked".to_string()]),
     );
-    assert!(decision.allowed);
-    assert_eq!(decision.reason, FilterReason::GlobalScope);
-
-    let decision = evaluate(
-        &[],
-        &config,
-        10_000,
-        PackageResolution::Known(vec!["android".to_string()]),
-    );
-    assert!(decision.allowed);
-    assert_eq!(decision.reason, FilterReason::GlobalScope);
+    assert!(!decision.allowed);
+    assert_eq!(decision.reason, FilterReason::RejectedByDenylist);
 }
 
 #[test]

@@ -12,13 +12,67 @@ pub enum PackageResolution {
 pub enum FilterReason {
     Disabled,
     Allowed,
-    /// `filter.global_scope` is on: every caller is handled by ommega,
-    /// regardless of `scoop` / deny list / package resolution.
+    /// `filter.global_scope` is on: an ordinary app (or an explicitly listed
+    /// component) is handled by ommega even though it is not in `scoop`.
     GlobalScope,
     RejectedAndroidPackage,
     RejectedByDenylist,
     RejectedNotInScope,
     RejectedUnknownPackage,
+    /// Global scope is on, but the caller is a ROM system package that was not
+    /// listed explicitly, so it keeps using the system backend.
+    RejectedSystemPackage,
+}
+
+/// Components global scope always intercepts, listed or not: Google Play and
+/// the GMS/GFS stack are what users expect to be spoofed on every device.
+const GLOBAL_SCOPE_ALWAYS: &[&str] = &["com.google.", "com.android.vending"];
+
+/// Package-name prefixes of ROM/vendor system components.  Global scope leaves
+/// these on the system backend (unless listed in `scoop`): they hold keys minted
+/// before ommega ran, and a ROM service losing access to them can restart the
+/// whole system.
+const SYSTEM_PACKAGE_PREFIXES: &[&str] = &[
+    "android",
+    "com.android.",
+    "com.zte.",
+    "com.qualcomm.",
+    "com.mediatek.",
+    "com.oplus.",
+    "com.oneplus.",
+    "com.coloros.",
+    "com.miui.",
+    "com.xiaomi.",
+    "com.samsung.",
+    "com.sec.",
+    "com.huawei.",
+    "com.hihonor.",
+    "com.vivo.",
+    "com.bbk.",
+    "com.nubia.",
+    "cn.nubia.",
+    "com.meizu.",
+    "com.motorola.",
+    "com.transsion.",
+    "com.sony.",
+    "com.lge.",
+    "org.codeaurora.",
+];
+
+/// Best-effort classification of a package as a system/ROM component.  Package
+/// names are all the filter has (the caller's ApplicationInfo is not reachable
+/// from inside keystore2), so this is a prefix heuristic; `scoop` overrides it,
+/// and `GLOBAL_SCOPE_ALWAYS` wins over the heuristic.
+fn is_system_package_name(package: &str) -> bool {
+    if GLOBAL_SCOPE_ALWAYS
+        .iter()
+        .any(|prefix| package.starts_with(prefix))
+    {
+        return false;
+    }
+    SYSTEM_PACKAGE_PREFIXES
+        .iter()
+        .any(|prefix| package == *prefix || package.starts_with(prefix))
 }
 
 #[derive(Debug, Clone)]
@@ -45,20 +99,56 @@ pub fn evaluate(
         };
     }
 
-    // Global scope ("全局作用域", toggled in the A-side WebUI's remote config):
-    // intercept everything — the scope list, `deny_packages`, the
-    // android-package rule and the unknown-package rule are all skipped, so
-    // whoever calls is handled.  Only the master switch above can still turn
-    // interception off.  Whether a handled request is served locally or by the
-    // remote relay is decided elsewhere and is not affected by this setting.
-    if config.global_scope {
+    // Non-app callers (uid < AID_APP_START: init, system_server, keystore
+    // itself, root, shell) always stay on the system backend, global scope or
+    // not.  Intercepting system_server's own keystore traffic during boot makes
+    // the system take a reply it cannot use and restart - observed on-device as
+    // "boots and immediately powers off/reboots" with `global_scope: true`.
+    if config.block_android_package && uid % AID_USER_OFFSET < AID_APP_START {
         return FilterDecision {
-            allowed: true,
-            reason: FilterReason::GlobalScope,
+            allowed: false,
+            reason: FilterReason::RejectedAndroidPackage,
             packages: match resolution {
                 PackageResolution::Known(packages) => packages,
                 PackageResolution::Unknown => Vec::new(),
             },
+        };
+    }
+
+    // Global scope ("全局作用域", toggled in the A-side WebUI's remote config)
+    // intercepts ordinary apps, and *also* whatever is listed in the scope
+    // explicitly (so Google Play / GMS components keep being handled).  ROM
+    // system packages that were never listed are left on the system backend:
+    // they already hold keys in the system keystore, so taking them over breaks
+    // their blobs - a ROM service failing like that has already taken a device
+    // into a boot loop (`com.zte.usebalance`).  `deny_packages` stays the
+    // escape hatch on top of that.  Only the master switch turns interception
+    // off entirely; whether a handled request is served locally or remotely is
+    // decided elsewhere and is not affected by this setting.
+    if config.global_scope {
+        let packages = match resolution {
+            PackageResolution::Known(packages) => packages,
+            PackageResolution::Unknown => Vec::new(),
+        };
+        let explicitly_in_scope = !scoop.is_empty()
+            && packages.iter().any(|pkg| scoop.iter().any(|s| s == pkg));
+        let denied = packages
+            .iter()
+            .any(|pkg| config.deny_packages.contains(pkg));
+        let system_like = packages
+            .iter()
+            .any(|pkg| is_system_package_name(pkg));
+        let allowed = explicitly_in_scope || (!system_like && !denied);
+        return FilterDecision {
+            allowed,
+            reason: if allowed {
+                FilterReason::GlobalScope
+            } else if denied {
+                FilterReason::RejectedByDenylist
+            } else {
+                FilterReason::RejectedSystemPackage
+            },
+            packages,
         };
     }
 

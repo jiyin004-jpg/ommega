@@ -1,5 +1,19 @@
 # 更新日志
 
+## 1.4.1
+
+- **修复：开「全局作用域」后设备开机立刻重启/断电。** 根因是全局作用域把 ROM 的系统服务也接管了：这类应用
+  在系统 keystore 里已有钥匙，被 ommega 接管后钥匙解不开（日志里 `AES finish failed / ErrorCode(-30)`），
+  关键服务一崩系统就循环重启（实测中兴 `com.zte.usebalance`）。
+- **全局作用域的新语义**（按实际使用需求定）：
+  - **普通应用**：一律接管（无需进名单）；
+  - **Google 系组件**（`com.google.*`、`com.android.vending`）：**即使没列进名单也接管**；
+  - **ROM/厂商系统组件**（`com.zte.*` / `com.qualcomm.*` / `com.oplus.*` / `com.miui.*` …）：**不碰**，
+    除非在名单里显式列出（列了就接管）；
+  - **非应用 UID**（init / system_server / keystore / root / shell）：**任何情况都不接管**；
+  - `deny_packages` 依旧生效，是额外的安全阀（出问题的包加进去即可豁免）。
+- 拦截日志里新增 `RejectedSystemPackage`，便于区分"被全局作用域跳过"和"不在名单里"。
+
 ## 1.4.0
 
 - **多架构**：A 端模块现在同时打包 **arm64-v8a / armeabi-v7a / x86 / x86_64** 四套库，安装时按设备
