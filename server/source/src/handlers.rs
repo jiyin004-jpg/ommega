@@ -748,9 +748,11 @@ pub async fn b_poll(
                 if machine_id.is_empty() { "<none>" } else { machine_id.as_str() },
                 task.task_id,
                 task.task_type,
+                // NB: inside tracing's macro `Value` resolves to tracing's own
+                // Value trait, so go through a closure instead of Value::as_str.
                 task.payload
                     .get("device_id")
-                    .and_then(Value::as_str)
+                    .and_then(|v| v.as_str())
                     .unwrap_or("")
             );
             Json(json!({
