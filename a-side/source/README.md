@@ -22,7 +22,9 @@ relay_server.
 
 1. Install this module (KernelSU/APatch, or Magisk).
 
-2. Configure `/data/adb/ommega/config` (the single shared A-side config dir):
+2. Configure `/data/adb/ommega/ommegadata/config` (the single shared A-side
+   config; `ommegadata` is a symlink to `/data/misc/keystore/ommega`, which is
+   the path the daemon actually reads):
 
    ```
    url: http://<relay-server>:<port>
@@ -34,7 +36,7 @@ relay_server.
    debug_logging: false
    ```
 
-3. Add the apps you want to intercept to `/data/adb/ommega/target.txt`
+3. Add the apps you want to intercept to `/data/adb/ommega/ommegadata/target.txt`
    (one package per line; `!` = force generate, `?` = force patch). The WebUI
    (`webroot/`) manages this for you under KernelSU.
 
@@ -42,10 +44,16 @@ relay_server.
    your own keys.
 
 > **Path note**: `/data/adb/` is root-only, so the keystore process (uid 1017)
-> cannot read `/data/adb/ommega/*` directly. `post-fs-data.sh` and the
-> `daemon-injector` sync `config` and `target.txt` to
-> `/data/misc/keystore/ommega/` automatically, so edits take effect without a
-> reboot.
+> cannot read `/data/adb/ommega/*` directly. The single data location is
+> `/data/misc/keystore/ommega/`, exposed at `/data/adb/ommega/ommegadata`
+> (a symlink created by `post-fs-data.sh`). `config` and `target.txt` are read
+> from there — **nothing reads `/data/adb/ommega/config` or
+> `/data/adb/ommega/target.txt`** (there is no sync/copy step; a file written
+> at that path is silently ignored). Both files are watched, so edits take
+> effect without a reboot.
+>
+> Editing by hand? Use `/data/adb/ommega/ommegadata/config`, or just toggle it
+> in the module WebUI, which writes through the symlink.
 
 ## Restarting keymint and injector
 

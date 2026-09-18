@@ -529,7 +529,12 @@ impl Fulfill {
 
     /// Shared attest chain-building given an already-resolved identity. Returns
     /// `Some(result)` on success, `Some(error)` on request/chain failure.
-    fn attest_from_identity(&self, body: &Value, identity: &DeviceIdentity) -> Option<Value> {
+    fn attest_from_identity(
+        &self,
+        body: &Value,
+        identity: &DeviceIdentity,
+        source: &str,
+    ) -> Option<Value> {
         let alias = body
             .get("alias")
             .and_then(Value::as_str)
@@ -560,7 +565,13 @@ impl Fulfill {
                     "cert_chain": c,
                     "leaf_certificate": c.first().cloned().unwrap_or_default(),
                     "key_fingerprint": key_fp,
-                    "source": "server_keybox",
+                    // Distinguishes a chain minted from the device's stored
+                    // keybox (`server_keybox`) from one minted by a throwaway
+                    // server self-signed identity (`server_self_signed`), and
+                    // names the identity that actually signed it — without this
+                    // the two are indistinguishable in the response.
+                    "source": source,
+                    "attested_device_id": identity.device_id,
                 }))
             }
             Err(e) => Some(json!({ "error": format!("server_keybox attest failed: {e:#}") })),
@@ -593,7 +604,7 @@ impl Fulfill {
                 }));
             }
         };
-        self.attest_from_identity(body, &identity)
+        self.attest_from_identity(body, &identity, "server_keybox")
     }
 
     /// Layer-3 (self-signed): extreme-case fallback that fulfils attestation
@@ -614,7 +625,7 @@ impl Fulfill {
                 }));
             }
         };
-        self.attest_from_identity(body, &identity)
+        self.attest_from_identity(body, &identity, "server_self_signed")
     }
 
     pub fn try_handle_sign(&self, device_id: &str, body: &Value) -> Option<Value> {

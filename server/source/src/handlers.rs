@@ -109,9 +109,11 @@ fn check_auth(state: &AppState, headers: &HeaderMap, role: Option<&str>) -> Resu
     Ok(token)
 }
 
-/// Layer ① — B-device fulfilment: enqueue a task for the (load-balanced)
-/// target and wait for the result. Fails fast when no B device is online so
-/// the next layer can run without waiting.
+/// Layer ① — B-device fulfilment: enqueue a task for the resolved target and
+/// wait for the result. Fails fast when no B device is online so the next layer
+/// can run without waiting. When the requested device is offline the balancer
+/// hands the task to another live B端 (intended: the real-device layer stays
+/// real hardware); the log line records requested vs. actual.
 async fn try_b_device_layer(
     state: &AppState,
     task_type: &str,
@@ -123,6 +125,20 @@ async fn try_b_device_layer(
         return Some(json!({ "error": "no B-side device online" }));
     }
     let target = state.store.resolve_online_target(device_id).await;
+    // Trace line: the requested device and the device that will actually serve
+    // the task. They differ exactly when the requested one is not online and
+    // the balancer picked another live B端 — the chain will then come from that
+    // other device, which is intended but must be visible in the log.
+    if !device_id.is_empty() && target != device_id {
+        tracing::warn!(
+            "b_layer: requested device {device_id} is not online; task served by {target} instead"
+        );
+    } else {
+        tracing::info!(
+            "b_layer: type={task_type} requested={} target={target} enqueued",
+            if device_id.is_empty() { "<any>" } else { device_id }
+        );
+    }
     let task_id = state
         .store
         .create_task(task_type, body.clone(), &target)
@@ -723,13 +739,28 @@ pub async fn b_poll(
         .pop_for_b(&q.device_id, &machine_id, timeout)
         .await
     {
-        Some(task) => Json(json!({
-            "task_id": task.task_id,
-            "task_type": task.task_type,
-            "payload": task.payload,
-            "target_device_id": task.target_device_id,
-        }))
-        .into_response(),
+        Some(task) => {
+            // Which device actually took the task — the counterpart of the
+            // `b_layer` log line, so a mismatch is visible from the log alone.
+            tracing::info!(
+                "b_poll: device={} machine={} claimed task={} type={} requested={}",
+                q.device_id,
+                if machine_id.is_empty() { "<none>" } else { machine_id.as_str() },
+                task.task_id,
+                task.task_type,
+                task.payload
+                    .get("device_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+            Json(json!({
+                "task_id": task.task_id,
+                "task_type": task.task_type,
+                "payload": task.payload,
+                "target_device_id": task.target_device_id,
+            }))
+            .into_response()
+        }
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }

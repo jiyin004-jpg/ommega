@@ -51,7 +51,7 @@ OMMEGA_RELAY_TOKEN=Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0
 ### A 端配置（a-side 模块）
 
 1. 刷入 `ommega-a-release-arm64-v8a-1.3.0.zip` 并重启
-2. 编辑 `/data/adb/ommega/config`（或模块 WebUI 中配置），填入官方配置：
+2. 编辑 `/data/adb/ommega/ommegadata/config`（或模块 WebUI 中配置），填入官方配置：
 
 ```
 url: http://110.40.170.96:10886
@@ -61,7 +61,13 @@ tls_insecure: true
 remote: on
 ```
 
+> ⚠️ 路径注意：`ommegadata` 是指向 `/data/misc/keystore/ommega` 的软链，守护进程真正读的就是
+> `/data/misc/keystore/ommega/config`。**没有 `ommegadata` 那一层**的
+> `/data/adb/ommega/config` 是另一个文件，写了不生效（改完不用重启，配置有 watch）。
+
 配置后 A 端认证/签名/解密请求即通过官方 server 中转，由在线 B 端设备的真实 TEE 执行。
+`device_id` 必须是**当前在线**那台 B 端的设备 ID（在 `/status/` 页面的「在线 B 端设备」里核对；
+只在「已保存证书的设备」里出现不算在线）——指定的 B 端不在线时，服务器不会拿别的 B 端顶替。
 
 ## 自行部署
 

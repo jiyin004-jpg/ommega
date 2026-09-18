@@ -365,8 +365,8 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
   <div class="body" style="padding:0">
     <div class="table-wrap">
     <table>
-      <thead><tr><th>任务 ID</th><th>任务类型</th><th>目标设备</th><th>状态</th><th>创建时间</th></tr></thead>
-      <tbody id="taskBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>任务 ID</th><th>任务类型</th><th>请求设备</th><th>派发到</th><th>实际执行</th><th>状态</th><th>创建时间</th></tr></thead>
+      <tbody id="taskBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
     </table>
     </div>
     <div class="collapse-bar" id="taskCollapse" style="display:none" onclick="toggleCollapse('task')">显示全部</div>
@@ -856,21 +856,27 @@ function renderTasks() {
   const filtered = !q ? _taskData : _taskData.filter(t =>
     (t.task_id && t.task_id.toLowerCase().includes(q)) ||
     (t.task_type && t.task_type.toLowerCase().includes(q)) ||
-    (t.target_device_id && t.target_device_id.toLowerCase().includes(q))
+    (t.requested_device_id && t.requested_device_id.toLowerCase().includes(q)) ||
+    (t.target_device_id && t.target_device_id.toLowerCase().includes(q)) ||
+    (t.assigned_device_id && t.assigned_device_id.toLowerCase().includes(q))
   );
   document.getElementById('taskCount').textContent = q
     ? `${filtered.length} / ${_taskData.length} 条`
     : `${_taskData.length} 条`;
   if (!filtered.length) {
-    document.getElementById('taskBody').innerHTML = '<tr><td colspan="5" class="empty">' + (q ? '无匹配任务' : '暂无任务') + '</td></tr>';
+    document.getElementById('taskBody').innerHTML = '<tr><td colspan="7" class="empty">' + (q ? '无匹配任务' : '暂无任务') + '</td></tr>';
     document.getElementById('taskCollapse').style.display = 'none';
     return;
   }
+  // 请求设备 = A 端要的那台；派发到 = 服务器解析出的目标；实际执行 = 真正取走任务的 B 端。
+  // 三者不一致就说明请求被派给了别的设备。
   const html = renderCollapsible(filtered, 'task', t => `
     <tr>
       <td class="mono">${esc(t.task_id)}</td>
       <td class="mono">${esc(t.task_type)}</td>
+      <td class="mono">${esc(t.requested_device_id || '—')}</td>
       <td class="mono">${esc(t.target_device_id || '—')}</td>
+      <td class="mono">${esc(t.assigned_device_id || '—')}</td>
       <td>${statusTag(t.status)}</td>
       <td>${fmtTime(t.created_at_ms)}</td>
     </tr>`);

@@ -526,10 +526,9 @@ impl TaskStore {
     ///
     /// - If `requested_did` is non-empty and online → return it directly.
     /// - If `requested_did` is not online but other devices are → return the
-    ///   device with the fewest active (pending/assigned) tasks.
+    ///   least-loaded online device (the real-device layer may be served by
+    ///   another B端 when the named one is down — this is intended).
     /// - If no devices are online → return `requested_did` unchanged.
-    ///
-    /// Mirrors `relay_server/apps/relay_core/store.py::resolve_online_target`.
     pub async fn resolve_online_target(&self, requested_did: &str) -> String {
         let mut inner = self.inner.lock().await;
         let now = Self::now_ms();
