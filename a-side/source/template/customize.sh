@@ -70,8 +70,10 @@ extract "$ZIPFILE" 'daemon-injector' "$MODPATH"
 extract "$ZIPFILE" 'injector.toml'   "$MODPATH"
 extract "$ZIPFILE" 'keybox.xml'      "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
+extract "$ZIPFILE" 'kmod-loader.sh'  "$MODPATH"
 chmod 755 "$MODPATH/daemon" "$MODPATH/daemon-injector" \
-  "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" "$MODPATH/uninstall.sh"
+  "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" "$MODPATH/uninstall.sh" \
+  "$MODPATH/kmod-loader.sh"
 
 
 if [ "$ARCH" = "x64" ] || [ "$ARCH" = "x86_64" ]; then
@@ -84,6 +86,15 @@ elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64-v8a" ]; then
   BINDIR="$MODPATH/libs/arm64-v8a"
   extract "$ZIPFILE" 'libs/arm64-v8a/keymint' "$MODPATH"
   extract "$ZIPFILE" 'libs/arm64-v8a/ommega-inject'  "$MODPATH"
+  # pathmask 内核模块只对 arm64 有意义（上游只提供 arm64 构建），逐个 extract
+  # 让 verify.sh 对每个 .ko 做 sha256 校验；缺文件或哈希不符会直接中止安装。
+  ui_print "- Extracting pathmask kernel modules"
+  for kmi in android12-5.10 android13-5.10 android13-5.15 android14-5.15 \
+             android14-6.1 android15-6.6 android16-6.12; do
+    extract "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" "$MODPATH"
+  done
+  extract "$ZIPFILE" 'pathmask/UPSTREAM.md' "$MODPATH"
+  chmod 0644 "$MODPATH"/pathmask/*.ko
 else
   abort "! Unsupported platform: $ARCH"
 fi

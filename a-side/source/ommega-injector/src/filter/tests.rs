@@ -144,3 +144,83 @@ fn empty_scope_keeps_android_and_denylist_precedence() {
     );
     assert_eq!(decision.reason, FilterReason::RejectedByDenylist);
 }
+
+#[test]
+fn global_scope_intercepts_apps_outside_the_scoop() {
+    let mut config = base_config();
+    config.global_scope = true;
+
+    let decision = evaluate(
+        &[],
+        &config,
+        10_000,
+        PackageResolution::Known(vec!["com.outside".to_string()]),
+    );
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, FilterReason::GlobalScope);
+    assert_eq!(decision.packages, vec!["com.outside".to_string()]);
+}
+
+#[test]
+fn global_scope_intercepts_unresolvable_packages_on_app_uids() {
+    let mut config = base_config();
+    config.global_scope = true;
+
+    let decision = evaluate(&[], &config, 10_123, PackageResolution::Unknown);
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, FilterReason::GlobalScope);
+    assert!(decision.packages.is_empty());
+}
+
+#[test]
+fn global_scope_also_covers_non_app_uids() {
+    let mut config = base_config();
+    config.global_scope = true;
+
+    for uid in [0, 1_000, 1_017, 2_000] {
+        let decision = evaluate(&[], &config, uid, PackageResolution::Unknown);
+        assert!(decision.allowed, "uid {uid} should be handled under global scope");
+        assert_eq!(decision.reason, FilterReason::GlobalScope);
+    }
+}
+
+#[test]
+fn global_scope_ignores_the_denylist_and_android_package() {
+    let mut config = base_config();
+    config.global_scope = true;
+    config.deny_packages = vec!["com.blocked".to_string()];
+
+    let decision = evaluate(
+        &[],
+        &config,
+        10_000,
+        PackageResolution::Known(vec!["com.blocked".to_string()]),
+    );
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, FilterReason::GlobalScope);
+
+    let decision = evaluate(
+        &[],
+        &config,
+        10_000,
+        PackageResolution::Known(vec!["android".to_string()]),
+    );
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, FilterReason::GlobalScope);
+}
+
+#[test]
+fn disabled_filter_wins_over_global_scope() {
+    let mut config = base_config();
+    config.enabled = false;
+    config.global_scope = true;
+
+    let decision = evaluate(
+        &base_scope(),
+        &config,
+        10_000,
+        PackageResolution::Known(vec!["com.allowed".to_string()]),
+    );
+    assert!(decision.allowed);
+    assert_eq!(decision.reason, FilterReason::Disabled);
+}

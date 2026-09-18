@@ -147,6 +147,8 @@
     <string name="remote_config_tls_insecure">禁用 TLS 验证</string>
 
     <string name="remote_config_debug_logging">启用调试日志</string>
+    <string name="remote_config_global_scope">全局作用域（谁来都处理）</string>
+    <string name="remote_config_status_link">查看在线 B 端设备 ID</string>
 
     <string name="remote_config_debug_logging_description">启用详细调试日志，记录所有操作、调用链和数据。日志将写入配置目录。</string>
 

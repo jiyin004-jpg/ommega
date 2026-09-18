@@ -66,7 +66,29 @@ MODULE_TEXT_FILES = (
     "verify.sh",
     "META-INF/com/google/android/update-binary",
     "META-INF/com/google/android/updater-script",
+    "pathmask/UPSTREAM.md",
 )
+
+# Official PathMask kernel modules bundled for A-side path masking.  Pinned to
+# the v2.8.0 release digests (see template/pathmask/UPSTREAM.md); packaging
+# refuses a .ko whose content does not match, so a tampered/corrupted asset can
+# never ship.  Keep this table in sync when bumping the upstream release.
+PATHMASK_KO_SHA256 = {
+    "android12-5.10_pathmask.ko": "a529f89da593c9078712cb9142de8fd94d90ea99a75802f7bf11217e4408d493",
+    "android13-5.10_pathmask.ko": "ba12e54a1bdf37df43daa204831aba3a782d970c1bfab5b8610628f22fd3f577",
+    "android13-5.15_pathmask.ko": "3c650cb1b2fb2da8a3f08d64a953b1a4828b67298e28e1cdda6f5ddf73f8e9d3",
+    "android14-5.15_pathmask.ko": "7f17772c1c3f626095ddd8252d65997606a29cee4c4fa3a60d41bb4b484eff6c",
+    "android14-6.1_pathmask.ko": "dd912e7d69ba3f2ec267d07880601c954fbf80470f6b2a0b27da82538768584b",
+    "android15-6.6_pathmask.ko": "d1f4a8da78f407d561b3c8207fa23a33111da2f25face9b1d0b5a7ed2d7e5ad0",
+    "android16-6.12_pathmask.ko": "6f20c7407235cc78b066ebc710fcdbba45b97fbceb2629e14698a30a2cf5c85f",
+}
+
+# Template entries that only make sense for one ABI.  The bundled pathmask
+# kernel modules are arm64-only upstream builds, so other ABIs skip that
+# directory entirely (customize.sh also only extracts them in the arm64 branch).
+TEMPLATE_ABI_EXCLUDES = {
+    "x86_64": ("pathmask",),
+}
 
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -146,7 +168,22 @@ def copy_binary(binary: Path, output_name: str, abi: str, stage_dir: Path) -> No
     print(f"Copied {binary} to {dest_path}")
 
 
-def copy_template_files(stage_dir: Path) -> None:
+def verify_pathmask_kos() -> None:
+    """Fail the build when a bundled PathMask kernel module is missing/altered."""
+    ko_dir = REPO_ROOT / "template" / "pathmask"
+    for name, expected in PATHMASK_KO_SHA256.items():
+        path = ko_dir / name
+        if not path.exists():
+            raise FileNotFoundError(f"pathmask kernel module missing: {path}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise ValueError(
+                f"pathmask kernel module {name} sha256 mismatch: {digest} != {expected}"
+            )
+    print(f"Verified {len(PATHMASK_KO_SHA256)} pathmask kernel modules")
+
+
+def copy_template_files(stage_dir: Path, abi: str) -> None:
     template_dir = REPO_ROOT / "template"
     if not template_dir.exists():
         raise FileNotFoundError("Template directory not found")
@@ -155,8 +192,12 @@ def copy_template_files(stage_dir: Path) -> None:
     if missing:
         raise FileNotFoundError(f"Template is missing required file(s): {', '.join(missing)}")
 
+    excluded = set(TEMPLATE_ABI_EXCLUDES.get(abi, ()))
     print(f"Copying template files into {stage_dir}...")
     for item in template_dir.iterdir():
+        if item.name in excluded:
+            print(f"  skipping {item.name} (not applicable to {abi})")
+            continue
         dst = stage_dir / item.name
         if item.is_dir():
             shutil.copytree(item, dst, dirs_exist_ok=True)
@@ -293,7 +334,9 @@ def build_package_for_abi(
                 bin_name=spec["bin"],
             )
 
-        copy_template_files(stage_dir)
+        if abi in ("arm64-v8a", "arm64"):
+            verify_pathmask_kos()
+        copy_template_files(stage_dir, abi)
         normalize_module_text_files(stage_dir)
         configure_template_for_abi(stage_dir, abi)
         for spec in BINARY_SPECS:

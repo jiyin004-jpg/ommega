@@ -65,3 +65,11 @@ update_status "Ommega ⏳ 启动中"
 
 start_daemon "$MODDIR/daemon" "$STATE_DIR/keymint-daemon.pid"
 start_daemon "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"
+
+# Bundled PathMask kernel module: pick the .ko matching this kernel and hide
+# /system/priv-app/SoterService only when its binder service cannot be reached
+# (see kmod-loader.sh).  Detached on purpose: it has to finish well within a few
+# seconds and must never delay late_start or the daemons above.
+if [ -f "$MODDIR/kmod-loader.sh" ]; then
+  ( sh "$MODDIR/kmod-loader.sh" >> "$STATE_DIR/kmod-loader.log" 2>&1 & )
+fi

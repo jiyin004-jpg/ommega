@@ -21,6 +21,10 @@ enabled = true
 deny_packages = []
 block_android_package = true
 allow_unknown_package = false
+# 全局作用域：谁来调用都处理，不再看 `scoop` / deny / 未知包名规则。
+# 正常由模块 WebUI 控制（它把 `global_scope` 写进 A 端平铺 config，并覆盖这里的值），
+# 这里保留一项是为了 schema 完整、也便于没有 WebUI 的场景。
+global_scope = false
 
 [intercept]
 get_security_level = true

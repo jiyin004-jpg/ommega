@@ -23,6 +23,11 @@ pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/keystore/ommega/injector.toml"
 /// `/data/adb/ommega/ommegadata` symlink (which points here), and the injected
 /// payload (keystore2, uid 1017) reads the same file.  There is no copy.
 const CLIENTA_TARGET_PATH: &str = "/data/misc/keystore/ommega/target.txt";
+/// Legacy A-side flat config (same directory as `target.txt`, written by the
+/// webroot UI and read by the keymint daemon).  The injector only looks at one
+/// key here: `global_scope`.  Everything else in that file belongs to the
+/// daemon's own parser (`crate::config` on the keymint side).
+const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
 const CURRENT_CONFIG_VERSION: u32 = 1;
 const REPLACE_SAVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REPLACE_SAVE_RETRY_LIMIT: usize = 10;
@@ -54,6 +59,11 @@ pub struct FilterConfig {
     pub deny_packages: Vec<String>,
     pub block_android_package: bool,
     pub allow_unknown_package: bool,
+    /// Intercept every app, ignoring `scoop`/`deny_packages` and the package
+    /// resolution gates ("全局作用域").  Set from the A-side WebUI; see
+    /// `clienta_global_scope()`.  Local-vs-remote handling is NOT affected:
+    /// this only widens which callers get handled by ommega.
+    pub global_scope: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,6 +124,7 @@ impl Default for FilterConfig {
             deny_packages: Vec::new(),
             block_android_package: true,
             allow_unknown_package: false,
+            global_scope: false,
         }
     }
 }
@@ -200,17 +211,43 @@ pub fn get() -> Arc<InjectorConfig> {
             .read()
             .expect("injector config lock poisoned"),
     );
-    merge_clienta_target_scoop(base)
+    apply_clienta_overrides(base)
 }
 
-/// Merges the legacy A-side `/data/adb/ommega/target.txt` package list into the
-/// effective scoop, so apps toggled in the webroot UI are intercepted exactly as
-/// under the old client-a module.  Returns `base` unchanged if the file is absent
-/// or unreadable (only package names are added; deny/scope details still come from
-/// `injector.toml`).
-fn merge_clienta_target_scoop(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
-    let Ok(contents) = fs::read_to_string(CLIENTA_TARGET_PATH) else {
+/// Applies the legacy A-side files to the effective config:
+///
+/// * `/data/misc/keystore/ommega/target.txt` — packages toggled in the webroot
+///   UI are merged into `scoop`, so those apps are intercepted exactly as under
+///   the old client-a module (only package names are added; deny/scope details
+///   still come from `injector.toml`).
+/// * `/data/misc/keystore/ommega/config` — its `global_scope` key switches on
+///   "intercept every app" mode.
+///
+/// Both files are re-read on every `get()`, so toggling either one in the
+/// WebUI takes effect without restarting the injector.  An absent or unreadable
+/// file leaves the base config unchanged.
+fn apply_clienta_overrides(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
+    let extras = clienta_target_extras(&base);
+    // Tri-state: a `global_scope` key present in the flat config wins; when the
+    // key is absent the `injector.toml` value is kept.  The WebUI always writes
+    // the key, so unchecking the box there really turns the mode off.
+    let scope_override = clienta_global_scope_override();
+    let scope_changed = scope_override.is_some_and(|value| value != base.filter.global_scope);
+    if extras.is_empty() && !scope_changed {
         return base;
+    }
+    let mut merged = (*base).clone();
+    if let Some(value) = scope_override {
+        merged.filter.global_scope = value;
+    }
+    merged.scoop.extend(extras);
+    Arc::new(merged)
+}
+
+/// Package names listed in the legacy `target.txt` that `scoop` does not have yet.
+fn clienta_target_extras(base: &InjectorConfig) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(CLIENTA_TARGET_PATH) else {
+        return Vec::new();
     };
     let mut extras: Vec<String> = Vec::new();
     for line in contents.lines() {
@@ -223,16 +260,35 @@ fn merge_clienta_target_scoop(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> 
         if pkg.is_empty() {
             continue;
         }
-        if !base.scoop.iter().any(|s| s == pkg) {
+        if !base.scoop.iter().any(|s| s == pkg) && !extras.iter().any(|s| s == pkg) {
             extras.push(pkg.to_string());
         }
     }
-    if extras.is_empty() {
-        return base;
+    extras
+}
+
+/// The flat A-side config's `global_scope` value, or `None` when the file or
+/// key is absent.  Truthy spellings are `1` / `true` / `yes` / `on`
+/// (case-insensitive); the webroot UI writes `true`/`false`.
+fn clienta_global_scope_override() -> Option<bool> {
+    let contents = fs::read_to_string(CLIENTA_CONFIG_PATH).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = line.find(':') else {
+            continue;
+        };
+        if !line[..idx].trim().eq_ignore_ascii_case("global_scope") {
+            continue;
+        }
+        return Some(matches!(
+            line[idx + 1..].trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ));
     }
-    let mut merged = (*base).clone();
-    merged.scoop.extend(extras);
-    Arc::new(merged)
+    None
 }
 
 fn ensure_initialized() {

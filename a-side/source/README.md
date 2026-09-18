@@ -55,6 +55,42 @@ relay_server.
 > Editing by hand? Use `/data/adb/ommega/ommegadata/config`, or just toggle it
 > in the module WebUI, which writes through the symlink.
 
+### Global scope (intercept every caller)
+
+`global_scope: true` in that same `config` file — or the checkbox in the
+WebUI's remote-config dialog — makes the injector handle **every** caller: the
+`scoop` list, `target.txt`, `deny_packages`, the android-package rule and the
+unknown-package rule are all skipped. `[filter].enabled = false` remains the
+only way to turn interception off completely.
+
+It is re-read on every event, so toggling it takes effect immediately, with no
+restart of the injector or keystore2. Whether a handled request is served
+locally or by the remote relay is decided elsewhere and does **not** change
+with this switch.
+
+### Bundled PathMask kernel module (`kmod-loader.sh`)
+
+The module ships the official PathMask `.ko` builds (see
+`template/pathmask/UPSTREAM.md`) and loads one at boot from `service.sh`:
+
+* the kernel's **major.minor** (`uname -r`, e.g. `6.1.145-android14-11` → `6.1`)
+  selects the candidate; the patch level is ignored, and when a series has
+  several official Android variants they are tried in order;
+* the SoterService binder is probed for at most ~2 s (whole run < 3 s): if it
+  answers, nothing is masked and any mask this module installed earlier is
+  removed; if it does not, `/system/priv-app/SoterService` is masked with
+  `scope_mode=global`;
+* an already-loaded `pathmask` instance that this module did not load is left
+  untouched (set `pathmask_takeover: 1` to take it over).
+
+Outcome is written to `/data/adb/ommega/pathmask.state`, the full log to
+`/data/adb/ommega/kmod-loader.log`. Optional keys, read from the same `config`
+file: `soter_hide: 0` (disable), `soter_hide_prefer: skip` (keep the path
+visible when the probe cannot reach the service), `pathmask_target: <path>`,
+`soter_service: <comma,separated,binder/names>`, `soter_package: <pkg>`.
+For a dry run (logs decisions, never touches `/proc/modules`):
+`KMOD_DRY_RUN=1 sh /data/adb/modules/ommega/kmod-loader.sh`.
+
 ## Restarting keymint and injector
 
 The module ships two background daemons: one for `keymint`, one for `injector`.

@@ -12,6 +12,9 @@ pub enum PackageResolution {
 pub enum FilterReason {
     Disabled,
     Allowed,
+    /// `filter.global_scope` is on: every caller is handled by ommega,
+    /// regardless of `scoop` / deny list / package resolution.
+    GlobalScope,
     RejectedAndroidPackage,
     RejectedByDenylist,
     RejectedNotInScope,
@@ -35,6 +38,23 @@ pub fn evaluate(
         return FilterDecision {
             allowed: true,
             reason: FilterReason::Disabled,
+            packages: match resolution {
+                PackageResolution::Known(packages) => packages,
+                PackageResolution::Unknown => Vec::new(),
+            },
+        };
+    }
+
+    // Global scope ("全局作用域", toggled in the A-side WebUI's remote config):
+    // intercept everything — the scope list, `deny_packages`, the
+    // android-package rule and the unknown-package rule are all skipped, so
+    // whoever calls is handled.  Only the master switch above can still turn
+    // interception off.  Whether a handled request is served locally or by the
+    // remote relay is decided elsewhere and is not affected by this setting.
+    if config.global_scope {
+        return FilterDecision {
+            allowed: true,
+            reason: FilterReason::GlobalScope,
             packages: match resolution {
                 PackageResolution::Known(packages) => packages,
                 PackageResolution::Unknown => Vec::new(),

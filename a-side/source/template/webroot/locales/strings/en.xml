@@ -147,6 +147,8 @@
     <string name="remote_config_tls_insecure">Disable TLS verification</string>
 
     <string name="remote_config_debug_logging">Enable Debug Logging</string>
+    <string name="remote_config_global_scope">Global scope (handle every caller)</string>
+    <string name="remote_config_status_link">Check online B-side device IDs</string>
 
     <string name="remote_config_debug_logging_description">Enable detailed debug logging, recording all operations, call chains and data. Logs will be written to the config directory.</string>
 

@@ -36,6 +36,18 @@ if [ -n "$K2" ] && kill -0 "$K2" 2>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1b. Unload the bundled PathMask kernel module - only when this module loaded
+#     it.  The marker file is written by kmod-loader.sh after a successful
+#     insmod, so a foreign instance (e.g. the official PathMask module) is left
+#     running when ommega is removed.
+# ---------------------------------------------------------------------------
+if [ -f "$STATE_DIR/pathmask.owned" ]; then
+  rmmod pathmask 2>/dev/null || toybox rmmod pathmask 2>/dev/null
+  rm -f "$STATE_DIR/pathmask.owned"
+fi
+rm -f "$STATE_DIR/pathmask.state" "$STATE_DIR/kmod-loader.log"
+
+# ---------------------------------------------------------------------------
 # 2. Remove the A-side data tree
 #    Keymaster DB, config, keybox, logs, RPC socket, crash counter, webroot
 #    cache, etc. This is A-side-only, so deleting it wholesale is safe.
