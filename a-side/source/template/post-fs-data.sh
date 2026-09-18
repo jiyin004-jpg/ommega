@@ -21,6 +21,7 @@ resetprop ro.secure 1
 resetprop ro.adb.secure 1
 resetprop ro.debuggable 0
 resetprop sys.oem_unlock_allowed 0
+resetprop sys.oem_unlock_allowed ""
 mkdir -p "$TARGET_DIR"
 chmod 0770 "$TARGET_DIR"
 chown 1017:1017 "$TARGET_DIR"
@@ -34,7 +35,31 @@ rm -f "$STATE_DIR/restart.keymint" "$STATE_DIR/restart.injector" "$STATE_DIR/res
 # Make the shared A-side config directory traversable and expose the data dir.
 mkdir -p "$CLIENTA_DIR"
 chmod 0755 "$CLIENTA_DIR"
-if [ ! -e "$CLIENTA_DIR/ommegadata" ]; then
+# The webroot UI and the keystore process (uid 1017) must share ONE data dir:
+# the UI only writes "$CLIENTA_DIR/ommegadata/*", the daemons only read
+# "$TARGET_DIR/*".  A plain directory (or file) left at that path by an older
+# build, a manual step or a file manager puts both sides on separate copies —
+# UI saves would then silently never reach the daemon.  Repair it every boot:
+# migrate what is there, then replace it with the symlink.
+if [ -L "$CLIENTA_DIR/ommegadata" ]; then
+  : # already the symlink
+elif [ -d "$CLIENTA_DIR/ommegadata" ]; then
+  for f in config target.txt system_app keybox.xml; do
+    stray="$CLIENTA_DIR/ommegadata/$f"
+    real="$TARGET_DIR/$f"
+    [ -f "$stray" ] || continue
+    # Newest copy wins; copy in place so owner/mode of the real file survive.
+    if [ ! -f "$real" ] || [ "$stray" -nt "$real" ]; then
+      cat "$stray" > "$real" 2>/dev/null || true
+    fi
+  done
+  rm -rf "$CLIENTA_DIR/ommegadata"
+  ln -s "$TARGET_DIR" "$CLIENTA_DIR/ommegadata" 2>/dev/null
+elif [ -e "$CLIENTA_DIR/ommegadata" ]; then
+  # Stray regular file: keep it aside, then expose the real dir as a symlink.
+  mv -f "$CLIENTA_DIR/ommegadata" "$CLIENTA_DIR/ommegadata.stray" 2>/dev/null
+  ln -s "$TARGET_DIR" "$CLIENTA_DIR/ommegadata" 2>/dev/null
+else
   ln -s "$TARGET_DIR" "$CLIENTA_DIR/ommegadata" 2>/dev/null
 fi
 
