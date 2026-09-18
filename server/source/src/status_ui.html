@@ -168,7 +168,7 @@ async function load() {
 let _devices = [];
 
 const VB_STATE = { 0: '已验证 Verified', 1: '自签名 SelfSigned', 2: '未验证 Unverified', 3: '校验失败 Failed' };
-const fmtPatch = v => (v ? String(v).slice(0, 4) + '-' + String(v).slice(4, 6) : '—');
+const fmtPatch = v => { if (!v) return '—'; const s = String(v); return s.length === 8 ? s.slice(0,4) + '-' + s.slice(4,6) + '-' + s.slice(6,8) : s.slice(0,4) + '-' + s.slice(4,6); };
 const fmtHex = v => (v ? v : '—');
 
 function kvRow(k, v) { return `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`; }

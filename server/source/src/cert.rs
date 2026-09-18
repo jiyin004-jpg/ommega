@@ -1061,11 +1061,20 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// A patch level has to look like YYYYMM.  Some devices reuse tag numbers in a
-/// vendor range for other integers (e.g. an attestation id), which must not be
-/// reported as a date.
+/// Patch levels are YYYYMM for `os_patch_level` (706) but YYYYMMDD for
+/// `vendor_patch_level` / `boot_patch_level` (718/719) — both forms are
+/// accepted, and anything that is not a plausible date is dropped (some
+/// vendors reuse these tag numbers for unrelated integers).
 fn as_patch_level(value: i64) -> Option<i64> {
-    (2_000_01..=2_099_12).contains(&value).then_some(value)
+    let (year, month, day) = match value {
+        v if (2_000_00..3_000_000).contains(&v) => (v / 100, v % 100, None),
+        v if (2_000_0000..300_000_000).contains(&v) => {
+            (v / 10_000, (v / 100) % 100, Some(v % 100))
+        }
+        _ => return None,
+    };
+    let day_ok = day.is_none_or(|d| (1..=31).contains(&d));
+    ((2000..=2099).contains(&year) && (1..=12).contains(&month) && day_ok).then_some(value)
 }
 
 /// One TLV of a DER stream.  Context tags above 30 use the long form, which a
