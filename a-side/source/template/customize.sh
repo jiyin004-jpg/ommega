@@ -81,6 +81,16 @@ if [ "$ARCH" = "x64" ] || [ "$ARCH" = "x86_64" ]; then
   BINDIR="$MODPATH/libs/x86_64"
   extract "$ZIPFILE" 'libs/x86_64/keymint' "$MODPATH"
   extract "$ZIPFILE" 'libs/x86_64/ommega-inject'  "$MODPATH"
+elif [ "$ARCH" = "x86" ]; then
+  ui_print "- Using packaged x86 binaries"
+  BINDIR="$MODPATH/libs/x86"
+  extract "$ZIPFILE" 'libs/x86/keymint' "$MODPATH"
+  extract "$ZIPFILE" 'libs/x86/ommega-inject'  "$MODPATH"
+elif [ "$ARCH" = "arm" ] || [ "$ARCH" = "armeabi-v7a" ]; then
+  ui_print "- Using packaged arm32 binaries"
+  BINDIR="$MODPATH/libs/armeabi-v7a"
+  extract "$ZIPFILE" 'libs/armeabi-v7a/keymint' "$MODPATH"
+  extract "$ZIPFILE" 'libs/armeabi-v7a/ommega-inject'  "$MODPATH"
 elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64-v8a" ]; then
   ui_print "- Using packaged arm64 binaries"
   BINDIR="$MODPATH/libs/arm64-v8a"

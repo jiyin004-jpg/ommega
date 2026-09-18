@@ -9,13 +9,42 @@ use nix::{
     unistd::Pid,
 };
 
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "x86_64",
-    target_arch = "x86"
-))]
-pub type Regs = libc::user_regs_struct;
+// The libc crate ships the ptrace register file only for the 64-bit Android
+// targets, so the 32-bit layouts are declared here (they are what the kernel
+// copies out for PTRACE_GETREGS / PTRACE_GETREGSET).
+#[cfg(target_arch = "arm")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Regs {
+    /// r0-r15, cpsr, orig_r0.
+    pub uregs: [u32; 18],
+}
+
+#[cfg(target_arch = "x86")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Regs {
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+    pub eax: u32,
+    pub xds: u32,
+    pub xes: u32,
+    pub xfs: u32,
+    pub xgs: u32,
+    pub orig_eax: u32,
+    pub eip: u32,
+    pub xcs: u32,
+    pub eflags: u32,
+    pub esp: u32,
+    pub xss: u32,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub use libc::user_regs_struct as Regs;
 
 pub const NT_PRSTATUS: std::ffi::c_int = 1;
 

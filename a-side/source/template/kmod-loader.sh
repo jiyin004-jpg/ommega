@@ -194,6 +194,12 @@ main() {
   local start series ko rc
   start=$(now_ms)
 
+  # The bundled .ko are arm64 builds; on any other ABI there is nothing to do.
+  case "$(uname -m 2>/dev/null)" in
+    aarch64|arm64) ;;
+    *) write_state "skipped-arch" "uname -m=$(uname -m 2>/dev/null)"; return 0 ;;
+  esac
+
   if [ "$(conf_get soter_hide)" = "0" ]; then
     write_state "skipped-disabled" "soter_hide=0"
     return 0

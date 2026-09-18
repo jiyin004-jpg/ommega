@@ -27,11 +27,15 @@ DEFAULT_PLATFORM = 24
 
 ABI_TO_TARGET = {
     "arm64-v8a": "aarch64-linux-android",
+    "armeabi-v7a": "armv7-linux-androideabi",
+    "x86": "i686-linux-android",
     "x86_64": "x86_64-linux-android",
 }
 
 ABI_TO_MODULE_ARCHES = {
     "arm64-v8a": "arm64 arm64-v8a",
+    "armeabi-v7a": "arm armeabi-v7a",
+    "x86": "x86",
     "x86_64": "x64 x86_64",
 }
 
@@ -87,6 +91,8 @@ PATHMASK_KO_SHA256 = {
 # kernel modules are arm64-only upstream builds, so other ABIs skip that
 # directory entirely (customize.sh also only extracts them in the arm64 branch).
 TEMPLATE_ABI_EXCLUDES = {
+    "armeabi-v7a": ("pathmask",),
+    "x86": ("pathmask",),
     "x86_64": ("pathmask",),
 }
 

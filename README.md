@@ -2,13 +2,13 @@
 
 Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真实硬件 TEE 能力通过网络提供给另一台设备（A 端）使用。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经过 server 中转调度，由 B 端设备的真实硬件 TEE（KeyMint / StrongBox）执行并返回结果，从而为 A 端应用提供真实可信的硬件级安全认证。
 
-源码版本：1.3.1（打包日期：2026-09-18）
+源码版本：1.4.0（打包日期：2026-09-18）
 
 ## 系统组成
 
 | 端 | 角色 | 形态 | 安装方式 |
 |----|------|------|----------|
-| **A 端（a-side）** | 服务请求端。keymint 守护进程 + inject 注入器拦截本机 keystore 调用，将认证/签名/解密请求转发到远程 B 端真实 TEE | Magisk 模块（arm64-v8a） | Magisk / KernelSU 刷入 zip |
+| **A 端（a-side）** | 服务请求端。keymint 守护进程 + inject 注入器拦截本机 keystore 调用，将认证/签名/解密请求转发到远程 B 端真实 TEE | Magisk 模块（arm64-v8a / armeabi-v7a / x86 / x86_64） | Magisk / KernelSU 刷入 zip |
 | **B 端（b-side）** | 服务提供端。relay 守护进程长轮询 server 领取任务，调用本机真实硬件 TEE 执行认证/签名/解密并回传结果 | Magisk 模块（arm64-v8a） | Magisk / KernelSU 刷入 zip |
 | **B 端 App（b-app）** | B 端管理界面，用于查看设备状态、配置连接参数 | Android APK | 直接安装 APK |
 | **Server（server）** | 中转与调度中心。任务队列、设备管理、卡片计费、密钥盒（keybox）管理、在线设备状态展示 | 独立二进制 | Linux x86_64 / Windows x86_64 部署 |
@@ -50,7 +50,7 @@ OMMEGA_RELAY_TOKEN=Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0
 
 ### A 端配置（a-side 模块）
 
-1. 刷入 `ommega-a-release-arm64-v8a-1.3.1.zip` 并重启
+1. 刷入 `ommega-a-release-1.4.0.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
 2. 编辑 `/data/adb/ommega/ommegadata/config`（或模块 WebUI 中配置），填入官方配置：
 
 ```
@@ -79,7 +79,7 @@ remote: on
 ommega/
 ├── a-side/                  # A 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（keymint 守护进程 + ommega-inject 注入器）
-│   └── build/               #   ommega-a-release-arm64-v8a-1.3.1.zip 安装包
+│   └── build/               #   ommega-a-release-1.4.0.zip 安装包（arm64-v8a + armeabi-v7a + x86 + x86_64）
 ├── b-side/                  # B 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（relay 守护进程）
 │   └── build/               #   ommegaclient-b-release-arm64-v8a-1.3.0.zip 安装包

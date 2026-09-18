@@ -252,5 +252,7 @@
     <string name="mode_certificate_generating">Создать сертификат (!)</string>
 
     <string name="prompt_security_patch_saved_restart">Security patch saved, reboot to take effect</string>
+    <string name="remote_config_status_link">Check online B-side device IDs</string>
+    <string name="prompt_status_hint">On the status page, tap a device ID to see its boot key, lock state, boot hash and patch levels</string>
 </resources>
 

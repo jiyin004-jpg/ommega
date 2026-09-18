@@ -12,7 +12,8 @@ pub fn get_current_time_in_milliseconds() -> i64 {
     // SAFETY: The pointer is valid because it comes from a reference, and clock_gettime doesn't
     // retain it beyond the call.
     unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut current_time) };
-    current_time.tv_sec * 1000 + (current_time.tv_nsec / 1_000_000)
+    // `tv_sec`/`tv_nsec` are i32 on 32-bit ABIs (armv7/i686), i64 on 64-bit.
+    (current_time.tv_sec as i64) * 1000 + (current_time.tv_nsec as i64) / 1_000_000
 }
 
 pub trait ParcelExt {

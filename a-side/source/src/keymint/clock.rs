@@ -49,6 +49,10 @@ impl crypto::MonotonicClock for StdClock {
             warn!("failed to get time!");
             return crypto::MillisecondsSinceEpoch(0);
         }
-        crypto::MillisecondsSinceEpoch((time.tv_sec * 1000) + (time.tv_nsec / 1000 / 1000))
+        // `tv_sec`/`tv_nsec` are i32 on 32-bit ABIs (armv7/i686) and i64 on
+        // 64-bit ones, so cast before the arithmetic.
+        crypto::MillisecondsSinceEpoch(
+            (time.tv_sec as i64) * 1000 + (time.tv_nsec as i64) / 1_000_000,
+        )
     }
 }

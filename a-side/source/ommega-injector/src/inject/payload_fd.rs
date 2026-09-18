@@ -452,7 +452,8 @@ where
 
     let mut local_hdr: libc::msghdr = unsafe { std::mem::zeroed() };
     local_hdr.msg_name = &mut local_dest_addr as *mut _ as *mut c_void;
-    local_hdr.msg_namelen = addr_len as u32;
+    // msg_namelen is u32 on 64-bit ABIs but i32 on 32-bit ones.
+    local_hdr.msg_namelen = addr_len as _;
     local_hdr.msg_iov = &mut local_iov;
     local_hdr.msg_iovlen = 1;
     local_hdr.msg_control = local_cmsg_storage.as_mut_ptr() as *mut c_void;

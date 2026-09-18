@@ -325,8 +325,12 @@ where
     unsafe fn is_binder_driver_fd(fd: c_int) -> bool {
         let saved_errno = *libc::__errno();
         let mut stat: libc::stat = std::mem::zeroed();
-        let is_character_device =
-            libc::fstat(fd, &mut stat) == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFCHR;
+        // st_mode/S_IFMT/S_IFCHR are u16 on some ABIs and u32 on others; go
+        // through mode_t so this compiles for every Android target.  fstat runs
+        // first - `stat` is still zeroed when the expression is laid out.
+        let is_character_device = libc::fstat(fd, &mut stat) == 0
+            && (stat.st_mode as libc::mode_t) & (libc::S_IFMT as libc::mode_t)
+                == libc::S_IFCHR as libc::mode_t;
         let mut version = binder_version::default();
         let is_binder = is_character_device
             && libc::syscall(
