@@ -1120,12 +1120,28 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
     let mut connected: Vec<(Value, u64)> = Vec::new();
     for d in connected_raw.drain(..) {
         let load = state.store.get_device_load(&d.device_id).await;
+        // Boot state this device attested to (parsed from its own attestation
+        // record).  Public on purpose: it is what the status page shows when a
+        // device id is clicked, and it holds no key material — only digests.
+        let boot = d.boot.as_ref().map(|b| {
+            json!({
+                "boot_key": b.boot_key,
+                "boot_hash": b.boot_hash,
+                "device_locked": b.device_locked,
+                "verified_boot_state": b.verified_boot_state,
+                "os_version": b.os_version,
+                "patch_system": b.patch_system,
+                "patch_vendor": b.patch_vendor,
+                "patch_boot": b.patch_boot,
+            })
+        });
         connected.push((
             json!({
                 "device_id": d.device_id,
                 "machine_id": d.machine_id,
                 "load": load,
                 "last_seen_ms": d.last_seen_ms,
+                "boot": boot,
             }),
             load,
         ));

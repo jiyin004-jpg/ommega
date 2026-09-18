@@ -1018,6 +1018,190 @@ pub fn rsa_exponent() -> i64 {
     65537
 }
 
+// ---------------------------------------------------------------------------
+// Reading a device-produced attestation record back out of its chain
+// ---------------------------------------------------------------------------
+
+/// Boot state a device reports in its own attestation record, parsed from the
+/// certificate chain a B-side returns for an `attest` task.  Every field is
+/// optional: chains differ per KeyMint version, and the vendor/boot patch
+/// levels are vendor extensions many devices never emit.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceBootInfo {
+    pub boot_key: Option<String>,
+    pub boot_hash: Option<String>,
+    pub device_locked: Option<bool>,
+    /// 0 = verified, 1 = self-signed, 2 = unverified, 3 = failed.
+    pub verified_boot_state: Option<i64>,
+    /// KeyMint os_version in its packed form (e.g. 160000 = Android 16).
+    pub os_version: Option<i64>,
+    pub patch_system: Option<i64>,
+    pub patch_vendor: Option<i64>,
+    pub patch_boot: Option<i64>,
+}
+
+impl DeviceBootInfo {
+    pub fn is_empty(&self) -> bool {
+        self.boot_key.is_none()
+            && self.boot_hash.is_none()
+            && self.device_locked.is_none()
+            && self.verified_boot_state.is_none()
+            && self.os_version.is_none()
+            && self.patch_system.is_none()
+            && self.patch_vendor.is_none()
+            && self.patch_boot.is_none()
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// A patch level has to look like YYYYMM.  Some devices reuse tag numbers in a
+/// vendor range for other integers (e.g. an attestation id), which must not be
+/// reported as a date.
+fn as_patch_level(value: i64) -> Option<i64> {
+    (2_000_01..=2_099_12).contains(&value).then_some(value)
+}
+
+/// One TLV of a DER stream.  Context tags above 30 use the long form, which a
+/// single-byte tag read would silently misparse.
+struct Tlv<'a> {
+    tag: u64,
+    value: &'a [u8],
+}
+
+fn take_tlv<'a>(buf: &'a [u8], pos: &mut usize) -> Option<Tlv<'a>> {
+    if *pos >= buf.len() {
+        return None;
+    }
+    let mut tag = buf[*pos] as u64;
+    *pos += 1;
+    if tag & 0x1f == 0x1f {
+        tag = 0;
+        loop {
+            let b = *buf.get(*pos)?;
+            *pos += 1;
+            tag = (tag << 7) | u64::from(b & 0x7f);
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    let first = *buf.get(*pos)?;
+    *pos += 1;
+    let len = if first & 0x80 == 0 {
+        first as usize
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 8 {
+            return None;
+        }
+        let mut len = 0usize;
+        for _ in 0..n {
+            len = (len << 8) | *buf.get(*pos)? as usize;
+            *pos += 1;
+        }
+        len
+    };
+    if *pos + len > buf.len() {
+        return None;
+    }
+    let value = &buf[*pos..*pos + len];
+    *pos += len;
+    Some(Tlv { tag, value })
+}
+
+/// AuthorizationList entries are `[tag] EXPLICIT <inner TLV>`, so unwrap one
+/// level before reading the value.
+fn explicit_inner(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let mut pos = 0;
+    let inner = take_tlv(bytes, &mut pos)?;
+    Some((inner.tag, inner.value))
+}
+
+fn explicit_int(bytes: &[u8]) -> Option<i64> {
+    let (_, raw) = explicit_inner(bytes)?;
+    if raw.is_empty() || raw.len() > 8 {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for b in raw {
+        value = (value << 8) | i64::from(*b);
+    }
+    Some(value)
+}
+
+fn read_auth_list(list: &[u8], out: &mut DeviceBootInfo) {
+    let mut pos = 0;
+    while let Some(entry) = take_tlv(list, &mut pos) {
+        match entry.tag {
+            704 => {
+                // RootOfTrust ::= SEQUENCE { key OCTET STRING, locked BOOLEAN,
+                //                          state ENUMERATED, hash OCTET STRING }
+                let Some((_, seq)) = explicit_inner(entry.value) else { continue };
+                let mut p = 0;
+                if let Some(key) = take_tlv(seq, &mut p) {
+                    out.boot_key = Some(to_hex(key.value));
+                }
+                if let Some(locked) = take_tlv(seq, &mut p) {
+                    out.device_locked = Some(!locked.value.is_empty() && locked.value != [0]);
+                }
+                if let Some(state) = take_tlv(seq, &mut p) {
+                    out.verified_boot_state = state.value.last().map(|b| i64::from(*b));
+                }
+                if let Some(hash) = take_tlv(seq, &mut p) {
+                    out.boot_hash = Some(to_hex(hash.value));
+                }
+            }
+            705 => out.os_version = explicit_int(entry.value),
+            706 => out.patch_system = explicit_int(entry.value).and_then(as_patch_level),
+            // Both the AOSP numbers (707/708) and the ones this server's own
+            // record builder emits (718/719) are accepted.
+            707 | 718 => out.patch_vendor = explicit_int(entry.value).and_then(as_patch_level),
+            708 | 719 => out.patch_boot = explicit_int(entry.value).and_then(as_patch_level),
+            _ => {}
+        }
+    }
+}
+
+/// Parse the leaf of a base64 DER chain (as returned in an `attest` result) and
+/// extract the boot state it attests to.  `None` when the chain is unreadable
+/// or carries no attestation extension.
+pub fn device_boot_info_from_chain(leaf_b64: &str) -> Option<DeviceBootInfo> {
+    use base64::Engine as _;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(leaf_b64.trim())
+        .ok()?;
+    let (_, cert) = parse_x509_certificate(&der).ok()?;
+    const ATTESTATION_OID_STR: &str = "1.3.6.1.4.1.11129.2.1.17";
+    let ext = cert
+        .extensions()
+        .iter()
+        .find(|e| e.oid.to_id_string() == ATTESTATION_OID_STR)?;
+
+    let mut pos = 0;
+    let seq = take_tlv(ext.value, &mut pos)?;
+    let mut p = 0;
+    // attestationVersion, attestationSecurityLevel, keymasterVersion,
+    // keymasterSecurityLevel, attestationChallenge, uniqueId
+    for _ in 0..6 {
+        take_tlv(seq.value, &mut p)?;
+    }
+    let mut info = DeviceBootInfo::default();
+    if let Some(software) = take_tlv(seq.value, &mut p) {
+        read_auth_list(software.value, &mut info);
+    }
+    if let Some(tee) = take_tlv(seq.value, &mut p) {
+        read_auth_list(tee.value, &mut info);
+    }
+    (!info.is_empty()).then_some(info)
+}
+
 #[cfg(test)]
 mod bench {
     use super::*;

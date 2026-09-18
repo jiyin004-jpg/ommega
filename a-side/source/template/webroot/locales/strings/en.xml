@@ -149,6 +149,7 @@
     <string name="remote_config_debug_logging">Enable Debug Logging</string>
     <string name="remote_config_global_scope">Global scope (handle every caller)</string>
     <string name="remote_config_status_link">Check online B-side device IDs</string>
+    <string name="prompt_status_hint">On the status page, tap a device ID to see its boot key, lock state, boot hash and patch levels</string>
 
     <string name="remote_config_debug_logging_description">Enable detailed debug logging, recording all operations, call chains and data. Logs will be written to the config directory.</string>
 

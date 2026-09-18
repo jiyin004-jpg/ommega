@@ -49,6 +49,9 @@ pub struct DeviceEntry {
     pub machine_id: String,
     pub last_seen_ms: u64,
     pub connected: bool,
+    /// Boot state parsed from the last attestation this device produced (see
+    /// `cert::device_boot_info_from_chain`).  Carried across poll upserts.
+    pub boot: Option<crate::cert::DeviceBootInfo>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,6 +193,7 @@ impl TaskStore {
                 let mut inner = self.inner.lock().await;
                 // Register the device as connected.
                 let hb_now = Self::now_ms();
+                let known_boot = inner.devices.get(device_id).and_then(|d| d.boot.clone());
                 inner.devices.insert(
                     device_id.to_string(),
                     DeviceEntry {
@@ -197,6 +201,7 @@ impl TaskStore {
                         machine_id: machine_id.to_string(),
                         last_seen_ms: hb_now,
                         connected: true,
+                        boot: known_boot,
                     },
                 );
                 self.mark_online_sync(device_id, hb_now);
@@ -377,6 +382,28 @@ impl TaskStore {
         device_id: &str,
     ) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
+        // Collect what the boot-info parse needs before taking the task borrow:
+        // an attestation result carries the device's own record, and its boot
+        // state (boot key / lock state / boot hash / patch levels) is kept per
+        // device for the status page.  Parsed outside the borrow, no logging -
+        // the outcome is visible on the page.
+        let task_type = inner.tasks.get(task_id).map(|t| t.task_type.clone());
+        let Some(task_type) = task_type else {
+            return Err("task not found".to_string());
+        };
+        let boot = if task_type == "attest"
+            && result.get("error").is_none()
+            && !device_id.is_empty()
+        {
+            result
+                .get("cert_chain")
+                .and_then(Value::as_array)
+                .and_then(|chain| chain.first())
+                .and_then(Value::as_str)
+                .and_then(crate::cert::device_boot_info_from_chain)
+        } else {
+            None
+        };
         let Some(task) = inner.tasks.get_mut(task_id) else {
             return Err("task not found".to_string());
         };
@@ -391,6 +418,11 @@ impl TaskStore {
             inner.failed_queue.push_back((now, task_id.to_string()));
         } else {
             inner.completed_queue.push_back((now, task_id.to_string()));
+        }
+        if let Some(info) = boot {
+            if let Some(entry) = inner.devices.get_mut(device_id) {
+                entry.boot = Some(info);
+            }
         }
         Self::record_event_locked(&mut inner, device_id, 1);
         // Prune completed/failed tasks to stay within capacity/TTL limits.

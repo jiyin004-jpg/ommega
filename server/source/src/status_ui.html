@@ -73,6 +73,17 @@ td.id-cell { padding: 6px 18px; }
 .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--green); margin-right:6px; }
 .foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; }
 .foot a { color: var(--blue); text-decoration: none; }
+.id-link { color: var(--blue); cursor: pointer; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.id-link:hover { text-decoration: underline; }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.62); display: none; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
+.modal.open { display: flex; }
+.modal-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; width: 100%; max-width: 720px; max-height: 82vh; overflow: auto; }
+.modal-card h3 { font-size: 15px; margin-bottom: 12px; }
+.kv { display: grid; grid-template-columns: 132px 1fr; gap: 8px 14px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+.kv .v { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+.modal-close { margin-top: 16px; text-align: right; }
+.modal-close button { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 14px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -107,6 +118,14 @@ td.id-cell { padding: 6px 18px; }
   </div>
 </div>
 
+<div class="modal" id="bootModal" onclick="if (event.target === this) closeBoot()">
+  <div class="modal-card">
+    <h3 id="bootTitle">设备启动状态</h3>
+    <div class="kv" id="bootBody"></div>
+    <div class="modal-close"><button onclick="closeBoot()">关闭</button></div>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -124,9 +143,10 @@ async function load() {
     $('#modeBadge').textContent = '模式：' + (d.mode === 'serverbox' ? 'serverbox（服务器出证）' : 'physical（A/B 转发）');
 
     const b = d.online_b_devices || [];
+    _devices = b;
     $('#onlineBadge').textContent = '在线设备：' + b.length;
     $('#bBody').innerHTML = b.length
-      ? b.map(x => `<tr><td class="id-cell"><input class="id-box" type="text" value="${esc(x.device_id)}" readonly onclick="this.select()"></td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
+      ? b.map((x, i) => `<tr><td class="id-cell"><span class="id-link" onclick="showBoot(${i})" title="点击查看该设备的启动状态">${esc(x.device_id)}</span></td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
       : '<tr><td colspan="4" class="empty">暂无 B 端设备在线</td></tr>';
 
     const c = d.cert_devices || [];
@@ -144,6 +164,36 @@ async function load() {
     $('#sub').textContent = '加载失败：' + e.message;
   }
 }
+
+let _devices = [];
+
+const VB_STATE = { 0: '已验证 Verified', 1: '自签名 SelfSigned', 2: '未验证 Unverified', 3: '校验失败 Failed' };
+const fmtPatch = v => (v ? String(v).slice(0, 4) + '-' + String(v).slice(4, 6) : '—');
+const fmtHex = v => (v ? v : '—');
+
+function kvRow(k, v) { return `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`; }
+
+function showBoot(i) {
+  const d = _devices[i];
+  if (!d) return;
+  const b = d.boot;
+  $('#bootTitle').textContent = '设备启动状态 · ' + (d.device_id || '');
+  $('#bootBody').innerHTML = b
+    ? [
+        kvRow('机型', d.machine_id || '—'),
+        kvRow('锁定状态', b.device_locked === true ? '已锁定（locked）' : b.device_locked === false ? '未锁定（unlocked）' : '—'),
+        kvRow('启动校验', VB_STATE[b.verified_boot_state] ?? (b.verified_boot_state ?? '—')),
+        kvRow('Boot Key', fmtHex(b.boot_key)),
+        kvRow('Boot Hash', fmtHex(b.boot_hash)),
+        kvRow('系统补丁', fmtPatch(b.patch_system)),
+        kvRow('内核补丁', fmtPatch(b.patch_boot)),
+        kvRow('厂商补丁', fmtPatch(b.patch_vendor)),
+      ].join('')
+    : '<div class="k">状态</div><div class="v">该设备暂未上报启动状态（等它完成一次认证后即可显示）</div>';
+  $('#bootModal').classList.add('open');
+}
+
+function closeBoot() { $('#bootModal').classList.remove('open'); }
 
 load();
 setInterval(load, 5000);
