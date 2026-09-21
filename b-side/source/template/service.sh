@@ -24,8 +24,25 @@ update_status() {
   sed -i "s/^description=.*/description=$status/" "$prop_file" 2>/dev/null || true
 }
 
+# Resolve the device ABI.  A single module zip now carries several ABIs at
+# once, so the libs/<abi> directory must be picked by what this device actually
+# runs — falling back to directory order would hand an x86_64 tablet the arm64
+# binary.
+device_abi() {
+  local abi
+  abi="$(getprop ro.product.cpu.abi 2>/dev/null)"
+  [ -n "$abi" ] || abi="$(uname -m 2>/dev/null)"
+  case "$abi" in
+    arm64*|aarch64*) echo arm64-v8a ;;
+    x86_64*) echo x86_64 ;;
+    armeabi*|armv7*) echo armeabi-v7a ;;
+    i?86|x86) echo x86 ;;
+    *) echo "" ;;
+  esac
+}
+
 # Locate the relay binary: a user-placed override under $STATE_DIR wins,
-# then the module dir, then the module libs/<abi>/ dir.
+# then the module dir, then the module libs/<abi>/ dir for this device.
 find_module_relay() {
   if [ -f "$STATE_DIR/relay" ]; then
     echo "$STATE_DIR/relay"
@@ -35,14 +52,21 @@ find_module_relay() {
     echo "$MODDIR/relay"
     return 0
   fi
-  if [ -f "$MODDIR/libs/arm64-v8a/relay" ]; then
-    echo "$MODDIR/libs/arm64-v8a/relay"
+
+  local abi
+  abi=$(device_abi)
+  if [ -n "$abi" ] && [ -f "$MODDIR/libs/$abi/relay" ]; then
+    echo "$MODDIR/libs/$abi/relay"
     return 0
   fi
-  if [ -f "$MODDIR/libs/x86_64/relay" ]; then
-    echo "$MODDIR/libs/x86_64/relay"
-    return 0
-  fi
+
+  # getprop/uname unavailable; accept any packaged ABI rather than nothing.
+  for abi in arm64-v8a x86_64; do
+    if [ -f "$MODDIR/libs/$abi/relay" ]; then
+      echo "$MODDIR/libs/$abi/relay"
+      return 0
+    fi
+  done
   return 1
 }
 

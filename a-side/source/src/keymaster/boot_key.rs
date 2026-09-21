@@ -110,7 +110,10 @@ fn get_level_zero_key_km_and_strategy() -> Result<(KeyMintDevice, DenyLaterStrat
                 DenyLaterStrategy::EarlyBootOnly,
             ))
         } else {
-            match KeyMintDevice::get_or_none(SecurityLevel::STRONGBOX)
+            // 注意这里用的是探测真实硬件的版本：hide_strongbox 把强盒对上层藏起来
+            // 之后，level 0 key 的选源不能跟着变。不然原本选 StrongBox 的设备会
+            // 改选 TEE，super key 换源，既有 blob 就全解不开了。
+            match KeyMintDevice::get_or_none_probing_real_hardware(SecurityLevel::STRONGBOX)
                 .context(err!("Get Strongbox instance failed."))?
             {
                 Some(strongbox) if strongbox.version() >= KeyMintDevice::KEY_MASTER_V4_1 => {
@@ -296,8 +299,16 @@ impl BootLevelKeyCache {
 
         // We `get` the new boot level for the side effect of advancing the cache to a point
         // where the new boot level is present.
-        self.get_hkdf_key(new_boot_level)
-            .context(err!("Advancing cache"))?;
+        // 拒绝增长（对抗性 boot_level 值超上限）时保持现状：往下继续走 split_off 的下标会
+        // 越界 panic（写锁中毒，keystore 全瘫）；返回 Err 则会把 watch 线程整个干掉。
+        if self
+            .get_hkdf_key(new_boot_level)
+            .context(err!("Advancing cache"))?
+            .is_none()
+        {
+            error!("Refusing to advance boot level to {new_boot_level:?}; keeping current cache");
+            return Ok(());
+        }
 
         // Then we split the queue at the index of the new boot level and discard the front,
         // keeping only the keys with the current boot level or higher.
@@ -409,6 +420,16 @@ impl LegacyBootLevelKeyCache {
             return Ok(None);
         }
         let first_not_cached = self.current.0 + self.cache.len();
+        // 与 BootLevelKeyCache 相同的上限：keystore.boot_level 可被 resetprop 改成
+        // 天大的值，无界推进会在持锁状态下做上亿次 KDF、吃掉几十 GB 内存。
+        const MAX_CACHE_GROWTH: usize = 4096;
+        if boot_level.0.saturating_sub(first_not_cached) > MAX_CACHE_GROWTH {
+            error!(
+                "boot level {boot_level:?} too far ahead of legacy cache ({} entries); refusing to grow",
+                MAX_CACHE_GROWTH
+            );
+            return Ok(None);
+        }
         for _level in first_not_cached..=boot_level.0 {
             let highest_key = self.cache.back().unwrap();
             let next_key = ommega_legacy_kdf_expand(
@@ -426,8 +447,18 @@ impl LegacyBootLevelKeyCache {
         if !self.level_accessible(new_boot_level) {
             return Ok(());
         }
-        self.get_hkdf_key(new_boot_level)
-            .context(err!("Advancing legacy cache"))?;
+        // 与主缓存一致的软失败：保持现状，不禁用 legacy 缓存（那会让后续合法
+        // 的小值也不再被处理），只拒绝本次越界推进。
+        if self
+            .get_hkdf_key(new_boot_level)
+            .context(err!("Advancing legacy cache"))?
+            .is_none()
+        {
+            error!(
+                "Refusing to advance legacy boot level to {new_boot_level:?}; keeping current cache"
+            );
+            return Ok(());
+        };
         self.cache = self.cache.split_off(new_boot_level.0 - self.current.0);
         self.current = new_boot_level;
         Ok(())
@@ -440,7 +471,9 @@ impl LegacyBootLevelKeyCache {
     pub(crate) fn aes_key(&mut self, boot_level: BootLevel) -> Result<Option<ZVec>> {
         self.get_hkdf_key(boot_level)
             .context(err!("Looking up legacy KDF key"))?
-            .map(|key| ommega_legacy_kdf_expand(AES_256_KEY_LENGTH, key, BootLevelKeyCache::HKDF_AES))
+            .map(|key| {
+                ommega_legacy_kdf_expand(AES_256_KEY_LENGTH, key, BootLevelKeyCache::HKDF_AES)
+            })
             .transpose()
             .context(err!("Calling legacy KDF expand"))
     }

@@ -15,8 +15,13 @@ use crate::{
     android::hardware::security::secureclock::ISecureClock::ISecureClock,
     err,
     keymaster::{
-        apex::ModuleInfoBundle, async_task::AsyncTask, db::KeymasterDb, enforcements::Enforcements,
-        gc::Gc, keymint_device::get_keymint_wrapper, super_key::SuperKeyManager,
+        apex::ModuleInfoBundle,
+        async_task::AsyncTask,
+        db::KeymasterDb,
+        enforcements::Enforcements,
+        gc::Gc,
+        keymint_device::{get_keymint_wrapper, KeyMintDevice},
+        super_key::SuperKeyManager,
         utils::get_interface_once,
     },
     plat::property_watcher::PropertyWatcher,
@@ -39,9 +44,26 @@ static GC: LazyLock<Arc<Gc>> = LazyLock::new(|| {
     Arc::new(Gc::new_init_with(ASYNC_TASK.clone(), || {
         (
             Box::new(|uuid, blob| {
-                let security_level = uuid.to_security_level().unwrap();
+                let security_level = match uuid.to_security_level() {
+                    Some(level) => level,
+                    // DB 里这条记录的 uuid 认不出对应的 HAL（数据损坏或者旧版本
+                    // 遗留），不知道该找谁去删，直接跳过。别在这儿 unwrap。
+                    None => return Ok(()),
+                };
 
-                let km_dev = get_keymint_wrapper(security_level).unwrap();
+                let km_dev = match get_keymint_wrapper(security_level) {
+                    Ok(dev) => dev,
+                    // 这个 level 的 HAL 拿不到（硬件上没有，或者被 hide_strongbox
+                    // 藏了），绑在上面的旧 blob 也就没法再 invalidate，当"不用失效"
+                    // 放行，让 DB 行正常删掉。不能在这儿 unwrap：release 下是
+                    // panic=abort，会把整个 keymint 进程打崩；而 blob 行因为没提交
+                    // 会留到下次开机，于是每次启动都再崩一次。
+                    Err(e) if KeyMintDevice::is_hardware_type_unavailable(&e) => return Ok(()),
+                    Err(e) => {
+                        return Err(e)
+                            .context(err!("Getting KeyMint device to invalidate key blob."))
+                    }
+                };
                 let _wp = wd::watch("invalidate key closure: calling IKeyMintDevice::deleteKey");
                 km_dev
                     .delete_Key(blob)

@@ -905,7 +905,11 @@ impl IAuthorizationService for AuthorizationManager {
     ) -> BinderResult<()> {
         let _wp = wd::watch("IAuthorizationService::onDeviceLocked");
         let ctx = require_ommega_ctx(ctx, "IAuthorizationService::onDeviceLocked")?;
-        check_ommega_keystore_permission(ctx, KeystorePerm::Lock, "caller missing Lock permission")?;
+        check_ommega_keystore_permission(
+            ctx,
+            KeystorePerm::Lock,
+            "caller missing Lock permission",
+        )?;
 
         let user = AndroidUserId(user_id);
         let unlocking_sids: Vec<_> = unlocking_sids.iter().map(|sid| {
@@ -928,7 +932,11 @@ impl IAuthorizationService for AuthorizationManager {
     fn onUserStorageLocked(&self, ctx: Option<&CallerInfo>, user_id: i32) -> BinderResult<()> {
         let _wp = wd::watch("IAuthorizationService::onUserStorageLocked");
         let ctx = require_ommega_ctx(ctx, "IAuthorizationService::onUserStorageLocked")?;
-        check_ommega_keystore_permission(ctx, KeystorePerm::Lock, "caller missing Lock permission")?;
+        check_ommega_keystore_permission(
+            ctx,
+            KeystorePerm::Lock,
+            "caller missing Lock permission",
+        )?;
 
         let user = AndroidUserId(user_id);
         let op = LockStateNotification {
@@ -946,7 +954,11 @@ impl IAuthorizationService for AuthorizationManager {
     ) -> BinderResult<()> {
         let _wp = wd::watch("IAuthorizationService::onWeakUnlockMethodsExpired");
         let ctx = require_ommega_ctx(ctx, "IAuthorizationService::onWeakUnlockMethodsExpired")?;
-        check_ommega_keystore_permission(ctx, KeystorePerm::Lock, "caller missing Lock permission")?;
+        check_ommega_keystore_permission(
+            ctx,
+            KeystorePerm::Lock,
+            "caller missing Lock permission",
+        )?;
 
         let user = AndroidUserId(user_id);
         let op = LockStateNotification {
@@ -963,11 +975,12 @@ impl IAuthorizationService for AuthorizationManager {
         user_id: i32,
     ) -> BinderResult<()> {
         let _wp = wd::watch("IAuthorizationService::onNonLskfUnlockMethodsExpired");
-        let ctx = require_ommega_ctx(
+        let ctx = require_ommega_ctx(ctx, "IAuthorizationService::onNonLskfUnlockMethodsExpired")?;
+        check_ommega_keystore_permission(
             ctx,
-            "IAuthorizationService::onNonLskfUnlockMethodsExpired",
+            KeystorePerm::Lock,
+            "caller missing Lock permission",
         )?;
-        check_ommega_keystore_permission(ctx, KeystorePerm::Lock, "caller missing Lock permission")?;
 
         let user = AndroidUserId(user_id);
         let op = LockStateNotification {

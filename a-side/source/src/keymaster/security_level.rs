@@ -1477,10 +1477,7 @@ impl ISecurityLevel for OmmegaSecurityLevelWrapper {
         params: &[KeyParameter],
         authenticators: &[AuthenticatorSpec],
     ) -> Result<KeyMetadata, Status> {
-        let ctx = Some(require_ommega_ctx(
-            ctx,
-            "ISecurityLevel::importWrappedKey",
-        )?);
+        let ctx = Some(require_ommega_ctx(ctx, "ISecurityLevel::importWrappedKey")?);
         let _wp = self.watch("ISecurityLevel::importWrappedKey");
         security_level_manager::notify_operation_performed(self.security_level);
         let (latency, result) = crate::timed_call!(self.import_wrapped_key(

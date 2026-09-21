@@ -248,8 +248,10 @@ impl Fulfill {
 
     /// Parse the A-side `device_attest_context` object into AttestationParams.
     fn parse_ctx(&self, ctx: &Value, challenge: &[u8]) -> AttestationParams {
-        let mut p = AttestationParams::default();
-        p.challenge = challenge.to_vec();
+        let mut p = AttestationParams {
+            challenge: challenge.to_vec(),
+            ..Default::default()
+        };
         let b64 = |k: &str| {
             ctx.get(k)
                 .and_then(Value::as_str)
@@ -328,7 +330,7 @@ impl Fulfill {
         if let Some(v) = ctx.get("os_patch_level").and_then(Value::as_i64) {
             p.os_patch_level = Some(v);
         }
-        // KeyMint 3.0+ per-partition patch levels (tags 707/708) and the RSA
+        // KeyMint 3.0+ per-partition patch levels (tags 718/719) and the RSA
         // OAEP MGF digest (tag 203) — emitted when the caller supplies them.
         if let Some(v) = ctx.get("vendor_patch_level").and_then(Value::as_i64) {
             p.vendor_patch_level = Some(v);
@@ -416,17 +418,17 @@ impl Fulfill {
         // attestation key, so the minted attest_key must carry the SAME KeyMint
         // version the A-side reports for its local HAL. The old Django heuristic
         // (200 for att_sl < 2) triggers VINTF mismatch on KeyMint 3.0+ devices.
-        let inferred_version = ctx
-            .get("os_version")
-            .and_then(Value::as_i64)
-            .map(|osv| match osv / 10000 {
-                v if v >= 17 => 500,
-                16 => 400,
-                14 | 15 => 300,
-                13 => 300,
-                12 => 200,
-                _ => 100,
-            });
+        let inferred_version =
+            ctx.get("os_version")
+                .and_then(Value::as_i64)
+                .map(|osv| match osv / 10000 {
+                    v if v >= 17 => 500,
+                    16 => 400,
+                    14 | 15 => 300,
+                    13 => 300,
+                    12 => 200,
+                    _ => 100,
+                });
         p.attestation_version = ctx
             .get("attest_record_version")
             .and_then(Value::as_i64)
@@ -440,14 +442,22 @@ impl Fulfill {
         let vb_key = b64("verified_boot_key");
         let vb_hash = b64("verified_boot_hash");
         // Always set RootOfTrust — matches Django's default bytes(32)
-        let vb_key = vb_key.map(|mut k| {
-            if k.len() != 32 { k.resize(32, 0); }
-            k
-        }).unwrap_or_else(|| vec![0u8; 32]);
-        let vb_hash = vb_hash.map(|mut h| {
-            if h.len() != 32 { h.resize(32, 0); }
-            h
-        }).unwrap_or_else(|| vec![0u8; 32]);
+        let vb_key = vb_key
+            .map(|mut k| {
+                if k.len() != 32 {
+                    k.resize(32, 0);
+                }
+                k
+            })
+            .unwrap_or_else(|| vec![0u8; 32]);
+        let vb_hash = vb_hash
+            .map(|mut h| {
+                if h.len() != 32 {
+                    h.resize(32, 0);
+                }
+                h
+            })
+            .unwrap_or_else(|| vec![0u8; 32]);
         p.root_of_trust = Some(RootOfTrust {
             verified_boot_key: vb_key,
             device_locked: ctx
@@ -479,7 +489,9 @@ impl Fulfill {
         tracing::info!(
             "attest_and_cache: device={} alias={alias} chain_certs={} leaf_fp={}",
             identity.device_id,
-            cert::parse_chain_pem(&chain_pem).map(|d| d.len()).unwrap_or(0),
+            cert::parse_chain_pem(&chain_pem)
+                .map(|d| d.len())
+                .unwrap_or(0),
             key_fp
         );
 
@@ -637,10 +649,13 @@ impl Fulfill {
         let Some(s) = self.get_session(&alias) else {
             tracing::warn!(
                 "try_handle_sign: no session for device={device_id} alias={alias} sessions=({:?})",
-                self.inner.lock().map(|g| {
-                    let keys: Vec<String> = g.sessions.keys().cloned().collect();
-                    keys.join(",")
-                }).unwrap_or_default()
+                self.inner
+                    .lock()
+                    .map(|g| {
+                        let keys: Vec<String> = g.sessions.keys().cloned().collect();
+                        keys.join(",")
+                    })
+                    .unwrap_or_default()
             );
             // Fail fast with a clear error instead of falling through to the
             // A/B queue, which would wait up to the queue timeout for a B
@@ -798,9 +813,10 @@ impl Fulfill {
 // Pure-Rust key helpers (EC P-256 / RSA)
 // ---------------------------------------------------------------------------
 
+/// 和 `cert::KeyMaterial` 一样，RSA 私钥装箱，免得整个 enum 被它撑大。
 enum LeafKey {
     Ec(cert::EcKey),
-    Rsa(RsaPrivateKey),
+    Rsa(Box<RsaPrivateKey>),
 }
 
 fn parse_leaf_key(pem_data: &str) -> anyhow::Result<LeafKey> {
@@ -821,20 +837,19 @@ fn sign_data(key: &LeafKey, data: &[u8]) -> anyhow::Result<Vec<u8>> {
             Ok(der_sig.as_bytes().to_vec())
         }
         LeafKey::Ec(cert::EcKey::P384(sk)) => {
-            let signing_key =
-                p384::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
+            let signing_key = p384::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
             let sig: P384Signature = signing_key.sign(data);
             let der_sig = P384DerSignature::from(sig);
             Ok(der_sig.as_bytes().to_vec())
         }
         LeafKey::Ec(cert::EcKey::P521(sk)) => {
-            let signing_key =
-                p521::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
+            let signing_key = p521::ecdsa::SigningKey::from(ecdsa::SigningKey::from(sk));
             let sig: P521Signature = signing_key.sign(data);
             let der_sig = P521DerSignature::from(sig);
             Ok(der_sig.as_bytes().to_vec())
         }
         LeafKey::Rsa(rk) => {
+            let rk = rk.as_ref();
             let signing_key = RsaSigningKey::<Sha256>::new(rk.clone());
             Ok(signing_key.sign(data).to_vec())
         }
@@ -844,14 +859,14 @@ fn sign_data(key: &LeafKey, data: &[u8]) -> anyhow::Result<Vec<u8>> {
 fn decrypt_data(key: &LeafKey, data: &[u8]) -> anyhow::Result<Vec<u8>> {
     match key {
         LeafKey::Rsa(rk) => {
+            let rk = rk.as_ref();
             // Try SHA-256 MGF1 first (standard OAEP).
             let decrypting_sha256 = rsa::oaep::DecryptingKey::<Sha256>::new(rk.clone());
             if let Ok(out) = decrypting_sha256.decrypt(data) {
                 return Ok(out);
             }
             // Try SHA-1 MGF1 (matches Java's OAEPWithSHA-256AndMGF1Padding).
-            let decrypting_sha1 =
-                rsa::oaep::DecryptingKey::<Sha256, Sha1>::new(rk.clone());
+            let decrypting_sha1 = rsa::oaep::DecryptingKey::<Sha256, Sha1>::new(rk.clone());
             decrypting_sha1
                 .decrypt(data)
                 .map_err(|e| anyhow::anyhow!("rsa oaep decrypt failed (SHA-256 + SHA-1 MGF1): {e}"))

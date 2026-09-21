@@ -168,10 +168,28 @@ async function load() {
 let _devices = [];
 
 const VB_STATE = { 0: '已验证 Verified', 1: '自签名 SelfSigned', 2: '未验证 Unverified', 3: '校验失败 Failed' };
+const KNOX_STATE = { 0: '正常 Normal', 1: '异常 Abnormal', 2: '不支持 Not support', 3: '未认证 Not verified' };
 const fmtPatch = v => { if (!v) return '—'; const s = String(v); return s.length === 8 ? s.slice(0,4) + '-' + s.slice(4,6) + '-' + s.slice(6,8) : s.slice(0,4) + '-' + s.slice(4,6); };
 const fmtHex = v => (v ? v : '—');
+const fmtState = v => (v === null || v === undefined) ? '—' : (KNOX_STATE[v] ?? v);
 
 function kvRow(k, v) { return `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`; }
+
+// Samsung's Knox block; the whole section is skipped on other vendors.
+function knoxRows(k) {
+  if (!k) return [];
+  const integrity = [['TrustBoot', k.trust_boot], ['Warranty', k.warranty], ['ICD', k.icd],
+                     ['内核 Kernel', k.kernel], ['系统 System', k.system]];
+  return [
+    kvRow('Knox 挑战', k.challenge || '—'),
+    kvRow('Knox ID 认证', k.id_attest || '—'),
+    kvRow('Knox 完整性', integrity.filter(([, v]) => v !== null && v !== undefined)
+                                   .map(([n, v]) => `${n}：${fmtState(v)}`).join(' · ') || '—'),
+    kvRow('Knox 调用方认证', k.caller_auth === null && k.package_auth === null ? '—'
+        : `调用方 ${fmtState(k.caller_auth)} / 包名 ${fmtState(k.package_auth)}`),
+    kvRow('Knox 记录哈希', k.record_hash || '—'),
+  ];
+}
 
 function showBoot(i) {
   const d = _devices[i];
@@ -188,6 +206,7 @@ function showBoot(i) {
         kvRow('系统补丁', fmtPatch(b.patch_system)),
         kvRow('内核补丁', fmtPatch(b.patch_boot)),
         kvRow('厂商补丁', fmtPatch(b.patch_vendor)),
+        ...knoxRows(b.knox),
       ].join('')
     : '<div class="k">状态</div><div class="v">该设备暂未上报启动状态（等它完成一次认证后即可显示）</div>';
   $('#bootModal').classList.add('open');

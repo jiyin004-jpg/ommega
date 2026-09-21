@@ -310,7 +310,9 @@ fn denylisted_grant_readback_does_not_probe_ommega() {
         &ParsedServiceRequest::GetKeyEntry { key: grant },
         &decision,
         &caller,
-        |_, _| -> anyhow::Result<bool> { panic!("denylisted callers must not probe ommega grants") },
+        |_, _| -> anyhow::Result<bool> {
+            panic!("denylisted callers must not probe ommega grants")
+        },
     )
     .expect("denylisted grant lookup should succeed"));
 }

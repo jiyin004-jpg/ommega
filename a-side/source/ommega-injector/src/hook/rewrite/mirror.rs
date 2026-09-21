@@ -665,15 +665,19 @@ fn execute_maintenance_mirror(
                 Ok(maintenance.r#clearNamespace(Some(caller), *domain, *nspace)?)
             })
         }
-        ParsedMaintenanceRequest::EarlyBootEnded => ipc::with_ommega_maintenance_once(|maintenance| {
-            Ok(maintenance.r#earlyBootEnded(Some(caller))?)
-        }),
+        ParsedMaintenanceRequest::EarlyBootEnded => {
+            ipc::with_ommega_maintenance_once(|maintenance| {
+                Ok(maintenance.r#earlyBootEnded(Some(caller))?)
+            })
+        }
         ParsedMaintenanceRequest::MigrateKeyNamespace { .. } => {
             unreachable!("migrateKeyNamespace is handled before maintenance mirroring")
         }
-        ParsedMaintenanceRequest::DeleteAllKeys => ipc::with_ommega_maintenance_once(|maintenance| {
-            Ok(maintenance.r#deleteAllKeys(Some(caller))?)
-        }),
+        ParsedMaintenanceRequest::DeleteAllKeys => {
+            ipc::with_ommega_maintenance_once(|maintenance| {
+                Ok(maintenance.r#deleteAllKeys(Some(caller))?)
+            })
+        }
         ParsedMaintenanceRequest::OnUserPasswordChanged { user_id, password } => {
             ipc::with_ommega_maintenance_once(|maintenance| {
                 Ok(maintenance.r#onUserPasswordChanged(

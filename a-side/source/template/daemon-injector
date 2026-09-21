@@ -7,6 +7,22 @@ RESTART_FILE=$STATE_DIR/restart.injector
 PEER_RESTART_FILE=$STATE_DIR/restart.keymint
 RESTART_ALL_FILE=$STATE_DIR/restart.all
 
+# Resolve the device ABI.  One module zip now carries every ABI at once, so
+# libs/<abi> has to be picked by what this device actually runs; falling back
+# to directory order would hand an x86_64 device the arm64 binary.
+device_abi() {
+  local abi
+  abi="$(getprop ro.product.cpu.abi 2>/dev/null)"
+  [ -n "$abi" ] || abi="$(uname -m 2>/dev/null)"
+  case "$abi" in
+    arm64*|aarch64*) echo arm64-v8a ;;
+    armeabi*|armv7*) echo armeabi-v7a ;;
+    x86_64*) echo x86_64 ;;
+    i?86|x86) echo x86 ;;
+    *) echo "" ;;
+  esac
+}
+
 find_module_injector() {
   if [ -f "$STATE_DIR/ommega-inject" ]; then
     echo "$STATE_DIR/ommega-inject"
@@ -16,14 +32,21 @@ find_module_injector() {
     echo "$MODDIR/ommega-inject"
     return 0
   fi
-  if [ -f "$MODDIR/libs/arm64-v8a/ommega-inject" ]; then
-    echo "$MODDIR/libs/arm64-v8a/ommega-inject"
+
+  local abi
+  abi=$(device_abi)
+  if [ -n "$abi" ] && [ -f "$MODDIR/libs/$abi/ommega-inject" ]; then
+    echo "$MODDIR/libs/$abi/ommega-inject"
     return 0
   fi
-  if [ -f "$MODDIR/libs/x86_64/ommega-inject" ]; then
-    echo "$MODDIR/libs/x86_64/ommega-inject"
-    return 0
-  fi
+
+  # getprop/uname unavailable; accept any packaged ABI rather than nothing.
+  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+    if [ -f "$MODDIR/libs/$abi/ommega-inject" ]; then
+      echo "$MODDIR/libs/$abi/ommega-inject"
+      return 0
+    fi
+  done
   return 1
 }
 

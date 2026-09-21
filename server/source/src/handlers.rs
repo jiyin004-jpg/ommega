@@ -33,11 +33,7 @@ fn token_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("x-relay-token")
         .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("x-api-token")
-                .and_then(|v| v.to_str().ok())
-        })
+        .or_else(|| headers.get("x-api-token").and_then(|v| v.to_str().ok()))
 }
 
 pub(crate) fn client_ip(headers: &HeaderMap) -> String {
@@ -67,44 +63,51 @@ fn json_err(status: StatusCode, msg: &str) -> Response {
 }
 
 fn auth_fail() -> Response {
-    json_err(StatusCode::UNAUTHORIZED, "unauthorized: missing or invalid X-Relay-Token")
+    json_err(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized: missing or invalid X-Relay-Token",
+    )
 }
 
 /// Authenticate + rate-limit a request. Returns Ok(token) or an error response.
 ///
 /// `role`: `Some("a")` for A-side endpoints, `Some("b")` for B-side, `None` for
 /// role-agnostic endpoints (ping/health/admin status).
-fn check_auth(state: &AppState, headers: &HeaderMap, role: Option<&str>) -> Result<String, Response> {
+fn check_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    role: Option<&str>,
+) -> Result<String, Box<Response>> {
     let token = token_from_headers(headers).unwrap_or("").to_string();
     let ip = client_ip(headers);
 
     // IP allow/deny filter (A/B-side only; admin uses its own session auth).
     if !state.auth.ip_allowed(&ip) {
-        return Err(json_err(
+        return Err(Box::new(json_err(
             StatusCode::FORBIDDEN,
             "access denied by IP filter",
-        ));
+        )));
     }
 
     // Authenticate first. Failed auth counts against the (much tighter)
     // invalid-request limit, keyed by client IP.
     if !state.auth.check_token(Some(&token), role, &ip) {
         if !state.auth.allow_invalid(&ip) {
-            return Err(json_err(
+            return Err(Box::new(json_err(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many invalid requests",
-            ));
+            )));
         }
-        return Err(auth_fail());
+        return Err(Box::new(auth_fail()));
     }
 
     // Valid auth: rate limit by token (or IP when no token).
     let rl_key = if token.is_empty() { ip } else { token.clone() };
     if !state.auth.allow(&rl_key) {
-        return Err(json_err(
+        return Err(Box::new(json_err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded",
-        ));
+        )));
     }
     Ok(token)
 }
@@ -136,7 +139,11 @@ async fn try_b_device_layer(
     } else {
         tracing::info!(
             "b_layer: type={task_type} requested={} target={target} enqueued",
-            if device_id.is_empty() { "<any>" } else { device_id }
+            if device_id.is_empty() {
+                "<any>"
+            } else {
+                device_id
+            }
         );
     }
     let task_id = state
@@ -163,7 +170,10 @@ fn is_strongbox_request(body: &Value) -> bool {
     body.get("device_attest_context")
         .and_then(|c| c.get("attestation_security_level"))
         .and_then(Value::as_i64)
-        .or_else(|| body.get("attestation_security_level").and_then(Value::as_i64))
+        .or_else(|| {
+            body.get("attestation_security_level")
+                .and_then(Value::as_i64)
+        })
         .unwrap_or(1)
         == 2
 }
@@ -240,10 +250,7 @@ async fn run_layer_keybox(
     let tt = task_type.to_string();
     let b = body.clone();
     let did = device_id.to_string();
-    match tokio::task::spawn_blocking(move || {
-        try_keybox_layer_sync(&fulfill, &tt, &b, &did)
-    })
-    .await
+    match tokio::task::spawn_blocking(move || try_keybox_layer_sync(&fulfill, &tt, &b, &did)).await
     {
         Ok(v) => v,
         Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
@@ -262,14 +269,21 @@ async fn run_layer_self_signed(
     let tt = task_type.to_string();
     let b = body.clone();
     let did = device_id.to_string();
-    match tokio::task::spawn_blocking(move || {
-        try_self_signed_layer_sync(&fulfill, &tt, &b, &did)
-    })
-    .await
+    match tokio::task::spawn_blocking(move || try_self_signed_layer_sync(&fulfill, &tt, &b, &did))
+        .await
     {
         Ok(v) => v,
         Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
     }
+}
+
+/// KeyMint security level (0 = software, 1 = TEE, 2 = StrongBox) of the leaf a
+/// relay minted, parsed out of the base64 DER chain.  Smart mode uses it to tell
+/// a real StrongBox chain from one the B side silently demoted to TEE.  `None`
+/// when the chain is missing, unreadable, or carries no attestation extension.
+fn chain_attestation_security_level(v: &Value) -> Option<i64> {
+    let leaf = v.get("cert_chain")?.as_array()?.first()?.as_str()?;
+    crate::cert::attestation_security_level_from_chain(leaf)
 }
 
 /// Whether a failed B-side attest result carries a "the device HAS a StrongBox
@@ -333,10 +347,27 @@ async fn run_smart_strongbox_attest(
     if any_b_online {
         if let Some(v) = try_b_device_layer(state, task_type, body, device_id, true).await {
             if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
+                // Only a chain that is itself StrongBox-tagged counts as the B
+                // device fulfilling the StrongBox request.  The b-app relay goes
+                // through the Android Keystore API, where `setIsStrongBoxBacked`
+                // silently degrades to TEE on a device without a StrongBox, so
+                // its chain comes back honestly tagged TEE.  Accepting that here
+                // would stop the fallback short of the server keybox — which can
+                // mint a properly StrongBox-tagged chain — and the calling app
+                // would end up with a TEE attestation after asking for StrongBox.
+                let level = chain_attestation_security_level(&v);
+                if level == Some(2) {
+                    tracing::info!(
+                        "run_smart_strongbox: B real StrongBox fulfilled attest for device {device_id}"
+                    );
+                    return Json(v).into_response();
+                }
+                // Unreadable chains (`None`) take the same path: the next layer
+                // either succeeds or the A-side local keybox does, and both
+                // produce a StrongBox-tagged chain.
                 tracing::info!(
-                    "run_smart_strongbox: B real StrongBox fulfilled attest for device {device_id}"
+                    "run_smart_strongbox: B returned a non-StrongBox chain (attestation_security_level={level:?}) for device {device_id} -> continuing fallback"
                 );
-                return Json(v).into_response();
             }
             if let Some(kind) = strongbox_b_kind(&v) {
                 let msg = v
@@ -395,24 +426,33 @@ async fn run_smart_strongbox_attest(
 /// A layer "succeeds" when it returns a result without an `error` field;
 /// otherwise the next layer is tried, and only when every layer fails is an
 /// error returned.
-async fn run_a_side_task(
-    state: &AppState,
-    task_type: &str,
-    body: &Value,
-) -> Response {
-    let device_id = body.get("device_id").and_then(Value::as_str).unwrap_or("").to_string();
+async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Response {
+    let device_id = body
+        .get("device_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if device_id.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "device_id required");
     }
-    let ctx = body.get("device_attest_context").cloned().unwrap_or(Value::Null);
+    let ctx = body
+        .get("device_attest_context")
+        .cloned()
+        .unwrap_or(Value::Null);
     let ctx_short = match &ctx {
         Value::Object(m) => {
             let mut s = String::new();
             for (k, v) in m {
                 if k == "attestation_application_id" {
-                    s.push_str(&format!("{k}=<appid-len:{}> ", v.as_str().map(|x| x.len()).unwrap_or(0)));
+                    s.push_str(&format!(
+                        "{k}=<appid-len:{}> ",
+                        v.as_str().map(|x| x.len()).unwrap_or(0)
+                    ));
                 } else if k == "certificate_subject" {
-                    s.push_str(&format!("{k}=<b64-len:{}> ", v.as_str().map(|x| x.len()).unwrap_or(0)));
+                    s.push_str(&format!(
+                        "{k}=<b64-len:{}> ",
+                        v.as_str().map(|x| x.len()).unwrap_or(0)
+                    ));
                 } else {
                     s.push_str(&format!("{k}={v} "));
                 }
@@ -465,8 +505,7 @@ async fn run_a_side_task(
             _ => None,
         };
         match result {
-            Some(v)
-                if v.get("error").is_none() && !attest_chain_empty(task_type, &v) => {
+            Some(v) if v.get("error").is_none() && !attest_chain_empty(task_type, &v) => {
                 tracing::info!(
                     "run_a_side_task: type={task_type} layer={layer} result_keys={:?} has_cert_chain={}",
                     v.as_object().map(|m| m.keys().cloned().collect::<Vec<String>>()),
@@ -499,14 +538,9 @@ async fn run_a_side_task(
                     && is_strongbox_request(body)
                 {
                     let demoted = demote_to_tee(body);
-                    if let Some(dv) = try_b_device_layer(
-                        state,
-                        task_type,
-                        &demoted,
-                        &device_id,
-                        any_b_online,
-                    )
-                    .await
+                    if let Some(dv) =
+                        try_b_device_layer(state, task_type, &demoted, &device_id, any_b_online)
+                            .await
                     {
                         if dv.get("error").is_none() && !attest_chain_empty(task_type, &dv) {
                             tracing::info!(
@@ -587,7 +621,7 @@ pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) 
     // a valid A/B token so the keybox identity is not exposed to unauthenticated
     // callers.
     if let Err(r) = check_auth(&state, &headers, None) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -603,7 +637,10 @@ pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) 
         .into_response(),
         Ok(Ok(None)) => json_err(StatusCode::NOT_FOUND, "no active server identity"),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -617,7 +654,7 @@ pub async fn attest(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("a")) {
-        return r;
+        return *r;
     }
     run_a_side_task(&state, "attest", &body).await
 }
@@ -628,7 +665,7 @@ pub async fn sign(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("a")) {
-        return r;
+        return *r;
     }
     run_a_side_task(&state, "sign", &body).await
 }
@@ -639,7 +676,7 @@ pub async fn decrypt(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("a")) {
-        return r;
+        return *r;
     }
     run_a_side_task(&state, "decrypt", &body).await
 }
@@ -654,7 +691,7 @@ pub async fn client_report(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("a")) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return Json(json!({ "status": "ok", "stored": false })).into_response();
@@ -696,7 +733,10 @@ pub async fn client_report(
     match result {
         Ok(Ok(())) => Json(json!({ "status": "ok" })).into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -717,7 +757,7 @@ pub async fn b_poll(
     Query(q): Query<PollQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("b")) {
-        return r;
+        return *r;
     }
     if q.device_id.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "device_id required");
@@ -727,7 +767,10 @@ pub async fn b_poll(
     // Concurrency guard: reject if another machine is actively serving this device.
     if let Some(active) = state.store.get_active_machine_id(&q.device_id).await {
         if !machine_id.is_empty() && active != machine_id {
-            return json_err(StatusCode::CONFLICT, "another machine is already serving this device");
+            return json_err(
+                StatusCode::CONFLICT,
+                "another machine is already serving this device",
+            );
         }
     }
 
@@ -745,7 +788,11 @@ pub async fn b_poll(
             tracing::info!(
                 "b_poll: device={} machine={} claimed task={} type={} requested={}",
                 q.device_id,
-                if machine_id.is_empty() { "<none>" } else { machine_id.as_str() },
+                if machine_id.is_empty() {
+                    "<none>"
+                } else {
+                    machine_id.as_str()
+                },
                 task.task_id,
                 task.task_type,
                 // NB: inside tracing's macro `Value` resolves to tracing's own
@@ -773,7 +820,7 @@ pub async fn b_result(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("b")) {
-        return r;
+        return *r;
     }
     let task_id = body
         .get("task_id")
@@ -789,7 +836,11 @@ pub async fn b_result(
     if task_id.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "task_id required");
     }
-    match state.store.complete_task(&task_id, result, &device_id).await {
+    match state
+        .store
+        .complete_task(&task_id, result, &device_id)
+        .await
+    {
         Ok(()) => Json(json!({ "status": "ok" })).into_response(),
         Err(_) => json_err(StatusCode::NOT_FOUND, "task not found"),
     }
@@ -801,7 +852,7 @@ pub async fn b_upload_keybox_identity(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("b")) {
-        return r;
+        return *r;
     }
     let fulfill = state.fulfill.clone();
     let b = body.clone();
@@ -841,7 +892,7 @@ pub async fn b_revoke_server_identity(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers, Some("b")) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -852,12 +903,14 @@ pub async fn b_revoke_server_identity(
         .unwrap_or("")
         .to_string();
     let result =
-        tokio::task::spawn_blocking(move || db.set_device_identity_active(&device_id, false))
-            .await;
+        tokio::task::spawn_blocking(move || db.set_device_identity_active(&device_id, false)).await;
     match result {
         Ok(Ok(())) => Json(json!({ "status": "ok" })).into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -895,7 +948,7 @@ pub async fn admin_cancel_task(
 
 #[cfg(test)]
 mod strongbox_smart_tests {
-    use super::strongbox_b_kind;
+    use super::{chain_attestation_security_level, strongbox_b_kind};
     use serde_json::json;
 
     #[test]
@@ -926,7 +979,9 @@ mod strongbox_smart_tests {
             None
         );
         assert_eq!(
-            strongbox_b_kind(&json!({ "error": "strongbox not supported: strongbox generateKey failed" })),
+            strongbox_b_kind(
+                &json!({ "error": "strongbox not supported: strongbox generateKey failed" })
+            ),
             None
         );
         assert_eq!(
@@ -935,5 +990,27 @@ mod strongbox_smart_tests {
         );
         assert_eq!(strongbox_b_kind(&json!({ "cert_chain": [] })), None);
         assert_eq!(strongbox_b_kind(&json!({ "cert_chain": ["Zm9v"] })), None);
+    }
+
+    /// Smart mode only accepts a chain that is itself StrongBox-tagged, so a
+    /// chain it cannot read has to come back `None` — that is what lets the
+    /// fallback continue to the server keybox instead of handing a
+    /// possibly-demoted chain to the app.  (Reading a real chain is covered by
+    /// the cert tests; what matters here is the unreadable case.)
+    #[test]
+    fn unreadable_chains_have_no_security_level() {
+        assert_eq!(chain_attestation_security_level(&json!({})), None);
+        assert_eq!(
+            chain_attestation_security_level(&json!({ "cert_chain": [] })),
+            None
+        );
+        assert_eq!(
+            chain_attestation_security_level(&json!({ "cert_chain": "not-an-array" })),
+            None
+        );
+        assert_eq!(
+            chain_attestation_security_level(&json!({ "cert_chain": ["bm90IGRlcg=="] })),
+            None
+        );
     }
 }

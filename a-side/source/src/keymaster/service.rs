@@ -119,7 +119,7 @@ impl KeystoreService {
             }
         };
 
-        if result.strongbox_enabled {
+        if result.strongbox_available() {
             match result.register_security_level(SecurityLevel::STRONGBOX) {
                 Result::Ok(v) => v,
                 Err(e) => {
@@ -127,6 +127,10 @@ impl KeystoreService {
                     log::error!("But we ignore this error because StrongBox is optional.");
                 }
             };
+        } else if result.strongbox_enabled {
+            log::info!(
+                "StrongBox disabled by config (hide_strongbox); skipping optional security level."
+            );
         } else {
             log::info!("StrongBox KeyMint HAL is not present; skipping optional security level.");
         }
@@ -164,7 +168,7 @@ impl KeystoreService {
                 .context(err!("refreshing TEE security level after keybox change"))?;
         }
 
-        if self.strongbox_enabled {
+        if self.strongbox_available() {
             let strongbox_uuid = Uuid::from(SecurityLevel::STRONGBOX);
             let refresh_strongbox = {
                 let security_levels = self.security_levels.read().unwrap();
@@ -182,9 +186,30 @@ impl KeystoreService {
                     );
                 }
             }
+        } else if self.unregister_strongbox() {
+            log::info!(
+                "StrongBox disabled by config (hide_strongbox); unregistered STRONGBOX security level."
+            );
         }
 
         Ok(())
+    }
+
+    /// StrongBox is offered when the A-side natively exposes a StrongBox
+    /// KeyMint HAL AND the WebUI has not enabled "Declare StrongBox
+    /// unsupported" (`hide_strongbox` in the flat config). The config watcher
+    /// keeps the runtime config in sync with that file, so toggling the option
+    /// applies without a daemon restart; `get_security_level` then fails with
+    /// HARDWARE_TYPE_UNAVAILABLE, matching a device without StrongBox.
+    fn strongbox_available(&self) -> bool {
+        self.strongbox_enabled && !crate::config::strongbox_hidden()
+    }
+
+    fn unregister_strongbox(&self) -> bool {
+        let mut security_levels = self.security_levels.write().unwrap();
+        security_levels
+            .unregister(SecurityLevel::STRONGBOX)
+            .is_some()
     }
 
     fn register_security_level(&self, sec_level: SecurityLevel) -> Result<()> {
@@ -767,7 +792,10 @@ impl IKeymintService for KeystoreService {
         certificate_chain: Option<&[u8]>,
     ) -> Result<(), Status> {
         let _wp = wd::watch("IKeymintService::updateSubcomponent");
-        let ctx = Some(require_ommega_ctx(ctx, "IKeymintService::updateSubcomponent")?);
+        let ctx = Some(require_ommega_ctx(
+            ctx,
+            "IKeymintService::updateSubcomponent",
+        )?);
         self.update_subcomponent(ctx, key, public_cert, certificate_chain)
             .map_err(into_logged_binder)
     }
@@ -824,7 +852,10 @@ impl IKeymintService for KeystoreService {
         namespace: i64,
     ) -> Result<i32, Status> {
         let _wp = wd::watch("IKeymintService::getNumberOfEntries");
-        let ctx = Some(require_ommega_ctx(ctx, "IKeymintService::getNumberOfEntries")?);
+        let ctx = Some(require_ommega_ctx(
+            ctx,
+            "IKeymintService::getNumberOfEntries",
+        )?);
         self.count_num_entries(ctx, domain, namespace)
             .map_err(into_logged_binder)
     }
@@ -837,7 +868,10 @@ impl IKeymintService for KeystoreService {
         start_past_alias: Option<&str>,
     ) -> Result<Vec<KeyDescriptor>, Status> {
         let _wp = wd::watch("IKeymintService::listEntriesBatched");
-        let ctx = Some(require_ommega_ctx(ctx, "IKeymintService::listEntriesBatched")?);
+        let ctx = Some(require_ommega_ctx(
+            ctx,
+            "IKeymintService::listEntriesBatched",
+        )?);
         self.list_entries_batched(ctx, domain, namespace, start_past_alias)
             .map_err(into_logged_binder)
     }

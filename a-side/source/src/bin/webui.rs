@@ -178,6 +178,7 @@ fn load_config_json() -> Result<Value> {
             "tls_insecure": cfg.remote.tls_insecure,
             "fallback_local": cfg.remote.fallback_local,
             "debug_logging": cfg.remote.debug_logging,
+            "hide_strongbox": cfg.remote.hide_strongbox,
         }
     }))
 }
@@ -205,6 +206,9 @@ fn update_config(value: Value) -> Result<()> {
         }
         if let Some(v) = remote.get("debug_logging").and_then(Value::as_bool) {
             cfg.remote.debug_logging = v;
+        }
+        if let Some(v) = remote.get("hide_strongbox").and_then(Value::as_bool) {
+            cfg.remote.hide_strongbox = v;
         }
     }
     ommegaclient_config::save(&cfg)?;
@@ -251,6 +255,7 @@ mod ommegaclient_config {
         pub tls_insecure: bool,
         pub fallback_local: bool,
         pub debug_logging: bool,
+        pub hide_strongbox: bool,
     }
 
     /// Legacy A-side (client-a) flat `key: value` config file.
@@ -290,6 +295,9 @@ mod ommegaclient_config {
                 "debug_logging" | "debug" | "verbose" => {
                     rc.debug_logging = parse_bool(&value).unwrap_or(false);
                 }
+                "hide_strongbox" | "no_strongbox" | "hide_strongbox_keystore" => {
+                    rc.hide_strongbox = parse_bool(&value).unwrap_or(false);
+                }
                 _ => {}
             }
         }
@@ -305,6 +313,7 @@ mod ommegaclient_config {
         contents.push_str(&format!("local_hw: {}\n", cfg.remote.fallback_local));
         contents.push_str(&format!("tls_insecure: {}\n", cfg.remote.tls_insecure));
         contents.push_str(&format!("debug_logging: {}\n", cfg.remote.debug_logging));
+        contents.push_str(&format!("hide_strongbox: {}\n", cfg.remote.hide_strongbox));
         if let Some(parent) = Path::new(CONFIG_PATH).parent() {
             fs::create_dir_all(parent).ok();
         }

@@ -67,21 +67,25 @@ pub async fn card_order(State(state): State<AppState>, Json(body): Json<OrderBod
     if body.contact.trim().is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "contact is required");
     }
-    let pay_type = if body.pay_type == "wxpay" { "wxpay" } else { "alipay" };
+    let pay_type = if body.pay_type == "wxpay" {
+        "wxpay"
+    } else {
+        "alipay"
+    };
     let Some(db) = &state.db else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
     let order_id = generate_order_id();
     // Buying a year card grants 1 bonus lottery draw.
-    if let Err(e) = db.create_card_order(
-        &order_id,
-        "year",
-        &body.role,
-        YEAR_PRICE_CENTS,
-        1,
-        body.contact.trim(),
+    if let Err(e) = db.create_card_order(crate::db::NewCardOrder {
+        order_id: &order_id,
+        card_type: "year",
+        role: &body.role,
+        price_cents: YEAR_PRICE_CENTS,
+        bonus_draws: 1,
+        contact: body.contact.trim(),
         pay_type,
-    ) {
+    }) {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"));
     }
 
@@ -109,19 +113,20 @@ pub async fn card_order(State(state): State<AppState>, Json(body): Json<OrderBod
         } else {
             cfg.pay_product_name.clone()
         };
-        match crate::pay::submit_order(
-            &cfg.pay_gateway,
-            &cfg.pay_pid,
-            &cfg.pay_key,
+        let gw = crate::pay::Gateway {
+            url: &cfg.pay_gateway,
+            pid: &cfg.pay_pid,
+            key: &cfg.pay_key,
+            notify_url: &cfg.pay_notify_url,
+            return_url: &cfg.pay_return_url,
+        };
+        let order = crate::pay::OrderReq {
             pay_type,
-            &order_id,
-            &cfg.pay_notify_url,
-            &cfg.pay_return_url,
-            &name,
-            &money,
-        )
-        .await
-        {
+            out_trade_no: &order_id,
+            name: &name,
+            money: &money,
+        };
+        match crate::pay::submit_order(gw, order).await {
             Ok(pay_resp) => {
                 let _ = db.set_order_trade_no(&order_id, &pay_resp.trade_no);
                 let pay_url = if !pay_resp.url.is_empty() {
@@ -139,15 +144,13 @@ pub async fn card_order(State(state): State<AppState>, Json(body): Json<OrderBod
                         resp["pay_qr_svg"] = json!(svg);
                     }
                 }
-                resp["message"] =
-                    json!("order created; scan the QR code to complete payment");
+                resp["message"] = json!("order created; scan the QR code to complete payment");
             }
             Err(e) => {
                 tracing::warn!("pay gateway submit failed: {e}");
                 resp["pay_error"] = json!(e);
-                resp["message"] = json!(
-                    "order created; payment gateway unavailable, contact admin"
-                );
+                resp["message"] =
+                    json!("order created; payment gateway unavailable, contact admin");
             }
         }
     } else {
@@ -173,7 +176,10 @@ pub async fn card_lottery(State(state): State<AppState>, headers: HeaderMap) -> 
     // Strict daily limit: at most 3 draws per client per day.
     match db.lottery_draws_today(&client_key, &today) {
         Ok(n) if n >= 3 => {
-            return json_err(StatusCode::TOO_MANY_REQUESTS, "daily draw limit reached (3/day)");
+            return json_err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "daily draw limit reached (3/day)",
+            );
         }
         Ok(_) => {}
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
@@ -190,7 +196,10 @@ pub async fn card_lottery(State(state): State<AppState>, headers: HeaderMap) -> 
     if won {
         let token = crate::util::generate_token_string();
         if let Err(e) = db.insert_api_token(&token, "a", crate::db::WEEK_SECS, "card:week") {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("issue failed: {e}"));
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("issue failed: {e}"),
+            );
         }
         return Json(json!({
             "status": "ok",
@@ -290,7 +299,10 @@ async fn aggregate_pay_notify(
     }
     // Verify signature.
     if !crate::pay::verify_sign(&params, &cfg.pay_key) {
-        tracing::warn!("pay callback: bad signature {:?}", params.get("out_trade_no"));
+        tracing::warn!(
+            "pay callback: bad signature {:?}",
+            params.get("out_trade_no")
+        );
         return "fail".into_response();
     }
     // Check pid matches ours (if provided).
@@ -362,7 +374,10 @@ async fn legacy_pay_callback(state: AppState, body: PayCallbackBody) -> Response
             }))
             .into_response()
         }
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("deliver failed: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("deliver failed: {e}"),
+        ),
     }
 }
 

@@ -13,6 +13,7 @@ ommega-三端全量-20260822-v3/
 **/.gradle/
 **/.kotlin/
 **/app/build/
+**/source/build/
 **/node_modules/
 **/*.iml
 **/__pycache__/
@@ -53,3 +54,7 @@ b-side/source/diag*.py
 b-side/source/fix_pid.py
 b-side/source/restart_relay_for_logs.py
 b-side/source/watch_relay.py
+
+# ===== 本机调试日志 / 跑测目录 =====
+/x.txt
+server/run-dev/

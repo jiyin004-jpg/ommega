@@ -33,7 +33,10 @@ const GLOBAL_SCOPE_ALWAYS: &[&str] = &["com.google.", "com.android.vending"];
 /// before ommega ran, and a ROM service losing access to them can restart the
 /// whole system.
 const SYSTEM_PACKAGE_PREFIXES: &[&str] = &[
+    // "android" 精确匹配裸系统包；"android." 前缀不能省掉点号，否则
+    // androidx.* 这类应用包也会被 starts_with("android") 误判成 ROM 组件。
     "android",
+    "android.",
     "com.android.",
     "com.zte.",
     "com.qualcomm.",
@@ -70,9 +73,16 @@ fn is_system_package_name(package: &str) -> bool {
     {
         return false;
     }
-    SYSTEM_PACKAGE_PREFIXES
-        .iter()
-        .any(|prefix| package == *prefix || package.starts_with(prefix))
+    SYSTEM_PACKAGE_PREFIXES.iter().any(|prefix| {
+        // 带点的项才是前缀；不带点的（目前只有裸的 "android"）只能精确匹配，
+        // 否则 starts_with("android") 会把 androidx.* / androidauto.* 这些
+        // 应用包一起当 ROM 组件吞掉。
+        if prefix.ends_with('.') {
+            package.starts_with(prefix)
+        } else {
+            package == *prefix
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -130,15 +140,16 @@ pub fn evaluate(
             PackageResolution::Known(packages) => packages,
             PackageResolution::Unknown => Vec::new(),
         };
-        let explicitly_in_scope = !scoop.is_empty()
-            && packages.iter().any(|pkg| scoop.iter().any(|s| s == pkg));
+        let explicitly_in_scope =
+            !scoop.is_empty() && packages.iter().any(|pkg| scoop.iter().any(|s| s == pkg));
         let denied = packages
             .iter()
             .any(|pkg| config.deny_packages.contains(pkg));
-        let system_like = packages
-            .iter()
-            .any(|pkg| is_system_package_name(pkg));
-        let allowed = explicitly_in_scope || (!system_like && !denied);
+        let system_like = packages.iter().any(|pkg| is_system_package_name(pkg));
+        // deny_packages 是安全阀（防 com.zte.* 开机循环那类事故），必须压过
+        // scoop 显式收录——与非全局路径（denylist 先于 scope）口径一致，否则
+        // target.txt 并入 scoop 后 overlap 的 deny 条目会静默失效。
+        let allowed = !denied && (explicitly_in_scope || !system_like);
         return FilterDecision {
             allowed,
             reason: if allowed {

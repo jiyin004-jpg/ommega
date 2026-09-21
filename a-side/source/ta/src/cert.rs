@@ -60,6 +60,9 @@ pub const ATTESTATION_EXTENSION_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
 const X509_ATTESTATION_EXTENSION_OID: X509ObjectIdentifier =
     X509ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
+/// KeyMint 4.0 起的一个东西，同一份 KeyDescription，只是从 DER 换成了 CBOR。
+const X509_EAT_ATTESTATION_EXTENSION_OID: X509ObjectIdentifier =
+    X509ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.25");
 
 #[derive(Sequence)]
 struct Validity {
@@ -285,17 +288,33 @@ pub(crate) fn parse_remote_root_of_trust(
     let Some(extensions) = cert.tbs_certificate().extensions() else {
         return Ok(None);
     };
-    let Some(att_ext) = extensions
-        .iter()
-        .find(|e| e.extn_id == X509_ATTESTATION_EXTENSION_OID)
-    else {
+    let Some(att_ext) = extensions.iter().find(|e| {
+        e.extn_id == X509_ATTESTATION_EXTENSION_OID
+            || e.extn_id == X509_EAT_ATTESTATION_EXTENSION_OID
+    }) else {
         return Ok(None);
     };
+    let ext_value = att_ext.extn_value.as_bytes();
+
     // Fail-open: if the remote attestation extension can't be parsed (e.g. an
     // unusual keymint version or vendor layout), we must NOT fail attest_key
     // generation — that would break remote mode entirely. Return `Ok(None)`
     // and let the child sign_key fall back to the local ROT/version.
-    let att = match AttestationExtension::from_der(att_ext.extn_value.as_bytes()) {
+    //
+    // 远端链可能是 CBOR（EAT）形式的，那个按 DER 解不开，先按载荷首字节
+    // 分派。少了这一支的话，远端链的 ROT/版本会被默默丢掉，子证书退回本地
+    // 值，和 attestation key 对不上，会被当成篡改。
+    if kmr_common::eat::is_cbor_attestation_extension(ext_value) {
+        return match kmr_common::eat::root_of_trust(ext_value) {
+            Ok(rot) => Ok(rot),
+            Err(e) => {
+                log::warn!("remote EAT attestation extension unparsable, ignoring ROT: {e:?}");
+                Ok(None)
+            }
+        };
+    }
+
+    let att = match AttestationExtension::from_der(ext_value) {
         Ok(att) => att,
         Err(e) => {
             log::warn!("remote attestation extension unparsable, ignoring ROT: {e:?}");

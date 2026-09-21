@@ -29,6 +29,14 @@ object KeystoreHelper {
     private const val DEFAULT_RSA_KEY_SIZE = 2048
     private val DEFAULT_RSA_EXPONENT = BigInteger.valueOf(65537)
 
+    // b-side 二进制 relay 上报「有 StrongBox HAL 但用不了」时用的两句话
+    // （relay.rs）。server 的 Smart 模式靠子串匹配这两句决定把错误如实回传给
+    // 调用方（而不是回退到服务端 keybox），所以本端报同样句子，两条 relay 对
+    // server 才是等价的。
+    private const val REASON_KEYS_NOT_PROVISIONED =
+        "HAL exists but attestation keys not provisioned (factory provisioning issue)"
+    private const val REASON_HW_UNAVAILABLE = "HAL exists but hardware type unavailable"
+
     // ---------------------------------------------------------------------
     // KeyMint AIDL enum -> Android Keystore Java constant mapping
     //
@@ -233,14 +241,20 @@ object KeystoreHelper {
                 .apply { initialize(keyGenSpec) }
                 .generateKeyPair()
 
-            // StrongBox 请求：复核实际安全级别，仅记录日志用于诊断 ——
-            // 若原生静默降级为 TEE（无 StrongBox 芯片时的标准行为），链上已
-            // 如实标记 TRUSTED_ENVIRONMENT，与真实设备表现一致，照常放行；
-            // 密钥无需删除，后续 sign/decrypt 由 Android Keystore 自动路由到
-            // 密钥实际所在的安全层（StrongBox 或 TEE）。
-            if (spec.securityLevel == 2 && !verifyStrongBoxBacked(alias)) {
-                Log.w(TAG, "attest: StrongBox requested but key was minted outside StrongBox " +
-                        "(standard silent fallback to TEE, alias=$alias)")
+            // StrongBox 请求：设备声明了 StrongBox 却让 key 落在别处，属于
+            // 「有 HAL 但不可用」，如实上报 —— 跟 b-side 二进制 relay 直连 HAL
+            // 拿到的 -68 同一个语义，由 server 的 Smart 模式决定是 surface 给
+            // 调用方还是回退服务端 keybox。
+            //
+            // 设备本来就没有 StrongBox（或 API < 31 压根判断不了实际落在哪层）
+            // 时不报：setIsStrongBoxBacked 静默降级 TEE 是官方行为，链上如实
+            // 标记 TRUSTED_ENVIRONMENT，与真实设备表现一致；这条 TEE 链会被
+            // server 的安全级别校验挡下来，不会冒充 StrongBox 成交。
+            if (spec.securityLevel == 2 && isStrongBoxBacked(alias) == false &&
+                declaresStrongBox(context)
+            ) {
+                Log.w(TAG, "attest: StrongBox requested but key landed outside StrongBox ($alias)")
+                return JSONObject().put("error", "strongbox not supported: $REASON_HW_UNAVAILABLE")
             }
 
             ks.load(null)
@@ -253,7 +267,11 @@ object KeystoreHelper {
             }
         } catch (e: Exception) {
             Log.e(TAG, "attest failed alias=$alias", e)
-            JSONObject().put("error", e.message ?: "attest error")
+            val reason = if (spec.securityLevel == 2) strongboxRefusalReason(e) else null
+            JSONObject().put(
+                "error",
+                reason?.let { "strongbox not supported: $it" } ?: (e.message ?: "attest error"),
+            )
         }
     }
 
@@ -346,7 +364,7 @@ object KeystoreHelper {
      * API < 28 无法表达该要求，返回 null。
      * 注意：官方行为是无 StrongBox 时静默回退 TEE（不抛异常），这是 Android
      * 标准降级行为，链上会如实标记 TRUSTED_ENVIRONMENT，由
-     * [verifyStrongBoxBacked] 在生成后复核并记录（诊断用途）。
+     * [isStrongBoxBacked] 在生成后复核。
      */
     private fun applyStrongBoxBacked(builder: KeyGenParameterSpec.Builder): KeyGenParameterSpec.Builder? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
@@ -360,24 +378,68 @@ object KeystoreHelper {
     }
 
     /**
-     * 复核 alias 对应的私钥实际受保护的安全级别（诊断用途）。
-     * 仅 API 31+ 的 KeyInfo.getSecurityLevel() 能精确区分 STRONGBOX /
-     * TRUSTED_ENVIRONMENT；更早版本没有任何公共 API 能证明密钥位于 StrongBox
-     * （isInsideSecureHardware 对 TEE 密钥同样返回 true），一律视为不在
-     * StrongBox 返回 false。返回 false 仅表示"原生静默降级为 TEE"，不再拒绝
-     * —— 这是 Android 标准行为，链上如实标记 TRUSTED_ENVIRONMENT。
+     * alias 的私钥到底落在哪一层：true = 确定在 StrongBox，false = 确定不在，
+     * null = 这个 API 级别判断不了。
+     *
+     * 只有 API 31+ 的 KeyInfo.getSecurityLevel() 能区分 StrongBox 与 TEE；
+     * 更早版本没有任何公共 API 能证明密钥位于 StrongBox（isInsideSecureHardware
+     * 对 TEE 密钥同样返回 true），所以返回 null 而不是 false —— 把「判断不了」
+     * 当成「不在 StrongBox」会把一台真有 StrongBox 的老设备谎报成不可用。
      */
-    private fun verifyStrongBoxBacked(alias: String): Boolean {
+    private fun isStrongBoxBacked(alias: String): Boolean? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
         return try {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
             val ks = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
-            val privateKey = ks.getKey(alias, null) ?: return false
+            val privateKey = ks.getKey(alias, null) ?: return null
             val kf = KeyFactory.getInstance(privateKey.algorithm, KEYSTORE_PROVIDER)
             val keyInfo = kf.getKeySpec(privateKey, KeyInfo::class.java)
             keyInfo.securityLevel == KeyProperties.SECURITY_LEVEL_STRONGBOX
         } catch (e: Exception) {
-            Log.e(TAG, "verifyStrongBoxBacked failed alias=$alias", e)
-            false
+            Log.e(TAG, "isStrongBoxBacked failed alias=$alias", e)
+            null
         }
+    }
+
+    /**
+     * 设备是否在 PackageManager 里声明了 StrongBox
+     * (`android.hardware.strongbox_keystore`，API 28+ 的 feature)。
+     *
+     * 没声明的设备上 setIsStrongBoxBacked 静默降级 TEE 是官方行为，本端照旧
+     * 放行（与真实设备一致）；声明了却拿不到才是「有 HAL 但不可用」。
+     */
+    private fun declaresStrongBox(context: Context): Boolean =
+        context.packageManager.hasSystemFeature("android.hardware.strongbox_keystore")
+
+    /**
+     * 把 Android 给的 KeyMint 错误码翻成 b-side relay 那套固定文本，好让 server
+     * 的 Smart 模式把错误如实回传给调用方；挖不出可识别的错误时返回 null，调用
+     * 方继续用原始 e.message。
+     *
+     * KeyStoreException.getErrorCode() 能拿到未经裁剪的 KeyMint 错误码
+     * (-68 = hardware type unavailable, -74 = attestation keys not provisioned)，
+     * 但它是 @hide（@TestApi）的 public 方法，只能反射——SDK 里没这个符号。
+     * 部分 ROM 也可能直接抛 android.security.keystore.StrongBoxUnavailableException。
+     * framework 会把原始异常包一层，所以沿 cause 链找。
+     */
+    private fun strongboxRefusalReason(e: Throwable): String? {
+        var cause: Throwable? = e
+        var depth = 0
+        while (cause != null && depth++ < 8) {
+            when (cause.javaClass.name) {
+                "android.security.keystore.StrongBoxUnavailableException" ->
+                    return REASON_HW_UNAVAILABLE
+                "android.security.KeyStoreException" -> {
+                    val code = runCatching {
+                        cause.javaClass.getMethod("getErrorCode").invoke(cause) as? Int
+                    }.getOrNull()
+                    when (code) {
+                        -74 -> return REASON_KEYS_NOT_PROVISIONED
+                        -68 -> return REASON_HW_UNAVAILABLE
+                    }
+                }
+            }
+            cause = cause.cause
+        }
+        return null
     }
 }

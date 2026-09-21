@@ -64,7 +64,7 @@ use crate::keymaster::{
     error::{Error as KsError, ErrorCode, ResponseCode},
     super_key::SuperKeyType,
 };
-use crate::plat::attestation::{parse_tlv, ANDROID_ATTESTATION_OID};
+use crate::plat::attestation::{parse_tlv, ANDROID_ATTESTATION_OID, ANDROID_EAT_ATTESTATION_OID};
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use rand::random;
@@ -1188,13 +1188,17 @@ impl KeystoreDB {
             let Ok(leaf_cert) = Certificate::from_der(&leaf_cert) else {
                 return Ok(());
             };
+            // EAT（2.1.25）链的密钥同样要打回收元数据，否则换 keybox 时这些
+            // 旧绑定永远不被 retire（元数据是 retire_stale_keybox_bound_entries
+            // 的唯一判据）。
             if !leaf_cert
                 .tbs_certificate()
                 .extensions()
                 .is_some_and(|extensions| {
-                    extensions
-                        .iter()
-                        .any(|e| e.extn_id == ANDROID_ATTESTATION_OID)
+                    extensions.iter().any(|e| {
+                        e.extn_id == ANDROID_ATTESTATION_OID
+                            || e.extn_id == ANDROID_EAT_ATTESTATION_OID
+                    })
                 })
             {
                 return Ok(());
@@ -4120,13 +4124,14 @@ mod tests {
             ..Default::default()
         };
         let password = Password::from(&b"fixed synthetic password"[..]);
-        let super_key = SuperKeyManager::extract_super_key_from_key_entry_with_ommega_compatibility(
-            SuperEncryptionAlgorithm::Aes256Gcm,
-            entry,
-            &password,
-            None,
-        )
-        .unwrap();
+        let super_key =
+            SuperKeyManager::extract_super_key_from_key_entry_with_ommega_compatibility(
+                SuperEncryptionAlgorithm::Aes256Gcm,
+                entry,
+                &password,
+                None,
+            )
+            .unwrap();
 
         let (ciphertext, iv, tag) = aes_gcm_encrypt(b"probe", &[0x42; 32]).unwrap();
         assert_eq!(

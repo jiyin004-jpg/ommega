@@ -210,10 +210,11 @@ impl Config {
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_SECRET_KEY") {
             cfg.secret_key = v;
         }
-        cfg.keybox_refresh_enabled =
-            env_bool("KEYBOX_REFRESH_ENABLED", cfg.keybox_refresh_enabled);
-        cfg.keybox_refresh_interval_secs =
-            env_u64("KEYBOX_REFRESH_INTERVAL_SEC", cfg.keybox_refresh_interval_secs);
+        cfg.keybox_refresh_enabled = env_bool("KEYBOX_REFRESH_ENABLED", cfg.keybox_refresh_enabled);
+        cfg.keybox_refresh_interval_secs = env_u64(
+            "KEYBOX_REFRESH_INTERVAL_SEC",
+            cfg.keybox_refresh_interval_secs,
+        );
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_ATTEST_SOURCE") {
             cfg.attest_source = v;
         }

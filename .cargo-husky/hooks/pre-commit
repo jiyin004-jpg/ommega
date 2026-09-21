@@ -1,0 +1,31 @@
+#!/bin/sh
+# 提交前跑 Rust 格式检查。
+# a-side 和 server 是两个独立工作区，谁有改动的 .rs 就查谁。
+# AGENTS.md 里那份完整门禁（clippy + Android 目标编译 + 真机跑测试）太慢，
+# 留给发版流程，这里只挡格式漂移。
+root=$(git rev-parse --show-toplevel)
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+failed=""
+for ws in a-side/source server/source; do
+    case "$staged" in
+        *"$ws/"*) ;;
+        *) continue ;;
+    esac
+    command -v cargo >/dev/null 2>&1 || continue
+    [ -f "$root/$ws/Cargo.toml" ] || continue
+    echo "fmt 检查：$ws"
+    if ! cargo fmt --manifest-path "$root/$ws/Cargo.toml" --all -- --check; then
+        failed="$failed $ws"
+    fi
+done
+
+if [ -n "$failed" ]; then
+    echo ""
+    echo "格式没过：$failed"
+    echo "在对应工作区里跑 cargo fmt --all 修一下再提交。"
+    exit 1
+fi

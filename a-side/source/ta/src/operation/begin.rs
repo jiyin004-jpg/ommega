@@ -597,12 +597,7 @@ fn remote_sign_algorithm(params: &[KeyParam]) -> Result<String, Error> {
                 Digest::Sha256 => "SHA256withECDSA",
                 Digest::Sha384 => "SHA384withECDSA",
                 Digest::Sha512 => "SHA512withECDSA",
-                _ => {
-                    return Err(km_err!(
-                        UnsupportedDigest,
-                        "remote EC sign for {digest:?}"
-                    ))
-                }
+                _ => return Err(km_err!(UnsupportedDigest, "remote EC sign for {digest:?}")),
             };
             Ok(name.to_string())
         }
@@ -643,7 +638,14 @@ fn remote_decrypt_algorithm(params: &[KeyParam]) -> Result<String, Error> {
             };
             Ok(format!("{name}{suffix}"))
         }
-        _ => Ok("RSA/ECB/PKCS1Padding".to_string()),
+        PaddingMode::RsaPkcs115Encrypt => Ok("RSA/ECB/PKCS1Padding".to_string()),
+        // 与本地 rsa_decryption_mode 同语义：NoPadding 裁 RSA 运算，不能用
+        // PKCS#1 去填充静默替换（那会把解密结果直接改错）。
+        PaddingMode::None => Ok("RSA/ECB/NoPadding".to_string()),
+        _ => Err(km_err!(
+            UnsupportedPaddingMode,
+            "padding mode {padding:?} not supported for remote RSA decrypt"
+        )),
     }
 }
 

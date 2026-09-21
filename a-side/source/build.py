@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import zipfile
 
 try:
@@ -23,6 +24,19 @@ except ModuleNotFoundError:
 
 REPO_ROOT = Path(__file__).resolve().parent
 TARGET_ROOT = REPO_ROOT / "target"
+
+
+def ensure_cargo_config() -> None:
+    """`.cargo/config.toml` 不入库，干净 clone 里没有它，cargo 不知道 Android
+    目标该用哪个链接器，到链接阶段才报一堆错。缺了就地生成一份。"""
+    cargo_config = REPO_ROOT / ".cargo" / "config.toml"
+    if cargo_config.exists():
+        return
+    script = REPO_ROOT / "scripts" / "setup_cargo_config.py"
+    if not script.exists():
+        return
+    print("Generating .cargo/config.toml ...")
+    subprocess.run([sys.executable, os.fspath(script)], cwd=REPO_ROOT, check=True)
 DEFAULT_PLATFORM = 24
 
 ABI_TO_TARGET = {
@@ -189,7 +203,7 @@ def verify_pathmask_kos() -> None:
     print(f"Verified {len(PATHMASK_KO_SHA256)} pathmask kernel modules")
 
 
-def copy_template_files(stage_dir: Path, abi: str) -> None:
+def copy_template_files(stage_dir: Path, abi: str | None = None) -> None:
     template_dir = REPO_ROOT / "template"
     if not template_dir.exists():
         raise FileNotFoundError("Template directory not found")
@@ -198,7 +212,9 @@ def copy_template_files(stage_dir: Path, abi: str) -> None:
     if missing:
         raise FileNotFoundError(f"Template is missing required file(s): {', '.join(missing)}")
 
-    excluded = set(TEMPLATE_ABI_EXCLUDES.get(abi, ()))
+    # abi=None means a combined multi-ABI package: nothing may be excluded,
+    # since any of the ABIs inside might need it at install time.
+    excluded = set(TEMPLATE_ABI_EXCLUDES.get(abi, ())) if abi else set()
     print(f"Copying template files into {stage_dir}...")
     for item in template_dir.iterdir():
         if item.name in excluded:
@@ -226,16 +242,25 @@ def normalize_module_text_files(stage_dir: Path) -> None:
         write_text_lf(path, content)
 
 
-def configure_template_for_abi(stage_dir: Path, abi: str) -> None:
+def configure_template_for_abis(stage_dir: Path, abis: list[str]) -> None:
+    """Rewrite SUPPORTED_ABIS in the staged customize.sh to exactly the set of
+    ABIs the package carries, so the installer accepts a device whose $ARCH is
+    any of them."""
     customize_path = stage_dir / "customize.sh"
     if not customize_path.exists():
         raise FileNotFoundError(f"customize.sh not found at {customize_path}")
 
-    supported_arch = ABI_TO_MODULE_ARCHES[abi]
+    arches: list[str] = []
+    for abi in abis:
+        for arch in ABI_TO_MODULE_ARCHES[abi].split():
+            if arch not in arches:
+                arches.append(arch)
+    supported_arch = " ".join(arches)
+
     content = customize_path.read_text(encoding="utf-8")
     content = content.replace('SUPPORTED_ABIS="arm64 x64"', f'SUPPORTED_ABIS="{supported_arch}"')
     write_text_lf(customize_path, content)
-    print(f"Updated customize.sh supported ABI to {supported_arch}")
+    print(f"Updated customize.sh supported ABIs to {supported_arch}")
 
 
 def modify_module_prop(stage_dir: Path, version: str, git_count: str, git_hash: str) -> None:
@@ -274,14 +299,13 @@ def generate_hash_files(stage_dir: Path) -> None:
         generate_hash_for_file(item)
 
 
-def delete_old_zips(release: bool, selected_abis: list[str]) -> None:
+def delete_old_zips(release: bool) -> None:
+    """Remove every previously built zip of this build type, whatever its
+    naming (with or without an ABI tag) or which ABIs it carried."""
     build_type = "release" if release else "debug"
-    old_zips: list[str] = []
-    for abi in selected_abis:
-        pattern = TARGET_ROOT / f"ommega-a-{build_type}-{abi}-*.zip"
-        old_zips.extend(glob.glob(os.fspath(pattern)))
+    old_zips = glob.glob(os.fspath(TARGET_ROOT / f"ommega-a-{build_type}-*.zip"))
     if not old_zips:
-        print(f"No old zip files found for build type {build_type} and ABIs {selected_abis}")
+        print(f"No old zip files found for build type {build_type}")
         return
 
     print(f"Found {len(old_zips)} old zip file(s) to delete:")
@@ -295,11 +319,12 @@ def create_zip_package(
     stage_dir: Path,
     version: str,
     git_hash: str,
-    abi: str,
+    abi: str | None,
     release: bool,
 ) -> Path:
     build_type = "release" if release else "debug"
-    zip_path = TARGET_ROOT / f"ommega-a-{build_type}-{abi}-{version}-{git_hash}.zip"
+    abi_suffix = f"-{abi}" if abi else ""
+    zip_path = TARGET_ROOT / f"ommega-a-{build_type}{abi_suffix}-{version}-{git_hash}.zip"
     print(f"Creating zip package: {zip_path}")
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -344,7 +369,7 @@ def build_package_for_abi(
             verify_pathmask_kos()
         copy_template_files(stage_dir, abi)
         normalize_module_text_files(stage_dir)
-        configure_template_for_abi(stage_dir, abi)
+        configure_template_for_abis(stage_dir, [abi])
         for spec in BINARY_SPECS:
             copy_binary(
                 built_binaries[spec["output_name"]],
@@ -368,6 +393,69 @@ def build_package_for_abi(
             shutil.rmtree(stage_dir)
 
 
+def build_combined_package(
+    *,
+    abis: list[str],
+    release: bool,
+    platform: int,
+    version: str,
+    git_count: str,
+    git_hash: str,
+) -> Path:
+    """Build every selected ABI into a single module zip.
+
+    customize.sh already picks libs/<abi> (and the matching pathmask .ko set) at
+    install time, so a multi-ABI package is the union of every ABI's binaries in
+    one stage directory plus a SUPPORTED_ABIS line listing all of them.
+    """
+    stage_dir = TARGET_ROOT / "temp" / "combined"
+    _ = platform
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        built: dict[str, dict[str, Path]] = {}
+        for abi in abis:
+            built[abi] = {}
+            for spec in BINARY_SPECS:
+                built[abi][spec["output_name"]] = build_binary(
+                    abi=abi,
+                    target=ABI_TO_TARGET[abi],
+                    release=release,
+                    package=spec["package"],
+                    bin_name=spec["bin"],
+                )
+
+        if any(abi in ("arm64-v8a", "arm64") for abi in abis):
+            verify_pathmask_kos()
+        copy_template_files(stage_dir)
+        normalize_module_text_files(stage_dir)
+        configure_template_for_abis(stage_dir, abis)
+        for abi in abis:
+            for spec in BINARY_SPECS:
+                copy_binary(
+                    built[abi][spec["output_name"]],
+                    spec["output_name"],
+                    abi,
+                    stage_dir,
+                )
+
+        modify_module_prop(stage_dir, version, git_count, git_hash)
+        normalize_module_text_files(stage_dir)
+        generate_hash_files(stage_dir)
+        return create_zip_package(
+            stage_dir=stage_dir,
+            version=version,
+            git_hash=git_hash,
+            abi=None,
+            release=release,
+        )
+    finally:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build ommega-a Magisk packages for Android")
     parser.add_argument("--release", action="store_true", help="Build in release mode")
@@ -377,7 +465,13 @@ def main() -> None:
         dest="abis",
         action="append",
         choices=sorted(ABI_TO_TARGET),
-        help="Build only the selected Android ABI(s). Defaults to arm64-v8a.",
+        help="Restrict the package to the selected Android ABI(s). "
+        "Defaults to every supported ABI in a single zip.",
+    )
+    parser.add_argument(
+        "--split",
+        action="store_true",
+        help="Emit one zip per ABI instead of a single multi-ABI package.",
     )
     parser.add_argument(
         "--platform",
@@ -390,21 +484,35 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    ensure_cargo_config()
+
     version = get_version_from_cargo_toml()
     git_count = get_git_commit_count()
     git_hash = get_git_commit_hash()
-    selected_abis = args.abis or ["arm64-v8a"]
+    selected_abis = args.abis or sorted(ABI_TO_TARGET)
 
     print(f"Building ommega-a version {version} (commit {git_count}, hash {git_hash})")
     print(f"Build mode: {'Release' if args.release else 'Debug'}")
     print(f"Target ABIs: {', '.join(selected_abis)}")
 
-    delete_old_zips(args.release, selected_abis)
+    delete_old_zips(args.release)
     built_packages = []
-    for abi in selected_abis:
+    if args.split:
+        for abi in selected_abis:
+            built_packages.append(
+                build_package_for_abi(
+                    abi=abi,
+                    release=args.release,
+                    platform=args.platform,
+                    version=version,
+                    git_count=git_count,
+                    git_hash=git_hash,
+                )
+            )
+    else:
         built_packages.append(
-            build_package_for_abi(
-                abi=abi,
+            build_combined_package(
+                abis=selected_abis,
                 release=args.release,
                 platform=args.platform,
                 version=version,

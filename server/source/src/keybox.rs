@@ -58,7 +58,10 @@ pub fn parse_keybox_xml_all(xml: &str) -> anyhow::Result<Vec<KeyboxData>> {
         .to_string();
 
     let mut out: Vec<KeyboxData> = Vec::new();
-    for key in keybox.children().filter(|n| n.is_element() && n.tag_name().name() == "Key") {
+    for key in keybox
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Key")
+    {
         let algorithm = key
             .attribute("algorithm")
             .map(|a| {
@@ -96,7 +99,10 @@ pub fn parse_keybox_xml_all(xml: &str) -> anyhow::Result<Vec<KeyboxData>> {
 }
 
 /// Depth-first search for the first element whose name matches.
-fn find_descendant<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+fn find_descendant<'a, 'i>(
+    node: roxmltree::Node<'a, 'i>,
+    name: &str,
+) -> Option<roxmltree::Node<'a, 'i>> {
     if node.is_element() && node.tag_name().name() == name {
         return Some(node);
     }
@@ -123,7 +129,9 @@ fn extract_certificate_chain(key: roxmltree::Node) -> String {
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == "CertificateChain")
     {
-        for cert in chain.children().filter(|n| n.is_element() && n.tag_name().name() == "Certificate")
+        for cert in chain
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "Certificate")
         {
             if let Some(text) = cert.text() {
                 out.push_str(&clean_pem(text));
@@ -141,5 +149,3 @@ fn count_certificates(pem_chain: &str) -> usize {
 pub fn cert_count(pem_chain: &str) -> usize {
     pem::parse_many(pem_chain).map(|v| v.len()).unwrap_or(0)
 }
-
-

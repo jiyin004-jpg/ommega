@@ -474,38 +474,39 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         };
 
         let method = request.method();
-        let allow_unknown_ommega_route = match should_allow_ommega_grant_security_level_request_with_probe(
-            &request,
-            &decision,
-            &caller,
-            probe_ommega_grant,
-        ) {
-            Ok(allow) => allow,
-            Err(error) => {
-                warn!(
+        let allow_unknown_ommega_route =
+            match should_allow_ommega_grant_security_level_request_with_probe(
+                &request,
+                &decision,
+                &caller,
+                probe_ommega_grant,
+            ) {
+                Ok(allow) => allow,
+                Err(error) => {
+                    warn!(
                     "event=decision ommega grant ownership probe failed for uid={} pid={}: {:#}; returning SYSTEM_ERROR without executing System",
                     caller.uid, caller.pid, error
                 );
-                block_system_request(tr);
-                if expects_reply {
-                    let pending = PendingSecurityLevelCall {
-                        request,
-                        caller,
-                        packages: decision.packages,
-                        route: RouteTarget::Ommega,
-                        security_level: target_info.security_level,
-                    };
-                    replace_top_pending(
-                        connection,
-                        PendingCall::PrecomputedSecurityLevel(
-                            pending,
-                            Box::new(Some(synthetic_fallback_reply())),
-                        ),
-                    );
+                    block_system_request(tr);
+                    if expects_reply {
+                        let pending = PendingSecurityLevelCall {
+                            request,
+                            caller,
+                            packages: decision.packages,
+                            route: RouteTarget::Ommega,
+                            security_level: target_info.security_level,
+                        };
+                        replace_top_pending(
+                            connection,
+                            PendingCall::PrecomputedSecurityLevel(
+                                pending,
+                                Box::new(Some(synthetic_fallback_reply())),
+                            ),
+                        );
+                    }
+                    return true;
                 }
-                return true;
-            }
-        };
+            };
         // Keystore2 shares each security-level Binder between getSecurityLevel and getKeyEntry.
         let scoop_enabled = security_level_scoop_enabled(&cfg.intercept);
         let route = if allow_unknown_ommega_route || decision.allowed && scoop_enabled {

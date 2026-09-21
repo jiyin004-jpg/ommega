@@ -80,33 +80,50 @@ pub struct OrderResp {
     pub url: String,
 }
 
+/// 网关侧的配置：下单地址、商户凭证、回调地址。
+pub struct Gateway<'a> {
+    pub url: &'a str,
+    pub pid: &'a str,
+    pub key: &'a str,
+    /// 异步通知地址（本服务 /api/card/pay_callback/）
+    pub notify_url: &'a str,
+    /// 支付完成后同步跳转地址
+    pub return_url: &'a str,
+}
+
+/// 一笔订单自己的业务参数。
+pub struct OrderReq<'a> {
+    /// 支付方式，"alipay" | "wxpay"
+    pub pay_type: &'a str,
+    /// 商户订单号
+    pub out_trade_no: &'a str,
+    /// 商品名
+    pub name: &'a str,
+    /// 金额，元，两位小数
+    pub money: &'a str,
+}
+
 /// 调用聚合支付平台创建支付单。
-pub async fn submit_order(
-    gateway: &str,
-    pid: &str,
-    key: &str,
-    pay_type: &str,
-    out_trade_no: &str,
-    notify_url: &str,
-    return_url: &str,
-    name: &str,
-    money: &str,
-) -> Result<OrderResp, String> {
+pub async fn submit_order(gw: Gateway<'_>, order: OrderReq<'_>) -> Result<OrderResp, String> {
     let mut params = BTreeMap::new();
-    params.insert("pid".to_string(), pid.to_string());
-    params.insert("type".to_string(), pay_type.to_string());
-    params.insert("out_trade_no".to_string(), out_trade_no.to_string());
-    params.insert("notify_url".to_string(), notify_url.to_string());
-    params.insert("return_url".to_string(), return_url.to_string());
-    params.insert("name".to_string(), name.to_string());
-    params.insert("money".to_string(), money.to_string());
-    let sign = sign(&params, key);
+    params.insert("pid".to_string(), gw.pid.to_string());
+    params.insert("type".to_string(), order.pay_type.to_string());
+    params.insert("out_trade_no".to_string(), order.out_trade_no.to_string());
+    params.insert("notify_url".to_string(), gw.notify_url.to_string());
+    params.insert("return_url".to_string(), gw.return_url.to_string());
+    params.insert("name".to_string(), order.name.to_string());
+    params.insert("money".to_string(), order.money.to_string());
+    let sign = sign(&params, gw.key);
     params.insert("sign".to_string(), sign);
     params.insert("sign_type".to_string(), "MD5".to_string());
 
-    let client = reqwest::Client::new();
+    // 总超时兑底：网关挂起时不能让下单接口无限阻塞（tokio 任务泄漏式挂起）
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))?;
     let resp = client
-        .post(gateway)
+        .post(gw.url)
         .form(&params)
         .send()
         .await
@@ -116,8 +133,7 @@ pub async fn submit_order(
         .await
         .map_err(|e| format!("读取网关响应失败: {e}"))?;
 
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|_| format!("网关响应格式错误: {text}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| format!("网关响应格式错误: {text}"))?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
     if code != 1 {
         let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");

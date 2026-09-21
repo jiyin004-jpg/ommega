@@ -5,18 +5,17 @@
 //!     propagates to the next fulfilment layer exactly as before (server
 //!     three-layer fallback → A-side local keybox).
 //!   - Smart: StrongBox-fidelity orchestration. A StrongBox attestation is
-//!     served by the strongest honest source available, in this order:
-//!       · the B device's real StrongBox HAL — when it works, its chain is
-//!         returned as-is;
-//!       · when the B device reports a *present-but-broken* StrongBox
-//!         (attestation keys not provisioned / hardware type unavailable),
-//!         that error is surfaced verbatim to the A-side app instead of being
-//!         masked by a demotion or by the server's stored keybox;
-//!       · when the B device has *no* StrongBox, the server's stored
-//!         per-device keybox identity mints the (StrongBox-tagged) chain;
-//!       · when the server has no stored identity either, the request fails so
-//!         the A-side falls back to its local software keybox — never a
-//!         self-signed StrongBox chain.
+//!     served by the strongest honest source available, in this order. First
+//!     the B device's real StrongBox HAL — when it works, its chain is
+//!     returned as-is. Then, when the B device reports a *present-but-broken*
+//!     StrongBox (attestation keys not provisioned / hardware type
+//!     unavailable), that error is surfaced verbatim to the A-side app instead
+//!     of being masked by a demotion or by the server's stored keybox. Then,
+//!     when the B device has *no* StrongBox, the server's stored per-device
+//!     keybox identity mints the (StrongBox-tagged) chain. Finally, when the
+//!     server has no stored identity either, the request fails so the A-side
+//!     falls back to its local software keybox — never a self-signed StrongBox
+//!     chain.
 //!   - Robust (original on): Android-standard silent fallback. A B-side
 //!     StrongBox capability error (not supported / attestation keys not
 //!     provisioned / HAL not present) is transparently retried as a TEE
@@ -47,15 +46,19 @@ impl StrongboxMode {
             StrongboxMode::Robust => "robust",
         }
     }
+}
 
-    /// Parse the admin-API token. Accepts only the lowercase tokens
-    /// `"off" | "smart" | "robust"`.
-    pub fn from_str(s: &str) -> Option<StrongboxMode> {
+/// Parse the admin-API token. Accepts only the lowercase tokens
+/// `"off" | "smart" | "robust"`.
+impl std::str::FromStr for StrongboxMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<StrongboxMode, ()> {
         match s {
-            "off" => Some(StrongboxMode::Off),
-            "smart" => Some(StrongboxMode::Smart),
-            "robust" => Some(StrongboxMode::Robust),
-            _ => None,
+            "off" => Ok(StrongboxMode::Off),
+            "smart" => Ok(StrongboxMode::Smart),
+            "robust" => Ok(StrongboxMode::Robust),
+            _ => Err(()),
         }
     }
 }
@@ -82,22 +85,33 @@ mod tests {
 
     #[test]
     fn str_roundtrip() {
-        for m in [StrongboxMode::Off, StrongboxMode::Smart, StrongboxMode::Robust] {
-            assert_eq!(StrongboxMode::from_str(m.as_str()), Some(m));
-            assert_eq!(m.as_str(), match m {
-                StrongboxMode::Off => "off",
-                StrongboxMode::Smart => "smart",
-                StrongboxMode::Robust => "robust",
-            });
+        for m in [
+            StrongboxMode::Off,
+            StrongboxMode::Smart,
+            StrongboxMode::Robust,
+        ] {
+            assert_eq!(m.as_str().parse::<StrongboxMode>(), Ok(m));
+            assert_eq!(
+                m.as_str(),
+                match m {
+                    StrongboxMode::Off => "off",
+                    StrongboxMode::Smart => "smart",
+                    StrongboxMode::Robust => "robust",
+                }
+            );
         }
-        assert_eq!(StrongboxMode::from_str("bogus"), None);
-        assert_eq!(StrongboxMode::from_str(""), None);
-        assert_eq!(StrongboxMode::from_str("ROBUST"), None);
+        assert_eq!("bogus".parse::<StrongboxMode>(), Err(()));
+        assert_eq!("".parse::<StrongboxMode>(), Err(()));
+        assert_eq!("ROBUST".parse::<StrongboxMode>(), Err(()));
     }
 
     #[test]
     fn set_get_roundtrip() {
-        for m in [StrongboxMode::Off, StrongboxMode::Smart, StrongboxMode::Robust] {
+        for m in [
+            StrongboxMode::Off,
+            StrongboxMode::Smart,
+            StrongboxMode::Robust,
+        ] {
             set_mode(m);
             assert_eq!(mode(), m);
         }

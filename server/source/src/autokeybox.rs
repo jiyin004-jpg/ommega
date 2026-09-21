@@ -33,7 +33,10 @@ fn device_ids() -> &'static Mutex<HashMap<String, String>> {
     DEVICE_IDS.get_or_init(|| {
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         let mut m = HashMap::new();
-        m.insert("yurikey".to_string(), env("KEYBOX_DEVICE_B1_ID", "device-b-1"));
+        m.insert(
+            "yurikey".to_string(),
+            env("KEYBOX_DEVICE_B1_ID", "device-b-1"),
+        );
         m.insert("kow".to_string(), env("KEYBOX_DEVICE_B2_ID", "device-b-2"));
         Mutex::new(m)
     })
@@ -75,7 +78,7 @@ fn cover_source_slot() -> &'static Mutex<String> {
 
 /// The current cover-source selection (`"auto"` or a configured source name).
 pub fn cover_source() -> String {
-    crate::util::mu(&cover_source_slot()).clone()
+    crate::util::mu(cover_source_slot()).clone()
 }
 
 /// Set the cover source. Accepts `"auto"` or a name present in
@@ -83,14 +86,14 @@ pub fn cover_source() -> String {
 pub fn set_cover_source(name: &str) -> bool {
     let ok = name == "auto" || configured_sources().iter().any(|s| s.name == name);
     if ok {
-        *crate::util::mu(&cover_source_slot()) = name.to_string();
+        *crate::util::mu(cover_source_slot()) = name.to_string();
     }
     ok
 }
 
 /// Get the current device_id for a source name.
 pub fn device_id_for(name: &str) -> String {
-    crate::util::mu(&device_ids())
+    crate::util::mu(device_ids())
         .get(name)
         .cloned()
         .unwrap_or_default()
@@ -98,8 +101,7 @@ pub fn device_id_for(name: &str) -> String {
 
 /// Set (override) the device_id for a source name.
 pub fn set_device_id(name: &str, device_id: &str) {
-    crate::util::mu(&device_ids())
-        .insert(name.to_string(), device_id.to_string());
+    crate::util::mu(device_ids()).insert(name.to_string(), device_id.to_string());
 }
 
 /// A single configured upstream keybox source.
@@ -138,10 +140,7 @@ pub fn configured_sources() -> Vec<KeyboxSource> {
         KeyboxSource {
             name: "kow".to_string(),
             device_id: device_id_for("kow"),
-            url_primary: env(
-                "KEYBOX_KOW_URL",
-                "https://keybox.kowx712.cc/api/keyboxes",
-            ),
+            url_primary: env("KEYBOX_KOW_URL", "https://keybox.kowx712.cc/api/keyboxes"),
             url_mirror: env(
                 "KEYBOX_KOW_MIRROR_URL",
                 "https://keybox.kowx712.cc/api/keyboxes",
@@ -171,18 +170,14 @@ fn fetch_source(src: &KeyboxSource) -> anyhow::Result<String> {
     }
     for u in [src.url_primary.clone(), src.url_mirror.clone()] {
         if u.contains("raw.githubusercontent.com") {
-            candidates.push(
-                u.replace(
-                    "raw.githubusercontent.com",
-                    "ghproxy.com/https://raw.githubusercontent.com",
-                ),
-            );
-            candidates.push(
-                u.replace(
-                    "raw.githubusercontent.com",
-                    "raw.gitmirror.com/raw.githubusercontent.com",
-                ),
-            );
+            candidates.push(u.replace(
+                "raw.githubusercontent.com",
+                "ghproxy.com/https://raw.githubusercontent.com",
+            ));
+            candidates.push(u.replace(
+                "raw.githubusercontent.com",
+                "raw.gitmirror.com/raw.githubusercontent.com",
+            ));
         }
     }
 
@@ -213,7 +208,7 @@ fn maybe_decode_ns_payload(raw: &str, decode_hex: bool) -> String {
     }
     if decode_hex {
         let hex_only: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-        if !hex_only.is_empty() && hex_only.len() % 2 == 0 {
+        if !hex_only.is_empty() && hex_only.len().is_multiple_of(2) {
             if let Ok(decoded) = hex_decode(&hex_only) {
                 if let Ok(s) = String::from_utf8(decoded) {
                     text = s;
@@ -438,9 +433,7 @@ fn download_and_store(
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
         // Server-side rejection (bot challenge / not found / forbidden).
-        tracing::warn!(
-            "autokeybox download endpoint {dl_endpoint} -> {status}: {text}"
-        );
+        tracing::warn!("autokeybox download endpoint {dl_endpoint} -> {status}: {text}");
         return Ok(Vec::new());
     }
     // Parse token/url.
@@ -497,10 +490,9 @@ fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData)
     // Reject a mismatched key/chain before it can poison attestation: the
     // b_upload path validates the same way, and auto-refresh should not be
     // laxer (a broken identity would mint an unverifiable leaf chain).
-    if let Some(err) = crate::cert::validate_identity_pem(
-        &kb.private_key_pem,
-        &kb.certificate_chain_pem,
-    ) {
+    if let Some(err) =
+        crate::cert::validate_identity_pem(&kb.private_key_pem, &kb.certificate_chain_pem)
+    {
         tracing::warn!(
             "autokeybox validate failed device_id={device_id} source={} err={err}",
             src.name
@@ -528,10 +520,9 @@ fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData)
 /// Store a fetched identity under `device_id`, tagged `auto-cover:<source>` so
 /// `clear_auto_cover` can later remove exactly the rows this mode wrote.
 fn store_cover_identity(db: &Db, device_id: &str, source: &str, kb: &KeyboxData) {
-    if let Some(err) = crate::cert::validate_identity_pem(
-        &kb.private_key_pem,
-        &kb.certificate_chain_pem,
-    ) {
+    if let Some(err) =
+        crate::cert::validate_identity_pem(&kb.private_key_pem, &kb.certificate_chain_pem)
+    {
         tracing::warn!(
             "autokeybox cover validate failed device_id={device_id} source={source} err={err}"
         );
@@ -597,7 +588,11 @@ pub fn refresh_all(db: &Db, store: Option<&TaskStore>) {
                 }
             }
             Err(e) => {
-                tracing::warn!("autokeybox refresh panicked source={} err={:?}", src.name, e);
+                tracing::warn!(
+                    "autokeybox refresh panicked source={} err={:?}",
+                    src.name,
+                    e
+                );
             }
         }
     }
@@ -608,10 +603,7 @@ pub fn refresh_all(db: &Db, store: Option<&TaskStore>) {
         let selected: Vec<(String, KeyboxData)> = if chosen == "auto" {
             fetched
         } else {
-            fetched
-                .into_iter()
-                .filter(|(s, _)| s == &chosen)
-                .collect()
+            fetched.into_iter().filter(|(s, _)| s == &chosen).collect()
         };
         if selected.is_empty() {
             tracing::warn!(
@@ -641,8 +633,11 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
         .spawn(move || {
             tracing::info!("autokeybox loop started interval={:?}", interval);
             loop {
+                // 禁用时挂起等待而不是退出线程：一旦退出就没人再拉起（toggle 只翻
+                // 标志位），admin 会一直报 enabled=true 而刷新早已停止。
                 if !is_enabled() {
-                    break;
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
                 refresh_all(&db, Some(store.as_ref()));
                 // Sleep in small slices so a disable can be observed promptly.
@@ -655,7 +650,6 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
                     waited += Duration::from_secs(1);
                 }
             }
-            tracing::info!("autokeybox loop stopped");
         })
         .ok();
 }

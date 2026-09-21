@@ -18,6 +18,12 @@ pub enum TaskStatus {
     Failed,
 }
 
+/// 一个任务最多被重新派发多少次。没这个上限的话，B 端反复领取又超时
+/// （拿了一直不 complete，或者领完就挂）会让任务在 Pending 里无限打转：
+/// reclaim_locked 每次回收都把 created_at_ms 重置成 now，expire_locked
+/// 就永远等不到 pending TTL。
+const MAX_ASSIGN_ATTEMPTS: u32 = 5;
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub task_id: String,
@@ -26,6 +32,9 @@ pub struct Task {
     pub target_device_id: String,
     pub assigned_device_id: Option<String>,
     pub assigned_at_ms: u64,
+    /// 被派发出去的次数（含第一次）。回收重排时递增，到
+    /// [`MAX_ASSIGN_ATTEMPTS`] 就判死，不再重派。
+    pub attempts: u32,
     pub result: Option<Value>,
     pub created_at_ms: u64,
     pub completed_at_ms: u64,
@@ -144,6 +153,7 @@ impl TaskStore {
                 target_device_id: target_device_id.to_string(),
                 assigned_device_id: None,
                 assigned_at_ms: 0,
+                attempts: 0,
                 result: None,
                 created_at_ms: now,
                 completed_at_ms: 0,
@@ -168,7 +178,10 @@ impl TaskStore {
     /// Record a device event (must be called while holding `inner`).
     fn record_event_locked(inner: &mut Inner, device_id: &str, weight: u64) {
         let now = Self::now_ms();
-        let q = inner.device_events.entry(device_id.to_string()).or_default();
+        let q = inner
+            .device_events
+            .entry(device_id.to_string())
+            .or_default();
         q.push_back((now, weight));
         while let Some((ts, _)) = q.front() {
             if now.saturating_sub(*ts) > 60_000 {
@@ -206,10 +219,9 @@ impl TaskStore {
                 );
                 self.mark_online_sync(device_id, hb_now);
                 if !machine_id.is_empty() {
-                    inner.active_machine.insert(
-                        device_id.to_string(),
-                        (machine_id.to_string(), hb_now),
-                    );
+                    inner
+                        .active_machine
+                        .insert(device_id.to_string(), (machine_id.to_string(), hb_now));
                 }
                 // Reclaim timed-out assignments first.
                 self.reclaim_locked(&mut inner);
@@ -351,14 +363,30 @@ impl TaskStore {
             .tasks
             .iter()
             .filter(|(_, t)| {
-                t.status == TaskStatus::Assigned && now.saturating_sub(t.assigned_at_ms) > timeout_ms
+                t.status == TaskStatus::Assigned
+                    && now.saturating_sub(t.assigned_at_ms) > timeout_ms
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
             if let Some(t) = inner.tasks.get_mut(&id) {
-                t.status = TaskStatus::Pending;
                 t.assigned_device_id = None;
+                t.attempts = t.attempts.saturating_add(1);
+                if t.attempts >= MAX_ASSIGN_ATTEMPTS {
+                    // 派发次数用完了，判死，不再重派。
+                    t.status = TaskStatus::Failed;
+                    t.result = Some(serde_json::json!({
+                        "error": "task expired: too many delivery attempts"
+                    }));
+                    t.completed_at_ms = now;
+                    inner.failed_queue.push_back((now, id.clone()));
+                    continue;
+                }
+                t.status = TaskStatus::Pending;
+                // 重置创建时间：expire_locked 按创建时长判 pending TTL，
+                // 不重置的话刚被回收重试的任务会立刻被判定超时失败，
+                // 重试机制形同虚设。次数上界由 attempts 兜住。
+                t.created_at_ms = now;
                 // Put back into the appropriate bucket.
                 if t.target_device_id.is_empty() {
                     inner.pending_any.push_back(id.clone());
@@ -391,26 +419,28 @@ impl TaskStore {
         let Some(task_type) = task_type else {
             return Err("task not found".to_string());
         };
-        let boot = if task_type == "attest"
-            && result.get("error").is_none()
-            && !device_id.is_empty()
-        {
-            result
-                .get("cert_chain")
-                .and_then(Value::as_array)
-                .and_then(|chain| chain.first())
-                .and_then(Value::as_str)
-                .and_then(crate::cert::device_boot_info_from_chain)
-        } else {
-            None
-        };
+        let boot =
+            if task_type == "attest" && result.get("error").is_none() && !device_id.is_empty() {
+                result
+                    .get("cert_chain")
+                    .and_then(Value::as_array)
+                    .and_then(|chain| chain.first())
+                    .and_then(Value::as_str)
+                    .and_then(crate::cert::device_boot_info_from_chain)
+            } else {
+                None
+            };
         let Some(task) = inner.tasks.get_mut(task_id) else {
             return Err("task not found".to_string());
         };
         let now = Self::now_ms();
         let is_err = result.get("error").is_some();
         task.result = Some(result);
-        task.status = if is_err { TaskStatus::Failed } else { TaskStatus::Completed };
+        task.status = if is_err {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Completed
+        };
         task.assigned_device_id = Some(device_id.to_string());
         task.completed_at_ms = now;
         // Track in the appropriate ordered queue for later TTL / capacity pruning.
@@ -433,11 +463,7 @@ impl TaskStore {
     }
 
     /// Wait for a task result, polling internally. Returns the result or None on timeout.
-    pub async fn wait_for_result(
-        &self,
-        task_id: &str,
-        timeout: Duration,
-    ) -> Option<Value> {
+    pub async fn wait_for_result(&self, task_id: &str, timeout: Duration) -> Option<Value> {
         let deadline = Instant::now() + timeout;
         loop {
             {
@@ -466,7 +492,7 @@ impl TaskStore {
     pub async fn list_tasks(&self, limit: usize) -> Vec<Task> {
         let inner = self.inner.lock().await;
         let mut v: Vec<Task> = inner.tasks.values().cloned().collect();
-        v.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        v.sort_by_key(|t| std::cmp::Reverse(t.created_at_ms));
         v.truncate(limit);
         v
     }
@@ -598,8 +624,7 @@ impl TaskStore {
                     .tasks
                     .values()
                     .filter(|t| {
-                        t.assigned_device_id.as_deref() == Some(id)
-                            || t.target_device_id == *id
+                        t.assigned_device_id.as_deref() == Some(id) || t.target_device_id == *id
                     })
                     .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Assigned))
                     .count();
@@ -610,10 +635,8 @@ impl TaskStore {
         candidates.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
 
         let min = (candidates[0].1, candidates[0].2);
-        let tied: Vec<&(String, u64, usize)> = candidates
-            .iter()
-            .filter(|c| (c.1, c.2) == min)
-            .collect();
+        let tied: Vec<&(String, u64, usize)> =
+            candidates.iter().filter(|c| (c.1, c.2) == min).collect();
         if tied.len() > 1 {
             let i = inner.load_balance_index % tied.len();
             inner.load_balance_index = inner.load_balance_index.wrapping_add(1);

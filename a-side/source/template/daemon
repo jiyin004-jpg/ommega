@@ -18,6 +18,22 @@ if [ -z "$_SDK" ] || [ "$_SDK" -lt 36 ]; then
 fi
 unset _SDK
 
+# Resolve the device ABI.  One module zip now carries every ABI at once, so
+# libs/<abi> has to be picked by what this device actually runs; falling back
+# to directory order would hand an x86_64 device the arm64 binary.
+device_abi() {
+  local abi
+  abi="$(getprop ro.product.cpu.abi 2>/dev/null)"
+  [ -n "$abi" ] || abi="$(uname -m 2>/dev/null)"
+  case "$abi" in
+    arm64*|aarch64*) echo arm64-v8a ;;
+    armeabi*|armv7*) echo armeabi-v7a ;;
+    x86_64*) echo x86_64 ;;
+    i?86|x86) echo x86 ;;
+    *) echo "" ;;
+  esac
+}
+
 find_module_keymint() {
   if [ -f "/data/adb/ommega/keymint" ]; then
     echo /data/adb/ommega/keymint
@@ -27,14 +43,21 @@ find_module_keymint() {
     echo "$MODDIR/keymint"
     return 0
   fi
-  if [ -f "$MODDIR/libs/arm64-v8a/keymint" ]; then
-    echo "$MODDIR/libs/arm64-v8a/keymint"
+
+  local abi
+  abi=$(device_abi)
+  if [ -n "$abi" ] && [ -f "$MODDIR/libs/$abi/keymint" ]; then
+    echo "$MODDIR/libs/$abi/keymint"
     return 0
   fi
-  if [ -f "$MODDIR/libs/x86_64/keymint" ]; then
-    echo "$MODDIR/libs/x86_64/keymint"
-    return 0
-  fi
+
+  # getprop/uname unavailable; accept any packaged ABI rather than nothing.
+  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+    if [ -f "$MODDIR/libs/$abi/keymint" ]; then
+      echo "$MODDIR/libs/$abi/keymint"
+      return 0
+    fi
+  done
   return 1
 }
 

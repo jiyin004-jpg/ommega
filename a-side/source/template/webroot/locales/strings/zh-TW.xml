@@ -265,6 +265,7 @@
 
     <string name="prompt_security_patch_saved_restart">安全補丁已儲存，重新啟動後生效</string>
     <string name="remote_config_status_link">查看在线 B 端设备 ID</string>
+  <string name="remote_config_hide_strongbox">宣告不支援 StrongBox（重啟後生效）</string>
     <string name="prompt_status_hint">状态页里点击设备 ID 可查看该设备的 Boot Key、锁定状态、Boot Hash 与三项补丁日期</string>
 </resources>
 

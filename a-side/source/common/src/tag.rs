@@ -565,7 +565,10 @@ fn check_ec_gen_params(params: &[KeyParam], sec_level: SecurityLevel) -> Result<
             // StrongBox only supports P-256/P-384; reject P-521 to match a real
             // StrongBox chip (detectors flag P-521 acceptance as atypical).
             if sec_level == SecurityLevel::Strongbox {
-                return Err(km_err!(UnsupportedEcCurve, "StrongBox does not support P-521"));
+                return Err(km_err!(
+                    UnsupportedEcCurve,
+                    "StrongBox does not support P-521"
+                ));
             }
             KeyGenInfo::NistEc(ec::NistCurve::P521)
         }

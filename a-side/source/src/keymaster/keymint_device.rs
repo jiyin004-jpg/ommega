@@ -191,10 +191,33 @@ impl KeyMintDevice {
     /// Version number of KeyMintDevice@V5
     pub const KEY_MINT_V5: i32 = 500;
 
+    /// 这个错误是不是"该 security level 的 HAL 根本拿不到"？两种情况会命中：
+    /// 硬件上压根没有，或者 hide_strongbox 把它藏起来了。GC 和 level 0 key
+    /// 选源都要按它分流，所以单独拎出来。
+    pub fn is_hardware_type_unavailable(e: &anyhow::Error) -> bool {
+        matches!(
+            e.root_cause().downcast_ref::<Error>(),
+            Some(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
+        )
+    }
+
     /// Get a [`KeyMintDevice`] for the given [`SecurityLevel`]
     pub fn get(security_level: SecurityLevel) -> Result<KeyMintDevice> {
+        Self::get_inner(security_level, true)
+    }
+
+    /// 和 [`Self::get`] 一样，只是忽略 hide_strongbox，按 HAL 的真实存在性判断。
+    ///
+    /// level 0 key 的选源必须走这条：hide_strongbox 只是让上层以为这台设备没有
+    /// StrongBox，内部选源要是也跟着变，原本建在 StrongBox 上的 level 0 key 会
+    /// 换成 TEE 那一份，super key 跟着变，既有 key blob 就全解不开了。
+    pub fn get_probing_real_hardware(security_level: SecurityLevel) -> Result<KeyMintDevice> {
+        Self::get_inner(security_level, false)
+    }
+
+    fn get_inner(security_level: SecurityLevel, respect_hide: bool) -> Result<KeyMintDevice> {
         let km_uuid = RwLock::new(Uuid::from(security_level));
-        let wrapper: KeyMintWrapper = KeyMintWrapper::new(security_level)?;
+        let wrapper: KeyMintWrapper = KeyMintWrapper::new_inner(security_level, respect_hide)?;
         let version = wrapper
             .get_hardware_info()
             .context(err!("Failed to get hardware info"))?
@@ -210,10 +233,22 @@ impl KeyMintDevice {
     /// Get a [`KeyMintDevice`] for the given [`SecurityLevel`], return
     /// [`None`] if the error `HARDWARE_TYPE_UNAVAILABLE` is returned
     pub fn get_or_none(security_level: SecurityLevel) -> Result<Option<KeyMintDevice>> {
-        KeyMintDevice::get(security_level).map(Some).or_else(|e| {
-            match e.root_cause().downcast_ref::<Error>() {
-                Some(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)) => Ok(None),
-                _ => Err(e),
+        Self::to_option(KeyMintDevice::get(security_level))
+    }
+
+    /// [`Self::get_or_none`] 的"看真实硬件"版本，给 level 0 key 选源用。
+    pub fn get_or_none_probing_real_hardware(
+        security_level: SecurityLevel,
+    ) -> Result<Option<KeyMintDevice>> {
+        Self::to_option(KeyMintDevice::get_probing_real_hardware(security_level))
+    }
+
+    fn to_option(r: Result<KeyMintDevice>) -> Result<Option<KeyMintDevice>> {
+        r.map(Some).or_else(|e| {
+            if Self::is_hardware_type_unavailable(&e) {
+                Ok(None)
+            } else {
+                Err(e)
             }
         })
     }
@@ -911,11 +946,18 @@ impl IKeyMintDevice for KeyMintWrapper {
 
 impl KeyMintWrapper {
     pub fn new(security_level: SecurityLevel) -> Result<Self> {
+        Self::new_inner(security_level, true)
+    }
+
+    /// respect_hide 为 false 时跳过 hide_strongbox 判断，只看 HAL 是不是真的在。
+    fn new_inner(security_level: SecurityLevel, respect_hide: bool) -> Result<Self> {
         if security_level == SecurityLevel::STRONGBOX
-            && !crate::plat::keymint_profile::strongbox_keymint_present()
+            && (!crate::plat::keymint_profile::strongbox_keymint_present()
+                || (respect_hide && crate::config::strongbox_hidden()))
         {
-            return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
-                .context(err!("StrongBox KeyMint HAL is not present"));
+            return Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE)).context(err!(
+                "StrongBox KeyMint HAL is not present or disabled by config"
+            ));
         }
 
         Ok(KeyMintWrapper {

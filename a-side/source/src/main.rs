@@ -248,7 +248,9 @@ fn main() {
 /// the only recovery.
 fn is_root_of_trust_mismatch(error: &anyhow::Error) -> bool {
     matches!(
-        error.root_cause().downcast_ref::<crate::keymaster::error::Error>(),
+        error
+            .root_cause()
+            .downcast_ref::<crate::keymaster::error::Error>(),
         Some(crate::keymaster::error::Error::Km(
             crate::android::hardware::security::keymint::ErrorCode::ErrorCode::INVALID_KEY_BLOB,
         ))
@@ -380,15 +382,16 @@ fn run() -> Result<()> {
         .context("failed to add ommega authorization RPC service")?;
 
     info!("creating ommega maintenance service");
-    let maintenance =
-        MaintenanceManager::new_ommega_binder().context("failed to create ommega maintenance service")?;
+    let maintenance = MaintenanceManager::new_ommega_binder()
+        .context("failed to create ommega maintenance service")?;
     info!("adding ommega maintenance service to RPC server");
     server
         .add_service(rpc::MAINTENANCE_SERVICE, maintenance.as_binder())
         .context("failed to add ommega maintenance RPC service")?;
 
     info!("creating ommega metrics service");
-    let metrics = Metrics::new_native_binder().context("failed to create ommega metrics service")?;
+    let metrics =
+        Metrics::new_native_binder().context("failed to create ommega metrics service")?;
     info!("adding ommega metrics service to RPC server");
     server
         .add_service(rpc::METRICS_SERVICE, metrics.as_binder())

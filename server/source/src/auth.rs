@@ -78,16 +78,22 @@ impl AuthState {
     }
 
     /// Set admin credentials (user/password/extra accounts).
-    pub fn with_admin_credentials(
-        mut self,
-        user: &str,
-        password: &str,
-        extra: &str,
-    ) -> Self {
+    pub fn with_admin_credentials(mut self, user: &str, password: &str, extra: &str) -> Self {
         self.admin_user = user.to_string();
         self.admin_password = password.to_string();
         self.admin_extra = extra.to_string();
         self
+    }
+
+    /// 定长比较。用 `==` 比密码的话，"前几个字符对不对"会从耗时上泄漏出去；
+    /// 这里不管第几位不匹配都把循环跑完，长度不同也不提前返回。
+    fn ct_eq_secret(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        let mut diff = if a.len() == b.len() { 0u8 } else { 1u8 };
+        for i in 0..a.len().max(b.len()) {
+            diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+        }
+        diff == 0
     }
 
     /// Verify admin credentials. Returns true when user/password match either
@@ -96,7 +102,12 @@ impl AuthState {
         if self.admin_user.is_empty() {
             return false;
         }
-        if user == self.admin_user && password == self.admin_password {
+        // 未配置密码时空字符串会直接命中下面的等值比较，等于“admin+空密码”
+        // 就能拿完整管理会话，所以主账号与 extra 条目都拒绝空密码。
+        if !self.admin_password.is_empty()
+            && user == self.admin_user
+            && Self::ct_eq_secret(password, &self.admin_password)
+        {
             return true;
         }
         for entry in self.admin_extra.split(',') {
@@ -105,7 +116,8 @@ impl AuthState {
                 continue;
             }
             if let Some((u, p)) = entry.split_once(':') {
-                if user == u.trim() && password == p.trim() {
+                let p = p.trim();
+                if !p.is_empty() && user == u.trim() && Self::ct_eq_secret(password, p) {
                     return true;
                 }
             }
@@ -173,7 +185,10 @@ impl AuthState {
     }
 
     pub fn ip_filter_list(&self) -> Vec<String> {
-        let mut list: Vec<String> = crate::util::mu(&self.ip_filter_list).iter().cloned().collect();
+        let mut list: Vec<String> = crate::util::mu(&self.ip_filter_list)
+            .iter()
+            .cloned()
+            .collect();
         list.sort();
         list
     }
@@ -362,7 +377,11 @@ fn token_is_valid(db: &Arc<Db>, token: &str, duration_seconds: i64) -> bool {
 fn parse_beijing_datetime(s: &str) -> Option<i64> {
     // Strip fractional seconds if present (e.g. `2026-08-14 12:00:00.123456`).
     let s = s.trim();
-    let s = if let Some(dot) = s.find('.') { &s[..dot] } else { s };
+    let s = if let Some(dot) = s.find('.') {
+        &s[..dot]
+    } else {
+        s
+    };
     let parts: Vec<&str> = s.split([' ', ':', '-']).collect();
     if parts.len() < 6 {
         return None;
@@ -375,8 +394,6 @@ fn parse_beijing_datetime(s: &str) -> Option<i64> {
     let mi: u32 = parts[4].parse().ok()?;
     let sec: u32 = parts[5].parse().ok()?;
     let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
-    let dt = offset
-        .with_ymd_and_hms(y, mo, d, h, mi, sec)
-        .single()?;
+    let dt = offset.with_ymd_and_hms(y, mo, d, h, mi, sec).single()?;
     Some(dt.timestamp())
 }

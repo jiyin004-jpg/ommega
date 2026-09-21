@@ -357,12 +357,18 @@ pub(super) unsafe fn build_service_reply_rewrite(
             build_direct_ommega_security_level_reply(*security_level, pending)
         }
         ParsedServiceRequest::GetKeyEntry { key } => {
-            let entry = match ipc::with_ommega_retry(|ommega| Ok(ommega.r#getKeyEntry(Some(caller), key)?)) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    return ommega_error_reply_for_method("getKeyEntry", &pending.caller, &error);
-                }
-            };
+            let entry =
+                match ipc::with_ommega_retry(|ommega| Ok(ommega.r#getKeyEntry(Some(caller), key)?))
+                {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return ommega_error_reply_for_method(
+                            "getKeyEntry",
+                            &pending.caller,
+                            &error,
+                        );
+                    }
+                };
             Ok(Some(build_no_carrier_ommega_key_entry_reply(
                 entry,
                 &pending.caller,
@@ -404,12 +410,16 @@ pub(super) unsafe fn build_service_reply_rewrite(
                 Ok(ommega.r#grant(Some(caller), key, *grantee_uid, *access_vector)?)
             }) {
                 Ok(ommega_grant) => ommega_grant,
-                Err(error) => return ommega_error_reply_for_method("grant", &pending.caller, &error),
+                Err(error) => {
+                    return ommega_error_reply_for_method("grant", &pending.caller, &error)
+                }
             };
             Ok(Some(parcel::build_plain_reply(&ommega_grant)?))
         }
         ParsedServiceRequest::Ungrant { key, grantee_uid } => {
-            match ipc::with_ommega_once(|ommega| Ok(ommega.r#ungrant(Some(caller), key, *grantee_uid)?)) {
+            match ipc::with_ommega_once(|ommega| {
+                Ok(ommega.r#ungrant(Some(caller), key, *grantee_uid)?)
+            }) {
                 Ok(()) => Ok(Some(parcel::build_void_reply()?)),
                 Err(error) => ommega_error_reply_for_method("ungrant", &pending.caller, &error),
             }
@@ -444,7 +454,9 @@ pub(super) unsafe fn build_service_reply_rewrite(
             }
         }
         ParsedServiceRequest::GetSupplementaryAttestationInfo { tag } => {
-            match ipc::with_ommega_retry(|ommega| Ok(ommega.r#getSupplementaryAttestationInfo(*tag)?)) {
+            match ipc::with_ommega_retry(|ommega| {
+                Ok(ommega.r#getSupplementaryAttestationInfo(*tag)?)
+            }) {
                 Ok(info) => Ok(Some(parcel::build_plain_reply(&info)?)),
                 Err(error) => ommega_error_reply_for_method(
                     "getSupplementaryAttestationInfo",
@@ -515,14 +527,15 @@ pub(super) fn build_ommega_security_level_reply(
     }
     let caller = &pending.caller;
     let _guard = BypassGuard::enter();
-    let ommega_level =
-        match ipc::with_ommega_retry(|ommega| Ok(ommega.r#getCustomSecurityLevel(pending.security_level)?)) {
-            Ok(level) => level,
-            Err(error) => {
-                let method = format!("security-level lookup {:?}", pending.security_level);
-                return ommega_error_reply_for_method(&method, &pending.caller, &error);
-            }
-        };
+    let ommega_level = match ipc::with_ommega_retry(|ommega| {
+        Ok(ommega.r#getCustomSecurityLevel(pending.security_level)?)
+    }) {
+        Ok(level) => level,
+        Err(error) => {
+            let method = format!("security-level lookup {:?}", pending.security_level);
+            return ommega_error_reply_for_method(&method, &pending.caller, &error);
+        }
+    };
 
     match &pending.request {
         ParsedSecurityLevelRequest::CreateOperation {
@@ -530,18 +543,21 @@ pub(super) fn build_ommega_security_level_reply(
             operation_parameters,
             forced,
         } => {
-            let ommega_response =
-                match ommega_level.r#createOperation(Some(caller), key, operation_parameters, *forced)
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return ommega_status_reply_for_method(
-                            "createOperation",
-                            &pending.caller,
-                            &error,
-                        );
-                    }
-                };
+            let ommega_response = match ommega_level.r#createOperation(
+                Some(caller),
+                key,
+                operation_parameters,
+                *forced,
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    return ommega_status_reply_for_method(
+                        "createOperation",
+                        &pending.caller,
+                        &error,
+                    );
+                }
+            };
             Ok(Some(build_no_carrier_create_operation_reply(
                 ommega_response,
                 operation_allows_aad(operation_parameters),
@@ -565,7 +581,9 @@ pub(super) fn build_ommega_security_level_reply(
                 entropy,
             ) {
                 Ok(metadata) => Ok(Some(parcel::build_plain_reply(&metadata)?)),
-                Err(error) => ommega_status_reply_for_method("generateKey", &pending.caller, &error),
+                Err(error) => {
+                    ommega_status_reply_for_method("generateKey", &pending.caller, &error)
+                }
             }
         }
         ParsedSecurityLevelRequest::ImportKey {
@@ -608,14 +626,16 @@ pub(super) fn build_ommega_security_level_reply(
                 }
             }
         }
-        ParsedSecurityLevelRequest::ConvertStorageKeyToEphemeral { storage_key } => match ommega_level
-            .r#convertStorageKeyToEphemeral(Some(caller), storage_key)
-        {
-            Ok(response) => Ok(Some(parcel::build_plain_reply(&response)?)),
-            Err(error) => {
-                ommega_status_reply_for_method("convertStorageKeyToEphemeral", &pending.caller, &error)
+        ParsedSecurityLevelRequest::ConvertStorageKeyToEphemeral { storage_key } => {
+            match ommega_level.r#convertStorageKeyToEphemeral(Some(caller), storage_key) {
+                Ok(response) => Ok(Some(parcel::build_plain_reply(&response)?)),
+                Err(error) => ommega_status_reply_for_method(
+                    "convertStorageKeyToEphemeral",
+                    &pending.caller,
+                    &error,
+                ),
             }
-        },
+        }
         ParsedSecurityLevelRequest::DeleteKey { key } => {
             match ommega_level.r#deleteKey(Some(caller), key) {
                 Ok(()) => Ok(Some(parcel::build_void_reply()?)),

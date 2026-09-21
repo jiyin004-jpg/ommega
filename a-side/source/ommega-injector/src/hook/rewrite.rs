@@ -229,9 +229,9 @@ fn precompute_ommega_service_mutator_reply(
                     certificate_chain.as_deref(),
                 )?)
             }) {
-                Ok(()) => {
-                    OmmegaServicePrecompute::Reply(PrecomputedServiceReply::UpdateSubcomponentSuccess)
-                }
+                Ok(()) => OmmegaServicePrecompute::Reply(
+                    PrecomputedServiceReply::UpdateSubcomponentSuccess,
+                ),
                 Err(error) if ommega_unavailable_error(&error) => {
                     warn!(
                     "event=route ommega updateSubcomponent unavailable for uid={} pid={}: {:#}; leaving original system request untouched",

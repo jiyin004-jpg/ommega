@@ -27,6 +27,7 @@ pub use kmr_wire as wire;
 pub mod android_version;
 pub mod consts;
 pub mod crypto;
+pub mod eat;
 pub mod keyblob;
 pub mod rpc;
 pub mod runtime;

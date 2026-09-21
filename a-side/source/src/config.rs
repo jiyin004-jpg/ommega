@@ -66,6 +66,19 @@ pub fn config_path() -> &'static str {
     CONFIG_PATH
 }
 
+/// True when the WebUI option "Declare StrongBox unsupported" is enabled
+/// (`hide_strongbox` in the flat A-side config, surfaced as
+/// `RemoteConfig::hide_strongbox`). Callers must treat StrongBox exactly like
+/// a device without StrongBox support while this is set. The config watcher
+/// keeps the runtime config in sync with the flat file, so toggling the
+/// option applies without a daemon restart.
+pub fn strongbox_hidden() -> bool {
+    config()
+        .read()
+        .map(|config| config.remote.hide_strongbox)
+        .unwrap_or(false)
+}
+
 #[derive(Debug)]
 enum ConfigLoadError {
     Missing(io::Error),
@@ -655,6 +668,13 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
+    let hide_strongbox = matches!(
+        get(&["hide_strongbox", "no_strongbox", "hide_strongbox_keystore"])
+            .map(|v| v.to_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
@@ -665,6 +685,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         // was unreachable; keep that behaviour.
         fallback_local: true,
         debug_logging,
+        hide_strongbox,
     })
 }
 
@@ -720,6 +741,13 @@ pub struct RemoteConfig {
     /// `verbose` in `/data/adb/ommega/config`, client-a semantics).
     #[serde(default)]
     pub debug_logging: bool,
+    /// WebUI option "Declare StrongBox unsupported". When true the keystore
+    /// daemon refuses the STRONGBOX KeyMint security level exactly like a
+    /// device without StrongBox, and `post-fs-data.sh` shadows the device's
+    /// `android.hardware.security.strongbox_keystore` feature XMLs so
+    /// PackageManager reports the feature as absent.
+    #[serde(default)]
+    pub hide_strongbox: bool,
 }
 
 impl Default for RemoteConfig {
@@ -735,6 +763,7 @@ impl Default for RemoteConfig {
             tls_insecure: true,
             fallback_local: true,
             debug_logging: false,
+            hide_strongbox: false,
         }
     }
 }

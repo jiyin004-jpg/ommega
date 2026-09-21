@@ -22,7 +22,9 @@ pub const WEEK_SECS: i64 = 604_800; // 7 days
 
 /// Find the positional index of a column by name in the row's column list.
 fn col_index(row: &mysql::Row, col: &str) -> Option<usize> {
-    row.columns_ref().iter().position(|c: &Column| c.name_str() == col)
+    row.columns_ref()
+        .iter()
+        .position(|c: &Column| c.name_str() == col)
 }
 
 /// Safely read an optional string / datetime / numeric column from a MySQL
@@ -119,6 +121,18 @@ pub struct CardOrderRow {
     pub trade_no: String, // 支付平台流水号
 }
 
+/// 新建一张卡订单要写的字段。字段多了点，打包成一个结构体传，省得在调用处
+/// 数到第几个参数是什么。
+pub struct NewCardOrder<'a> {
+    pub order_id: &'a str,
+    pub card_type: &'a str, // "year" | "month"
+    pub role: &'a str,      // "a" | "b"
+    pub price_cents: i64,
+    pub bonus_draws: i64,
+    pub contact: &'a str,
+    pub pay_type: &'a str, // "alipay" | "wxpay" | ""
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientReportRow {
     pub device_id: String,
@@ -137,11 +151,10 @@ impl Db {
     /// Beijing time (`+08:00`) so all `NOW()` values are local time.
     pub fn open(url: &str) -> anyhow::Result<Self> {
         let base = mysql::Opts::from_url(url)?;
-        let opts = OptsBuilder::from_opts(base)
-            .init(vec![
-                "SET time_zone = '+08:00'".to_string(),
-                "SET NAMES utf8mb4".to_string(),
-            ]);
+        let opts = OptsBuilder::from_opts(base).init(vec![
+            "SET time_zone = '+08:00'".to_string(),
+            "SET NAMES utf8mb4".to_string(),
+        ]);
         let pool = Pool::new(opts)?;
         // Verify connection: check out once and immediately return it.
         let _conn = pool.get_conn()?;
@@ -254,7 +267,10 @@ impl Db {
     /// Fetch any active identity for a device regardless of algorithm — a
     /// targeted lookup replacing a full `list_device_identities()` scan when
     /// the exact algorithm match is missing.
-    pub fn get_any_device_identity(&self, device_id: &str) -> anyhow::Result<Option<DeviceIdentity>> {
+    pub fn get_any_device_identity(
+        &self,
+        device_id: &str,
+    ) -> anyhow::Result<Option<DeviceIdentity>> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT device_id, algorithm, certificate_chain_pem, private_key_pem_cipher,
@@ -432,23 +448,31 @@ impl Db {
         // BEGIN/COMMIT must use the text protocol: the mysql crate sends
         // `exec_drop` (even with empty params) through the prepared-statement
         // protocol, which MySQL rejects for BEGIN/COMMIT with ERROR 1295.
-        conn.query_drop("BEGIN")?;
-        conn.exec_drop(
-            "UPDATE api_token SET last_ip = :ip, last_used_at = NOW() WHERE token = :token",
-            params! {
-                "ip" => ip,
-                "token" => token,
-            },
-        )?;
-        conn.exec_drop(
-            "INSERT INTO token_usage_log (token, ip) VALUES (:token, :ip)",
-            params! {
-                "token" => token,
-                "ip" => ip,
-            },
-        )?;
-        conn.query_drop("COMMIT")?;
-        Ok(())
+        // 中途失败必须 ROLLBACK 后还连接：否则带着未提交事务和 api_token 行锁
+        // 归还连接池，后续同名 token 的写操作全部被阻塞到 wait_timeout。
+        let txn = (|| -> anyhow::Result<()> {
+            conn.query_drop("BEGIN")?;
+            conn.exec_drop(
+                "UPDATE api_token SET last_ip = :ip, last_used_at = NOW() WHERE token = :token",
+                params! {
+                    "ip" => ip,
+                    "token" => token,
+                },
+            )?;
+            conn.exec_drop(
+                "INSERT INTO token_usage_log (token, ip) VALUES (:token, :ip)",
+                params! {
+                    "token" => token,
+                    "ip" => ip,
+                },
+            )?;
+            conn.query_drop("COMMIT")?;
+            Ok(())
+        })();
+        if txn.is_err() {
+            let _ = conn.query_drop("ROLLBACK");
+        }
+        txn
     }
 
     /// Distinct historical IPs used by a token, with first/last use time and
@@ -499,7 +523,10 @@ impl Db {
 
     pub fn delete_token(&self, id: i64) -> anyhow::Result<()> {
         let mut conn = self.conn()?;
-        conn.exec_drop("DELETE FROM api_token WHERE id = :id", params! { "id" => id })?;
+        conn.exec_drop(
+            "DELETE FROM api_token WHERE id = :id",
+            params! { "id" => id },
+        )?;
         Ok(())
     }
 
@@ -547,16 +574,16 @@ impl Db {
         })
     }
 
-    pub fn create_card_order(
-        &self,
-        order_id: &str,
-        card_type: &str,
-        role: &str,
-        price_cents: i64,
-        bonus_draws: i64,
-        contact: &str,
-        pay_type: &str,
-    ) -> anyhow::Result<()> {
+    pub fn create_card_order(&self, order: NewCardOrder<'_>) -> anyhow::Result<()> {
+        let NewCardOrder {
+            order_id,
+            card_type,
+            role,
+            price_cents,
+            bonus_draws,
+            contact,
+            pay_type,
+        } = order;
         let mut conn = self.conn()?;
         conn.exec_drop(
             "INSERT INTO card_order (order_id, card_type, role, price_cents, bonus_draws, contact, pay_type)
@@ -654,10 +681,14 @@ impl Db {
         let mut conn = self.conn()?;
         conn.query_drop("BEGIN")?;
         // Serialize on the order row so two concurrent callbacks cannot both mint.
-        let rows: Vec<mysql::Row> = conn.exec(
-            "SELECT id, status, token_id FROM card_order WHERE order_id = :oid FOR UPDATE",
-            params! { "oid" => order_id },
-        )?;
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT id, status, token_id FROM card_order WHERE order_id = :oid FOR UPDATE",
+                params! { "oid" => order_id },
+            )
+            .inspect_err(|_| {
+                let _ = conn.query_drop("ROLLBACK");
+            })?;
         let Some(row) = rows.first() else {
             conn.query_drop("ROLLBACK")?;
             anyhow::bail!("order not found");
@@ -694,9 +725,8 @@ impl Db {
                 "SELECT id FROM api_token WHERE token = :t LIMIT 1",
                 params! { "t" => &token },
             )
-            .map_err(|e| {
+            .inspect_err(|_| {
                 let _ = conn.query_drop("ROLLBACK");
-                e
             })?;
         let inserted_id = inserted_id.unwrap_or(0);
         if let Err(e) = conn.exec_drop(

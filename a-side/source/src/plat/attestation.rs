@@ -4,6 +4,11 @@ use x509_cert::Certificate;
 
 pub const ANDROID_ATTESTATION_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
+/// KeyMint's other attestation encoding: the same KeyDescription, but as a
+/// CBOR map instead of a DER SEQUENCE.  A certificate carries one or the
+/// other, never both.
+pub const ANDROID_EAT_ATTESTATION_OID: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.25");
 const ROOT_OF_TRUST_TAG: u32 = 704;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,11 +40,17 @@ pub fn extract_verified_boot_hash_from_leaf_certificate(leaf: &[u8]) -> Result<[
 }
 
 pub fn extract_attestation_challenge_from_attestation_extension(bytes: &[u8]) -> Result<Vec<u8>> {
+    if kmr_common::eat::is_cbor_attestation_extension(bytes) {
+        return kmr_common::eat::challenge(bytes);
+    }
     let (challenge, _) = parse_attestation_extension(bytes)?;
     Ok(challenge.to_vec())
 }
 
 pub fn extract_verified_boot_hash_from_attestation_extension(bytes: &[u8]) -> Result<[u8; 32]> {
+    if kmr_common::eat::is_cbor_attestation_extension(bytes) {
+        return kmr_common::eat::verified_boot_hash(bytes);
+    }
     let (_, hardware_enforced) = parse_attestation_extension(bytes)?;
     extract_verified_boot_hash_from_authorization_list(hardware_enforced)
 }
@@ -143,6 +154,11 @@ fn find_attestation_extension(certificate: &Certificate) -> Result<&[u8]> {
     let extension = extensions
         .iter()
         .find(|extension| extension.extn_id == ANDROID_ATTESTATION_OID)
+        .or_else(|| {
+            extensions
+                .iter()
+                .find(|extension| extension.extn_id == ANDROID_EAT_ATTESTATION_OID)
+        })
         .ok_or_else(|| anyhow!("Android attestation extension missing"))?;
     Ok(extension.extn_value.as_bytes())
 }
@@ -246,6 +262,35 @@ mod tests {
     }
 
     #[test]
+    fn extracts_challenge_from_eat_leaf_certificate() {
+        let expected = b"eat-nonce".to_vec();
+        let leaf = build_leaf_with_extension(
+            &EAT_OID,
+            &encode_claims(&[(-75_008, &expected), (-82_003, &[0x77u8; 32])]),
+        );
+        let parsed = extract_attestation_challenge_from_leaf_certificate(&leaf).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn extracts_verified_boot_hash_from_eat_leaf_certificate() {
+        let expected = [0x5cu8; 32];
+        let leaf = build_leaf_with_extension(
+            &EAT_OID,
+            &encode_claims(&[(-75_008, b"challenge"), (-82_003, &expected)]),
+        );
+        let parsed = extract_verified_boot_hash_from_leaf_certificate(&leaf).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn eat_extension_without_boot_hash_is_rejected() {
+        let payload = encode_claims(&[(-75_008, b"challenge")]);
+        let error = extract_verified_boot_hash_from_attestation_extension(&payload).unwrap_err();
+        assert!(error.to_string().contains("verified-boot-hash"));
+    }
+
+    #[test]
     fn missing_root_of_trust_is_rejected() {
         let extension = encode_tlv(
             TlvClass::Universal,
@@ -277,18 +322,64 @@ mod tests {
             .contains("failed to parse attestation leaf"));
     }
 
+    /// OID 1.3.6.1.4.1.11129.2.1.17, as DER wants it.
+    const ASN1_OID: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 1, 17];
+    /// OID 1.3.6.1.4.1.11129.2.1.25 (EAT).
+    const EAT_OID: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 1, 25];
+
     fn build_leaf_with_attestation_extension(challenge: &[u8], hash: [u8; 32]) -> Vec<u8> {
-        let extension = build_test_attestation_extension(challenge, hash);
+        build_leaf_with_extension(
+            &ASN1_OID,
+            &build_test_attestation_extension(challenge, hash),
+        )
+    }
+
+    /// Self-signed leaf carrying `extension` under `oid`.  The bytes go in
+    /// verbatim, which is what the parsers get out of a real chain.
+    fn build_leaf_with_extension(oid: &[u64], extension: &[u8]) -> Vec<u8> {
         let mut params = CertificateParams::new(Vec::new()).unwrap();
         params
             .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
-                extension,
-            ));
+            .push(CustomExtension::from_oid_content(oid, extension.to_vec()));
         let key_pair = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         cert.der().to_vec()
+    }
+
+    /// Test-side CBOR writer: one map whose claims all hold byte strings.
+    fn encode_claims(claims: &[(i64, &[u8])]) -> Vec<u8> {
+        let mut out = cbor_head(5, claims.len() as u64);
+        for (claim, value) in claims {
+            let (major, arg) = if *claim < 0 {
+                (1, claim.unsigned_abs() - 1)
+            } else {
+                (0, *claim as u64)
+            };
+            out.extend(cbor_head(major, arg));
+            out.extend(cbor_head(2, value.len() as u64));
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    fn cbor_head(major: u8, arg: u64) -> Vec<u8> {
+        let mut out = vec![major << 5];
+        match arg {
+            value if value < 24 => out[0] |= value as u8,
+            value if value <= u64::from(u8::MAX) => {
+                out[0] |= 24;
+                out.push(value as u8);
+            }
+            value if value <= u64::from(u16::MAX) => {
+                out[0] |= 25;
+                out.extend_from_slice(&(value as u16).to_be_bytes());
+            }
+            value => {
+                out[0] |= 26;
+                out.extend_from_slice(&(value as u32).to_be_bytes());
+            }
+        }
+        out
     }
 
     fn build_test_attestation_extension(challenge: &[u8], hash: [u8; 32]) -> Vec<u8> {

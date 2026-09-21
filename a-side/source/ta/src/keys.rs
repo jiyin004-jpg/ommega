@@ -256,7 +256,11 @@ impl crate::KeyMintTa {
                 Some(SigningInfo {
                     signing_key: KeyMaterial::Remote(remote),
                     ..
-                }) if remote.root_of_trust.as_ref().is_some_and(|r| r.attestation_version > 0) => {
+                }) if remote
+                    .root_of_trust
+                    .as_ref()
+                    .is_some_and(|r| r.attestation_version > 0) =>
+                {
                     remote.root_of_trust.as_ref().unwrap().attestation_version
                 }
                 _ => self.aidl_version as i32,
@@ -351,12 +355,7 @@ impl crate::KeyMintTa {
                 };
                 backend
                     .sign(&remote.alias, tbs_data, algorithm)?
-                    .ok_or_else(|| {
-                        km_err!(
-                            UnknownError,
-                            "remote attestation-key sign unavailable"
-                        )
-                    })
+                    .ok_or_else(|| km_err!(UnknownError, "remote attestation-key sign unavailable"))
             }
             _ => Err(km_err!(
                 IncompatibleAlgorithm,
@@ -498,8 +497,7 @@ impl crate::KeyMintTa {
         // with negligible collision probability. 32 bits was enough to collide
         // when a caller minted two keys within the same millisecond.
         let alias_seed = u64::from_be_bytes([
-            digest[0], digest[1], digest[2], digest[3],
-            digest[4], digest[5], digest[6], digest[7],
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
         ]);
         let alias = format!("ommega-remote-{:016x}", alias_seed);
         // Mirror client-a's `effectiveCertificateSerial`: forward the caller's

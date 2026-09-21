@@ -182,7 +182,10 @@ fn global_scope_keeps_non_app_uids_on_the_system_backend() {
 
     for uid in [0, 1_000, 1_017, 2_000] {
         let decision = evaluate(&[], &config, uid, PackageResolution::Unknown);
-        assert!(!decision.allowed, "uid {uid} must stay on the system backend");
+        assert!(
+            !decision.allowed,
+            "uid {uid} must stay on the system backend"
+        );
         assert_eq!(decision.reason, FilterReason::RejectedAndroidPackage);
     }
 }

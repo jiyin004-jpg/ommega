@@ -177,7 +177,8 @@ impl KeyBox {
     }
 
     fn refresh_identity_digest(&mut self) -> Result<()> {
-        self.identity_digest = Self::compute_identity_digest(self.rsa_info.as_ref(), self.ec_info.as_ref())?;
+        self.identity_digest =
+            Self::compute_identity_digest(self.rsa_info.as_ref(), self.ec_info.as_ref())?;
         Ok(())
     }
 
@@ -245,11 +246,15 @@ impl KeyBox {
         let blocks = [
             (
                 KeyAlgorithm::Ec,
-                self.ec_info.as_ref().map(|info| ("ecdsa", "EC PRIVATE KEY", info)),
+                self.ec_info
+                    .as_ref()
+                    .map(|info| ("ecdsa", "EC PRIVATE KEY", info)),
             ),
             (
                 KeyAlgorithm::Rsa,
-                self.rsa_info.as_ref().map(|info| ("rsa", "RSA PRIVATE KEY", info)),
+                self.rsa_info
+                    .as_ref()
+                    .map(|info| ("rsa", "RSA PRIVATE KEY", info)),
             ),
         ]
         .into_iter()
@@ -632,7 +637,10 @@ fn load_keybox_with_fallback(path: &str) -> Result<(KeyBox, bool)> {
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            info!("keybox.xml missing at {}; using bundled template in memory", path);
+            info!(
+                "keybox.xml missing at {}; using bundled template in memory",
+                path
+            );
             Ok((KeyBox::new(), true))
         }
         Err(error) => Err(error).with_context(|| format!("failed to read keybox.xml from {path}")),
@@ -765,12 +773,13 @@ mod tests {
         assert!(parsed.ec_info.is_some());
         assert!(parsed.rsa_info.is_none());
         assert_eq!(
-            parsed.signing_info(SigningKeyType {
-                which: SigningKey::Batch,
-                algo_hint: SigningAlgorithm::Ec,
-            })
-            .unwrap()
-            .cert_chain,
+            parsed
+                .signing_info(SigningKeyType {
+                    which: SigningKey::Batch,
+                    algo_hint: SigningAlgorithm::Ec,
+                })
+                .unwrap()
+                .cert_chain,
             keybox.ec_info.as_ref().unwrap().chain
         );
         assert!(parsed

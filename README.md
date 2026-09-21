@@ -2,14 +2,14 @@
 
 Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真实硬件 TEE 能力通过网络提供给另一台设备（A 端）使用。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经过 server 中转调度，由 B 端设备的真实硬件 TEE（KeyMint / StrongBox）执行并返回结果，从而为 A 端应用提供真实可信的硬件级安全认证。
 
-源码版本：1.4.0（打包日期：2026-09-18）
+源码版本：1.4.2（打包日期：2026-09-21）
 
 ## 系统组成
 
 | 端 | 角色 | 形态 | 安装方式 |
 |----|------|------|----------|
 | **A 端（a-side）** | 服务请求端。keymint 守护进程 + inject 注入器拦截本机 keystore 调用，将认证/签名/解密请求转发到远程 B 端真实 TEE | Magisk 模块（arm64-v8a / armeabi-v7a / x86 / x86_64） | Magisk / KernelSU 刷入 zip |
-| **B 端（b-side）** | 服务提供端。relay 守护进程长轮询 server 领取任务，调用本机真实硬件 TEE 执行认证/签名/解密并回传结果 | Magisk 模块（arm64-v8a） | Magisk / KernelSU 刷入 zip |
+| **B 端（b-side）** | 服务提供端。relay 守护进程长轮询 server 领取任务，调用本机真实硬件 TEE 执行认证/签名/解密并回传结果 | Magisk 模块（arm64-v8a / x86_64） | Magisk / KernelSU 刷入 zip |
 | **B 端 App（b-app）** | B 端管理界面，用于查看设备状态、配置连接参数 | Android APK | 直接安装 APK |
 | **Server（server）** | 中转与调度中心。任务队列、设备管理、卡片计费、密钥盒（keybox）管理、在线设备状态展示 | 独立二进制 | Linux x86_64 / Windows x86_64 部署 |
 
@@ -37,7 +37,7 @@ Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真
 
 ### B 端配置（b-side 模块 + b-app）
 
-1. 安装 `client-b-app-release.apk`，刷入 `ommegaclient-b-release-arm64-v8a-1.3.0.zip` 并重启
+1. 安装 `client-b-app-release.apk`，刷入 `ommegaclient-b-release-1.3.1.zip` 并重启（该 zip 同时包含 arm64-v8a 与 x86_64，安装时按设备架构自动选）
 2. 编辑 `/data/adb/ommega/relay.conf`，填入官方配置：
 
 ```
@@ -50,7 +50,7 @@ OMMEGA_RELAY_TOKEN=Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0
 
 ### A 端配置（a-side 模块）
 
-1. 刷入 `ommega-a-release-1.4.0.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
+1. 刷入 `ommega-a-release-1.4.2.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
 2. 编辑 `/data/adb/ommega/ommegadata/config`（或模块 WebUI 中配置），填入官方配置：
 
 ```
@@ -79,10 +79,10 @@ remote: on
 ommega/
 ├── a-side/                  # A 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（keymint 守护进程 + ommega-inject 注入器）
-│   └── build/               #   ommega-a-release-1.4.0.zip 安装包（arm64-v8a + armeabi-v7a + x86 + x86_64）
+│   └── build/               #   ommega-a-release-1.4.2.zip 安装包（arm64-v8a + armeabi-v7a + x86 + x86_64）
 ├── b-side/                  # B 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（relay 守护进程）
-│   └── build/               #   ommegaclient-b-release-arm64-v8a-1.3.0.zip 安装包
+│   └── build/               #   ommegaclient-b-release-1.3.1.zip 安装包（arm64-v8a + x86_64）
 ├── b-app/                   # B 端 Android App（Kotlin 工程）
 │   ├── source/              #   app 源码 + Gradle 配置
 │   └── build/               #   client-b-app-release.apk
@@ -101,7 +101,11 @@ ommega/
 
 ### 模块与 App 构建
 
-- A/B 端模块：在 `a-side/source`、`b-side/source` 下执行 `python build.py` 生成 zip
+- A/B 端模块：在 `a-side/source`、`b-side/source` 下执行 `python build.py --release` 生成 zip。
+  默认产出一个**包含全部受支持 ABI 的单一 zip**（A 端 arm64-v8a / armeabi-v7a / x86 / x86_64，
+  B 端 arm64-v8a / x86_64），安装时由模块的 `customize.sh` 检查设备架构并释放对应的
+  `libs/<abi>/` 二进制；运行时守护脚本也按 `ro.product.cpu.abi` 选二进制，不靠目录顺序。
+  用 `--abi <name>` 可只把指定 ABI 打进包里（仍是单包，可重复传），`--split` 才会每个 ABI 各出一个 zip。
 - B 端 App：在 `b-app/source` 下执行 Gradle 构建生成 APK
 
 ## 参考项目

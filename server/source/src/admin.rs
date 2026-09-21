@@ -54,12 +54,12 @@ fn session_from_headers(headers: &HeaderMap) -> String {
 }
 
 /// Require a valid admin session.
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     let sid = session_from_headers(headers);
     if state.auth.check_session(&sid) {
         Ok(())
     } else {
-        Err(auth_fail())
+        Err(Box::new(auth_fail()))
     }
 }
 
@@ -86,7 +86,10 @@ pub async fn admin_login(
     let key = format!("{ip}:{}", body.username);
     // Rate-limit login attempts (5/min per username+IP) to prevent brute force.
     if !state.auth.allow_login_attempt(&key) {
-        return json_err(StatusCode::TOO_MANY_REQUESTS, "too many login attempts, try again later");
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many login attempts, try again later",
+        );
     }
     if !state.auth.verify_admin(&body.username, &body.password) {
         return json_err(StatusCode::UNAUTHORIZED, "invalid username or password");
@@ -96,20 +99,14 @@ pub async fn admin_login(
 }
 
 /// POST /api/admin/logout/ — invalidate the current session.
-pub async fn admin_logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn admin_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let sid = session_from_headers(&headers);
     state.auth.drop_session(&sid);
     Json(json!({ "status": "ok" })).into_response()
 }
 
 /// GET /api/admin/session/ — report whether the current session is valid.
-pub async fn admin_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn admin_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let valid = state.auth.check_session(&session_from_headers(&headers));
     Json(json!({ "valid": valid })).into_response()
 }
@@ -133,7 +130,7 @@ pub async fn login_page() -> impl IntoResponse {
 
 pub async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let counts = state.store.counts().await;
     let connected = state.store.get_connected_devices().await;
@@ -181,7 +178,7 @@ pub async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -
 
 pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     // Stored server identities (deduplicated per device_id, with their
     // algorithms listed). These represent "devices that have an uploaded
@@ -198,10 +195,10 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
             let mut grouped: Vec<Value> = Vec::new();
             for d in &rows {
                 if let Some(last) = grouped.last_mut().and_then(|v| v.as_object_mut()) {
-                    if last.get("device_id").and_then(Value::as_str) == Some(d.device_id.as_str())
-                    {
+                    if last.get("device_id").and_then(Value::as_str) == Some(d.device_id.as_str()) {
                         // Append algorithm to an existing device entry.
-                        if let Some(arr) = last.get_mut("algorithms").and_then(Value::as_array_mut) {
+                        if let Some(arr) = last.get_mut("algorithms").and_then(Value::as_array_mut)
+                        {
                             arr.push(json!(d.algorithm));
                         }
                         continue;
@@ -237,7 +234,10 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
             load,
         ));
     }
-    connected.sort_by(|a, b| a.1.cmp(&b.1).then(a.0["device_id"].as_str().cmp(&b.0["device_id"].as_str())));
+    connected.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then(a.0["device_id"].as_str().cmp(&b.0["device_id"].as_str()))
+    });
     let connected: Vec<Value> = connected.into_iter().map(|(v, _)| v).collect();
 
     Json(json!({
@@ -254,7 +254,7 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
 
 pub async fn admin_tasks(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let tasks: Vec<Value> = state
         .store
@@ -282,26 +282,24 @@ pub async fn admin_tasks(State(state): State<AppState>, headers: HeaderMap) -> R
 
 pub async fn admin_reports(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let reports: Vec<Value> = match state.db.clone() {
-        Some(db) => {
-            match tokio::task::spawn_blocking(move || db.list_client_reports(100)).await {
-                Ok(Ok(rows)) => rows
-                    .iter()
-                    .map(|r| {
-                        json!({
-                            "device_id": r.device_id,
-                            "level": r.level,
-                            "code": r.code,
-                            "message": r.message,
-                            "created_at": r.created_at,
-                        })
+        Some(db) => match tokio::task::spawn_blocking(move || db.list_client_reports(100)).await {
+            Ok(Ok(rows)) => rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "device_id": r.device_id,
+                        "level": r.level,
+                        "code": r.code,
+                        "message": r.message,
+                        "created_at": r.created_at,
                     })
-                    .collect(),
-                _ => Vec::new(),
-            }
-        }
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
         None => Vec::new(),
     };
     Json(json!({ "status": "ok", "reports": reports })).into_response()
@@ -319,7 +317,7 @@ pub async fn admin_upload_keybox(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = &state.db else {
         return json_err(
@@ -338,12 +336,7 @@ pub async fn admin_upload_keybox(
     // fulfil layer can serve whichever algorithm the A-side requests.
     let keyboxes = match keybox::parse_keybox_xml_all(xml) {
         Ok(kb) => kb,
-        Err(e) => {
-            return json_err(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid keybox.xml: {e}"),
-            )
-        }
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, &format!("invalid keybox.xml: {e}")),
     };
 
     if keyboxes.is_empty() {
@@ -363,10 +356,9 @@ pub async fn admin_upload_keybox(
         // Validate the private key parses AND matches the chain leaf before
         // persisting this entry (mirrors the B-side upload path), so a
         // mismatched keybox cannot mint an unverifiable attestation chain.
-        if let Some(err) = crate::cert::validate_identity_pem(
-            &kb.private_key_pem,
-            &kb.certificate_chain_pem,
-        ) {
+        if let Some(err) =
+            crate::cert::validate_identity_pem(&kb.private_key_pem, &kb.certificate_chain_pem)
+        {
             return json_err(
                 StatusCode::BAD_REQUEST,
                 &format!(
@@ -435,7 +427,7 @@ pub async fn admin_set_mode(
     Json(body): Json<ModeBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     state.fulfill.set_enabled(body.enabled);
     Json(json!({
@@ -462,7 +454,7 @@ pub async fn admin_set_device_active(
     Json(body): Json<ActiveBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -474,10 +466,15 @@ pub async fn admin_set_device_active(
     })
     .await;
     match result {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "device_id": device_id, "active": body.active }))
-            .into_response(),
+        Ok(Ok(())) => {
+            Json(json!({ "status": "ok", "device_id": device_id, "active": body.active }))
+                .into_response()
+        }
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -487,7 +484,7 @@ pub async fn admin_delete_device(
     Path(device_id): Path<String>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -498,7 +495,10 @@ pub async fn admin_delete_device(
     match result {
         Ok(Ok(())) => Json(json!({ "status": "ok", "device_id": device_id })).into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -518,7 +518,7 @@ pub struct TokenGenBody {
 /// GET /api/admin/tokens/ — list all API tokens.
 pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -546,7 +546,10 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
             return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
         }
         Err(e) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}"))
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("join error: {e}"),
+            )
         }
     };
     Json(json!({ "status": "ok", "tokens": tokens })).into_response()
@@ -559,7 +562,7 @@ pub async fn admin_generate_token(
     Json(body): Json<TokenGenBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -588,7 +591,10 @@ pub async fn admin_generate_token(
         }))
         .into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -605,18 +611,22 @@ pub async fn admin_toggle_token(
     Json(body): Json<TokenToggleBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
     let enabled = body.enabled;
-    let result =
-        tokio::task::spawn_blocking(move || db.set_token_enabled(id, enabled)).await;
+    let result = tokio::task::spawn_blocking(move || db.set_token_enabled(id, enabled)).await;
     match result {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id, "enabled": body.enabled })).into_response(),
+        Ok(Ok(())) => {
+            Json(json!({ "status": "ok", "id": id, "enabled": body.enabled })).into_response()
+        }
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -627,7 +637,7 @@ pub async fn admin_delete_token(
     Path(id): Path<i64>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -636,7 +646,10 @@ pub async fn admin_delete_token(
     match result {
         Ok(Ok(())) => Json(json!({ "status": "ok", "id": id })).into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -648,25 +661,34 @@ pub async fn admin_token_ips(
     Path(token): Path<String>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
     let rows = match tokio::task::spawn_blocking(move || db.token_usage_ips(&token)).await {
         Ok(Ok(rows)) => rows,
-        Ok(Err(e)) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Ok(Err(e)) => {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
+        }
+        Err(e) => {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("join error: {e}"),
+            )
+        }
     };
     // Attach region info for each IP.
     let geo = state.geo.as_ref();
     let ips: Vec<Value> = rows
         .iter()
         .map(|r| {
-            let ip = r.get("ip").and_then(Value::as_str).unwrap_or("").to_string();
-            let region = geo
-                .and_then(|g| g.search(&ip))
-                .unwrap_or_default();
+            let ip = r
+                .get("ip")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let region = geo.and_then(|g| g.search(&ip)).unwrap_or_default();
             let (country, province, city, isp) = split_region(&region);
             json!({
                 "ip": ip,
@@ -701,7 +723,7 @@ pub async fn admin_autokeybox_status(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let sources: Vec<Value> = crate::autokeybox::configured_sources()
         .iter()
@@ -738,7 +760,7 @@ pub async fn admin_autokeybox_toggle(
     Json(body): Json<AutoKeyboxToggleBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     crate::autokeybox::set_enabled(body.enabled);
     Json(json!({ "status": "ok", "enabled": body.enabled })).into_response()
@@ -750,7 +772,7 @@ pub async fn admin_autokeybox_refresh(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -780,7 +802,7 @@ pub async fn admin_autokeybox_cover_toggle(
     Json(body): Json<AutoKeyboxCoverBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(
@@ -802,8 +824,8 @@ pub async fn admin_autokeybox_cover_toggle(
         .into_response()
     } else {
         crate::autokeybox::set_cover_enabled(false);
-        let result = tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db))
-            .await;
+        let result =
+            tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db)).await;
         match result {
             Ok(Ok(cleared)) => Json(json!({
                 "status": "ok",
@@ -812,7 +834,10 @@ pub async fn admin_autokeybox_cover_toggle(
             }))
             .into_response(),
             Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+            Err(e) => json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("join error: {e}"),
+            ),
         }
     }
 }
@@ -824,16 +849,20 @@ pub async fn admin_autokeybox_cover_clear(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
-    let result = tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db)).await;
+    let result =
+        tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db)).await;
     match result {
         Ok(Ok(cleared)) => Json(json!({ "status": "ok", "cleared": cleared })).into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
     }
 }
 
@@ -857,7 +886,7 @@ pub async fn admin_autokeybox_cover_source(
     Json(body): Json<AutoKeyboxCoverSourceBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     if !crate::autokeybox::set_cover_source(&body.source) {
         let names: Vec<String> = crate::autokeybox::configured_sources()
@@ -886,7 +915,7 @@ pub async fn admin_autokeybox_set_device(
     Json(body): Json<AutoKeyboxDeviceBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     if body.device_id.trim().is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "device_id must not be empty");
@@ -905,12 +934,9 @@ pub async fn admin_autokeybox_set_device(
 // ---------------------------------------------------------------------------
 
 /// GET /api/admin/cards/ — list all card orders.
-pub async fn admin_card_orders(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn admin_card_orders(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -941,7 +967,10 @@ pub async fn admin_card_orders(
             return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
         }
         Err(e) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("join error: {e}"))
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("join error: {e}"),
+            )
         }
     };
     Json(json!({ "status": "ok", "orders": orders })).into_response()
@@ -952,12 +981,9 @@ pub async fn admin_card_orders(
 // ---------------------------------------------------------------------------
 
 /// GET /api/admin/ipfilter/ — current state + list.
-pub async fn admin_ipfilter_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn admin_ipfilter_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     Json(json!({
         "status": "ok",
@@ -982,7 +1008,7 @@ pub async fn admin_ipfilter_config(
     Json(body): Json<IpFilterConfigBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     state.auth.set_ip_filter_enabled(body.enabled);
     state.auth.set_ip_filter_whitelist(body.whitelist);
@@ -1006,7 +1032,7 @@ pub async fn admin_ipfilter_add(
     Json(body): Json<IpFilterIpBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     state.auth.add_ip(&body.ip);
     Json(json!({ "status": "ok", "ips": state.auth.ip_filter_list() })).into_response()
@@ -1019,7 +1045,7 @@ pub async fn admin_ipfilter_remove(
     Json(body): Json<IpFilterIpBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     state.auth.remove_ip(&body.ip);
     Json(json!({ "status": "ok", "ips": state.auth.ip_filter_list() })).into_response()
@@ -1034,12 +1060,9 @@ pub async fn admin_ipfilter_remove(
 /// `mode` is the three-state token (`"off" | "smart" | "robust"`); `enabled`
 /// is kept for backwards compatibility and reports only whether the Robust
 /// (original "强健/降级") mode is active.
-pub async fn admin_strongbox_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn admin_strongbox_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let m = crate::strongbox::mode();
     Json(json!({
@@ -1077,12 +1100,12 @@ pub async fn admin_strongbox_toggle(
     Json(body): Json<StrongboxToggleBody>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let next = if let Some(tok) = body.mode.as_deref() {
-        match crate::strongbox::StrongboxMode::from_str(tok) {
-            Some(m) => m,
-            None => {
+        match tok.parse::<crate::strongbox::StrongboxMode>() {
+            Ok(m) => m,
+            Err(_) => {
                 return json_err(
                     StatusCode::BAD_REQUEST,
                     &format!("invalid mode {tok:?}: expected \"off\" | \"smart\" | \"robust\""),
@@ -1133,6 +1156,19 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 "patch_system": b.patch_system,
                 "patch_vendor": b.patch_vendor,
                 "patch_boot": b.patch_boot,
+                // Samsung devices only; absent for every other vendor.
+                "knox": b.knox.as_ref().map(|k| json!({
+                    "challenge": k.challenge,
+                    "id_attest": k.id_attest,
+                    "record_hash": k.record_hash,
+                    "trust_boot": k.trust_boot,
+                    "warranty": k.warranty,
+                    "icd": k.icd,
+                    "kernel": k.kernel,
+                    "system": k.system,
+                    "caller_auth": k.caller_auth,
+                    "package_auth": k.package_auth,
+                })),
             })
         });
         connected.push((
@@ -1146,7 +1182,10 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
             load,
         ));
     }
-    connected.sort_by(|a, b| a.1.cmp(&b.1).then(a.0["device_id"].as_str().cmp(&b.0["device_id"].as_str())));
+    connected.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then(a.0["device_id"].as_str().cmp(&b.0["device_id"].as_str()))
+    });
     let connected: Vec<Value> = connected.into_iter().map(|(v, _)| v).collect();
 
     // Stored-cert device IDs (deduplicated, no key/cert material).
@@ -1163,7 +1202,8 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
             for d in &rows {
                 if let Some(last) = grouped.last_mut().and_then(|v| v.as_object_mut()) {
                     if last.get("device_id").and_then(Value::as_str) == Some(d.device_id.as_str()) {
-                        if let Some(arr) = last.get_mut("algorithms").and_then(Value::as_array_mut) {
+                        if let Some(arr) = last.get_mut("algorithms").and_then(Value::as_array_mut)
+                        {
                             arr.push(json!(d.algorithm));
                         }
                         continue;

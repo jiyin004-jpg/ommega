@@ -107,7 +107,10 @@ fn wait_for_rpc_socket() -> Result<()> {
         thread::sleep(READY_RETRY_DELAY);
     }
 
-    bail!("ommega RPC socket did not appear in time (socket={})", rpc::SOCKET);
+    bail!(
+        "ommega RPC socket did not appear in time (socket={})",
+        rpc::SOCKET
+    );
 }
 
 pub fn inject_library(pid: Pid) -> Result<()> {

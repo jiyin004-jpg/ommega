@@ -220,30 +220,15 @@ fn build_router(cfg: &Arc<Config>) -> Router {
             "/api/admin/ipfilter/config/",
             post(admin::admin_ipfilter_config),
         )
-        .route(
-            "/api/admin/ipfilter/add/",
-            post(admin::admin_ipfilter_add),
-        )
+        .route("/api/admin/ipfilter/add/", post(admin::admin_ipfilter_add))
         .route(
             "/api/admin/ipfilter/remove/",
             post(admin::admin_ipfilter_remove),
         )
-        .route(
-            "/api/admin/strongbox/",
-            get(admin::admin_strongbox_status),
-        )
-        .route(
-            "/api/admin/strongbox/",
-            post(admin::admin_strongbox_toggle),
-        )
-        .route(
-            "/api/admin/tokens/:token/ips/",
-            get(admin::admin_token_ips),
-        )
-        .route(
-            "/api/admin/tokens/:id/",
-            post(admin::admin_toggle_token),
-        )
+        .route("/api/admin/strongbox/", get(admin::admin_strongbox_status))
+        .route("/api/admin/strongbox/", post(admin::admin_strongbox_toggle))
+        .route("/api/admin/tokens/:token/ips/", get(admin::admin_token_ips))
+        .route("/api/admin/tokens/:id/", post(admin::admin_toggle_token))
         .route(
             "/api/admin/tokens/:id/",
             axum::routing::delete(admin::admin_delete_token),
@@ -267,15 +252,17 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(
-            tracing::Level::INFO.into(),
-        ))
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
 
     let cfg = Arc::new(Config::load());
     tracing::info!(
         "relay_rs starting: mode={} bind={} http={} https={} tls={}",
-        if cfg.server_keybox_enabled() { "server_keybox" } else { "physical" },
+        if cfg.server_keybox_enabled() {
+            "server_keybox"
+        } else {
+            "physical"
+        },
         cfg.bind_addr,
         cfg.http_port,
         cfg.https_port,
@@ -290,7 +277,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("HTTP listening on {http_addr}");
     let http_server = axum::serve(
         http_listener,
-        app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app.clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     );
 
     // HTTPS server (if TLS enabled and cert files exist)
@@ -308,7 +296,10 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?,
             )
-            .serve(app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>());
+            .serve(
+                app.clone()
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            );
             // Run both servers concurrently.
             tokio::select! {
                 r = http_server => { r?; }

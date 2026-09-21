@@ -388,10 +388,7 @@ impl IKeystoreMaintenance for MaintenanceManager {
 impl IMaintenanceService for MaintenanceManager {
     fn onUserAdded(&self, ctx: Option<&CallerInfo>, user_id: i32) -> rsbinder::status::Result<()> {
         let _wp = wd::watch("IMaintenanceService::onUserAdded");
-        let ctx = Some(require_ommega_ctx(
-            ctx,
-            "IMaintenanceService::onUserAdded",
-        )?);
+        let ctx = Some(require_ommega_ctx(ctx, "IMaintenanceService::onUserAdded")?);
         self.on_user_added(ctx, user_id).map_err(into_logged_binder)
     }
 
