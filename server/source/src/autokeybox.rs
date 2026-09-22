@@ -25,6 +25,11 @@ use crate::queue::TaskStore;
 /// Global enable flag for the auto-refresh background loop.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// 后台线程是否真的被拉起来了。`ENABLED` 只是"用户想不想让它跑"，而线程只在
+/// `KEYBOX_REFRESH_ENABLED=true` 时由 main 启动一次。两者分开记，才能让管理接口
+/// 分辨"开关开着但根本没线程"这种状态 —— 否则状态页会报 enabled 而实际不刷新。
+static STARTED: AtomicBool = AtomicBool::new(false);
+
 /// Runtime-overridable device_id per source name (initialised from env, editable
 /// via the admin API).
 static DEVICE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -44,6 +49,16 @@ fn device_ids() -> &'static Mutex<HashMap<String, String>> {
 
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// 真正在跑：开关开着，而且后台线程确实启动了。状态页与管理接口报的是这个值。
+pub fn is_running() -> bool {
+    STARTED.load(Ordering::Relaxed) && ENABLED.load(Ordering::Relaxed)
+}
+
+/// 后台线程是否已被启动（与开关无关）。
+pub fn is_started() -> bool {
+    STARTED.load(Ordering::Relaxed)
 }
 
 pub fn set_enabled(v: bool) {
@@ -631,6 +646,7 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
     std::thread::Builder::new()
         .name("autokeybox".to_string())
         .spawn(move || {
+            STARTED.store(true, Ordering::Relaxed);
             tracing::info!("autokeybox loop started interval={:?}", interval);
             loop {
                 // 禁用时挂起等待而不是退出线程：一旦退出就没人再拉起（toggle 只翻

@@ -232,7 +232,9 @@ impl AuthState {
             return false;
         }
         match header {
-            Some(v) => v == self.relay_token,
+            // 定长比较，跟 admin 密码走同一套（见 ct_eq_secret）：用 `==` 会让
+            // “前缀对了几位”从耗时上泄出去。
+            Some(v) => Self::ct_eq_secret(v, &self.relay_token),
             None => false,
         }
     }

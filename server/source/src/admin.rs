@@ -740,6 +740,7 @@ pub async fn admin_autokeybox_status(
     Json(json!({
         "status": "ok",
         "enabled": crate::autokeybox::is_enabled(),
+        "running": crate::autokeybox::is_running(),
         "cover_enabled": crate::autokeybox::cover_enabled(),
         "cover_source": crate::autokeybox::cover_source(),
         "interval_secs": state.cfg.keybox_refresh_interval_secs,
@@ -762,8 +763,22 @@ pub async fn admin_autokeybox_toggle(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
+    // 后台线程只在 KEYBOX_REFRESH_ENABLED=true 时由 main 启动一次，运行时开不
+    // 出来。这种情况下把开关翻成 true，状态页会显示已启用而实际永不刷新，
+    // 所以直接拒掉，让配置层去解决。
+    if body.enabled && !crate::autokeybox::is_started() {
+        return json_err(
+            StatusCode::CONFLICT,
+            "auto-refresh loop is not running: set KEYBOX_REFRESH_ENABLED=true and restart",
+        );
+    }
     crate::autokeybox::set_enabled(body.enabled);
-    Json(json!({ "status": "ok", "enabled": body.enabled })).into_response()
+    Json(json!({
+        "status": "ok",
+        "enabled": body.enabled,
+        "running": crate::autokeybox::is_running(),
+    }))
+    .into_response()
 }
 
 /// POST /api/admin/autokeybox/refresh/ — trigger an immediate refresh (async).
@@ -1158,7 +1173,6 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 "patch_boot": b.patch_boot,
                 // Samsung devices only; absent for every other vendor.
                 "knox": b.knox.as_ref().map(|k| json!({
-                    "challenge": k.challenge,
                     "id_attest": k.id_attest,
                     "record_hash": k.record_hash,
                     "trust_boot": k.trust_boot,

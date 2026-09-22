@@ -22,6 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -132,6 +133,59 @@ fn sessions_dir() -> PathBuf {
     PathBuf::from("/data/adb/ommega/sessions")
 }
 
+/// Session files 原本只进不出：A 端每要一个新 key（新 alias）就落一个文件，
+/// 长期在线的设备会一直堆 —— 真机上到过 19967 个 / 162 MB，启动全量加载要
+/// 12 秒。两个上限把它压住：超过 TTL 的删，超过数量上限的从最旧的开始删。
+const SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
+const SESSION_MAX_FILES: usize = 2000;
+/// 每这么多次保存做一轮清理（启动时另有一轮，见 `load_all_sessions`）。
+const SESSION_PRUNE_EVERY: usize = 200;
+
+/// 清理会话文件：先按 mtime 从旧到新排序，超 TTL 的或超出数量上限的都删掉，
+/// 于是留下来的总是最新的那一批。全程 best-effort —— 删不掉就当没发生过，
+/// 最坏结果只是这一轮没清成，不影响任何正在用的会话（它们在内存里）。
+fn prune_sessions() {
+    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        files.push((path, mtime));
+    }
+    let total = files.len();
+    if total == 0 {
+        return;
+    }
+    files.sort_by_key(|(_, t)| *t);
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for (i, (path, mtime)) in files.iter().enumerate() {
+        let expired = now
+            .duration_since(*mtime)
+            .map(|d| d.as_secs() > SESSION_TTL_SECS)
+            .unwrap_or(false);
+        // 排序后下标 i 之前都是更旧的，剩下 total - i 个（含自己）。
+        let over_cap = total - i > SESSION_MAX_FILES;
+        if (expired || over_cap) && std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        log::info!(
+            "pruned {removed} session file(s), kept {} of {total}",
+            total - removed
+        );
+    }
+}
+
 /// Alias -> safe file stem.  Aliases can contain arbitrary UTF-8, so we keep
 /// the printable prefix and append a short hash to guarantee uniqueness.
 fn session_stem(alias: &str) -> String {
@@ -209,6 +263,12 @@ fn save_session_to_disk(alias: &str, session: &TeeSession) {
         "hal_service": hal_service_label,
     });
     let _ = std::fs::write(&path, serde_json::to_string(&value).unwrap_or_default());
+    // 运行时也要收着点：每 SESSION_PRUNE_EVERY 次保存清一轮，否则一个长期
+    // 在线的设备还是会一直堆下去。
+    static SAVES: AtomicUsize = AtomicUsize::new(0);
+    if SAVES.fetch_add(1, Ordering::Relaxed) % SESSION_PRUNE_EVERY == SESSION_PRUNE_EVERY - 1 {
+        prune_sessions();
+    }
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, TeeSession>> {
@@ -244,6 +304,8 @@ fn session_get(alias: &str) -> Result<TeeSession> {
 /// Loads every persisted session into memory.  Called once at startup so that
 /// an alias generated before a relay restart is immediately usable.
 pub fn load_all_sessions() {
+    // 先清一轮再加载：“只增不减”就是在这一步收住的，顺带把启动耗时压下来。
+    prune_sessions();
     let Some(entries) = std::fs::read_dir(sessions_dir()).ok() else {
         return;
     };

@@ -402,7 +402,11 @@ impl TaskStore {
     }
 
     /// Complete a task with a result reported by the B-side.
-    /// Returns Ok(()) if the task existed, Err(msg) otherwise.
+    /// Returns Ok(()) if the task existed and was still open, Err(msg) otherwise.
+    ///
+    /// 守卫（2026-09-21 加固）：只有 Assigned / Pending 状态可以被回传终结，
+    /// 已 Completed / Failed 的任务直接拒绝；认领过的任务只接受
+    /// assigned_device_id 那台设备的结果。
     pub async fn complete_task(
         &self,
         task_id: &str,
@@ -430,6 +434,35 @@ impl TaskStore {
             } else {
                 None
             };
+        // 只允许"在飞"的任务被回传终结：已经完结的任务再来一次（b 端最多
+        // 重试 4 次、最坏 139s，同一个结果可能重复到达）不能覆盖已有结果，
+        // 也不能把同一条任务二次塞进 completed_queue —— 那会让队列长度
+        // 虚高，并让结果被取两次。Pending 仍然放行：分配超时（默认 60s）
+        // 把任务回收成 Pending 后，原设备的晚到结果依旧是有效结果，此时
+        // assigned_device_id 已被清空，下面的归属校验自然跳过。
+        {
+            let task = inner.tasks.get(task_id).expect("checked above");
+            match task.status {
+                TaskStatus::Assigned | TaskStatus::Pending => {}
+                // 重复回传当幂等处理：结果已经在里面了，不动它，也不报错 ——
+                // b 端 post_result 只在收到 2xx 时停止重试，回 4xx 只会让它的
+                // 日志多一条"被拒绝"。真正的重复在这里被吃掉。
+                TaskStatus::Completed | TaskStatus::Failed => {
+                    tracing::debug!(
+                        "complete_task: duplicate report for {task_id} from {device_id} ignored"
+                    );
+                    return Ok(());
+                }
+            }
+            // 归属校验：认领过设备 id 的任务，只认那个设备报上来的结果，
+            // 免得共享 B token 下另一台设备把结果顶掉。任一侧为空
+            // （尚未认领 / 老客户端不带 device_id）时不拦。
+            if let Some(assigned) = task.assigned_device_id.as_deref() {
+                if !assigned.is_empty() && !device_id.is_empty() && assigned != device_id {
+                    return Err("device mismatch".to_string());
+                }
+            }
+        }
         let Some(task) = inner.tasks.get_mut(task_id) else {
             return Err("task not found".to_string());
         };
@@ -441,7 +474,10 @@ impl TaskStore {
         } else {
             TaskStatus::Completed
         };
-        task.assigned_device_id = Some(device_id.to_string());
+        // 空 device_id 不覆盖已记录的归属，否则归属信息会被抹掉。
+        if !device_id.is_empty() {
+            task.assigned_device_id = Some(device_id.to_string());
+        }
         task.completed_at_ms = now;
         // Track in the appropriate ordered queue for later TTL / capacity pruning.
         if is_err {

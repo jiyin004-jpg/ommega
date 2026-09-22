@@ -123,10 +123,35 @@ fi
 chmod 0755 "$TARGET" 2>/dev/null || true
 load_relay_env
 
-"$TARGET" &
+# 守护循环（放在子 shell 里后台跑，service.sh 本身不阻塞启动流程）：
+# B 端要 7×24 挂着领任务，而 relay 除了这里没有任何东西会把它拉起来 ——
+# 只有重启手机或重装模块才会再进 service.sh。原版是 `"$TARGET" &` 加
+# 等 10s 就退出，进程一挂设备就静默地不再领任务了。A 端 daemon 早就有
+# 这个 while 循环，B 端现在对齐。
+(
+  while true; do
+    TARGET=$(find_module_relay)
+    if [ -z "$TARGET" ]; then
+      echo "[service] relay binary vanished; retrying in 5s"
+      sleep 5
+      continue
+    fi
+    chmod 0755 "$TARGET" 2>/dev/null || true
+    # 每轮都重新导环境：守护进程要能感知 relay.conf 的改动。
+    load_relay_env
+    "$TARGET" &
+    child=$!
+    echo "[service] relay started (pid $child)"
+    wait "$child"
+    rc=$?
+    echo "[service] relay exited (code $rc); restarting in 2s"
+    sleep 2
+  done
+) >> "$STATE_DIR/logs/service.log" 2>&1 &
+
+# 先确认第一次是否真的起来了，好在模块日志里给出可见结果。
 if wait_for_relay; then
-  echo "[service] ommegaclient-b relay started"
+  echo "[service] ommegaclient-b relay is up"
 else
-  echo "[service] ommegaclient-b relay failed to start; see logcat tag ommegaclient-b"
-  exit 1
+  echo "[service] relay did not come up within 10s; watchdog will keep retrying"
 fi

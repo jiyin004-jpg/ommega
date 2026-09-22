@@ -2,7 +2,7 @@
 
 Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真实硬件 TEE 能力通过网络提供给另一台设备（A 端）使用。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经过 server 中转调度，由 B 端设备的真实硬件 TEE（KeyMint / StrongBox）执行并返回结果，从而为 A 端应用提供真实可信的硬件级安全认证。
 
-源码版本：1.4.2（打包日期：2026-09-21）
+源码版本：1.4.3（打包日期：2026-09-21）
 
 ## 系统组成
 
@@ -37,7 +37,7 @@ Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真
 
 ### B 端配置（b-side 模块 + b-app）
 
-1. 安装 `client-b-app-release.apk`，刷入 `ommegaclient-b-release-1.3.1.zip` 并重启（该 zip 同时包含 arm64-v8a 与 x86_64，安装时按设备架构自动选）
+1. 安装 `client-b-app-release.apk`，刷入 `ommegaclient-b-release-1.3.2.zip` 并重启（该 zip 同时包含 arm64-v8a 与 x86_64，安装时按设备架构自动选）
 2. 编辑 `/data/adb/ommega/relay.conf`，填入官方配置：
 
 ```
@@ -50,7 +50,7 @@ OMMEGA_RELAY_TOKEN=Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0
 
 ### A 端配置（a-side 模块）
 
-1. 刷入 `ommega-a-release-1.4.2.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
+1. 刷入 `ommega-a-release-1.4.3.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
 2. 编辑 `/data/adb/ommega/ommegadata/config`（或模块 WebUI 中配置），填入官方配置：
 
 ```
@@ -79,10 +79,10 @@ remote: on
 ommega/
 ├── a-side/                  # A 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（keymint 守护进程 + ommega-inject 注入器）
-│   └── build/               #   ommega-a-release-1.4.2.zip 安装包（arm64-v8a + armeabi-v7a + x86 + x86_64）
+│   └── build/               #   ommega-a-release-1.4.3.zip 安装包（arm64-v8a + armeabi-v7a + x86 + x86_64）
 ├── b-side/                  # B 端（Magisk 模块）
 │   ├── source/              #   Rust 源码（relay 守护进程）
-│   └── build/               #   ommegaclient-b-release-1.3.1.zip 安装包（arm64-v8a + x86_64）
+│   └── build/               #   ommegaclient-b-release-1.3.2.zip 安装包（arm64-v8a + x86_64）
 ├── b-app/                   # B 端 Android App（Kotlin 工程）
 │   ├── source/              #   app 源码 + Gradle 配置
 │   └── build/               #   client-b-app-release.apk
@@ -107,6 +107,11 @@ ommega/
   `libs/<abi>/` 二进制；运行时守护脚本也按 `ro.product.cpu.abi` 选二进制，不靠目录顺序。
   用 `--abi <name>` 可只把指定 ABI 打进包里（仍是单包，可重复传），`--split` 才会每个 ABI 各出一个 zip。
 - B 端 App：在 `b-app/source` 下执行 Gradle 构建生成 APK
+
+> 开发提示：`b-side` 依赖 `rsproperties`，它只对 Linux / Android target 生效，所以在
+> Windows 上直接跑裸 `cargo check`（不带 `--target`）会编译失败，看着像代码坏了。
+> 加上目标平台就行：`cargo check --target aarch64-linux-android`（需先设好 NDK 环境变量
+> `ANDROID_NDK_ROOT` / `ANDROID_NDK_HOME`）。A 端与 server 没有这个限制。
 
 ## 参考项目
 

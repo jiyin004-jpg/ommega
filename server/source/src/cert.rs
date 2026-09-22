@@ -1700,8 +1700,14 @@ fn boot_info_from_leaf(der: &[u8]) -> Option<DeviceBootInfo> {
         // record; the certificate itself was already verified by its chain.
         if payload.first() == Some(&0x30) {
             read_asn1_attestation(payload, &mut info);
-        } else {
-            let _ = eat::read(payload, &mut info);
+        } else if let Err(e) = eat::read(payload, &mut info) {
+            // 解析失败只让这条记录的 EAT 字段空着，不影响证书本身（链已经验过），
+            // 但不能再静默吞掉：畸形 CBOR 会让整条 claim 消失得无影无踪。
+            tracing::warn!(
+                "EAT payload unparsable ({} bytes, first byte {:#04x}): {e}",
+                payload.len(),
+                payload.first().copied().unwrap_or(0)
+            );
         }
     }
     if let Some(knox) = extension(KNOX_ATTESTATION_OID_STR) {

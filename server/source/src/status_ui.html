@@ -168,7 +168,9 @@ async function load() {
 let _devices = [];
 
 const VB_STATE = { 0: '已验证 Verified', 1: '自签名 SelfSigned', 2: '未验证 Unverified', 3: '校验失败 Failed' };
-const KNOX_STATE = { 0: '正常 Normal', 1: '异常 Abnormal', 2: '不支持 Not support', 3: '未认证 Not verified' };
+// Knox 完整性与调用方认证只有 0/1/2 三个取值（服务端 cert.rs 的 KnoxInfo 里写明了
+// 0 normal / 1 abnormal / 2 not supported），没有 3。
+const KNOX_STATE = { 0: '正常 Normal', 1: '异常 Abnormal', 2: '不支持 Not support' };
 const fmtPatch = v => { if (!v) return '—'; const s = String(v); return s.length === 8 ? s.slice(0,4) + '-' + s.slice(4,6) + '-' + s.slice(6,8) : s.slice(0,4) + '-' + s.slice(4,6); };
 const fmtHex = v => (v ? v : '—');
 const fmtState = v => (v === null || v === undefined) ? '—' : (KNOX_STATE[v] ?? v);
@@ -181,7 +183,6 @@ function knoxRows(k) {
   const integrity = [['TrustBoot', k.trust_boot], ['Warranty', k.warranty], ['ICD', k.icd],
                      ['内核 Kernel', k.kernel], ['系统 System', k.system]];
   return [
-    kvRow('Knox 挑战', k.challenge || '—'),
     kvRow('Knox ID 认证', k.id_attest || '—'),
     kvRow('Knox 完整性', integrity.filter(([, v]) => v !== null && v !== undefined)
                                    .map(([n, v]) => `${n}：${fmtState(v)}`).join(' · ') || '—'),

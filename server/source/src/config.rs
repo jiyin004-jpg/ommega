@@ -31,6 +31,12 @@ pub struct Config {
     /// Seconds a B-side assignment may stay pending before being reclaimed.
     pub assignment_timeout_secs: u64,
     /// Default A-side wait-for-result timeout, seconds.
+    ///
+    /// 必须大于 b 端一次回传的最坏耗时，否则“a 端已超时、b 端还在重试”的
+    /// 结果就没人接收了。b 端 post_result 最多 4 次尝试，每次 connect 3s +
+    /// read 30s（relay.rs 的 CONNECT_TIMEOUT_MS / READ_TIMEOUT_MS），退避
+    /// 1s+2s+4s，合起来 4×33+7 = 139s，所以这个值取了 180。改 b 端的重试参数
+    /// 时要一并核对这里。
     pub wait_result_timeout_secs: u64,
     /// Long-poll default timeout, seconds.
     pub poll_timeout_secs: u64,
@@ -87,7 +93,7 @@ impl Default for Config {
             keybox_refresh_interval_secs: 7200,
             attest_source: "physical".to_string(),
             assignment_timeout_secs: 60,
-            wait_result_timeout_secs: 120,
+            wait_result_timeout_secs: 180,
             poll_timeout_secs: 30,
             mysql_url: String::new(),
             mysql_time_zone: "+08:00".to_string(),
@@ -219,7 +225,7 @@ impl Config {
             cfg.attest_source = v;
         }
         cfg.assignment_timeout_secs = env_u64("RELAY_ASSIGNMENT_TIMEOUT", 60);
-        cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 120);
+        cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 180);
         cfg.poll_timeout_secs = env_u64("RELAY_POLL_TIMEOUT", 30);
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_MYSQL_URL") {
             cfg.mysql_url = v;
