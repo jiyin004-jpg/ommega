@@ -2,46 +2,21 @@
 
 ## 1.4.3
 
-（A 端模块 1.4.3；B 端模块同步升到 1.3.2；b-app 未改动，仍为 1.3.1）
+（A 端模块 1.4.3；B 端模块 1.3.2；b-app 未改动）
 
-- **任务回传加守卫（server）**。`TaskStore::complete_task` 原来不校验状态、不校验归属：
-  `task.assigned_device_id` 是拿上报的 `device_id` **覆盖**上去的，于是任何一个带合法共享
-  B token 的请求都能终结任意 task，晚到或重复的回传会盖掉已完成的结果，还会把同一条
-  task 二次塞进 `completed_queue`。现在只接受 `Assigned` / `Pending` 状态的回传，已完结的
-  当幂等处理直接返回（b 端最多重试 4 次，重申不该被当成错误），并且只认任务认领时那台设备
-  报上来的结果（任一侧 device_id 为空时不拦，兼容老客户端）。`Pending` 仍然放行：分配超时
-  回收后原设备的晚到结果依旧有效。
-- **修掉“时限倒挂”（server / b-side）**。b 端 `post_result` 最多尝试 4 次，每次
-  connect 3s + read 30s，退避 1s+2s+4s，最坏 139s；而服务端 `RELAY_WAIT_RESULT_TIMEOUT`
-  默认 120s —— 也就是 A 端已经放弃等待、b 端还在重试，结果没人接。服务端默认值改为
-  **180s**，并在 `config.rs` 里把这个推导写成了注释，以后改 b 端重试参数时能对上。
-- **B 端 relay 加上守护循环**。`b-side/template/service.sh` 原来只是 `"$TARGET" &` 再等 10s
-  就退出，relay 一旦崩掉就没人拉起来 —— 而 B 端是要 7×24 挂着领任务的。现在把它放进子
-  shell 后台的 `while true` 里（跟 A 端 `daemon` 同构）：退出就重启，间隔 2s，日志进
-  `$STATE_DIR/logs/service.log`。重装/重启仍然走原有的 `kill_all` 清场逻辑。
-- **sessions 目录不再只进不出**（b-side）。A 端每要一个新 key 就落一个 session 文件，代码里
-  没有任何清理，真机上已经积到 19967 个 / 162 MB，启动 `load_all_sessions()` 要 12 秒。
-  现在加了 TTL（7 天）与数量上限（2000 个），启动时清一轮、运行时每 200 次保存清一轮，
-  留下的总是最新的那批。
-- **公开状态接口不再吐 Knox 挑战值**（server）。`/api/status/` 是无鉴权的，它吐出的 `knox`
-  块里含 `challenge` —— 那是服务端自己下发的会话随机数，状态页展示它没有意义。其余字段
-  （`id_attest` / `record_hash` / 完整性状态）是状态页要用的摘要，不带密钥材料，继续公开。
-- **EAT 解析失败不再静默**（server）。`device_boot_info_from_chain` 里的 `let _ = eat::read(...)`
-  会让畸形 CBOR 把整条 claim 悄悄丢掉；现在解析失败会打一条 `warn`，并带上长度与首字节。
-  “解析失败不影响证书本身”这个原有语义不变。（复审里提到的另一处 `cert.rs:2112` 在
-  `#[cfg(test)]` 里，是测试故意遍历截断，不是问题。）
-- **状态页 Knox 状态表语义修正**（server）。`status_ui.html` 的 `KNOX_STATE` 是 4 项的
-  （多了一个 `3: 未认证`），而 `KnoxInfo` 里完整性与调用方认证字段只有 0/1/2 三个取值，
-  一旦设备上报 3 就会显示成错误语义。去掉多余的项并注明取值来源。
-- **“自动刷新开关开着”与“后台线程真在跑”区分开**（server）。后台线程只在
-  `KEYBOX_REFRESH_ENABLED=true` 时由 main 启动一次，而管理接口可以直接 `set_enabled(true)`，
-  造成状态页报 enabled、实际永不刷新的假象。现在多记一个 `STARTED` 标记，`is_running()`
-  要求两者都成立；线程没启动时切换开关会返回 409 并提示去改配置。
-- **relay token 改定长比较**（server）。`check_static_token` 原本用 `==`，同文件里
-  `verify_admin` 已经用的是 `ct_eq_secret`，现在统一。（token 本身公开属于设计取舍，
-  这里防的只是时序侧信道。）
-- **README 补开发提示**：b-side 依赖的 `rsproperties` 只对 Linux / Android target 生效，
-  Windows 上裸跑 `cargo check` 会编译失败，需带 `--target`。
+服务端：
+
+- 任务结果回传增加状态与归属校验，重复或迟到的回传不再覆盖已完成的结果。
+- 修正等待超时与实际重试耗时的倒挂：A 端等待上限由 120s 调整为 180s。
+- 无鉴权的状态接口不再返回 Knox 挑战值。
+- 自动 keybox 刷新区分「开关已开」与「后台线程在运行」，避免状态页虚报。
+- EAT 解析失败改为记录日志，不再静默忽略。
+- relay token 改用定长比较；状态页 Knox 状态取值修正。
+
+B 端模块：
+
+- relay 增加守护循环，进程退出后自动重启。
+- session 文件增加过期时间与数量上限，不再无限增长。
 
 ## 1.4.2
 

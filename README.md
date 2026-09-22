@@ -77,23 +77,17 @@ remote: on
 
 ```
 ommega/
-├── a-side/                  # A 端（Magisk 模块）
-│   ├── source/              #   Rust 源码（keymint 守护进程 + ommega-inject 注入器）
-│   └── build/               #   ommega-a-release-1.4.3.zip 安装包（arm64-v8a + armeabi-v7a + x86 + x86_64）
-├── b-side/                  # B 端（Magisk 模块）
-│   ├── source/              #   Rust 源码（relay 守护进程）
-│   └── build/               #   ommegaclient-b-release-1.3.2.zip 安装包（arm64-v8a + x86_64）
-├── b-app/                   # B 端 Android App（Kotlin 工程）
-│   ├── source/              #   app 源码 + Gradle 配置
-│   └── build/               #   client-b-app-release.apk
-└── server/                  # 服务端
-    ├── source/              #   Rust 源码 + 运维脚本
-    └── build/               #   relay_rs-linux-x86_64-musl / relay_rs-windows-x86_64-msvc.exe
+├── a-side/source/           # A 端（Magisk 模块）Rust 源码：keymint 守护进程 + ommega-inject 注入器
+├── b-side/source/           # B 端（Magisk 模块）Rust 源码：relay 守护进程
+├── b-app/source/            # B 端 Android App（Kotlin + Gradle）
+└── server/source/           # 服务端 Rust 源码 + 运维脚本
 ```
+
+仓库只保存源码与文档，构建产物（模块 zip、APK、服务端二进制）一律以 Release 附件形式发布。
 
 ### Server 部署
 
-1. 按系统选择二进制：
+1. 从 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 下载对应二进制：
    - Linux x86_64：`relay_rs-linux-x86_64-musl`（musl 静态编译，无 libc 依赖，`chmod +x` 后直接运行）
    - Windows x86_64：`relay_rs-windows-x86_64-msvc.exe`
 2. 参考 `server/source/.env.pay.example` 的格式创建并配置 `.env`：RELAY_TOKEN、MySQL 连接、TLS 证书、HTTP/HTTPS 端口（默认 10886 / 8443）
@@ -107,6 +101,8 @@ ommega/
   `libs/<abi>/` 二进制；运行时守护脚本也按 `ro.product.cpu.abi` 选二进制，不靠目录顺序。
   用 `--abi <name>` 可只把指定 ABI 打进包里（仍是单包，可重复传），`--split` 才会每个 ABI 各出一个 zip。
 - B 端 App：在 `b-app/source` 下执行 Gradle 构建生成 APK
+
+构建完成后把 zip / APK / 服务端二进制作为 Release 附件上传即可，不需要提交进仓库。
 
 > 开发提示：`b-side` 依赖 `rsproperties`，它只对 Linux / Android target 生效，所以在
 > Windows 上直接跑裸 `cargo check`（不带 `--target`）会编译失败，看着像代码坏了。

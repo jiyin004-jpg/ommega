@@ -58,3 +58,9 @@ b-side/source/watch_relay.py
 # ===== 本机调试日志 / 跑测目录 =====
 /x.txt
 server/run-dev/
+
+# ===== 构建产物（只发 Release 附件，不入库）=====
+/a-side/build/
+/b-side/build/
+/b-app/build/
+/server/build/
