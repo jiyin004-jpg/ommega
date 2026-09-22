@@ -514,15 +514,26 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                 return Json(v).into_response();
             }
             Some(v) => {
+                // The empty-chain text must name the layer that produced it: the
+                // keybox/self_signed layers return the same shape, so the old
+                // wording ("from B device") sent operators looking at the wrong
+                // side. `device` is the *requested* device — the `b_poll` line
+                // right above shows which device actually served a substitution.
                 let msg = if attest_chain_empty(task_type, &v) {
-                    "empty cert chain from B device".to_string()
+                    if layer == "b" {
+                        "empty cert chain from B device".to_string()
+                    } else {
+                        format!("empty cert chain from layer '{layer}'")
+                    }
                 } else {
                     v.get("error")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown error")
                         .to_string()
                 };
-                tracing::info!("run_a_side_task: type={task_type} layer={layer} failed: {msg}");
+                tracing::info!(
+                    "run_a_side_task: type={task_type} layer={layer} device={device_id} failed: {msg}"
+                );
                 // StrongBox robustness mode: a StrongBox attest that the B
                 // device cannot fulfil (capability error — not supported /
                 // keys not provisioned / HAL absent — or no cert chain at

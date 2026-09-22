@@ -419,6 +419,21 @@ pub fn generate_attest_key_on(
         .map(|cert| cert.encodedCertificate)
         .collect();
 
+    // A HAL that reports generateKey() *success* together with an empty
+    // certificate chain must not be forwarded as a successful attestation:
+    // sending `cert_chain: []` means the operator cannot tell which side dropped
+    // the chain, and the empty session would also be persisted to
+    // /data/adb/ommega/sessions. Fail loudly instead: the relay server treats an
+    // error exactly like an empty chain (next layer / StrongBox demotion), so
+    // behaviour is unchanged.
+    if cert_chain.is_empty() {
+        return Err(anyhow!(
+            "real keymint {service} returned an empty certificate chain \
+             (key_blob {}B) — generateKey was accepted but the key was not attested",
+            result.keyBlob.len()
+        ));
+    }
+
     let session = TeeSession {
         key_blob: result.keyBlob,
         cert_chain,

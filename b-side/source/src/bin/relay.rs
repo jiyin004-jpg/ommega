@@ -647,6 +647,8 @@ fn handle_generate_attest(_task_type: &str, payload: &Value) -> Result<Value> {
                     "HAL exists but hardware type unavailable"
                 } else if err_str.contains("[km_error=") {
                     "HAL rejected key generation (possible parameter/version mismatch)"
+                } else if err_str.contains("empty certificate chain") {
+                    "HAL accepted key generation but returned no attestation certificate chain"
                 } else if err_str.contains("connect")
                     || err_str.contains("NameNotFound")
                     || err_str.contains("not found")

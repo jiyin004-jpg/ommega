@@ -85,6 +85,9 @@ ommega/
 
 仓库只保存源码与文档，构建产物（模块 zip、APK、服务端二进制）一律以 Release 附件形式发布。
 
+更新日志分两份，两个模块各看各的：`CHANGELOG.md` 是 A 端（服务端与 b-app 的改动也记在这），
+`CHANGELOG-B.md` 是 B 端模块；`update.json` / `b-update.json` 的 `changelog` 各自指向自己那份。
+
 ### Server 部署
 
 1. 从 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 下载对应二进制：

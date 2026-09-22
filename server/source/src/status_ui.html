@@ -146,7 +146,7 @@ async function load() {
     _devices = b;
     $('#onlineBadge').textContent = '在线设备：' + b.length;
     $('#bBody').innerHTML = b.length
-      ? b.map((x, i) => `<tr><td class="id-cell"><span class="id-link" onclick="showBoot(${i})" title="点击查看该设备的启动状态">${esc(x.device_id)}</span></td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
+      ? b.map((x, i) => `<tr><td class="id-cell"><span class="id-link" onclick="showBoot(${i})" title="点击查看该设备的启动状态">${esc(x.device_id)}</span>${x.tee_error ? ' <span class="tag off" title="TEE 自检失败，点开看原因">自检失败</span>' : ''}</td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
       : '<tr><td colspan="4" class="empty">暂无 B 端设备在线</td></tr>';
 
     const c = d.cert_devices || [];
@@ -209,7 +209,13 @@ function showBoot(i) {
         kvRow('厂商补丁', fmtPatch(b.patch_vendor)),
         ...knoxRows(b.knox),
       ].join('')
-    : '<div class="k">状态</div><div class="v">该设备暂未上报启动状态（等它完成一次认证后即可显示）</div>';
+    : (d.tee_error
+        ? [
+            kvRow('机型', d.machine_id || '—'),
+            kvRow('TEE 自检', '失败'),
+            kvRow('失败原因', d.tee_error),
+          ].join('')
+        : '<div class="k">状态</div><div class="v">该设备还没上报启动状态（连上服务端后会自动自检一次）</div>');
   $('#bootModal').classList.add('open');
 }
 

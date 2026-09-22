@@ -24,6 +24,16 @@ pub enum TaskStatus {
 /// 就永远等不到 pending TTL。
 const MAX_ASSIGN_ATTEMPTS: u32 = 5;
 
+/// 自检的结果回来之前，隔多久才允许重新排一次（毫秒）。设备刚连上时会立刻排
+/// 一次，正常情况下一个来回就出结论（`tee_error` 或 `boot`），不会再排。
+const SELFCHECK_RETRY_MS: u64 = 120_000;
+
+/// 自检失败原因写进状态页前的截断长度（B 端错误文本可能很长）。
+const SELFCHECK_ERROR_MAX_CHARS: usize = 300;
+
+/// 自检请求用的 alias。跟 A 端的 `ommega-remote-*` 分开，互不干扰。
+const SELFCHECK_ALIAS: &str = "ommega-selfcheck";
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub task_id: String,
@@ -61,6 +71,11 @@ pub struct DeviceEntry {
     /// Boot state parsed from the last attestation this device produced (see
     /// `cert::device_boot_info_from_chain`).  Carried across poll upserts.
     pub boot: Option<crate::cert::DeviceBootInfo>,
+    /// 自检（连上后替它排的那次认证）失败的原因。成功或还没自检时是 None，
+    /// 状态页用它解释"这台为什么没有启动信息"。
+    pub tee_error: Option<String>,
+    /// 上次替这台设备排自检的时间戳（毫秒，0 = 从没排过）。只用来限流。
+    pub tee_probe_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -107,6 +122,43 @@ pub struct TaskStore {
     completed_max: usize,
     /// How long completed/failed tasks are kept before being purged.
     completed_ttl: Duration,
+    /// B 端连上后是否替它排一次自检认证（见 `pop_for_b`）。
+    b_selfcheck: bool,
+}
+
+/// 单字节长度的 DER 封装（自检用的 AAID 长度远小于 128）。
+fn der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
+    debug_assert!(content.len() < 128);
+    let mut out = vec![tag, content.len() as u8];
+    out.extend_from_slice(content);
+    out
+}
+
+/// 自检请求用的 `AttestationApplicationId`（DER）：
+/// `SEQUENCE { SET { SEQUENCE { OCTET STRING "org.ommega.selfcheck", INTEGER 1 } },
+/// SET {} }`。自检没有真实调用方，用这个占位包名；做成合法 DER 是因为 b 端
+/// 会先 `check_app_id_der` 再交给 TEE。
+fn selfcheck_app_id_der() -> Vec<u8> {
+    let name = b"org.ommega.selfcheck";
+    // PackageInfoRecord ::= SEQUENCE { packageName OCTET STRING, version INTEGER }
+    let mut info = vec![0x04, name.len() as u8];
+    info.extend_from_slice(name);
+    info.extend_from_slice(&[0x02, 0x01, 0x01]); // version = 1
+    let record = der_wrap(0x30, &info);
+    // packageInfos ::= SET OF <record>
+    let mut body = der_wrap(0x31, &record);
+    // signatureDigests ::= SET OF <空>
+    body.extend_from_slice(&[0x31, 0x00]);
+    der_wrap(0x30, &body)
+}
+
+/// 截断上报文本（错误信息可能很长，状态页只留前面一段）。
+fn truncate_text(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 impl TaskStore {
@@ -115,6 +167,7 @@ impl TaskStore {
         pending_ttl_secs: u64,
         completed_max: usize,
         completed_ttl_secs: u64,
+        b_selfcheck: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
@@ -124,6 +177,7 @@ impl TaskStore {
             pending_ttl: Duration::from_secs(pending_ttl_secs),
             completed_max,
             completed_ttl: Duration::from_secs(completed_ttl_secs),
+            b_selfcheck,
         })
     }
 
@@ -132,6 +186,34 @@ impl TaskStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    /// 自检任务的 payload：跟 A 端请求同形，参数走 b 端默认值，且只有目标设备能领。
+    fn selfcheck_payload(device_id: &str) -> Value {
+        use base64::Engine as _;
+        let app_id = base64::engine::general_purpose::STANDARD.encode(selfcheck_app_id_der());
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+        let challenge = base64::engine::general_purpose::STANDARD.encode(nonce);
+        serde_json::json!({
+            // 自检标记：`complete_task` 只对带这个标记的任务写 `tee_error`，
+            // 免得 A 端某次参数不对的失败被记成"这台设备 TEE 坏了"。
+            "selfcheck": true,
+            "device_id": device_id,
+            "alias": SELFCHECK_ALIAS,
+            "challenge": challenge,
+            // 跟 A 端真实请求同形。b 端除了 `challenge` 和 AAID 之外都有默认值，
+            // 这里还是把常用参数显式写出来，让它跟一次真实认证走同一条路径。
+            "device_attest_context": {
+                "attestation_application_id": app_id,
+                "attestation_security_level": 1,
+                "key_algorithm": 3,
+                "ec_curve": 1,
+                "key_size": 256,
+                "purpose": [2, 3],
+                "digest": [4],
+            },
+        })
     }
 
     /// Create a task and enqueue it. Returns the task_id.
@@ -204,9 +286,16 @@ impl TaskStore {
         loop {
             {
                 let mut inner = self.inner.lock().await;
-                // Register the device as connected.
+                // Register the device as connected.  Carrying the previous
+                // boot/tee state forward keeps what the status page already
+                // knows about this device across the poll upsert.
                 let hb_now = Self::now_ms();
-                let known_boot = inner.devices.get(device_id).and_then(|d| d.boot.clone());
+                let (known_boot, known_tee_error, known_probe_at) =
+                    match inner.devices.get(device_id) {
+                        Some(d) => (d.boot.clone(), d.tee_error.clone(), d.tee_probe_at_ms),
+                        None => (None, None, 0),
+                    };
+                let has_tee_verdict = known_boot.is_some() || known_tee_error.is_some();
                 inner.devices.insert(
                     device_id.to_string(),
                     DeviceEntry {
@@ -215,6 +304,8 @@ impl TaskStore {
                         last_seen_ms: hb_now,
                         connected: true,
                         boot: known_boot,
+                        tee_error: known_tee_error,
+                        tee_probe_at_ms: known_probe_at,
                     },
                 );
                 self.mark_online_sync(device_id, hb_now);
@@ -222,6 +313,45 @@ impl TaskStore {
                     inner
                         .active_machine
                         .insert(device_id.to_string(), (machine_id.to_string(), hb_now));
+                }
+                // 自检：设备一连上就替它排一次认证，把 TEE 状态（启动信息）落到
+                // 状态页 —— 否则得等它恰好接到一次 A 端请求才有人认识它，服务端
+                // 重启后这段空白期更长，而那些从来没接到过请求的设备（比如 TEE
+                // 出问题、认证一直失败的那台）在页面上永远是一片空白。已经有结论
+                // 就不再排（成功解析出启动信息、或已经失败并记了原因），结论还没
+                // 回来之前的重排由 `SELFCHECK_RETRY_MS` 限流。
+                if self.b_selfcheck
+                    && !has_tee_verdict
+                    && hb_now.saturating_sub(known_probe_at) > SELFCHECK_RETRY_MS
+                {
+                    let task_id = uuid::Uuid::new_v4().to_string();
+                    inner.tasks.insert(
+                        task_id.clone(),
+                        Task {
+                            task_id: task_id.clone(),
+                            task_type: "attest".to_string(),
+                            payload: Self::selfcheck_payload(device_id),
+                            target_device_id: device_id.to_string(),
+                            assigned_device_id: None,
+                            assigned_at_ms: 0,
+                            attempts: 0,
+                            result: None,
+                            created_at_ms: hb_now,
+                            completed_at_ms: 0,
+                            status: TaskStatus::Pending,
+                        },
+                    );
+                    inner
+                        .pending_by_device
+                        .entry(device_id.to_string())
+                        .or_default()
+                        .push_back(task_id.clone());
+                    if let Some(entry) = inner.devices.get_mut(device_id) {
+                        entry.tee_probe_at_ms = hb_now;
+                    }
+                    tracing::info!(
+                        "b_selfcheck: enqueued TEE self-check {task_id} for {device_id}"
+                    );
                 }
                 // Reclaim timed-out assignments first.
                 self.reclaim_locked(&mut inner);
@@ -423,6 +553,13 @@ impl TaskStore {
         let Some(task_type) = task_type else {
             return Err("task not found".to_string());
         };
+        // 自检任务（`payload.selfcheck == true`）的结论要单独写回设备状态。
+        let is_selfcheck = inner
+            .tasks
+            .get(task_id)
+            .and_then(|t| t.payload.get("selfcheck"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let boot =
             if task_type == "attest" && result.get("error").is_none() && !device_id.is_empty() {
                 result
@@ -468,6 +605,16 @@ impl TaskStore {
         };
         let now = Self::now_ms();
         let is_err = result.get("error").is_some();
+        // 自检的失败原因下面要写回设备，而 `result` 马上会被移进 task，先抄出来。
+        let selfcheck_error = if is_err {
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string()
+        } else {
+            String::new()
+        };
         task.result = Some(result);
         task.status = if is_err {
             TaskStatus::Failed
@@ -488,6 +635,31 @@ impl TaskStore {
         if let Some(info) = boot {
             if let Some(entry) = inner.devices.get_mut(device_id) {
                 entry.boot = Some(info);
+                // 认证成功就说明 TEE 是好用的，清掉自检可能留下的失败记录。
+                entry.tee_error = None;
+            }
+        }
+        // 自检的失败原因要落到状态页上：这台设备之后可能再没人给它发任务，光有
+        // 一个空的 boot 看不出到底是"还没自检"还是"TEE 报错了"。
+        if is_selfcheck && !device_id.is_empty() {
+            let verdict = if is_err {
+                Some(truncate_text(&selfcheck_error, SELFCHECK_ERROR_MAX_CHARS))
+            } else if inner
+                .devices
+                .get(device_id)
+                .and_then(|d| d.boot.as_ref())
+                .is_none()
+            {
+                // 认证成功、链也回来了，但链里没有可解析的启动信息。
+                Some("认证链里没有可解析的启动信息".to_string())
+            } else {
+                None
+            };
+            if let Some(msg) = verdict {
+                tracing::info!("b_selfcheck: {device_id} TEE self-check failed: {msg}");
+                if let Some(entry) = inner.devices.get_mut(device_id) {
+                    entry.tee_error = Some(msg);
+                }
             }
         }
         Self::record_event_locked(&mut inner, device_id, 1);
@@ -688,7 +860,7 @@ mod online_snapshot_tests {
 
     #[test]
     fn connected_device_ids_sync_evicts_stale() {
-        let store = TaskStore::new(30, 60, 100, 60);
+        let store = TaskStore::new(30, 60, 100, 60, false);
         let now = TaskStore::now_ms();
         store.mark_online_sync("fresh", now);
         store.mark_online_sync("stale", now.saturating_sub(200_000));
@@ -696,5 +868,137 @@ mod online_snapshot_tests {
         let ids = store.connected_device_ids_sync();
         assert_eq!(ids.len(), 1, "stale device must be evicted on read");
         assert_eq!(ids[0], "fresh");
+    }
+}
+
+#[cfg(test)]
+mod selfcheck_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// 自检用的 AAID 必须是 b 端 `check_app_id_der` 能解出的形状，所以把编码
+    /// 逐字节钉住：`SEQUENCE { SET { SEQUENCE { OCTET STRING "org.ommega.selfcheck",
+    /// INTEGER 1 } }, SET {} }`。
+    #[test]
+    fn selfcheck_app_id_is_the_expected_der() {
+        let der = selfcheck_app_id_der();
+        assert_eq!(der[0], 0x30);
+        assert_eq!(der[1] as usize, der.len() - 2, "外层 SEQUENCE 长度不对");
+        assert_eq!(der[2], 0x31, "packageInfos 应该是 SET OF");
+        // 外层 SEQUENCE 的内容 = packageInfos SET（der[2..31]）+ 空的
+        // signatureDigests SET（der[31..33] 两字节），所以这里要减 6 而不是 4。
+        assert_eq!(der[3] as usize, der.len() - 6);
+        assert_eq!(der[4], 0x30, "PackageInfoRecord 应该是 SEQUENCE");
+        assert_eq!(der[5], 0x19);
+        assert_eq!(
+            &der[6..8],
+            &[0x04, 0x14],
+            "包名应该是 20 字节的 OCTET STRING"
+        );
+        assert_eq!(&der[8..28], b"org.ommega.selfcheck");
+        assert_eq!(&der[28..31], &[0x02, 0x01, 0x01], "version 应该是 1");
+        assert_eq!(&der[31..33], &[0x31, 0x00], "signatureDigests 应该是空 SET");
+        assert_eq!(der.len(), 33);
+    }
+
+    /// 设备一连上就替它排一次自检，而且只排一次；失败原因要落到设备状态上。
+    #[tokio::test]
+    async fn selfcheck_enqueued_once_and_records_failure() {
+        let store = TaskStore::new(30, 60, 100, 60, true);
+
+        // 第一次轮询：注册设备的同时排进自检，同一轮就能领到。
+        let task = store
+            .pop_for_b("device-b-self", "TEST-1", Duration::from_millis(50))
+            .await
+            .expect("连上后应该拿到一条自检任务");
+        assert_eq!(task.task_type, "attest");
+        assert_eq!(task.payload["selfcheck"], Value::Bool(true));
+        assert_eq!(task.payload["alias"], SELFCHECK_ALIAS);
+        assert_eq!(task.target_device_id, "device-b-self");
+        let ctx = &task.payload["device_attest_context"];
+        assert_eq!(ctx["attestation_security_level"], Value::from(1));
+        assert_eq!(
+            ctx["attestation_application_id"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(selfcheck_app_id_der())
+                    .as_str()
+            )
+        );
+        let nonce = base64::engine::general_purpose::STANDARD
+            .decode(task.payload["challenge"].as_str().unwrap())
+            .expect("challenge 必须是 base64");
+        assert_eq!(nonce.len(), 32, "challenge 应该是 32 字节随机数");
+
+        // 模拟 b 端回传失败（比如三星那种"成功但空链"最终被拦下的情况）。
+        store
+            .complete_task(
+                &task.task_id,
+                serde_json::json!({ "error": "empty cert chain" }),
+                "device-b-self",
+            )
+            .await
+            .expect("回传应该被接收");
+        let dev = store
+            .get_connected_devices()
+            .await
+            .into_iter()
+            .find(|d| d.device_id == "device-b-self")
+            .expect("设备应该还在线");
+        assert_eq!(dev.tee_error.as_deref(), Some("empty cert chain"));
+        assert!(dev.boot.is_none());
+
+        // 已经有结论（失败）了，不再重排。
+        assert!(
+            store
+                .pop_for_b("device-b-self", "TEST-1", Duration::from_millis(50))
+                .await
+                .is_none(),
+            "已经有自检结论的设备不该再被自检"
+        );
+    }
+
+    /// 自检"成功"、但链里没有可解析的启动信息时也要给出原因，不能留空。
+    #[tokio::test]
+    async fn selfcheck_unparsable_chain_reports_a_reason() {
+        let store = TaskStore::new(30, 60, 100, 60, true);
+        let task = store
+            .pop_for_b("device-b-blank", "TEST-1", Duration::from_millis(50))
+            .await
+            .expect("自检任务");
+        store
+            .complete_task(
+                &task.task_id,
+                serde_json::json!({ "cert_chain": [] }),
+                "device-b-blank",
+            )
+            .await
+            .expect("回传");
+        let dev = store
+            .get_connected_devices()
+            .await
+            .into_iter()
+            .find(|d| d.device_id == "device-b-blank")
+            .expect("设备在线");
+        assert!(
+            dev.tee_error
+                .as_deref()
+                .is_some_and(|e| e.contains("没有可解析的启动信息")),
+            "空链要给出可读原因，实际是 {:?}",
+            dev.tee_error
+        );
+    }
+
+    /// 关掉开关就完全不排自检。
+    #[tokio::test]
+    async fn selfcheck_disabled_enqueues_nothing() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        assert!(
+            store
+                .pop_for_b("device-b-off", "TEST-1", Duration::from_millis(50))
+                .await
+                .is_none(),
+            "关掉自检后不该有任何任务"
+        );
     }
 }

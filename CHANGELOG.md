@@ -1,8 +1,22 @@
-# 更新日志
+# A 端更新日志
+
+这里只写 A 端模块的改动；服务端和 b-app 的改动也一并记在这。B 端模块（`ommegaclient_b`）的
+改动看 [CHANGELOG-B.md](CHANGELOG-B.md)。
+
+## 未发布
+
+服务端：
+
+- **B 端连上后就自动做一次自检**：设备一连上就替它排一次认证，把 TEE 状态（启动信息）落到状态页，
+  不用再等它恰好接到一次 A 端请求 —— 服务端重启后那段空白期、以及从来没接到过请求的设备（比如
+  TEE 出问题、认证一直失败的那台）以前在页面上是一片空白。自检的失败原因会直接显示在设备详情里，
+  `RELAY_B_SELFCHECK=0` 可以关掉。
+- 逐层回退的日志文案修正：`empty cert chain from B device` 以前是写死的，`keybox` 层失败也会这么
+  打，把人往 B 端引；现在按层区分，并带上设备 ID。
 
 ## 1.4.3
 
-（A 端模块 1.4.3；B 端模块 1.3.2；b-app 未改动）
+（A 端模块 1.4.3，versionCode 26；b-app 未改动）
 
 服务端：
 
@@ -13,40 +27,24 @@
 - EAT 解析失败改为记录日志，不再静默忽略。
 - relay token 改用定长比较；状态页 Knox 状态取值修正。
 
-B 端模块：
-
-- relay 增加守护循环，进程退出后自动重启。
-- session 文件增加过期时间与数量上限，不再无限增长。
-
 ## 1.4.2
 
-（A 端模块 1.4.2，versionCode 24；B 端模块同步升到 1.3.1，包名不再带 ABI 后缀）
+（A 端模块 1.4.2，versionCode 24）
 
 - **模块包改回「单包多 ABI」**（2026-09-21）。`build.py` 之前按 `--abi` 逐个出包
-  （`ommega-a-release-arm64-v8a-….zip`、`ommegaclient-b-release-arm64-v8a-….zip`），但入库的
-  却是多 ABI 合并包，两边对不上。现在默认把全部受支持 ABI 打进**一个** zip
-  （A 端 arm64-v8a / armeabi-v7a / x86 / x86_64，B 端 arm64-v8a / x86_64），包名不再带 ABI 后缀，
+  （`ommega-a-release-arm64-v8a-….zip`），但入库的却是多 ABI 合并包，两边对不上。现在默认把
+  A 端全部受支持 ABI 打进**一个** zip（arm64-v8a / armeabi-v7a / x86 / x86_64），包名不再带 ABI 后缀，
   安装时由 `customize.sh` 按 `$ARCH` 释放对应的 `libs/<abi>/`。要只打某个 ABI 用 `--abi`
-  （仍是单包），要每个 ABI 各出一个包用 `--split`。
-- **修掉单包多 ABI 下的架构选择 bug**。`a-side/template/daemon`、`a-side/template/daemon-injector`
-  和 `b-side/template/service.sh` 找二进制都是「arm64-v8a 不存在就试 x86_64」的顺序 fallback ——
-  单 ABI 包时没暴露，一旦同一个包里同时带多个 ABI，x86_64 设备就会拿到 arm64 的二进制。现在都先按
-  `ro.product.cpu.abi`（拿不到再退回 `uname -m`）解析出本机 ABI，再取 `libs/<abi>/`；都拿不到才
-  退化成任意可用 ABI。
+  （仍是单包），要每个 ABI 各出一个包用 `--split`。（B 端同步改成单包，见 CHANGELOG-B.md。）
+- **修掉单包多 ABI 下的架构选择 bug**。`a-side/template/daemon` 和 `a-side/template/daemon-injector`
+  找二进制都是「arm64-v8a 不存在就试 x86_64」的顺序 fallback —— 单 ABI 包时没暴露，一旦同一个包里
+  同时带多个 ABI，x86_64 设备就会拿到 arm64 的二进制。现在先按 `ro.product.cpu.abi`（拿不到再退回
+  `uname -m`）解析出本机 ABI，再取 `libs/<abi>/`；都拿不到才退化成任意可用 ABI。
 - **WebUI 远程配置的复选框不再被长文案挤扁**。`webroot/index.html` 里 5 个 `label.config-option`
   用的是 `align-items:center` + `gap:4px`，而 `md-checkbox` 在 flex 里没有 `flex-shrink:0`，
   文案一长就把勾选框压成一半。改成 `align-items:flex-start` + `gap:8px`，勾选框 `flex-shrink:0`、
   文字 `flex:1;min-width:0`（多行也能正常换行）；同时把「声明不支持安全模块 StrongBox（应用将视为
   设备没有安全模块；重启后生效）」压成「声明不支持 StrongBox（重启后生效）」，中简 / 中繁 / 英三语同步。
-- **修掉 B 端启动即崩（编译配置错）**（2026-09-21 真机定位）。`b-side/scripts/setup_cargo_config.py`
-  生成的 rustflags 里多了 `-L native=<NDK>/sysroot/usr/lib/<triple>`，而那个目录只放静态库
-  （`libc.a` / `libm.a` / `libdl.a`，版本化的 `.so` stub 都在 `21/`~`35/` 这些 API 子目录、本来就在
-  clang 默认搜索路径上）。linker 因此把 bionic 静态链了进去，`NEEDED` 只剩 `liblog.so`，relay 一走到
-  `rsbinder::ProcessState::init_default()` 就空指针 SIGSEGV（`uptime 0s`、无日志、module.prop 卡在
-  「⏳ 启动中」）。去掉这行后依赖恢复成 `liblog/libdl/libm/libc`，真机跑通轮询与任务派发。
-  这个 config 是 `build.py` 本轮首次自动生成的，上一版是手工传 linker 编的所以没踩到；a-side 同名
-  脚本没这行，一直正常。修完顺手删了变成死代码的 `toml_escape()`。
-
 - **b-app 的 StrongBox 拒绝原因与 b-side 对齐**（2026-09 复审）。b-app 走 Android Keystore API，
   `setIsStrongBoxBacked` 在无 StrongBox 的设备上会静默降级 TEE（官方行为，链如实标 TEE），此前它不管
   什么情况都只把 framework 的 `e.message` 丢出去，跟 b-side 那两句固定英文对不上，server 的 Smart 模式

@@ -73,6 +73,9 @@ pub struct Config {
     pub completed_max: usize,
     /// 已完成/失败任务的保留时间（秒）。
     pub completed_ttl_secs: u64,
+    /// B 端一连上就替它排一次自检认证，把设备 TEE 状态（启动信息）落到状态页。
+    /// 默认开；`RELAY_B_SELFCHECK=0` 关掉。
+    pub b_selfcheck: bool,
 }
 
 impl Default for Config {
@@ -112,6 +115,7 @@ impl Default for Config {
             pending_ttl_secs: 300,
             completed_max: 10000,
             completed_ttl_secs: 60,
+            b_selfcheck: true,
         }
     }
 }
@@ -275,6 +279,10 @@ impl Config {
             if let Ok(n) = v.parse::<u64>() {
                 cfg.completed_ttl_secs = n;
             }
+        }
+        cfg.b_selfcheck = env_bool("RELAY_B_SELFCHECK", cfg.b_selfcheck);
+        if let Some(v) = env_or_dotenv(&dotenv, "RELAY_B_SELFCHECK") {
+            cfg.b_selfcheck = matches!(v.as_str(), "1" | "true" | "True" | "TRUE" | "yes" | "on");
         }
         if let Ok(v) = std::env::var("RELAY_COMPLETED_MAX") {
             if let Ok(n) = v.parse::<usize>() {

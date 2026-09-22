@@ -1192,6 +1192,9 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 "load": load,
                 "last_seen_ms": d.last_seen_ms,
                 "boot": boot,
+                // 自检失败的原因（连上后替它排的那次认证的结果）。有值时状态页
+                // 点开就能看到“为什么这台没有启动信息”，不再是一片空白。
+                "tee_error": d.tee_error,
             }),
             load,
         ));

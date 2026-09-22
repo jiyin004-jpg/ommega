@@ -78,6 +78,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         cfg.pending_ttl_secs,
         cfg.completed_max,
         cfg.completed_ttl_secs,
+        cfg.b_selfcheck,
     );
     // Initialize the Fernet cipher used to encrypt stored private keys.
     crate::crypto::init_fernet(&cfg.secret_key);
