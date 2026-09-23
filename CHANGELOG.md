@@ -1,8 +1,10 @@
 # A 端更新日志
 
-## 1.4.4
+## 1.4.5
 
-（A 端模块 1.4.4，versionCode 32；本版模块本身没有改动，改动都在服务端）
+（本版**只发服务端二进制**：`relay_rs-linux-x86_64-musl` 与 `relay_rs-windows-x86_64-msvc.exe`。
+A 端模块仍是 1.4.4 / versionCode 32，B 端模块 1.3.4，两者代码都没改，所以不重发模块 zip；
+`update.json` / `b-update.json` 也不动）
 
 服务端：
 
