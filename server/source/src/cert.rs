@@ -1120,6 +1120,13 @@ pub struct DeviceBootInfo {
     /// block for a chain that carries no boot information.  Smart mode reads it
     /// through [`attestation_security_level_from_chain`] instead.
     pub security_level: Option<i64>,
+    /// `ATTESTATION_APPLICATION_ID` (tag 709) as the chain itself reports it:
+    /// the package name(s) the key was minted for, `com.example` or
+    /// `com.example@12`.  Like `security_level` it is deliberately NOT part of
+    /// [`DeviceBootInfo::is_empty`] — it says nothing about the boot state, and
+    /// the status page reads it through
+    /// [`attestation_application_id_from_chain`] instead.
+    pub aaid: Option<String>,
     /// KeyMint os_version in its packed form (e.g. 160000 = Android 16).
     pub os_version: Option<i64>,
     pub patch_system: Option<i64>,
@@ -1266,6 +1273,71 @@ fn der_int(raw: &[u8]) -> Option<i64> {
     Some(value)
 }
 
+/// `AttestationApplicationId` (KeyMint tag 709) — the package identity a key
+/// was minted for.  KeyMint writes it as `[709] EXPLICIT OCTET STRING` holding
+/// the DER below; the EAT/CBOR form carries the same DER inside a byte string,
+/// and a few implementations skip the OCTET STRING wrapper.
+///
+/// ```text
+/// AttestationApplicationId ::= SEQUENCE {
+///     packageInfos     SET OF AttestationPackageInfo,
+///     signatureDigests SET OF OCTET STRING }
+/// AttestationPackageInfo ::= SEQUENCE {
+///     packageName OCTET STRING,
+///     version     INTEGER }
+/// ```
+///
+/// Returns the package names, `name@version` when a non-zero version is given,
+/// comma-separated.  `None` when there is nothing readable in there: this is a
+/// diagnostic string, so a malformed AAID is dropped rather than reported.
+fn parse_attestation_application_id(entry: &[u8]) -> Option<String> {
+    /// Everything beyond this is cut — the device entry has to stay small.
+    const MAX_CHARS: usize = 160;
+    const SEQUENCE_TAG: u64 = 0x30;
+
+    let mut pos = 0;
+    let first = take_tlv(entry, &mut pos)?;
+    // The `[709]` value is the OCTET STRING, the EAT claim is the DER itself;
+    // normalise to the DER.
+    let der = if first.tag == SEQUENCE_TAG {
+        entry
+    } else {
+        first.value
+    };
+    let mut p = 0;
+    let sequence = take_tlv(der, &mut p)?;
+    let mut q = 0;
+    let packages = take_tlv(sequence.value, &mut q)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut r = 0;
+    while let Some(info) = take_tlv(packages.value, &mut r) {
+        let mut s = 0;
+        let Some(name) = take_tlv(info.value, &mut s) else {
+            continue;
+        };
+        let mut text = String::from_utf8_lossy(name.value).into_owned();
+        // Version 0 means "not given" (AOSP writes 0 when the caller did not
+        // supply one), so it is left off instead of shown as `@0`.
+        if let Some(version) = take_tlv(info.value, &mut s).and_then(|v| der_int(v.value)) {
+            if version != 0 {
+                text.push_str(&format!("@{version}"));
+            }
+        }
+        if !text.is_empty() {
+            names.push(text);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut text = names.join(", ");
+    if text.chars().count() > MAX_CHARS {
+        text = text.chars().take(MAX_CHARS).collect();
+        text.push('…');
+    }
+    Some(text)
+}
+
 fn read_auth_list(list: &[u8], out: &mut DeviceBootInfo) {
     let mut pos = 0;
     while let Some(entry) = take_tlv(list, &mut pos) {
@@ -1297,6 +1369,9 @@ fn read_auth_list(list: &[u8], out: &mut DeviceBootInfo) {
             // STRING），不能当 patch 级别的别名收进来——否则 challenge 之类
             // 的随机字节会被 explicit_int 累积成整数，落在日期区间内就编造
             // 出一条假的 patch 值。
+            // ATTESTATION_APPLICATION_ID。链是“谁的身份”出的就看它，所以
+            // 不能像别的 tag 那样一丢了事。
+            709 => out.aaid = parse_attestation_application_id(entry.value),
             718 => out.patch_vendor = explicit_int(entry.value).and_then(as_patch_level),
             719 => out.patch_boot = explicit_int(entry.value).and_then(as_patch_level),
             _ => {}
@@ -1311,7 +1386,7 @@ fn read_auth_list(list: &[u8], out: &mut DeviceBootInfo) {
 /// reader keeps only what the status page shows, which is why it is not a
 /// general CBOR decoder.
 mod eat {
-    use super::{as_patch_level, to_hex, DeviceBootInfo};
+    use super::{as_patch_level, parse_attestation_application_id, to_hex, DeviceBootInfo};
     use anyhow::{anyhow, bail, Result};
 
     const CLAIM_SECURITY_LEVEL: i64 = -76_002;
@@ -1325,6 +1400,8 @@ mod eat {
     const CLAIM_OS_PATCHLEVEL: i64 = -80_000 - 706;
     const CLAIM_VENDOR_PATCHLEVEL: i64 = -80_000 - 718;
     const CLAIM_BOOT_PATCHLEVEL: i64 = -80_000 - 719;
+    /// KeyMint's ATTESTATION_APPLICATION_ID (709), renumbered the same way.
+    const CLAIM_ATTESTATION_APPLICATION_ID: i64 = -80_000 - 709;
     const SUBMOD_SOFTWARE: &str = "software";
     const SUBMOD_TEE: &str = "tee";
     /// Keeps a hand-crafted chain from recursing the stack away.
@@ -1372,6 +1449,11 @@ mod eat {
         let official_build = matches!(get(&claims, CLAIM_OFFICIAL_BUILD), Some(Cbor::Bool(true)));
         if let Some(Cbor::Array(states)) = get(&claims, CLAIM_BOOT_STATE) {
             out.verified_boot_state = verified_boot_state(states, official_build);
+        }
+        // AAID：多数实现把它放在 submods 的 software/tee 子 map 里（和 OS 版本
+        // 那几个一样），也有放顶层的，两处都收。
+        if let Some(Cbor::Bytes(app_id)) = get(&claims, CLAIM_ATTESTATION_APPLICATION_ID) {
+            out.aaid = parse_attestation_application_id(app_id);
         }
 
         if let Some(Cbor::Map(submods)) = get(&claims, CLAIM_SUBMODS) {
@@ -1428,6 +1510,12 @@ mod eat {
                 }
                 Some(CLAIM_BOOT_PATCHLEVEL) => {
                     out.patch_boot = as_int(value).and_then(as_patch_level);
+                }
+                // AAID 是 bstr，里面装的是与 ASN.1 那边相同的 DER。
+                Some(CLAIM_ATTESTATION_APPLICATION_ID) => {
+                    if let Cbor::Bytes(app_id) = value {
+                        out.aaid = parse_attestation_application_id(app_id);
+                    }
                 }
                 _ => {}
             }
@@ -1662,6 +1750,15 @@ pub fn device_boot_info_from_chain(leaf_b64: &str) -> Option<DeviceBootInfo> {
 /// through [`device_boot_info_from_chain`].
 pub fn attestation_security_level_from_chain(leaf_b64: &str) -> Option<i64> {
     boot_info_from_leaf(&decode_leaf(leaf_b64)?)?.security_level
+}
+
+/// The `ATTESTATION_APPLICATION_ID` (tag 709) of a base64 DER leaf: the package
+/// name(s) the key was minted for, as the chain itself states them.  This is
+/// what tells a chain the B-side *app* produced (`org.ommega.deviceb`) apart
+/// from one the module produced while relaying someone else's request — the
+/// requesting package — which no other field in the chain reveals.
+pub fn attestation_application_id_from_chain(leaf_b64: &str) -> Option<String> {
+    boot_info_from_leaf(&decode_leaf(leaf_b64)?)?.aaid
 }
 
 fn decode_leaf(leaf_b64: &str) -> Option<Vec<u8>> {
@@ -1922,9 +2019,26 @@ mod tests {
     const CLAIM_OS_PATCHLEVEL: i64 = -80_000 - 706;
     const CLAIM_VENDOR_PATCHLEVEL: i64 = -80_000 - 718;
     const CLAIM_BOOT_PATCHLEVEL: i64 = -80_000 - 719;
+    const CLAIM_ATTESTATION_APPLICATION_ID: i64 = -80_000 - 709;
 
     const EAT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 25];
     const KNOX_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 236, 11, 3, 23, 7];
+
+    /// 测试侧的 `AttestationApplicationId` DER 编码（单包，长度都 < 128）。
+    fn aaid_der(name: &str, version: i64) -> Vec<u8> {
+        let mut info_body = vec![0x04, name.len() as u8];
+        info_body.extend_from_slice(name.as_bytes());
+        info_body.extend_from_slice(&[0x02, 0x01, version as u8]);
+        let mut info = vec![0x30, info_body.len() as u8];
+        info.extend_from_slice(&info_body);
+        let mut package_infos = vec![0x31, info.len() as u8];
+        package_infos.extend_from_slice(&info);
+        let mut body = package_infos;
+        body.extend_from_slice(&[0x31, 0x00]); // 空的 signatureDigests
+        let mut out = vec![0x30, body.len() as u8];
+        out.extend_from_slice(&body);
+        out
+    }
 
     // ---- test-side CBOR writer: just the shapes the EAT claims use ----
 
@@ -2447,6 +2561,91 @@ mod tests {
         assert_eq!(info.os_version, Some(160_000));
         assert_eq!(info.patch_system, Some(202_606));
         assert!(info.knox.is_none());
+    }
+
+    /// AAID 是「这条链是谁的身份出的」唯一硬证据（服务端判读法就是靠它），
+    /// 所以两种编码都要能读出来，而且不能把没有 AAID 的链读成有。
+    #[test]
+    fn asn1_chain_exposes_the_attestation_application_id() {
+        let identity = generate_self_signed("ec").unwrap();
+        let with_aaid = AttestationParams {
+            challenge: vec![0x01],
+            app_id: Some(aaid_der("org.ommega.deviceb", 12)),
+            ..Default::default()
+        };
+        let device = DeviceIdentity {
+            device_id: "test-device".to_string(),
+            algorithm: "ec".to_string(),
+            certificate_chain_pem: identity.certificate_chain_pem,
+            private_key_pem_cipher: identity.private_key_pem,
+            active: true,
+            machine_id: "test".to_string(),
+            created_at: String::new(),
+        };
+        let (chain, _) = build_attested_chain(&device, &with_aaid).unwrap();
+        let leaf = parse_chain_pem(&chain).unwrap().remove(0);
+        let leaf_b64 = base64::engine::general_purpose::STANDARD.encode(&leaf);
+        assert_eq!(
+            attestation_application_id_from_chain(&leaf_b64).as_deref(),
+            Some("org.ommega.deviceb@12")
+        );
+
+        let no_aaid = AttestationParams {
+            challenge: vec![0x01],
+            ..Default::default()
+        };
+        let (chain, _) = build_attested_chain(&device, &no_aaid).unwrap();
+        let leaf = parse_chain_pem(&chain).unwrap().remove(0);
+        let leaf_b64 = base64::engine::general_purpose::STANDARD.encode(&leaf);
+        assert_eq!(attestation_application_id_from_chain(&leaf_b64), None);
+    }
+
+    #[test]
+    fn eat_chain_exposes_the_attestation_application_id() {
+        let app_id = aaid_der("com.example.app", 1);
+        // submods 里的 software 子 map（真机常见位置）
+        let in_submod = encode(&Val::Map(vec![
+            (Val::Int(CLAIM_VERIFIED_BOOT_KEY), Val::Bytes(&[0x11u8; 32])),
+            (
+                Val::Int(CLAIM_SUBMODS),
+                Val::Map(vec![(
+                    Val::Text("software"),
+                    Val::Map(vec![(
+                        Val::Int(CLAIM_ATTESTATION_APPLICATION_ID),
+                        Val::Bytes(&app_id),
+                    )]),
+                )]),
+            ),
+        ]));
+        let info = device_boot_info_from_chain(&leaf_with_extension(EAT_OID, &in_submod)).unwrap();
+        assert_eq!(info.aaid.as_deref(), Some("com.example.app@1"));
+
+        // 顶层摆放（版本 0 不显示）
+        let top_level = encode(&Val::Map(vec![
+            (Val::Int(CLAIM_VERIFIED_BOOT_KEY), Val::Bytes(&[0x11u8; 32])),
+            (
+                Val::Int(CLAIM_ATTESTATION_APPLICATION_ID),
+                Val::Bytes(&aaid_der("com.example.app", 0)),
+            ),
+        ]));
+        let info = device_boot_info_from_chain(&leaf_with_extension(EAT_OID, &top_level)).unwrap();
+        assert_eq!(info.aaid.as_deref(), Some("com.example.app"));
+    }
+
+    /// AAID 不能把一条没有启动信息的链变成“有启动信息”，否则状态页会给它显示
+    /// 一个空的启动块。
+    #[test]
+    fn aaid_alone_does_not_make_a_boot_record() {
+        let payload = encode(&Val::Map(vec![(
+            Val::Int(CLAIM_ATTESTATION_APPLICATION_ID),
+            Val::Bytes(&aaid_der("com.example.app", 0)),
+        )]));
+        let leaf = leaf_with_extension(EAT_OID, &payload);
+        assert!(device_boot_info_from_chain(&leaf).is_none());
+        assert_eq!(
+            attestation_application_id_from_chain(&leaf).as_deref(),
+            Some("com.example.app")
+        );
     }
 
     /// 拿真机证书对拍。android/keyattestation 的 testdata 里每张 `.pem` 边上放着一份

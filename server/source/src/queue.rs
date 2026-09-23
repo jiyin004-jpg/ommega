@@ -71,6 +71,13 @@ pub struct DeviceEntry {
     /// Boot state parsed from the last attestation this device produced (see
     /// `cert::device_boot_info_from_chain`).  Carried across poll upserts.
     pub boot: Option<crate::cert::DeviceBootInfo>,
+    /// `ATTESTATION_APPLICATION_ID` from the last chain this device produced —
+    /// the package identity the key was minted for, parsed by
+    /// `cert::attestation_application_id_from_chain`.  This is the one field
+    /// that tells a chain minted by the device's *app* (`org.ommega.deviceb`)
+    /// apart from one the module minted while relaying someone else's request
+    /// (the requesting package).  Carried across poll upserts like `boot`.
+    pub last_aaid: Option<String>,
     /// 自检（连上后替它排的那次认证）失败的原因。成功或还没自检时是 None，
     /// 状态页用它解释"这台为什么没有启动信息"。
     pub tee_error: Option<String>,
@@ -290,10 +297,15 @@ impl TaskStore {
                 // boot/tee state forward keeps what the status page already
                 // knows about this device across the poll upsert.
                 let hb_now = Self::now_ms();
-                let (known_boot, known_tee_error, known_probe_at) =
+                let (known_boot, known_aaid, known_tee_error, known_probe_at) =
                     match inner.devices.get(device_id) {
-                        Some(d) => (d.boot.clone(), d.tee_error.clone(), d.tee_probe_at_ms),
-                        None => (None, None, 0),
+                        Some(d) => (
+                            d.boot.clone(),
+                            d.last_aaid.clone(),
+                            d.tee_error.clone(),
+                            d.tee_probe_at_ms,
+                        ),
+                        None => (None, None, None, 0),
                     };
                 let has_tee_verdict = known_boot.is_some() || known_tee_error.is_some();
                 inner.devices.insert(
@@ -304,6 +316,7 @@ impl TaskStore {
                         last_seen_ms: hb_now,
                         connected: true,
                         boot: known_boot,
+                        last_aaid: known_aaid,
                         tee_error: known_tee_error,
                         tee_probe_at_ms: known_probe_at,
                     },
@@ -560,16 +573,24 @@ impl TaskStore {
             .and_then(|t| t.payload.get("selfcheck"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let boot =
+        // 同一条叶子证书上再取一次 AAID：启动信息只说明"设备处于什么状态"，
+        // AAID 才说明"这条链是谁的身份出的"，两个都要落到状态页上。
+        let (boot, chain_aaid) =
             if task_type == "attest" && result.get("error").is_none() && !device_id.is_empty() {
-                result
+                match result
                     .get("cert_chain")
                     .and_then(Value::as_array)
                     .and_then(|chain| chain.first())
                     .and_then(Value::as_str)
-                    .and_then(crate::cert::device_boot_info_from_chain)
+                {
+                    Some(leaf) => (
+                        crate::cert::device_boot_info_from_chain(leaf),
+                        crate::cert::attestation_application_id_from_chain(leaf),
+                    ),
+                    None => (None, None),
+                }
             } else {
-                None
+                (None, None)
             };
         // 只允许"在飞"的任务被回传终结：已经完结的任务再来一次（b 端最多
         // 重试 4 次、最坏 139s，同一个结果可能重复到达）不能覆盖已有结果，
@@ -632,11 +653,16 @@ impl TaskStore {
         } else {
             inner.completed_queue.push_back((now, task_id.to_string()));
         }
-        if let Some(info) = boot {
+        if boot.is_some() || chain_aaid.is_some() {
             if let Some(entry) = inner.devices.get_mut(device_id) {
-                entry.boot = Some(info);
-                // 认证成功就说明 TEE 是好用的，清掉自检可能留下的失败记录。
-                entry.tee_error = None;
+                if let Some(info) = boot {
+                    entry.boot = Some(info);
+                    // 认证成功就说明 TEE 是好用的，清掉自检可能留下的失败记录。
+                    entry.tee_error = None;
+                }
+                if let Some(aaid) = chain_aaid {
+                    entry.last_aaid = Some(aaid);
+                }
             }
         }
         // 自检的失败原因要落到状态页上：这台设备之后可能再没人给它发任务，光有

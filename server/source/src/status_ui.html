@@ -200,6 +200,7 @@ function showBoot(i) {
   $('#bootBody').innerHTML = b
     ? [
         kvRow('机型', d.machine_id || '—'),
+        kvRow('认证应用（AAID）', d.aaid || '—'),
         kvRow('锁定状态', b.device_locked === true ? '已锁定（locked）' : b.device_locked === false ? '未锁定（unlocked）' : '—'),
         kvRow('启动校验', VB_STATE[b.verified_boot_state] ?? (b.verified_boot_state ?? '—')),
         kvRow('Boot Key', fmtHex(b.boot_key)),
@@ -212,6 +213,7 @@ function showBoot(i) {
     : (d.tee_error
         ? [
             kvRow('机型', d.machine_id || '—'),
+            kvRow('认证应用（AAID）', d.aaid || '—'),
             kvRow('TEE 自检', '失败'),
             kvRow('失败原因', d.tee_error),
           ].join('')
