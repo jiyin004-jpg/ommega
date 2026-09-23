@@ -258,7 +258,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Arc::new(Config::load());
     tracing::info!(
-        "relay_rs starting: mode={} bind={} http={} https={} tls={}",
+        "relay_rs starting: version={} mode={} bind={} http={} https={} tls={}",
+        crate::config::VERSION,
         if cfg.server_keybox_enabled() {
             "server_keybox"
         } else {

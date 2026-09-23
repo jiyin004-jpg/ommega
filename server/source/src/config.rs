@@ -5,6 +5,12 @@
 
 use std::path::Path;
 
+/// 版本号唯一来源 = 仓库根的 `VERSION`（A 模块 / B 模块 / b-app / 服务端 四端一致）。
+///
+/// `Cargo.toml` 的 version 在编译期被写进二进制，所以这里用 `env!` 读它，再由
+/// `version_tests` 里的单测强制它等于 `VERSION` 文件：只改一处会在 `cargo test` 直接红。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -308,5 +314,37 @@ impl Config {
 
     pub fn server_keybox_enabled(&self) -> bool {
         self.attest_source.eq_ignore_ascii_case("server_keybox")
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::VERSION;
+
+    #[test]
+    fn version_matches_the_repo_version_file() {
+        assert_eq!(
+            VERSION,
+            include_str!("../../../VERSION").trim(),
+            "Cargo.toml 的 version 必须等于仓库根的 VERSION（两个都要改）"
+        );
+    }
+
+    /// A/B 模块与 b-app 的 versionCode 是 major*1000000+minor*1000+patch 推出来的，
+    /// 版本号必须是这个三段格式，它们才算得出来。
+    #[test]
+    fn version_is_major_minor_patch() {
+        let parts: Vec<&str> = VERSION.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "VERSION 必须是 MAJOR.MINOR.PATCH: {VERSION}"
+        );
+        for p in parts {
+            assert!(
+                p.parse::<u32>().is_ok(),
+                "VERSION 的每一段都得是数字: {VERSION}"
+            );
+        }
     }
 }

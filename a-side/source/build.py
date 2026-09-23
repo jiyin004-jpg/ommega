@@ -25,6 +25,9 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parent
 TARGET_ROOT = REPO_ROOT / "target"
 
+# 版本号唯一来源：仓库根的 VERSION（A 模块 / B 模块 / b-app / 服务端 四端必须一致）。
+VERSION_FILE = REPO_ROOT.parent.parent / "VERSION"
+
 
 def ensure_cargo_config() -> None:
     """`.cargo/config.toml` 不入库，干净 clone 里没有它，cargo 不知道 Android
@@ -118,26 +121,31 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
         raise RuntimeError(f"command failed: {' '.join(cmd)}")
 
 
-def get_version_from_cargo_toml() -> str:
+def get_version() -> str:
+    """版本号唯一来源 = 仓库根的 VERSION；顺带强制 Cargo.toml 与它一致。"""
+    version = VERSION_FILE.read_text(encoding="utf-8").strip()
     with (REPO_ROOT / "Cargo.toml").open("r", encoding="utf-8") as fh:
-        cargo_toml = toml.loads(fh.read())
-    return cargo_toml["package"]["version"]
+        cargo_version = toml.loads(fh.read())["package"]["version"]
+    if cargo_version != version:
+        raise SystemExit(
+            f"Cargo.toml version ({cargo_version}) != VERSION ({version}): "
+            "两个都要改，别只改一个"
+        )
+    return version
 
 
-def get_git_commit_count() -> str:
-    result = subprocess.run(
-        ["git", "rev-list", "--count", "HEAD"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        # Not a git checkout (e.g. a source archive); fall back to 0.
-        return "0"
-    git_count = result.stdout.strip()
-    if not git_count.isdigit():
-        raise ValueError(f"Git commit count must be numeric only, got: {git_count}")
-    return git_count
+def version_code(version: str) -> str:
+    """versionCode 由版本号推出（major*1000000 + minor*1000 + patch）。
+
+    以前用 git 提交数：随便一次无关提交都会让它跳，没有 .git 的源码包还会退化成 0。
+    """
+    parts = version.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise ValueError(f"VERSION must be MAJOR.MINOR.PATCH, got: {version}")
+    major, minor, patch = (int(p) for p in parts)
+    if minor > 999 or patch > 999:
+        raise ValueError(f"VERSION minor/patch must be <= 999: {version}")
+    return str(major * 1_000_000 + minor * 1_000 + patch)
 
 
 def get_git_commit_hash() -> str:
@@ -263,7 +271,7 @@ def configure_template_for_abis(stage_dir: Path, abis: list[str]) -> None:
     print(f"Updated customize.sh supported ABIs to {supported_arch}")
 
 
-def modify_module_prop(stage_dir: Path, version: str, git_count: str, git_hash: str) -> None:
+def modify_module_prop(stage_dir: Path, version: str, vcode: str, git_hash: str) -> None:
     module_prop_path = stage_dir / "module.prop"
     if not module_prop_path.exists():
         raise FileNotFoundError(f"module.prop not found at {module_prop_path}")
@@ -271,9 +279,9 @@ def modify_module_prop(stage_dir: Path, version: str, git_count: str, git_hash: 
     version_name = f"{version}-{git_hash}"
     content = module_prop_path.read_text(encoding="utf-8")
     content = content.replace("${versionName}", version_name)
-    content = content.replace("${versionCode}", git_count)
+    content = content.replace("${versionCode}", vcode)
     write_text_lf(module_prop_path, content)
-    print(f"Updated module.prop: versionName={version_name}, versionCode={git_count}")
+    print(f"Updated module.prop: versionName={version_name}, versionCode={vcode}")
 
 
 def generate_hash_for_file(file_path: Path) -> None:
@@ -343,7 +351,7 @@ def build_package_for_abi(
     release: bool,
     platform: int,
     version: str,
-    git_count: str,
+    vcode: str,
     git_hash: str,
 ) -> Path:
     target = ABI_TO_TARGET[abi]
@@ -378,7 +386,7 @@ def build_package_for_abi(
                 stage_dir,
             )
 
-        modify_module_prop(stage_dir, version, git_count, git_hash)
+        modify_module_prop(stage_dir, version, vcode, git_hash)
         normalize_module_text_files(stage_dir)
         generate_hash_files(stage_dir)
         return create_zip_package(
@@ -399,7 +407,7 @@ def build_combined_package(
     release: bool,
     platform: int,
     version: str,
-    git_count: str,
+    vcode: str,
     git_hash: str,
 ) -> Path:
     """Build every selected ABI into a single module zip.
@@ -441,7 +449,7 @@ def build_combined_package(
                     stage_dir,
                 )
 
-        modify_module_prop(stage_dir, version, git_count, git_hash)
+        modify_module_prop(stage_dir, version, vcode, git_hash)
         normalize_module_text_files(stage_dir)
         generate_hash_files(stage_dir)
         return create_zip_package(
@@ -486,12 +494,12 @@ def main() -> None:
 
     ensure_cargo_config()
 
-    version = get_version_from_cargo_toml()
-    git_count = get_git_commit_count()
+    version = get_version()
+    vcode = version_code(version)
     git_hash = get_git_commit_hash()
     selected_abis = args.abis or sorted(ABI_TO_TARGET)
 
-    print(f"Building ommega-a version {version} (commit {git_count}, hash {git_hash})")
+    print(f"Building ommega-a version {version} (versionCode {vcode}, hash {git_hash})")
     print(f"Build mode: {'Release' if args.release else 'Debug'}")
     print(f"Target ABIs: {', '.join(selected_abis)}")
 
@@ -505,7 +513,7 @@ def main() -> None:
                     release=args.release,
                     platform=args.platform,
                     version=version,
-                    git_count=git_count,
+                    vcode=vcode,
                     git_hash=git_hash,
                 )
             )
@@ -516,7 +524,7 @@ def main() -> None:
                 release=args.release,
                 platform=args.platform,
                 version=version,
-                git_count=git_count,
+                vcode=vcode,
                 git_hash=git_hash,
             )
         )

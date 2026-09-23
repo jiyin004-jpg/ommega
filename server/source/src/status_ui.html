@@ -140,7 +140,7 @@ async function load() {
   try {
     const r = await fetch('/api/status/');
     const d = await r.json();
-    $('#modeBadge').textContent = '模式：' + (d.mode === 'serverbox' ? 'serverbox（服务器出证）' : 'physical（A/B 转发）');
+    $('#modeBadge').textContent = '模式：' + (d.mode === 'serverbox' ? 'serverbox（服务器出证）' : 'physical（A/B 转发）') + ' · 服务端 v' + (d.version || '?');
 
     const b = d.online_b_devices || [];
     _devices = b;

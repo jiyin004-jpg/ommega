@@ -1242,6 +1242,8 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
 
     Json(json!({
         "status": "ok",
+        // 线上跑的到底是哪一版 —— 以后不用再靠 sha256 认。
+        "version": crate::config::VERSION,
         "mode": if state.fulfill.is_enabled() { "serverbox" } else { "physical" },
         "online_b_devices": connected,
         "cert_devices": cert_devices,

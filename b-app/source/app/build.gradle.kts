@@ -3,6 +3,15 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+// 版本号唯一来源 = 仓库根的 VERSION（A 模块 / B 模块 / b-app / 服务端 四端一致）。
+val ommegaVersion = file("$rootDir/../../VERSION").readText().trim()
+
+// versionCode 由版本号推出：major*1000000 + minor*1000 + patch（1.5.0 -> 1500000），
+// 与 A/B 模块的 build.py 用同一套算法。
+val ommegaVersionCode = ommegaVersion.split(".").let { (major, minor, patch) ->
+    major.toInt() * 1_000_000 + minor.toInt() * 1_000 + patch.toInt()
+}
+
 android {
     namespace = "org.ommega.deviceb"
     compileSdk = 36
@@ -11,8 +20,8 @@ android {
         applicationId = "org.ommega.deviceb"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3.1-ommega"
+        versionCode = ommegaVersionCode
+        versionName = ommegaVersion
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
