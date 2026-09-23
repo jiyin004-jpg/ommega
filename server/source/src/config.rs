@@ -29,14 +29,23 @@ pub struct Config {
     /// fulfils tasks locally using the stored DeviceServerIdentity.
     pub attest_source: String,
     /// Seconds a B-side assignment may stay pending before being reclaimed.
-    pub assignment_timeout_secs: u64,
-    /// Default A-side wait-for-result timeout, seconds.
     ///
-    /// 必须大于 b 端一次回传的最坏耗时，否则“a 端已超时、b 端还在重试”的
-    /// 结果就没人接收了。b 端 post_result 最多 4 次尝试，每次 connect 3s +
-    /// read 30s（relay.rs 的 CONNECT_TIMEOUT_MS / READ_TIMEOUT_MS），退避
-    /// 1s+2s+4s，合起来 4×33+7 = 139s，所以这个值取了 180。改 b 端的重试参数
-    /// 时要一并核对这里。
+    /// “设备接到任务后多久必须交结果”的死线，超时就把任务放回队列，免得一台卡住
+    /// 的设备拖住整条请求。TEE 里做一次 keymint 调用是百毫秒量级，设备又是在长
+    /// 轮询上等着拿任务，留 3s 已经很宽松。可用 `RELAY_ASSIGNMENT_TIMEOUT` 调整。
+    pub assignment_timeout_secs: u64,
+    /// A-side wait-for-result timeout, seconds —— layer ① 等 B 设备结果的上限。
+    ///
+    /// 必须小于 a 端的 HTTP 读超时（`a-side/source/src/remote.rs` 的
+    /// `READ_TIMEOUT_MS = 30_000`）：超了就是“a 端已经放弃、服务端还在等”，用户
+    /// 什么都拿不到。同时也必须足够短：一次 TEE 认证正常情况下是百毫秒到一两秒
+    /// （实测小米 1.6s / 三星 0.5s），等几十秒说明设备已经不对劲了，此时快速失败、
+    /// 让回退阶梯（服务端密钥 → 自签 → a 端本地）接手反而更快也更可靠。3s 覆盖
+    /// “一次长轮询空档 + TEE 运算 + 回传”的常规耗时。可用
+    /// `RELAY_WAIT_RESULT_TIMEOUT` 调整。
+    ///
+    /// 代价：b 端若需要重试回传（最多 4×33s + 7s 退避），这次结果可能晚于 a 端
+    /// 超时，就作废了 —— 但那时 a 端已经从回退层拿到一条能用的链。
     pub wait_result_timeout_secs: u64,
     /// Long-poll default timeout, seconds.
     pub poll_timeout_secs: u64,
@@ -95,8 +104,8 @@ impl Default for Config {
             keybox_refresh_enabled: true,
             keybox_refresh_interval_secs: 7200,
             attest_source: "physical".to_string(),
-            assignment_timeout_secs: 60,
-            wait_result_timeout_secs: 180,
+            assignment_timeout_secs: 3,
+            wait_result_timeout_secs: 3,
             poll_timeout_secs: 30,
             mysql_url: String::new(),
             mysql_time_zone: "+08:00".to_string(),
@@ -228,8 +237,8 @@ impl Config {
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_ATTEST_SOURCE") {
             cfg.attest_source = v;
         }
-        cfg.assignment_timeout_secs = env_u64("RELAY_ASSIGNMENT_TIMEOUT", 60);
-        cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 180);
+        cfg.assignment_timeout_secs = env_u64("RELAY_ASSIGNMENT_TIMEOUT", 3);
+        cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 3);
         cfg.poll_timeout_secs = env_u64("RELAY_POLL_TIMEOUT", 30);
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_MYSQL_URL") {
             cfg.mysql_url = v;
