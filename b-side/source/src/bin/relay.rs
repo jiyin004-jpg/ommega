@@ -65,13 +65,39 @@ const READ_TIMEOUT_MS: u64 = 30_000;
 const CONF_PATH: &str = "/data/adb/ommega/relay.conf";
 const RESTART_MARKER: &str = "/data/adb/ommega/restart.all";
 const RELOAD_POLL_MS: u64 = 1000;
-const MODULE_PROP: &str = "/data/adb/modules/ommegaclient_b/module.prop";
+/// Only used when the module root cannot be derived from the running binary
+/// (relay started from a user-placed copy under `/data/adb/ommega/`).
+const FALLBACK_MODULE_PROP: &str = "/data/adb/modules/ommegaclient_b/module.prop";
+
+/// Module dir of the running binary: relay lives in
+/// `/data/adb/modules/<id>/libs/<abi>/relay` (or `<id>/relay`), so walking up to
+/// the `modules` directory yields the module root whatever its id is.
+fn module_root_from_exe() -> Option<std::path::PathBuf> {
+    let exe = std::fs::read_link("/proc/self/exe").ok()?;
+    let mut dir = exe.parent()?;
+    loop {
+        let name = dir.file_name()?.to_str()?.to_string();
+        if dir.parent().is_some_and(|p| p.ends_with("modules")) && name != "modules" {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
 
 /// Keep the KernelSU/Magisk module status (module.prop description) in sync
 /// with the relay's real state. Best effort: failures are silently ignored
 /// (e.g. module dir absent when running from a manual copy).
+///
+/// The write goes through [`write_atomic`] on purpose: `service.sh` kills stale
+/// relay processes with `kill -9` before every start, and a plain `fs::write`
+/// (truncate, then write) landing in that window leaves an empty `module.prop` —
+/// the manager card would then show neither name nor version.
 fn update_module_status(status: &str) {
-    let Ok(contents) = std::fs::read_to_string(MODULE_PROP) else {
+    let prop_file = module_root_from_exe()
+        .map(|root| root.join("module.prop"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from(FALLBACK_MODULE_PROP));
+    let Ok(contents) = std::fs::read_to_string(&prop_file) else {
         return;
     };
     let mut out = String::new();
@@ -88,7 +114,32 @@ fn update_module_status(status: &str) {
         }
     }
     if changed {
-        let _ = std::fs::write(MODULE_PROP, out);
+        let _ = write_atomic(&prop_file, out.as_bytes());
+    }
+}
+
+/// Same-directory temp file, `fsync`, then `rename`: readers (and a `kill -9`
+/// at the wrong moment) see either the old file or the new one, never a
+/// half-written or empty one.
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(".module.prop.tmp.{}", std::process::id()));
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(data)?;
+        file.sync_all()
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 

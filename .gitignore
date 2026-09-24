@@ -64,3 +64,6 @@ server/run-dev/
 /b-side/build/
 /b-app/build/
 /server/build/
+
+# Cindy 的工作树目录（工具自己的，不属于本仓库）
+.cindy-worktrees/

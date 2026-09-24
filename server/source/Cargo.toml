@@ -1,7 +1,7 @@
 [package]
 name = "relay_rs"
 authors = ["jiyin004"]
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 description = "Rust port of the ommega relay_server (A/B relay protocol + server_keybox)"
 license = "MIT"

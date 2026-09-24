@@ -60,6 +60,11 @@ fn module_root_from_exe() -> Option<PathBuf> {
 /// Best-effort update of the module.prop description so the KernelSU/Magisk
 /// card reflects the actual injected state.  The module dir is derived from the
 /// running binary's own path, so this works regardless of module id.
+///
+/// The write goes through [`write_atomic`] on purpose: `service.sh` kills stale
+/// module processes with `kill -9` before every start, and a plain `fs::write`
+/// (truncate, then write) landing in that window leaves an empty `module.prop` —
+/// the manager card would then show neither name nor version.
 pub fn update_module_status(status: &str) {
     let Some(module_root) = module_root_from_exe() else {
         return;
@@ -82,7 +87,32 @@ pub fn update_module_status(status: &str) {
         }
     }
     if changed {
-        let _ = std::fs::write(&prop_file, out);
+        let _ = write_atomic(&prop_file, out.as_bytes());
+    }
+}
+
+/// Same-directory temp file, `fsync`, then `rename`: readers (and a `kill -9`
+/// at the wrong moment) see either the old file or the new one, never a
+/// half-written or empty one.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".module.prop.tmp.{}", std::process::id()));
+    let written = File::create(&tmp).and_then(|mut file| {
+        file.write_all(data)?;
+        file.sync_all()
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
