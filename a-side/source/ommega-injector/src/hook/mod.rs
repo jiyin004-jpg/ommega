@@ -7,6 +7,9 @@ pub(crate) mod binder;
 mod install;
 mod intercept;
 pub(crate) mod rewrite;
+pub(crate) mod soter;
+pub(crate) mod soter_local;
+pub(crate) mod soter_ndk;
 
 static OLD_IOCTL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static OLD_CLOSE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());

@@ -16,5 +16,3 @@ macro_rules! err {
         format!("{}:{}", file!(), line!())
     };
 }
-
-

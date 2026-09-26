@@ -67,3 +67,6 @@ server/run-dev/
 
 # Cindy 的工作树目录（工具自己的，不属于本仓库）
 .cindy-worktrees/
+
+# 发版打包产物（几十 MB 的 zip），不进版本库
+.release-history/

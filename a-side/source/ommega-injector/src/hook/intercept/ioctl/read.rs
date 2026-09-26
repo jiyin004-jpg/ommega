@@ -2,13 +2,17 @@ use super::super::*;
 
 pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
     fd: c_int,
-    read: &mut [u8],
+    read: &mut Vec<u8>,
 ) -> PendingReadEffects {
     let base = read.as_mut_ptr();
     let total_size = read.len();
     let mut offset = 0usize;
     let connection = binder_state_key(fd);
     let mut effects = PendingReadEffects::new(connection);
+    // 要就地换掉的失败回复：`(命令字偏移, 命令总长, 换成什么字节流)`。先收集、
+    // 等遍历完了再统一处理 —— 边遍历边 splice 会 realloc，`base` 就废了，
+    // 后面所有偏移全乱。
+    let mut replacements: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     while offset < total_size {
         let command_start = base.add(offset);
         if total_size.saturating_sub(offset) < size_of::<u32>() {
@@ -50,6 +54,17 @@ pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
             )
         {
             complete_failed_transaction_submission(fd, cmd_nr);
+            // 这条 BR_FAILED_REPLY 可能是我们自己在写阶段把 handle 换坏引出来的：
+            // 换成备好的真回复，宿主就当这个调用成功了。
+            if cmd_nr == BR_FAILED_REPLY_NR {
+                if let Some(framed) = peek_intercepted_soter(connection) {
+                    replacements.push((
+                        command_start as usize - base as usize,
+                        size_of::<u32>() + cmd_size,
+                        framed,
+                    ));
+                }
+            }
         } else if is_read {
             match cmd_nr {
                 BR_TRANSACTION_NR => {
@@ -157,6 +172,10 @@ pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
         }
         offset += cmd_size;
     }
+    // 从后往前换，前面那些命令的偏移就不会被搅动。
+    for (at, len, framed) in replacements.into_iter().rev() {
+        read.splice(at..at + len, framed);
+    }
     effects
 }
 
@@ -176,6 +195,14 @@ unsafe fn handle_incoming_transaction(
         }
         return false;
     }
+
+    // The SOTER observer watches *incoming* requests: in a server-role process every
+    // transaction an app sends arrives on the read side, while the write side only ever
+    // carries this process's own replies. The payload was swapped for a shadow copy by the
+    // caller, which is exactly what `observe` assumes.
+    // SAFETY: the caller installed the shadow, so `tr.data.ptr.buffer` points at a readable
+    // copy inside this process.
+    let _ = unsafe { crate::hook::soter::observe(tr) };
 
     handle_br_transaction(binder_state_key(fd), tr, caller_sid, label)
 }

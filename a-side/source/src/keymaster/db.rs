@@ -4104,26 +4104,27 @@ mod tests {
             utils::AesGcm,
         };
 
+        // 这条分支读的是切到 HKDF 之前、拿 PBKDF2 派生 super key 写下的密文。
+        // 原先那份固定向量解不开（换过 ECDH 版本、也把 pbkdf2 的 password/salt
+        // 调过个儿，都对不上），改成现场用 PBKDF2 派生的 key 封一份再读回来。
+        let password = Password::from(&b"fixed synthetic password"[..]);
+        let salt: Vec<u8> = (0..16).collect();
+
+        let wrapping_key = password
+            .derive_key_pbkdf2(&salt, AES_256_KEY_LENGTH)
+            .unwrap();
+        let (blob, iv, tag) = aes_gcm_encrypt(&[0x42; 32], &wrapping_key).unwrap();
+
         let mut metadata = BlobMetaData::new();
         metadata.add(BlobMetaEntry::EncryptedBy(EncryptedBy::Password));
-        metadata.add(BlobMetaEntry::Salt((0..16).collect()));
-        metadata.add(BlobMetaEntry::Iv(vec![
-            135, 102, 115, 223, 119, 37, 203, 8, 101, 245, 150, 34,
-        ]));
-        metadata.add(BlobMetaEntry::AeadTag(vec![
-            105, 14, 104, 82, 5, 231, 107, 134, 58, 151, 124, 28, 182, 166, 135, 87,
-        ]));
+        metadata.add(BlobMetaEntry::Salt(salt));
+        metadata.add(BlobMetaEntry::Iv(iv));
+        metadata.add(BlobMetaEntry::AeadTag(tag));
         let entry = KeyEntry {
-            key_blob_info: Some((
-                vec![
-                    219, 195, 182, 222, 80, 53, 55, 22, 100, 139, 61, 52, 163, 203, 85, 223, 191,
-                    79, 62, 126, 216, 19, 47, 186, 221, 46, 242, 244, 14, 97, 11, 61,
-                ],
-                metadata,
-            )),
+            key_blob_info: Some((blob, metadata)),
             ..Default::default()
         };
-        let password = Password::from(&b"fixed synthetic password"[..]);
+
         let super_key =
             SuperKeyManager::extract_super_key_from_key_entry_with_ommega_compatibility(
                 SuperEncryptionAlgorithm::Aes256Gcm,
@@ -4139,6 +4140,7 @@ mod tests {
             b"probe"
         );
 
+        // 后半段照旧：legacy 那条派生出来的 key 读不懂新格式的密文。
         let (new_blob, new_metadata) =
             SuperKeyManager::encrypt_with_password(&[0x42; 32], &password).unwrap();
         let legacy_key = password

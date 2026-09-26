@@ -108,8 +108,11 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
 
     let mut completion_commands = Vec::new();
     let mut freed_inbound_shadows = Vec::new();
+    // 我们自己的 parcel 被宿主释放时那条 BC_FREE_BUFFER 会被整条抹掉，write 缓冲就短了。
+    let mut dropped_write_bytes = 0usize;
     if write_remaining > 0 {
-        freed_inbound_shadows = rewrite_inbound_free_buffers(connection, &mut host_write);
+        (freed_inbound_shadows, dropped_write_bytes) =
+            rewrite_inbound_free_buffers(connection, &mut host_write);
         for (end, _) in &mut freed_inbound_shadows {
             *end += input_write_consumed;
         }
@@ -126,7 +129,7 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
         }
         bwr.write_buffer = host_write.as_mut_ptr() as libc::c_ulong;
     }
-    bwr.write_size = write_remaining;
+    bwr.write_size = write_remaining.saturating_sub(dropped_write_bytes);
     bwr.write_consumed = 0;
 
     let ret = old_ioctl_fn(
@@ -138,7 +141,7 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
     let ioctl_error = (ret < 0).then_some(ioctl_errno);
     let driver_write_consumed = bwr.write_consumed;
     let driver_read_consumed = bwr.read_consumed;
-    let write_consumption_valid = driver_write_consumed <= write_remaining;
+    let write_consumption_valid = driver_write_consumed <= bwr.write_size;
     // binder_ioctl_write_read() resets read_consumed when the write phase fails,
     // even when userspace supplied an accumulated non-zero value.
     let read_consumption_reset =
@@ -169,14 +172,23 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
     }
     bwr.write_size = original_write_size;
     bwr.read_size = original_read_size;
-    bwr.write_consumed = input_write_consumed + driver_write_consumed;
+    // 驱动实打实吃掉的那部分（按宿主原始 write 缓冲的坐标算）。后面凡是拿
+    // write_consumed 当「流里走到哪了」的比较，都得用这个值，不能用下面那个
+    // 报给宿主的数 —— 那个多算了被我们吞掉的命令。
+    let driver_consumed = input_write_consumed + driver_write_consumed;
+    bwr.write_consumed = reported_write_consumed(
+        input_write_consumed,
+        driver_write_consumed,
+        dropped_write_bytes,
+        original_write_size,
+    );
     bwr.read_consumed = driver_read_consumed;
     bwr.write_buffer = original_write_buffer;
     bwr.read_buffer = original_read_buffer;
 
     for &(_, reply_data, expects_reply, acquire_target) in completion_commands
         .iter()
-        .take_while(|(end, _, _, _)| *end <= bwr.write_consumed)
+        .take_while(|(end, _, _, _)| *end <= driver_consumed)
     {
         if let Some(target) = acquire_target {
             complete_operation_acquire(target);
@@ -206,7 +218,7 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
         }
     }
 
-    mark_inbound_free_buffers_consumed(connection, &freed_inbound_shadows, bwr.write_consumed);
+    mark_inbound_free_buffers_consumed(connection, &freed_inbound_shadows, driver_consumed);
 
     let mut pending_read = PendingReadCopyback::None;
     let mut read_effects = PendingReadEffects::new(connection);
@@ -219,6 +231,19 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
         match copy_process_buffer(read_address, read_len) {
             Ok(mut read) => {
                 read_effects = parse_read_buffer(fd, &mut read);
+                // 我们可能把一条 4 字节的失败回复换成了更长的真回复：长度得跟着涨。
+                // 但宿主给的 read 缓冲就那么大，塞不下就退回内核给的那份长度。
+                let grown = read.len();
+                let available = original_read_size.saturating_sub(input_read_consumed);
+                if grown > available {
+                    warn!(
+                        "event=soter synthetic reply does not fit the host read buffer fd={} need={} have={}",
+                        fd, grown, available
+                    );
+                    read.truncate(read_len);
+                } else {
+                    bwr.read_consumed = input_read_consumed + grown;
+                }
                 if !copy_to_process(read_address, &read) {
                     warn!(
                         "event=binder failed to copy processed read buffer after ioctl fd={} previous={} consumed={}",
@@ -281,9 +306,30 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
         return -1;
     }
     read_effects.commit();
-    complete_inbound_free_buffers(connection, &freed_inbound_shadows, bwr.write_consumed);
+    complete_inbound_free_buffers(connection, &freed_inbound_shadows, driver_consumed);
     *libc::__errno() = ioctl_errno;
     ret
+}
+
+/// 报给宿主的 `write_consumed`。
+///
+/// 被我们吞掉的那几条命令（宿主释放我们合成的 parcel 时那条 BC_FREE_BUFFER，内核
+/// 对那个指针一无所知）驱动压根没看见，所以驱动报回来的消费量会短掉这一截。可宿主的
+/// libbinder 只认「我写出去的字节全被收下了」：`IPCThreadState::talkWithDriver` 里一旦
+/// `write_consumed < write_size`，它会直接 abort —— `Driver did not consume write buffer.
+/// err: OK consumed: 80 of 92` 就是这个，宿主当场没。
+///
+/// 那些字节我们确实处理过了（自己把 parcel 收回、命令抹掉），只是没转给驱动，所以替驱动
+/// 认下来，别让它短。上限是宿主给的 write_size，不越界。
+fn reported_write_consumed(
+    input_write_consumed: usize,
+    driver_write_consumed: usize,
+    dropped_write_bytes: usize,
+    original_write_size: usize,
+) -> usize {
+    let consumed = input_write_consumed.saturating_add(driver_write_consumed);
+    let acknowledged = dropped_write_bytes.min(original_write_size.saturating_sub(consumed));
+    consumed.saturating_add(acknowledged)
 }
 
 #[cfg(test)]

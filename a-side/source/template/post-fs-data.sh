@@ -1,6 +1,10 @@
 MODDIR=${0%/*}
 TARGET_DIR=/data/misc/keystore/ommega
 LOG_DIR=$TARGET_DIR/logs
+LOG_FILE=$LOG_DIR/post-fs-data.log
+# app 域（SOTER 宿主 uid 1000）进不去 keystore 那个 0770 目录，payload 的日志
+# 得有个它写得动的位置：权限开到 system 组。
+APP_LOG_DIR=/data/misc/ommega/logs
 TARGET_KEYBOX=$TARGET_DIR/keybox.xml
 TARGET_INJECTOR_CONFIG=$TARGET_DIR/injector.toml
 TARGET_CONF=$TARGET_DIR/config
@@ -28,8 +32,29 @@ chown 1017:1017 "$TARGET_DIR"
 mkdir -p "$LOG_DIR"
 chmod 0770 "$LOG_DIR"
 chown 1017:1017 "$LOG_DIR"
+mkdir -p "$APP_LOG_DIR"
+chmod 0770 "$APP_LOG_DIR"
+chown 0:1000 "$APP_LOG_DIR"
 mkdir -p "$STATE_DIR"
 rm -f "$STATE_DIR/keymint-daemon.pid" "$STATE_DIR/injector-daemon.pid"
+
+# 「启用调试日志」关着时本脚本一条都不打：post-fs-data 的输出也会进管理器的日志。
+debug_logging_enabled() {
+  [ -f "$TARGET_CONF" ] || return 1
+  val=$(sed -n 's/^[[:space:]]*\(debug_logging\|debug\|verbose\)[[:space:]]*:[[:space:]]*\(.*\)$/\2/p' "$TARGET_CONF" 2>/dev/null | head -n1 | tr -d ' \r' | tr 'A-Z' 'a-z')
+  case "$val" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# 只落文件，不再往 stdout 打（那会进管理器的日志，也是系统日志）。
+log_line() {
+  debug_logging_enabled || return 0
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  printf '%s [INFO] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null
+  return 0
+}
 rm -f "$STATE_DIR/restart.keymint" "$STATE_DIR/restart.injector" "$STATE_DIR/restart.all"
 
 # Make the shared A-side config directory traversable and expose the data dir.
@@ -136,13 +161,13 @@ for rel in $WL_RELS; do
     [ -e "$marker" ] && continue
     mkdir -p "$MODDIR/system/$rel"
     if mknod "$marker" c 0 0 2>/dev/null; then
-      echo "ommega: hide_strongbox on; whiteout restored at $rel"
+      log_line "ommega: hide_strongbox on; whiteout restored at $rel"
     elif printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions/>\n' > "$marker" 2>/dev/null; then
-      echo "ommega: hide_strongbox on; overlay restored at $rel"
+      log_line "ommega: hide_strongbox on; overlay restored at $rel"
     fi
   elif [ -e "$marker" ]; then
     rm -f "$marker"
-    echo "ommega: hide_strongbox off; whiteout removed from $rel"
+    log_line "ommega: hide_strongbox off; whiteout removed from $rel"
   fi
 done
 unset WL_NAME WL_RELS hide_strongbox

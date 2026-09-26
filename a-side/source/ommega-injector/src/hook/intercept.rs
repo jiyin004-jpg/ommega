@@ -61,6 +61,18 @@ struct PendingTransactionCompletion {
     operation_target: Option<NativeBinderRetirement>,
 }
 
+/// 一条被我们扣下的出站 SOTER 调用。
+///
+/// 它在写阶段被换成了一个无效 handle，所以内核会照自己的规矩回一个 `BR_FAILED_REPLY`；
+/// 我们在读阶段拿`framed` 把那 4 字节替掉，宿主就看到一笔正常的回复。
+struct InterceptedSoter {
+    /// 拼好的 `BR_TRANSACTION_COMPLETE` + `BR_REPLY` 字节流。
+    framed: Vec<u8>,
+    /// `framed` 里那个 `data.ptr.buffer` 指的就是它。得活到宿主把 `BC_FREE_BUFFER`
+    /// 交回来为止 —— 那个指针是我们自己的内存，内核根本不认识。
+    parcel: crate::parcel::OwnedReply,
+}
+
 #[derive(Clone, Copy)]
 struct PreparedBcReply {
     frame_id: Option<u64>,
@@ -80,6 +92,13 @@ thread_local! {
     static PREPARED_BC_REPLIES: RefCell<HashMap<BinderStateKey, VecDeque<PreparedBcReply>>> = RefCell::default();
     static OBSERVED_BINDER_FD_TOKENS: RefCell<HashMap<c_int, BinderFdToken>> = RefCell::default();
     static PENDING_IOCTL_COPYBACKS: RefCell<HashMap<BinderStateKey, PendingIoctlCopyback>> = RefCell::default();
+    /// 等着替换成真回复的 SOTER 调用，按 connection 分开、先进先出。
+    ///
+    /// 靠顺序而不靠 handle 对号：内核回 `BR_FAILED_REPLY` 的时候不带任何标识，
+    /// 而同一个线程上一次只会有一个同步调用在等（它阻塞在 ioctl 里），所以 FIFO 就够。
+    /// 队首那个的 parcel 得一直留着 —— 宿主释放它时发过来的 `BC_FREE_BUFFER`
+    /// 就指着这个地址，见 `is_soter_owned_buffer`。
+    static INTERCEPTED_SOTER: RefCell<HashMap<BinderStateKey, VecDeque<InterceptedSoter>>> = RefCell::default();
 }
 
 struct PendingIoctlCopyback {
@@ -130,6 +149,62 @@ fn copy_from_process(address: usize, destination: &mut [u8]) -> bool {
 
 fn copy_to_process(address: usize, source: &[u8]) -> bool {
     crate::sys::write_process_exact(Pid::this(), address, source).is_ok()
+}
+
+/// 记下一条扣下来的 SOTER 调用：备好的回复字节流，加那块得跟着活的 parcel。
+pub(super) fn remember_intercepted_soter(
+    connection: BinderStateKey,
+    framed: Vec<u8>,
+    parcel: crate::parcel::OwnedReply,
+) {
+    INTERCEPTED_SOTER.with(|slot| {
+        slot.borrow_mut()
+            .entry(connection)
+            .or_default()
+            .push_back(InterceptedSoter { framed, parcel });
+    });
+}
+
+/// 取队首那条备好的回复字节流（克隆一份走，不把它从队列里拿掉 ——
+/// parcel 还得留着撑到宿主的 `BC_FREE_BUFFER` 回来）。
+pub(super) fn peek_intercepted_soter(connection: BinderStateKey) -> Option<Vec<u8>> {
+    INTERCEPTED_SOTER.with(|slot| {
+        slot.borrow()
+            .get(&connection)?
+            .front()
+            .map(|entry| entry.framed.clone())
+    })
+}
+
+/// 宿主把队首那块 parcel 释放掉了，记录可以清了。
+pub(super) fn release_intercepted_soter(connection: BinderStateKey, buffer: usize) {
+    INTERCEPTED_SOTER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(queue) = slot.get_mut(&connection) else {
+            return;
+        };
+        if queue
+            .front()
+            .is_some_and(|entry| entry.parcel.data_ptr() as usize == buffer)
+        {
+            queue.pop_front();
+        }
+        if queue.is_empty() {
+            slot.remove(&connection);
+        }
+    });
+}
+
+/// 这个地址是不是我们自己合成回复时分配的（那它的 `BC_FREE_BUFFER` 就得整条抹掉，
+/// 因为内核对这个指针一无所知，让它发出去就是 binder_user_error + EINVAL）。
+pub(super) fn is_soter_owned_buffer(connection: BinderStateKey, buffer: usize) -> bool {
+    INTERCEPTED_SOTER.with(|slot| {
+        slot.borrow().get(&connection).is_some_and(|queue| {
+            queue
+                .iter()
+                .any(|entry| entry.parcel.data_ptr() as usize == buffer)
+        })
+    })
 }
 
 fn zeroed_buffer(size: usize) -> Result<Vec<u8>, c_int> {

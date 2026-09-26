@@ -135,6 +135,14 @@ pub(crate) const BINDER_GET_NODE_DEBUG_INFO: u32 = ioc(
 pub(crate) const BR_NOOP_CMD: u32 = ioc(IOC_NONE, b'r' as u32, BR_NOOP_NR, 0);
 pub(crate) const BR_TRANSACTION_COMPLETE_CMD: u32 =
     ioc(IOC_NONE, b'r' as u32, BR_TRANSACTION_COMPLETE_NR, 0);
+/// `BR_REPLY` 的完整命令字。方向是内核 → 用户，载荷是一个 `binder_transaction_data`，
+/// 所以 `_ioc_dir` 得是 `IOC_READ`。核对自己的回复是这样发下来的，我们合成时照抄这个形状。
+pub(crate) const BR_REPLY_CMD: u32 = ioc(
+    IOC_READ,
+    b'r' as u32,
+    BR_REPLY_NR,
+    size_of::<binder_transaction_data>(),
+);
 #[cfg(test)]
 pub(crate) const BR_TRANSACTION_CMD: u32 = ioc(
     IOC_READ,

@@ -353,7 +353,11 @@ mod test {
 
     #[test]
     fn test_output_is_consistent() -> Result<()> {
-        let initial_key = b"initial key";
+        // ommega 的 HKDF 是纯 Rust 实现（hkdf crate 的 from_prk），PRK 至少要
+        // 一个 SHA-256 摘要那么长（32 字节）；上游走 BoringSSL，不看长度，所以
+        // 上游那个 11 字节的 "initial key" 在这儿直接报 Failed to expand。
+        // 换成一个刚好 32 字节的常量，测的缓存推进逻辑没变。
+        let initial_key = b"initial key padded to 32 bytes..";
         let mut blkc = BootLevelKeyCache::new(ZVec::try_from(initial_key as &[u8])?);
         assert!(blkc.level_accessible(BootLevel(0)));
         assert!(blkc.level_accessible(BootLevel(9)));
@@ -485,7 +489,11 @@ mod ommega_test {
 
     #[test]
     fn legacy_cache_is_independent() -> Result<()> {
-        let initial_key = b"initial key";
+        // ommega 的 HKDF 是纯 Rust 实现（hkdf crate 的 from_prk），PRK 至少要
+        // 一个 SHA-256 摘要那么长（32 字节）；上游走 BoringSSL，不看长度，所以
+        // 上游那个 11 字节的 "initial key" 在这儿直接报 Failed to expand。
+        // 换成一个刚好 32 字节的常量，测的缓存推进逻辑没变。
+        let initial_key = b"initial key padded to 32 bytes..";
         let mut current = BootLevelKeyCache::new(ZVec::try_from(initial_key as &[u8])?);
         let mut legacy = LegacyBootLevelKeyCache::new(ZVec::try_from(initial_key as &[u8])?);
         assert_ne!(

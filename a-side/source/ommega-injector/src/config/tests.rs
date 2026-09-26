@@ -301,3 +301,45 @@ fn replace_save_retry_only_retries_read_failures() {
     assert!(matches!(error, LoadError::Parse(_)));
     assert!(sleeps.is_empty());
 }
+
+#[test]
+fn flat_config_bool_reads_the_webroot_spellings() {
+    let path = temp_config_path("flat-bool");
+    fs::write(
+        &*path,
+        "# comment\nurl: http://example\ndebug_logging: on\nglobal_scope: false\n",
+    )
+    .expect("flat config should be writable");
+
+    assert_eq!(
+        clienta_config_bool(&path, &["debug_logging", "debug", "verbose"]),
+        Some(true),
+        "`on` 是开"
+    );
+    assert_eq!(
+        clienta_config_bool(&path, &["global_scope"]),
+        Some(false),
+        "写了 false 就是明确的关"
+    );
+    assert_eq!(
+        clienta_config_bool(&path, &["soter_inject"]),
+        None,
+        "缺键返回 None，调用处才合并得上默认值"
+    );
+
+    fs::write(&*path, "Global_Scope:  1\n").expect("flat config should be writable");
+    assert_eq!(
+        clienta_config_bool(&path, &["global_scope"]),
+        Some(true),
+        "键大小写和 1 都要认"
+    );
+
+    assert_eq!(
+        clienta_config_bool(
+            Path::new("/definitely/not/there/config"),
+            &["debug_logging"]
+        ),
+        None,
+        "文件读不到就是 None，由调用处决定要不要当关"
+    );
+}

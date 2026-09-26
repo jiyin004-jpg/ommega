@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::hook::soter::SoterCall;
 
 fn prepared_bc_reply(fd: c_int, reply_index: usize) -> Option<PreparedBcReply> {
     let connection = binder_state_key(fd);
@@ -105,11 +106,15 @@ pub(super) unsafe fn write_buffer_is_safe_to_intercept(write: &[u8]) -> bool {
 
 pub(super) unsafe fn rewrite_inbound_free_buffers(
     connection: BinderStateKey,
-    write: &mut [u8],
-) -> Vec<(usize, usize)> {
+    write: &mut Vec<u8>,
+) -> (Vec<(usize, usize)>, usize) {
     let mut offset = 0usize;
     let mut rewritten = Vec::new();
+    // 宿主把我们合成回复的那块 parcel 释放了：这条命令得整条抹掉 —— 内核对那个
+    // 指针一无所知，真发出去就是 binder_user_error + EINVAL，整个 ioctl 批次都废。
+    let mut dropped: Vec<(usize, usize)> = Vec::new();
     while write.len().saturating_sub(offset) >= size_of::<u32>() {
+        let command_start = offset;
         let cmd = std::ptr::read_unaligned(write.as_ptr().add(offset) as *const u32);
         offset += size_of::<u32>();
         let cmd_size = _ioc_size(cmd);
@@ -123,7 +128,10 @@ pub(super) unsafe fn rewrite_inbound_free_buffers(
         {
             let payload = write.as_mut_ptr().add(offset) as *mut libc::c_ulong;
             let shadow_buffer = std::ptr::read_unaligned(payload) as usize;
-            if let Some(original_buffer) =
+            if is_soter_owned_buffer(connection, shadow_buffer) {
+                dropped.push((command_start, command_end));
+                release_intercepted_soter(connection, shadow_buffer);
+            } else if let Some(original_buffer) =
                 inbound_transaction_original_buffer(connection, shadow_buffer)
             {
                 std::ptr::write_unaligned(payload, original_buffer);
@@ -132,7 +140,24 @@ pub(super) unsafe fn rewrite_inbound_free_buffers(
         }
         offset = command_end;
     }
-    rewritten
+    if dropped.is_empty() {
+        return (rewritten, 0);
+    }
+    let removed = dropped.iter().map(|(start, end)| end - start).sum();
+    // 从后往前抹，前面的命令坐标就不会被搅动。
+    for (start, end) in dropped.iter().rev() {
+        write.drain(*start..*end);
+    }
+    // 那些窗口的结束位置得往前挪，挪多少 = 排在它前面被删掉的命令总长。
+    for (end, _) in rewritten.iter_mut() {
+        let shifted: usize = dropped
+            .iter()
+            .filter(|(_, drop_end)| drop_end <= end)
+            .map(|(start, drop_end)| drop_end - start)
+            .sum();
+        *end -= shifted;
+    }
+    (rewritten, removed)
 }
 
 pub(super) fn mark_inbound_free_buffers_consumed(
@@ -176,6 +201,43 @@ pub(in crate::hook::intercept) fn complete_inbound_free_buffers(
             entries.remove(&(connection, shadow_buffer));
         }
     }
+}
+
+/// 拿去换掉真 handle 的那个无效值。挑一个远超任何真实 ref 号的数 —— binder 的
+/// ref 号是从 1 往上发的，内核在它自己的 rb-tree 里查不到就回 BR_FAILED_REPLY。
+/// 代价是内核会打一条 binder_user_error，可接受：SOTER 调用不频繁。
+const SOTER_VOID_HANDLE: u32 = 0x7fff_ffff;
+
+/// 扣下一条出站 SOTER 调用：备好真回复、把目标 handle 换坏。
+///
+/// 备不出回复（本地后端不认识这个号、或者参数不够）就什么也不动，让这条调用照
+/// 原样去真 HAL —— 宁可慢一点，也别把宿主坑在一条它永远等不到的回复上。
+fn intercept_soter_call(fd: c_int, tr: &mut binder_transaction_data, call: &SoterCall) {
+    let Some((framed, parcel)) = crate::hook::soter::build_br_reply(call) else {
+        // 本地后端不认识这个号、或者参数不够 —— 放它去真 HAL。宿主等的是真回复，
+        // 比让它永远等不到要好。
+        log::info!(
+            "event=soter intercept skipped side=hal code={} uid={:?} (no local answer)",
+            call.code,
+            call.uid
+        );
+        return;
+    };
+    let connection = binder_state_key(fd);
+    let framed_len = framed.len();
+    remember_intercepted_soter(connection, framed, parcel);
+    // target 是个普通结构体，不是 union，改它不用 unsafe（tr 本身是本地副本，
+    // 不会碰到宿主内存）。
+    tr.target.handle = SOTER_VOID_HANDLE;
+    // 这条就是"拦截真的动手了"的无歧义凭据：出现它说明 handle 已被换坏、合成回复
+    // 已备好，read 侧随后会把内核的 BR_FAILED_REPLY 就地改成这条回复。
+    log::info!(
+        "event=soter intercept armed side=hal code={} uid={:?} framed_len={} handle=0x{:x}",
+        call.code,
+        call.uid,
+        framed_len,
+        SOTER_VOID_HANDLE
+    );
 }
 
 pub(super) unsafe fn parse_write_buffer(
@@ -265,6 +327,21 @@ pub(super) unsafe fn parse_write_buffer(
                         };
                         if inspectable {
                             log_write_transaction(label, &tr);
+                            if !is_reply {
+                                // 出站的 transaction 里可能就有 SOTER 的：宿主进程
+                                // 把 App 的请求转成对高通 HAL 的调用发出去。认出来了、
+                                // 而且我们本地答得了的话，就把目标 handle 换坏 ——
+                                // 命令本体原样留着（偏移记账全不用动），内核查不到那个
+                                // ref，会照自己的规矩回一个 BR_FAILED_REPLY，我们在读
+                                // 阶段把它换成真回复。
+                                // SAFETY: 上面 payload shadow 已经把这段换成本进程里的
+                                // 副本，tr.data 指向 tr.data_size 个可读字节。
+                                if let Some(call) = unsafe { crate::hook::soter::observe(&tr) } {
+                                    if crate::hook::soter::interceptable(&call) {
+                                        intercept_soter_call(fd, &mut tr, &call);
+                                    }
+                                }
+                            }
                         }
                         if let Some(shadow) = shadow.as_ref() {
                             shadow.restore(&mut tr);

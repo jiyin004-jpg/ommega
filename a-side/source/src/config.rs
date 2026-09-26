@@ -675,6 +675,28 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
+    // WebUI "mask SOTER" switch, off by default (an absent key means off).
+    // `kmod-loader.sh` is the only consumer and reads the flat key itself;
+    // `hide_soter` is accepted as an alias so a hand-written config cannot
+    // silently differ from the loader's reading.
+    let soter_hide = matches!(
+        get(&["soter_hide", "hide_soter"])
+            .map(|v| v.to_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+
+    // WebUI "inject the local SOTER service" switch, off by default (an absent
+    // key means off, which is what a fresh install and the WebUI both leave
+    // behind).  `daemon-injector` is the consumer: it reads the flat key itself
+    // and only starts the local SOTER host and injects into it when this is on.
+    let soter_inject = matches!(
+        get(&["soter_inject", "inject_soter"])
+            .map(|v| v.to_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
@@ -686,6 +708,8 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         fallback_local: true,
         debug_logging,
         hide_strongbox,
+        soter_hide,
+        soter_inject,
     })
 }
 
@@ -748,6 +772,22 @@ pub struct RemoteConfig {
     /// PackageManager reports the feature as absent.
     #[serde(default)]
     pub hide_strongbox: bool,
+    /// WebUI option "Mask SOTER". `kmod-loader.sh` reads the flat config key
+    /// directly and hides `/system/priv-app/SoterService` with the bundled
+    /// PathMask kernel module when the local SOTER binder service cannot be
+    /// reached; when this is false no kernel module is loaded at all and an
+    /// existing mask of ours is removed. Defaults to false: masking has to be
+    /// switched on explicitly in the WebUI.
+    #[serde(default)]
+    pub soter_hide: bool,
+    /// WebUI option "Inject the local SOTER service". When true
+    /// `daemon-injector` starts `com.tencent.soter.soterserver` at boot and
+    /// injects the payload into it (plus the Qualcomm SOTER HAL) so App SOTER
+    /// traffic can be observed; when false the SOTER host is neither started
+    /// nor injected. Defaults to false: injection has to be switched on
+    /// explicitly in the WebUI.
+    #[serde(default)]
+    pub soter_inject: bool,
 }
 
 impl Default for RemoteConfig {
@@ -764,8 +804,51 @@ impl Default for RemoteConfig {
             fallback_local: true,
             debug_logging: false,
             hide_strongbox: false,
+            soter_hide: false,
+            soter_inject: false,
         }
     }
+}
+
+/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`),
+/// read straight from the file instead of through the runtime [`config`].
+///
+/// `logging::init_logger()` is the first statement of `main()`, long before the
+/// runtime config exists, so the gate cannot go through the config bootstrap.
+/// An unreadable file, a missing key or a non-truthy value all mean "off" —
+/// which is exactly what the WebUI checkbox shows for those cases.  Off means
+/// every sink is silent (file log, logcat, all levels), not merely less
+/// verbose.
+pub fn flat_debug_logging() -> bool {
+    flat_config_truthy(&["debug_logging", "debug", "verbose"])
+}
+
+/// Reads one boolean key out of the flat A-side config.  Truthy spellings are
+/// `1` / `true` / `yes` / `on` (case-insensitive): the WebUI writes
+/// `true`/`false` for the relay flags and `0`/`1` for the mask/inject ones, and
+/// both have to keep working.
+fn flat_config_truthy(keys: &[&str]) -> bool {
+    let Ok(contents) = std::fs::read_to_string(CLIENTA_CONFIG_PATH) else {
+        return false;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = line.find(':') else {
+            continue;
+        };
+        let key = line[..idx].trim();
+        if !keys.iter().any(|want| key.eq_ignore_ascii_case(want)) {
+            continue;
+        }
+        return matches!(
+            line[idx + 1..].trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

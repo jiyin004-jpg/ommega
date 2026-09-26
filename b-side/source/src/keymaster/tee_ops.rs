@@ -45,7 +45,9 @@ fn now_date_time() -> DateTime {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    DateTime { ms_since_epoch: now }
+    DateTime {
+        ms_since_epoch: now,
+    }
 }
 
 /// Certificate validity bound (now + ~10 years).
@@ -56,14 +58,12 @@ fn after_date_time() -> DateTime {
     }
 }
 
-use crate::android::hardware::security::keymint::{
-    KeyPurpose::KeyPurpose,
-};
 use crate::android::hardware::security::keymint::KeyParameter::KeyParameter as KmKeyParameter;
+use crate::android::hardware::security::keymint::KeyPurpose::KeyPurpose;
 use crate::err as ks_err;
 use crate::keymaster::relay_tee::{
-    clear_system_keymint, extract_km_error_code, get_system_keymint,
-    key_params_to_aidl, probe_keymint_version, KEY_MINT_V5,
+    clear_system_keymint, extract_km_error_code, get_system_keymint, key_params_to_aidl,
+    probe_keymint_version, KEY_MINT_V5,
 };
 
 use super::attest_proxy::{SYSTEM_KEYMINT_DEFAULT, SYSTEM_KEYMINT_STRONGBOX};
@@ -278,7 +278,10 @@ fn sessions() -> &'static Mutex<HashMap<String, TeeSession>> {
 
 fn session_put(alias: &str, session: TeeSession) {
     save_session_to_disk(alias, &session);
-    sessions().lock().unwrap().insert(alias.to_string(), session);
+    sessions()
+        .lock()
+        .unwrap()
+        .insert(alias.to_string(), session);
 }
 
 fn session_get(alias: &str) -> Result<TeeSession> {
@@ -543,9 +546,7 @@ fn build_attestation_params(
         KmAlgorithm::Ec => {
             // The real TEE requires an explicit curve for EC keys; without it
             // generateKey fails with UNSUPPORTED_KEY_SIZE (ErrorCode -6).
-            params.push(KeyParam::EcCurve(
-                spec.ec_curve.unwrap_or(KmEcCurve::P256),
-            ));
+            params.push(KeyParam::EcCurve(spec.ec_curve.unwrap_or(KmEcCurve::P256)));
         }
         _ => {}
     }
@@ -601,7 +602,13 @@ pub fn sign(alias: &str, data: &[u8], algorithm: &str) -> Result<Vec<u8>> {
     let session = session_get(alias)?;
     let op_params = sign_begin_params(algorithm, session.algorithm)
         .with_context(|| ks_err!("unsupported sign algorithm {algorithm}"))?;
-    run_single_input_op(&session.key_blob, session.hal_service, KeyPurpose::SIGN, &op_params, data)
+    run_single_input_op(
+        &session.key_blob,
+        session.hal_service,
+        KeyPurpose::SIGN,
+        &op_params,
+        data,
+    )
 }
 
 /// Decrypts `data` with the TEE key for `alias`.
@@ -609,7 +616,13 @@ pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<Vec<u8>> {
     let session = session_get(alias)?;
     let op_params = decrypt_begin_params(algorithm, session.algorithm)
         .with_context(|| ks_err!("unsupported decrypt algorithm {algorithm}"))?;
-    run_single_input_op(&session.key_blob, session.hal_service, KeyPurpose::DECRYPT, &op_params, data)
+    run_single_input_op(
+        &session.key_blob,
+        session.hal_service,
+        KeyPurpose::DECRYPT,
+        &op_params,
+        data,
+    )
 }
 
 /// Formats a KeyMint service-specific error code as a `[km_error=CODE]`
@@ -639,12 +652,16 @@ fn run_single_input_op(
                 clear_system_keymint(hal_service);
             }
             let km_code = km_error_suffix(&status);
-            return Err(anyhow!("real keymint {hal_service} begin failed {km_code}: {status}"));
+            return Err(anyhow!(
+                "real keymint {hal_service} begin failed {km_code}: {status}"
+            ));
         }
     };
 
     let Some(operation) = begin.operation else {
-        return Err(anyhow!("real keymint {hal_service} begin returned no operation"));
+        return Err(anyhow!(
+            "real keymint {hal_service} begin returned no operation"
+        ));
     };
 
     // Feed the whole payload in a single update, then finish. update() may
@@ -652,20 +669,16 @@ fn run_single_input_op(
     // plaintext from update); finish() then returns whatever is left, so both
     // outputs must be concatenated or the operation's result is silently lost.
     let result = (|| -> Result<Vec<u8>> {
-        let mut out = operation
-            .update(input, None, None)
-            .map_err(|status| {
+        let mut out = operation.update(input, None, None).map_err(|status| {
+            let km_code = km_error_suffix(&status);
+            anyhow!("real keymint {hal_service} update failed {km_code}: {status}")
+        })?;
+        out.extend_from_slice(&operation.finish(None, None, None, None, None).map_err(
+            |status| {
                 let km_code = km_error_suffix(&status);
-                anyhow!("real keymint {hal_service} update failed {km_code}: {status}")
-            })?;
-        out.extend_from_slice(
-            &operation
-                .finish(None, None, None, None, None)
-                .map_err(|status| {
-                    let km_code = km_error_suffix(&status);
-                    anyhow!("real keymint {hal_service} finish failed {km_code}: {status}")
-                })?,
-        );
+                anyhow!("real keymint {hal_service} finish failed {km_code}: {status}")
+            },
+        )?);
         Ok(out)
     })();
 
@@ -780,8 +793,7 @@ fn digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
 
 fn spki_from_cert_der(der: &[u8]) -> Result<Vec<u8>> {
     use x509_cert::{der::Decode as _, der::Encode as _, Certificate};
-    let cert = Certificate::from_der(der)
-        .with_context(|| ks_err!("parse leaf certificate"))?;
+    let cert = Certificate::from_der(der).with_context(|| ks_err!("parse leaf certificate"))?;
     cert.tbs_certificate()
         .subject_public_key_info()
         .to_der()

@@ -401,6 +401,27 @@ impl RemoteRelay {
         });
         Self::post_json("/api/decrypt/", &body)
     }
+
+    /// Forward one SOTER operation to a B-side device.
+    ///
+    /// `payload` is the operation plus its arguments (`{"op": "export_ask_public_key",
+    /// "uid": 10373, ...}`); `device_id` is filled in here so the server prefers a
+    /// B端 carrying this device's own id and otherwise load-balances to another one
+    /// that reported SOTER support.
+    ///
+    /// `Ok(None)` means no B-side can serve SOTER right now — the server answers a
+    /// capability error (`no B-side device reporting SOTER support is online`, or
+    /// the chosen device's own HAL error) and this method maps it to "not
+    /// available", so the caller falls back to whatever it does without
+    /// forwarding instead of inventing an answer.
+    pub fn soter(payload: &Value) -> Result<Option<Value>> {
+        let mut body = match payload.as_object() {
+            Some(map) => map.clone(),
+            None => return Err(anyhow!("soter payload must be a JSON object")),
+        };
+        body.insert("device_id".to_string(), Value::from(Self::device_id()?));
+        Self::post_json("/api/soter/", &Value::Object(body))
+    }
 }
 
 fn base64_encode(data: &[u8]) -> String {

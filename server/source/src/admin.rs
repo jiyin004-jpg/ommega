@@ -230,6 +230,10 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
                 "last_seen_ms": d.last_seen_ms,
                 "connected": d.connected,
                 "load": load,
+                // 心跳里上报的能力（None = 没上报过）。管理页用它判断
+                // 这台能不能接 SOTER 任务。
+                "soter": d.supports_soter,
+                "strongbox": d.supports_strongbox,
             }),
             load,
         ));
@@ -1198,6 +1202,10 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 // 自检失败的原因（连上后替它排的那次认证的结果）。有值时状态页
                 // 点开就能看到“为什么这台没有启动信息”，不再是一片空白。
                 "tee_error": d.tee_error,
+                // 心跳里上报的能力：`true` 支持 / `false` 明确不支持 / `null`
+                // 没上报过（老版本 relay）。状态页点开设备时显示。
+                "soter": d.supports_soter,
+                "strongbox": d.supports_strongbox,
             }),
             load,
         ));

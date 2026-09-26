@@ -179,6 +179,8 @@ fn load_config_json() -> Result<Value> {
             "fallback_local": cfg.remote.fallback_local,
             "debug_logging": cfg.remote.debug_logging,
             "hide_strongbox": cfg.remote.hide_strongbox,
+            "soter_hide": cfg.remote.soter_hide,
+            "soter_inject": cfg.remote.soter_inject,
         }
     }))
 }
@@ -209,6 +211,12 @@ fn update_config(value: Value) -> Result<()> {
         }
         if let Some(v) = remote.get("hide_strongbox").and_then(Value::as_bool) {
             cfg.remote.hide_strongbox = v;
+        }
+        if let Some(v) = remote.get("soter_hide").and_then(Value::as_bool) {
+            cfg.remote.soter_hide = v;
+        }
+        if let Some(v) = remote.get("soter_inject").and_then(Value::as_bool) {
+            cfg.remote.soter_inject = v;
         }
     }
     ommegaclient_config::save(&cfg)?;
@@ -256,6 +264,13 @@ mod ommegaclient_config {
         pub fallback_local: bool,
         pub debug_logging: bool,
         pub hide_strongbox: bool,
+        /// WebUI "mask SOTER" switch, off by default: an absent key means off,
+        /// matching `Default::default()` and `kmod-loader.sh`.
+        pub soter_hide: bool,
+        /// WebUI "inject the local SOTER service" switch, off by default: an
+        /// absent key means off, matching `Default::default()` and
+        /// `daemon-injector`.
+        pub soter_inject: bool,
     }
 
     /// Legacy A-side (client-a) flat `key: value` config file.
@@ -298,6 +313,13 @@ mod ommegaclient_config {
                 "hide_strongbox" | "no_strongbox" | "hide_strongbox_keystore" => {
                     rc.hide_strongbox = parse_bool(&value).unwrap_or(false);
                 }
+                // An absent or unparsable value means off, like the loader.
+                "soter_hide" | "hide_soter" => {
+                    rc.soter_hide = parse_bool(&value).unwrap_or(false);
+                }
+                "soter_inject" | "inject_soter" => {
+                    rc.soter_inject = parse_bool(&value).unwrap_or(false);
+                }
                 _ => {}
             }
         }
@@ -314,6 +336,8 @@ mod ommegaclient_config {
         contents.push_str(&format!("tls_insecure: {}\n", cfg.remote.tls_insecure));
         contents.push_str(&format!("debug_logging: {}\n", cfg.remote.debug_logging));
         contents.push_str(&format!("hide_strongbox: {}\n", cfg.remote.hide_strongbox));
+        contents.push_str(&format!("soter_hide: {}\n", cfg.remote.soter_hide));
+        contents.push_str(&format!("soter_inject: {}\n", cfg.remote.soter_inject));
         if let Some(parent) = Path::new(CONFIG_PATH).parent() {
             fs::create_dir_all(parent).ok();
         }

@@ -83,6 +83,42 @@ pub struct DeviceEntry {
     pub tee_error: Option<String>,
     /// 上次替这台设备排自检的时间戳（毫秒，0 = 从没排过）。只用来限流。
     pub tee_probe_at_ms: u64,
+    /// 心跳里上报"这台能不能做 SOTER"。`Some(false)` 是设备明确说了没有，
+    /// `None` 是没上报过（老版本 relay），两者对路由的意义不同：说过没有的
+    /// 设备不会再被派 SOTER 任务。
+    pub supports_soter: Option<bool>,
+    /// 心跳里上报的 StrongBox 能力（有没有那个 HAL 实例）。只看展示，
+    /// StrongBox 出证走的是 strongbox 模式那套逻辑。
+    pub supports_strongbox: Option<bool>,
+}
+
+/// B 端心跳里带的能力声明。
+///
+/// `None` = 这台设备没上报这个能力（老版本 relay 不会带 `caps`），跟
+/// "上报了但没有"是两回事：路由时前者可以试，后者直接跳过。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceCaps {
+    pub soter: Option<bool>,
+    pub strongbox: Option<bool>,
+}
+
+impl DeviceCaps {
+    /// 解析心跳的 `caps` 字段：逗号分隔的能力名，例如 `soter,strongbox`。
+    ///
+    /// - 字段缺失（`None`）→ 没有上报，沿用上一次的结论；
+    /// - 空串（`Some("")`）→ 明确上报"一个都没有"。
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            None => DeviceCaps::default(),
+            Some(raw) => {
+                let has = |name: &str| raw.split(',').any(|t| t.trim().eq_ignore_ascii_case(name));
+                DeviceCaps {
+                    soter: Some(has("soter")),
+                    strongbox: Some(has("strongbox")),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,6 +323,7 @@ impl TaskStore {
         &self,
         device_id: &str,
         machine_id: &str,
+        caps: DeviceCaps,
         timeout: Duration,
     ) -> Option<Task> {
         let deadline = Instant::now() + timeout;
@@ -297,16 +334,24 @@ impl TaskStore {
                 // boot/tee state forward keeps what the status page already
                 // knows about this device across the poll upsert.
                 let hb_now = Self::now_ms();
-                let (known_boot, known_aaid, known_tee_error, known_probe_at) =
-                    match inner.devices.get(device_id) {
-                        Some(d) => (
-                            d.boot.clone(),
-                            d.last_aaid.clone(),
-                            d.tee_error.clone(),
-                            d.tee_probe_at_ms,
-                        ),
-                        None => (None, None, None, 0),
-                    };
+                let (
+                    known_boot,
+                    known_aaid,
+                    known_tee_error,
+                    known_probe_at,
+                    known_supports_soter,
+                    known_supports_strongbox,
+                ) = match inner.devices.get(device_id) {
+                    Some(d) => (
+                        d.boot.clone(),
+                        d.last_aaid.clone(),
+                        d.tee_error.clone(),
+                        d.tee_probe_at_ms,
+                        d.supports_soter,
+                        d.supports_strongbox,
+                    ),
+                    None => (None, None, None, 0, None, None),
+                };
                 let has_tee_verdict = known_boot.is_some() || known_tee_error.is_some();
                 inner.devices.insert(
                     device_id.to_string(),
@@ -319,6 +364,9 @@ impl TaskStore {
                         last_aaid: known_aaid,
                         tee_error: known_tee_error,
                         tee_probe_at_ms: known_probe_at,
+                        // 这次心跳没提的能力保留上次的结论，提了就按最新的算。
+                        supports_soter: caps.soter.or(known_supports_soter),
+                        supports_strongbox: caps.strongbox.or(known_supports_strongbox),
                     },
                 );
                 self.mark_online_sync(device_id, hb_now);
@@ -394,10 +442,20 @@ impl TaskStore {
     /// Try to dequeue a task matching this device from the FIFO.
     /// O(1): checks per-device queue first, then the wildcard queue.
     fn dequeue_locked(&self, inner: &mut Inner, device_id: &str) -> Option<Task> {
+        // 说过不支持的设备不该拿到 SOTER 任务：正常路径上 `resolve_soter_target`
+        // 已经把它排除了，这里是兜底（比如设备在上报之后能力又变了）。
+        let soter_ok = inner
+            .devices
+            .get(device_id)
+            .map(|d| d.supports_soter != Some(false))
+            .unwrap_or(true);
         // 1) Try device-specific queue first.
         if let Some(q) = inner.pending_by_device.get_mut(device_id) {
             while let Some(candidate_id) = q.pop_front() {
                 if let Some(t) = inner.tasks.get_mut(&candidate_id) {
+                    if !soter_ok && t.task_type == "soter" {
+                        continue;
+                    }
                     t.assigned_device_id = Some(device_id.to_string());
                     t.assigned_at_ms = Self::now_ms();
                     t.status = TaskStatus::Assigned;
@@ -412,6 +470,9 @@ impl TaskStore {
         // 2) Try wildcard (any-device) queue.
         while let Some(candidate_id) = inner.pending_any.pop_front() {
             if let Some(t) = inner.tasks.get_mut(&candidate_id) {
+                if !soter_ok && t.task_type == "soter" {
+                    continue;
+                }
                 t.assigned_device_id = Some(device_id.to_string());
                 t.assigned_at_ms = Self::now_ms();
                 t.status = TaskStatus::Assigned;
@@ -575,22 +636,22 @@ impl TaskStore {
             .unwrap_or(false);
         // 同一条叶子证书上再取一次 AAID：启动信息只说明"设备处于什么状态"，
         // AAID 才说明"这条链是谁的身份出的"，两个都要落到状态页上。
-        let (boot, chain_aaid) =
+        //
+        // 这里**只把 leaf 抄出来，不当场解析**。解析是两次纯 CPU 的 DER/CBOR
+        // 遍历，而这段还在 `inner` 锁里 —— 解析完才轮到下面的任务落库，才轮到
+        // 末尾的 notify_waiters，也就是说等这条结果的 A 端请求要陪着一起等。
+        // 状态页那份设备记录晚几十微秒更新没有任何人受影响，A 端的响应延迟却是
+        // 整条链路的关键路径。所以顺序反过来：先把结果放给 A 端，再解析、再落表。
+        let leaf =
             if task_type == "attest" && result.get("error").is_none() && !device_id.is_empty() {
-                match result
+                result
                     .get("cert_chain")
                     .and_then(Value::as_array)
                     .and_then(|chain| chain.first())
                     .and_then(Value::as_str)
-                {
-                    Some(leaf) => (
-                        crate::cert::device_boot_info_from_chain(leaf),
-                        crate::cert::attestation_application_id_from_chain(leaf),
-                    ),
-                    None => (None, None),
-                }
+                    .map(str::to_owned)
             } else {
-                (None, None)
+                None
             };
         // 只允许"在飞"的任务被回传终结：已经完结的任务再来一次（b 端最多
         // 重试 4 次、最坏 139s，同一个结果可能重复到达）不能覆盖已有结果，
@@ -653,6 +714,24 @@ impl TaskStore {
         } else {
             inner.completed_queue.push_back((now, task_id.to_string()));
         }
+        // 任务本身（结果 + 状态 + 归属 + 队列）到这里已经全部落定，先把锁放掉：
+        // A 端的 wait_for_result 只认 status，所以 notify 一响它立刻就能取走结果。
+        // 下面那串"状态页的活儿"不该再挡在它前面。
+        drop(inner);
+        self.notify.notify_waiters();
+
+        // 锁外解析：两次纯 CPU 的 DER/CBOR 遍历，不碰任何共享状态，也不用排队。
+        let (boot, chain_aaid) = match leaf {
+            Some(ref leaf) => (
+                crate::cert::device_boot_info_from_chain(leaf),
+                crate::cert::attestation_application_id_from_chain(leaf),
+            ),
+            None => (None, None),
+        };
+
+        // 再拿一次锁补设备记录。这一步纯粹是状态页展示用的，晚几十微秒没有任何
+        // 代价；万一这段时间设备下线、条目被清掉了，就当这次没解析过，不重建条目。
+        let mut inner = self.inner.lock().await;
         if boot.is_some() || chain_aaid.is_some() {
             if let Some(entry) = inner.devices.get_mut(device_id) {
                 if let Some(info) = boot {
@@ -691,8 +770,6 @@ impl TaskStore {
         Self::record_event_locked(&mut inner, device_id, 1);
         // Prune completed/failed tasks to stay within capacity/TTL limits.
         self.expire_locked(&mut inner);
-        drop(inner);
-        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -878,6 +955,83 @@ impl TaskStore {
         }
         candidates[0].0.clone()
     }
+
+    /// Resolve the target for a SOTER task.
+    ///
+    /// SOTER 的答案是在目标设备的 TEE 里签的，换台设备就换了身份，所以它跟认证
+    /// 不一样，没有 keybox / self_signed 兜底，只能挑一台真能做的设备：
+    ///
+    /// 1. 指定的设备在线、且上报了支持 SOTER → 就用它；
+    /// 2. 否则在"上报了支持"的在线设备里按负载挑一台；
+    /// 3. 再否则（没有设备上报过能力，比如老版本 relay）在"没上报"的设备里按负载挑；
+    /// 4. 都没有 → `None`，调用方自己降级。
+    ///
+    /// 明确上报"不支持"的设备在第 1~3 步都不参与。
+    pub async fn resolve_soter_target(&self, requested_did: &str) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        let now = Self::now_ms();
+        // 先把手上的设备快照出来（只取判路由要的字段），免得后面算负载时
+        // 和 `load_balance_index` 的写操作撞借用。
+        let online: Vec<(String, Option<bool>)> = inner
+            .devices
+            .values()
+            .filter(|d| now.saturating_sub(d.last_seen_ms) < 120_000)
+            .map(|d| (d.device_id.clone(), d.supports_soter))
+            .collect();
+        if online.is_empty() {
+            return None;
+        }
+
+        // 1) 指定的设备只要能做就直接用它 —— 这是调用方点名要的设备。
+        if !requested_did.is_empty()
+            && online
+                .iter()
+                .any(|(id, cap)| id == requested_did && *cap == Some(true))
+        {
+            return Some(requested_did.to_string());
+        }
+
+        // 2/3) 负载均衡。先只有"上报支持"的一档，再退到"没上报"的一档。
+        // 负载口径跟认证那条路一致（近 60 s 的活动量 + 在跑的任务数）。
+        for tier in [Some(true), None] {
+            let mut candidates: Vec<(String, u64, usize)> = online
+                .iter()
+                .filter(|(_, cap)| *cap == tier)
+                .map(|(id, _)| {
+                    let events: u64 = inner
+                        .device_events
+                        .get(id)
+                        .map(|q| q.iter().map(|(_, w)| *w).sum())
+                        .unwrap_or(0);
+                    let active = inner
+                        .tasks
+                        .values()
+                        .filter(|t| {
+                            t.assigned_device_id.as_deref() == Some(id.as_str())
+                                || t.target_device_id == *id
+                        })
+                        .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Assigned))
+                        .count();
+                    (id.clone(), events, active)
+                })
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+            let min = (candidates[0].1, candidates[0].2);
+            let tied: Vec<&(String, u64, usize)> =
+                candidates.iter().filter(|c| (c.1, c.2) == min).collect();
+            if tied.len() > 1 {
+                let i = inner.load_balance_index % tied.len();
+                inner.load_balance_index = inner.load_balance_index.wrapping_add(1);
+                return Some(tied[i].0.clone());
+            }
+            return Some(candidates[0].0.clone());
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -934,7 +1088,12 @@ mod selfcheck_tests {
 
         // 第一次轮询：注册设备的同时排进自检，同一轮就能领到。
         let task = store
-            .pop_for_b("device-b-self", "TEST-1", Duration::from_millis(50))
+            .pop_for_b(
+                "device-b-self",
+                "TEST-1",
+                DeviceCaps::default(),
+                Duration::from_millis(50),
+            )
             .await
             .expect("连上后应该拿到一条自检任务");
         assert_eq!(task.task_type, "attest");
@@ -977,7 +1136,12 @@ mod selfcheck_tests {
         // 已经有结论（失败）了，不再重排。
         assert!(
             store
-                .pop_for_b("device-b-self", "TEST-1", Duration::from_millis(50))
+                .pop_for_b(
+                    "device-b-self",
+                    "TEST-1",
+                    DeviceCaps::default(),
+                    Duration::from_millis(50)
+                )
                 .await
                 .is_none(),
             "已经有自检结论的设备不该再被自检"
@@ -989,7 +1153,12 @@ mod selfcheck_tests {
     async fn selfcheck_unparsable_chain_reports_a_reason() {
         let store = TaskStore::new(30, 60, 100, 60, true);
         let task = store
-            .pop_for_b("device-b-blank", "TEST-1", Duration::from_millis(50))
+            .pop_for_b(
+                "device-b-blank",
+                "TEST-1",
+                DeviceCaps::default(),
+                Duration::from_millis(50),
+            )
             .await
             .expect("自检任务");
         store
@@ -1021,10 +1190,158 @@ mod selfcheck_tests {
         let store = TaskStore::new(30, 60, 100, 60, false);
         assert!(
             store
-                .pop_for_b("device-b-off", "TEST-1", Duration::from_millis(50))
+                .pop_for_b(
+                    "device-b-off",
+                    "TEST-1",
+                    DeviceCaps::default(),
+                    Duration::from_millis(50)
+                )
                 .await
                 .is_none(),
             "关掉自检后不该有任何任务"
         );
+    }
+
+    /// `caps` 解析：字段缺失 = 没上报，空串 = 明确上报"一个都没有"，两者不是一回事。
+    #[test]
+    fn device_caps_parse_distinguishes_absent_from_empty() {
+        let absent = DeviceCaps::parse(None);
+        assert_eq!(absent.soter, None);
+        assert_eq!(absent.strongbox, None);
+
+        let none = DeviceCaps::parse(Some(""));
+        assert_eq!(none.soter, Some(false));
+        assert_eq!(none.strongbox, Some(false));
+
+        let both = DeviceCaps::parse(Some("soter,strongbox"));
+        assert_eq!(both.soter, Some(true));
+        assert_eq!(both.strongbox, Some(true));
+
+        // 大小写/空格无所谓，不认识的名字不该被当成支持。
+        let mixed = DeviceCaps::parse(Some(" SOTER , fingerprint "));
+        assert_eq!(mixed.soter, Some(true));
+        assert_eq!(mixed.strongbox, Some(false));
+    }
+
+    /// SOTER 路由：点名的设备支持就用它；不支持/没上报/不认识就落到支持的设备上。
+    #[tokio::test]
+    async fn soter_target_prefers_a_device_that_reported_support() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let none = DeviceCaps {
+            soter: Some(false),
+            strongbox: Some(false),
+        };
+        let unknown = DeviceCaps::default();
+        let yes = DeviceCaps {
+            soter: Some(true),
+            strongbox: Some(true),
+        };
+        for (id, caps) in [
+            ("dev-none", none),
+            ("dev-unknown", unknown),
+            ("dev-yes", yes),
+        ] {
+            assert!(store
+                .pop_for_b(id, "TEST-1", caps, Duration::from_millis(10))
+                .await
+                .is_none());
+        }
+
+        assert_eq!(
+            store.resolve_soter_target("dev-yes").await.as_deref(),
+            Some("dev-yes"),
+            "点名的设备支持就应该用它"
+        );
+        for requested in ["dev-none", "dev-unknown", "dev-absent", ""] {
+            assert_eq!(
+                store.resolve_soter_target(requested).await.as_deref(),
+                Some("dev-yes"),
+                "requested={requested} 时应该落到唯一支持的设备"
+            );
+        }
+    }
+
+    /// 只有"没上报"的设备在线时也能用（老版本 relay）；但只剩"明确不支持"时不给结果。
+    #[tokio::test]
+    async fn soter_target_never_lands_on_a_device_that_said_no() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let none = DeviceCaps {
+            soter: Some(false),
+            strongbox: None,
+        };
+        assert!(store
+            .pop_for_b(
+                "dev-unknown",
+                "TEST-1",
+                DeviceCaps::default(),
+                Duration::from_millis(10)
+            )
+            .await
+            .is_none());
+        assert!(store
+            .pop_for_b("dev-none", "TEST-1", none, Duration::from_millis(10))
+            .await
+            .is_none());
+        assert_eq!(
+            store.resolve_soter_target("").await.as_deref(),
+            Some("dev-unknown"),
+            "没上报的设备还能试"
+        );
+
+        let only_no = TaskStore::new(30, 60, 100, 60, false);
+        assert!(only_no
+            .pop_for_b("dev-none", "TEST-1", none, Duration::from_millis(10))
+            .await
+            .is_none());
+        assert_eq!(only_no.resolve_soter_target("").await, None);
+    }
+
+    /// 兜底：设备上报"不支持"后不会领到 SOTER 任务，其他任务照常。
+    #[tokio::test]
+    async fn unsupported_device_never_dequeues_a_soter_task() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let yes = DeviceCaps {
+            soter: Some(true),
+            strongbox: None,
+        };
+        assert!(store
+            .pop_for_b("dev", "TEST-1", yes, Duration::from_millis(10))
+            .await
+            .is_none());
+        let soter_task = store
+            .create_task("soter", serde_json::json!({ "op": "probe" }), "dev")
+            .await;
+
+        // 改口：明确说不支持了。
+        let no = DeviceCaps {
+            soter: Some(false),
+            strongbox: None,
+        };
+        assert!(
+            store
+                .pop_for_b("dev", "TEST-1", no, Duration::from_millis(50))
+                .await
+                .is_none(),
+            "说过不支持的设备不该领到 SOTER 任务"
+        );
+
+        // 认证任务不受影响。
+        let attest_task = store
+            .create_task("attest", serde_json::json!({}), "dev")
+            .await;
+        let popped = store
+            .pop_for_b("dev", "TEST-1", no, Duration::from_millis(50))
+            .await
+            .expect("认证任务应该领得到");
+        assert_eq!(popped.task_id, attest_task);
+
+        // SOTER 任务还在待办里，没被谁吃掉。
+        let still_pending = store
+            .list_tasks(10)
+            .await
+            .into_iter()
+            .find(|t| t.task_id == soter_task)
+            .expect("任务应该还在");
+        assert_eq!(still_pending.status, TaskStatus::Pending);
     }
 }

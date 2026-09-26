@@ -28,6 +28,12 @@ const CLIENTA_TARGET_PATH: &str = "/data/misc/keystore/ommega/target.txt";
 /// key here: `global_scope`.  Everything else in that file belongs to the
 /// daemon's own parser (`crate::config` on the keymint side).
 const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
+/// 日志开关的副本，由 daemon-injector 按真配置写好：`log_flag: 1` / `log_flag: 0`。
+///
+/// 位置挑在 `/data/misc` 下面是有讲究的：SOTER 宿主是 uid 1000 的 system_app，
+/// 它连 `/data/adb`（0700 root）的门都进不去，读不到就回落到「日志关」。
+/// `/data/misc/ommega` 的 context 是 `system_data_file`，system_app 读得动。
+const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/ommega/log_flag";
 const CURRENT_CONFIG_VERSION: u32 = 1;
 const REPLACE_SAVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REPLACE_SAVE_RETRY_LIMIT: usize = 10;
@@ -271,7 +277,36 @@ fn clienta_target_extras(base: &InjectorConfig) -> Vec<String> {
 /// key is absent.  Truthy spellings are `1` / `true` / `yes` / `on`
 /// (case-insensitive); the webroot UI writes `true`/`false`.
 fn clienta_global_scope_override() -> Option<bool> {
-    let contents = fs::read_to_string(CLIENTA_CONFIG_PATH).ok()?;
+    clienta_config_bool(Path::new(CLIENTA_CONFIG_PATH), &["global_scope"])
+}
+
+/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`),
+/// or `None` when the file or key is absent.
+///
+/// Read straight from the file, not through the injector config: logging is
+/// initialised before (and independently of) the config, and inside a target
+/// that cannot open the flat file — the SOTER host runs as uid 1000, the file
+/// lives in a 0770 keystore-owned directory — the read fails and logging falls
+/// back to off.
+pub fn clienta_debug_logging() -> Option<bool> {
+    // 先看启动器（daemon-injector，root）读完之后写下的那份副本：它放在
+    // system_app 也读得到的地方（见 CLIENTA_LOG_FLAG_PATH），payload 落进读不到
+    // /data/misc/keystore 的域时（SOTER 宿主是 uid1000）就靠它。副本没有或读不到
+    // 才回落到真配置本身。
+    if let Some(value) = clienta_config_bool(Path::new(CLIENTA_LOG_FLAG_PATH), &["log_flag"]) {
+        return Some(value);
+    }
+    clienta_config_bool(
+        Path::new(CLIENTA_CONFIG_PATH),
+        &["debug_logging", "debug", "verbose"],
+    )
+}
+
+/// Reads one boolean key out of a flat `key: value` config file.  `None` when
+/// the file is unreadable or the key is missing; a present key always wins, so
+/// `false` has to be spelled out to turn something off.
+fn clienta_config_bool(path: &Path, keys: &[&str]) -> Option<bool> {
+    let contents = fs::read_to_string(path).ok()?;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -280,7 +315,8 @@ fn clienta_global_scope_override() -> Option<bool> {
         let Some(idx) = line.find(':') else {
             continue;
         };
-        if !line[..idx].trim().eq_ignore_ascii_case("global_scope") {
+        let key = line[..idx].trim();
+        if !keys.iter().any(|want| key.eq_ignore_ascii_case(want)) {
             continue;
         }
         return Some(matches!(
@@ -645,7 +681,7 @@ fn reload_runtime_config(path: &Path, trigger: WatchTrigger) {
             Ok(mut guard) => {
                 let level = config.main.log_level_filter();
                 *guard = Arc::new(config);
-                log::set_max_level(level);
+                crate::logging::apply_level(level);
                 log::info!(
                     "reloaded config from {} via {}",
                     path.display(),

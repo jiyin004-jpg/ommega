@@ -5,6 +5,33 @@ STATE_DIR=/data/adb/ommega
 RESTART_FILE=$STATE_DIR/restart.keymint
 PEER_RESTART_FILE=$STATE_DIR/restart.injector
 RESTART_ALL_FILE=$STATE_DIR/restart.all
+CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
+LOG_DIR=/data/misc/keystore/ommega/logs
+LOG_FILE=$LOG_DIR/daemon.log
+
+# 本脚本的日志只落文件（见下面 log 的定义），「启用调试日志」关着时一条都不打。
+# 开关按 2 秒一次的循环现读。
+conf_get() {
+  [ -f "$CONF_PATH" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*\(.*\)$/\1/p" "$CONF_PATH" 2>/dev/null | head -n1
+}
+
+debug_logging_enabled() {
+  case "$(conf_get debug_logging | tr 'A-Z' 'a-z' | tr -d ' \r')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# 日志只落文件：以前这里是 echo，输出会进管理器的 service 日志（那也是系统日志），
+# 现在跟 daemon / payload 统一写到一个文件里。「启用调试日志」关着时一条都不打，
+# 开关按 2 秒一次的循环现读。
+log() {
+  [ "$LOG_ON" = "1" ] || return 0
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  printf '%s [INFO] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null
+  return 0
+}
 
 # Extra library search paths are only needed on older Android. From Android 16
 # (SDK 36) the default linker namespace already covers vendor/system/apex
@@ -82,11 +109,15 @@ consume_restart_request() {
 
 cd "$MODDIR" || exit 1
 mkdir -p "$STATE_DIR"
+LOG_ON=0
 
 while true; do
+  LOG_ON=0
+  debug_logging_enabled && LOG_ON=1
+
   TARGET=$(find_module_keymint)
   if [ -z "$TARGET" ]; then
-    echo "[keymint-daemon] keymint binary not found"
+    log "[keymint-daemon] keymint binary not found"
     sleep 5
     continue
   fi
@@ -104,7 +135,7 @@ while true; do
 
   while kill -0 "$child_pid" 2>/dev/null; do
     if consume_restart_request; then
-      echo "[keymint-daemon] restart requested"
+      log "[keymint-daemon] restart requested"
       kill -TERM "$child_pid" 2>/dev/null
       sleep 2
       if kill -0 "$child_pid" 2>/dev/null; then
@@ -117,6 +148,6 @@ while true; do
 
   wait "$child_pid"
   rc=$?
-  echo "[keymint-daemon] keymint exited with code $rc"
+  log "[keymint-daemon] keymint exited with code $rc"
   sleep 2
 done

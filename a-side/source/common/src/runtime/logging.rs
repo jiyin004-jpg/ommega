@@ -25,7 +25,6 @@ use std::{eprintln, format, vec::Vec};
 
 use anyhow::{anyhow, Context as _};
 use log::{LevelFilter, Record};
-use log4rs::append::console::ConsoleAppender;
 use log4rs::append::Append;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
@@ -53,9 +52,13 @@ impl LockedRotatingFileAppender {
     ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let _ = fs::remove_file(suffixed_path(&path, ".lock"));
+        // 这里就把文件开掉，不等到第一条日志：调用方拿这个 Result 判断“这个位置
+        // 到底写不写得动”（SOTER 宿主是 uid 1000，进不去 keystore 那个 0770 目录），
+        // 如果拖到 append 才发现，那就没机会换别的路径了。
+        let file = Self::open_log_file(&path)?;
         Ok(Self {
             path,
-            file: Mutex::new(None),
+            file: Mutex::new(Some(file)),
             encoder,
             max_size_bytes,
         })
@@ -207,7 +210,14 @@ impl Drop for FileLockGuard {
     }
 }
 
-pub fn build_console_file_config<P: AsRef<Path>>(
+/// Builds a file-only log4rs config.  A 端不再有第二个落点：以前这里还会往
+/// stdout 挂一个 console appender，但那条线要么进了管理器的 service 日志（一样
+/// 算系统日志），要么在 app 域里根本没人看，索性全部去掉，日志只落文件。
+///
+/// 第二个返回值是“文件 appender 到底装上没有”：目标进程没权限打开日志目录时
+/// （SOTER 宿主是 uid 1000，日志目录是 0770 keystore），这里不报错，而是把
+/// `false` 交回调用方，让它有机会换个自己写得动的位置再试一次。
+pub fn build_file_config<P: AsRef<Path>>(
     file_path: P,
     pattern: &str,
     level: LevelFilter,
@@ -215,16 +225,6 @@ pub fn build_console_file_config<P: AsRef<Path>>(
 ) -> anyhow::Result<(Config, bool)> {
     let mut builder = Config::builder();
     let mut root = Root::builder();
-    if fs::read_link("/proc/self/fd/1")
-        .map(|target| target != Path::new("/dev/null"))
-        .unwrap_or(true)
-    {
-        let stdout = ConsoleAppender::builder()
-            .encoder(Box::new(PatternEncoder::new(pattern)))
-            .build();
-        builder = builder.appender(Appender::builder().build("stdout", Box::new(stdout)));
-        root = root.appender("stdout");
-    }
     let path = file_path.as_ref();
 
     match FileLockGuard::lock_path(path).and_then(|_guard| rotate_existing_log_file(path)) {

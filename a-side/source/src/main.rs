@@ -40,6 +40,13 @@ include!(concat!(env!("OUT_DIR"), "/aidl.rs"));
 // include!( "./aidl.rs"); // for development only
 
 fn storage_warn(message: String) {
+    // The stderr branch exists for the case where the logger could not be
+    // installed at all.  With logging switched off in the WebUI it must stay
+    // quiet too, otherwise the warnings land in the root manager's service log
+    // and the off switch would not mean "no logs".
+    if !crate::logging::enabled() {
+        return;
+    }
     if log::log_enabled!(log::Level::Warn) {
         warn!("{message}");
     } else {
@@ -161,25 +168,78 @@ fn prepare_android_storage() {
     }
 }
 
-fn create_rpc_server() -> Result<Arc<RpcServer>> {
+/// Which rendezvous point a server listens on.
+#[derive(Clone, Copy)]
+enum RpcBind {
+    /// The original one: a filesystem socket in the keystore state dir.
+    FileSocket,
+    /// The app-domain one: an abstract socket, for callers that cannot traverse
+    /// into the keystore state dir (the SOTER host runs as uid 1000).
+    Abstract,
+}
+
+/// Has the injector recorded this pid as carrying our payload?
+///
+/// The pid comes from SO_PEERCRED and cannot be forged, which is what makes this usable as
+/// an identity check: the kernel hides other uids' /proc entries from the keystore uid
+/// (hidepid), so the peer's command line is out of reach and there is nothing else in the
+/// peer credentials to go on. The injector does the injection as root, so it is the one that
+/// can keep this list. A stale line is possible (pids do get reused), same as with any such
+/// list.
+fn peer_is_injected(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    match std::fs::read_to_string(consts::RPC_PEER_STATE) {
+        Ok(state) => state.lines().any(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(|field| field.parse::<i32>().ok())
+                == Some(pid)
+        }),
+        Err(error) => {
+            debug!(
+                "cannot read the injector peer state {}: {error}",
+                consts::RPC_PEER_STATE
+            );
+            false
+        }
+    }
+}
+
+fn create_rpc_server(bind: RpcBind) -> Result<Arc<RpcServer>> {
     set_sockcreate_con(RPC_SOCKET_CONTEXT)
         .context("failed to set ommega RPC socket SELinux context")?;
-    let server = RpcServer::setup_unix_server(rpc::SOCKET);
+    let server = match bind {
+        RpcBind::FileSocket => RpcServer::setup_unix_server(rpc::SOCKET),
+        RpcBind::Abstract => RpcServer::setup_unix_server_abstract(consts::RPC_ABSTRACT_NAME),
+    };
     let clear_result =
         clear_sockcreate_con().context("failed to clear ommega RPC socket SELinux context");
-    let server = server.context("failed to bind ommega RPC socket")?;
+    let server = match bind {
+        RpcBind::FileSocket => server.context("failed to bind ommega RPC socket")?,
+        RpcBind::Abstract => server.context("failed to bind ommega RPC abstract socket")?,
+    };
     clear_result?;
     server.set_android13plus(rpc::WIRE_MAX_VERSION);
-    std::fs::set_permissions(rpc::SOCKET, std::fs::Permissions::from_mode(0o660))
-        .context("failed to chmod ommega RPC socket")?;
 
-    server.set_authorizer(|peer| {
-        let allowed = matches!(
-            peer,
-            PeerIdentity::Local { uid, .. } if *uid == KEYSTORE_UID
-        );
-        if !allowed {
-            warn!("rejected ommega RPC peer {peer}");
+    if matches!(bind, RpcBind::FileSocket) {
+        std::fs::set_permissions(rpc::SOCKET, std::fs::Permissions::from_mode(0o660))
+            .context("failed to chmod ommega RPC socket")?;
+    }
+
+    server.set_authorizer(move |peer| {
+        let allowed = match peer {
+            PeerIdentity::Local { uid, .. } if *uid == KEYSTORE_UID => true,
+            PeerIdentity::Local { pid, .. } => {
+                matches!(bind, RpcBind::Abstract) && peer_is_injected(*pid)
+            }
+            _ => false,
+        };
+        match (allowed, bind) {
+            (true, RpcBind::Abstract) => info!("accepted app RPC peer {peer}"),
+            (true, RpcBind::FileSocket) => debug!("accepted ommega RPC peer {peer}"),
+            (false, _) => warn!("rejected ommega RPC peer {peer}"),
         }
         allowed
     });
@@ -354,7 +414,7 @@ fn run() -> Result<()> {
     info!("setting uid/gid={} role=keystore", KEYSTORE_UID);
     set_keystore_identity()?;
 
-    let injector_rpc_server = create_rpc_server()?;
+    let injector_rpc_server = create_rpc_server(RpcBind::FileSocket)?;
 
     crate::keymaster::metrics_store::update_keystore_crash_count();
 
@@ -366,36 +426,57 @@ fn run() -> Result<()> {
 
     info!("creating keystore service");
     let dev = KeystoreService::new_native_binder().context("failed to create ommega service")?;
-
-    info!("adding ommega service to RPC server");
-    let service = BnKeymintService::new_binder_with_features(dev, consts::sid_features());
-    server
-        .add_service(rpc::SERVICE, service.as_binder())
-        .context("failed to add ommega RPC service")?;
+    let service =
+        BnKeymintService::new_binder_with_features(dev, consts::sid_features()).as_binder();
 
     info!("creating ommega authorization service");
     let auth = AuthorizationManager::new_ommega_binder()
-        .context("failed to create ommega authorization service")?;
-    info!("adding ommega authorization service to RPC server");
-    server
-        .add_service(rpc::AUTHORIZATION_SERVICE, auth.as_binder())
-        .context("failed to add ommega authorization RPC service")?;
+        .context("failed to create ommega authorization service")?
+        .as_binder();
 
     info!("creating ommega maintenance service");
     let maintenance = MaintenanceManager::new_ommega_binder()
-        .context("failed to create ommega maintenance service")?;
-    info!("adding ommega maintenance service to RPC server");
-    server
-        .add_service(rpc::MAINTENANCE_SERVICE, maintenance.as_binder())
-        .context("failed to add ommega maintenance RPC service")?;
+        .context("failed to create ommega maintenance service")?
+        .as_binder();
 
     info!("creating ommega metrics service");
-    let metrics =
-        Metrics::new_native_binder().context("failed to create ommega metrics service")?;
-    info!("adding ommega metrics service to RPC server");
-    server
-        .add_service(rpc::METRICS_SERVICE, metrics.as_binder())
-        .context("failed to add ommega metrics RPC service")?;
+    let metrics = Metrics::new_native_binder()
+        .context("failed to create ommega metrics service")?
+        .as_binder();
+
+    let services: [(&str, rsbinder::SIBinder); 4] = [
+        (rpc::SERVICE, service),
+        (rpc::AUTHORIZATION_SERVICE, auth),
+        (rpc::MAINTENANCE_SERVICE, maintenance),
+        (rpc::METRICS_SERVICE, metrics),
+    ];
+
+    info!("adding ommega services to RPC server");
+    for (name, binder) in &services {
+        server
+            .add_service(name, binder.clone())
+            .with_context(|| format!("failed to add ommega RPC service {name}"))?;
+    }
+
+    // Second rendezvous point for app-domain callers: the SOTER host cannot reach
+    // the file socket (0700 keystore dir), so it connects here instead. Served by
+    // its own accept loop, same wire version, same services, narrower authorizer.
+    let app_server = create_rpc_server(RpcBind::Abstract)?;
+    for (name, binder) in &services {
+        app_server
+            .add_service(name, binder.clone())
+            .with_context(|| format!("failed to add ommega app RPC service {name}"))?;
+    }
+    let app_runner = Arc::clone(&app_server);
+    std::thread::spawn(move || {
+        if let Err(error) = app_runner.run() {
+            error!("ommega app RPC server stopped: {error:#}");
+        }
+    });
+    info!(
+        "serving ommega app RPC abstract socket={}",
+        String::from_utf8_lossy(consts::RPC_ABSTRACT_NAME)
+    );
 
     info!("serving ommega RPC socket={}", rpc::SOCKET);
     server.run().context("ommega RPC server stopped")?;

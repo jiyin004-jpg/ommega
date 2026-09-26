@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use nix::unistd::Pid;
 use rand::TryRng;
 
@@ -39,7 +39,7 @@ pub(super) fn log_loader_abi() {
     );
 }
 
-fn build_abstract_sockaddr(magic_bytes: &[u8]) -> Result<(libc::sockaddr_un, usize)> {
+pub(crate) fn build_abstract_sockaddr(magic_bytes: &[u8]) -> Result<(libc::sockaddr_un, usize)> {
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     if magic_bytes.len() > addr.sun_path.len().saturating_sub(1) {
         bail!(
@@ -75,7 +75,7 @@ fn cmsg_align(size: usize) -> usize {
     (size + align - 1) & !(align - 1)
 }
 
-fn remote_c_int_result(value: usize) -> i32 {
+pub(super) fn remote_c_int_result(value: usize) -> i32 {
     value as u32 as i32
 }
 
@@ -133,9 +133,21 @@ fn validate_received_remote_fd(
 
     let trunc_flags = libc::MSG_CTRUNC | libc::MSG_TRUNC;
     if remote_msg.msg_flags & trunc_flags != 0 {
+        // A 端这台机器上，往 system_app（SOTER 宿主那个域）递 fd 时内核只送来一条
+        // SCM_CREDENTIALS（msg_controllen=32），SCM_RIGHTS 被丢掉并置 MSG_CTRUNC。
+        // 没有 fd 后面那套校验也过不了，所以这里直接把它当失败，但把现场参数带上。
+        warn!(
+            "remote recvmsg dropped our control data: msg_flags=0x{:x} msg_controllen={} msg_control=0x{:x} want_control={}",
+            remote_msg.msg_flags,
+            remote_msg.msg_controllen,
+            remote_msg.msg_control as usize,
+            remote_cmsg_data.len(),
+        );
         bail!(
-            "remote recvmsg reported truncated data/control: msg_flags=0x{:x}",
-            remote_msg.msg_flags
+            "remote recvmsg reported truncated data/control: msg_flags=0x{:x} msg_controllen={} (wanted {} bytes of control)",
+            remote_msg.msg_flags,
+            remote_msg.msg_controllen,
+            remote_cmsg_data.len(),
         );
     }
 
@@ -401,8 +413,12 @@ where
     }
 
     let send_cmsg_space = unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as usize };
-    let recv_cmsg_space =
-        send_cmsg_space + unsafe { libc::CMSG_SPACE(size_of::<libc::ucred>() as u32) as usize };
+    // SO_PASSCRED 会在收端多塞一条 SCM_CREDENTIALS，不同域/内核还可能再补别的 cmsg
+    //（安全上下文之类）。按理论最小值卡着来会拿到 MSG_CTRUNC，所以留一截余量：
+    // 多给 256 字节换掉一次“收不到 fd”的怪错，代价是目标进程栈上多一百多个字节。
+    let recv_cmsg_space = send_cmsg_space
+        + unsafe { libc::CMSG_SPACE(size_of::<libc::ucred>() as u32) as usize }
+        + 256;
     let remote_cmsg_storage = vec![0usize; control_words(recv_cmsg_space)];
     let remote_cmsg_bytes = unsafe {
         std::slice::from_raw_parts(remote_cmsg_storage.as_ptr() as *const u8, recv_cmsg_space)

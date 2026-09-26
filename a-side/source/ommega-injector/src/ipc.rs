@@ -25,6 +25,15 @@ const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
 const PM_SERVICE: &str = "sec_key_att_app_id_provider";
 
+/// Second rendezvous point for app-domain callers, on the abstract namespace.
+///
+/// It has to match `consts::RPC_ABSTRACT_NAME` on the daemon side (the two crates
+/// share no code, so the name lives in both). The file socket sits under
+/// /data/misc/keystore, which is 0700 keystore: the SOTER host (system uid) cannot
+/// even traverse into it. An abstract socket has no filesystem entry, so DAC does
+/// not apply; admission is SELinux plus the daemon's authorizer.
+pub const RPC_ABSTRACT_NAME: &[u8] = b"ommega.soter.rpc";
+
 thread_local! {
     static PM: RefCell<Option<Strong<dyn IKeyAttestationApplicationIdProvider>>> = const { RefCell::new(None) };
     static PM_DEATH: RefCell<Option<Arc<dyn DeathRecipient>>> = const { RefCell::new(None) };
@@ -113,25 +122,111 @@ fn connect_rpc_session(connect_context: &'static str) -> Result<RpcCache> {
     loop {
         match connect_rpc_session_once(connect_context) {
             Ok(session) => return Ok(session),
-            Err(error) if start.elapsed() >= RPC_READY_TIMEOUT => {
-                return Err(error).context("ommega RPC server did not become ready in time");
+            Err(error) => {
+                // A policy denial on the abstract rendezvous point is permanent, and an
+                // app-domain target has no other way in: returning here instead of after
+                // the full timeout keeps the host process from stalling half a minute on
+                // every start (and stops the retry loop from spamming audit denials).
+                if app_domain_rpc_denied() {
+                    return Err(error)
+                        .context("ommega RPC is denied by policy for this app-domain process");
+                }
+                if start.elapsed() >= RPC_READY_TIMEOUT {
+                    return Err(error).context("ommega RPC server did not become ready in time");
+                }
+                thread::sleep(cmp::min(
+                    RPC_READY_RETRY_DELAY,
+                    RPC_READY_TIMEOUT.saturating_sub(start.elapsed()),
+                ));
             }
-            Err(_) => thread::sleep(cmp::min(
-                RPC_READY_RETRY_DELAY,
-                RPC_READY_TIMEOUT.saturating_sub(start.elapsed()),
-            )),
         }
     }
 }
 
 fn connect_rpc_session_once(connect_context: &'static str) -> Result<RpcCache> {
-    let session = RpcSession::setup_unix_client_android13plus(rpc::SOCKET, rpc::WIRE_MAX_VERSION)
-        .context(connect_context)?;
+    let session =
+        match RpcSession::setup_unix_client_android13plus(rpc::SOCKET, rpc::WIRE_MAX_VERSION) {
+            Ok(session) => session,
+            Err(file_error) => {
+                debug!(
+                "ommega RPC file socket {} unusable ({file_error:#}); trying the abstract socket",
+                rpc::SOCKET
+            );
+                RpcSession::setup_unix_client_android13plus_abstract(
+                    RPC_ABSTRACT_NAME,
+                    rpc::WIRE_MAX_VERSION,
+                )
+                .with_context(|| format!("{connect_context} (file socket: {file_error:#})"))?
+            }
+        };
     let service = session.get_service(rpc::SERVICE).context(connect_context)?;
     Ok(RpcCache {
         session,
         services: HashMap::from([(rpc::SERVICE, service)]),
     })
+}
+
+/// What a connect attempt to the abstract rendezvous point says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AbstractProbe {
+    /// Connected: the listener is there and policy allows the connect. The probe
+    /// connection is closed again immediately.
+    Reachable,
+    /// The kernel refused the connect for policy reasons (SELinux). Retrying cannot
+    /// help, so a caller should give up instead of waiting out a timeout.
+    Denied,
+    /// No listener on that name; the daemon is most likely not up yet.
+    Absent,
+}
+
+fn probe_abstract_rpc() -> AbstractProbe {
+    let Ok((addr, len)) = crate::inject::payload_fd::build_abstract_sockaddr(RPC_ABSTRACT_NAME)
+    else {
+        return AbstractProbe::Absent;
+    };
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return AbstractProbe::Absent;
+        }
+        let result = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len as libc::socklen_t,
+        );
+        let errno = if result == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        libc::close(fd);
+
+        if errno == 0 {
+            AbstractProbe::Reachable
+        } else if errno == libc::EACCES || errno == libc::EPERM {
+            AbstractProbe::Denied
+        } else {
+            AbstractProbe::Absent
+        }
+    }
+}
+
+/// This process is not keystore itself and the abstract rendezvous point is denied
+/// by policy, so no amount of retrying will produce an RPC session.
+fn app_domain_rpc_denied() -> bool {
+    if unsafe { libc::geteuid() } == kmr_common::consts::KEYSTORE_UID {
+        return false;
+    }
+    probe_abstract_rpc() == AbstractProbe::Denied
+}
+
+/// Is the abstract rendezvous point reachable? A connect answers it.
+///
+/// The pre-injection wait uses this: a target that cannot see the file socket path
+/// at all (EACCES on the keystore dir) would otherwise burn the full timeout waiting
+/// for a stat that will never succeed.
+pub fn abstract_rpc_reachable() -> bool {
+    probe_abstract_rpc() == AbstractProbe::Reachable
 }
 
 fn ensure_rpc_cache(connect_context: &'static str) -> Result<()> {
@@ -408,6 +503,70 @@ where
         is_rpc_cache_invalidating_error,
         f,
     )
+}
+
+/// Hook observations waiting to go to the daemon; drained by [`event_sender_loop`].
+static EVENT_QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static EVENT_THREAD: Once = Once::new();
+
+/// More than this many undelivered observations means the daemon is unreachable; old lines
+/// are worth less than keeping the hook's own thread moving.
+const EVENT_QUEUE_LIMIT: usize = 64;
+const EVENT_POLL_DELAY: Duration = Duration::from_millis(200);
+
+/// Hand one hook observation to the daemon, for it to log.
+///
+/// Never blocks and never fails out loud. The hook runs on whatever thread the target gave
+/// it (usually a binder thread), and an app-domain target has no other way to be heard: its
+/// log file sits behind a 0700 keystore directory and logcat carries nothing from the
+/// injected image. Delivery rides on the same RPC session as everything else, so a daemon
+/// that is down just means dropped lines.
+pub fn report_event(message: String) {
+    {
+        let mut queue = EVENT_QUEUE.lock().expect("event queue poisoned");
+        if queue.len() >= EVENT_QUEUE_LIMIT {
+            queue.remove(0);
+        }
+        queue.push(message);
+    }
+    EVENT_THREAD.call_once(|| {
+        if let Err(error) = thread::Builder::new()
+            .name("ommega-event".to_string())
+            .spawn(event_sender_loop)
+        {
+            warn!("failed to start the hook event sender: {error}");
+        }
+    });
+}
+
+fn event_sender_loop() {
+    loop {
+        let message = {
+            let mut queue = EVENT_QUEUE.lock().expect("event queue poisoned");
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        };
+        match message {
+            Some(message) => {
+                if let Err(error) = send_event(&message) {
+                    debug!("failed to report hook event to the daemon: {error:#}");
+                }
+            }
+            None => thread::sleep(EVENT_POLL_DELAY),
+        }
+    }
+}
+
+fn send_event(message: &str) -> Result<()> {
+    ensure_process_state();
+    with_ommega_maintenance_once(|maintenance| {
+        maintenance
+            .reportHookEvent(message)
+            .context("reportHookEvent failed")
+    })
 }
 
 pub fn resolve_packages_for_uid(uid: u32) -> PackageResolution {

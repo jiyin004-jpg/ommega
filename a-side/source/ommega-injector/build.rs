@@ -44,6 +44,7 @@ fn main() {
         "../aidl/android/security/maintenance",
         "../aidl/android/security/keystore",
         "../aidl/top/jiyin004/ommega",
+        "../aidl/vendor/qti/hardware/soter",
     ];
     let mut aidl = rsbinder_aidl::Builder::new();
     for dir in aidl_dirs {
@@ -58,15 +59,22 @@ fn main() {
 
     let generated_path = PathBuf::from(format!("{}/aidl.rs", std::env::var("OUT_DIR").unwrap()));
     let content = fs::read_to_string(&generated_path).unwrap();
-    let patched_content = content
-        .replace(
-            "\npub mod top {",
-            "\n#[allow(clippy::all)]\n#[allow(unused_imports)]\npub mod top {",
-        )
-        .replace(
-            "fn build_parcel_getNumberOfEntries(&self, _arg_domain: super::Domain::Domain, _arg_nspace: i64) -> rsbinder::Result<rsbinder::Parcel>",
-            "pub(crate) fn build_parcel_getNumberOfEntries(&self, _arg_domain: super::Domain::Domain, _arg_nspace: i64) -> rsbinder::Result<rsbinder::Parcel>",
+    // rsbinder-aidl only puts `#[allow(clippy::all)]` on the first package tree it
+    // emits, so the later ones (`top`, `vendor`) trip `clippy -- -D warnings` on
+    // generated code we do not own (`identity_op` on `FIRST_CALL_TRANSACTION + 0`
+    // for the first method of an interface, for one).  Give each of them the same
+    // allow; this only ever rewrites the freshly generated file.
+    let mut patched_content = content;
+    for module in ["android", "top", "vendor"] {
+        patched_content = patched_content.replace(
+            &format!("\npub mod {module} {{"),
+            &format!("\n#[allow(clippy::all)]\n#[allow(unused_imports)]\npub mod {module} {{"),
         );
+    }
+    let patched_content = patched_content.replace(
+        "fn build_parcel_getNumberOfEntries(&self, _arg_domain: super::Domain::Domain, _arg_nspace: i64) -> rsbinder::Result<rsbinder::Parcel>",
+        "pub(crate) fn build_parcel_getNumberOfEntries(&self, _arg_domain: super::Domain::Domain, _arg_nspace: i64) -> rsbinder::Result<rsbinder::Parcel>",
+    );
 
     fs::write(&generated_path, &patched_content).unwrap();
 }

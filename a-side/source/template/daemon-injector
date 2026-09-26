@@ -7,6 +7,25 @@ RESTART_FILE=$STATE_DIR/restart.injector
 PEER_RESTART_FILE=$STATE_DIR/restart.keymint
 RESTART_ALL_FILE=$STATE_DIR/restart.all
 
+# A 端平铺 config（WebUI 写的），只有 soter_inject 这个键是本脚本读的：
+# 关着（键不在、或写了 0/false）就完全不碰 SOTER 宿主——不起服务、不注入；
+# 开着才 `am start-service` 把它拉起来再注进去。
+CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
+# 日志开关的副本：payload 有可能落进读不到上面那个配置的域（SOTER 宿主是 uid 1000），
+# 它按这个文件决定写不写日志。内容只有 `log_flag: 0|1` 一行，别往里放别的。
+# 放 /data/misc 下面是因为宿主（system_app）连 /data/adb（0700 root）都进不去，
+# 而这里的 context 是 system_data_file，它读得到。
+LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/ommega/log_flag}
+LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
+# 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
+LOG_DIR=/data/misc/keystore/ommega/logs
+LOG_FILE=$LOG_DIR/daemon-injector.log
+# app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
+# 得给它一个自己写得动的位置，权限开到 system 组。
+APP_LOG_DIR=$LOG_FLAG_DIR/logs
+SOTER_PKG=com.tencent.soter.soterserver
+SOTER_ACTION=$SOTER_PKG.ISoterService
+
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
 # to directory order would hand an x86_64 device the arm64 binary.
@@ -53,14 +72,14 @@ find_module_injector() {
 prepare_injector() {
   TARGET_INJECTOR=$(find_module_injector)
   if [ -z "$TARGET_INJECTOR" ]; then
-    echo "[injector-daemon] injector binary not found"
+    log "[injector-daemon] injector binary not found"
     return 1
   fi
 
   chmod 0755 "$TARGET_INJECTOR" 2>/dev/null || true
   chcon u:object_r:system_file:s0 "$TARGET_INJECTOR" 2>/dev/null || true
   if [ ! -x "$TARGET_INJECTOR" ]; then
-    echo "[injector-daemon] injector binary missing or not executable: $TARGET_INJECTOR"
+    log "[injector-daemon] injector binary missing or not executable: $TARGET_INJECTOR"
     return 1
   fi
   return 0
@@ -87,6 +106,72 @@ consume_restart_request() {
 
 get_keystore_pid() {
   pidof keystore2 2>/dev/null | awk '{print $1}'
+}
+
+conf_get() {
+  [ -f "$CONF_PATH" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*\(.*\)$/\1/p" "$CONF_PATH" 2>/dev/null | head -n1
+}
+
+# 0 = WebUI 「注入 SOTER 服务」开着。键不在（全新安装的默认）就是关，所以只有显式
+# 写了真值才认；WebUI 写的是 1/0，手写的 true/on 也认。
+soter_inject_enabled() {
+  case "$(conf_get soter_inject | tr 'A-Z' 'a-z' | tr -d ' \r')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# 日志只落文件。「启用调试日志」关着时一条都不打，开关按循环现读，WebUI 一改
+# 下一次循环就跟着变。
+log() {
+  [ "$LOG_ON" = "1" ] || return 0
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  printf '%s [INFO] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null
+  return 0
+}
+
+# 0 = 「启用调试日志」开着。键不在或写了假值都算关。
+debug_logging_enabled() {
+  case "$(conf_get debug_logging | tr 'A-Z' 'a-z' | tr -d ' \r')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# 把开关落成一行给 payload 看（内容没变就不动文件，别每 5 秒写一次）。
+sync_log_flag() {
+  want=0
+  debug_logging_enabled && want=1
+  # app 域那几个（SOTER 宿主里那份 payload）要用这个目录；顺手建掉，内容没变
+  # 的时候也不多做别的事。
+  mkdir -p "$APP_LOG_DIR" 2>/dev/null
+  chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
+  chmod 0770 "$APP_LOG_DIR" 2>/dev/null
+  cur=$(sed -n 's/^log_flag:[[:space:]]*//p' "$LOG_FLAG" 2>/dev/null | head -n1 | tr -d ' \r')
+  if [ "$cur" != "$want" ]; then
+    mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
+    chmod 755 "$LOG_FLAG_DIR" 2>/dev/null
+    printf 'log_flag: %s\n' "$want" > "$LOG_FLAG" 2>/dev/null
+    chmod 644 "$LOG_FLAG" 2>/dev/null
+  fi
+}
+
+soter_pid() {
+  pidof "$SOTER_PKG" 2>/dev/null | awk '{print $1}'
+}
+
+# SOTER 宿主是 bind-only 的服务：没人要就不起来，所以开关开着时得替客户端先喊一声。
+# 拉不起来只记一行、不死循环重试（启动失败通常是系统那边的问题，本模块管不了）。
+start_soter_service() {
+  log "[injector-daemon] soter_inject on; starting $SOTER_PKG"
+  am start-service -a "$SOTER_ACTION" >/dev/null 2>&1
+  i=0
+  while [ -z "$(soter_pid)" ] && [ "$i" -lt 20 ]; do
+    sleep 0.5
+    i=$((i + 1))
+  done
+  [ -n "$(soter_pid)" ] || log "[injector-daemon] $SOTER_PKG did not come up"
 }
 
 is_injected() {
@@ -121,7 +206,7 @@ is_injected() {
 restart_keystore() {
   pid=$1
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    echo "[injector-daemon] restart requested; stopping keystore2 pid=$pid"
+    log "[injector-daemon] restart requested; stopping keystore2 pid=$pid"
     kill -TERM "$pid" 2>/dev/null
     sleep 2
     if kill -0 "$pid" 2>/dev/null; then
@@ -131,15 +216,23 @@ restart_keystore() {
 }
 
 mkdir -p "$STATE_DIR"
+LOG_ON=0
 pending_restart=0
 last_attempt_pid=
 last_attempt_at=0
 retry_cooldown=15
+soter_start_attempted=0
+last_soter_pid=
+last_soter_attempt_at=0
 
 while true; do
   # Config and target list live in the single data location
   # (/data/misc/keystore/ommega/); the webroot UI writes them through the
   # ommegadata symlink, so no copy/sync is needed here.
+
+  LOG_ON=0
+  debug_logging_enabled && LOG_ON=1
+  sync_log_flag
 
   if ! prepare_injector; then
     sleep 5
@@ -155,23 +248,49 @@ while true; do
     fi
   fi
 
-  pid=$(get_keystore_pid)
-  if [ -z "$pid" ]; then
-    last_attempt_pid=
-    sleep 2
-    continue
+  # 注入目标跟着 WebUI 开关走：关着只有 keystore2（主路），开着再加上 SOTER 宿主。
+  # 开关是热读的，WebUI 一改下一次循环就生效（注入本身仍在目标起来之后）。
+  inject_targets=keystore2
+  if soter_inject_enabled; then
+    inject_targets=keystore2,soter
+    if [ "$soter_start_attempted" -eq 0 ]; then
+      soter_start_attempted=1
+      start_soter_service
+    fi
   fi
 
-  if is_injected "$pid"; then
+  pid=$(get_keystore_pid)
+  keystore_pending=0
+  if [ -z "$pid" ]; then
+    last_attempt_pid=
+  elif ! is_injected "$pid"; then
+    keystore_pending=1
+  fi
+
+  spid=$(soter_pid)
+  soter_pending=0
+  if [ "$inject_targets" != "keystore2" ] && [ -n "$spid" ] && ! is_injected "$spid"; then
+    soter_pending=1
+  fi
+
+  if [ "$keystore_pending" -eq 0 ] && [ "$soter_pending" -eq 0 ]; then
     pending_restart=0
     last_attempt_pid=
+    last_soter_pid=
     sleep 5
     continue
   fi
 
-  if [ "$last_attempt_pid" = "$pid" ] && [ "$pending_restart" -eq 0 ]; then
-    now=$(date +%s 2>/dev/null)
-    if [ -n "$now" ] && [ "$now" -lt $((last_attempt_at + retry_cooldown)) ]; then
+  # 同一个目标连着注失败就缓一下，别每 5 秒拿 ptrace 去戳一次。
+  now=$(date +%s 2>/dev/null)
+  if [ -n "$now" ] && [ "$pending_restart" -eq 0 ]; then
+    if [ "$keystore_pending" -eq 1 ] && [ "$last_attempt_pid" = "$pid" ] \
+      && [ "$now" -lt $((last_attempt_at + retry_cooldown)) ]; then
+      sleep 5
+      continue
+    fi
+    if [ "$soter_pending" -eq 1 ] && [ "$last_soter_pid" = "$spid" ] \
+      && [ "$now" -lt $((last_soter_attempt_at + retry_cooldown)) ]; then
       sleep 5
       continue
     fi
@@ -181,12 +300,18 @@ while true; do
   # leftover injector from a previous run cannot coexist with the new one.
   pkill -9 -f "$TARGET_INJECTOR" 2>/dev/null
   sleep 1
-  echo "[injector-daemon] injecting into keystore2 pid=$pid via $TARGET_INJECTOR"
-  "$TARGET_INJECTOR"
+  if [ "$keystore_pending" -eq 1 ]; then
+    log "[injector-daemon] injecting into keystore2 pid=$pid via $TARGET_INJECTOR"
+  else
+    log "[injector-daemon] injecting into $SOTER_PKG pid=$spid via $TARGET_INJECTOR"
+  fi
+  OMMEGA_INJECT_TARGETS="$inject_targets" "$TARGET_INJECTOR"
   rc=$?
   last_attempt_pid=$pid
   last_attempt_at=$(date +%s 2>/dev/null)
+  last_soter_pid=$spid
+  last_soter_attempt_at=$last_attempt_at
   pending_restart=0
-  echo "[injector-daemon] injector exited with code $rc"
+  log "[injector-daemon] injector exited with code $rc"
   sleep 3
 done

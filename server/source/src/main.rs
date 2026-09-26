@@ -24,6 +24,7 @@ mod handlers;
 mod keybox;
 mod pay;
 mod queue;
+mod soter_mint;
 mod strongbox;
 mod util;
 
@@ -158,6 +159,8 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .route("/api/attest/", post(handlers::attest))
         .route("/api/sign/", post(handlers::sign))
         .route("/api/decrypt/", post(handlers::decrypt))
+        // SOTER 转发：跟认证/签名不是一条链，单独一个入口。
+        .route("/api/soter/", post(handlers::soter))
         .route("/api/client_report/", post(handlers::client_report))
         .route("/api/b/poll/", get(handlers::b_poll))
         .route("/api/b/result/", post(handlers::b_result))

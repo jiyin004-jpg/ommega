@@ -26,7 +26,8 @@ pub fn init_logger(
     logcat_level: LevelFilter,
 ) {
     let _ = LOGGER_INIT.get_or_init(|| {
-        if let Err(error) = init_logger_inner(file_enabled, file_level, logcat_enabled, logcat_level)
+        if let Err(error) =
+            init_logger_inner(file_enabled, file_level, logcat_enabled, logcat_level)
         {
             eprintln!("relay logging failed to initialize: {error:#}");
         }

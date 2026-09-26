@@ -83,13 +83,19 @@ The module ships the official PathMask `.ko` builds (see
 * an already-loaded `pathmask` instance that this module did not load is left
   untouched (set `pathmask_takeover: 1` to take it over).
 
-Outcome is written to `/data/adb/ommega/pathmask.state`, the full log to
-`/data/adb/ommega/kmod-loader.log`. Optional keys, read from the same `config`
-file: `soter_hide: 0` (disable), `soter_hide_prefer: skip` (keep the path
-visible when the probe cannot reach the service), `pathmask_target: <path>`,
-`soter_service: <comma,separated,binder/names>`, `soter_package: <pkg>`.
+The WebUI switch **Mask SOTER** (flat config key `soter_hide`, off by default)
+controls the whole thing: with the switch off the loader never loads the kernel
+module and removes a mask of its own that is still loaded, so the service
+becomes visible again. The switch has to be turned on explicitly; a config
+without the key means off. Other optional keys, read from the same `config`
+file:
+`soter_hide_prefer: skip` (keep the path visible when the probe cannot reach the
+service), `pathmask_target: <path>`, `soter_service: <comma,separated,binder/names>`,
+`soter_package: <pkg>`.
 For a dry run (logs decisions, never touches `/proc/modules`):
-`KMOD_DRY_RUN=1 sh /data/adb/modules/ommega/kmod-loader.sh`.
+`KMOD_DRY_RUN=1 sh /data/adb/modules/ommega/kmod-loader.sh`; add
+`KMOD_CONF_PATH=/path/to/config` and `KMOD_STATE_DIR=/some/scratch/dir` to test
+against a scratch config without disturbing the real state.
 
 ## Restarting keymint and injector
 

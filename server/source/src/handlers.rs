@@ -112,6 +112,29 @@ fn check_auth(
     Ok(token)
 }
 
+/// Enqueue a task for an already-resolved target and wait for the B-side
+/// result.  Shared by the layer helper and the SOTER path (which resolves its
+/// target by capability instead of by load only).
+async fn enqueue_and_wait(state: &AppState, task_type: &str, body: &Value, target: &str) -> Value {
+    let task_id = state
+        .store
+        .create_task(task_type, body.clone(), target)
+        .await;
+    let timeout = Duration::from_secs(state.cfg.wait_result_timeout_secs);
+    match state.store.wait_for_result(&task_id, timeout).await {
+        Some(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("task_id".to_string(), json!(task_id));
+            }
+            result
+        }
+        None => json!({
+            "error": "task timeout: no B-side result",
+            "task_id": task_id,
+        }),
+    }
+}
+
 /// Layer ① — B-device fulfilment: enqueue a task for the resolved target and
 /// wait for the result. Fails fast when no B device is online so the next layer
 /// can run without waiting. When the requested device is offline the balancer
@@ -146,23 +169,7 @@ async fn try_b_device_layer(
             }
         );
     }
-    let task_id = state
-        .store
-        .create_task(task_type, body.clone(), &target)
-        .await;
-    let timeout = Duration::from_secs(state.cfg.wait_result_timeout_secs);
-    match state.store.wait_for_result(&task_id, timeout).await {
-        Some(mut result) => {
-            if let Some(obj) = result.as_object_mut() {
-                obj.insert("task_id".to_string(), json!(task_id));
-            }
-            Some(result)
-        }
-        None => Some(json!({
-            "error": "task timeout: no B-side result",
-            "task_id": task_id,
-        })),
-    }
+    Some(enqueue_and_wait(state, task_type, body, &target).await)
 }
 
 /// Whether the A-side request explicitly asked for StrongBox (security_level=2).
@@ -692,6 +699,146 @@ pub async fn decrypt(
     run_a_side_task(&state, "decrypt", &body).await
 }
 
+/// POST /api/soter/ — SOTER 转发的入口，鉴权后交给 `run_soter_task`。
+pub async fn soter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers, Some("a")) {
+        return *r;
+    }
+    run_soter_task(&state, &body).await
+}
+
+/// SOTER 转发：跟认证共用同一套三层链，差别只在三层的实现。
+///
+/// 层序（`physical` / `serverbox` 两种模式只差优先级）：
+///   physical:   B 端设备层 -> 服务端密钥层(keybox) -> 服务端自签层
+///   serverbox:  服务端密钥层 -> B 端设备层 -> 服务端自签层
+/// 哪一层没做成（没物料、没能力、请求失败）就回退下一层，三层都不行才把错误回
+/// 给 A 端；A 端据此用本地密钥，本地也不行就透原生。
+///
+/// B 端层的路由规则跟认证一样（见 `queue::resolve_soter_target`）：点名的设备
+/// 支持 SOTER 就用它，否则按负载在报过支持的设备里挑一台；一台都没有就是这层
+/// 没做成。SOTER 的答案本来是目标设备 TEE 里签的，换台设备就换了身份，所以这
+/// 一层没有"拿别的设备的密钥顶一下"这回事，只能换设备。
+///
+/// 服务端两层（见 `soter_mint`）用服务端自己的 RSA 物料现造一份自洽的 ASK，让
+/// A 端本地流程先闭环；腾讯那边的根谁也拿不到，这两层不假装自己是腾讯认得的东西。
+async fn run_soter_task(state: &AppState, body: &Value) -> Response {
+    if !body.is_object() {
+        return json_err(StatusCode::BAD_REQUEST, "json object body required");
+    }
+    let requested = body.get("device_id").and_then(Value::as_str).unwrap_or("");
+    let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+    tracing::info!(
+        "soter: op={op} requested={}",
+        if requested.is_empty() {
+            "<any>"
+        } else {
+            requested
+        }
+    );
+
+    let serverbox = state.fulfill.is_enabled();
+    let order: &[&str] = if serverbox {
+        &["keybox", "b", "self_signed"]
+    } else {
+        &["b", "keybox", "self_signed"]
+    };
+
+    let mut last_error: Option<String> = None;
+    for &layer in order {
+        let result = match layer {
+            "b" => try_b_soter_layer(state, body, requested).await,
+            "keybox" | "self_signed" => run_layer_soter(state, layer, body, requested).await,
+            _ => None,
+        };
+        match result {
+            Some(v) if v.get("error").is_none() => {
+                tracing::info!("soter: op={op} layer={layer} ok");
+                return Json(v).into_response();
+            }
+            Some(v) => {
+                let msg = v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+                    .to_string();
+                tracing::info!("soter: op={op} layer={layer} failed: {msg}");
+                last_error = Some(format!("{layer}: {msg}"));
+            }
+            None => {
+                tracing::info!("soter: op={op} layer={layer} 不管这个 op");
+                last_error = Some(format!("{layer}: op '{op}' not handled by this layer"));
+            }
+        }
+    }
+
+    let detail = last_error.unwrap_or_else(|| "no layer could serve the request".to_string());
+    tracing::warn!("soter: op={op} requested={requested} all layers failed (last: {detail})");
+    json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("no layer could serve SOTER op '{op}' ({detail})"),
+    )
+}
+
+/// B 端设备层：优先点名的设备，它做不了就按负载换一台报过支持的。
+///
+/// 一台都没有不算"这层不管这个 op"，而是这层没做成，所以返回带 `error` 的对象，
+/// 让上层接着试服务端那两层。
+async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> Option<Value> {
+    let Some(target) = state.store.resolve_soter_target(requested).await else {
+        return Some(json!({
+            "error": "no B-side device reporting SOTER support is online",
+        }));
+    };
+    if !requested.is_empty() && target != requested {
+        tracing::warn!(
+            "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
+        );
+    }
+    Some(enqueue_and_wait(state, "soter", body, &target).await)
+}
+
+/// 服务端那两层：`keybox` 层得先从库里把这台设备名下的服务端身份私钥拿出来
+/// （只有 RSA 才签得动 SOTER），拿不到就让下一层试。
+async fn run_layer_soter(
+    state: &AppState,
+    layer: &str,
+    body: &Value,
+    device_id: &str,
+) -> Option<Value> {
+    let db = state.db.clone();
+    let layer = layer.to_string();
+    let body = body.clone();
+    let device_id = device_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let key_pem = if layer == "keybox" {
+            // keybox 层只认 RSA：EC 身份签不动 SOTER，那就是这层没物料。
+            db.and_then(|db| match db.get_device_identity_by_id(&device_id, "rsa") {
+                Ok(Some(identity)) => Some(identity.private_key_pem_cipher),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "soter: keybox layer could not load the server identity for {device_id}: {e:#}"
+                    );
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        crate::soter_mint::run(&layer, &device_id, &body, key_pem.as_deref())
+    })
+    .await;
+    match result {
+        Ok(v) => v,
+        Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client report (A-side diagnostics)
 // ---------------------------------------------------------------------------
@@ -760,6 +907,9 @@ pub struct PollQuery {
     pub device_id: String,
     pub machine_id: Option<String>,
     pub timeout: Option<u64>,
+    /// 设备能力声明（逗号分隔，例如 `soter,strongbox`）。缺失 = 没上报，
+    /// 空串 = 上报了一个都没有。见 `queue::DeviceCaps::parse`。
+    pub caps: Option<String>,
 }
 
 pub async fn b_poll(
@@ -790,7 +940,12 @@ pub async fn b_poll(
 
     match state
         .store
-        .pop_for_b(&q.device_id, &machine_id, timeout)
+        .pop_for_b(
+            &q.device_id,
+            &machine_id,
+            crate::queue::DeviceCaps::parse(q.caps.as_deref()),
+            timeout,
+        )
         .await
     {
         Some(task) => {

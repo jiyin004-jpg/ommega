@@ -2,7 +2,24 @@ allow keystore system_file unix_dgram_socket { getattr read recvfrom }
 allow system_file keystore unix_dgram_socket sendto
 allow keystore system_file file { execute getattr map read receive }
 
+# SOTER 的宿主进程（com.tencent.soter.soterserver）也要能收下我们的 payload：
+# 注入器把 payload 镜像的 fd 经 unix dgram socket 递进去，它自己在进程里 dlopen。
+# 各机器上这个进程的域不一定一样，A 端这台（红魔 9 Pro / Android 16）是 system_app。
+allow system_app system_file unix_dgram_socket { getattr read recvfrom }
+allow system_file system_app unix_dgram_socket sendto
+allow system_app system_file file { execute getattr map read receive }
+
 allow crash_dump keystore process *
+
+# SOTER 的宿主（system_app）进不去 /data/misc/keystore（0700 keystore），所以 daemon
+# 另开了一个抽象 unix socket 当第二会合点：不打文件，DAC 管不着，放行只能靠这条。
+allow system_app keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
 
 allow keystore default_android_service service_manager find
 allow shell default_android_service service_manager find
+
+# SOTER 宿主（system_app）也要能把自己的日志落文件：payload 只走文件、不走 logcat
+# 之后，它得进得去这个目录。实测系统只放行了 file 的 read（log_flag 它能读），
+# 目录本身的 open/read 和建文件都被拒，所以这里把 dir 那一侧补齐。
+allow system_app system_data_file dir { open read write add_name remove_name rename search lock }
+allow system_app system_data_file file { open read write create append getattr setattr }

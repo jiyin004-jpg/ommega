@@ -1,4 +1,5 @@
-mod payload_fd;
+mod memfd;
+pub(crate) mod payload_fd;
 
 use std::ffi::{c_void, CString};
 use std::os::fd::AsRawFd;
@@ -12,6 +13,7 @@ use log::{debug, error, info, warn};
 use nix::{sys::signal::Signal, unistd::Pid};
 use rand::TryRng;
 
+use memfd::{write_payload_into_remote_memfd, RemoteMemfdAddrs};
 use payload_fd::{
     log_loader_abi, open_remote_payload_fd_from_path, send_fd_to_remote, RemoteFdHandoffAddrs,
 };
@@ -21,6 +23,13 @@ use crate::{sys, utils};
 
 const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
 const REMOTE_PAYLOAD_STATE_PATH: &str = "/data/adb/ommega/injector.payload";
+
+/// The daemon cannot look at another uid's /proc entry (hidepid hides those), so it has no
+/// way to tell what a socket peer process actually is. This is the list it checks against
+/// instead: one "<pid> <identifier>" line per target this launcher has injected. It lives
+/// next to the daemon's own state because that directory is the one the daemon can read
+/// for sure; the launcher runs as root, so writing there is fine.
+const DAEMON_PEER_STATE_PATH: &str = "/data/misc/keystore/ommega/rpc.peers";
 // 30s so an injection racing keystore2/keymint (re)start after boot has time
 // for keymint to (re)bind rpc.sock instead of timing out after 10s.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,9 +86,39 @@ fn persist_remote_payload_state(pid: Pid, payload_identifier: &str) -> Result<()
             )
         })?;
     }
-    std::fs::write(path, format!("{} {}\n", pid, payload_identifier))
+    // 这个文件里可以有多行（daemon 那边按多行记录读），一个目标一行。写的时要保住别人的
+    // 行：多个目标都往这里记，直接覆写会把 keystore2 那条顶掉，daemon 就会以为它没注过。
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let pid_field = pid.to_string();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .map(|field| field != pid_field)
+                != Some(false)
+        })
+        .map(|line| line.to_string())
+        .collect();
+    lines.push(format!("{pid} {payload_identifier}"));
+    let mut body = lines.join("\n");
+    body.push('\n');
+    std::fs::write(path, &body)
         .with_context(|| format!("failed to write injector payload state {}", path.display()))?;
+    write_daemon_peer_state(&body);
     Ok(())
+}
+
+fn write_daemon_peer_state(body: &str) {
+    let path = Path::new(DAEMON_PEER_STATE_PATH);
+    match std::fs::write(path, body) {
+        Ok(()) => debug!("refreshed the daemon peer state {}", path.display()),
+        Err(error) => debug!(
+            "cannot write the daemon peer state {} ({error}); an app-domain target of this \
+             injection will not be accepted by the RPC server",
+            path.display()
+        ),
+    }
 }
 
 fn wait_for_rpc_socket() -> Result<()> {
@@ -90,8 +129,12 @@ fn wait_for_rpc_socket() -> Result<()> {
     let mut warned = false;
 
     while start.elapsed() < READY_TIMEOUT {
+        // The file socket is invisible to app-domain callers (0700 keystore dir), so
+        // the abstract rendezvous point counts as ready too.
+        if std::fs::metadata(rpc::SOCKET).is_ok() || crate::ipc::abstract_rpc_reachable() {
+            return Ok(());
+        }
         match std::fs::metadata(rpc::SOCKET) {
-            Ok(_) => return Ok(()),
             Err(err) if !warned => {
                 // Log the real reason (EACCES vs ENOENT etc.) so an Android-17
                 // SELinux denial surfaces clearly instead of a bare timeout.
@@ -102,14 +145,15 @@ fn wait_for_rpc_socket() -> Result<()> {
                 );
                 warned = true;
             }
-            Err(_) => {}
+            _ => {}
         }
         thread::sleep(READY_RETRY_DELAY);
     }
 
     bail!(
-        "ommega RPC socket did not appear in time (socket={})",
-        rpc::SOCKET
+        "ommega RPC endpoint did not become reachable in time (file={}, abstract={})",
+        rpc::SOCKET,
+        crate::ipc::abstract_rpc_reachable()
     );
 }
 
@@ -337,35 +381,76 @@ fn do_inject(pid: Pid, self_path: &std::path::Path) -> Result<()> {
         libc_return: libc_return_addr,
     };
 
-    let remote_lib_fd = match send_fd_to_remote(
-        pid,
-        local_lib_fd,
-        "payload image",
-        fd_handoff_addrs,
-        &mut push_to_remote_stack,
-        &get_remote_errno,
-        &close_remote,
+    // memfd 那条路要的三个 libc 符号。缺一个就不走这条路（老机器上 memfd_create 可能
+    // 根本不存在），而不是把整个注入判失败 —— 还有递 fd 和直接开文件两条回落。
+    let memfd_addrs = match (
+        resolve("libc.so", "memfd_create"),
+        resolve("libc.so", "write"),
+        resolve("libc.so", "lseek").or_else(|_| resolve("libc.so", "lseek64")),
     ) {
-        Ok(fd) => fd,
-        Err(error) => {
-            warn!(
-                "payload fd handoff failed: {error:#}. Trying direct fallback via {}.",
-                self_path.display()
-            );
-            open_remote_payload_fd_from_path(
+        (Ok(memfd_create), Ok(write), Ok(lseek)) => Some(RemoteMemfdAddrs {
+            memfd_create,
+            write,
+            lseek,
+            libc_return: libc_return_addr,
+        }),
+        _ => {
+            warn!("memfd payload transfer unavailable: memfd_create/write/lseek not resolvable in the target");
+            None
+        }
+    };
+
+    // payload 镜像统一走 memfd：在目标进程里现开一块内存文件、分块写完再 dlopen 它。
+    // 这条对 keystore2 和 SOTER 宿主一样有效，也不碰文件系统。以前是先跨进程递 fd
+    // （只有 keystore2 那条验过）、memfd 只当兜底，两个目标各走一条路；现在从 memfd
+    // 起手，递 fd 和直接开文件只留作老内核 / 权限受限时的回落，行为一致。
+    let remote_lib_fd = 'handoff: {
+        let memfd_note = match memfd_addrs {
+            Some(addrs) => match write_payload_into_remote_memfd(
                 pid,
-                open_addr,
-                libc_return_addr,
+                &payload_identifier,
                 self_path,
+                addrs,
                 &mut push_to_remote_stack,
                 &get_remote_errno,
-            )
-            .with_context(|| {
-                format!(
-                    "failed to hand off payload fd and could not reopen {} directly",
+                &close_remote,
+            ) {
+                Ok(fd) => break 'handoff fd,
+                Err(error) => format!("memfd payload transfer failed: {error:#}"),
+            },
+            None => "memfd payload transfer unavailable: memfd_create/write/lseek not resolvable in the target".to_string(),
+        };
+
+        match send_fd_to_remote(
+            pid,
+            local_lib_fd,
+            "payload image",
+            fd_handoff_addrs,
+            &mut push_to_remote_stack,
+            &get_remote_errno,
+            &close_remote,
+        ) {
+            Ok(fd) => break 'handoff fd,
+            Err(socket_error) => {
+                warn!(
+                    "{memfd_note}; payload fd handoff also failed: {socket_error:#}. Trying direct fallback via {}.",
                     self_path.display()
+                );
+                open_remote_payload_fd_from_path(
+                    pid,
+                    open_addr,
+                    libc_return_addr,
+                    self_path,
+                    &mut push_to_remote_stack,
+                    &get_remote_errno,
                 )
-            })?
+                .with_context(|| {
+                    format!(
+                        "failed to move the payload into the target process: {memfd_note}; fd handoff: {socket_error:#}; couldn't reopen {} directly either",
+                        self_path.display()
+                    )
+                })?
+            }
         }
     };
 
@@ -388,6 +473,17 @@ fn do_inject(pid: Pid, self_path: &std::path::Path) -> Result<()> {
 
     let remote_loader_path_c = CString::new(payload_identifier.as_str())?;
     let remote_path_ptr = push_to_remote_stack(remote_loader_path_c.as_bytes_with_nul())?;
+
+    // Register the pid before the payload runs: the daemon authorizes an app-domain client by
+    // matching the pid SO_PEERCRED reports against this list, and the payload starts talking
+    // to the RPC server from inside `entry`. Writing this after the call would be too late for
+    // the first (and on a target that never retries, the only) connection attempt.
+    if let Err(error) = persist_remote_payload_state(pid, &payload_identifier) {
+        warn!(
+            "failed to persist payload identifier state for pid {}: {:#}",
+            pid, error
+        );
+    }
 
     // Call dlopen
     // args: filename, flags (RTLD_NOW=2), extinfo
@@ -438,13 +534,6 @@ fn do_inject(pid: Pid, self_path: &std::path::Path) -> Result<()> {
     let entry_result = sys::remote_call(pid, injector_entry, libc_return_addr, &[handle])?;
     if entry_result == 0 {
         bail!("Remote entry returned false");
-    }
-
-    if let Err(error) = persist_remote_payload_state(pid, &payload_identifier) {
-        warn!(
-            "failed to persist payload identifier state for pid {}: {:#}",
-            pid, error
-        );
     }
 
     info!("remote entry returned successfully");

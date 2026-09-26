@@ -1,7 +1,7 @@
 [package]
 name = "ommega-injector"
 authors = ["jiyin004"]
-version = "1.5.1"
+version = "1.6.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 build = "build.rs"
@@ -22,6 +22,9 @@ async-trait = "0.1.91"
 rsbinder = { version = "0.10.0", features = ["android_12_plus", "rpc"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
+# SOTER 的 ASK/AuthKey 签名是 RSA-PSS-SHA256；`rsa 0.9` 自带 sha2 / rand_core
+# 的 re-export，所以不额外引第二个版本，直接从 `rsa::sha2` 取。
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 toml = "1.1.3"
 rand = "0.10.2"
 android_logger = "0.15.1"

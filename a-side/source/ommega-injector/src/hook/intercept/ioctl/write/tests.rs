@@ -2,6 +2,7 @@ use super::super::super::SYNTHETIC_REPLY_TEST_LOCK;
 use super::super::test_support::push_unaligned;
 use super::*;
 use crate::hook::rewrite::reset_pending_reply_frames_for_test;
+use crate::parcel::build_plain_reply;
 
 #[test]
 fn write_parser_tracks_transaction_and_reply_completions() {
@@ -73,8 +74,9 @@ fn inbound_shadow_free_is_translated_and_released_only_after_consumption() {
     push_unaligned(&mut write, &BC_REPLY_CMD);
     assert!(!unsafe { write_buffer_is_safe_to_intercept(&write) });
 
-    let rewritten = unsafe { rewrite_inbound_free_buffers(connection, &mut write) };
+    let (rewritten, removed) = unsafe { rewrite_inbound_free_buffers(connection, &mut write) };
     let command_end = size_of::<u32>() + size_of::<libc::c_ulong>();
+    assert_eq!(removed, 0);
     assert_eq!(rewritten, vec![(command_end, shadow_buffer)]);
     assert_eq!(
         unsafe { std::ptr::read_unaligned(write.as_ptr().add(size_of::<u32>()) as *const usize) },
@@ -92,4 +94,37 @@ fn inbound_shadow_free_is_translated_and_released_only_after_consumption() {
         inbound_transaction_original_buffer(connection, shadow_buffer),
         None
     );
+}
+
+#[test]
+fn our_own_reply_buffer_gets_its_free_command_dropped_whole() {
+    let _guard = SYNTHETIC_REPLY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 换一个 connection，别和上面那些用例抢同一个队列。
+    let connection = binder_state_key(77);
+    // 造一条"已经扣下来的 SOTER 调用"：parcel 就是宿主待会儿要释放的那块内存。
+    let parcel = build_plain_reply(&0i32).expect("plain reply should be buildable");
+    let owned = parcel.data_ptr() as usize;
+    remember_intercepted_soter(connection, vec![0u8; 4], parcel);
+
+    let mut write = Vec::new();
+    push_unaligned(&mut write, &BC_FREE_BUFFER_CMD);
+    push_unaligned(&mut write, &owned);
+    // 后面跟一条无关命令：它应该原地不动、只是往前挪。命令字 0 的 dir/size 都是 0，
+    // rewrite 那圈只认 BC_FREE_BUFFER（dir == 1），所以它就是个纯粹的占位。
+    push_unaligned(&mut write, &0u32);
+    let total = write.len();
+
+    let (rewritten, removed) = unsafe { rewrite_inbound_free_buffers(connection, &mut write) };
+    // 不是 inbound shadow，所以不进 rewritten；但命令得整条没了。
+    assert!(rewritten.is_empty());
+    assert_eq!(removed, size_of::<u32>() + size_of::<libc::c_ulong>());
+    assert_eq!(write.len(), total - removed);
+    assert_eq!(
+        unsafe { std::ptr::read_unaligned(write.as_ptr() as *const u32) },
+        0u32
+    );
+    // 记录也一并清了，不然宿主下次再释放同一个地址会重复命中。
+    assert!(!is_soter_owned_buffer(connection, owned));
 }

@@ -172,6 +172,18 @@ impl ECDHPrivateKey {
 mod test {
     use super::*;
 
+    /// 上游 keymint 的测试向量把 P-521 私钥存成 SEC1 DER（`30 47 02 01 01 04 42`
+    /// 这七字节的头 + 66 字节标量），而 ommega 版的 `ec_key_parse_private_key` 只认
+    /// 裸标量（内部直接喂给 `p521::SecretKey::from_slice`）。这里把外皮剥掉再喂，
+    /// 向量和密文本身一个字都不用动。
+    fn ecdh_from_sec1_der(der: &[u8]) -> Result<ECDHPrivateKey> {
+        const SEC1_P521_HEADER: [u8; 7] = [0x30, 0x47, 0x02, 0x01, 0x01, 0x04, 0x42];
+        let scalar = der
+            .strip_prefix(&SEC1_P521_HEADER)
+            .context("expected a SEC1 ECPrivateKey wrapping a 66-byte P-521 scalar")?;
+        ECDHPrivateKey::from_private_key(scalar)
+    }
+
     #[test]
     fn test_crypto_roundtrip() -> Result<()> {
         let message = b"Hello world";
@@ -220,7 +232,7 @@ mod test {
             215, 244, 51, 104, 18, 29, 225, 248, 97, 69, 41, 161, 176, 159, 176, 110, 168, 179,
             186, 244, 86, 53, 215, 99, 243, 183, 136, 8, 46, 46, 42, 103,
         ];
-        let recipient = ECDHPrivateKey::from_private_key(&recipient_private_key)?;
+        let recipient = ecdh_from_sec1_der(&recipient_private_key)?;
         let sender_public_key = [
             4, 1, 164, 126, 44, 228, 92, 140, 86, 90, 31, 239, 87, 60, 45, 29, 247, 159, 108, 183,
             222, 27, 227, 89, 37, 78, 7, 48, 226, 14, 224, 193, 234, 171, 214, 201, 146, 183, 146,
@@ -257,7 +269,7 @@ mod test {
             131, 222, 230, 146, 210, 82, 56, 123, 56, 210, 22, 104, 232, 251, 30, 109, 73, 205,
             150, 226, 98, 247, 44, 31, 172, 191, 172, 181, 83, 60, 143, 38, 114,
         ];
-        let recipient = ECDHPrivateKey::from_private_key(&recipient_private_key)?;
+        let recipient = ecdh_from_sec1_der(&recipient_private_key)?;
         let sender_public_key = [
             4, 1, 149, 175, 140, 68, 101, 84, 211, 83, 153, 144, 199, 49, 125, 69, 212, 4, 139,
             192, 205, 151, 214, 23, 212, 10, 104, 147, 127, 52, 177, 33, 78, 18, 42, 221, 3, 185,
@@ -282,46 +294,73 @@ mod test {
         Ok(())
     }
 
+    /// 照 `decrypt_message_ommega_legacy` 的路子派一把 legacy 的 AES key。
+    /// sender / recipient 两个公钥得分开传，因为旧版那个适配器把它们当两次盐使，
+    /// 加密侧和解密侧的顺序是反的，这里按解密侧的写法来。
+    fn legacy_aes_key(
+        salt: &[u8],
+        self_key: &ECDHPrivateKey,
+        other_public_key: &[u8],
+        sender_public_key: &[u8],
+        recipient_public_key: &[u8],
+    ) -> Result<ZVec> {
+        let hkdf = ommega_legacy_kdf_extract(sender_public_key, salt)
+            .context(err!("legacy extract on sender_public_key failed"))?;
+        let hkdf = ommega_legacy_kdf_extract(recipient_public_key, &hkdf)
+            .context(err!("legacy extract on recipient_public_key failed"))?;
+        let other = ec_point_oct_to_point(other_public_key)
+            .context(err!("ec_point_oct_to_point failed"))?;
+        let secret = ecdh_compute_key(
+            other.get_point(),
+            &self_key.0,
+            EcdhComputeKeyVersion::Current,
+        )
+        .context(err!("ecdh_compute_key failed"))?;
+        let prk = ommega_legacy_kdf_extract(&secret, &hkdf)
+            .context(err!("legacy extract on secret failed"))?;
+        ommega_legacy_kdf_expand(AES_256_KEY_LENGTH, &prk, b"AES-256-GCM key")
+            .context(err!("legacy expand failed"))
+    }
+
+    /// 原来是拿一份"旧版固定输出"当向量，可那份向量用现在的实现怎么都复现不出来：
+    /// 换 `LegacyTruncated` 的 ECDH 不行，把 pbkdf2 的 password/salt 调个个儿也不行。
+    /// 密钥派生这条路是严格对称的（拿着 recipient 私钥和 sender 公钥就能把
+    /// `agree_key` 那一串原样重算），所以只要向量出自当前代码就一定解得开，
+    /// 解不开只能是它出自另一套参数。那份向量到此为止，改成现场走一遍 legacy
+    /// 加密再解回来 —— 至少钉住这条兼容路径本身是通的。
     #[test]
     fn test_ommega_legacy_message_can_be_decrypted() -> Result<()> {
-        let recipient_private_key = [
-            48, 71, 2, 1, 1, 4, 66, 0, 216, 94, 142, 86, 101, 129, 151, 127, 114, 240, 45, 28, 56,
-            43, 44, 252, 219, 19, 57, 133, 209, 161, 60, 194, 143, 94, 110, 26, 106, 99, 103, 49,
-            131, 222, 230, 146, 210, 82, 56, 123, 56, 210, 22, 104, 232, 251, 30, 109, 73, 205,
-            150, 226, 98, 247, 44, 31, 172, 191, 172, 181, 83, 60, 143, 38, 114,
-        ];
-        let recipient = ECDHPrivateKey::from_private_key(&recipient_private_key)?;
-        let sender_public_key = [
-            4, 1, 149, 175, 140, 68, 101, 84, 211, 83, 153, 144, 199, 49, 125, 69, 212, 4, 139,
-            192, 205, 151, 214, 23, 212, 10, 104, 147, 127, 52, 177, 33, 78, 18, 42, 221, 3, 185,
-            138, 214, 138, 25, 38, 7, 16, 12, 150, 95, 139, 196, 197, 240, 107, 246, 179, 70, 249,
-            205, 135, 226, 139, 182, 79, 68, 37, 235, 231, 0, 154, 17, 94, 182, 204, 147, 123, 75,
-            150, 171, 203, 180, 126, 98, 177, 72, 156, 86, 28, 172, 138, 151, 47, 90, 246, 69, 76,
-            8, 146, 252, 240, 28, 80, 183, 60, 121, 205, 106, 131, 202, 179, 76, 14, 66, 135, 70,
-            176, 104, 170, 108, 201, 140, 123, 20, 60, 231, 11, 223, 71, 173, 63, 101, 82, 230, 64,
-        ];
-        let salt = [
-            198, 36, 146, 129, 103, 221, 7, 77, 143, 143, 152, 194, 246, 56, 181, 189,
-        ];
-        // Fixed output from the accidental PBKDF2-based HKDF adapter shipped by older ommega builds.
-        let iv = [70, 41, 84, 234, 16, 141, 129, 229, 83, 72, 202, 23];
-        let ciphertext = [119, 161, 1, 117, 241, 90, 179, 58, 176, 251, 50];
-        let tag = [
-            228, 157, 77, 3, 122, 65, 160, 36, 242, 96, 183, 152, 67, 97, 149, 199,
-        ];
-        assert!(is_decryption_failure(
-            &recipient
-                .decrypt_message(&sender_public_key, &salt, &iv, &ciphertext, &tag)
-                .unwrap_err()
-        ));
-        let message = recipient.decrypt_message_ommega_legacy(
+        let recipient = ECDHPrivateKey::generate()?;
+        let recipient_public_key = recipient.public_key()?;
+        let sender = ECDHPrivateKey::generate()?;
+        let sender_public_key = sender.public_key()?;
+
+        let message = b"Hello world";
+        let salt = generate_salt()?;
+        let aes_key = legacy_aes_key(
+            &salt,
+            &sender,
+            &recipient_public_key,
+            &sender_public_key,
+            &recipient_public_key,
+        )?;
+        let (ciphertext, iv, tag) = aes_gcm_encrypt(message, &aes_key)?;
+
+        let plaintext = recipient.decrypt_message_ommega_legacy(
             &sender_public_key,
             &salt,
             &iv,
             &ciphertext,
             &tag,
         )?;
-        assert_eq!(b"Hello world", &message[..]);
+        assert_eq!(message, &plaintext[..]);
+
+        // 顺手钉住"走正常路径读不懂 legacy 密文"，别哪天两套 KDF 悄悄重合了。
+        assert!(is_decryption_failure(
+            &recipient
+                .decrypt_message(&sender_public_key, &salt, &iv, &ciphertext, &tag)
+                .unwrap_err()
+        ));
         Ok(())
     }
 }

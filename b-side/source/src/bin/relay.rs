@@ -149,6 +149,9 @@ struct RelayConfig {
     device_id: String,
     machine_id: String,
     token: String,
+    /// Allow SOTER ops that create or remove keys on the device.  Off by
+    /// default: those ops change the real payment-key state.
+    soter_allow_mutation: bool,
 }
 
 impl RelayConfig {
@@ -179,10 +182,17 @@ fn file_mtime(path: &str) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// Parse a `KEY=VALUE` boolean: `1`, `true`, `yes`, `on` (any case) are true.
+fn parse_bool(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// Load config from `/data/adb/ommega/relay.conf` (KEY=VALUE lines).
 fn load_config_from_file() -> Result<RelayConfig> {
-    let raw = std::fs::read_to_string(CONF_PATH)
-        .with_context(|| format!("read {CONF_PATH}"))?;
+    let raw = std::fs::read_to_string(CONF_PATH).with_context(|| format!("read {CONF_PATH}"))?;
     let mut m: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for line in raw.lines() {
         let line = line.trim();
@@ -209,13 +219,20 @@ fn load_config_from_file() -> Result<RelayConfig> {
         .get("OMMEGA_RELAY_TOKEN")
         .cloned()
         .context("OMMEGA_RELAY_TOKEN missing in relay.conf")?;
-    let machine_id = m.get("OMMEGA_RELAY_MACHINE_ID").cloned().unwrap_or_default();
+    let machine_id = m
+        .get("OMMEGA_RELAY_MACHINE_ID")
+        .cloned()
+        .unwrap_or_default();
+    let soter_allow_mutation = m
+        .get("OMMEGA_RELAY_SOTER_MUTATION")
+        .is_some_and(|v| parse_bool(v));
     let server = server.trim_end_matches('/').to_string();
     Ok(RelayConfig {
         server,
         device_id,
         machine_id,
         token,
+        soter_allow_mutation,
     })
 }
 
@@ -303,12 +320,14 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
     let token = env("OMMEGA_RELAY_TOKEN")
         .context("OMMEGA_RELAY_TOKEN not set and relay.conf unreadable")?;
     let machine_id = env("OMMEGA_RELAY_MACHINE_ID").unwrap_or_default();
+    let soter_allow_mutation = env("OMMEGA_RELAY_SOTER_MUTATION").is_some_and(|v| parse_bool(&v));
     let server = server.trim_end_matches('/').to_string();
     let cfg = RelayConfig {
         server,
         device_id,
         machine_id,
         token,
+        soter_allow_mutation,
     };
     cfg.validate()?;
     Ok((cfg, "env"))
@@ -349,7 +368,9 @@ fn get_http_client() -> Result<Arc<Client>> {
         }
     }
     // Slow path: write lock, build if still absent.
-    let mut guard = HTTP_CLIENT.write().map_err(|_| anyhow!("HTTP client lock poisoned"))?;
+    let mut guard = HTTP_CLIENT
+        .write()
+        .map_err(|_| anyhow!("HTTP client lock poisoned"))?;
     if let Some(client) = guard.as_ref() {
         return Ok(client.clone());
     }
@@ -417,22 +438,21 @@ fn http_request(
 // ---------------------------------------------------------------------------
 
 fn poll_tasks(cfg: &RelayConfig) -> Result<Option<(String, String, Value)>> {
+    // 带上本机能力声明：服务端靠它把 SOTER 任务路由到真能做的设备上，状态页也
+    // 显示这两个。只查服务实例在不在，不做 HAL 调用、没有副作用。
+    let caps = ommegaclient_b::caps::report();
     let url = format!(
-        "{}/api/b/poll/?device_id={}&machine_id={}&timeout={}",
-        cfg.server, cfg.device_id, cfg.machine_id, POLL_TIMEOUT_SEC
+        "{}/api/b/poll/?device_id={}&machine_id={}&timeout={}&caps={}",
+        cfg.server, cfg.device_id, cfg.machine_id, POLL_TIMEOUT_SEC, caps
     );
-    let headers = vec![(
-        "X-Relay-Token".to_string(),
-        cfg.token.clone(),
-    )];
-    let (status, body) = http_request("GET", &url, &headers, None)
-        .with_context(|| "b/poll failed")?;
+    let headers = vec![("X-Relay-Token".to_string(), cfg.token.clone())];
+    let (status, body) =
+        http_request("GET", &url, &headers, None).with_context(|| "b/poll failed")?;
     log::info!("b/poll status={status} body_len={}", body.len());
     match status {
         204 => Ok(None),
         200 => {
-            let v: Value =
-                serde_json::from_slice(&body).with_context(|| "b/poll bad json")?;
+            let v: Value = serde_json::from_slice(&body).with_context(|| "b/poll bad json")?;
             let task_id = v
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -526,8 +546,7 @@ fn extract_attestation_context(payload: &Value) -> Result<AttestationContext> {
         .get("challenge")
         .ok_or_else(|| anyhow!("payload missing challenge"))?;
 
-    let app_id_der = b64_decode(app_id)
-        .with_context(|| "decode attestation_application_id")?;
+    let app_id_der = b64_decode(app_id).with_context(|| "decode attestation_application_id")?;
     let challenge = b64_decode(challenge).with_context(|| "decode challenge")?;
     Ok((app_id_der, challenge))
 }
@@ -538,12 +557,16 @@ fn extract_attestation_context(payload: &Value) -> Result<AttestationContext> {
 /// SHA-256, etc.).
 fn parse_key_spec(payload: &Value) -> Result<KeySpec> {
     let nested = payload.get("device_attest_context");
-    let get = |k: &str| -> Option<&Value> {
-        payload.get(k).or_else(|| nested.and_then(|n| n.get(k)))
-    };
+    let get =
+        |k: &str| -> Option<&Value> { payload.get(k).or_else(|| nested.and_then(|n| n.get(k))) };
     let get_i64 = |k: &str| get(k).and_then(Value::as_i64);
     let get_arr = |k: &str| -> Vec<&Value> {
-        get(k).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]).iter().collect()
+        get(k)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .collect()
     };
 
     // Algorithm family: prefer the explicit KeyMint `key_algorithm` int (raw
@@ -560,7 +583,10 @@ fn parse_key_spec(payload: &Value) -> Result<KeySpec> {
     };
 
     let collect_enum = |vals: Vec<&Value>| -> Vec<i32> {
-        vals.iter().filter_map(|v| v.as_i64()).map(|n| n as i32).collect()
+        vals.iter()
+            .filter_map(|v| v.as_i64())
+            .map(|n| n as i32)
+            .collect()
     };
 
     Ok(KeySpec {
@@ -624,7 +650,11 @@ fn log_cert_chain(tag: &str, chain: &[Vec<u8>]) {
             None => lines.push(format!("#{i} {}B (unparsable)", der.len())),
         }
     }
-    log::info!("cert_chain[{tag}]: {} certs :: {}", chain.len(), lines.join(" | "));
+    log::info!(
+        "cert_chain[{tag}]: {} certs :: {}",
+        chain.len(),
+        lines.join(" | ")
+    );
 }
 
 /// Picks a signing key algorithm from the payload (defaults to EC P-256).
@@ -651,8 +681,9 @@ fn alias_of(payload: &Value, default: &str) -> String {
 
 fn handle_generate_attest(_task_type: &str, payload: &Value) -> Result<Value> {
     let (app_id_der, challenge) = extract_attestation_context(payload)?;
-    check_app_id_der(&app_id_der)
-        .with_context(|| "attestation_application_id is not a valid AttestationApplicationId DER")?;
+    check_app_id_der(&app_id_der).with_context(|| {
+        "attestation_application_id is not a valid AttestationApplicationId DER"
+    })?;
     let alias = alias_of(payload, "attest");
     let spec = parse_key_spec(payload)?;
     // The requested purposes are forwarded unchanged (see
@@ -708,9 +739,7 @@ fn handle_generate_attest(_task_type: &str, payload: &Value) -> Result<Value> {
                 } else {
                     "strongbox generateKey failed"
                 };
-                log::warn!(
-                    "B-side StrongBox unavailable ({reason}): {err_str}"
-                );
+                log::warn!("B-side StrongBox unavailable ({reason}): {err_str}");
                 return Ok(json!({ "error": format!("strongbox not supported: {reason}") }));
             }
         }
@@ -766,28 +795,47 @@ fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
     }))
 }
 
+/// SOTER forwarding: the payload selects a HAL op (see `ommegaclient_b::soter`).
+///
+/// Read-only ops always run; the ops that create or remove keys are gated by
+/// `OMMEGA_RELAY_SOTER_MUTATION` because they change real device key state.
+fn handle_soter(cfg: &RelayConfig, _task_type: &str, payload: &Value) -> Result<Value> {
+    ommegaclient_b::soter::handle(payload, cfg.soter_allow_mutation)
+}
+
 fn handle_task(cfg: &RelayConfig, task_id: &str, task_type: &str, payload: &Value) -> Result<()> {
-    let handler: fn(&str, &Value) -> Result<Value> = match task_type {
-        "attest" => handle_generate_attest,
-        "sign" => handle_sign,
-        "decrypt" => handle_decrypt,
+    let handler: fn(&RelayConfig, &str, &Value) -> Result<Value> = match task_type {
+        "attest" => |_cfg, task_type, payload| handle_generate_attest(task_type, payload),
+        "sign" => |_cfg, task_type, payload| handle_sign(task_type, payload),
+        "decrypt" => |_cfg, task_type, payload| handle_decrypt(task_type, payload),
+        // SOTER forwarding needs the config (mutation policy), so it gets the
+        // config-aware handler signature directly.
+        "soter" => handle_soter,
         other => {
             log::warn!("task {task_id} type={other} not supported, reporting failure");
-            post_result(cfg, task_id, &json!({ "error": format!("unsupported task type: {other}") }))?;
+            post_result(
+                cfg,
+                task_id,
+                &json!({ "error": format!("unsupported task type: {other}") }),
+            )?;
             return Ok(());
         }
     };
 
     let start = std::time::Instant::now();
     log::info!("processing task {task_id} type={task_type}");
-    let result = match handler(task_type, payload) {
+    let result = match handler(cfg, task_type, payload) {
         Ok(v) => v,
         Err(e) => {
             log::error!("task {task_id} type={task_type} failed: {e:#}");
             json!({ "error": format!("{e:#}") })
         }
     };
-    let outcome = if result.get("error").is_some() { "failed" } else { "ok" };
+    let outcome = if result.get("error").is_some() {
+        "failed"
+    } else {
+        "ok"
+    };
     log::info!(
         "task {task_id} type={task_type} {outcome} in {:?}",
         start.elapsed()
@@ -891,6 +939,7 @@ fn main() {
             device_id: String::new(),
             machine_id: String::new(),
             token: String::new(),
+            soter_allow_mutation: false,
         });
         log::info!(
             "relay daemon starting (config from {source}) server={} device={} machine={}",

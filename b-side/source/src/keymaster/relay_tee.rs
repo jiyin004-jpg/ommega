@@ -17,7 +17,12 @@
 //! so this module can survive on its own if the software keystore modules are
 //! removed.
 
-use std::{cell::RefCell, collections::HashMap, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Context, Result};
 use kmr_wire::keymint::KeyParam;
@@ -26,9 +31,9 @@ use rsbinder::{hub, DeathRecipient, FromIBinder, StatusCode, Strong, WIBinder};
 
 use crate::android::hardware::security::keymint::{
     Algorithm::Algorithm, EcCurve::EcCurve, HardwareAuthenticatorType::HardwareAuthenticatorType,
-    IKeyMintDevice::IKeyMintDevice, KeyOrigin::KeyOrigin, KeyParameter::KeyParameter as KmKeyParameter,
-    KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose, MlDsaVariant::MlDsaVariant as AidlMlDsaVariant,
-    Tag::Tag,
+    IKeyMintDevice::IKeyMintDevice, KeyOrigin::KeyOrigin,
+    KeyParameter::KeyParameter as KmKeyParameter, KeyParameterValue::KeyParameterValue,
+    KeyPurpose::KeyPurpose, MlDsaVariant::MlDsaVariant as AidlMlDsaVariant, Tag::Tag,
 };
 
 // ---------------------------------------------------------------------------
@@ -364,9 +369,7 @@ pub fn probe_keymint_version(keymint: &Strong<dyn IKeyMintDevice>) -> i32 {
             info.versionNumber
         }
         Err(status) => {
-            log::warn!(
-                "getHardwareInfo failed: {status:?}; falling back to KEY_MINT_V5"
-            );
+            log::warn!("getHardwareInfo failed: {status:?}; falling back to KEY_MINT_V5");
             KEY_MINT_V5
         }
     }
@@ -409,9 +412,7 @@ pub fn key_param_to_aidl(kp: KeyParam, km_dev_version: i32) -> Result<KmKeyParam
             KeyParameterValue::Integer(v as i32)
         }
         KP::MlDsaVariant(v) => KeyParameterValue::MlDsaVariant(AidlMlDsaVariant(v as i32)),
-        KP::RsaPublicExponent(kmr_wire::RsaExponent(v)) => {
-            KeyParameterValue::LongInteger(v as i64)
-        }
+        KP::RsaPublicExponent(kmr_wire::RsaExponent(v)) => KeyParameterValue::LongInteger(v as i64),
         KP::IncludeUniqueId => KeyParameterValue::BoolValue(true),
         KP::RsaOaepMgfDigest(v) => KeyParameterValue::Digest(
             crate::android::hardware::security::keymint::Digest::Digest(v as i32),

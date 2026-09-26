@@ -19,7 +19,11 @@
 #
 # Optional keys, read from the A-side flat config
 # (/data/misc/keystore/ommega/config):
-#   soter_hide=0            disable this script entirely
+#   soter_hide=1|<true>     "mask SOTER" switch on in the WebUI: mask the path
+#                           when the service cannot be reached. Key absent (the
+#                           fresh-install default) or 0/false/no/off = never
+#                           load the mask, and a mask of ours that is still
+#                           loaded is removed again so the path stays visible.
 #   soter_hide_prefer=skip  when the service cannot be reached, prefer keeping
 #                           the path visible instead of masking it
 #   soter_package=...       package name used by the process tier
@@ -30,7 +34,9 @@
 MODDIR=${0%/*}
 KMOD_DIR="$MODDIR/pathmask"
 CONF_PATH=${KMOD_CONF_PATH:-/data/misc/keystore/ommega/config}
-STATE_DIR=/data/adb/ommega
+# Both overridable so the loader can be exercised from a scratch directory
+# (KMOD_DRY_RUN=1) without touching the real state.
+STATE_DIR=${KMOD_STATE_DIR:-/data/adb/ommega}
 STATE_FILE="$STATE_DIR/pathmask.state"
 OWNED_FILE="$STATE_DIR/pathmask.owned"
 
@@ -58,6 +64,16 @@ now_ms() {
 conf_get() {
   [ -f "$CONF_PATH" ] || return 0
   sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*\(.*\)$/\1/p" "$CONF_PATH" 2>/dev/null | head -n1
+}
+
+# 0 = the WebUI "mask SOTER" switch is on.  An absent key means off, which is
+# also the fresh-install default, so only an explicit truthy value masks; the
+# Rust booleans the WebUI writes are accepted alongside the shell-style 1.
+soter_hide_enabled() {
+  case "$(conf_get soter_hide | tr 'A-Z' 'a-z')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
 }
 
 write_state() {
@@ -200,8 +216,23 @@ main() {
     *) write_state "skipped-arch" "uname -m=$(uname -m 2>/dev/null)"; return 0 ;;
   esac
 
-  if [ "$(conf_get soter_hide)" = "0" ]; then
-    write_state "skipped-disabled" "soter_hide=0"
+  if ! soter_hide_enabled; then
+    # The WebUI switch is off (or absent): no insmod, ever.  If a previous run
+    # of ours is still masking the path, undo it so the service is visible
+    # again; a foreign pathmask instance is left alone, as everywhere else.
+    if pathmask_loaded && [ -f "$OWNED_FILE" ]; then
+      if [ "$DRY_RUN" = "1" ]; then
+        # Unloading would also drop the marker; in dry-run both are skipped.
+        write_state "dry-run-would-unload" "soter_hide off; mask is ours"
+      elif unload_pathmask; then
+        rm -f "$OWNED_FILE"
+        write_state "skipped-disabled" "soter_hide off; our mask unloaded"
+      else
+        write_state "skipped-disabled" "soter_hide off; rmmod failed, mask still loaded"
+      fi
+    else
+      write_state "skipped-disabled" "soter_hide off"
+    fi
     return 0
   fi
   [ "$(conf_get soter_hide_prefer)" = "skip" ] && PREFER=skip

@@ -146,13 +146,15 @@
 
     <string name="remote_config_tls_insecure">禁用 TLS 验证</string>
 
-    <string name="remote_config_debug_logging">启用调试日志</string>
+    <string name="remote_config_debug_logging">启用调试日志（重启后生效）</string>
     <string name="remote_config_global_scope">全局作用域</string>
   <string name="remote_config_hide_strongbox">声明不支持 StrongBox（重启后生效）</string>
+  <string name="remote_config_hide_soter">遮蔽本机 SOTER 服务（重启后生效）</string>
+<string name="remote_config_soter_inject">注入本机 SOTER 服务（重启后生效）</string>
     <string name="remote_config_status_link">查看在线 B 端设备 ID</string>
     <string name="prompt_status_hint">状态页里点击设备 ID 可查看该设备的 Boot Key、锁定状态、Boot Hash 与三项补丁日期</string>
 
-    <string name="remote_config_debug_logging_description">启用详细调试日志，记录所有操作、调用链和数据。日志将写入配置目录。</string>
+    <string name="remote_config_debug_logging_description">启用详细调试日志，记录所有操作、调用链和数据。只有开着这项才会写日志，写到配置目录里。</string>
 
     <string name="remote_config_save_success">配置保存成功</string>
 

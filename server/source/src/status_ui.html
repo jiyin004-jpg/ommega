@@ -146,7 +146,7 @@ async function load() {
     _devices = b;
     $('#onlineBadge').textContent = '在线设备：' + b.length;
     $('#bBody').innerHTML = b.length
-      ? b.map((x, i) => `<tr><td class="id-cell"><span class="id-link" onclick="showBoot(${i})" title="点击查看该设备的启动状态">${esc(x.device_id)}</span>${x.tee_error ? ' <span class="tag off" title="TEE 自检失败，点开看原因">自检失败</span>' : ''}</td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
+      ? b.map((x, i) => `<tr><td class="id-cell"><span class="id-link" onclick="showBoot(${i})" title="点击查看该设备的详情">${esc(x.device_id)}</span>${x.tee_error ? ' <span class="tag off" title="TEE 自检失败，点开看原因">自检失败</span>' : ''}${x.soter === true ? ' <span class="tag on" title="支持 SOTER 转发">SOTER</span>' : ''}${x.strongbox === true ? ' <span class="tag on" title="有 StrongBox HAL">SB</span>' : ''}</td><td>${esc(x.machine_id || '—')}</td><td>${x.load ?? 0}</td><td>${fmtTime(x.last_seen_ms)}</td></tr>`).join('')
       : '<tr><td colspan="4" class="empty">暂无 B 端设备在线</td></tr>';
 
     const c = d.cert_devices || [];
@@ -177,6 +177,14 @@ const fmtState = v => (v === null || v === undefined) ? '—' : (KNOX_STATE[v] ?
 
 function kvRow(k, v) { return `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`; }
 
+// 心跳上报的能力：true 支持 / false 明确不支持 / null 没上报过（老版本 relay）。
+// 后两种对路由的意义不一样：说过没有的设备不会被派 SOTER 任务，没上报的还能试。
+const CAP_TEXT = v => v === true ? '支持' : v === false ? '不支持' : '未上报（老版本 relay）';
+const capRows = d => [
+  kvRow('SOTER 转发', CAP_TEXT(d.soter)),
+  kvRow('StrongBox', CAP_TEXT(d.strongbox)),
+];
+
 // Samsung's Knox block; the whole section is skipped on other vendors.
 function knoxRows(k) {
   if (!k) return [];
@@ -197,6 +205,7 @@ function showBoot(i) {
   if (!d) return;
   const b = d.boot;
   $('#bootTitle').textContent = '设备启动状态 · ' + (d.device_id || '');
+  const caps = capRows(d);
   $('#bootBody').innerHTML = b
     ? [
         kvRow('机型', d.machine_id || '—'),
@@ -209,6 +218,7 @@ function showBoot(i) {
         kvRow('内核补丁', fmtPatch(b.patch_boot)),
         kvRow('厂商补丁', fmtPatch(b.patch_vendor)),
         ...knoxRows(b.knox),
+        ...caps,
       ].join('')
     : (d.tee_error
         ? [
@@ -216,8 +226,9 @@ function showBoot(i) {
             kvRow('认证应用（AAID）', d.aaid || '—'),
             kvRow('TEE 自检', '失败'),
             kvRow('失败原因', d.tee_error),
+            ...caps,
           ].join('')
-        : '<div class="k">状态</div><div class="v">该设备还没上报启动状态（连上服务端后会自动自检一次）</div>');
+        : '<div class="k">状态</div><div class="v">该设备还没上报启动状态（连上服务端后会自动自检一次）</div>' + caps.join(''));
   $('#bootModal').classList.add('open');
 }
 

@@ -345,6 +345,50 @@ pub fn build_plain_reply<T: Serialize>(value: &T) -> Result<OwnedReply> {
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
+/// HAL 那边 `int xxx(..., out SoterBufferReturn)` 的回复。
+///
+/// 形状 `[Status][i32 返回值][i32 非空标记][SoterBufferReturn]` —— 那个标记是 AIDL
+/// 给 out parcelable 留的，Java 侧就是 `if (readInt() != 0)`；不管成不成功都得写
+/// 一个 int，少写后面整体错位，宿主解出来的就是垃圾。
+pub fn build_soter_buffer_reply(return_code: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&return_code)?;
+    match data {
+        Some(bytes) => {
+            parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+            write_soter_buffer_return(&mut parcel, bytes)?;
+        }
+        None => {
+            parcel.write(&0i32)?;
+        }
+    }
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
+/// `SoterInitReturn initSign(...)` 的回复：`[Status][i32 非空标记][SoterInitReturn]`。
+pub fn build_soter_init_reply(status: i32, session: i64) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+    // SoterInitReturn 自己那段：4 字节总长 + status + session，总共 16
+    parcel.write(&16i32)?;
+    parcel.write(&status)?;
+    parcel.write(&session)?;
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
+/// `SoterBufferReturn` 的编码：`[i32 本段长度][byte[] data][i32 dataLength]`。
+/// 长度含它自己那 4 字节；byte[] 是 AIDL 的写法（4 字节长度 + 数据 + 补到 4 字节）。
+fn write_soter_buffer_return(parcel: &mut Parcel, data: &[u8]) -> Result<()> {
+    let padded = (data.len() + 3) & !3;
+    let total = 4 + 4 + padded + 4;
+    parcel.write(&(total as i32))?;
+    parcel.write(&data.to_vec())?;
+    parcel.write(&(data.len() as i32))?;
+    Ok(())
+}
+
 pub fn build_void_reply() -> Result<OwnedReply> {
     build_status_reply(&Status::from(StatusCode::Ok))
 }

@@ -71,5 +71,11 @@ start_daemon "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"
 # (see kmod-loader.sh).  Detached on purpose: it has to finish well within a few
 # seconds and must never delay late_start or the daemons above.
 if [ -f "$MODDIR/kmod-loader.sh" ]; then
-  ( sh "$MODDIR/kmod-loader.sh" >> "$STATE_DIR/kmod-loader.log" 2>&1 & )
+  # 调试日志关着时连这个日志文件都不建（它也是「日志」，开关开了才有）。
+  kmod_log=/dev/null
+  kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  case "$kmod_val" in
+    1|true|yes|on) kmod_log="$STATE_DIR/kmod-loader.log" ;;
+  esac
+  ( sh "$MODDIR/kmod-loader.sh" >> "$kmod_log" 2>&1 & )
 fi

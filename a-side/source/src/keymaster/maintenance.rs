@@ -513,4 +513,16 @@ impl IMaintenanceService for MaintenanceManager {
         self.on_user_password_changed(ctx, user_id, password)
             .map_err(into_logged_binder)
     }
+
+    /// Record one observation sent by a hook inside an injected process.
+    ///
+    /// Deliberately does nothing but log: whatever a hook observes is only interesting as a
+    /// log line for now (the SOTER forwarding decision is made elsewhere). There is no
+    /// caller context to require here, and the peer that got this far already passed the
+    /// socket authorizer.
+    fn reportHookEvent(&self, message: &str) -> rsbinder::status::Result<()> {
+        let _wp = wd::watch("IMaintenanceService::reportHookEvent");
+        log::info!("hook event: {message}");
+        Ok(())
+    }
 }
