@@ -5,7 +5,7 @@
 //! `CertificateChain` (leaf first). We extract the first usable key pair and
 //! store it as a `DeviceIdentity` so the admin UI only needs one file upload.
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use roxmltree::Document;
 
 /// Parsed result of a keybox.xml upload.
@@ -37,58 +37,77 @@ fn clean_pem(raw: &str) -> String {
 
 /// Parse the full keybox.xml document.
 ///
-/// A single keybox.xml may carry multiple `<Key>` entries (e.g. one RSA and one
-/// EC). Every usable `<Key>` with a `<PrivateKey>` is returned, so the admin
-/// upload can persist all of them and the fulfil layer can serve whichever
-/// algorithm the A-side request asks for.
+/// A keybox file may carry several `<Keybox>` blocks — 公开仓库里常见的「EC 一个、
+/// RSA 一个」就是这个形状 —— and each block holds its own `<Key>`. Every usable
+/// `<Key>` with a `<PrivateKey>` is returned, so the admin upload can persist all
+/// of them and the fulfil layer can serve whichever algorithm the A-side request
+/// asks for.
 pub fn parse_keybox_xml_all(xml: &str) -> anyhow::Result<Vec<KeyboxData>> {
     let doc = Document::parse(xml).context("invalid XML")?;
     let root = doc.root_element();
 
-    // Locate the `<Keybox>` element.
-    let keybox = find_descendant(root, "Keybox")
-        .or_else(|| find_descendant(root, "AndroidAttestation"))
-        .ok_or_else(|| anyhow!("no <Keybox> element found"))?;
-
-    // Prefer the direct `DeviceID` attribute, else fall back to a nested one.
-    let device_id = keybox
-        .attribute("DeviceID")
-        .or_else(|| keybox.attribute("deviceID"))
-        .unwrap_or("")
-        .to_string();
+    // 收全所有 `<Keybox>`（`descendants` 含自身，根就是 Keybox 时也在内）。以前只抓
+    // 第一个，同一个文件里第二个算法的材料整段就丢了 —— 那些「EC + RSA 双段」的公开
+    // keybox 因此永远只进得来 EC。
+    let boxes: Vec<roxmltree::Node> = root
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Keybox")
+        .collect();
+    // 有的文件省了 `<Keybox>` 这层，直接 `<AndroidAttestation><Key>…`；那就把根当成
+    // 唯一一段，DeviceID 也从根上取（没有就留空）。
+    let boxes = if boxes.is_empty() { vec![root] } else { boxes };
 
     let mut out: Vec<KeyboxData> = Vec::new();
-    for key in keybox
-        .children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "Key")
-    {
-        let algorithm = key
-            .attribute("algorithm")
-            .map(|a| {
-                let l = a.to_ascii_lowercase();
-                if l.contains("rsa") {
-                    "rsa".to_string()
-                } else {
-                    "ec".to_string()
-                }
-            })
-            .unwrap_or_else(|| "ec".to_string());
+    for keybox in boxes {
+        // Prefer the direct `DeviceID` attribute, else fall back to a nested one.
+        let device_id = keybox
+            .attribute("DeviceID")
+            .or_else(|| keybox.attribute("deviceID"))
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
-        // <PrivateKey format="pem">...</PrivateKey>
-        let priv_pem = child_text(key, "PrivateKey").map(|s| clean_pem(&s));
+        // 直接子 `<Key>`；一个都没有就放宽到整棵子树（有的文件多包了一层容器）。
+        let mut keys: Vec<roxmltree::Node> = keybox
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "Key")
+            .collect();
+        if keys.is_empty() {
+            keys = keybox
+                .descendants()
+                .filter(|n| n.is_element() && n.tag_name().name() == "Key")
+                .collect();
+        }
 
-        // <CertificateChain> -> <Certificate format="pem"> ...
-        let chain_pem = extract_certificate_chain(key);
-        let cert_count = count_certificates(&chain_pem);
+        for key in keys {
+            let algorithm = key
+                .attribute("algorithm")
+                .map(|a| {
+                    let l = a.to_ascii_lowercase();
+                    if l.contains("rsa") {
+                        "rsa".to_string()
+                    } else {
+                        "ec".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "ec".to_string());
 
-        if let Some(private_key_pem) = priv_pem {
-            out.push(KeyboxData {
-                device_id: device_id.clone(),
-                algorithm,
-                private_key_pem,
-                certificate_chain_pem: chain_pem,
-                cert_count,
-            });
+            // <PrivateKey format="pem">...</PrivateKey>
+            let priv_pem = child_text(key, "PrivateKey").map(|s| clean_pem(&s));
+
+            // <CertificateChain> -> <Certificate format="pem"> ...
+            let chain_pem = extract_certificate_chain(key);
+            let cert_count = count_certificates(&chain_pem);
+
+            if let Some(private_key_pem) = priv_pem {
+                out.push(KeyboxData {
+                    device_id: device_id.clone(),
+                    algorithm,
+                    private_key_pem,
+                    certificate_chain_pem: chain_pem,
+                    cert_count,
+                });
+            }
         }
     }
 
@@ -98,28 +117,24 @@ pub fn parse_keybox_xml_all(xml: &str) -> anyhow::Result<Vec<KeyboxData>> {
     Ok(out)
 }
 
-/// Depth-first search for the first element whose name matches.
-fn find_descendant<'a, 'i>(
-    node: roxmltree::Node<'a, 'i>,
-    name: &str,
-) -> Option<roxmltree::Node<'a, 'i>> {
-    if node.is_element() && node.tag_name().name() == name {
-        return Some(node);
-    }
-    for child in node.children() {
-        if let Some(found) = find_descendant(child, name) {
-            return Some(found);
-        }
-    }
-    None
+/// 一个元素里的全部文本子节点拼起来。
+///
+/// keybox 文件里常夹着 `<!--t.me/xxx-->` 这类注释，注释既可能落在内容前面、也可能
+/// 正好插进 base64 中间把文本切成几段；只取第一个文本节点的话，后面那段就没了，
+/// 拿去解 base64 会报个看不懂的 “Invalid symbol …”。这里统统拼上。
+fn node_text(node: &roxmltree::Node) -> String {
+    node.children()
+        .filter(|c| c.is_text())
+        .filter_map(|c| c.text())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
-/// Return the trimmed text of the first child element named `tag`.
+/// Return the text of the first child element named `tag`.
 fn child_text(node: roxmltree::Node, tag: &str) -> Option<String> {
     node.children()
         .find(|n| n.is_element() && n.tag_name().name() == tag)
-        .and_then(|n| n.text())
-        .map(str::to_string)
+        .map(|n| node_text(&n))
 }
 
 /// Concatenate all `<Certificate>` PEM blocks under `<CertificateChain>`.
@@ -133,8 +148,9 @@ fn extract_certificate_chain(key: roxmltree::Node) -> String {
             .children()
             .filter(|n| n.is_element() && n.tag_name().name() == "Certificate")
         {
-            if let Some(text) = cert.text() {
-                out.push_str(&clean_pem(text));
+            let text = node_text(&cert);
+            if !text.trim().is_empty() {
+                out.push_str(&clean_pem(&text));
             }
         }
     }
@@ -217,4 +233,70 @@ pub fn build_keybox_xml(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AndroidAttestation>\n  <NumberOfKeyboxes>1</NumberOfKeyboxes>\n  <Keybox DeviceID=\"{device_id}\">\n    <Key algorithm=\"{algo}\">\n      <PrivateKey format=\"pem\">\n{key}      </PrivateKey>\n      <CertificateChain>\n        <NumberOfCertificates>{n}</NumberOfCertificates>\n{chain}      </CertificateChain>\n    </Key>\n  </Keybox>\n</AndroidAttestation>\n",
         n = certs.len()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个文件里 EC、RSA 各一个 `<Keybox>`，两段都得出来。
+    ///
+    /// 公开仓库里那种「EC + RSA 双段」文件以前只进得来第一个，RSA 整段白丢。
+    #[test]
+    fn both_keyboxes_are_parsed() {
+        let xml = r#"<AndroidAttestation>
+<NumberOfKeyboxes>2</NumberOfKeyboxes>
+<Keybox DeviceID="dev-a">
+<Key algorithm="ecdsa">
+<PrivateKey format="pem">KEY-EC</PrivateKey>
+<CertificateChain><NumberOfCertificates>1</NumberOfCertificates><Certificate format="pem">CERT-EC</Certificate></CertificateChain>
+</Key>
+</Keybox>
+<Keybox DeviceID="dev-a">
+<Key algorithm="rsa">
+<PrivateKey format="pem">KEY-RSA</PrivateKey>
+<CertificateChain><NumberOfCertificates>1</NumberOfCertificates><Certificate format="pem">CERT-RSA</Certificate></CertificateChain>
+</Key>
+</Keybox>
+</AndroidAttestation>"#;
+        let got = parse_keybox_xml_all(xml).expect("两段的文件应该能解析");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].algorithm, "ec");
+        assert!(got[0].private_key_pem.contains("KEY-EC"));
+        assert_eq!(got[1].algorithm, "rsa");
+        assert!(got[1].private_key_pem.contains("KEY-RSA"));
+        assert!(got[1].certificate_chain_pem.contains("CERT-RSA"));
+        assert_eq!(got[1].device_id, "dev-a");
+    }
+
+    /// 注释插在内容中间时，文本要拼回去，不能只留第一段（那正是 “Invalid symbol 61,
+    /// offset 1377” 的来源）。
+    #[test]
+    fn comments_inside_content_do_not_truncate_it() {
+        let xml = r#"<AndroidAttestation><Keybox DeviceID="x"><Key algorithm="rsa">
+<PrivateKey format="pem">AAA<!--t.me/xxx-->BBB</PrivateKey>
+<CertificateChain><Certificate format="pem">CCC<!--note-->DDD</Certificate></CertificateChain>
+</Key></Keybox></AndroidAttestation>"#;
+        let got = parse_keybox_xml_all(xml).expect("注释包着的段也该解析");
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].private_key_pem.contains("AAABBB"),
+            "私钥被截断了: {:?}",
+            got[0].private_key_pem
+        );
+        assert!(
+            got[0].certificate_chain_pem.contains("CCCDDD"),
+            "证书被截断了: {:?}",
+            got[0].certificate_chain_pem
+        );
+    }
+
+    /// 没有 `<Keybox>` 这层（直接 `<AndroidAttestation><Key>`）也要能解析。
+    #[test]
+    fn key_without_a_keybox_wrapper_still_parses() {
+        let xml = r#"<AndroidAttestation><Key algorithm="ecdsa"><PrivateKey format="pem">K</PrivateKey><CertificateChain><Certificate format="pem">C</Certificate></CertificateChain></Key></AndroidAttestation>"#;
+        let got = parse_keybox_xml_all(xml).expect("没有 Keybox 层也该解析");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].algorithm, "ec");
+    }
 }

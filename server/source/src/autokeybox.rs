@@ -129,7 +129,12 @@ const DEFAULT_PUBLIC_SEARCH_URL: &str =
 /// 一轮最多看几个仓库、最多收几条身份 —— 别让一轮刷新跑太久。
 const PUBLIC_MAX_REPOS: usize = 20;
 pub const PUBLIC_MAX_IDENTITIES: usize = 6;
-/// keybox 文件在仓库里就这几个常见位置。
+/// 一个仓库最多下几个文件。公开仓库里动不动躺几十个 keybox，全撸太慢；EC 和 RSA
+/// 各中一份就够用了。
+const PUBLIC_MAX_FILES_PER_REPO: usize = 8;
+/// 整轮公开源最多下几个文件（跨仓库一起算）。
+const PUBLIC_MAX_FILES_TOTAL: usize = 24;
+/// keybox 文件在仓库里就这几个常见位置（列不出目录时的兵底）。
 const PUBLIC_PATHS: &[&str] = &["keybox.xml", "keybox", "module/keybox.xml"];
 
 /// A single configured upstream keybox source.
@@ -448,14 +453,31 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
     // 往往落在 device-b-2-9 这种位置，而 A 端取公开 keybox 的接口只扫主 id 和
     // -1/-2/-3，那份材料就等于白采了。
     let mut taken = 0usize;
+    // 整轮下了几个文件、本轮收到了哪几种算法。仓库里 EC、RSA 是分在不同文件里的，
+    // 两种都到手就可以不看了。
+    let mut files_fetched = 0usize;
+    let mut algos: std::collections::HashSet<String> = std::collections::HashSet::new();
     'outer: for (full, br) in repos.iter().take(PUBLIC_MAX_REPOS) {
-        for path in PUBLIC_PATHS {
-            for url in public_file_urls(src, full, br, path) {
+        // 先把仓库里的 .xml 列出来再挑着下。原先只试几个固定路径，人家叫
+        // `Yurikey58.xml` 的文件就永远轮不到，里面的 RSA 也就永远采不进池子。
+        let mut paths: Vec<String> = public_repo_xml_files(full, br)
+            .into_iter()
+            .take(PUBLIC_MAX_FILES_PER_REPO)
+            .collect();
+        if paths.is_empty() {
+            paths = PUBLIC_PATHS.iter().map(|p| (*p).to_string()).collect();
+        }
+        for path in paths {
+            if files_fetched >= PUBLIC_MAX_FILES_TOTAL {
+                break 'outer;
+            }
+            for url in public_file_urls(src, full, br, &path) {
                 tried += 1;
                 let txt = match public_http_get(&url, 8) {
                     Some(t) => t,
                     None => continue,
                 };
+                files_fetched += 1;
                 if !(txt.contains("BEGIN CERTIFICATE") || txt.contains("<AndroidAttestation")) {
                     continue;
                 }
@@ -481,18 +503,22 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
                 let before = stored.len();
                 for kb in parsed {
                     if store_identity(db, src, &device_id, &kb) {
+                        algos.insert(kb.algorithm.clone());
                         stored.push(kb);
                     }
-                }
-                if stored.len() > before {
-                    taken += 1;
                 }
                 if stored.len() >= PUBLIC_MAX_IDENTITIES {
                     break 'outer;
                 }
-                // 这个仓库已经找到能用的 keybox 了，换下一个仓库（不然会接着拿
-                // 同一个仓库的其他路径重复入库）。
-                continue 'outer;
+                if stored.len() > before {
+                    taken += 1;
+                }
+                // 这个文件里的东西都看完了，接着看同一个仓库的下一个 —— EC 和 RSA
+                // 往往就分散在同一仓库的不同文件里，别拿到第一个就换仓库。
+                break;
+            }
+            if algos.contains("ec") && algos.contains("rsa") {
+                break 'outer;
             }
         }
     }
@@ -518,6 +544,66 @@ fn public_http_get(url: &str, timeout_secs: u64) -> Option<String> {
             None
         }
     }
+}
+
+/// URL 路径里必须转义的那些字符。公开仓库的文件名什么都有（`don't buy! it's
+/// free for you_v68.xml`、`keybox (1).xml`），原样拼进 URL 会被 curl 直接拒收，
+/// 文件就白列了。保留 RFC3986 里路径合法的那些，其余一律 %XX。
+fn url_encode_path(p: &str) -> String {
+    let mut out = String::new();
+    for b in p.bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_'
+                    | b'.'
+                    | b'~'
+                    | b'/'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 列一个仓库里所有 .xml 文件的相对路径。
+///
+/// 公开仓库动辄塞几十个 keybox 文件，而这边原先只试几个固定名字 —— 一个叫
+/// `Yurikey58.xml`、里头装看 RSA 材料的文件就永远轮不到。jsdelivr 的 data
+/// 接口不要 token、也不吃 GitHub 的匿名限额，拿它列目录最省事。列不出来（仓库
+/// 没被分发过 / 接口抽风）就返回空，调用方会退回固定的几个常见路径。
+fn public_repo_xml_files(full: &str, branch: &str) -> Vec<String> {
+    let url = format!("https://data.jsdelivr.com/v1/packages/gh/{full}@{branch}?structure=flat");
+    let Some(txt) = public_http_get(&url, 10) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("files").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|f| f.get("name").and_then(Value::as_str))
+        .filter(|n| n.to_ascii_lowercase().ends_with(".xml"))
+        .map(|n| url_encode_path(n.trim_start_matches('/')))
+        .collect()
 }
 
 /// 一个 raw.githubusercontent.com 链接的备选镜像。顺序按机房实测的可用性和速度
@@ -936,6 +1022,20 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 公开仓库的文件名带空格、引号、括号，不编码就取不到 —— curl 会直接
+    /// 报 “URL rejected”。
+    #[test]
+    fn public_file_names_get_url_encoded() {
+        assert_eq!(url_encode_path("keybox (1).xml"), "keybox%20(1).xml");
+        assert_eq!(
+            url_encode_path("don't buy! it's free for you_v68.xml"),
+            "don't%20buy!%20it's%20free%20for%20you_v68.xml"
+        );
+        assert_eq!(url_encode_path("Yurikey58.xml"), "Yurikey58.xml");
+        // `?` 和 `#` 必须转义，否则会被当成查询串/片段的开头。
+        assert_eq!(url_encode_path("a?b#c.xml"), "a%3Fb%23c.xml");
+    }
 
     fn src_for_test() -> KeyboxSource {
         KeyboxSource {
