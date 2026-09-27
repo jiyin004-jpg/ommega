@@ -1,0 +1,70 @@
+# 服务器出墙要用、但服务器自己拿不到的两样东西，定时抓下来推到 relay-assets 分支：
+#   1. attestation-status.json  —— Google 的 keybox 吊销名单
+#   2. clash-subscription.yaml  —— 机场订阅转出来的 mihomo 代理列表
+#
+# 为什么绕这一道：服务端（腾讯云那台）直连不到 android.googleapis.com，也连不到
+# 机场的订阅站（试了，连接超时），但 raw.githubusercontent.com 是通的。东西走仓库
+# 过一手，服务器就有地方拿；服务器上那个 mihomo 再拿它去发真正出墙的请求。
+#
+# 抓订阅为什么不用 clash 类 UA：拿 clash 系客户端的 UA 去请求，回来的 proxies 全是
+# 占位货（名字写着「不支持您的代理软件」，server 一律 127.0.0.1:6666），一个真节点
+# 都没有；换成 mihomo 的 UA，回来的是 base64 的真实节点。所以这里用 mihomo 的 UA
+# 抓，再自己转格式（.github/scripts/sub_to_clash.js）。
+#
+# 两个文件只待在 relay-assets 这个分支上，每次 force-push 覆盖，分支上永远只有一个
+# commit，不会越积越厚。服务器读 raw，CDN 缓存最多几分钟，不碍事。
+name: relay-assets
+
+on:
+  schedule:
+    # 每 6 小时一次：名单一天动一回，订阅节点也不常变，够了。
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 抓官方吊销名单
+        run: |
+          set -euo pipefail
+          curl -sSfL --max-time 60 -o attestation-status.json \
+            https://android.googleapis.com/attestation/status
+          # 确认抓到的真是那份 JSON，别把错误页推到分支上
+          python3 - <<'PY'
+          import json
+          with open("attestation-status.json") as f:
+              data = json.load(f)
+          entries = data.get("entries")
+          assert isinstance(entries, dict) and entries, "entries 是空的"
+          print(f"吊销名单 {len(entries)} 条")
+          PY
+
+      - name: 抓订阅并转成 mihomo 代理列表
+        env:
+          # 不想把链接写在仓库里的话，加个仓库 secret：CLASH_SUB_URL
+          SUB_URL: ${{ secrets.CLASH_SUB_URL || 'https://dash.xn--cp3a08l.com/api/v1/pq/bc70754da654fd0503fbbd4d53215eda' }}
+        run: |
+          set -euo pipefail
+          curl -sSfL --max-time 90 -A 'mihomo/1.19.31' -o sub.txt "$SUB_URL"
+          node .github/scripts/sub_to_clash.js sub.txt > clash-subscription.yaml
+          test -s clash-subscription.yaml
+          head -3 clash-subscription.yaml
+
+      - name: 推到 relay-assets 分支
+        run: |
+          set -euo pipefail
+          git init -q .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b relay-assets
+          git add -f attestation-status.json clash-subscription.yaml
+          git commit -q -m "relay assets $(date -u +%F)"
+          git push -q --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            relay-assets
