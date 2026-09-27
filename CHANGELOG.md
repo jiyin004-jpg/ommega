@@ -19,12 +19,14 @@
 - **池子里没有能用的密钥时会说清楚**：材料全被吊销或者还没采到的时候，A 端那边直接提示「未找到有效密钥箱」，不会卡在那儿，也不会报成「设置失败」。
 - **假 keybox 进不了池子**：那种用生成器现造的 mock keybox（根证书名字里写着 Mock/Test，整条链自己签自己），采集时会认出来丢掉，不再让它们占着槽位。
 
-- **A 端不再预设 SOTER HAL 长什么样**：以前只认高通那套 AIDL 接口和一两个进程名，换台机器（一加 PLC110 是联发科 + Trustonic）就整个瞎掉。现在 HAL 进程名和 service/interface 都是候选表，qti、trustonic 两套 AIDL 挨个试，HIDL 那套（`@1.0::`）也认得出来 —— 先只记账不拦，免得答复的形状不对把它带歪。
+- **A 端不再预设 SOTER HAL 长什么样**：以前只认高通那套 AIDL 接口和一两个进程名，换台机器（一加 PLC110 是联发科 + Trustonic）就整个瞎掉。现在 HAL 进程名和 service/interface 都是候选表，qti、trustonic 两套 AIDL 挨个试，HIDL 那套（`@1.0::`）也认得出来、也照样拦（答复按 HIDL 自己的布局拼，见下面那条）。
 - **SOTER 宿主和 HAL 里的日志能写出来了**：注入到 app 域的进程（宿主、HAL）以前日志整条哑掉，因为写日志那一层的建目录在「目录已存在但自己没 getattr」的域里会返回 EEXIST，整个写日志的组件就建不起来，报错还只往 stderr 丢、没人看得见。现在改成先开文件、开不动才建目录；顺带把日志目录/log_flag 的权限按各机器真实的 uid 补齐（一加上宿主是 u0_a292，既不是属主也不在 system 组）。
 - **要不要写日志现在看得见**：每个 payload 起来会沿 RPC 报一条自己的日志状态（装在哪个文件、开关是开还是关、两个候选路径各自开得开不开），排查时不用再猜。
 - **SELinux 规则不再挑机器**：宿主和 SOTER HAL 的域名各家 ROM 都不一样（一加 13 / ColorOS 16 上是 `platform_app` + `vendor_hal_soter_qti`，一加 PLC110 上是 `platform_app` + `hal_soter_trustonic`，AOSP 上是 `system_app` + `hal_soter`），以前只写一组，换台机器就变成「注进去了但日志写不出来、答复也连不上」。现在三类目标进程的域名各列一张表，顺手把递 payload 那侧的域名也列全；policy 里没有的域名 kernel 会跳过那条规则，不会连累别的，以后碰到新域名往表里加个名字就行。
 
 - **两家 SOTER HAL 的答复形状分开拼了**：以前两家共一个回复构造器，字节数凑巧一样所以不会当场报错，其实字段是错位的 —— 高通那套方法带 `int` 返回值、错误码就在返回值里，联发科那套方法不带返回值、错误码放在 parcelable 里，两边差一格。宿主 APK 里各自的代理类就是各自的规格（联发科的读一个 int，高通的读两个），现在按接口描述符分开写。顺带把「这次没数据但有错误码」那种回包改成真 HAL 的样子（非空 parcelable，长度两格写 0），以前写的是空标记，宿主直接当没答过。
+
+- **HIDL 那套 SOTER 也能替它答了**：老一些的机器上宿主走的是 hwbinder（`vendor.qti.hardware.soter@1.0::ISoter`），它的问题不少：事务号是 `.hal` 里的声明顺序、跟 AIDL 那套不是一张表（getDeviceId 在 HIDL 是第 4 个、AIDL 是第 8 个），string 和 vector 也不内联在 parcel 里，而是走 binder 的 buffer 对象 —— 结构体和数据体在 parcel 外面，靠对象里写的地址去读。以前只认得出来、答不了，现在请求按 buffer 对象解出 uid / 别名 / challenge，答复按 HIDL 的布局拼（开头一个 `Status`，`hidl_vec` 是两层 buffer 对象：一层指向结构体、一层指向元素）。布局是照着 AOSP 的 libhidl / 宿主 APK 里的代理类对出来的，单测里用宿主的读法（`readObject` + `verifyBufferObject`）把答复回读了一遍；HIDL 版 SOTER 的真机手上没有，那一侧还没实机验过。
 
 **稳定性**
 
