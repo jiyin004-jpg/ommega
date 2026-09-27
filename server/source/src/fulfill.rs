@@ -34,6 +34,13 @@ const MAX_CHALLENGE_SIZE: usize = 128;
 
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// 会话表过期清理的节流间隔。清理是 O(会话数) 的，几千条的表在每个 sign /
+/// decrypt 请求上都扫一遍纯属浪费；隔一分钟清一次就够，反正过期会话在查表
+/// 时本来也拿不到东西。
+const PURGE_INTERVAL_MS: u64 = 60 * 1000;
+
+static LAST_PURGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Where server_keybox sessions (leaf private key + chain) are persisted so a
 /// relay restart does not orphan the A-side's `KeyMaterial::Remote` keys.
 /// The A-side derives the session alias deterministically from the attestation
@@ -53,6 +60,10 @@ const SESSION_FILE: &str = "data/sessions.json";
 struct Session {
     chain_pem: String,
     leaf_key_pem: String,
+    /// 落盘用的 Fernet 密文。构造时算一次、之后每轮写盘直接复用 —— 以前是
+    /// 每写一次盘就把表里所有会话重新加密一遍，几千条就是几百毫秒，还全程
+    /// 持着全局锁。
+    leaf_key_cipher: String,
     created_epoch_ms: u64,
 }
 
@@ -71,7 +82,12 @@ impl From<&Session> for SessionFile {
     fn from(s: &Session) -> Self {
         SessionFile {
             chain_pem: s.chain_pem.clone(),
-            leaf_key_pem: crate::crypto::encrypt_private_pem(&s.leaf_key_pem),
+            // 非空由 put_session / From<SessionFile> 保证；万一走了别的路子才现加。
+            leaf_key_pem: if s.leaf_key_cipher.is_empty() {
+                crate::crypto::encrypt_private_pem(&s.leaf_key_pem)
+            } else {
+                s.leaf_key_cipher.clone()
+            },
             created_epoch_ms: s.created_epoch_ms,
         }
     }
@@ -79,9 +95,11 @@ impl From<&Session> for SessionFile {
 
 impl From<SessionFile> for Session {
     fn from(sf: SessionFile) -> Self {
+        let cipher = sf.leaf_key_pem.clone();
         Session {
             chain_pem: sf.chain_pem,
             leaf_key_pem: crate::crypto::decrypt_private_pem(&sf.leaf_key_pem),
+            leaf_key_cipher: cipher,
             created_epoch_ms: sf.created_epoch_ms,
         }
     }
@@ -134,6 +152,18 @@ impl Fulfill {
         map.retain(|_, s| !Self::session_expired(s));
     }
 
+    fn purge_if_due(map: &mut HashMap<String, Session>) {
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        let last = LAST_PURGE.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < PURGE_INTERVAL_MS {
+            return;
+        }
+        LAST_PURGE.store(now_ms, Ordering::Relaxed);
+        map.retain(|_, s| {
+            now_ms.saturating_sub(s.created_epoch_ms) <= SESSION_TTL.as_millis() as u64
+        });
+    }
+
     fn session_file() -> std::path::PathBuf {
         std::path::Path::new(SESSION_FILE).to_path_buf()
     }
@@ -170,35 +200,52 @@ impl Fulfill {
     /// Write the current session map to `data/sessions.json` with leaf private
     /// keys encrypted at rest (same Fernet cipher as the DB identities).
     fn persist_sessions(&self) {
-        let inner = crate::util::mu(&self.inner);
-        let path = Self::session_file();
-        let out: HashMap<String, SessionFile> = inner
-            .sessions
-            .iter()
-            .map(|(a, s)| (a.clone(), SessionFile::from(s)))
-            .collect();
+        // 锁里只做收集（字段克隆；加密已经在 put_session 做过一次了）；序列化
+        // 和写盘是几十 MB 的活，放到锁外，别让一次出证把并发的 sign/decrypt
+        // 全堵在锁上。
+        let out: HashMap<String, SessionFile> = {
+            let inner = crate::util::mu(&self.inner);
+            inner
+                .sessions
+                .iter()
+                .map(|(a, s)| (a.clone(), SessionFile::from(s)))
+                .collect()
+        };
         let Ok(text) = serde_json::to_string(&out) else {
             return;
         };
+        let path = Self::session_file();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(&path, text) {
+        // 先写临时文件再改名：覆盖写写到一半崩掉会把整份会话表截断，A 端所有
+        // KeyMaterial::Remote 的钥匙当场变成签不了。
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, text) {
+            tracing::error!("persist_sessions: failed to write {}: {e}", tmp.display());
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
             // A lost session file means every A-side `KeyMaterial::Remote` key
             // becomes unsignable after a restart — surface it, don't swallow it.
-            tracing::error!("persist_sessions: failed to write {}: {e}", path.display());
+            tracing::error!(
+                "persist_sessions: failed to replace {}: {e}",
+                path.display()
+            );
         }
     }
 
     fn get_session(&self, alias: &str) -> Option<Session> {
         let mut inner = crate::util::mu(&self.inner);
-        Self::purge_locked(&mut inner.sessions);
+        Self::purge_if_due(&mut inner.sessions);
         inner.sessions.get(alias).cloned()
     }
 
-    fn put_session(&self, alias: &str, s: Session) {
+    fn put_session(&self, alias: &str, mut s: Session) {
+        // 密文在这里算一次，之后每轮落盘都直接复用（见 persist_sessions）。
+        s.leaf_key_cipher = crate::crypto::encrypt_private_pem(&s.leaf_key_pem);
         let mut inner = crate::util::mu(&self.inner);
-        Self::purge_locked(&mut inner.sessions);
+        Self::purge_if_due(&mut inner.sessions);
         inner.sessions.insert(alias.to_string(), s);
         drop(inner);
         self.persist_sessions();
@@ -500,6 +547,7 @@ impl Fulfill {
             Session {
                 chain_pem: chain_pem.clone(),
                 leaf_key_pem: new_leaf_key_pem,
+                leaf_key_cipher: String::new(),
                 created_epoch_ms: Utc::now().timestamp_millis() as u64,
             },
         );
