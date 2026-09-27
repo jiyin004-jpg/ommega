@@ -140,7 +140,12 @@ pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
                 }
                 BR_REPLY_NR => {
                     complete_sync_transaction(fd, SyncTransactionState::AwaitingReply);
-                    if cmd_size == size_of::<binder_transaction_data>() {
+                    // 下面这一整段（整段 parcel 拷贝 + 指针替换）唯一作用就是拼一行
+                    // debug 日志。日志关着的时候这笔 memcpy 纯属白送，而每笔同步
+                    // 答复都要经过这里。
+                    if cmd_size != size_of::<binder_transaction_data>() {
+                        warn!("unexpected BR_REPLY payload size {}", cmd_size);
+                    } else if log::log_enabled!(log::Level::Debug) {
                         let mut tr =
                             std::ptr::read_unaligned(payload as *const binder_transaction_data);
                         if let Some(mut shadow) = TransactionPayloadShadow::read(&tr) {
@@ -163,8 +168,6 @@ pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
                                 fd, tr.data_size, tr.offsets_size
                             );
                         }
-                    } else {
-                        warn!("unexpected BR_REPLY payload size {}", cmd_size);
                     }
                 }
                 _ => {}

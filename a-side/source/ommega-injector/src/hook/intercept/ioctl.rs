@@ -36,6 +36,13 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
         return old_ioctl_fn(fd, request, arg);
     }
 
+    // 注入器自己发出去的 binder 调用（PM 查询、合成答复、转发等）已经标了
+    // bypass。这些调用没必要再走一遍 fd 记账和整段 parcel 拷贝 —— 白白多花
+    // 几个 syscall 和一堆内存，而它们本身就占着 keystore2 的 binder 线程。
+    if crate::forward::is_bypassed() {
+        return old_ioctl_fn(fd, request, arg);
+    }
+
     let binder_token = match synchronize_binder_fd_generation(fd) {
         Ok(token) => token,
         Err(_) => {

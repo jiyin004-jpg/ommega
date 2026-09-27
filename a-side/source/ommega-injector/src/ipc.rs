@@ -582,16 +582,44 @@ pub fn forward_soter(request: &str) -> Result<Vec<u8>> {
     })
 }
 
+/// uid -> 包名解析结果的缓存时长。这层映射只在装/卸应用时变，而每笔 keystore
+/// 请求都要问一次「这个 uid 是谁」（一次跨进程 binder 往返，还占着调用方正
+/// 等着的那条 binder 线程），缓存一分钟能省掉绝大多数 RPC。
+const UID_CACHE_TTL: Duration = Duration::from_secs(60);
+
 pub fn resolve_packages_for_uid(uid: u32) -> PackageResolution {
+    static CACHE: Mutex<Option<HashMap<u32, (Instant, PackageResolution)>>> = Mutex::new(None);
+    {
+        let guard = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((stamp, hit)) = guard.as_ref().and_then(|map| map.get(&uid)) {
+            if stamp.elapsed() < UID_CACHE_TTL {
+                return hit.clone();
+            }
+        }
+    }
     ensure_process_state();
-    match resolve_package_names_for_uid(uid) {
+    let resolved = match resolve_package_names_for_uid(uid) {
         Ok(packages) if packages.is_empty() => PackageResolution::Unknown,
         Ok(packages) => PackageResolution::Known(packages),
         Err(error) => {
             warn!("failed to resolve packages for uid {}: {:#}", uid, error);
             PackageResolution::Unknown
         }
+    };
+    // 只缓存解析成功的：Unknown 多半是 PM 服务一时不可用，缓存下来会一直错。
+    if matches!(resolved, PackageResolution::Known(_)) {
+        let mut guard = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        if map.len() > 1024 {
+            map.clear();
+        }
+        map.insert(uid, (Instant::now(), resolved.clone()));
     }
+    resolved
 }
 
 fn resolve_package_names_for_uid(uid: u32) -> Result<Vec<String>> {

@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/keystore/ommega/injector.toml";
 /// Legacy A-side (client-a) per-app interception list.  Each non-comment line is
@@ -236,26 +236,70 @@ pub fn get() -> Arc<InjectorConfig> {
 /// Both files are re-read on every `get()`, so toggling either one in the
 /// WebUI takes effect without restarting the injector.  An absent or unreadable
 /// file leaves the base config unchanged.
+/// 这两个 legacy 文件（`target.txt` 和扁平 `config`）以前每笔 `get()` 都要重新
+/// 读一遍、解析一遍，而 `get()` 就在每笔 binder 调用的路上。它们的改动频率和
+/// 调用频率差着好几个数量级，所以最多每 200ms 重看一次，中间直接复用上次结果
+/// （热路径上只剩一次锁 + 一次 `Instant::elapsed`）。
+const CLIENTA_OVERRIDE_TTL: Duration = Duration::from_millis(200);
+
+struct ClientaOverrides {
+    /// `target.txt` 里的包名（已去重、已脱掉 `!`/`?` 后缀），还没跟 base 取差异。
+    extras: Vec<String>,
+    scope_override: Option<bool>,
+}
+
+static CLIENTA_OVERRIDE_CACHE: Mutex<Option<(Instant, Arc<ClientaOverrides>)>> = Mutex::new(None);
+
+fn clienta_overrides() -> Arc<ClientaOverrides> {
+    {
+        let guard = CLIENTA_OVERRIDE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((stamp, cached)) = guard.as_ref() {
+            if stamp.elapsed() < CLIENTA_OVERRIDE_TTL {
+                return Arc::clone(cached);
+            }
+        }
+    }
+    // 读文件放在锁外，别让一次慢读把别的 binder 线程堵在这把锁上。
+    let fresh = Arc::new(ClientaOverrides {
+        extras: read_clienta_target_extras(),
+        scope_override: clienta_global_scope_override(),
+    });
+    let mut guard = CLIENTA_OVERRIDE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some((Instant::now(), Arc::clone(&fresh)));
+    fresh
+}
+
 fn apply_clienta_overrides(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
-    let extras = clienta_target_extras(&base);
+    let overrides = clienta_overrides();
     // Tri-state: a `global_scope` key present in the flat config wins; when the
     // key is absent the `injector.toml` value is kept.  The WebUI always writes
     // the key, so unchecking the box there really turns the mode off.
-    let scope_override = clienta_global_scope_override();
-    let scope_changed = scope_override.is_some_and(|value| value != base.filter.global_scope);
+    let scope_changed = overrides
+        .scope_override
+        .is_some_and(|value| value != base.filter.global_scope);
+    let extras: Vec<&String> = overrides
+        .extras
+        .iter()
+        .filter(|pkg| !base.scoop.iter().any(|s| s == *pkg))
+        .collect();
     if extras.is_empty() && !scope_changed {
         return base;
     }
     let mut merged = (*base).clone();
-    if let Some(value) = scope_override {
+    if let Some(value) = overrides.scope_override {
         merged.filter.global_scope = value;
     }
-    merged.scoop.extend(extras);
+    merged.scoop.extend(extras.into_iter().cloned());
     Arc::new(merged)
 }
 
-/// Package names listed in the legacy `target.txt` that `scoop` does not have yet.
-fn clienta_target_extras(base: &InjectorConfig) -> Vec<String> {
+/// `target.txt` 里的包名（只做内部去重，不跟 base 比）；结果由
+/// `clienta_overrides` 缓存。
+fn read_clienta_target_extras() -> Vec<String> {
     let Ok(contents) = fs::read_to_string(CLIENTA_TARGET_PATH) else {
         return Vec::new();
     };
@@ -270,7 +314,7 @@ fn clienta_target_extras(base: &InjectorConfig) -> Vec<String> {
         if pkg.is_empty() {
             continue;
         }
-        if !base.scoop.iter().any(|s| s == pkg) && !extras.iter().any(|s| s == pkg) {
+        if !extras.iter().any(|s| s == pkg) {
             extras.push(pkg.to_string());
         }
     }
