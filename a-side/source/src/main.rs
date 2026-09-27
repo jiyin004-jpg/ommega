@@ -33,6 +33,7 @@ pub mod plat;
 pub mod proto;
 pub mod remote;
 pub mod selinux;
+pub mod soter_relay;
 pub mod utils;
 pub mod watchdog;
 

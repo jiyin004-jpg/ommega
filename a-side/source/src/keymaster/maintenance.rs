@@ -525,4 +525,14 @@ impl IMaintenanceService for MaintenanceManager {
         log::info!("hook event: {message}");
         Ok(())
     }
+
+    /// 宿主拦到一笔 SOTER HAL 调用，问这笔该由谁答：远程、A 端本地自签，还是透传真 HAL。
+    ///
+    /// 决策之所以落在这里而不是注入进程里：宿主是 uid 1000，读不到 A 端配置（配置在 0770
+    /// 的 keystore 目录），而 daemon 盯着那个文件，改完开关立即生效。没有 caller context
+    /// 要查 —— 能走到这里的 peer 已经过了 socket 鉴权，与 `reportHookEvent` 同理。
+    fn forwardSoter(&self, request: &str) -> rsbinder::status::Result<Vec<u8>> {
+        let _wp = wd::watch("IMaintenanceService::forwardSoter");
+        Ok(crate::soter_relay::forward(request))
+    }
 }

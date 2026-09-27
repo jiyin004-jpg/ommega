@@ -373,16 +373,18 @@ fn log_call(call: &SoterCall) {
 
 /// 这条出站请求，我们自己答还是放它去真 HAL。
 ///
-/// 这条出站请求，我们自己答还是放它去真 HAL。
-///
-/// 本地后端写了实现的那 11 个号码现在全部拦下来自己回：这台机器的真 HAL 对整族
-/// ATTK 都是 -20（连 provisioning 都拒），留着它只会把宿主一路坑下去。号码不认识、
-/// 参数不够的仍在 `intercept_soter_call` 里原样透传，不会把宿主挂住。
+/// 拦截范围就是本地后端写了实现的那 11 个号码：这台机器的真 HAL 对整族 ATTK 都是
+/// -20（连 provisioning 都拒），留着它只会把宿主一路坑下去；而这 11 个号码无论最后
+/// 是远程答、本地答还是配置说不许兜底，走的都是同一套拦截与回填。号码不认识、参数
+/// 不够的仍在 `intercept_soter_call` 里原样透传，不会把宿主挂住。
 pub(crate) fn interceptable(call: &SoterCall) -> bool {
     call.hal && soter_local::answerable(call.code)
 }
 
-/// 把一笔本地答案拼成宿主能直接吃的内核命令字节流，连同一块得活着的 parcel 一起交出去。
+/// 把一笔答复拼成宿主能直接吃的内核命令字节流，连同一块得活着的 parcel 一起交出去。
+///
+/// 答复从哪来由 [`crate::hook::soter_relay`] 定：远程（B 端 TEE）优先，配置允许就退回
+/// A 端本地自签，两边都没有就返回 `None` 让调用方透传。
 ///
 /// 形状是 `[BR_TRANSACTION_COMPLETE][BR_REPLY]`。为什么前面那条也得给：宿主
 /// `waitForResponse` 的写法是「读一个 cmd，碰到 COMPLETE 就 break 出 switch 回循环顶部」，
@@ -395,7 +397,7 @@ pub(crate) fn interceptable(call: &SoterCall) -> bool {
 /// parcel 一直留到宿主把 `BC_FREE_BUFFER` 交回来为止** —— 这两个返回值是一个整体。
 /// `OwnedReply` 里装的是堆上的 `Parcel`，移交给调用方不会挪动数据本身，指针依旧有效。
 pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> {
-    let reply = match soter_local::answer(call)? {
+    let reply = match crate::hook::soter_relay::answer(call)? {
         Answer::Code(code) => build_plain_reply(&code).ok()?,
         Answer::Buffer { code, data } => build_soter_buffer_reply(code, data.as_deref()).ok()?,
         Answer::Init { status, session } => build_soter_init_reply(status, session).ok()?,

@@ -697,15 +697,24 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
+    // WebUI 的「远程不通就退回本地」开关，落盘写的是 `local_hw`（老配置写
+    // `local_depend_hardware`）。legacy client-a 一直都退，所以缺省就是 true —— 但这个键
+    // 以前没人读（写下去的 `local_hw` 白写），现在归位：它就是 `remote.fallback_local`。
+    let fallback_local = match get(&["local_hw", "local_depend_hardware"])
+        .map(|v| v.to_lowercase())
+        .as_deref()
+    {
+        Some("0" | "false" | "no" | "off") => false,
+        _ => true,
+    };
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
         token,
         device_id,
         tls_insecure,
-        // Legacy client-a always fell back to local processing when the remote
-        // was unreachable; keep that behaviour.
-        fallback_local: true,
+        fallback_local,
         debug_logging,
         hide_strongbox,
         soter_hide,

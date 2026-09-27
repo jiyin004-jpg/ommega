@@ -569,6 +569,19 @@ fn send_event(message: &str) -> Result<()> {
     })
 }
 
+/// 把一笔 SOTER 请求交给 daemon，拿回它的结论（blob 布局见 `hook::soter_relay`）。
+///
+/// 跟 [`report_event`] 不一样，这条是要**等结果**的：宿主拦下的那笔调用正挂着等答复，
+/// 所以在此线程上同步走 RPC；失败就由调用方退回本地兜底，行不了一直重试。
+pub fn forward_soter(request: &str) -> Result<Vec<u8>> {
+    ensure_process_state();
+    with_ommega_maintenance_once(|maintenance| {
+        maintenance
+            .forwardSoter(request)
+            .context("forwardSoter failed")
+    })
+}
+
 pub fn resolve_packages_for_uid(uid: u32) -> PackageResolution {
     ensure_process_state();
     match resolve_package_names_for_uid(uid) {

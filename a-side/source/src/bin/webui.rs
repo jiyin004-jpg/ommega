@@ -181,6 +181,7 @@ fn load_config_json() -> Result<Value> {
             "hide_strongbox": cfg.remote.hide_strongbox,
             "soter_hide": cfg.remote.soter_hide,
             "soter_inject": cfg.remote.soter_inject,
+            "global_scope": cfg.remote.global_scope,
         }
     }))
 }
@@ -217,6 +218,9 @@ fn update_config(value: Value) -> Result<()> {
         }
         if let Some(v) = remote.get("soter_inject").and_then(Value::as_bool) {
             cfg.remote.soter_inject = v;
+        }
+        if let Some(v) = remote.get("global_scope").and_then(Value::as_bool) {
+            cfg.remote.global_scope = v;
         }
     }
     ommegaclient_config::save(&cfg)?;
@@ -271,6 +275,11 @@ mod ommegaclient_config {
         /// absent key means off, matching `Default::default()` and
         /// `daemon-injector`.
         pub soter_inject: bool,
+        /// WebUI "global scope" switch: let the payload intercept every app on
+        /// this device instead of only the `scoop` list. The injector reads it
+        /// straight out of the same flat file (`filter.global_scope`), so it
+        /// has to survive a save even though nothing in the daemon consumes it.
+        pub global_scope: bool,
     }
 
     /// Legacy A-side (client-a) flat `key: value` config file.
@@ -320,14 +329,56 @@ mod ommegaclient_config {
                 "soter_inject" | "inject_soter" => {
                     rc.soter_inject = parse_bool(&value).unwrap_or(false);
                 }
+                "global_scope" => {
+                    rc.global_scope = parse_bool(&value).unwrap_or(false);
+                }
                 _ => {}
             }
         }
         Ok(RelayConfig { remote: rc })
     }
 
+    /// 写入：只换我们管的那几行，其余原样留着。
+    ///
+    /// 以前这里是「拼一份完整文件写下去」，不认识的行直接消失 —— WebUI 里随手拨一个
+    /// 开关，`global_scope`（还有手写的别名键）就没了。现在先读回来，把不归我们管的行
+    /// 原位置保留。
     pub fn save(cfg: &RelayConfig) -> Result<()> {
+        let managed: [&str; 17] = [
+            "url",
+            "token",
+            "device_id",
+            "remote",
+            "local_hw",
+            "local_depend_hardware",
+            "tls_insecure",
+            "tls_skip_verify",
+            "insecure_tls",
+            "debug_logging",
+            "debug",
+            "verbose",
+            "hide_strongbox",
+            "no_strongbox",
+            "global_scope",
+            "soter_hide",
+            "soter_inject",
+        ];
         let mut contents = String::new();
+        let existing = fs::read_to_string(CONFIG_PATH).unwrap_or_default();
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some(idx) = trimmed.find(':') else {
+                continue;
+            };
+            let key = trimmed[..idx].trim().to_lowercase();
+            if !managed.contains(&key.as_str()) {
+                contents.push_str(line);
+                contents.push('\n');
+            }
+        }
         contents.push_str(&format!("url: {}\n", cfg.remote.url));
         contents.push_str(&format!("token: {}\n", cfg.remote.token));
         contents.push_str(&format!("device_id: {}\n", cfg.remote.device_id));
@@ -336,6 +387,7 @@ mod ommegaclient_config {
         contents.push_str(&format!("tls_insecure: {}\n", cfg.remote.tls_insecure));
         contents.push_str(&format!("debug_logging: {}\n", cfg.remote.debug_logging));
         contents.push_str(&format!("hide_strongbox: {}\n", cfg.remote.hide_strongbox));
+        contents.push_str(&format!("global_scope: {}\n", cfg.remote.global_scope));
         contents.push_str(&format!("soter_hide: {}\n", cfg.remote.soter_hide));
         contents.push_str(&format!("soter_inject: {}\n", cfg.remote.soter_inject));
         if let Some(parent) = Path::new(CONFIG_PATH).parent() {

@@ -454,6 +454,19 @@ pub fn remote_enabled() -> bool {
     }
 }
 
+/// Convenience: `true` if the remote chain may fall back to local processing.
+///
+/// The flat A-side config spells this `local_hw` (`RemoteConfig::fallback_local`
+/// is what the WebUI writes under that name); a lock poisoned by another thread
+/// means we cannot tell, and the legacy client-a behaviour always fell back, so
+/// answer `true`.
+pub fn fallback_local() -> bool {
+    match config::config().read() {
+        Ok(g) => g.remote.fallback_local,
+        Err(_) => true,
+    }
+}
+
 /// Adapts [`RemoteRelay`] to the TA's [`kmr_ta::device::RemoteBackend`] trait.
 pub struct RemoteRelayBackend;
 
@@ -574,9 +587,6 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
     }
 
     fn fallback_local(&self) -> bool {
-        match config::config().read() {
-            Ok(g) => g.remote.fallback_local,
-            Err(_) => true,
-        }
+        fallback_local()
     }
 }
