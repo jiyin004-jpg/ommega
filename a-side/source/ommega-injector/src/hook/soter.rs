@@ -24,8 +24,8 @@
 //! | 12 | removeAllUidKey          | i32 uid |
 //! | 13 | removeAuthKey            | i32 uid, String alias |
 //!
-//! 这一版只认、只记，不改写：先把真实 transaction 看清楚（拿到现场字节和 uid /
-//! alias），下一步才按它写应答。日志进 logcat，格式是 `event=soter …`，好过滤。
+//! 这一版既认也答：认得出来的号码就由本地/远程后端写应答（`soter_local`、`soter_relay`），
+//! 认不出来或者缺参数的照旧透给真 HAL。日志进 logcat，格式是 `event=soter …`，好过滤。
 //!
 //! 两边号码表得分开：两个接口是各自独立的 AIDL，号码不通用。App 面向那边
 //! （`ISoterService`，1..13 连着、没空号，9 号是腾讯自家拼错的 `initSigh`）：
@@ -56,11 +56,13 @@ use log::{debug, info};
 
 use crate::hook::binder::{
     binder_transaction_data, binder_transaction_data_data, binder_transaction_data_data_ptr,
-    binder_transaction_data_target, BR_REPLY_CMD, BR_TRANSACTION_COMPLETE_CMD,
+    binder_transaction_data_target, BINDER_BUFFER_FLAG_HAS_PARENT, BINDER_TYPE_PTR, BR_REPLY_CMD,
+    BR_TRANSACTION_COMPLETE_CMD,
 };
 use crate::hook::soter_local::{self, Answer};
 use crate::parcel::{
-    build_plain_reply, build_soter_buffer_reply, build_soter_init_reply, OwnedReply,
+    build_hidl_soter_buffer_reply, build_hidl_soter_init_reply, build_plain_reply,
+    build_soter_buffer_reply, build_soter_init_reply, OwnedReply, HIDL_STRUCT_SIZE,
 };
 
 /// 高通 HAL 的接口描述符（SoterService 发出去的那条）。
@@ -81,15 +83,15 @@ pub(crate) const APP_DESCRIPTOR: &str = "com.tencent.soter.soterserver.ISoterSer
 
 /// 描述符是哪一边的。
 ///
-/// HIDL 单独一档是因为答复的布局还没拿真实流量对照过。这是从 AOSP / libhidl 与宿主 dex 里
-/// 抠出来的硬事实，下回接着做照这个来，别再从猜的地方起步：
+/// HIDL 单独一档是因为那边的事务号、参数形状、答复布局跟 AIDL 全是两套东西。规格是从
+/// AOSP / libhidl 与宿主 dex 里抠出来的硬事实，别再从头猜：
 ///
 /// - 事务号不是什么 hash，就是 `.hal` 里的声明顺序 1..14（宿主 dex 里是 `transact(4, ...)`
-///   这种字面量）。但**映射跟 AIDL 不是一套**：HIDL 的 4 = AIDL 的 8（getDeviceId）。
+///   这种字面量）。但**映射跟 AIDL 不是一套**（见 [`HIDL_TO_INTERNAL_CODE`]）。
 /// - 回包开头是一个 `Status`（一个 i32，0 即成功；非 0 时后面还跟一条 String16 的 message）。
-/// - 请求与回包里的 string / vector 走的是 binder 的 buffer 对象（偏移表里一项 + 数据在
-///   parcel 尾部），跟 AIDL 那种内联的「长度 + 字节」完全不是一回事 —— 这也是当初
-///   「认得出但答不了」的真正原因。
+/// - 请求与回包里的 string / vector 走 binder 的 buffer 对象：parcel 里只躺对象，
+///   结构体和数据体都在 parcel 外面，靠对象里的地址去读。跟 AIDL 那种内联的
+///   「长度 + 字节 / String16」完全是两回事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     Hal,
@@ -98,7 +100,7 @@ pub(crate) enum Side {
 }
 
 impl Side {
-    /// 是不是宿主发往 HAL 的那条路（HIDL 也算，只是暂时不拦）。
+    /// 是不是宿主发往 HAL 的那条路（HIDL 也走拦截，只是答复形状另拼）。
     pub(crate) fn is_hal(self) -> bool {
         matches!(self, Side::Hal | Side::HalHidl)
     }
@@ -115,6 +117,9 @@ pub(crate) struct SoterCall {
     /// 这一格有没有决定了错误码放哪、答复总长怎么算（见 `parcel::reply` 里那两个构造器）。
     pub(crate) has_return_code: bool,
     pub(crate) code: u32,
+    /// 线上那个号。HIDL 那套号跟内部（AIDL）那套不是一个排列，解析时已经换算成内部号了，
+    /// 这里留一份原值只为看日志时对得上真实流量。
+    pub(crate) wire_code: u32,
     pub(crate) op: &'static str,
     pub(crate) uid: Option<i32>,
     pub(crate) alias: Option<String>,
@@ -187,17 +192,35 @@ pub(crate) fn is_mutation(hal: bool, code: u32) -> bool {
     }
 }
 
+/// 请求里那个 `binder_buffer_object`（HIDL 的 string / vector 走它）。
+///
+/// 字段照内核 uapi 的 `struct binder_buffer_object` 摆，`buffer` / `length` / `parent` /
+/// `parent_offset` 的宽度跟 ABI 走。解析一个字符串只用到 `type_`、`length` 和 `buffer`，
+/// 其余几个留着是为了跟结构体对得上（也方便以后要看 parent 链的时候用）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct HidlBufferObject {
+    type_: u32,
+    flags: u32,
+    buffer: usize,
+    length: usize,
+    parent: usize,
+    parent_offset: usize,
+}
+
 /// 一个只往前走、每一步都做边界检查的 parcel 读游标。
 ///
 /// 读的是别的进程写下来的字节，宁可读不出来也不能越界。
 struct Cursor<'a> {
     data: &'a [u8],
     at: usize,
+    /// HIDL 那条路：string 不是内联的 String16，而是 binder 的 buffer 对象。
+    hidl: bool,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8], at: usize) -> Self {
-        Self { data, at }
+    fn new(data: &'a [u8], at: usize, hidl: bool) -> Self {
+        Self { data, at, hidl }
     }
 
     fn remaining(&self) -> usize {
@@ -229,6 +252,13 @@ impl<'a> Cursor<'a> {
         Some(i64::from_le_bytes(raw))
     }
 
+    fn u64(&mut self) -> Option<u64> {
+        let bytes = self.take(8)?;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(bytes);
+        Some(u64::from_le_bytes(raw))
+    }
+
     /// AIDL 的 String 就是 String16，跟 interface token 里的描述符一个格式：
     /// `[i32 字符数][UTF-16LE 2*字符数 字节][补到 4 字节]`（0 = 空串，-1 = null）。
     ///
@@ -242,6 +272,75 @@ impl<'a> Cursor<'a> {
         let (text, at) = read_string16(self.data, self.at)?;
         self.at = at;
         Some(text)
+    }
+
+    /// 按这一路自己的写法读一个参数字符串。
+    fn text(&mut self) -> Option<String> {
+        if self.hidl {
+            self.hidl_string()
+        } else {
+            self.string()
+        }
+    }
+
+    /// 一个 `binder_buffer_object`。
+    ///
+    /// 第二个 u32 是 buffer 自己的 flags（`BINDER_BUFFER_FLAG_HAS_PARENT` 在这一格），
+    /// 不是 `hdr.flags` —— 内核的定义是 `{hdr{type}, flags, buffer, length, parent,
+    /// parent_offset}`，别把这两格弄反了。
+    fn hidl_buffer_object(&mut self) -> Option<HidlBufferObject> {
+        let type_ = self.u32()?;
+        let flags = self.u32()?;
+        let buffer = self.abi_usize()?;
+        let length = self.abi_usize()?;
+        let parent = self.abi_usize()?;
+        let parent_offset = self.abi_usize()?;
+        Some(HidlBufferObject {
+            type_,
+            flags,
+            buffer,
+            length,
+            parent,
+            parent_offset,
+        })
+    }
+
+    fn abi_usize(&mut self) -> Option<usize> {
+        if size_of::<usize>() == size_of::<u64>() {
+            self.u64().map(|value| value as usize)
+        } else {
+            self.u32().map(|value| value as usize)
+        }
+    }
+
+    /// HIDL 的 `hidl_string`：parcel 里只躺两个对象 —— 一个指向那 16 字节的
+    /// `hidl_string` 结构体（`hidl_pointer mBuffer`(8) + `uint32_t mSize`(4) + 补位），
+    /// 一个指向字符本身（长度是 size+1，尾巴上有 NUL）。结构体和字符都在 parcel 外面，
+    /// 只能按对象里写的地址去读。
+    ///
+    /// 那些地址就是我们自己这个进程里的（宿主就是发这笔 transaction 的那个进程，
+    /// 是它自己的 libhwbinder 写下的指针），但仍旧走 `process_vm_readv` 去读：读不动
+    /// 就当认不出来，不能为了解析一串日志把宿主读崩。
+    fn hidl_string(&mut self) -> Option<String> {
+        let parent = self.hidl_buffer_object()?;
+        let child = self.hidl_buffer_object()?;
+        if parent.type_ != BINDER_TYPE_PTR || parent.length != HIDL_STRUCT_SIZE {
+            return None;
+        }
+        if child.type_ != BINDER_TYPE_PTR || child.flags != BINDER_BUFFER_FLAG_HAS_PARENT {
+            return None;
+        }
+        let mut head = [0u8; HIDL_STRUCT_SIZE];
+        read_self(parent.buffer, &mut head)?;
+        let pointer = usize::try_from(u64::from_le_bytes(head[0..8].try_into().ok()?)).ok()?;
+        let size = u32::from_le_bytes(head[8..12].try_into().ok()?) as usize;
+        // 别名、challenge 都短得很，上千字节一定是读歪了。
+        if size > 4096 {
+            return None;
+        }
+        let mut bytes = vec![0u8; size];
+        read_self(pointer, &mut bytes)?;
+        String::from_utf8(bytes).ok()
     }
 
     fn skip_padding(&mut self, written: usize) -> Option<()> {
@@ -311,7 +410,7 @@ fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
 /// 读一个 String16（i32 字符数 0 = 空串、-1 = null，然后 UTF-16LE 的 2*len 字节，
 /// 补齐到 4），返回 (文本, 参数区起点)。
 fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
-    let mut cursor = Cursor::new(data, at);
+    let mut cursor = Cursor::new(data, at, false);
     let len = cursor.u32()?;
     if len == u32::MAX {
         // AIDL 里 -1 表示 null
@@ -339,37 +438,70 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
     Some((text, cursor.at))
 }
 
+/// HIDL 的号对到内部（AIDL）那套号码上。
+///
+/// `.hal` 里 14 个方法按声明顺序拿号：1 generateAttkKeyPair、2 verifyAttkKeyPair、
+/// 3 exportAttkPublicKey、4 getDeviceId、5 generateAskKeyPair、6 exportAskPublicKey、
+/// 7 removeAllUidKey、8 hasAskAlready、9 generateAuthKeyPair、10 exportAuthKeyPublicKey、
+/// 11 removeAuthKey、12 hasAuthKey、13 initSign、14 finishSign。
+/// AIDL 那套的声明顺序是另一个排列，这张表是宿主 dex 里两个代理类各自的
+/// `transact(n, …)` 字面量对出来的（HIDL 4 = AIDL 8 getDeviceId、HIDL 6 = AIDL 1
+/// exportAskPublicKey …），不是按名字猜的，别重排。
+/// 1/2/3 落到 AIDL 的 6/14/2 上，那是运行时没有的 provisioning 号，所以照旧认不出来
+/// —— 跟 AIDL 那半边一致。
+const HIDL_TO_INTERNAL_CODE: [u32; 14] = [6, 14, 2, 8, 5, 1, 12, 9, 7, 3, 13, 10, 11, 4];
+
+fn hidl_internal_code(code: u32) -> Option<u32> {
+    let index = code.checked_sub(1)? as usize;
+    HIDL_TO_INTERNAL_CODE.get(index).copied()
+}
+
+/// 读自己进程里的内存，读不动就返回 `None`（`process_vm_readv` 失败，不是崩）。
+fn read_self(address: usize, out: &mut [u8]) -> Option<()> {
+    if out.is_empty() {
+        return Some(());
+    }
+    if address == 0 {
+        return None;
+    }
+    crate::sys::read_process_exact(nix::unistd::Pid::this(), address, out).ok()
+}
+
 /// 解析一条 transaction 的 data。认不出来就返回 `None`（正常流量都归这一类）。
 pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
     let (side, has_return_code, args_at) = match_descriptor(data)?;
     let hal = side.is_hal();
+    let hidl = side == Side::HalHidl;
+    // HIDL 的号是 `.hal` 的声明顺序，跟 AIDL 那套不是一个排列。认出来之后就换算成内部号：
+    // 参数形状、下面那几层分派（本地/远程、mutation 开关）全都只看内部号。
+    let wire_code = code;
+    let code = if hidl {
+        hidl_internal_code(code)?
+    } else {
+        code
+    };
     let (op, shape) = describe(hal, code)?;
-    let mut cursor = Cursor::new(data, args_at);
+    let mut cursor = Cursor::new(data, args_at, hidl);
     let (uid, alias, challenge, session, key) = match shape {
         Args::None => (None, None, None, None, None),
         Args::Uid => (Some(cursor.i32()?), None, None, None, None),
-        Args::UidAlias => (
-            Some(cursor.i32()?),
-            Some(cursor.string()?),
-            None,
-            None,
-            None,
-        ),
+        Args::UidAlias => (Some(cursor.i32()?), Some(cursor.text()?), None, None, None),
         Args::UidAliasChallenge => (
             Some(cursor.i32()?),
-            Some(cursor.string()?),
-            Some(cursor.string()?),
+            Some(cursor.text()?),
+            Some(cursor.text()?),
             None,
             None,
         ),
         Args::Session => (None, None, None, Some(cursor.i64()?), None),
-        Args::Key => (None, None, None, None, Some(cursor.string()?)),
+        Args::Key => (None, None, None, None, Some(cursor.text()?)),
     };
     Some(SoterCall {
         hal,
-        hidl: side == Side::HalHidl,
+        hidl,
         has_return_code,
         code,
+        wire_code,
         op,
         uid,
         alias,
@@ -426,6 +558,12 @@ fn log_call(call: &SoterCall) {
             ""
         },
     );
+    let wire_code = if call.hidl {
+        format!(" wire_code={}", call.wire_code)
+    } else {
+        String::new()
+    };
+    let line = format!("{line}{wire_code}");
     // 本地那一路（logcat / 日志文件）在 app 域的进程里是哑的，所以同一条还顺 RPC 送一份给
     // daemon 记：宿主的观测只有这一条路能看见。
     info!("{line}");
@@ -442,7 +580,7 @@ fn log_call(call: &SoterCall) {
 /// 是远程答、本地答还是配置说不许兜底，走的都是同一套拦截与回填。号码不认识、参数
 /// 不够的仍在 `intercept_soter_call` 里原样透传，不会把宿主挂住。
 pub(crate) fn interceptable(call: &SoterCall) -> bool {
-    call.hal && !call.hidl && soter_local::answerable(call.code)
+    call.hal && soter_local::answerable(call.code)
 }
 
 /// 把一笔答复拼成宿主能直接吃的内核命令字节流，连同一块得活着的 parcel 一起交出去。
@@ -464,10 +602,18 @@ pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> 
     let reply = match crate::hook::soter_relay::answer(call)? {
         Answer::Code(code) => build_plain_reply(&code).ok()?,
         Answer::Buffer { code, data } => {
-            build_soter_buffer_reply(code, data.as_deref(), call.has_return_code).ok()?
+            if call.hidl {
+                build_hidl_soter_buffer_reply(code, data.as_deref()).ok()?
+            } else {
+                build_soter_buffer_reply(code, data.as_deref(), call.has_return_code).ok()?
+            }
         }
         Answer::Init { status, session } => {
-            build_soter_init_reply(status, session, call.has_return_code).ok()?
+            if call.hidl {
+                build_hidl_soter_init_reply(status, session).ok()?
+            } else {
+                build_soter_init_reply(status, session, call.has_return_code).ok()?
+            }
         }
     };
     let bytes = encode_br_reply(&reply);
@@ -757,20 +903,22 @@ mod tests {
     }
 
     #[test]
-    fn a_hidl_descriptor_is_recognized_but_not_intercepted() {
-        // 宿主 dex 里 HIDL 那套代理类（`...@1.0::ISoter@Proxy`）也在，跟 AIDL 不是同一个
-        // 描述符。先只认、只记：hidl 标上，interceptable 必须是 false。
-        let mut data = interface_token(QTI_HIDL_DESCRIPTOR);
-        push_i32(&mut data, 1000);
-        let call = parse(&data, 9).expect("hidl hasAskAlready");
-        assert!(call.hal && call.hidl, "HIDL 那侧归 HAL，但要单独标出来");
-        assert_eq!(call.op, "hasAskAlready");
-        assert!(!interceptable(&call), "HIDL 现在只观察，不拦");
-
-        let mut data = interface_token(TRUSTONIC_HIDL_DESCRIPTOR);
-        push_i32(&mut data, 1000);
-        let call = parse(&data, 9).expect("trustonic hidl hasAskAlready");
-        assert!(call.hal && call.hidl);
+    fn the_hidl_descriptors_are_recognised_and_intercepted() {
+        // 宿主 dex 里 HIDL 那套代理类（`...@1.0::ISoter@Proxy`）也在，描述符跟 AIDL 不是
+        // 同一条。现在照样拦 —— 答复换成 HIDL 的布局（`build_hidl_*`），不再只观察。
+        // hasAuthKey 在 HIDL 线上是声明顺序的第 12 个，AIDL 那边是 10。
+        for descriptor in [QTI_HIDL_DESCRIPTOR, TRUSTONIC_HIDL_DESCRIPTOR] {
+            let mut keep: Vec<Box<[u8]>> = Vec::new();
+            let mut data = hidl_token(descriptor);
+            push_i32(&mut data, 1000);
+            push_hidl_string(&mut data, &mut keep, "SoterAuthKey");
+            let call = parse(&data, 12).unwrap_or_else(|| panic!("{descriptor} hasAuthKey"));
+            assert!(call.hal && call.hidl, "HIDL 那侧归 HAL，也得单独标出来");
+            assert_eq!(call.code, 10, "换算成内部那套号码");
+            assert_eq!(call.op, "hasAuthKey");
+            assert!(interceptable(&call), "HIDL 现在也拦");
+            drop(keep);
+        }
     }
 
     #[test]
@@ -868,7 +1016,7 @@ mod tests {
 
     #[test]
     fn a_cursor_never_reads_past_the_end() {
-        let mut cursor = Cursor::new(&[1, 2, 3], 0);
+        let mut cursor = Cursor::new(&[1, 2, 3], 0, false);
         assert!(cursor.u32().is_none());
         assert_eq!(cursor.remaining(), 3);
         assert!(cursor.take(4).is_none());
@@ -971,5 +1119,156 @@ mod tests {
             assert_eq!(tr.flags & TF_STATUS_CODE, 0);
             assert_eq!(tr.offsets_size, 0);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // HIDL 那一套
+    // -------------------------------------------------------------------
+
+    fn push_abi_usize(out: &mut Vec<u8>, value: usize) {
+        if size_of::<usize>() == 8 {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        } else {
+            out.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+    }
+
+    /// 一个 `binder_buffer_object`：`{hdr{type}, flags, buffer, length, parent, parent_offset}`，
+    /// 后面四格宽度跟 ABI 走。
+    fn push_hidl_buffer_object(
+        out: &mut Vec<u8>,
+        buffer: usize,
+        length: usize,
+        flags: u32,
+        parent: usize,
+    ) {
+        out.extend_from_slice(&BINDER_TYPE_PTR.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        push_abi_usize(out, buffer);
+        push_abi_usize(out, length);
+        push_abi_usize(out, parent);
+        push_abi_usize(out, 0);
+    }
+
+    /// HIDL 的一个 string 参数：parcel 里两个对象，结构体和字符在外面。
+    ///
+    /// `keep` 是那些外面那块内存的持有者 —— 对象里写的是它们的地址，解析的时候真去 deref，
+    /// 所以调用方得让它们活到 parse 完。
+    fn push_hidl_string(out: &mut Vec<u8>, keep: &mut Vec<Box<[u8]>>, value: &str) {
+        let mut chars = value.as_bytes().to_vec();
+        chars.push(0);
+        let chars: Box<[u8]> = chars.into_boxed_slice();
+        let chars_pointer = chars.as_ptr() as usize;
+        keep.push(chars);
+
+        // hidl_pointer(8) + uint32 mSize + bool mOwnsBuffer + 3 补位
+        let mut head = vec![0u8; HIDL_STRUCT_SIZE].into_boxed_slice();
+        head[0..8].copy_from_slice(&(chars_pointer as u64).to_le_bytes());
+        head[8..12].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        let head_pointer = head.as_ptr() as usize;
+        keep.push(head);
+
+        push_hidl_buffer_object(out, head_pointer, HIDL_STRUCT_SIZE, 0, 0);
+        push_hidl_buffer_object(
+            out,
+            chars_pointer,
+            value.len() + 1,
+            BINDER_BUFFER_FLAG_HAS_PARENT,
+            0,
+        );
+    }
+
+    /// hwbinder 的接口 token：没有 strict-mode 那几个 i32 头，开头就是一个 String16。
+    fn hidl_token(descriptor: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_string(&mut out, descriptor);
+        out
+    }
+
+    #[test]
+    fn reads_a_hidl_request_and_remaps_its_code() {
+        // 线上 10 号 = exportAuthKeyPublicKey（`.hal` 的声明顺序），AIDL 那边是 3 号。
+        let mut keep: Vec<Box<[u8]>> = Vec::new();
+        let mut data = hidl_token(QTI_HIDL_DESCRIPTOR);
+        push_i32(&mut data, 10373);
+        push_hidl_string(&mut data, &mut keep, "SoterAuthKeyV2_salt11d8ba34_scene1");
+
+        let call = parse(&data, 10).expect("the HIDL request must be recognised");
+        assert!(call.hal && call.hidl);
+        assert_eq!(call.code, 3, "换算成内部那套号码");
+        assert_eq!(call.wire_code, 10);
+        assert_eq!(call.op, "exportAuthKeyPublicKey");
+        assert_eq!(call.uid, Some(10373));
+        assert_eq!(
+            call.alias.as_deref(),
+            Some("SoterAuthKeyV2_salt11d8ba34_scene1"),
+            "别名从 buffer 对象里读出来，一个字节都不能少"
+        );
+        drop(keep);
+    }
+
+    #[test]
+    fn reads_a_hidl_init_sign_with_two_strings() {
+        // initSign 线上是 13 号，uid + 两个 string。
+        let mut keep: Vec<Box<[u8]>> = Vec::new();
+        let mut data = hidl_token(TRUSTONIC_HIDL_DESCRIPTOR);
+        push_i32(&mut data, 10490);
+        push_hidl_string(&mut data, &mut keep, "SoterAuthKeyV2_salt4d605b62_scene1");
+        push_hidl_string(&mut data, &mut keep, "0102030405060708");
+
+        let call = parse(&data, 13).expect("the HIDL initSign must be recognised");
+        assert_eq!(call.code, 11);
+        assert_eq!(call.uid, Some(10490));
+        assert_eq!(call.challenge.as_deref(), Some("0102030405060708"));
+        drop(keep);
+    }
+
+    #[test]
+    fn hidl_provisioning_codes_stay_unrecognised() {
+        // 1/2/3（generateAttkKeyPair / verifyAttkKeyPair / exportAttkPublicKey）换算过去是
+        // AIDL 的 6/14/2 —— 运行时没有那三个号，所以跟 AIDL 那半边一样认不出来。
+        for code in [1u32, 2, 3] {
+            let data = hidl_token(QTI_HIDL_DESCRIPTOR);
+            assert!(parse(&data, code).is_none(), "HIDL {code} 不该认");
+        }
+    }
+
+    #[test]
+    fn the_hidl_code_map_is_a_permutation_of_the_aidl_one() {
+        // 14 个方法一一对应，换算表不能出现重号、也不能掉出那套 1..14。
+        let mut seen = std::collections::BTreeSet::new();
+        for code in 1..=14u32 {
+            let internal = hidl_internal_code(code).expect("every HIDL code maps");
+            assert!((1..=14).contains(&internal), "{internal} 不在 1..14 里");
+            assert!(seen.insert(internal), "内部号 {internal} 被用了两次");
+        }
+    }
+
+    #[test]
+    fn a_hidl_call_is_answered_in_the_hidl_shape() {
+        // getDeviceId：HIDL 线上 4 号、内部 8 号。应答里应当是两个 buffer 对象。
+        let data = hidl_token(QTI_HIDL_DESCRIPTOR);
+        let call = parse(&data, 4).expect("HIDL 4 is getDeviceId");
+        assert_eq!((call.code, call.op), (8, "getDeviceId"));
+        assert!(interceptable(&call), "HIDL 那条路现在也拦");
+
+        let (bytes, reply) = build_br_reply(&call).expect("the local backend answers it");
+        assert_eq!(&bytes[..4], &BR_TRANSACTION_COMPLETE_CMD.to_ne_bytes());
+        assert_eq!(&bytes[4..8], &BR_REPLY_CMD.to_ne_bytes());
+        let tr = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(8) as *const binder_transaction_data)
+        };
+        assert_eq!(tr.data_size, reply.data_size());
+        assert_eq!(tr.flags & TF_STATUS_CODE, 0);
+        assert_eq!(
+            tr.offsets_size,
+            2 * size_of::<usize>(),
+            "结构体和元素各一个对象"
+        );
+
+        let head = unsafe { std::slice::from_raw_parts(reply.data_ptr(), reply.data_size()) };
+        assert_eq!(&head[..8], &[0u8; 8], "hardware::Status ok + 错误码 0");
+        let type_ = u32::from_le_bytes(head[8..12].try_into().unwrap());
+        assert_eq!(type_, BINDER_TYPE_PTR, "8 那里就该是对象 A");
     }
 }

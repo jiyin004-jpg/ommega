@@ -618,6 +618,7 @@ mod tests {
             // 这里只比回答内容的型号，回包形状用不上，取高通那套。
             has_return_code: true,
             code,
+            wire_code: code,
             op: "test",
             uid,
             alias: alias.map(str::to_string),

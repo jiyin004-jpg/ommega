@@ -37,6 +37,13 @@ pub(crate) const BINDER_TYPE_WEAK_BINDER: u32 = b_pack_chars(b'w', b'b', b'*', B
 pub(crate) const BINDER_TYPE_HANDLE: u32 = b_pack_chars(b's', b'h', b'*', B_TYPE_LARGE as u8);
 pub(crate) const BINDER_TYPE_WEAK_HANDLE: u32 = b_pack_chars(b'w', b'h', b'*', B_TYPE_LARGE as u8);
 pub(crate) const BINDER_TYPE_FD: u32 = b_pack_chars(b'f', b'd', b'*', B_TYPE_LARGE as u8);
+/// HIDL/hwbinder 那套的「用户态缓冲」对象。内核 uapi 里是 `struct binder_buffer_object`：
+/// `{hdr.type, flags, buffer, length, parent, parent_offset}`。hidl_string 和 hidl_vec 都走它
+/// —— 结构体和数据体都在 parcel 外面，parcel 里只躺这个 40 字节（64 位）的对象。
+pub(crate) const BINDER_TYPE_PTR: u32 = b_pack_chars(b'p', b't', b'*', B_TYPE_LARGE as u8);
+/// `binder_buffer_object.flags`：这个 buffer 嵌在另一个 buffer 里（vector 的元素、
+/// string 的字符就是这种），此时 `parent` / `parent_offset` 才有意义。
+pub(crate) const BINDER_BUFFER_FLAG_HAS_PARENT: u32 = 0x01;
 const FLAT_BINDER_FLAG_TXN_SECURITY_CTX: u32 = 0x1000;
 
 pub(crate) fn vintf_stability_wire() -> i32 {

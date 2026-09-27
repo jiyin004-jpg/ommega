@@ -14,8 +14,8 @@ use crate::android::system::keystore2::KeyParameters::KeyParameters;
 use crate::android::system::keystore2::OperationChallenge::OperationChallenge;
 use crate::hook::binder::{
     binder_object_header, flat_binder_object, flat_binder_object_handle_or_ptr,
-    NativeBinderRetirement, BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER,
-    BINDER_TYPE_WEAK_HANDLE,
+    NativeBinderRetirement, BINDER_BUFFER_FLAG_HAS_PARENT, BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE,
+    BINDER_TYPE_PTR, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE,
 };
 
 use super::parcel_from_ipc_parts;
@@ -25,6 +25,14 @@ pub struct OwnedReply {
     parcel: Parcel,
     pub offsets: Box<[usize]>,
     pub(crate) native_operation: Option<NativeBinderRetirement>,
+    /// HIDL 的答复里，对象（`binder_buffer_object`）的 `buffer` 写的是堆块的地址，
+    /// 那些块得跟 parcel 一样活到宿主把 `BC_FREE_BUFFER` 交回来为止：内核不认识这些
+    /// 指针，我们拿来就用、宿主直接按地址读，谁挪一下（或者提前释放）宿主就崩。
+    /// AIDL 那条路没有这种东西，留空就行。
+    ///
+    /// 这些块没人读，纯靠它活着，所以标记成别管 lint。
+    #[allow(dead_code)]
+    storage: Vec<Box<[u8]>>,
 }
 
 impl OwnedReply {
@@ -426,6 +434,125 @@ fn write_soter_buffer_return(
     Ok(())
 }
 
+/// HIDL 的 `hidl_pointer<T>` / `hidl_vec<T>` / `hidl_string` 那一副骨架一共 16 字节：
+/// `hidl_pointer`(8) + `uint32_t mSize` + `bool mOwnsBuffer` + 3 字节补位。
+///
+/// 指针那个槽两个 ABI 都是 8 字节 —— `hidl_pointer` 内部是 `union { T*; uint64_t; }`，
+/// AOSP 里有 `static_assert(sizeof(*this) == 8)`；32 位进程只填低 4 字节、高位留 0，
+/// 所以这个结构体的字节布局在两边一模一样，不用按 ABI 分开写。
+pub(crate) const HIDL_STRUCT_SIZE: usize = 16;
+
+fn hidl_struct(pointer: usize, size: u32) -> Box<[u8]> {
+    let mut buf = vec![0u8; HIDL_STRUCT_SIZE].into_boxed_slice();
+    buf[0..8].copy_from_slice(&(pointer as u64).to_le_bytes());
+    buf[8..12].copy_from_slice(&size.to_le_bytes());
+    buf
+}
+
+/// 往 parcel 里写一个 `binder_buffer_object`。
+///
+/// 内核 uapi 里它是 `{hdr{type}, flags, buffer, length, parent, parent_offset}`，
+/// 后面四个字段的宽度跟着 ABI 走（`binder_uintptr_t` / `binder_size_t` 就是 32 位 4 字节、
+/// 64 位 8 字节的 typedef）。同一份结构体在没有 libhwbinder 源码的年代被猜成过别的字段
+/// 顺序，别照那个来 —— 以内核头文件为准。
+fn write_hidl_buffer_object(
+    parcel: &mut Parcel,
+    buffer: usize,
+    length: usize,
+    flags: u32,
+    parent: usize,
+    parent_offset: usize,
+) -> Result<()> {
+    parcel.write_u32(BINDER_TYPE_PTR)?;
+    parcel.write_u32(flags)?;
+    write_abi_usize(parcel, buffer)?;
+    write_abi_usize(parcel, length)?;
+    write_abi_usize(parcel, parent)?;
+    write_abi_usize(parcel, parent_offset)?;
+    Ok(())
+}
+
+fn write_abi_usize(parcel: &mut Parcel, value: usize) -> Result<()> {
+    if size_of::<usize>() == size_of::<u64>() {
+        parcel.write_u64(value as u64)?;
+    } else {
+        parcel.write_u32(value as u32)?;
+    }
+    Ok(())
+}
+
+/// HIDL 那边 `generates (int32 error, vec<uint8_t> data, soter_size_t length)` 的回复。
+///
+/// ```text
+/// [Status i32 = 0][错误码 i32][对象 A][对象 B][长度 u32]
+/// ```
+///
+/// 两个对象都是 `binder_buffer_object`（64 位下 40 字节）：A 指向那个 16 字节的
+/// `hidl_vec` 结构体（`length` 必须正好等于 `sizeof(hidl_vec<uint8_t>)`，宿主读完会
+/// 逐字节比），B 指向元素本身，`parent` 是 A 在偏移表里的下标（这里是 0）、
+/// `parent_offset` 是结构体里指针那一格的偏移（`offsetof(hidl_vec, mBuffer)` = 0）。
+/// 宿主校验 B 的时候会去读 A 指向的那个结构体、看第一个指针是不是就指着 B 的 `buffer`
+/// —— 两者必须一致，所以结构体得我们自己拼好、地址写进去。
+///
+/// `data = None` 就是空 vector：元素指针和长度都给 0。这不是「不写」—— 读的那侧走的是
+/// `readNullableEmbeddedBuffer`，空 vector 天生就长这样（AOSP 的 `writeObject` 对
+/// buffer 为 null 的对象也不登记偏移表，所以这里只登记 A）。
+pub fn build_hidl_soter_buffer_reply(error: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
+    let payload = data.unwrap_or(&[]);
+    let mut storage: Vec<Box<[u8]>> = Vec::new();
+    let elements = if payload.is_empty() {
+        0
+    } else {
+        let block: Box<[u8]> = payload.to_vec().into_boxed_slice();
+        let pointer = block.as_ptr() as usize;
+        storage.push(block);
+        pointer
+    };
+    let structure = hidl_struct(elements, payload.len() as u32);
+    let structure_pointer = structure.as_ptr() as usize;
+    storage.push(structure);
+
+    let mut parcel = Parcel::new();
+    // 回包开头是 `hardware::Status`：一个 i32，0 即成功。非 0 时后面还得跟一条
+    // String16 的 message，我们从来不往那条路上走。
+    parcel.write_i32(0)?;
+    parcel.write_i32(error)?;
+    let parent = parcel.data_position();
+    write_hidl_buffer_object(&mut parcel, structure_pointer, HIDL_STRUCT_SIZE, 0, 0, 0)?;
+    let child = parcel.data_position();
+    write_hidl_buffer_object(
+        &mut parcel,
+        elements,
+        payload.len(),
+        BINDER_BUFFER_FLAG_HAS_PARENT,
+        0,
+        0,
+    )?;
+    parcel.write_u32(payload.len() as u32)?;
+
+    let offsets = if elements == 0 {
+        vec![parent]
+    } else {
+        vec![parent, child]
+    };
+    Ok(OwnedReply {
+        parcel,
+        offsets: offsets.into_boxed_slice(),
+        native_operation: None,
+        storage,
+    })
+}
+
+/// HIDL 那边 `generates (int32 error, uint64 session)` 的回复：
+/// `[Status i32 = 0][错误码 i32][session u64]`。
+pub fn build_hidl_soter_init_reply(error: i32, session: i64) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write_i32(0)?;
+    parcel.write_i32(error)?;
+    parcel.write_i64(session)?;
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
 pub fn build_void_reply() -> Result<OwnedReply> {
     build_status_reply(&Status::from(StatusCode::Ok))
 }
@@ -441,6 +568,7 @@ fn owned_reply_from_parcel(parcel: Parcel, offsets: impl IntoIterator<Item = usi
         parcel,
         offsets: offsets.into_iter().collect(),
         native_operation: None,
+        storage: Vec::new(),
     }
 }
 

@@ -112,6 +112,7 @@ mod tests {
             // 这些测试只看请求怎么拼，跟回包那一格无关，随手取高通那套。
             has_return_code: true,
             code,
+            wire_code: code,
             op: "test",
             uid,
             alias: alias.map(str::to_string),

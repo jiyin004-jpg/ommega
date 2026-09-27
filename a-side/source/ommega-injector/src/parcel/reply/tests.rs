@@ -274,3 +274,168 @@ fn a_trustonic_soter_buffer_reply_reads_back_the_way_the_host_reads_it() {
         "总长 + 错误码 + array 长 + 数据(补到 4) + dataLength"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SOTER HAReply —— HIDL 那一套
+// ---------------------------------------------------------------------------
+
+/// 内核 uapi 里 `binder_uintptr_t` / `binder_size_t` 就是 32 位 4 字节、64 位 8 字节的
+/// typedef，对象里那几格宽度得跟着 ABI 走。
+fn abi_usize(bytes: &[u8], at: usize) -> usize {
+    if size_of::<usize>() == 8 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+    } else {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+    }
+}
+
+fn abi_usize_width() -> usize {
+    size_of::<usize>()
+}
+
+fn hidl_object_size() -> usize {
+    8 + abi_usize_width() * 4
+}
+
+/// `struct binder_buffer_object`：`{hdr{type}, flags, buffer, length, parent, parent_offset}`。
+#[derive(Debug, Clone, Copy)]
+struct HidlObject {
+    type_: u32,
+    flags: u32,
+    buffer: usize,
+    length: usize,
+    parent: usize,
+    parent_offset: usize,
+}
+
+fn read_hidl_object(bytes: &[u8], at: usize) -> HidlObject {
+    let width = abi_usize_width();
+    HidlObject {
+        type_: u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+        flags: u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+        buffer: abi_usize(bytes, at + 8),
+        length: abi_usize(bytes, at + 8 + width),
+        parent: abi_usize(bytes, at + 8 + width * 2),
+        parent_offset: abi_usize(bytes, at + 8 + width * 3),
+    }
+}
+
+/// 照着宿主 libhwbinder 的读法把一笔 HIDL 答复读一遍，返回 (status, 错误码, 数据)。
+///
+/// 这几下都是真读数器会做的：对象的位置得跟数据游标**正好相等**（`readObject` 就是这么
+/// 在偏移表里找的）、对象里的地址得能 deref、带 parent 的那个元素对象还得跟父结构体里
+/// 第一个指针一致（`verifyBufferObject` 查这个）。
+fn read_back_hidl_buffer_reply(reply: &mut OwnedReply) -> (i32, i32, Vec<u8>) {
+    let bytes = soter_bytes(reply);
+    let offsets = reply.offsets.to_vec();
+    let status = le_i32(&bytes, 0);
+    let error = le_i32(&bytes, 4);
+
+    let parent_at = 8;
+    let parent = read_hidl_object(&bytes, parent_at);
+    let child_at = parent_at + hidl_object_size();
+    let child = read_hidl_object(&bytes, child_at);
+    let length_field = le_i32(&bytes, child_at + hidl_object_size()) as usize;
+
+    assert_eq!(
+        parent.type_, BINDER_TYPE_PTR,
+        "结构体那个对象是 buffer 对象"
+    );
+    assert_eq!(parent.flags, 0, "外面这层不带 parent");
+    assert_eq!(
+        parent.length, HIDL_STRUCT_SIZE,
+        "长度得正好是 sizeof(hidl_vec<uint8_t>)"
+    );
+    assert_eq!(offsets.first().copied(), Some(parent_at));
+
+    // 结构体：hidl_pointer(8) + uint32 mSize + bool mOwnsBuffer + 3 字节补位
+    let head = unsafe { std::slice::from_raw_parts(parent.buffer as *const u8, HIDL_STRUCT_SIZE) };
+    let data_pointer = u64::from_le_bytes(head[0..8].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(head[8..12].try_into().unwrap()) as usize;
+    assert_eq!(head[12], 0, "借来的 buffer，不接管所有权");
+    assert_eq!(head[13..16], [0, 0, 0]);
+    assert_eq!(
+        data_pointer, child.buffer,
+        "结构体里的第一个指针就是元素那块"
+    );
+    assert_eq!(size, child.length, "uint8 的元素个数就是字节数");
+    assert_eq!(length_field, size, "回包最后那个 soter_size_t");
+
+    if child.buffer == 0 {
+        assert_eq!(size, 0, "空 vector 才是空指针");
+        assert_eq!(
+            offsets.len(),
+            1,
+            "空元素对象不进偏移表（AOSP 也是这么写的）"
+        );
+        return (status, error, Vec::new());
+    }
+    assert_eq!(child.type_, BINDER_TYPE_PTR);
+    assert_eq!(child.flags, BINDER_BUFFER_FLAG_HAS_PARENT);
+    assert_eq!(child.parent, 0, "父对象在偏移表里的下标");
+    assert_eq!(child.parent_offset, 0, "offsetof(hidl_vec, mBuffer)");
+    assert_eq!(offsets.get(1).copied(), Some(child_at));
+    let data = unsafe { std::slice::from_raw_parts(child.buffer as *const u8, size) }.to_vec();
+    (status, error, data)
+}
+
+#[test]
+fn hidl_soter_buffer_reply_has_the_exact_wire_shape() {
+    let payload = [0xde, 0xad, 0xbe, 0xef];
+    let mut reply = build_hidl_soter_buffer_reply(0, Some(&payload)).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    // Status(4) + error(4) + 对象 A + 对象 B + 长度(4)
+    assert_eq!(
+        bytes.len(),
+        8 + hidl_object_size() * 2 + 4,
+        "got {bytes:02x?}"
+    );
+    let (status, error, data) = read_back_hidl_buffer_reply(&mut reply);
+    assert_eq!(status, 0, "hardware::Status::ok()");
+    assert_eq!(error, 0);
+    assert_eq!(data, payload);
+}
+
+#[test]
+fn hidl_soter_buffer_reply_keeps_the_error_code_and_an_empty_vector() {
+    // 「没数据但有错误码」在 HIDL 这边就是一个空 vector —— 元素指针给 0、长度 0，
+    // 读的那侧走的是 readNullableEmbeddedBuffer，天生就认得这种，不是「不写」。
+    let mut reply = build_hidl_soter_buffer_reply(-5, None).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    assert_eq!(
+        bytes.len(),
+        8 + hidl_object_size() * 2 + 4,
+        "got {bytes:02x?}"
+    );
+    let (status, error, data) = read_back_hidl_buffer_reply(&mut reply);
+    assert_eq!(status, 0);
+    assert_eq!(error, -5);
+    assert!(data.is_empty());
+}
+
+#[test]
+fn hidl_soter_buffer_reply_keeps_a_long_payload_intact() {
+    let payload = vec![7u8; 200];
+    let mut reply = build_hidl_soter_buffer_reply(0, Some(&payload)).unwrap();
+    let (status, error, data) = read_back_hidl_buffer_reply(&mut reply);
+    assert_eq!((status, error), (0, 0));
+    assert_eq!(
+        data, payload,
+        "元素那块是单独一块内存，多少字节都不进 parcel"
+    );
+}
+
+#[test]
+fn hidl_soter_init_reply_carries_error_then_session() {
+    let mut reply = build_hidl_soter_init_reply(-5, 0x1122334455667788).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    assert_eq!(bytes.len(), 16, "got {bytes:02x?}");
+    assert_eq!(le_i32(&bytes, 0), 0, "hardware::Status::ok()");
+    assert_eq!(le_i32(&bytes, 4), -5, "错误码 ");
+    assert_eq!(
+        i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        0x1122334455667788,
+        "session"
+    );
+    assert!(reply.offsets.is_empty(), "没有对象，偏移表是空的");
+}
