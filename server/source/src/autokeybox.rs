@@ -187,25 +187,7 @@ pub fn configured_sources() -> Vec<KeyboxSource> {
 
 /// Fetch a URL over http/https, returning the body text.
 ///
-/// 走系统 curl，不用 reqwest：这个机房里的 reqwest（rustls）过不了 Cloudflare 的
-/// bot 检查（raw / gh-proxy / jsdelivr 都在它后面），会一直挂到超时；curl 每次都是
-/// 秒回。另外这台机器会把某些域名只解析出 IPv6，而它的 IPv6 是不通的 —— curl 自己
-/// 会退回 IPv4，reqwest 不会。`-f` 是为了让 404/403 直接算失败，别把错误页当成
-/// keybox 内容往下解析。
-fn http_get(url: &str, timeout: Duration) -> anyhow::Result<String> {
-    let secs = timeout.as_secs().max(1).to_string();
-    let out = std::process::Command::new("curl")
-        .args(["-sSfL", "--max-time", &secs, url])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "curl exit={:?} {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
+// 取网页文本统一走 `crate::http::get_text`（那边记了为什么不用 reqwest）。
 
 /// Fetch the source body.
 ///
@@ -220,7 +202,7 @@ fn fetch_source(src: &KeyboxSource) -> anyhow::Result<String> {
         if i > 0 {
             std::thread::sleep(Duration::from_secs(2));
         }
-        match http_get(url, Duration::from_secs(30)) {
+        match crate::http::get_text(url, Duration::from_secs(30)) {
             Ok(body) => return Ok(body),
             Err(e) => {
                 tracing::warn!("autokeybox fetch failed url={url} err={e}");
@@ -529,7 +511,7 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
 /// 过不了它的 bot 检查，会一直挂到超时；curl 实测每个都是秒回。服务端本来就装
 /// 了 curl，这里不多一个依赖。
 fn public_http_get(url: &str, timeout_secs: u64) -> Option<String> {
-    match http_get(url, Duration::from_secs(timeout_secs)) {
+    match crate::http::get_text(url, Duration::from_secs(timeout_secs)) {
         Ok(t) => Some(t),
         Err(e) => {
             tracing::debug!("autokeybox public get failed url={url} err={e}");
@@ -687,10 +669,10 @@ fn download_and_store(
 
     // Step 2: fetch the actual keybox content.
     let content = if let Some(url) = direct_url {
-        http_get(&url, Duration::from_secs(30))?
+        crate::http::get_text(&url, Duration::from_secs(30))?
     } else if let Some(tok) = token {
         let dl_url = format!("{}/download/{tok}", base_url(src));
-        http_get(&dl_url, Duration::from_secs(30))?
+        crate::http::get_text(&dl_url, Duration::from_secs(30))?
     } else {
         // The download response itself might be the keybox content.
         if text.contains("BEGIN ") || text.contains("<Keybox") || text.contains("<?xml") {
@@ -724,17 +706,30 @@ fn base_url(src: &KeyboxSource) -> String {
     }
 }
 
+/// 入库前的质量门：私钥配不配链、链像不像造出来的、链上的证书有没有被吊销。
+/// 返回 `Some(原因)` 表示这份材料该扔。
+///
+/// 吊销名单要联网，万一没拉下来（`attstatus` 那边会记 warn），这道就放行 ——
+/// 不能因为网络问题把整条采集链路卡死。
+fn reject_reason(private_key_pem: &str, chain_pem: &str) -> Option<String> {
+    if let Some(why) = crate::cert::identity_problem(private_key_pem, chain_pem) {
+        return Some(why);
+    }
+    if let Some((serial, status)) = crate::attstatus::revoked_reason(chain_pem) {
+        return Some(format!(
+            "certificate serial {serial} is {status} in the attestation status list"
+        ));
+    }
+    None
+}
+
 /// Store an identity under a source's target device id. Returns whether it was
 /// actually written (`false` when validation or the DB write failed).
 fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData) -> bool {
-    // Reject a mismatched key/chain before it can poison attestation: the
-    // b_upload path validates the same way, and auto-refresh should not be
-    // laxer (a broken identity would mint an unverifiable leaf chain).
-    if let Some(err) =
-        crate::cert::validate_identity_pem(&kb.private_key_pem, &kb.certificate_chain_pem)
-    {
+    // 采集是自动跑的，宁可少收一份也不能把坏材料塞进池子 —— 出证时会直接失败。
+    if let Some(why) = reject_reason(&kb.private_key_pem, &kb.certificate_chain_pem) {
         tracing::warn!(
-            "autokeybox validate failed device_id={device_id} source={} err={err}",
+            "autokeybox skip device_id={device_id} source={} reason={why}",
             src.name
         );
         return false;
@@ -760,12 +755,8 @@ fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData)
 /// Store a fetched identity under `device_id`, tagged `auto-cover:<source>` so
 /// `clear_auto_cover` can later remove exactly the rows this mode wrote.
 fn store_cover_identity(db: &Db, device_id: &str, source: &str, kb: &KeyboxData) {
-    if let Some(err) =
-        crate::cert::validate_identity_pem(&kb.private_key_pem, &kb.certificate_chain_pem)
-    {
-        tracing::warn!(
-            "autokeybox cover validate failed device_id={device_id} source={source} err={err}"
-        );
+    if let Some(why) = reject_reason(&kb.private_key_pem, &kb.certificate_chain_pem) {
+        tracing::warn!("autokeybox cover skip device_id={device_id} source={source} reason={why}");
         return;
     }
     let identity = crate::db::DeviceIdentity {
@@ -814,11 +805,58 @@ pub fn clear_auto_cover(db: &Db) -> anyhow::Result<u64> {
     Ok(n)
 }
 
+/// 拿吊销名单给池子做体检：`auto:*` / `auto-cover:*` 这些自动写进来的身份，链上
+/// 有证书被吊销的就删掉，返回清了几条。
+///
+/// 只动自动写的行 —— 手动上传的身份是人自己挑的，删不删由人决定。同一个 device_id
+/// 的 EC 和 RSA 是一份材料的两半，删的时候一起走。
+fn sweep_revoked(db: &Db) -> usize {
+    if crate::attstatus::cached().is_none() {
+        return 0; // ensure() 里已经记过日志，这里不重复刷屏
+    }
+    let rows = match db.list_device_identities_meta() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("autokeybox status sweep: 读身份列表失败: {e}");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for row in rows {
+        if !row.machine_id.starts_with("auto") {
+            continue;
+        }
+        let Some((serial, status)) = crate::attstatus::revoked_reason(&row.certificate_chain_pem)
+        else {
+            continue;
+        };
+        tracing::warn!(
+            "autokeybox status sweep: 已吊销 device_id={} algo={} machine_id={} serial={serial} status={status}",
+            row.device_id,
+            row.algorithm,
+            row.machine_id
+        );
+        if let Err(e) = db.delete_device_identity(&row.device_id) {
+            tracing::warn!("autokeybox status sweep: 删 {} 失败: {e}", row.device_id);
+            continue;
+        }
+        removed += 1;
+    }
+    removed
+}
+
 /// Refresh all configured sources once (blocking). When the auto-cover flag is
 /// on and the fetched identities are non-empty, also writes them into the
 /// server-side identity of every online B device id (`store` provides the
 /// online snapshot; pass `None` when no store is available — cover is skipped).
 pub fn refresh_all(db: &Db, store: Option<&TaskStore>) {
+    // 每轮先看一眼吊销名单，顺手给池子做个体检。被吊销的材料留在池子里只会害事
+    // （出证时对面一查就拒），清掉之后这轮采集会把缺的槽位重新填上。
+    crate::attstatus::ensure(false);
+    let removed = sweep_revoked(db);
+    if removed > 0 {
+        tracing::warn!("autokeybox status sweep: 本轮清掉 {removed} 条已吊销身份");
+    }
     let mut fetched: Vec<(String, KeyboxData)> = Vec::new();
     for src in configured_sources() {
         match std::panic::catch_unwind(|| refresh_one(&src, db)) {

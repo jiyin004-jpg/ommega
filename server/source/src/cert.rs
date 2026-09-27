@@ -563,6 +563,96 @@ pub fn validate_identity_pem(private_key_pem: &str, chain_pem: &str) -> Option<S
     }
 }
 
+/// 一条身份能不能进池子的综合判定：私钥跟链配不配对 + 链本身像不像造出来的。
+/// `None` 表示没问题，`Some(原因)` 表示这条该扔。
+///
+/// 单独拎出来是因为只查配对不够：用脚本现场生成的假 keybox（私钥、证书、链全是
+/// 自己造自己签的）本身完全自洽，配对和链结构都能过，得把「像不像造出来的」
+/// 也一起看。管理员手动上传不走这里 —— 那是人自己挑的，好坏自负。
+pub fn identity_problem(private_key_pem: &str, chain_pem: &str) -> Option<String> {
+    if let Some(why) = validate_identity_pem(private_key_pem, chain_pem) {
+        return Some(why);
+    }
+    chain_problem(chain_pem)
+}
+
+/// 链的形态：一张张得接得上（前一张的 issuer 是后一张的 subject）、根要自签、
+/// leaf 不能是自签的、根的名字里不能明写着 Mock/Test 这类词。
+fn chain_problem(chain_pem: &str) -> Option<String> {
+    let ders = match parse_chain_pem(chain_pem) {
+        Ok(d) => d,
+        Err(e) => return Some(format!("cannot parse certificate chain: {e}")),
+    };
+    if ders.is_empty() {
+        return Some("certificate chain is empty".to_string());
+    }
+    let mut certs = Vec::with_capacity(ders.len());
+    for der in &ders {
+        match x509_parser::parse_x509_certificate(der) {
+            Ok((_, c)) => certs.push(c),
+            Err(e) => return Some(format!("cannot parse certificate: {e}")),
+        }
+    }
+
+    let leaf = &certs[0];
+    if leaf.issuer() == leaf.subject() {
+        return Some("leaf certificate is self-signed".to_string());
+    }
+    for i in 1..certs.len() {
+        if certs[i - 1].issuer() != certs[i].subject() {
+            return Some(format!(
+                "chain broken between cert {} and {i}: issuer/subject mismatch",
+                i - 1
+            ));
+        }
+    }
+    let root = certs.last().expect("checked non-empty");
+    if root.issuer() != root.subject() {
+        return Some("chain root is not self-signed".to_string());
+    }
+    let name = root.subject().to_string();
+    if looks_generated(&name) {
+        return Some(format!("chain root looks generated: {name}"));
+    }
+    // 没见过的根也顺手记一笔，日志里能看出池子里的材料都挂在谁下面。
+    tracing::debug!("cert chain ok root={name} certs={}", certs.len());
+    None
+}
+
+/// 明摆着是造出来的根 —— mock keybox 生成器爱在 DN 里写这些词。
+/// 认不出来的新根不拦（免得误杀将来出现的真根），这里只挡最直白的一类。
+///
+/// 按词边界找：只要关键词前后不是字母数字就算命中。不这么卡的话，
+/// "Software At-[tes-t]-ation Root" 里的 "test" 也算上了。
+fn looks_generated(name: &str) -> bool {
+    const WORDS: [&str; 8] = [
+        "mock",
+        "fake",
+        "dummy",
+        "test",
+        "sample",
+        "example",
+        "demo",
+        "self-signed",
+    ];
+    let n = name.to_ascii_lowercase();
+    let bytes = n.as_bytes();
+    WORDS.iter().any(|w| {
+        let mut from = 0;
+        while let Some(pos) = n[from..].find(w) {
+            let start = from + pos;
+            let end = start + w.len();
+            let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+        false
+    })
+}
+
 fn sign_tbs(key: &KeyMaterial, tbs: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     match key {
         KeyMaterial::Ec(EcKey::P256(sk)) => {
@@ -2005,6 +2095,105 @@ mod bench {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    // -----------------------------------------------------------------
+    // 质量门（identity_problem / chain_problem）的测试素材：几张现造的证书，
+    // 全部活到 2026-10-27。前两张是一对由 mock 根签出来的链，模拟那些用生成器
+    // 造的假 keybox；后两张是一对正常名字的链，用来盯住别误杀。
+    // -----------------------------------------------------------------
+    const MOCK_LEAF: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBeTCCASCgAwIBAgIUSpDL26Ki52Vxq8qFqXKo3x8EhsYwCgYIKoZIzj0EAwIw
+IjEgMB4GA1UEAwwXTW9jayBHb29nbGUgUktQIFJvb3QgQ0EwHhcNMjYwOTI3MDc1
+NTU5WhcNMjYxMDI3MDc1NTU5WjAUMRIwEAYDVQQDDAlTb21lIExlYWYwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAAS3ZWEzPEABwrjmZ5FPPTuu+Kw0zaNJOlVyddc2
+73YcMCkDkTcvWv/FDzV46e9eDvGz1l7BS/0a+tXofU+3evako0IwQDAdBgNVHQ4E
+FgQUme61vWNGnde4DVVagDatpVlr14wwHwYDVR0jBBgwFoAUy+6SITyc9nvVVfhN
+l9zZzoXm0iMwCgYIKoZIzj0EAwIDRwAwRAIgGmzwmEetbbSSendaqmDZtsQS2wDW
+GWshmOcc9bsptRcCIBDlmhoyEHaXaOUNZuAtFB9wxCcUF8DHj9IxyNc1I4oh
+-----END CERTIFICATE-----
+";
+
+    const MOCK_ROOT: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBmTCCAT+gAwIBAgIUZQa+hEaeyuuNj2FbYrpF91XNXxMwCgYIKoZIzj0EAwIw
+IjEgMB4GA1UEAwwXTW9jayBHb29nbGUgUktQIFJvb3QgQ0EwHhcNMjYwOTI3MDc1
+NTQzWhcNMjYxMDI3MDc1NTQzWjAiMSAwHgYDVQQDDBdNb2NrIEdvb2dsZSBSS1Ag
+Um9vdCBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABL89e/200R2c6Qh7TTLa
+PabY+d6oD5wVfqyIZFEj9Ea50IlIa3G0hnQ8OAjBARGJu2/ddMjfClNjRFikwB3g
+7/qjUzBRMB0GA1UdDgQWBBTL7pIhPJz2e9VV+E2X3NnOhebSIzAfBgNVHSMEGDAW
+gBTL7pIhPJz2e9VV+E2X3NnOhebSIzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49
+BAMCA0gAMEUCIB1wlGwRGQqlaKMcqUIfNqgqdIvwHJ5cA5w3hHpumTOTAiEAhET7
+XTgfZLLE7wk49kiQmpy+dwnYWJu4aa6wwuw3zIY=
+-----END CERTIFICATE-----
+";
+
+    const OTHER_ROOT: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBiDCCAS+gAwIBAgIUd/WGrNM9LaOBsCqm4vbK4hAiRTUwCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPU29tZSBPdGhlciBSb290MB4XDTI2MDkyNzA3NTU0M1oXDTI2
+MTAyNzA3NTU0M1owGjEYMBYGA1UEAwwPU29tZSBPdGhlciBSb290MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEiWvqMucZ9L7pBR4UkczJqa6TJqiUi0TOiXb6bEEM
+gqFJ9050t704JIvbM2A+KGzJQ+tt9N2hA5TMbGQjxKe0P6NTMFEwHQYDVR0OBBYE
+FP0QMG8A8jbAFxFDdbBUt9J/BHAtMB8GA1UdIwQYMBaAFP0QMG8A8jbAFxFDdbBU
+t9J/BHAtMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgXWq11ESr
+QD4bA1A0YgIR5md/ZvO00/z76DjQpCuckt4CIDXkBTz6/wcVMNF9+g9B5qzMd2Ty
+131k10aaeBuQs6fJ
+-----END CERTIFICATE-----
+";
+
+    const OTHER_LEAF: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBczCCARigAwIBAgIUQFe9X6RudWeHoZr0WXcHVIzIOwYwCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPU29tZSBPdGhlciBSb290MB4XDTI2MDkyNzA3NTU1OVoXDTI2
+MTAyNzA3NTU1OVowFDESMBAGA1UEAwwJU29tZSBMZWFmMFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEzFVQ/tzF8wYADOVD03U5V/zKgD0f9sCqKLqZX73j3lRR+Uyb
+0iiVgEkBYS6TvyeZ25165GSSIIsu85bEf04s/6NCMEAwHQYDVR0OBBYEFGXs1h92
+p4q69SgZlxx7dHhu4FSvMB8GA1UdIwQYMBaAFP0QMG8A8jbAFxFDdbBUt9J/BHAt
+MAoGCCqGSM49BAMCA0kAMEYCIQDBuNvC8IEJHP5qDlc7M5ORquVhfTIX2l9xDoIU
+Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn generated_roots_are_caught() {
+        assert!(looks_generated("CN=Mock Google RKP Root CA"));
+        assert!(looks_generated("CN=RKP Test Root"));
+        assert!(looks_generated("CN=example root"));
+        // 真硬件的根名字里只有序列号，别把这种也当成造出来的
+        assert!(!looks_generated("serialNumber=f92009e853b6b045"));
+        // "attestation" 里字面上含 "test"，不能这么认亲
+        assert!(!looks_generated(
+            "CN=Android Keystore Software Attestation Root"
+        ));
+        assert!(!looks_generated("CN=Google RKP Root CA, O=Google"));
+    }
+
+    /// mock 生成器的链结构是自洽的（差在名字上），这条门就是为它加的。
+    #[test]
+    fn generated_chain_is_rejected() {
+        let why = chain_problem(&format!("{MOCK_LEAF}{MOCK_ROOT}")).unwrap();
+        assert!(why.contains("looks generated"), "{why}");
+    }
+
+    /// leaf 是这条根签的，却配了另一条根 —— 拼出来的链要接得住。
+    #[test]
+    fn broken_chain_is_rejected() {
+        let why = chain_problem(&format!("{MOCK_LEAF}{OTHER_ROOT}")).unwrap();
+        assert!(why.contains("chain broken"), "{why}");
+    }
+
+    /// 单张自签证书（leaf 自己就是根）不是 keybox 里的东西。
+    #[test]
+    fn self_signed_leaf_is_rejected() {
+        let why = chain_problem(OTHER_ROOT).unwrap();
+        assert!(why.contains("self-signed"), "{why}");
+    }
+
+    #[test]
+    fn ordinary_chain_passes() {
+        assert!(chain_problem(&format!("{OTHER_LEAF}{OTHER_ROOT}")).is_none());
+    }
 
     // AOSP's claim numbers, spelled out again here because the reader keeps
     // its own copies private.

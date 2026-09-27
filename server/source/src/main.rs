@@ -11,6 +11,7 @@
 //! Auth: `X-Relay-Token` header must match RELAY_TOKEN.
 
 mod admin;
+mod attstatus;
 mod auth;
 mod autokeybox;
 mod card;
@@ -21,6 +22,7 @@ mod db;
 mod fulfill;
 mod geo;
 mod handlers;
+mod http;
 mod keybox;
 mod pay;
 mod queue;
@@ -128,6 +130,16 @@ fn build_router(cfg: &Arc<Config>) -> Router {
             );
         }
     }
+
+    // 吊销名单：采集那轮也会看一眼，可那个循环是能关的，而出证接口一直要查，
+    // 所以另起一个常驻线程每小时自己对一次表（`ensure` 里有 TTL，够新就不联网）。
+    std::thread::Builder::new()
+        .name("attstatus".to_string())
+        .spawn(|| loop {
+            crate::attstatus::ensure(false);
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        })
+        .ok();
 
     let state = handlers::AppState {
         cfg: cfg.clone(),

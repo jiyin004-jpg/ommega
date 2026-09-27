@@ -1285,6 +1285,19 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
                         );
                         continue;
                     }
+                    // 发出去之前再看一眼吊销名单：万一这份是名单更新之前采进来的，
+                    // 发过去就是让对面白跑一次，顺手把这行删了等下一轮采集重填。
+                    if let Some((serial, status)) =
+                        crate::attstatus::revoked_reason(&id.certificate_chain_pem)
+                    {
+                        tracing::warn!(
+                            "public_keybox device_id={device_id} 已吊销（serial={serial} {status}），删掉换下一个"
+                        );
+                        if let Err(e) = db.delete_device_identity(device_id) {
+                            tracing::warn!("public_keybox 删 {device_id} 失败: {e}");
+                        }
+                        continue;
+                    }
                     picked = Some((device_id.clone(), id));
                     break 'scan;
                 }
@@ -1296,7 +1309,17 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
         }
     }
     let Some((device_id, id)) = picked else {
-        return json_err(StatusCode::NOT_FOUND, "no public keybox collected yet");
+        // 池子里一个能用的都没有：要么还没采到，要么采到的全进了吊销名单。
+        // 这里特意回「404 + 空 body」而不是 JSON 错误体 —— A 端拿 curl 取完只判断
+        // 「有没有输出」，输出为空它就弹自己那句「未找到有效密钥箱」；回 JSON 的话
+        // 对面 atob 会抛异常，弹出来的是「设置失败」，看着像服务端坏了。
+        tracing::warn!("public_keybox 池子里没有可用身份（未采到或全被吊销），回 404 空 body");
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain; charset=utf-8")],
+            "",
+        )
+            .into_response();
     };
     let xml = crate::keybox::build_keybox_xml(
         &device_id,

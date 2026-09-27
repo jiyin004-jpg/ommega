@@ -1,5 +1,6 @@
 //! relay_rs library crate (modules shared with the binary).
 
+pub mod attstatus;
 pub mod auth;
 pub mod autokeybox;
 pub mod card;
@@ -10,6 +11,7 @@ pub mod db;
 pub mod fulfill;
 pub mod geo;
 pub mod handlers;
+pub mod http;
 pub mod keybox;
 pub mod pay;
 pub mod queue;
