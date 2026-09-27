@@ -38,12 +38,13 @@ allow { system_app platform_app priv_app } keystore unix_stream_socket { connect
 
 # 宿主自己要落日志：payload 只走文件、不走 logcat，它得进得去那个目录。
 # 实测系统只放行了 file 的 read（读 log_flag 够了），目录本身的 open/read 和建文件
-# 全被拒，所以 dir 那一侧得补齐。
-allow { system_app platform_app priv_app } system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow { system_app platform_app priv_app } system_data_file file { open read write create append getattr setattr }
+# 全被拒，所以 dir 那一侧得补齐。unlink 和 dir 的 setattr 是后补的：日志涨到轮转阈值
+# 要删旧件、改目录时间戳，少这两个词就吃一串 avc。
+allow { system_app platform_app priv_app } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { system_app platform_app priv_app } system_data_file file { open read write create append getattr setattr unlink }
 # 日志目录另外会被 daemon 打成 system_app_data_file，这个标签也得放行。
-allow { system_app platform_app priv_app } system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow { system_app platform_app priv_app } system_app_data_file file { open read write create append getattr setattr }
+allow { system_app platform_app priv_app } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { system_app platform_app priv_app } system_app_data_file file { open read write create append getattr setattr unlink }
 
 allow crash_dump keystore process *
 
@@ -56,10 +57,13 @@ allow { hal_soter hal_soter_default hal_soter_qti } system_file unix_dgram_socke
 allow { system_file ksu magisk su } { hal_soter hal_soter_default hal_soter_qti } unix_dgram_socket sendto
 allow { hal_soter hal_soter_default hal_soter_qti } system_file file { execute getattr map read receive }
 allow { hal_soter hal_soter_default hal_soter_qti } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow { hal_soter hal_soter_default hal_soter_qti } system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow { hal_soter hal_soter_default hal_soter_qti } system_data_file file { open read write create append getattr setattr }
-allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file file { open read write create append getattr setattr }
+allow { hal_soter hal_soter_default hal_soter_qti } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { hal_soter hal_soter_default hal_soter_qti } system_data_file file { open read write create append getattr setattr unlink }
+allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file file { open read write create append getattr setattr unlink }
+# payload 是从一个 memfd 里 dlopen 起来的，memfd 落在 tmpfs 上、标签就是 tmpfs，它要
+# 往那个镜像里写。实测缺这条会吃 `tmpfs:file write` 拒绝。
+allow { hal_soter hal_soter_default hal_soter_qti } tmpfs file { write }
 
 # H2 = vendor_hal_soter_qti（一加 13 / ColorOS 16 实测就是这个）、hal_soter_trustonic
 #      （一加 PLC110 / 联发科 Trustonic）、hal_soter_service（联发科那套里另一个名字）
@@ -67,10 +71,12 @@ allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_file
 allow { system_file ksu magisk su } { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } unix_dgram_socket sendto
 allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_file file { execute getattr map read receive }
 allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file file { open read write create append getattr setattr }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file file { open read write create append getattr setattr }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file file { open read write create append getattr setattr unlink }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file file { open read write create append getattr setattr unlink }
+# 同上：memfd 镜像的写入。这个域（一加 13 / 努比亚 Z60 Ultra 实测）就是它卡的。
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs file { write }
 
 allow keystore default_android_service service_manager find
 allow shell default_android_service service_manager find
