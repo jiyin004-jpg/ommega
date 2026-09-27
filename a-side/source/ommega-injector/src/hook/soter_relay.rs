@@ -109,6 +109,8 @@ mod tests {
         SoterCall {
             hal: true,
             hidl: false,
+            // 这些测试只看请求怎么拼，跟回包那一格无关，随手取高通那套。
+            has_return_code: true,
             code,
             op: "test",
             uid,

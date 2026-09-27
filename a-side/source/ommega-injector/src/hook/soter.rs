@@ -81,9 +81,15 @@ pub(crate) const APP_DESCRIPTOR: &str = "com.tencent.soter.soterserver.ISoterSer
 
 /// 描述符是哪一边的。
 ///
-/// HIDL 单独一档是因为答复的布局还没拿真实流量对照过：参数布局跟 AIDL 那套很像
-/// （都是 u32 长度 + 字节），但没验过，所以先只认、只记，不拦 —— 拦下去发一份形状不对
-/// 的答复，宿主那边就是一片乱码。
+/// HIDL 单独一档是因为答复的布局还没拿真实流量对照过。这是从 AOSP / libhidl 与宿主 dex 里
+/// 抠出来的硬事实，下回接着做照这个来，别再从猜的地方起步：
+///
+/// - 事务号不是什么 hash，就是 `.hal` 里的声明顺序 1..14（宿主 dex 里是 `transact(4, ...)`
+///   这种字面量）。但**映射跟 AIDL 不是一套**：HIDL 的 4 = AIDL 的 8（getDeviceId）。
+/// - 回包开头是一个 `Status`（一个 i32，0 即成功；非 0 时后面还跟一条 String16 的 message）。
+/// - 请求与回包里的 string / vector 走的是 binder 的 buffer 对象（偏移表里一项 + 数据在
+///   parcel 尾部），跟 AIDL 那种内联的「长度 + 字节」完全不是一回事 —— 这也是当初
+///   「认得出但答不了」的真正原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     Hal,
@@ -105,6 +111,9 @@ pub(crate) struct SoterCall {
     pub(crate) hal: bool,
     /// 走的是 HIDL（`@1.0::` 那种描述符）。只影响拦截：HIDL 现在只观察。
     pub(crate) hidl: bool,
+    /// 回包里有没有「方法返回值」那一格。高通那套签名是 `int xxx(...)`、联发科是 `void`，
+    /// 这一格有没有决定了错误码放哪、答复总长怎么算（见 `parcel::reply` 里那两个构造器）。
+    pub(crate) has_return_code: bool,
     pub(crate) code: u32,
     pub(crate) op: &'static str,
     pub(crate) uid: Option<i32>,
@@ -258,7 +267,10 @@ impl<'a> Cursor<'a> {
 /// 结尾那个 0 是**单另一个 u32**；而老的 String16 写法把结尾 0 算进 `len` 里。
 /// 两种都试，谁的 UTF-16 解出来正好等于我们认的串就用谁。
 /// 别省这一步：少了 12 字节那个前缀，App 侧的 SOTER 流量一条都认不出来。
-fn match_descriptor(data: &[u8]) -> Option<(Side, usize)> {
+///
+/// 第二个返回值是「这个接口的方法带不带 int 返回值」，跟着描述符一起定：
+/// 高通那两条（AIDL 与 HIDL）都是 `int`，联发科那两条都是 `void`。
+fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
     for prefix in [0usize, 4, 8, 12] {
         let variants: &[bool] = if prefix == 12 {
             &[true, false]
@@ -276,14 +288,20 @@ fn match_descriptor(data: &[u8]) -> Option<(Side, usize)> {
                 }
                 next += 4;
             }
-            if text == HAL_DESCRIPTOR || text == TRUSTONIC_DESCRIPTOR {
-                return Some((Side::Hal, next));
+            if text == HAL_DESCRIPTOR {
+                return Some((Side::Hal, true, next));
             }
-            if text == QTI_HIDL_DESCRIPTOR || text == TRUSTONIC_HIDL_DESCRIPTOR {
-                return Some((Side::HalHidl, next));
+            if text == TRUSTONIC_DESCRIPTOR {
+                return Some((Side::Hal, false, next));
+            }
+            if text == QTI_HIDL_DESCRIPTOR {
+                return Some((Side::HalHidl, true, next));
+            }
+            if text == TRUSTONIC_HIDL_DESCRIPTOR {
+                return Some((Side::HalHidl, false, next));
             }
             if text == APP_DESCRIPTOR {
-                return Some((Side::App, next));
+                return Some((Side::App, false, next));
             }
         }
     }
@@ -323,7 +341,7 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
 
 /// 解析一条 transaction 的 data。认不出来就返回 `None`（正常流量都归这一类）。
 pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
-    let (side, args_at) = match_descriptor(data)?;
+    let (side, has_return_code, args_at) = match_descriptor(data)?;
     let hal = side.is_hal();
     let (op, shape) = describe(hal, code)?;
     let mut cursor = Cursor::new(data, args_at);
@@ -350,6 +368,7 @@ pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
     Some(SoterCall {
         hal,
         hidl: side == Side::HalHidl,
+        has_return_code,
         code,
         op,
         uid,
@@ -444,8 +463,12 @@ pub(crate) fn interceptable(call: &SoterCall) -> bool {
 pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> {
     let reply = match crate::hook::soter_relay::answer(call)? {
         Answer::Code(code) => build_plain_reply(&code).ok()?,
-        Answer::Buffer { code, data } => build_soter_buffer_reply(code, data.as_deref()).ok()?,
-        Answer::Init { status, session } => build_soter_init_reply(status, session).ok()?,
+        Answer::Buffer { code, data } => {
+            build_soter_buffer_reply(code, data.as_deref(), call.has_return_code).ok()?
+        }
+        Answer::Init { status, session } => {
+            build_soter_init_reply(status, session, call.has_return_code).ok()?
+        }
     };
     let bytes = encode_br_reply(&reply);
     Some((bytes, reply))

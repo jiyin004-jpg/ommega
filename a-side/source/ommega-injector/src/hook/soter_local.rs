@@ -615,6 +615,8 @@ mod tests {
         soter::SoterCall {
             hal: true,
             hidl: false,
+            // 这里只比回答内容的型号，回包形状用不上，取高通那套。
+            has_return_code: true,
             code,
             op: "test",
             uid,

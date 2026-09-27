@@ -345,45 +345,82 @@ pub fn build_plain_reply<T: Serialize>(value: &T) -> Result<OwnedReply> {
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
-/// HAL 那边 `int xxx(..., out SoterBufferReturn)` 的回复。
+/// HAL 那边 `void/int xxx(..., out SoterBufferReturn)` 的回复。
 ///
-/// 形状 `[Status][i32 返回值][i32 非空标记][SoterBufferReturn]` —— 那个标记是 AIDL
-/// 给 out parcelable 留的，Java 侧就是 `if (readInt() != 0)`；不管成不成功都得写
-/// 一个 int，少写后面整体错位，宿主解出来的就是垃圾。
-pub fn build_soter_buffer_reply(return_code: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
+/// 两家 HAL 的形状差一格，规格就是宿主 dex 里各自的代理类（联发科 `d/a`、高通 `b/a`）：
+///
+/// ```text
+/// 联发科 [Status][非空标记][总长][错误码][byte[]][dataLength]   总长 = 16 + pad4
+/// 高通   [Status][返回值][非空标记][总长][byte[]][dataLength]   总长 = 12 + pad4
+/// ```
+///
+/// 高通的错误码就在方法返回值里、parcelable 里没有那一格；联发科反过来，方法不带返回值。
+/// 两家的字节数还常常一模一样（4+4+4+…），写错了宿主不会报错，只是把垃圾当数据收下 ——
+/// 所以千万别按长度对齐来猜是哪家。
+///
+/// `data = None` 是「这次没数据但有错误码」：真 HAL 这时给的是**非空**的 parcelable
+/// （`[标记=1][总长][错误码][长度=0][长度=0]`），不是 null，别写成 0 标记那一支。
+pub fn build_soter_buffer_reply(
+    code: i32,
+    data: Option<&[u8]>,
+    has_return_code: bool,
+) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
-    parcel.write(&return_code)?;
-    match data {
-        Some(bytes) => {
-            parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
-            write_soter_buffer_return(&mut parcel, bytes)?;
-        }
-        None => {
-            parcel.write(&0i32)?;
-        }
+    if has_return_code {
+        parcel.write(&code)?;
+    }
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+    write_soter_buffer_return(&mut parcel, data.unwrap_or(&[]), code, has_return_code)?;
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
+/// `SoterInitReturn initSign(...)` 的回复，同样按家分两种。
+///
+/// ```text
+/// 联发科 [Status][非空标记][总长=16][错误码][session]
+/// 高通   [Status][返回值][非空标记][总长=16][session][错误码]
+/// ```
+///
+/// 那个 parcelable 自己一段固定 16 字节：先 4 的总长，再错误码和 8 的 session；
+/// 两家就是后两个字段前后对调。
+pub fn build_soter_init_reply(
+    code: i32,
+    session: i64,
+    has_return_code: bool,
+) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok))?;
+    if has_return_code {
+        parcel.write(&code)?;
+    }
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+    parcel.write(&16i32)?;
+    if has_return_code {
+        parcel.write(&session)?;
+        parcel.write(&code)?;
+    } else {
+        parcel.write(&code)?;
+        parcel.write(&session)?;
     }
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
-/// `SoterInitReturn initSign(...)` 的回复：`[Status][i32 非空标记][SoterInitReturn]`。
-pub fn build_soter_init_reply(status: i32, session: i64) -> Result<OwnedReply> {
-    let mut parcel = Parcel::new();
-    parcel.write(&Status::from(StatusCode::Ok))?;
-    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
-    // SoterInitReturn 自己那段：4 字节总长 + status + session，总共 16
-    parcel.write(&16i32)?;
-    parcel.write(&status)?;
-    parcel.write(&session)?;
-    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
-}
-
-/// `SoterBufferReturn` 的编码：`[i32 本段长度][byte[] data][i32 dataLength]`。
-/// 长度含它自己那 4 字节；byte[] 是 AIDL 的写法（4 字节长度 + 数据 + 补到 4 字节）。
-fn write_soter_buffer_return(parcel: &mut Parcel, data: &[u8]) -> Result<()> {
+/// `SoterBufferReturn` 自己那段：`[总长][(错误码)][byte[]][dataLength]`。
+/// 总长从它自己那 4 字节算起，一路盖到最后的 dataLength：联发科把错误码也圈进来
+/// （16 = 4+4+4+4，再加补到 4 的数据），高通没有错误码那一格（12 = 4+4+4）。
+fn write_soter_buffer_return(
+    parcel: &mut Parcel,
+    data: &[u8],
+    code: i32,
+    has_return_code: bool,
+) -> Result<()> {
     let padded = (data.len() + 3) & !3;
-    let total = 4 + 4 + padded + 4;
-    parcel.write(&(total as i32))?;
+    let header = if has_return_code { 12 } else { 16 };
+    parcel.write(&((header + padded) as i32))?;
+    if !has_return_code {
+        parcel.write(&code)?;
+    }
     parcel.write(&data.to_vec())?;
     parcel.write(&(data.len() as i32))?;
     Ok(())

@@ -144,15 +144,35 @@ fn le_i32(bytes: &[u8], at: usize) -> i32 {
 }
 
 #[test]
-fn soter_buffer_reply_has_the_exact_wire_shape() {
-    let mut reply = build_soter_buffer_reply(0, Some(&[0xde, 0xad, 0xbe, 0xef])).unwrap();
+fn qti_soter_buffer_reply_has_the_exact_wire_shape() {
+    let mut reply = build_soter_buffer_reply(0, Some(&[0xde, 0xad, 0xbe, 0xef]), true).unwrap();
     let bytes = soter_bytes(&mut reply);
-    // Status(4) + 返回值(4) + 非空标记(4) + [总长(4) + byte[](8) + dataLength(4)]
+    // Status(4) + 方法返回值(4) + 非空标记(4) + [总长(4) + byte[](8) + dataLength(4)]
     assert_eq!(bytes.len(), 28, "got {bytes:02x?}");
     assert_eq!(le_i32(&bytes, 0), 0, "binder status");
-    assert_eq!(le_i32(&bytes, 4), 0, "返回值");
+    assert_eq!(le_i32(&bytes, 4), 0, "方法返回值");
     assert_eq!(le_i32(&bytes, 8), 1, "非空标记");
-    assert_eq!(le_i32(&bytes, 12), 16, "SoterBufferReturn 自己的总长");
+    assert_eq!(
+        le_i32(&bytes, 12),
+        16,
+        "SoterBufferReturn 自己的总长：12 + pad4(4)"
+    );
+    assert_eq!(le_i32(&bytes, 16), 4, "byte[] 长度");
+    assert_eq!(&bytes[20..24], &[0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(le_i32(&bytes, 24), 4, "dataLength");
+}
+
+#[test]
+fn trustonic_soter_buffer_reply_has_the_exact_wire_shape() {
+    let mut reply = build_soter_buffer_reply(0, Some(&[0xde, 0xad, 0xbe, 0xef]), false).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    // Status(4) + 非空标记(4) + [总长(4) + 错误码(4) + byte[](8) + dataLength(4)]
+    // 注意总长度、字节数和高通那份一模一样，全靠字段位置区分。
+    assert_eq!(bytes.len(), 28, "got {bytes:02x?}");
+    assert_eq!(le_i32(&bytes, 0), 0, "binder status");
+    assert_eq!(le_i32(&bytes, 4), 1, "非空标记就在返回值那一格");
+    assert_eq!(le_i32(&bytes, 8), 20, "总长：16 + pad4(4)");
+    assert_eq!(le_i32(&bytes, 12), 0, "错误码在 parcelable 里");
     assert_eq!(le_i32(&bytes, 16), 4, "byte[] 长度");
     assert_eq!(&bytes[20..24], &[0xde, 0xad, 0xbe, 0xef]);
     assert_eq!(le_i32(&bytes, 24), 4, "dataLength");
@@ -160,33 +180,38 @@ fn soter_buffer_reply_has_the_exact_wire_shape() {
 
 #[test]
 fn soter_buffer_return_pads_short_data_to_four() {
-    let mut reply = build_soter_buffer_reply(0, Some(&[1, 2, 3])).unwrap();
+    let mut reply = build_soter_buffer_reply(0, Some(&[1, 2, 3]), false).unwrap();
     let bytes = soter_bytes(&mut reply);
-    // 数据补到 4 字节，所以总长还是 16，但两个长度字段都是真实的 3
-    assert_eq!(le_i32(&bytes, 12), 16);
+    // 数据补到 4 字节，所以总长还是 16 + 4，但两个长度字段都是真实的 3
+    assert_eq!(le_i32(&bytes, 8), 20);
     assert_eq!(le_i32(&bytes, 16), 3);
     assert_eq!(&bytes[20..23], &[1, 2, 3]);
     assert_eq!(le_i32(&bytes, 24), 3, "dataLength 是真实长度，不是补完的");
 }
 
 #[test]
-fn soter_buffer_reply_marks_an_empty_out_as_null() {
-    let mut reply = build_soter_buffer_reply(-5, None).unwrap();
+fn a_missing_payload_still_comes_back_as_a_present_parcelable() {
+    // 真 HAL 在「没数据但有错误码」时给的是非空 parcelable（长度那两格是 0），
+    // 不是 null 标记 —— 写成 0 标记的话宿主直接当没答过。
+    let mut reply = build_soter_buffer_reply(-5, None, false).unwrap();
     let bytes = soter_bytes(&mut reply);
-    assert_eq!(bytes.len(), 12, "只有 status + 返回值 + 标记");
-    assert_eq!(le_i32(&bytes, 4), -5);
-    assert_eq!(le_i32(&bytes, 8), 0, "空的 out 写 0，那个 int 不能省");
+    assert_eq!(bytes.len(), 24, "got {bytes:02x?}");
+    assert_eq!(le_i32(&bytes, 4), 1, "非空标记");
+    assert_eq!(le_i32(&bytes, 8), 16, "总长还是 16");
+    assert_eq!(le_i32(&bytes, 12), -5, "错误码");
+    assert_eq!(le_i32(&bytes, 16), 0, "空数据的 byte[] 长度");
+    assert_eq!(le_i32(&bytes, 20), 0, "dataLength");
 }
 
 #[test]
-fn soter_init_reply_carries_status_then_session() {
-    let mut reply = build_soter_init_reply(-5, 0x1122334455667788).unwrap();
+fn trustonic_soter_init_reply_carries_error_code_then_session() {
+    let mut reply = build_soter_init_reply(-5, 0x1122334455667788, false).unwrap();
     let bytes = soter_bytes(&mut reply);
     assert_eq!(bytes.len(), 24, "got {bytes:02x?}");
     assert_eq!(le_i32(&bytes, 0), 0, "binder status");
     assert_eq!(le_i32(&bytes, 4), 1, "非空标记");
     assert_eq!(le_i32(&bytes, 8), 16, "SoterInitReturn 自己的总长");
-    assert_eq!(le_i32(&bytes, 12), -5, "status 在前");
+    assert_eq!(le_i32(&bytes, 12), -5, "错误码在前");
     assert_eq!(
         i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
         0x1122334455667788,
@@ -195,12 +220,29 @@ fn soter_init_reply_carries_status_then_session() {
 }
 
 #[test]
-fn a_soter_buffer_reply_reads_back_the_way_the_host_reads_it() {
+fn qti_soter_init_reply_carries_session_then_error_code() {
+    let mut reply = build_soter_init_reply(-5, 0x1122334455667788, true).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    assert_eq!(bytes.len(), 28, "got {bytes:02x?}");
+    assert_eq!(le_i32(&bytes, 0), 0, "binder status");
+    assert_eq!(le_i32(&bytes, 4), -5, "方法返回值就是错误码");
+    assert_eq!(le_i32(&bytes, 8), 1, "非空标记");
+    assert_eq!(le_i32(&bytes, 12), 16, "总长一样是 16");
+    assert_eq!(
+        i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        0x1122334455667788,
+        "session 在前"
+    );
+    assert_eq!(le_i32(&bytes, 24), -5, "parcelable 里再带一份错误码");
+}
+
+#[test]
+fn a_qti_soter_buffer_reply_reads_back_the_way_the_host_reads_it() {
     let payload = vec![7u8; 200];
-    let mut reply = build_soter_buffer_reply(0, Some(&payload)).unwrap();
+    let mut reply = build_soter_buffer_reply(0, Some(&payload), true).unwrap();
     let (data, data_size, offsets, offsets_size) = raw_parts(&mut reply);
     let mut parcel = unsafe { parcel_from_ipc_parts(data, data_size, offsets, offsets_size) };
-    // 宿主 Proxy 的顺序：readException() → readInt() → if (readInt() != 0) → readFromParcel()
+    // 高通宿主代理（SoterService 里的 `b/a`）：readException() → readInt() → readInt() != 0
     read_ok_status(&mut parcel).unwrap();
     let return_code: i32 = parcel.read().unwrap();
     assert_eq!(return_code, 0);
@@ -213,5 +255,22 @@ fn a_soter_buffer_reply_reads_back_the_way_the_host_reads_it() {
         parcel.data_avail(),
         4 + 4 + ((payload.len() + 3) & !3) + 4,
         "总长 + array 长 + 数据(补到 4) + dataLength"
+    );
+}
+
+#[test]
+fn a_trustonic_soter_buffer_reply_reads_back_the_way_the_host_reads_it() {
+    let payload = vec![7u8; 200];
+    let mut reply = build_soter_buffer_reply(0, Some(&payload), false).unwrap();
+    let (data, data_size, offsets, offsets_size) = raw_parts(&mut reply);
+    let mut parcel = unsafe { parcel_from_ipc_parts(data, data_size, offsets, offsets_size) };
+    // 联发科宿主代理（`d/a`）：readException() → if (readInt() != 0) —— 没有方法返回值那一格
+    read_ok_status(&mut parcel).unwrap();
+    let non_null: i32 = parcel.read().unwrap();
+    assert_eq!(non_null, 1, "第一个 int 就得是非空标记");
+    assert_eq!(
+        parcel.data_avail(),
+        4 + 4 + 4 + ((payload.len() + 3) & !3) + 4,
+        "总长 + 错误码 + array 长 + 数据(补到 4) + dataLength"
     );
 }
