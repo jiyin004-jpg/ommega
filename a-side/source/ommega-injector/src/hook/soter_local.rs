@@ -614,6 +614,7 @@ mod tests {
     fn call(code: u32, uid: Option<i32>, alias: Option<&str>) -> soter::SoterCall {
         soter::SoterCall {
             hal: true,
+            hidl: false,
             code,
             op: "test",
             uid,

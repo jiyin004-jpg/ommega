@@ -65,14 +65,46 @@ use crate::parcel::{
 
 /// 高通 HAL 的接口描述符（SoterService 发出去的那条）。
 pub(crate) const HAL_DESCRIPTOR: &str = "vendor.qti.hardware.soter.ISoter";
+/// Trustonic 那套 AIDL 的描述符。联发科机型上没有高通那个 HAL，宿主发出去的是这条
+/// （实测一加 PLC110：`vendor.trustonic.hardware.soter.ITrustonicSoter/default`，vintf 里声明成
+/// aidl）。方法号与高通那份同序同名，1..14 一张表就能盖住，所以解析那半段完全复用；
+/// 差别只在 2 / 6 / 14 这三个 provisioning 方法：联发科上是真实现，高通那边是空号。
+pub(crate) const TRUSTONIC_DESCRIPTOR: &str = "vendor.trustonic.hardware.soter.ITrustonicSoter";
+/// HIDL 那一版的描述符。名字里带版本号（`@1.0::`），跟 AIDL 那两条完全不是一回事：
+/// 宿主 dex 里两种代理类都在（`...@1.0::ISoter@Proxy` / `...@1.0::ITrustonicSoter@Proxy`），
+/// 哪条路通得看系统里装的是哪种实现，所以两条都得认。
+pub(crate) const QTI_HIDL_DESCRIPTOR: &str = "vendor.qti.hardware.soter@1.0::ISoter";
+pub(crate) const TRUSTONIC_HIDL_DESCRIPTOR: &str =
+    "vendor.trustonic.hardware.soter@1.0::ITrustonicSoter";
 /// App 面向的接口描述符（App 发给 SoterService 的那条，走的是入站 transaction）。
 pub(crate) const APP_DESCRIPTOR: &str = "com.tencent.soter.soterserver.ISoterService";
+
+/// 描述符是哪一边的。
+///
+/// HIDL 单独一档是因为答复的布局还没拿真实流量对照过：参数布局跟 AIDL 那套很像
+/// （都是 u32 长度 + 字节），但没验过，所以先只认、只记，不拦 —— 拦下去发一份形状不对
+/// 的答复，宿主那边就是一片乱码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Side {
+    Hal,
+    HalHidl,
+    App,
+}
+
+impl Side {
+    /// 是不是宿主发往 HAL 的那条路（HIDL 也算，只是暂时不拦）。
+    pub(crate) fn is_hal(self) -> bool {
+        matches!(self, Side::Hal | Side::HalHidl)
+    }
+}
 
 /// 一条被认出来的 SOTER 请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SoterCall {
     /// 描述符是哪一边的：`true` = HAL（宿主发出去），`false` = App 面向。
     pub(crate) hal: bool,
+    /// 走的是 HIDL（`@1.0::` 那种描述符）。只影响拦截：HIDL 现在只观察。
+    pub(crate) hidl: bool,
     pub(crate) code: u32,
     pub(crate) op: &'static str,
     pub(crate) uid: Option<i32>,
@@ -226,7 +258,7 @@ impl<'a> Cursor<'a> {
 /// 结尾那个 0 是**单另一个 u32**；而老的 String16 写法把结尾 0 算进 `len` 里。
 /// 两种都试，谁的 UTF-16 解出来正好等于我们认的串就用谁。
 /// 别省这一步：少了 12 字节那个前缀，App 侧的 SOTER 流量一条都认不出来。
-fn match_descriptor(data: &[u8]) -> Option<(bool, usize)> {
+fn match_descriptor(data: &[u8]) -> Option<(Side, usize)> {
     for prefix in [0usize, 4, 8, 12] {
         let variants: &[bool] = if prefix == 12 {
             &[true, false]
@@ -244,11 +276,14 @@ fn match_descriptor(data: &[u8]) -> Option<(bool, usize)> {
                 }
                 next += 4;
             }
-            if text == HAL_DESCRIPTOR {
-                return Some((true, next));
+            if text == HAL_DESCRIPTOR || text == TRUSTONIC_DESCRIPTOR {
+                return Some((Side::Hal, next));
+            }
+            if text == QTI_HIDL_DESCRIPTOR || text == TRUSTONIC_HIDL_DESCRIPTOR {
+                return Some((Side::HalHidl, next));
             }
             if text == APP_DESCRIPTOR {
-                return Some((false, next));
+                return Some((Side::App, next));
             }
         }
     }
@@ -288,7 +323,8 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
 
 /// 解析一条 transaction 的 data。认不出来就返回 `None`（正常流量都归这一类）。
 pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
-    let (hal, args_at) = match_descriptor(data)?;
+    let (side, args_at) = match_descriptor(data)?;
+    let hal = side.is_hal();
     let (op, shape) = describe(hal, code)?;
     let mut cursor = Cursor::new(data, args_at);
     let (uid, alias, challenge, session, key) = match shape {
@@ -313,6 +349,7 @@ pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
     };
     Some(SoterCall {
         hal,
+        hidl: side == Side::HalHidl,
         code,
         op,
         uid,
@@ -347,7 +384,13 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
 }
 
 fn log_call(call: &SoterCall) {
-    let side = if call.hal { "hal" } else { "app" };
+    let side = if call.hidl {
+        "hal-hidl"
+    } else if call.hal {
+        "hal"
+    } else {
+        "app"
+    };
     let line = format!(
         "event=soter side={side} code={} op={} uid={} alias={:?} session={:?} challenge_len={} key={:?} bytes={}{}",
         call.code,
@@ -380,7 +423,7 @@ fn log_call(call: &SoterCall) {
 /// 是远程答、本地答还是配置说不许兜底，走的都是同一套拦截与回填。号码不认识、参数
 /// 不够的仍在 `intercept_soter_call` 里原样透传，不会把宿主挂住。
 pub(crate) fn interceptable(call: &SoterCall) -> bool {
-    call.hal && soter_local::answerable(call.code)
+    call.hal && !call.hidl && soter_local::answerable(call.code)
 }
 
 /// 把一笔答复拼成宿主能直接吃的内核命令字节流，连同一块得活着的 parcel 一起交出去。
@@ -669,6 +712,42 @@ mod tests {
         let call = parse(&data, 10).expect("code 10 is ours");
         assert_eq!(call.op, "hasAuthKey");
         assert_eq!(call.alias.as_deref(), Some("SoterAuthKey"));
+    }
+
+    #[test]
+    fn the_trustonic_descriptor_is_also_a_hal_request() {
+        // 联发科机型（一加 PLC110）上宿主发出去的是 Trustonic 那条，号码跟高通那份同序。
+        let mut data = interface_token(TRUSTONIC_DESCRIPTOR);
+        push_i32(&mut data, 1000);
+        let call = parse(&data, 9).expect("trustonic hasAskAlready");
+        assert!(call.hal, "Trustonic 那侧也算 HAL");
+        assert_eq!(call.op, "hasAskAlready");
+        assert_eq!(call.uid, Some(1000));
+
+        // 带参数的那个也一样能解出来（3 号 exportAuthKeyPublicKey）。
+        let mut data = interface_token(TRUSTONIC_DESCRIPTOR);
+        push_i32(&mut data, 10373);
+        push_string(&mut data, "SoterAuthKey");
+        let call = parse(&data, 3).expect("trustonic exportAuthKeyPublicKey");
+        assert_eq!(call.op, "exportAuthKeyPublicKey");
+        assert_eq!(call.alias.as_deref(), Some("SoterAuthKey"));
+    }
+
+    #[test]
+    fn a_hidl_descriptor_is_recognized_but_not_intercepted() {
+        // 宿主 dex 里 HIDL 那套代理类（`...@1.0::ISoter@Proxy`）也在，跟 AIDL 不是同一个
+        // 描述符。先只认、只记：hidl 标上，interceptable 必须是 false。
+        let mut data = interface_token(QTI_HIDL_DESCRIPTOR);
+        push_i32(&mut data, 1000);
+        let call = parse(&data, 9).expect("hidl hasAskAlready");
+        assert!(call.hal && call.hidl, "HIDL 那侧归 HAL，但要单独标出来");
+        assert_eq!(call.op, "hasAskAlready");
+        assert!(!interceptable(&call), "HIDL 现在只观察，不拦");
+
+        let mut data = interface_token(TRUSTONIC_HIDL_DESCRIPTOR);
+        push_i32(&mut data, 1000);
+        let call = parse(&data, 9).expect("trustonic hidl hasAskAlready");
+        assert!(call.hal && call.hidl);
     }
 
     #[test]

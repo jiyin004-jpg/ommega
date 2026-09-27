@@ -108,6 +108,7 @@ mod tests {
     ) -> SoterCall {
         SoterCall {
             hal: true,
+            hidl: false,
             code,
             op: "test",
             uid,

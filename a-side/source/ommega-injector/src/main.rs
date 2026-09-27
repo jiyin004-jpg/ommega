@@ -21,13 +21,20 @@ include!(concat!(env!("OUT_DIR"), "/aidl.rs"));
 
 /// 主目标：KeyMint 的客户端进程，这个注不进去就算启动失败。
 const KEYSTORE_PROCESS: &str = "keystore2";
-/// SOTER 的宿主进程：App 的 SOTER 调用都是它转成对高通 HAL 的调用发出去的，
+/// SOTER 的宿主进程：App 的 SOTER 调用都是它转成对 HAL 的调用发出去的，
 /// hook 得在它进程里才认得到那条 transaction。它是附加目标，没在跑也不影响主路。
 const SOTER_HOST_PROCESS: &str = "com.tencent.soter.soterserver";
-/// 高通那个 SOTER HAL 的进程。宿主把 app 的 SOTER 调用转成对它的调用，所以注上它就能
+/// SOTER HAL 的进程名。宿主把 app 的 SOTER 调用转成对它的调用，所以注上它就能
 /// 看见直接打到 HAL 的那条路（`service call` 绕开宿主，只有注进 HAL 才有反应）。同样是
 /// 附加目标，没在跑只记一条日志。
-const SOTER_HAL_PROCESS: &str = "vendor.qti.hardware.soter-service";
+///
+/// 各家 HAL 的进程名不一样，摆一起挨个试：高通是 `vendor.qti.hardware.soter-service`，
+/// 联发科走 Trustonic 那套的叫 `vendor.trustonic.soter@1.0-service`（一加 PLC110 实测，
+/// 它上面根本没有高通那个进程）。两个都没有也不当事 —— 宿主那条路照样是通的。
+const SOTER_HAL_PROCESSES: [&str; 2] = [
+    "vendor.qti.hardware.soter-service",
+    "vendor.trustonic.soter@1.0-service",
+];
 
 /// 已经注过的目标不要再注第二遍：payload 是同一个可执行文件，dlopen 第二次就是第二份
 /// 代码、各自一套全局状态，两边的初始化会互相扯（实测往已经注过的 SOTER 宿主再注一次，
@@ -49,10 +56,21 @@ fn payload_thread_present(pid: i32) -> bool {
     })
 }
 
-/// 高通那个 SOTER HAL 在 ServiceManager 里挂的名字，宿主取 HAL 用的就是它。
-const SOTER_HAL_SERVICE: &str = "vendor.qti.hardware.soter.ISoter/default";
-/// 同一个接口的 AIDL interface token。远端 binder 拿不到 descriptor，写事务时得自己填。
-const SOTER_HAL_INTERFACE: &str = "vendor.qti.hardware.soter.ISoter";
+/// 自检要打的目标。宿主取 HAL 用的就是这些名字，一个接口一个实例。
+///
+/// 高通是 `vendor.qti.hardware.soter-service` 那个进程、服务名不带版本；联发科走
+/// Trustonic 那套（一加 PLC110 实测），服务名里嵌着版本、接口描述符也不同。摆一起
+/// 挨个试：在 ServiceManager 里查不到的会直接报错退出，不碍事。
+const SOTER_HAL_CANDIDATES: [(&str, &str); 2] = [
+    (
+        "vendor.qti.hardware.soter.ISoter/default",
+        "vendor.qti.hardware.soter.ISoter",
+    ),
+    (
+        "vendor.trustonic.hardware.soter.ITrustonicSoter/default",
+        "vendor.trustonic.hardware.soter.ITrustonicSoter",
+    ),
+];
 /// ISoter.getDeviceId(out SoterBufferReturn)。挑它做自检是因为纯只读：不建密钥、
 /// 不动 TEE 里的任何东西。
 const SOTER_HAL_GET_DEVICE_ID: u32 = 8;
@@ -77,11 +95,13 @@ fn spawn_soter_selfcheck() {
         .name("ommega-soter-selfcheck".to_string())
         .spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(2000));
-            match soter_selfcheck_transact() {
-                Ok(error_code) => {
-                    info!("event=soter selfcheck getDeviceId returned code={error_code}")
+            for (service, interface) in SOTER_HAL_CANDIDATES {
+                match soter_selfcheck_transact(service, interface) {
+                    Ok(error_code) => info!(
+                        "event=soter selfcheck {service} getDeviceId returned code={error_code}"
+                    ),
+                    Err(error) => warn!("event=soter selfcheck {service} failed: {error:#}"),
                 }
-                Err(error) => warn!("event=soter selfcheck failed: {error:#}"),
             }
         });
     if let Err(error) = thread {
@@ -95,13 +115,9 @@ fn spawn_soter_selfcheck() {
 /// 实现对 /dev/binder 的 ioctl，不引用 libbinder.so，而我们 hook 打在 libbinder*
 /// .so 的 ioctl GOT 上，所以 rsbinder 发出去的调用绕过了 hook。之前用 rsbinder
 /// 跑出来的 code=0 是真实 HAL 回的，当成"拦截生效"是错的。
-fn soter_selfcheck_transact() -> anyhow::Result<i32> {
-    crate::hook::soter_ndk::transact(
-        SOTER_HAL_SERVICE,
-        SOTER_HAL_INTERFACE,
-        SOTER_HAL_GET_DEVICE_ID,
-    )
-    .map_err(|error| anyhow::anyhow!(error))
+fn soter_selfcheck_transact(service: &str, interface: &str) -> anyhow::Result<i32> {
+    crate::hook::soter_ndk::transact(service, interface, SOTER_HAL_GET_DEVICE_ID)
+        .map_err(|error| anyhow::anyhow!(error))
 }
 
 /// 按进程名找一个目标、把 payload 注进去，顺带把它的身份打进日志。
@@ -221,9 +237,12 @@ fn main() {
             Ok(()) => info!("soter host injection completed"),
             Err(e) => warn!("soter host injection skipped: {:#}", e),
         }
-        match inject_named_process(SOTER_HAL_PROCESS) {
-            Ok(()) => info!("soter hal injection completed"),
-            Err(e) => warn!("soter hal injection skipped: {:#}", e),
+        // HAL 的进程名一家一个样，逐个试。谁都不在就都不注（宿主那条路照常）。
+        for hal in SOTER_HAL_PROCESSES {
+            match inject_named_process(hal) {
+                Ok(()) => info!("soter hal injection completed ({hal})"),
+                Err(e) => info!("soter hal injection skipped ({hal}): {:#}", e),
+            }
         }
     } else {
         info!("soter host target skipped by OMMEGA_INJECT_TARGETS");
@@ -277,6 +296,16 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
     if let Err(error) = ipc::install_direct_rpc_session() {
         error!("failed to initialize ommega RPC session: {error:#}; installing the hook anyway");
     }
+    // 日志到底装上没有、装在哪：app 域的进程（SOTER 宿主、SOTER HAL）各自的 uid 不一样，
+    // 有的机型上那个目录它们进不去，本地日志就整条哑掉。这一条顺 RPC 递给 daemon，
+    // 至少能看见原因，不用再靠猜。
+    crate::ipc::report_event(format!(
+        "event=logging role=Payload path={} enabled={} probes=[{}] error={}",
+        crate::logging::active_path(),
+        crate::logging::enabled(),
+        crate::logging::path_probes(),
+        crate::logging::init_error(),
+    ));
     hook::init_hook().expect("failed to initialize binder ioctl hook");
     if in_soter_host() {
         spawn_soter_selfcheck();
