@@ -28,6 +28,13 @@ const MAX_ASSIGN_ATTEMPTS: u32 = 5;
 /// 一次，正常情况下一个来回就出结论（`tee_error` 或 `boot`），不会再排。
 const SELFCHECK_RETRY_MS: u64 = 120_000;
 
+/// 两次「清理」之间至少隔多久（毫秒）。`reclaim_locked` / `expire_locked` 都是
+/// 对 `tasks` 的全表扫描，而 `pop_for_b` 的长轮询里每 250 ms 就回退醒一次
+/// —— 一次 30 秒的 poll 光清理就扫上百遍，且全程占着同一把全局锁。这些
+/// TTL 都是秒到分钟级的，按这个间隔节流既不妨碍判定超时，又能把扫描次数
+/// 压到几十次以内。
+const SWEEP_INTERVAL_MS: u64 = 1_000;
+
 /// 自检失败原因写进状态页前的截断长度（B 端错误文本可能很长）。
 const SELFCHECK_ERROR_MAX_CHARS: usize = 300;
 
@@ -148,6 +155,8 @@ struct Inner {
     /// Rotating index used to break load ties round-robin so the balancer
     /// doesn't always pick the same (first) device when several are idle.
     load_balance_index: usize,
+    /// 上次跑 `sweep_locked` 的时间戳（毫秒，0 = 还没跑过）。见 `SWEEP_INTERVAL_MS`。
+    last_sweep_ms: u64,
 }
 
 pub struct TaskStore {
@@ -414,10 +423,9 @@ impl TaskStore {
                         "b_selfcheck: enqueued TEE self-check {task_id} for {device_id}"
                     );
                 }
-                // Reclaim timed-out assignments first.
-                self.reclaim_locked(&mut inner);
-                // Expire stale pending tasks and prune old completed/failed.
-                self.expire_locked(&mut inner);
+                // 回收超时派发 + 过期/超量剪枝。两个都是全表扫描，按
+                // `SWEEP_INTERVAL_MS` 节流（见常量注释）。
+                self.sweep_locked(&mut inner);
 
                 if let Some(task) = self.dequeue_locked(&mut inner, device_id) {
                     Self::record_event_locked(&mut inner, device_id, 1);
@@ -450,38 +458,85 @@ impl TaskStore {
             .map(|d| d.supports_soter != Some(false))
             .unwrap_or(true);
         // 1) Try device-specific queue first.
+        //
+        // 扫描上限设成本轮开始的长度：做不了的 SOTER 任务会被推到队尾，
+        // 不设上限就会在“弹出→推回→再弹出”里转不出去。
+        let mut picked: Option<Task> = None;
+        let mut deferred: Vec<String> = Vec::new();
         if let Some(q) = inner.pending_by_device.get_mut(device_id) {
-            while let Some(candidate_id) = q.pop_front() {
-                if let Some(t) = inner.tasks.get_mut(&candidate_id) {
-                    if !soter_ok && t.task_type == "soter" {
-                        continue;
-                    }
-                    t.assigned_device_id = Some(device_id.to_string());
-                    t.assigned_at_ms = Self::now_ms();
-                    t.status = TaskStatus::Assigned;
-                    return Some(t.clone());
-                }
-                // Stale id (task no longer exists) — drop it.
-            }
-            // Queue is empty now — remove the entry to save memory.
-            inner.pending_by_device.remove(device_id);
-        }
-
-        // 2) Try wildcard (any-device) queue.
-        while let Some(candidate_id) = inner.pending_any.pop_front() {
-            if let Some(t) = inner.tasks.get_mut(&candidate_id) {
+            let mut budget = q.len();
+            while budget > 0 {
+                budget -= 1;
+                let Some(candidate_id) = q.pop_front() else {
+                    break;
+                };
+                let Some(t) = inner.tasks.get_mut(&candidate_id) else {
+                    // Stale id (task no longer exists) — drop it.
+                    continue;
+                };
                 if !soter_ok && t.task_type == "soter" {
+                    // 这台说它做不了 SOTER。任务本身还等着人做，不能就这么
+                    // 从队列里没了（那就只剩 TTL 扫到才被标失败），先收着。
+                    deferred.push(candidate_id);
                     continue;
                 }
                 t.assigned_device_id = Some(device_id.to_string());
                 t.assigned_at_ms = Self::now_ms();
                 t.status = TaskStatus::Assigned;
-                return Some(t.clone());
+                picked = Some(t.clone());
+                break;
             }
-            // Stale id (task no longer exists) — drop it.
+            // Queue drained and nothing matched — drop the entry to save memory.
+            if picked.is_none() && q.is_empty() {
+                inner.pending_by_device.remove(device_id);
+            }
+        }
+        // 做不了的那些交给通配队列：换台做得了的设备领走，别压在原地。
+        for id in deferred {
+            inner.pending_any.push_back(id);
+        }
+        if picked.is_some() {
+            return picked;
+        }
+
+        // 2) Try wildcard (any-device) queue.
+        let mut budget = inner.pending_any.len();
+        while budget > 0 {
+            budget -= 1;
+            let Some(candidate_id) = inner.pending_any.pop_front() else {
+                break;
+            };
+            let Some(t) = inner.tasks.get_mut(&candidate_id) else {
+                // Stale id (task no longer exists) — drop it.
+                continue;
+            };
+            if !soter_ok && t.task_type == "soter" {
+                // 同上：放回队尾，留给做得了的设备。
+                inner.pending_any.push_back(candidate_id);
+                continue;
+            }
+            t.assigned_device_id = Some(device_id.to_string());
+            t.assigned_at_ms = Self::now_ms();
+            t.status = TaskStatus::Assigned;
+            return Some(t.clone());
         }
 
         None
+    }
+
+    /// 一次清理：先回收超时没回的派发，再剪掉过期/超量的任务。
+    ///
+    /// 两步都是 `tasks` 全表扫描，调用点（长轮询回退、每笔结果结算）又都很密，
+    /// 所以这里按 `SWEEP_INTERVAL_MS` 节流。TTL 判定最坏晚一个间隔，实际影响
+    /// 可以忽略 —— 而省下的是全程持锁的全表扫描。
+    fn sweep_locked(&self, inner: &mut Inner) {
+        let now = Self::now_ms();
+        if now.saturating_sub(inner.last_sweep_ms) < SWEEP_INTERVAL_MS {
+            return;
+        }
+        inner.last_sweep_ms = now;
+        self.reclaim_locked(inner);
+        self.expire_locked(inner);
     }
 
     /// Expire stale pending tasks and prune old completed/failed tasks.
@@ -769,7 +824,7 @@ impl TaskStore {
         }
         Self::record_event_locked(&mut inner, device_id, 1);
         // Prune completed/failed tasks to stay within capacity/TTL limits.
-        self.expire_locked(&mut inner);
+        self.sweep_locked(&mut inner);
         Ok(())
     }
 

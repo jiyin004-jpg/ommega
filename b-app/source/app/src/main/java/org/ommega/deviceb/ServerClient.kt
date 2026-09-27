@@ -30,6 +30,13 @@ object ServerClient {
     /** Injected by MainActivity for poll conflict checks. */
     var machineId: () -> String = { "" }
 
+    /** Injected by MainActivity: capabilities announced on every poll heartbeat
+     *  (server side `queue::DeviceCaps`). The app relays through the Android
+     *  Keystore API only, so it never claims `soter` — that one belongs to the
+     *  B-side module. Empty string means "explicitly none", which is *not* the
+     *  same as omitting the field (what older builds did). */
+    var capsProvider: () -> String = { "" }
+
     private val trustAllManager =
         object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -83,7 +90,11 @@ object ServerClient {
     /** Long-polls one task; throws ConflictException on 409. */
     fun pollTask(timeoutSec: Int = 10): JSONObject? {
         return try {
-            val url = URL("$serverUrl/api/b/poll/?timeout=$timeoutSec&device_id=$deviceId&machine_id=${machineId()}")
+            val url =
+                URL(
+                    "$serverUrl/api/b/poll/?timeout=$timeoutSec&device_id=$deviceId" +
+                        "&machine_id=${machineId()}&caps=${capsProvider()}",
+                )
             val conn = openDirect(url).apply {
                     requestMethod = "GET"
                     connectTimeout = (timeoutSec + 5) * 1000

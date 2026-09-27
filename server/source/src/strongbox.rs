@@ -1,6 +1,6 @@
 //! StrongBox handling-mode switch (runtime, in-memory).
 //!
-//! Three modes:
+//! Four modes:
 //!   - Off (default): strict native semantics. A StrongBox attest failure
 //!     propagates to the next fulfilment layer exactly as before (server
 //!     three-layer fallback → A-side local keybox).
@@ -22,6 +22,15 @@
 //!     request on the same B device; the downgraded chain is tagged
 //!     TRUSTED_ENVIRONMENT by the B side, so this is an honest degradation,
 //!     never a mislabelled StrongBox.
+//!   - Refuse: honest refusal. A StrongBox request is answered only by the B
+//!     device's real StrongBox, and only when that device actually hands back a
+//!     StrongBox-tagged chain. Anything else — no HAL, keys not provisioned,
+//!     hardware type unavailable, timeout, empty chain — comes back as a
+//!     `relay_error_kind` marker that the A side turns into the matching KeyMint
+//!     error (AttestationKeysNotProvisioned / HardwareTypeUnavailable). Nothing
+//!     is ever minted on the server or on the A side for these requests, so the
+//!     calling app sees exactly what AOSP would show on a device that advertises
+//!     StrongBox but has no usable keys.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -35,6 +44,8 @@ pub enum StrongboxMode {
     Smart = 1,
     /// Transparent B-side TEE demotion (original on).
     Robust = 2,
+    /// Honest refusal: real B StrongBox or a real KeyMint error, nothing minted.
+    Refuse = 3,
 }
 
 impl StrongboxMode {
@@ -44,12 +55,13 @@ impl StrongboxMode {
             StrongboxMode::Off => "off",
             StrongboxMode::Smart => "smart",
             StrongboxMode::Robust => "robust",
+            StrongboxMode::Refuse => "refuse",
         }
     }
 }
 
 /// Parse the admin-API token. Accepts only the lowercase tokens
-/// `"off" | "smart" | "robust"`.
+/// `"off" | "smart" | "robust" | "refuse"`.
 impl std::str::FromStr for StrongboxMode {
     type Err = ();
 
@@ -58,6 +70,7 @@ impl std::str::FromStr for StrongboxMode {
             "off" => Ok(StrongboxMode::Off),
             "smart" => Ok(StrongboxMode::Smart),
             "robust" => Ok(StrongboxMode::Robust),
+            "refuse" => Ok(StrongboxMode::Refuse),
             _ => Err(()),
         }
     }
@@ -70,6 +83,7 @@ pub fn mode() -> StrongboxMode {
     match MODE.load(Ordering::Relaxed) {
         1 => StrongboxMode::Smart,
         2 => StrongboxMode::Robust,
+        3 => StrongboxMode::Refuse,
         _ => StrongboxMode::Off,
     }
 }
@@ -89,6 +103,7 @@ mod tests {
             StrongboxMode::Off,
             StrongboxMode::Smart,
             StrongboxMode::Robust,
+            StrongboxMode::Refuse,
         ] {
             assert_eq!(m.as_str().parse::<StrongboxMode>(), Ok(m));
             assert_eq!(
@@ -97,12 +112,14 @@ mod tests {
                     StrongboxMode::Off => "off",
                     StrongboxMode::Smart => "smart",
                     StrongboxMode::Robust => "robust",
+                    StrongboxMode::Refuse => "refuse",
                 }
             );
         }
         assert_eq!("bogus".parse::<StrongboxMode>(), Err(()));
         assert_eq!("".parse::<StrongboxMode>(), Err(()));
         assert_eq!("ROBUST".parse::<StrongboxMode>(), Err(()));
+        assert_eq!("REFUSE".parse::<StrongboxMode>(), Err(()));
     }
 
     #[test]
@@ -111,6 +128,7 @@ mod tests {
             StrongboxMode::Off,
             StrongboxMode::Smart,
             StrongboxMode::Robust,
+            StrongboxMode::Refuse,
         ] {
             set_mode(m);
             assert_eq!(mode(), m);

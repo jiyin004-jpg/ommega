@@ -82,6 +82,7 @@ class MainActivity : AppCompatActivity() {
         ServerClient.relayToken = savedToken
         ServerClient.tlsInsecure = savedTlsInsecure
         ServerClient.machineId = { getMachineId() }
+        ServerClient.capsProvider = { getCaps() }
 
         val root = ScrollView(this)
         val layout = LinearLayout(this).apply {
@@ -132,6 +133,17 @@ class MainActivity : AppCompatActivity() {
             setTextColor(0xFF888888.toInt())
         }
         layout.addView(connectionStatusText)
+
+        layout.addView(
+            TextView(this).apply {
+                setPadding(0, 0, 0, 16)
+                textSize = 12f
+                setTextColor(0xFF888888.toInt())
+                text =
+                    "本应用通过 Android Keystore 中继认证与签名请求。" +
+                        "SOTER 转发由 B 端模块（ommegaclient_b）提供，本应用不支持 SOTER。"
+            },
+        )
 
         RelayService.uiListener = object : RelayService.ConnectionListener {
             override fun onStateChanged(state: RelayService.ConnectionState) {
@@ -206,6 +218,20 @@ class MainActivity : AppCompatActivity() {
 
     /** Machine id reported to the relay_server: the current device model. */
     private fun getMachineId(): String = Build.MODEL
+
+    /** Capabilities announced to the relay_server.
+     *
+     *  This app only relays Keystore API requests (attest / sign / decrypt), so it
+     *  never announces `soter` — SOTER forwarding is the B-side module's job. The
+     *  server reads an announced-and-missing capability as a hard "no", which
+     *  keeps SOTER tasks away from this app. StrongBox is announced only when the
+     *  device actually has the HAL feature. */
+    private fun getCaps(): String {
+        val hasStrongBox =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
+        return if (hasStrongBox) "strongbox" else ""
+    }
 
     /** Fresh random device id (device-b-<8 hex>) for the first launch of an install. */
     private fun randomDeviceId(): String {

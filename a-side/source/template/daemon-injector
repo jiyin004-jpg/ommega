@@ -162,9 +162,13 @@ sync_log_flag() {
   cur=$(sed -n 's/^log_flag:[[:space:]]*//p' "$LOG_FLAG" 2>/dev/null | head -n1 | tr -d ' \r')
   if [ "$cur" != "$want" ]; then
     mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
-    chmod 755 "$LOG_FLAG_DIR" 2>/dev/null
+    # 这个目录里可能放着用户自己替换的 soter_ask.pem（本地兜底的私钥），
+    # 所以不能让 other 进来：0755 的话任何 app 都能读到那把钥匙。属主给
+    # system(1000) 是因为 app 域的 payload 要进来读开关和钥匙。
+    chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
+    chmod 0750 "$LOG_FLAG_DIR" 2>/dev/null
     printf 'log_flag: %s\n' "$want" > "$LOG_FLAG" 2>/dev/null
-    chmod 644 "$LOG_FLAG" 2>/dev/null
+    chmod 0640 "$LOG_FLAG" 2>/dev/null
   fi
 }
 
@@ -196,7 +200,10 @@ sync_soter_ask() {
   fi
 
   if cp -f "$src" "$SOTER_ASK_DST" 2>/dev/null; then
-    chmod 0644 "$SOTER_ASK_DST" 2>/dev/null
+    # 640 而不是 644：这是私钥。app 域的 payload 是 uid 1000，靠 system
+    # 组权限读得到，其他 app 就不行了。
+    chown 0:1000 "$SOTER_ASK_DST" 2>/dev/null
+    chmod 0640 "$SOTER_ASK_DST" 2>/dev/null
     soter_ask_changed=1
     log "[injector-daemon] local soter ask updated from $src"
   else

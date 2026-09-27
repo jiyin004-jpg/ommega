@@ -635,6 +635,12 @@ fn cert_chain_json(chain: &[Vec<u8>]) -> Vec<Value> {
 /// subject/issuer when x509_cert can decode it (helps debugging what the real
 /// TEE actually minted vs what the server expects).
 fn log_cert_chain(tag: &str, chain: &[Vec<u8>]) {
+    // 每笔 attest 都无条件把整条链 DER 解一遍、拼 subject/issuer 字符串，
+    // 而结果只进日志 —— 关了就直接不做（否则白花的时间全加在 A 端等结果的
+    // 关键路径上）。
+    if !log::log_enabled!(log::Level::Info) {
+        return;
+    }
     if chain.is_empty() {
         log::info!("cert_chain[{tag}]: EMPTY");
         return;

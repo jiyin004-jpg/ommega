@@ -142,7 +142,14 @@ pub(in crate::hook) unsafe fn handle_bc_reply(
     let original_data_size = tr.data_size;
     let original_offsets_size = tr.offsets_size;
     let original_flags = tr.flags;
-    let original_objects = describe_transaction_objects(tr);
+    // 这条描述只喂给下面那条 debug! 日志。log 关着的时候 `debug!` 会在展开处
+    // 短路、参数不求值，但这个 `let` 在宏外面，每笔 BC_REPLY 都照算 —— 宿主
+    // 的每笔 binder 回复都白白拼一遍字符串。所以这里自己挡一下。
+    let original_objects = if log::log_enabled!(log::Level::Debug) {
+        describe_transaction_objects(tr)
+    } else {
+        String::new()
+    };
 
     let result = match &mut pending {
         PendingCall::Authorization(call) => {

@@ -442,6 +442,84 @@ async fn run_smart_strongbox_attest(
     )
 }
 
+/// Refuse mode: answer a StrongBox request only with the B device's real
+/// StrongBox, and refuse honestly otherwise.
+///
+/// Nothing is minted on this path — no stored server keybox, no self-signed
+/// chain, and no silent hand-back to the A-side local software keybox (which
+/// would fabricate a StrongBox-tagged chain). The A side turns the
+/// `relay_error_kind` marker into the matching KeyMint error, so the calling app
+/// sees what AOSP shows on a device that advertises StrongBox but has no
+/// provisioned keys.
+async fn run_refuse_strongbox_attest(
+    state: &AppState,
+    device_id: &str,
+    body: &Value,
+    any_b_online: bool,
+) -> Response {
+    let task_type = "attest";
+
+    // Only the B device's own StrongBox can answer in this mode.
+    if let Some(v) = try_b_device_layer(state, task_type, body, device_id, any_b_online).await {
+        if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
+            let level = chain_attestation_security_level(&v);
+            if level == Some(2) {
+                tracing::info!(
+                    "run_refuse_strongbox: B real StrongBox fulfilled attest for device {device_id}"
+                );
+                return Json(v).into_response();
+            }
+            // A chain did come back but it is not StrongBox-tagged: the B side
+            // demoted the request to TEE. Refusing is the whole point of this
+            // mode, so say so instead of handing the app a TEE chain it did not
+            // ask for.
+            tracing::info!(
+                "run_refuse_strongbox: B returned a non-StrongBox chain (attestation_security_level={level:?}) for device {device_id} -> refusing"
+            );
+            return refuse_strongbox_body(
+                "strongbox_unprovisioned",
+                "strongbox not supported: serving device demoted the request to TEE",
+            );
+        }
+
+        // Keep the B side's own verdict when it named one; otherwise fall through
+        // to the AOSP "keys not provisioned" wording (KeyMint -74 on the A side).
+        if let Some(kind) = strongbox_b_kind(&v) {
+            let msg = v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("strongbox attestation refused by B device")
+                .to_string();
+            tracing::info!(
+                "run_refuse_strongbox: B StrongBox present but not usable (kind={kind}) -> refusing: {msg}"
+            );
+            return refuse_strongbox_body(kind, &msg);
+        }
+    }
+
+    tracing::info!(
+        "run_refuse_strongbox: no real B StrongBox for device {device_id} -> refusing (nothing minted server-side or A-side)"
+    );
+    refuse_strongbox_body(
+        "strongbox_unprovisioned",
+        "strongbox not supported: no usable StrongBox on the serving device (attestation keys not provisioned)",
+    )
+}
+
+/// Error body carrying the `relay_error_kind` marker. HTTP 200 on purpose: the A
+/// side only inspects 2xx bodies, and this is the shape it converts into a real
+/// KeyMint error (AttestationKeysNotProvisioned / HardwareTypeUnavailable).
+fn refuse_strongbox_json(kind: &str, msg: &str) -> Value {
+    json!({
+        "error": msg,
+        "relay_error_kind": kind,
+    })
+}
+
+fn refuse_strongbox_body(kind: &str, msg: &str) -> Response {
+    Json(refuse_strongbox_json(kind, msg)).into_response()
+}
+
 /// Shared logic for A-side task endpoints.
 ///
 /// Three-layer fallback, with the order set by the active mode:
@@ -502,6 +580,16 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
         && is_strongbox_request(body)
     {
         return run_smart_strongbox_attest(state, &device_id, body, any_b_online).await;
+    }
+
+    // Refuse mode: a StrongBox request gets the serving device's real StrongBox
+    // or a real KeyMint error. Nothing is minted — not by the server keybox, not
+    // by the self-signed layer, and not by the A-side local software keybox.
+    if task_type == "attest"
+        && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Refuse
+        && is_strongbox_request(body)
+    {
+        return run_refuse_strongbox_attest(state, &device_id, body, any_b_online).await;
     }
 
     let serverbox = state.fulfill.is_enabled();
@@ -1168,8 +1256,34 @@ pub async fn admin_cancel_task(
 
 #[cfg(test)]
 mod strongbox_smart_tests {
-    use super::{chain_attestation_security_level, strongbox_b_kind};
+    use super::{chain_attestation_security_level, refuse_strongbox_json, strongbox_b_kind};
     use serde_json::json;
+
+    #[test]
+    fn refuse_body_uses_aosp_kinds() {
+        // 拒绝模式回给 A 端的形状：error + relay_error_kind。A 端按 kind 翻成
+        // KeyMint -74 / -68，也就是 AOSP 的「支持但没预制密钥 / 硬件类型不可用」。
+        let v = refuse_strongbox_json(
+            "strongbox_unprovisioned",
+            "strongbox not supported: no usable StrongBox on the serving device",
+        );
+        assert_eq!(
+            v.get("relay_error_kind").and_then(|x| x.as_str()),
+            Some("strongbox_unprovisioned")
+        );
+        assert!(v
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap()
+            .contains("no usable StrongBox"));
+
+        // B 端自己报了 verdict 时原样带上（比如硬件类型不可用）。
+        let named = refuse_strongbox_json("strongbox_unavailable", "hardware type unavailable");
+        assert_eq!(
+            named.get("relay_error_kind").and_then(|x| x.as_str()),
+            Some("strongbox_unavailable")
+        );
+    }
 
     #[test]
     fn classifies_relay_strongbox_errors() {

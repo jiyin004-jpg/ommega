@@ -1071,14 +1071,14 @@ pub async fn admin_ipfilter_remove(
 }
 
 // ---------------------------------------------------------------------------
-// StrongBox handling mode (three-state: off | smart | robust).
+// StrongBox handling mode (four-state: off | smart | robust | refuse).
 // ---------------------------------------------------------------------------
 
 /// GET /api/admin/strongbox/ — current StrongBox handling-mode switch state.
 ///
-/// `mode` is the three-state token (`"off" | "smart" | "robust"`); `enabled`
-/// is kept for backwards compatibility and reports only whether the Robust
-/// (original "强健/降级") mode is active.
+/// `mode` is the four-state token (`"off" | "smart" | "robust" | "refuse"`);
+/// `enabled` is kept for backwards compatibility and reports only whether the
+/// Robust (original "强健/降级") mode is active.
 pub async fn admin_strongbox_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
@@ -1113,6 +1113,11 @@ pub struct StrongboxToggleBody {
 ///     has no StrongBox; otherwise hand back to the A-side local keybox.
 ///   - robust: Android-standard silent fallback — a B-side StrongBox capability
 ///     error is transparently retried as a TEE request on the same B device.
+///   - refuse: honest refusal — a StrongBox request is served only by the B
+///     device's real StrongBox; anything else (no HAL / keys not provisioned /
+///     hardware type unavailable / TEE demotion / timeout) comes back as a
+///     `relay_error_kind` marker that the A side maps to the matching KeyMint
+///     error. Nothing is minted on the server or on the A side.
 pub async fn admin_strongbox_toggle(
     State(state): State<AppState>,
     headers: HeaderMap,

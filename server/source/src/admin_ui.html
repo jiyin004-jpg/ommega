@@ -481,15 +481,16 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
   </div>
 </div>
 
-<!-- StrongBox mode (three-state: off | smart | robust) -->
+<!-- StrongBox mode (four-state: off | smart | robust | refuse) -->
 <div class="panel">
-  <h2>StrongBox 强健模式 <span class="hint">三段可选：关闭（原生语义）· 智能（按 B 端真实 StrongBox 能力择优）· 强健（降级 B 端 TEE 出证）</span></h2>
+  <h2>StrongBox 强健模式 <span class="hint">四段可选：关闭（原生语义）· 智能（按 B 端真实 StrongBox 能力择优）· 强健（降级 B 端 TEE 出证）· 拒绝（只用真 StrongBox，出不来就如实报错）</span></h2>
   <div class="body">
     <div class="token-gen" style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
       <div class="seg" id="sbrSeg" style="margin:0;">
         <button type="button" class="seg-btn" data-mode="off" onclick="setStrongboxMode('off')">关闭</button>
         <button type="button" class="seg-btn" data-mode="smart" onclick="setStrongboxMode('smart')">智能</button>
         <button type="button" class="seg-btn" data-mode="robust" onclick="setStrongboxMode('robust')">强健</button>
+        <button type="button" class="seg-btn" data-mode="refuse" onclick="setStrongboxMode('refuse')">拒绝</button>
       </div>
       <span class="hint" id="sbrStatus" style="flex:1;min-width:220px;">加载中…</span>
     </div>
@@ -1092,21 +1093,22 @@ async function loadStrongbox() {
 const STRONGBOX_DESC = {
   off: '关闭：StrongBox 失败按原生语义三层回退（server 三层回退），不自动降级、不替设备出证。',
   smart: '智能：B 真 StrongBox 可用→直连回传；B 支持但未预制/不可用→原样回传错误给 A 端应用；B 无 StrongBox→服务端用该设备存储密钥出 StrongBox 级证书链；服务端也无此设备密钥→交还 A 端本地出 StrongBox 级。',
-  robust: '强健：B 端 StrongBox 失败自动降级为 B 端 TEE 出证（Android 标准静默降级，降级链如实标记 TRUSTED_ENVIRONMENT，不冒充 StrongBox）。'
+  robust: '强健：B 端 StrongBox 失败自动降级为 B 端 TEE 出证（Android 标准静默降级，降级链如实标记 TRUSTED_ENVIRONMENT，不冒充 StrongBox）。',
+  refuse: '拒绝：只用 B 端真 StrongBox。B 端拿不出 StrongBox 链时不代出、不降级、不用服务端密钥、也不交回 A 端本地，直接把错误码回给 A 端应用，语义等价于 AOSP 的「设备报告支持 StrongBox 但没有预制密钥」。'
 };
 
 function setStrongboxUI(mode) {
   document.querySelectorAll('#sbrSeg .seg-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.mode === mode);
   });
-  $('#sbrStatus').textContent = mode === 'off' ? '关闭（默认）' : mode === 'smart' ? '智能档' : '强健档';
+  $('#sbrStatus').textContent = mode === 'off' ? '关闭（默认）' : mode === 'smart' ? '智能档' : mode === 'robust' ? '强健档' : '拒绝档';
   $('#sbrDesc').textContent = STRONGBOX_DESC[mode] || STRONGBOX_DESC.off;
 }
 
 async function setStrongboxMode(mode) {
   try {
     await api('/api/admin/strongbox/', { method: 'POST', body: JSON.stringify({ mode }) });
-    const names = { off: '关闭', smart: '智能', robust: '强健' };
+    const names = { off: '关闭', smart: '智能', robust: '强健', refuse: '拒绝' };
     toast(`StrongBox 模式已切换为「${names[mode] || mode}」`);
     setStrongboxUI(mode);
   } catch (e) { toast(e.message, 'err'); loadStrongbox(); }
