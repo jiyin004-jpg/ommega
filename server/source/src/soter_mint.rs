@@ -1,4 +1,4 @@
-﻿//! 服务端侧的两层 SOTER：keybox 层（用服务端存的那把设备身份）和自签层（现
+//! 服务端侧的两层 SOTER：keybox 层（用服务端存的那把设备身份）和自签层（现
 //! 生成、进程内复用）。
 //!
 //! SOTER 的"证书"不是 X.509，是 `[i32 le JSON 长度][JSON][256 字节 RSA-PSS
@@ -22,6 +22,16 @@
 //!     一把新身份，A 端要重新取 ATTK 公钥。
 //!
 //! 处理不了的 op 会返回带 `error` 的对象，调用方据此回退下一层。
+//!
+//! 换层是策略（没物料 / 超时 / 不认这个 op 就往下换），但**同一个槽位的材料
+//! 必须只出自一层**：一半是 B 的 ASK、一半是 keybox 的 AuthKey，App 手里就是
+//! 自相矛盾的状态（`hasAuthKey` 一会儿有一会儿没，导出的公钥和签名的私钥也
+//! 对不上）。所以：
+//!
+//!   - 谁来服务这个槽位就把它钉在谁身上（`pin_layer`，落盘不丢），下次先问它；
+//!   - 它真不灵了再换（换层仍是策略），换成了钉子跟着挪；
+//!   - 每层自己也得把整个流程走完：ASK 自描述、AuthKey 自描述、签名现场，
+//!     三份信封一个不少，签名的那把钥匙和导出的公钥对得上。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -106,12 +116,32 @@ struct Store {
     next_session: Mutex<i64>,
     /// 会话号 -> 这一次要签的挑战
     sessions: Mutex<HashMap<i64, SignSession>>,
+    /// `{device}|{uid}` -> 这个槽位归哪一层（带时间戳，见 `SlotPin`）。
+    slots: Mutex<HashMap<String, SlotPin>>,
 }
+
+/// 钉在槽位上的那一层，加个时间。
+///
+/// 为什么要有时间：B 端只是打了个嗝（比如一次长轮询空档超时），keybox 抢答成功，
+/// 槽位就钉在 keybox 上了 —— 而 keybox 递给 App 的是假链，腾讯不认，这轮开启注定
+/// 失败。要是钉子永不过期，后面的重试也永远拿不到 B 的真料，一次抖动就变成永久
+/// 失败。给个寿命：一轮流程内（几秒到几分钟）接着钉保证不自相矛盾，过期之后
+/// 重新评，该回 B 就回 B。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SlotPin {
+    layer: String,
+    at_millis: i64,
+}
+
+/// 钉子活多久。取 30 分钟：比一轮开启流程长得多，又短到不至于把一次抖动变成
+/// 永久失败（微信缓存的 cpu_id 变了会自己重走一轮流程，所以跨层也是能自愈的）。
+const SLOT_PIN_TTL_MILLIS: i64 = 30 * 60 * 1000;
 
 struct SignSession {
     uid: i32,
     alias: String,
-    challenge: Vec<u8>,
+    /// 挑战原文。真机把这段原文写进签名 JSON 的 `raw` 里，不是解出来的字节。
+    raw: String,
 }
 
 fn store() -> &'static Store {
@@ -122,6 +152,7 @@ fn store() -> &'static Store {
         counters: Mutex::new(HashMap::new()),
         next_session: Mutex::new(chrono::Utc::now().timestamp_millis()),
         sessions: Mutex::new(HashMap::new()),
+        slots: Mutex::new(load_slots()),
     })
 }
 
@@ -155,6 +186,95 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
         .map_err(|_| anyhow!("self-signed material lock poisoned"))?;
     *guard = Some(fresh.clone());
     Ok(fresh)
+}
+
+// ---------------------------------------------------------------------------
+// 槽位钉层
+// ---------------------------------------------------------------------------
+
+/// 钉子落盘的地方（systemd 的 WorkingDirectory 就是 /opt/relay，data/ 在那儿）。
+/// 测试里改用 target/，别在仓库里拉一个 data/ 出来。
+#[cfg(not(test))]
+const SLOT_FILE: &str = "data/soter_slots.json";
+#[cfg(test)]
+const SLOT_FILE: &str = "target/soter_slots-test.json";
+
+fn slot_id(device_id: &str, uid: i32) -> String {
+    format!("{device_id}|{uid}")
+}
+
+fn load_slots() -> HashMap<String, SlotPin> {
+    match std::fs::read_to_string(SLOT_FILE) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            tracing::warn!("soter: {SLOT_FILE} 读得出来但解不开（{e}），按空的算");
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn save_slots(map: &HashMap<String, SlotPin>) {
+    if let Some(dir) = std::path::Path::new(SLOT_FILE).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_string(map) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(SLOT_FILE, text) {
+                tracing::warn!("soter: 槽位钉子没写进 {SLOT_FILE}: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("soter: 槽位钉子序列化失败: {e:#}"),
+    }
+}
+
+/// 钉子是不是还新鲜。
+fn pin_is_fresh(at_millis: i64, now_millis: i64) -> bool {
+    now_millis - at_millis <= SLOT_PIN_TTL_MILLIS
+}
+
+/// 这个槽位归哪一层（没钉过、或者钉子过期了就是 None）。
+pub fn pinned_layer(device_id: &str, uid: i32) -> Option<String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let guard = store().slots.lock().ok()?;
+    let pin = guard.get(&slot_id(device_id, uid))?;
+    pin_is_fresh(pin.at_millis, now).then(|| pin.layer.clone())
+}
+
+/// 把槽位钉在某一层上。第一次服务这个槽位、或者换层之后都要调。
+pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
+    if device_id.is_empty() {
+        // 请求里没点名设备（route 到哪台都可能）时钉子没有意义，不钉。
+        return;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let id = slot_id(device_id, uid);
+    let Ok(mut map) = store().slots.lock() else {
+        return;
+    };
+    if let Some(pin) = map.get(&id) {
+        if pin.layer == layer && pin_is_fresh(pin.at_millis, now) {
+            return;
+        }
+    }
+    map.insert(
+        id,
+        SlotPin {
+            layer: layer.to_string(),
+            at_millis: now,
+        },
+    );
+    save_slots(&map);
+}
+
+/// 槽位的钥匙被清掉了（`remove_all_uid_key`），钉子也拔掉：下一次走什么层都行。
+pub fn unpin_layer(device_id: &str, uid: i32) {
+    let id = slot_id(device_id, uid);
+    let Ok(mut map) = store().slots.lock() else {
+        return;
+    };
+    if map.remove(&id).is_some() {
+        save_slots(&map);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +346,17 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                 },
             )),
             "export_auth_key_public_key" => match auth_key(device_id, body) {
-                Some(key) => Ok(data_result(op, OK, key.attk_pem.as_bytes())),
+                // 回的是「AuthKey 的自描述 + 签名」的信封，签名得用这一层的身份
+                // （也就是 ASK）私钥 —— App 是先拿 ASK 公钥再验这个的。只回一把
+                // 裸 PEM 的话，宿主拿它当信封解，解出来的是垃圾。
+                Some(auth) => {
+                    let counter = counter_for(&slot_id(device_id, uid_of(body)?));
+                    let document = key_doc(&auth.attk_pem, &product, counter, uid_of(body)?)?;
+                    let signature = key.sign(&document)?;
+                    let mut out = envelope_result(op, &document, &signature)?;
+                    out["layer"] = json!(layer);
+                    Ok(out)
+                }
                 None => Ok(code_result(op, NOT_FOUND)),
             },
             "generate_auth_key_pair" => {
@@ -250,16 +380,24 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                 if let Ok(mut map) = store().auth.lock() {
                     map.retain(|k, _| !k.starts_with(&prefix));
                 }
+                // 钥匙没了，槽位的钉子也跟着拔：下次哪一层服务它都算从头来。
+                unpin_layer(device_id, uid);
                 Ok(code_result(op, OK))
             }
             "generate_ask_key_pair" | "generate_attk_key_pair" => {
-                // keybox 层那把是服务端存的身份，不给它轮换；自签层就是换一把新的。
-                if layer != "self_signed" {
-                    return Err(anyhow!(
-                    "layer '{layer}' holds a stored identity, it cannot rotate the ASK/ATTK pair"
-                ));
+                // 自签层就是换一把新的。keybox 层那把是服务端存的身份，轮换不了
+                // —— 但也不能回错误：一报错调用方就往下换层，这个槽位的材料立刻
+                // 劈成两半。它的 ASK 本来就在，回成功，让流程留在这层里。
+                if layer == "self_signed" {
+                    rotate_self_signed_key()?;
+                } else {
+                    tracing::info!(
+                        "soter: layer={layer} 拿着服务端存的身份，{op} 不轮换、直接回成功"
+                    );
                 }
-                rotate_self_signed_key()?;
+                // 重建 ASK = 全新一轮流程（App 正在把旧的扔掉），槽位的钉子也该摘掉：
+                // 后面哪一层服务这一轮，它就重新钉到哪一层。
+                unpin_layer(device_id, uid_of(body)?);
                 Ok(code_result(op, OK))
             }
             "init_sign" => {
@@ -269,12 +407,11 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                     // 没有 AuthKey 就是没有，-5；跟真机上"这把钥匙不在"是同一个码。
                     return Ok(code_result(op, NOT_FOUND));
                 }
-                let challenge = body
+                let raw = body
                     .get("challenge")
                     .and_then(Value::as_str)
                     .unwrap_or("")
-                    .as_bytes()
-                    .to_vec();
+                    .to_string();
                 let session = {
                     let mut next = store()
                         .next_session
@@ -286,14 +423,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                         .sessions
                         .lock()
                         .map_err(|_| anyhow!("session lock poisoned"))?;
-                    sessions.insert(
-                        session,
-                        SignSession {
-                            uid,
-                            alias,
-                            challenge,
-                        },
-                    );
+                    sessions.insert(session, SignSession { uid, alias, raw });
                     session
                 };
                 Ok(json!({
@@ -323,8 +453,17 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                     Some(key) => key,
                     None => return Ok(code_result(op, NOT_FOUND)),
                 };
-                match key.sign(&sign_session.challenge) {
-                    Ok(signature) => Ok(data_result(op, OK, &signature)),
+                // 签的是那段 JSON 原文，不是 challenge 的字节；回「JSON + 签名」的信封
+                let counter = counter_for(&slot_id(device_id, sign_session.uid));
+                let document = sign_doc(
+                    &product,
+                    sign_session.uid,
+                    &sign_session.raw,
+                    counter,
+                    layer,
+                )?;
+                match key.sign(&document) {
+                    Ok(signature) => Ok(envelope_result(op, &document, &signature)?),
                     Err(e) => Err(e),
                 }
             }
@@ -389,32 +528,67 @@ fn counter_for(key: &str) -> u64 {
     *entry
 }
 
-fn ask_json(key: &MintKey, device_id: &str, counter: u64, uid: i32) -> Result<Vec<u8>> {
-    // 键序照现场抓到的来：pub_key / cpu_id / counter / uid / rsa_pss_saltlen。
-    // `uid` 在 SOTER 里是字符串，别写成数字。
+/// 一份自描述文档（ASK 或 AuthKey 的都用它）。键序照现场抓到的来：`pub_key` /
+/// `cpu_id` / `counter` / `uid` / `rsa_pss_saltlen`，`uid` 是字符串别写成数字。
+fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result<Vec<u8>> {
     let doc = json!({
-        "pub_key": key.attk_pem,
+        "pub_key": pub_key_pem,
         "cpu_id": device_id,
         "counter": counter,
         "uid": uid.to_string(),
         "rsa_pss_saltlen": ASK_SALT_LEN,
     });
-    serde_json::to_vec(&doc).context("failed to serialize the ASK document")
+    serde_json::to_vec(&doc).context("failed to serialize the key document")
+}
+
+/// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
+/// 都不能少 —— App 会把它们存下来当设备指纹。服务端两层是虚拟设备，指纹和 TEE
+/// 这几个字段没有真值，用固定值加这台设备派生的 fid 填，稳定可复现就行。
+fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64, layer: &str) -> Result<Vec<u8>> {
+    let doc = json!({
+        "raw": raw,
+        "fid": fid_of(cpu_id),
+        "counter": counter,
+        "tee_n": "ommega-server-soter",
+        "tee_v": env!("CARGO_PKG_VERSION"),
+        "fp_n": "server",
+        "fp_v": layer,
+        "cpu_id": cpu_id,
+        "uid": uid.to_string(),
+        "rsa_pss_saltlen": ASK_SALT_LEN,
+    });
+    serde_json::to_vec(&doc).context("failed to serialize the sign document")
+}
+
+/// 虚拟设备的指纹 id：跟真机一个形状（十位十进制），同一台设备每次都一样。
+fn fid_of(cpu_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ommega-server-soter-fid:");
+    hasher.update(cpu_id.as_bytes());
+    let digest = hasher.finalize();
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 4_000_000_000;
+    (1_000_000_000u64 + n as u64).to_string()
+}
+
+/// 信封应答：`[i32 le JSON 长度][JSON][256 字节签名]` —— 跟 B 端一个形状，
+/// A 端那一套解析就能直接用。
+fn envelope_result(op: &str, document: &[u8], signature: &[u8]) -> Result<Value> {
+    let mut data = Vec::with_capacity(4 + document.len() + signature.len());
+    data.extend_from_slice(&(document.len() as i32).to_le_bytes());
+    data.extend_from_slice(document);
+    data.extend_from_slice(signature);
+    let mut out = data_result(op, OK, &data);
+    out["json_bytes"] = json!(document.len());
+    out["signature"] = json!(b64(signature));
+    out["payload"] = serde_json::from_slice(document)?;
+    Ok(out)
 }
 
 fn ask_result(op: &str, layer: &str, key: &MintKey, device_id: &str, uid: i32) -> Result<Value> {
-    let counter = counter_for(&format!("{device_id}|{uid}"));
-    let document = ask_json(key, device_id, counter, uid)?;
+    let counter = counter_for(&slot_id(device_id, uid));
+    let document = key_doc(&key.attk_pem, device_id, counter, uid)?;
     let signature = key.sign(&document)?;
-    let mut data = Vec::with_capacity(4 + document.len() + signature.len());
-    data.extend_from_slice(&(document.len() as i32).to_le_bytes());
-    data.extend_from_slice(&document);
-    data.extend_from_slice(&signature);
-
-    let mut out = data_result(op, OK, &data);
-    out["json_bytes"] = json!(document.len());
-    out["signature"] = json!(b64(&signature));
-    out["payload"] = serde_json::from_slice(&document)?;
+    let mut out = envelope_result(op, &document, &signature)?;
     out["layer"] = json!(layer);
     Ok(out)
 }
@@ -624,6 +798,251 @@ mod tests {
             value.get("error").is_some(),
             "a keybox layer without RSA material must let the next layer try"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 闭环：每层都得把整个流程走完，而且签名那把钥匙和导出的公钥对得上
+    // -----------------------------------------------------------------------
+
+    /// 拆信封：`[i32 le JSON 长度][JSON][签名]`。
+    fn split_envelope(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let len = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        (data[4..4 + len].to_vec(), data[4 + len..].to_vec())
+    }
+
+    fn data_of(value: &Value) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(value["data"].as_str().expect("data is base64"))
+            .expect("payload decodes")
+    }
+
+    /// 从一份 JSON 里抠出 `pub_key` 的 PEM。
+    fn pem_of(document: &str) -> String {
+        const BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
+        const END: &str = "-----END PUBLIC KEY-----";
+        let start = document.find(BEGIN).expect("the document carries a pem");
+        let end = document.find(END).expect("the pem has a tail") + END.len();
+        document[start..end].replace("\\n", "\n")
+    }
+
+    /// 拿一把 PEM 公钥验一段签名（RSA-PSS-SHA256）。
+    fn verifies(pem: &str, message: &[u8], signature: &[u8]) -> bool {
+        use pkcs8::DecodePublicKey as _;
+        let Ok(public) = rsa::RsaPublicKey::from_public_key_pem(pem) else {
+            return false;
+        };
+        let Ok(signature) = PssSignature::try_from(signature) else {
+            return false;
+        };
+        PssVerifyingKey::<Sha256>::new(public)
+            .verify(message, &signature)
+            .is_ok()
+    }
+
+    /// 这一层的 ASK（也就是它的身份）公钥 PEM。
+    fn ask_pem(device: &str, uid: i64) -> String {
+        let ask = run(
+            "self_signed",
+            device,
+            &json!({ "op": "export_ask_public_key", "uid": uid }),
+            None,
+        )
+        .expect("ASK export is handled");
+        let (document, _) = split_envelope(&data_of(&ask));
+        pem_of(&String::from_utf8(document).expect("json is utf-8"))
+    }
+
+    /// 一把能当 keybox 身份的 RSA 私钥 PEM。
+    fn test_rsa_pem() -> String {
+        use rsa::pkcs8::EncodePrivateKey as _;
+        MintKey::generate()
+            .expect("keygen")
+            .private
+            .to_pkcs8_pem(pkcs8::LineEnding::LF)
+            .expect("pem")
+            .to_string()
+    }
+
+    #[test]
+    fn the_auth_key_document_is_signed_by_the_layer_identity() {
+        let device = "device-a-authdoc";
+        let uid = 10373i64;
+        let alias = "SoterAuthKeyPay";
+        assert_eq!(
+            run(
+                "self_signed",
+                device,
+                &json!({ "op": "generate_auth_key_pair", "uid": uid, "alias": alias }),
+                None,
+            )
+            .expect("handled")["error_code"],
+            json!(0)
+        );
+
+        let auth = run(
+            "self_signed",
+            device,
+            &json!({ "op": "export_auth_key_public_key", "uid": uid, "alias": alias }),
+            None,
+        )
+        .expect("handled");
+        let (document, signature) = split_envelope(&data_of(&auth));
+        assert_eq!(signature.len(), 256, "RSA-2048 signature is 256 bytes");
+
+        let text = String::from_utf8(document.clone()).expect("json is utf-8");
+        let order: Vec<usize> = ["pub_key", "cpu_id", "counter", "uid", "rsa_pss_saltlen"]
+            .iter()
+            .map(|k| text.find(&format!("\"{k}\"")).expect("key present"))
+            .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "key order changed: {text}"
+        );
+
+        // App 是先拿 ASK 公钥再验这个信封的 —— 验得过，AuthKey 这条链才算自洽
+        assert!(
+            verifies(&ask_pem(device, uid), &document, &signature),
+            "the AuthKey document must verify with the ASK key"
+        );
+    }
+
+    #[test]
+    fn the_sign_document_closes_the_loop() {
+        let device = "device-a-signdoc";
+        let uid = 10373i64;
+        let alias = "SoterAuthKeyPay";
+        assert_eq!(
+            run(
+                "self_signed",
+                device,
+                &json!({ "op": "generate_auth_key_pair", "uid": uid, "alias": alias }),
+                None,
+            )
+            .expect("handled")["error_code"],
+            json!(0)
+        );
+        let init = run(
+            "self_signed",
+            device,
+            &json!({ "op": "init_sign", "uid": uid, "alias": alias, "challenge": "0a1b2c3d" }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(init["error_code"], json!(0), "init_sign: {init}");
+        let session = init["session"].as_i64().expect("session is a number");
+
+        let finish = run(
+            "self_signed",
+            device,
+            &json!({ "op": "finish_sign", "session": session }),
+            None,
+        )
+        .expect("handled");
+        let (document, signature) = split_envelope(&data_of(&finish));
+        let text = String::from_utf8(document.clone()).expect("json is utf-8");
+
+        let order: Vec<usize> = [
+            "raw",
+            "fid",
+            "counter",
+            "tee_n",
+            "tee_v",
+            "fp_n",
+            "fp_v",
+            "cpu_id",
+            "uid",
+            "rsa_pss_saltlen",
+        ]
+        .iter()
+        .map(|k| text.find(&format!("\"{k}\":")).expect("key present"))
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "key order changed: {text}"
+        );
+        assert!(
+            text.contains("\"raw\":\"0a1b2c3d\""),
+            "raw 得是挑战原文，不是解出来的字节: {text}"
+        );
+
+        // 拿导出的 AuthKey 公钥验这段 JSON —— 验得过才叫闭环
+        let auth = run(
+            "self_signed",
+            device,
+            &json!({ "op": "export_auth_key_public_key", "uid": uid, "alias": alias }),
+            None,
+        )
+        .expect("handled");
+        let (auth_document, _) = split_envelope(&data_of(&auth));
+        let auth_pem = pem_of(&String::from_utf8(auth_document).expect("json is utf-8"));
+        assert!(
+            verifies(&auth_pem, &document, &signature),
+            "the sign document must verify with the AuthKey"
+        );
+    }
+
+    #[test]
+    fn the_keybox_layer_keeps_serving_a_generate_request() {
+        // 以前它回错误 ⇒ 调用方换层 ⇒ 同槽位的材料立刻劈成两半。
+        let pem = test_rsa_pem();
+        let value = run(
+            "keybox",
+            "device-a-keyboxgen",
+            &json!({ "op": "generate_ask_key_pair", "uid": 10373 }),
+            Some(&pem),
+        )
+        .expect("handled");
+        assert!(value.get("error").is_none(), "不该报错: {value}");
+        assert_eq!(value["error_code"], json!(0));
+    }
+
+    #[test]
+    fn slots_are_pinned_to_the_layer_that_served_them() {
+        let device = "device-a-pin-test";
+        assert!(pinned_layer(device, 4242).is_none());
+
+        pin_layer(device, 4242, "keybox");
+        assert_eq!(pinned_layer(device, 4242).as_deref(), Some("keybox"));
+
+        // 换层之后钉子跟着挑
+        pin_layer(device, 4242, "b");
+        assert_eq!(pinned_layer(device, 4242).as_deref(), Some("b"));
+
+        unpin_layer(device, 4242);
+        assert!(pinned_layer(device, 4242).is_none());
+
+        // 请求里没点名设备时不钉（route 到哪台都行的请求）
+        pin_layer("", 4242, "keybox");
+        assert!(pinned_layer("", 4242).is_none());
+    }
+
+    #[test]
+    fn a_rebuilt_ask_drops_the_slot_pin() {
+        let device = "device-a-pin-rebuild";
+        let uid = 5150i64;
+        pin_layer(device, uid as i32, "keybox");
+        assert_eq!(pinned_layer(device, uid as i32).as_deref(), Some("keybox"));
+
+        run(
+            "self_signed",
+            device,
+            &json!({ "op": "generate_ask_key_pair", "uid": uid }),
+            None,
+        )
+        .expect("handled");
+
+        assert!(
+            pinned_layer(device, uid as i32).is_none(),
+            "App 重建 ASK 的时候，槽位得重新评层，不能钉死在上一轮那一层"
+        );
+    }
+
+    #[test]
+    fn a_stale_pin_is_ignored() {
+        let now = 1_700_000_000_000i64;
+        assert!(pin_is_fresh(now, now));
+        assert!(pin_is_fresh(now, now + SLOT_PIN_TTL_MILLIS));
+        assert!(!pin_is_fresh(now, now + SLOT_PIN_TTL_MILLIS + 1));
     }
 
     #[test]

@@ -53,6 +53,12 @@ pub struct Config {
     /// 代价：b 端若需要重试回传（最多 4×33s + 7s 退避），这次结果可能晚于 a 端
     /// 超时，就作废了 —— 但那时 a 端已经从回退层拿到一条能用的链。
     pub wait_result_timeout_secs: u64,
+    /// SOTER 单独用一份等待超时（`RELAY_SOTER_WAIT_RESULT_TIMEOUT`，默认 15）。
+    ///
+    /// 认证那条路等不到 B 就换层是好事（回退层给的链能用，还能快一点），SOTER
+    /// 不一样：同一个槽位的 ASK / AuthKey / 签名必须出自同一层，早一步换层就是
+    /// 给 App 递了另一把钥匙。所以 SOTER 多等一会儿，宁可慢也别换错身份。
+    pub soter_wait_result_timeout_secs: u64,
     /// Long-poll default timeout, seconds.
     pub poll_timeout_secs: u64,
     /// MySQL connection URL: `mysql://user:pass@host:port/dbname`
@@ -112,6 +118,7 @@ impl Default for Config {
             attest_source: "physical".to_string(),
             assignment_timeout_secs: 3,
             wait_result_timeout_secs: 3,
+            soter_wait_result_timeout_secs: 15,
             poll_timeout_secs: 30,
             mysql_url: String::new(),
             mysql_time_zone: "+08:00".to_string(),
@@ -245,6 +252,8 @@ impl Config {
         }
         cfg.assignment_timeout_secs = env_u64("RELAY_ASSIGNMENT_TIMEOUT", 3);
         cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 3);
+        cfg.soter_wait_result_timeout_secs =
+            env_u64("RELAY_SOTER_WAIT_RESULT_TIMEOUT", 15).max(cfg.wait_result_timeout_secs);
         cfg.poll_timeout_secs = env_u64("RELAY_POLL_TIMEOUT", 30);
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_MYSQL_URL") {
             cfg.mysql_url = v;

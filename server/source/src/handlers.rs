@@ -115,12 +115,20 @@ fn check_auth(
 /// Enqueue a task for an already-resolved target and wait for the B-side
 /// result.  Shared by the layer helper and the SOTER path (which resolves its
 /// target by capability instead of by load only).
-async fn enqueue_and_wait(state: &AppState, task_type: &str, body: &Value, target: &str) -> Value {
+/// 入队并等 B 端结果。`timeout_secs` 由调用方给：认证（attest）要快速失败好让回退
+/// 阶梯接手，SOTER 反而要宽一点 —— 早一步换层等于给同一个槽位换了身份。
+async fn enqueue_and_wait(
+    state: &AppState,
+    task_type: &str,
+    body: &Value,
+    target: &str,
+    timeout_secs: u64,
+) -> Value {
     let task_id = state
         .store
         .create_task(task_type, body.clone(), target)
         .await;
-    let timeout = Duration::from_secs(state.cfg.wait_result_timeout_secs);
+    let timeout = Duration::from_secs(timeout_secs);
     match state.store.wait_for_result(&task_id, timeout).await {
         Some(mut result) => {
             if let Some(obj) = result.as_object_mut() {
@@ -169,7 +177,16 @@ async fn try_b_device_layer(
             }
         );
     }
-    Some(enqueue_and_wait(state, task_type, body, &target).await)
+    Some(
+        enqueue_and_wait(
+            state,
+            task_type,
+            body,
+            &target,
+            state.cfg.wait_result_timeout_secs,
+        )
+        .await,
+    )
 }
 
 /// Whether the A-side request explicitly asked for StrongBox (security_level=2).
@@ -749,7 +766,31 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     };
 
     let mut last_error: Option<String> = None;
-    for &layer in order {
+
+    // 这个槽位已经定过层就把它排到最前面：同一槽位的材料必须只出自一层，否则 App
+    // 手里会出现一半 B 的一半 keybox 的状态（导出的公钥和签名的私钥都对不上）。
+    // 它这会儿不灵就照旧往下换 —— 换层是策略，只是换成了钉子跟着挪。
+    let uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+    let mut layers: Vec<&str> = Vec::with_capacity(order.len());
+    if let (false, Some(uid)) = (requested.is_empty(), uid) {
+        if let Some(pinned) = crate::soter_mint::pinned_layer(requested, uid) {
+            if let Some(pos) = order.iter().position(|layer| *layer == pinned) {
+                layers.push(order[pos]);
+                layers.extend(
+                    order
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != pos)
+                        .map(|(_, layer)| *layer),
+                );
+            }
+        }
+    }
+    if layers.is_empty() {
+        layers.extend(order.iter().copied());
+    }
+
+    for &layer in &layers {
         let result = match layer {
             "b" => try_b_soter_layer(state, body, requested).await,
             "keybox" | "self_signed" => run_layer_soter(state, layer, body, requested).await,
@@ -758,6 +799,10 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         match result {
             Some(v) if v.get("error").is_none() => {
                 tracing::info!("soter: op={op} layer={layer} ok");
+                // 谁服务了这个槽位就把它钉在谁身上，下次先问它。
+                if let Some(uid) = uid {
+                    crate::soter_mint::pin_layer(requested, uid, layer);
+                }
                 return Json(v).into_response();
             }
             Some(v) => {
@@ -799,7 +844,16 @@ async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> O
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
         );
     }
-    Some(enqueue_and_wait(state, "soter", body, &target).await)
+    Some(
+        enqueue_and_wait(
+            state,
+            "soter",
+            body,
+            &target,
+            state.cfg.soter_wait_result_timeout_secs,
+        )
+        .await,
+    )
 }
 
 /// 服务端那两层：`keybox` 层得先从库里把这台设备名下的服务端身份私钥拿出来
