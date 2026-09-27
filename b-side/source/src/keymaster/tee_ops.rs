@@ -22,9 +22,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -139,7 +138,11 @@ fn sessions_dir() -> PathBuf {
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
 const SESSION_MAX_FILES: usize = 2000;
 /// 每这么多次保存做一轮清理（启动时另有一轮，见 `load_all_sessions`）。
-const SESSION_PRUNE_EVERY: usize = 200;
+/// 运行时清理的节流间隔。清一遍是 read_dir + 对每个文件 stat，几百次系统
+/// 调用；丢在 keygen 的结果路径上会直接拖住正在等答复的 A 端，所以改成按时间
+/// 节流 —— 不管来多少任务，最多每 10 分钟清一次就够（磁盘上限本来就还有个
+/// 文件数封顶兜着）。
+const SESSION_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// 清理会话文件：先按 mtime 从旧到新排序，超 TTL 的或超出数量上限的都删掉，
 /// 于是留下来的总是最新的那一批。全程 best-effort —— 删不掉就当没发生过，
@@ -263,11 +266,22 @@ fn save_session_to_disk(alias: &str, session: &TeeSession) {
         "hal_service": hal_service_label,
     });
     let _ = std::fs::write(&path, serde_json::to_string(&value).unwrap_or_default());
-    // 运行时也要收着点：每 SESSION_PRUNE_EVERY 次保存清一轮，否则一个长期
-    // 在线的设备还是会一直堆下去。
-    static SAVES: AtomicUsize = AtomicUsize::new(0);
-    if SAVES.fetch_add(1, Ordering::Relaxed) % SESSION_PRUNE_EVERY == SESSION_PRUNE_EVERY - 1 {
-        prune_sessions();
+    {
+        static LAST_PRUNE: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut guard = LAST_PRUNE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = match guard.as_ref() {
+            Some(last) => last.elapsed() >= SESSION_PRUNE_INTERVAL,
+            None => true,
+        };
+        if due {
+            *guard = Some(Instant::now());
+        }
+        drop(guard);
+        if due {
+            prune_sessions();
+        }
     }
 }
 

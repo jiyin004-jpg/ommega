@@ -44,7 +44,7 @@
 
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use x509_cert::der::Decode as _;
 
 use anyhow::{anyhow, Context, Result};
@@ -254,7 +254,9 @@ fn parse_log_level(v: &str) -> Option<log::LevelFilter> {
 /// previous behaviour.
 fn parse_log_config(raw: &str) -> (bool, log::LevelFilter, bool, log::LevelFilter) {
     let mut file_enabled = true;
-    let mut file_level = log::LevelFilter::Debug;
+    // 默认 info：debug 是排查时手动开的。文件 sink 每条记录要 flock + stat +
+    // write + flush，常驻进程里默认开着不划算。
+    let mut file_level = log::LevelFilter::Info;
     let mut logcat_enabled = true;
     let mut logcat_level = log::LevelFilter::Info;
     for line in raw.lines() {
@@ -285,7 +287,7 @@ fn parse_log_config(raw: &str) -> (bool, log::LevelFilter, bool, log::LevelFilte
 
 /// Read the logging switches *before* the full RelayConfig is loaded/validated,
 /// so a broken relay.conf still honours its log settings while reporting the
-/// error. Order: relay.conf -> environment -> defaults (file log on debug,
+/// error. Order: relay.conf -> environment -> defaults (file log on info,
 /// logcat on info).
 fn preload_log_config() -> (bool, log::LevelFilter, bool, log::LevelFilter) {
     if let Ok(raw) = std::fs::read_to_string(CONF_PATH) {
@@ -296,7 +298,7 @@ fn preload_log_config() -> (bool, log::LevelFilter, bool, log::LevelFilter) {
         .unwrap_or(true);
     let file_level = env("OMMEGA_RELAY_LOG_LEVEL")
         .and_then(|v| parse_log_level(&v))
-        .unwrap_or(log::LevelFilter::Debug);
+        .unwrap_or(log::LevelFilter::Info);
     let logcat_enabled = env("OMMEGA_RELAY_LOGCAT_ENABLED")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(true);
@@ -896,6 +898,12 @@ fn spawn_config_watcher(shared: Arc<RwLock<RelayConfig>>, last_mtime: u64) {
 }
 
 fn run_loop(shared: Arc<RwLock<RelayConfig>>) {
+    // 正常情况下服务端会挂着 20s 长轮询，一轮一个请求。但它要是立刻回 204
+    // （老版本服务端、代理提前收掉连接等），这里不设下限就变成“能跑多快跑多快”，
+    // 直接把服务器打满。失败路径同理，用指数退避兜住。
+    const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(30);
+    let mut error_backoff = Duration::from_secs(1);
     loop {
         // Read the latest live config (may be updated by the watcher).
         let cfg = match shared.read() {
@@ -906,17 +914,27 @@ fn run_loop(shared: Arc<RwLock<RelayConfig>>) {
                 continue;
             }
         };
+        let started = Instant::now();
         match poll_tasks(&cfg) {
             Ok(Some((task_id, task_type, payload))) => {
+                error_backoff = Duration::from_secs(1);
                 log::info!("poll received task {task_id} type={task_type}");
                 if let Err(e) = handle_task(&cfg, &task_id, &task_type, &payload) {
                     log::error!("handle_task failed: {e:#}");
                 }
             }
-            Ok(None) => { /* long poll timed out, loop again */ }
+            Ok(None) => {
+                // 立刻返回的空轮询说明长轮询没生效，压到最小间隔再打。
+                error_backoff = Duration::from_secs(1);
+                let waited = started.elapsed();
+                if waited < MIN_POLL_INTERVAL {
+                    std::thread::sleep(MIN_POLL_INTERVAL - waited);
+                }
+            }
             Err(e) => {
-                log::warn!("poll failed: {e:#}; retrying");
-                std::thread::sleep(Duration::from_millis(1000));
+                log::warn!("poll failed: {e:#}; retrying in {error_backoff:?}");
+                std::thread::sleep(error_backoff);
+                error_backoff = (error_backoff * 2).min(MAX_ERROR_BACKOFF);
             }
         }
     }

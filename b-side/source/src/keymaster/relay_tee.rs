@@ -19,9 +19,10 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -164,19 +165,58 @@ fn join_capped(items: &[String], max: usize, max_chars: usize) -> String {
 /// cannot: is the service declared in the VINTF manifest at all, which AIDL
 /// instances are actually registered, and does the device ship HIDL keymaster
 /// client libraries (i.e. is it an AIDL-KeyMint-less legacy device)?
+///
+/// 体检本身要发 SM 查询、列服务、扫四个 HIDL 目录，不便宜；而一台机器上失败
+/// 原因基本不变。所以按 service 名缓存 10 秒 —— StrongBox 机型每个强箱请求都
+/// 会在查找失败后走到这里，一遍遍重算纯属浪费。
+const DIAGNOSIS_TTL: Duration = Duration::from_secs(10);
+
 pub fn keymint_diagnosis(service: &str) -> String {
-    format!(
+    static CACHE: Mutex<Option<(Instant, String, String)>> = Mutex::new(None);
+    {
+        let guard = CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((stamp, cached_service, text)) = guard.as_ref() {
+            if cached_service == service && stamp.elapsed() < DIAGNOSIS_TTL {
+                return text.clone();
+            }
+        }
+    }
+    let text = format!(
         "decl={} aidl={} hidl_km={}",
         hub::is_declared(service),
         join_capped(&keymint_aidl_instances(), 2, 60),
         join_capped(&hidl_keymaster_versions(), 2, 24),
-    )
+    );
+    let mut guard = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some((Instant::now(), service.to_string(), text.clone()));
+    text
+}
+
+/// Interned copy of an instance name, so `&'static str`-keyed caches can hold
+/// it without leaking a fresh allocation every call.
+fn intern_instance(name: String) -> &'static str {
+    static INTERNED: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+    let mut guard = INTERNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    if let Some(existing) = set.get(name.as_str()) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
 /// The single non-`default`, non-`strongbox` AIDL KeyMint instance registered
-/// for the requested interface, if there is exactly one.  The name is leaked so
-/// it can key the `&'static str`-keyed proxy cache; the set of instance names a
-/// device has is tiny and fixed, so this cannot grow unboundedly.
+/// for the requested interface, if there is exactly one.  The name is interned
+/// so it can key the `&'static str`-keyed proxy cache; the set of instance names
+/// a device has is tiny and fixed, but re-leaking one on every failed lookup
+/// (which happens on every StrongBox request) was a slow leak.
 fn sole_alternate_instance(service: &str) -> Option<&'static str> {
     let (iface, _) = service.rsplit_once('/')?;
     let short = iface.rsplit('.').next()?;
@@ -198,7 +238,7 @@ fn sole_alternate_instance(service: &str) -> Option<&'static str> {
         }
         found = Some(format!("{iface}/{instance}"));
     }
-    found.map(|name| &*Box::leak(name.into_boxed_str()))
+    found.map(intern_instance)
 }
 
 /// Connects to the requested KeyMint service, mirroring AOSP `keystore2`'s
