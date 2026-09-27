@@ -708,6 +708,12 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         _ => true,
     };
 
+    // SOTER uid 替身映射（`soter_uid_map: 10490=10373`）。不解析成结构：这里只负责把
+    // 原串交给 `soter_relay`，解析 + 单测都在那边，免得两处对格式的理解跑偏。
+    let soter_uid_map = get(&["soter_uid_map", "soter_uid_replace"])
+        .unwrap_or_default()
+        .to_string();
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
@@ -719,6 +725,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         hide_strongbox,
         soter_hide,
         soter_inject,
+        soter_uid_map,
     })
 }
 
@@ -797,6 +804,14 @@ pub struct RemoteConfig {
     /// explicitly in the WebUI.
     #[serde(default)]
     pub soter_inject: bool,
+    /// SOTER uid 的替身映射，写 `A 端 uid=B 端 uid`（逗号分隔多条），也会写进
+    /// RemoteConfig 的一份副本里。为什么需要它：SOTER 的身份是 `(cpu_id, uid)` 一起绑的，
+    /// B 的 store 里只有它自己那套应用的密钥（本机实测：B 上只有 10373 那把 = B 自己的
+    /// 微信，其余 uid 全 `-5`）。拿 A 端微信的 10490 去问 B，问到的必然是「没有」。
+    ///
+    /// 没配就原样转发（不做任何推断：uid 猜错了答出来的东西更坑）。
+    #[serde(default)]
+    pub soter_uid_map: String,
 }
 
 impl Default for RemoteConfig {
@@ -815,6 +830,7 @@ impl Default for RemoteConfig {
             hide_strongbox: false,
             soter_hide: false,
             soter_inject: false,
+            soter_uid_map: String::new(),
         }
     }
 }

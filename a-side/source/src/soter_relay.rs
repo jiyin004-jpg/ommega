@@ -41,7 +41,7 @@ pub fn forward(request: &str) -> Vec<u8> {
         return Outcome::Local.encode();
     }
 
-    match RemoteRelay::soter(&value) {
+    match RemoteRelay::soter(&request_value(&value, op.as_str())) {
         Ok(Some(reply)) => match encode_reply(&op, &reply) {
             Some(outcome) => {
                 let code = reply.get("error_code").and_then(Value::as_i64).unwrap_or(0);
@@ -85,6 +85,72 @@ fn out_bytes(outcome: &Outcome) -> usize {
         Outcome::Buffer { data, .. } => data.as_ref().map(Vec::len).unwrap_or(0),
         Outcome::Init { .. } => 8,
         _ => 0,
+    }
+}
+
+/// SOTER 的身份是 `(cpu_id, uid)` 一起绑的：B 的密钥库里只有它自己那套应用的密钥
+/// （本机实测：B 上只有 10373 那把 = B 自己的微信，其余 uid 全 `-5`，而 ASK 的 JSON 里
+/// 钉着 `"uid":"10373"` 和 B 自己的 cpu_id）。所以设备替身这条线上，拿 A 端那个 uid
+/// 去问 B 必然问不到 —— 得按 B 自己的身份问。
+///
+/// 这就是那张表存在的理由（`soter_uid_map: 10490=10373`，逗号/分号/空格分隔多条，
+/// 每条的 `A=B` 里 `=` 也可以写成 `:` 或 `->`）。没配就不动：uid 猜错了答出来的东西
+/// 比「没有」更坑。
+fn apply_uid_map(value: &Value, raw: &str) -> Option<Value> {
+    let from = value.get("uid").and_then(Value::as_i64)?;
+    let to = parse_uid_map(raw).into_iter().find(|(a, _)| *a == from)?.1;
+    let mut mapped = value.clone();
+    mapped["uid"] = Value::from(to);
+    Some(mapped)
+}
+
+/// 解析映射表；不认得的部分直接丢（配置写错一个字符不该把整条远程链路弄挂）。
+pub(crate) fn parse_uid_map(raw: &str) -> Vec<(i64, i64)> {
+    let mut pairs = Vec::new();
+    for entry in raw.split([',', ';', '\n']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (a, b) = match entry.split_once('=') {
+            Some(split) => split,
+            None => match entry.split_once("->") {
+                Some(split) => split,
+                None => match entry.split_once(':') {
+                    Some(split) => split,
+                    None => continue,
+                },
+            },
+        };
+        let (Ok(a), Ok(b)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) else {
+            continue;
+        };
+        if !pairs.contains(&(a, b)) {
+            pairs.push((a, b));
+        }
+    }
+    pairs
+}
+
+/// 转发前的最后一步：按配置里的映射表把请求的 uid 换成 B 端对应的那个。
+///
+/// 换成功了记一行 info —— 拿 A 的 uid 去问 B 得到的是「没有」，换完才拿得到真材料，
+/// 这条日志是区分这两种情况的唯一依据。
+fn request_value(value: &Value, op: &str) -> Value {
+    let raw = match crate::config::config().read() {
+        Ok(cfg) => cfg.remote.soter_uid_map.clone(),
+        Err(_) => String::new(),
+    };
+    match apply_uid_map(value, &raw) {
+        Some(mapped) => {
+            log::info!(
+                "event=soter relay op={op} uid {} -> {} (B 端那个同名应用)",
+                value.get("uid").and_then(Value::as_i64).unwrap_or(-1),
+                mapped.get("uid").and_then(Value::as_i64).unwrap_or(-1),
+            );
+            mapped
+        }
+        None => value.clone(),
     }
 }
 
@@ -202,6 +268,50 @@ mod tests {
             None
         );
         assert_eq!(encode_reply("init_sign", &json!({"session": 1})), None);
+    }
+
+    #[test]
+    fn a_uid_map_entry_moves_the_request_to_the_other_device() {
+        let value = json!({"op": "export_ask_public_key", "uid": 10490});
+        let mapped = apply_uid_map(&value, "10490=10373").expect("a mapped uid must move");
+        assert_eq!(mapped["uid"], json!(10373));
+        // 原请求不动（调用方还要用它记日志）。
+        assert_eq!(value["uid"], json!(10490));
+    }
+
+    #[test]
+    fn an_unmapped_uid_is_left_alone() {
+        let value = json!({"op": "export_ask_public_key", "uid": 10490});
+        assert_eq!(apply_uid_map(&value, ""), None);
+        assert_eq!(apply_uid_map(&value, "10491=10373"), None);
+        // 没有 uid 的说法（getDeviceId 这类）自然也不动。
+        assert_eq!(
+            apply_uid_map(&json!({"op": "get_device_id"}), "10490=10373"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_spelling_of_the_map_is_accepted() {
+        assert_eq!(parse_uid_map("10490=10373"), vec![(10490, 10373)]);
+        assert_eq!(parse_uid_map("10490:10373"), vec![(10490, 10373)]);
+        assert_eq!(parse_uid_map("10490->10373"), vec![(10490, 10373)]);
+        assert_eq!(
+            parse_uid_map("10490=10373, 10123 = 10102;"),
+            vec![(10490, 10373), (10123, 10102)]
+        );
+        // 同一对写两遍只算一条，顺序无关。
+        assert_eq!(parse_uid_map("1=2,1=2"), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn a_malformed_entry_is_dropped_not_fatal() {
+        assert_eq!(parse_uid_map("乱写"), Vec::new());
+        assert_eq!(parse_uid_map("10490="), Vec::new());
+        assert_eq!(parse_uid_map("=10373"), Vec::new());
+        assert_eq!(parse_uid_map("10490=abc"), Vec::new());
+        // 坏了一条，好的那一条还得留着。
+        assert_eq!(parse_uid_map("乱写,10490=10373"), vec![(10490, 10373)]);
     }
 
     #[test]
