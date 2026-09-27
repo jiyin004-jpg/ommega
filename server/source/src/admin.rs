@@ -898,7 +898,7 @@ pub struct AutoKeyboxCoverSourceBody {
 
 /// POST /api/admin/autokeybox/cover/source/ — choose which Auto Keybox source
 /// feeds the auto-cover step: `"auto"` (all sources, later wins per algorithm)
-/// or a configured source name such as `"yurikey"` / `"kow"`.
+/// or a configured source name such as `"yurikey"` / `"public"`.
 pub async fn admin_autokeybox_cover_source(
     State(state): State<AppState>,
     headers: HeaderMap,

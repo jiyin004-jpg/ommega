@@ -42,7 +42,10 @@ fn device_ids() -> &'static Mutex<HashMap<String, String>> {
             "yurikey".to_string(),
             env("KEYBOX_DEVICE_B1_ID", "device-b-1"),
         );
-        m.insert("kow".to_string(), env("KEYBOX_DEVICE_B2_ID", "device-b-2"));
+        m.insert(
+            "public".to_string(),
+            env("KEYBOX_DEVICE_B2_ID", "device-b-2"),
+        );
         Mutex::new(m)
     })
 }
@@ -119,6 +122,16 @@ pub fn set_device_id(name: &str, device_id: &str) {
     crate::util::mu(device_ids()).insert(name.to_string(), device_id.to_string());
 }
 
+/// 公开源默认的仓库搜索入口。匿名 search 接口是 10 次/分钟，这里两小时才打一
+/// 次，余量很大。
+const DEFAULT_PUBLIC_SEARCH_URL: &str =
+    "https://api.github.com/search/repositories?q=keybox&sort=updated&per_page=30";
+/// 一轮最多看几个仓库、最多收几条身份 —— 别让一轮刷新跑太久。
+const PUBLIC_MAX_REPOS: usize = 20;
+pub const PUBLIC_MAX_IDENTITIES: usize = 6;
+/// keybox 文件在仓库里就这几个常见位置。
+const PUBLIC_PATHS: &[&str] = &["keybox.xml", "keybox", "module/keybox.xml"];
+
 /// A single configured upstream keybox source.
 #[derive(Debug, Clone)]
 pub struct KeyboxSource {
@@ -131,6 +144,11 @@ pub struct KeyboxSource {
     /// with `identity`/`status`); valid entries are downloaded individually and
     /// matched to `device_id` with `-1`, `-2`, ... suffixes.
     pub api_list: bool,
+    /// When true, `url_primary` is a GitHub repository-search API. Every hit is
+    /// probed for a keybox file at the usual paths and the first usable one is
+    /// stored. `search/repositories` needs no auth, and the raw file fetches
+    /// consume no API quota, so this stays well inside the anonymous limits.
+    pub search_repos: bool,
 }
 
 /// Build the configured sources from environment variables (URLs) and the
@@ -147,60 +165,58 @@ pub fn configured_sources() -> Vec<KeyboxSource> {
             ),
             url_mirror: env(
                 "KEYBOX_YURI_MIRROR_URL",
-                "https://hub.gitmirror.com/raw.githubusercontent.com/Yurii0307/yurikey/main/key",
+                "https://gh-proxy.com/https://raw.githubusercontent.com/Yurii0307/yurikey/main/key",
             ),
             decode_hex: false,
             api_list: false,
+            search_repos: false,
         },
         KeyboxSource {
-            name: "kow".to_string(),
-            device_id: device_id_for("kow"),
-            url_primary: env("KEYBOX_KOW_URL", "https://keybox.kowx712.cc/api/keyboxes"),
-            url_mirror: env(
-                "KEYBOX_KOW_MIRROR_URL",
-                "https://keybox.kowx712.cc/api/keyboxes",
-            ),
+            name: "public".to_string(),
+            device_id: device_id_for("public"),
+            url_primary: env("KEYBOX_PUBLIC_SEARCH_URL", DEFAULT_PUBLIC_SEARCH_URL),
+            // 仓库里的 keybox 文件是直接取 raw 的（不走 API 配额），所以这一项是
+            // 取文件失败时换哪个镜像，而不是 API 镜像。
+            url_mirror: env("KEYBOX_PUBLIC_MIRROR", "https://gh-proxy.com/"),
             decode_hex: false,
-            api_list: true,
+            api_list: false,
+            search_repos: true,
         },
     ]
 }
 
 /// Fetch a URL over http/https, returning the body text.
+///
+/// 走系统 curl，不用 reqwest：这个机房里的 reqwest（rustls）过不了 Cloudflare 的
+/// bot 检查（raw / gh-proxy / jsdelivr 都在它后面），会一直挂到超时；curl 每次都是
+/// 秒回。另外这台机器会把某些域名只解析出 IPv6，而它的 IPv6 是不通的 —— curl 自己
+/// 会退回 IPv4，reqwest 不会。`-f` 是为了让 404/403 直接算失败，别把错误页当成
+/// keybox 内容往下解析。
 fn http_get(url: &str, timeout: Duration) -> anyhow::Result<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .user_agent("Mozilla/5.0")
-        .build()?;
-    let resp = client.get(url).send()?;
-    let bytes = resp.bytes()?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let secs = timeout.as_secs().max(1).to_string();
+    let out = std::process::Command::new("curl")
+        .args(["-sSfL", "--max-time", &secs, url])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "curl exit={:?} {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Fetch from primary, then mirror, then GitHub-mirror rewrites.
+/// Fetch the source body.
+///
+/// 候选顺序按「实测能通的排前面」：raw.githubusercontent.com 直连在这台机器上要么
+/// 30s 超时、要么被 CF 挡，几家公共镜像反而秒回，所以主址是 raw 链接时把它压到最后
+/// 兜底；主址不是 raw 的（API 类源）还是主址优先。重复的地址去掉，少打几个空包。
 fn fetch_source(src: &KeyboxSource) -> anyhow::Result<String> {
-    let mut candidates: Vec<String> = vec![src.url_primary.clone()];
-    if !src.url_mirror.is_empty() {
-        candidates.push(src.url_mirror.clone());
-    }
-    for u in [src.url_primary.clone(), src.url_mirror.clone()] {
-        if u.contains("raw.githubusercontent.com") {
-            candidates.push(u.replace(
-                "raw.githubusercontent.com",
-                "ghproxy.com/https://raw.githubusercontent.com",
-            ));
-            candidates.push(u.replace(
-                "raw.githubusercontent.com",
-                "raw.gitmirror.com/raw.githubusercontent.com",
-            ));
-        }
-    }
+    let candidates = fetch_candidates(src);
 
     let mut last_err: Option<anyhow::Error> = None;
     for (i, url) in candidates.iter().enumerate() {
-        if url.is_empty() {
-            continue;
-        }
         if i > 0 {
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -213,6 +229,28 @@ fn fetch_source(src: &KeyboxSource) -> anyhow::Result<String> {
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no candidate URL")))
+}
+
+/// 「试哪个地址」的排序，和网络分开，方便直接钉住顺序。
+fn fetch_candidates(src: &KeyboxSource) -> Vec<String> {
+    let published = raw_url_mirrors(&src.url_primary);
+    let mut candidates: Vec<String> = Vec::new();
+    if published.is_empty() {
+        candidates.push(src.url_primary.clone());
+        if !src.url_mirror.is_empty() {
+            candidates.push(src.url_mirror.clone());
+        }
+    } else {
+        candidates.extend(published);
+        if !src.url_mirror.is_empty() {
+            candidates.push(src.url_mirror.clone());
+        }
+        candidates.push(src.url_primary.clone());
+    }
+    candidates.extend(raw_url_mirrors(&src.url_mirror));
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|u| !u.is_empty() && seen.insert(u.clone()));
+    candidates
 }
 
 /// Decode hex- or base64-wrapped payloads (mirrors `_maybe_decode_ns_payload`).
@@ -260,27 +298,39 @@ fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
 /// Normalise raw source text into a keybox-XML-compatible payload.
 fn build_keybox_xml(source_text: &str, source_name: &str) -> String {
     let raw = source_text.trim();
-    if raw.starts_with("<?xml") && raw.contains("<Key") {
+    // 已经是 keybox XML 就直接过。别只认 `<?xml` 开头 —— 有些源（yurikey 那个就是
+    // base64 解出来的）省了声明，直接 `<AndroidAttestation>` 开头；漏判就会掉进下面
+    // 的 PEM 合成分支，拼出来的证书链是空的，白拿一份材料还过不了校验。
+    if raw.contains("<AndroidAttestation") || raw.contains("<Keybox") {
         return raw.to_string();
     }
     // Extract PEM blocks from wrapped text and synthesise a minimal keybox XML.
     let pem_blocks = extract_pem_blocks(raw);
-    if !pem_blocks.is_empty() {
-        let mut keys = Vec::new();
-        for block in pem_blocks {
-            if block.contains("BEGIN CERTIFICATE") {
-                continue;
-            }
-            keys.push(format!(
-                "  <Key>\n    <PrivateKey>{block}</PrivateKey>\n    <CertificateChain>\n    </CertificateChain>\n  </Key>"
+    let certs: Vec<&String> = pem_blocks
+        .iter()
+        .filter(|b| b.contains("BEGIN CERTIFICATE"))
+        .collect();
+    let keys: Vec<&String> = pem_blocks
+        .iter()
+        .filter(|b| !b.contains("BEGIN CERTIFICATE"))
+        .collect();
+    if !keys.is_empty() {
+        // 证书按顺序挂在每把钥匙下面（通常这种文件里就一对）。没有证书的话链就是
+        // 空的，入库校验会把它挡掉 —— 但至少形状是完整的，日志能看出是被校验拒的。
+        let chain: String = certs
+            .iter()
+            .map(|c| format!("      <Certificate format=\"pem\">{c}      </Certificate>\n"))
+            .collect();
+        let mut out = Vec::new();
+        for k in keys {
+            out.push(format!(
+                "  <Key>\n    <PrivateKey>{k}</PrivateKey>\n    <CertificateChain>\n{chain}    </CertificateChain>\n  </Key>"
             ));
         }
-        if !keys.is_empty() {
-            return format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AndroidAttestation source=\"{source_name}\">\n{}\n</AndroidAttestation>\n",
-                keys.join("\n")
-            );
-        }
+        return format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AndroidAttestation source=\"{source_name}\">\n{}\n</AndroidAttestation>\n",
+            out.join("\n")
+        );
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AndroidAttestation source=\"{source_name}\">\n  <Raw><![CDATA[\n{raw}\n  ]]></Raw>\n</AndroidAttestation>\n"
@@ -313,6 +363,9 @@ fn extract_pem_blocks(text: &str) -> Vec<String> {
 
 /// Refresh a single source: fetch -> decode -> parse -> store.
 pub fn refresh_one(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
+    if src.search_repos {
+        return refresh_public_source(src, db);
+    }
     if src.api_list {
         return refresh_api_list_source(src, db);
     }
@@ -350,6 +403,178 @@ pub fn refresh_one(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
         stored.len()
     );
     stored
+}
+
+/// 采到的第 `taken` 份材料（从 0 起）挂在哪个 device_id 下。
+///
+/// A 端取公开 keybox 的路由扫的是主 id 加 `-1…-(PUBLIC_MAX_IDENTITIES-1)`，所以
+/// 编号必须是「第几份材料」而不是仓库下标 —— 用下标的话第一份常常落在够不着的
+/// 号上，采了跟没采一样。
+pub fn public_device_id(base: &str, taken: usize) -> String {
+    if taken == 0 {
+        base.to_string()
+    } else {
+        format!("{base}-{taken}")
+    }
+}
+
+/// 采集公开仓库里的 keybox。
+///
+/// 只花一次 API 调用（搜仓库），之后按常见路径直连 raw / CDN 取文件 —— 那些请求不
+/// 算 GitHub API 配额，所以可以放心多试几个仓库和几个路径。拿到内容后走和其它源一
+/// 样的解析 + 校验 + 入库流程，坏数据进不了池子。
+fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
+    let body = match public_http_get(&src.url_primary, 25) {
+        Some(b) => b,
+        None => {
+            tracing::warn!("autokeybox public search failed url={}", src.url_primary);
+            return Vec::new();
+        }
+    };
+    let repos: Vec<(String, String)> = match serde_json::from_str::<Value>(&body) {
+        Ok(Value::Object(o)) => o
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|it| {
+                        let full = it.get("full_name").and_then(Value::as_str)?;
+                        let br = it
+                            .get("default_branch")
+                            .and_then(Value::as_str)
+                            .unwrap_or("main");
+                        Some((full.to_string(), br.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if repos.is_empty() {
+        tracing::warn!("autokeybox public search empty source={}", src.name);
+        return Vec::new();
+    }
+    tracing::info!(
+        "autokeybox public search source={} repos={}",
+        src.name,
+        repos.len()
+    );
+
+    let mut stored: Vec<KeyboxData> = Vec::new();
+    let mut tried = 0usize;
+    // 采到材料的第几个仓库 —— 编号要用这个，不是仓库下标。用下标的话第一份材料
+    // 往往落在 device-b-2-9 这种位置，而 A 端取公开 keybox 的接口只扫主 id 和
+    // -1/-2/-3，那份材料就等于白采了。
+    let mut taken = 0usize;
+    'outer: for (full, br) in repos.iter().take(PUBLIC_MAX_REPOS) {
+        for path in PUBLIC_PATHS {
+            for url in public_file_urls(src, full, br, path) {
+                tried += 1;
+                let txt = match public_http_get(&url, 8) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if !(txt.contains("BEGIN CERTIFICATE") || txt.contains("<AndroidAttestation")) {
+                    continue;
+                }
+                let xml = build_keybox_xml(&maybe_decode_ns_payload(&txt, false), &src.name);
+                // 解析失败不记 warn：同一个文件会因镜像被重试好几遍，一条 warn 重复
+                // 好几次；debug 里能看到是哪个仓库的哪个 URL 挖到了东西但不成形。
+                let parsed = match crate::keybox::parse_keybox_xml_all(&xml) {
+                    Ok(p) if !p.is_empty() => p,
+                    Ok(_) => {
+                        tracing::debug!("autokeybox public parse empty repo={full} url={url}");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "autokeybox public parse failed repo={full} url={url} err={e}"
+                        );
+                        continue;
+                    }
+                };
+                // 第一份用源自己的 device_id，后面的往下排 -1、-2 …。只有真的入库了
+                // 才往后排，不然校验不过的那几份会白占编号，后面的就跳过了一个号。
+                let device_id = public_device_id(&src.device_id, taken);
+                let before = stored.len();
+                for kb in parsed {
+                    if store_identity(db, src, &device_id, &kb) {
+                        stored.push(kb);
+                    }
+                }
+                if stored.len() > before {
+                    taken += 1;
+                }
+                if stored.len() >= PUBLIC_MAX_IDENTITIES {
+                    break 'outer;
+                }
+                // 这个仓库已经找到能用的 keybox 了，换下一个仓库（不然会接着拿
+                // 同一个仓库的其他路径重复入库）。
+                continue 'outer;
+            }
+        }
+    }
+    tracing::info!(
+        "autokeybox updated device_id={} source={} identities={} urls_tried={tried}",
+        src.device_id,
+        src.name,
+        stored.len()
+    );
+    stored
+}
+
+/// 公开源专用取文件 —— 走系统 curl，不走 reqwest。
+///
+/// gh-proxy 和 jsdelivr 都在 Cloudflare 后面，而这个机房里的 reqwest（rustls）
+/// 过不了它的 bot 检查，会一直挂到超时；curl 实测每个都是秒回。服务端本来就装
+/// 了 curl，这里不多一个依赖。
+fn public_http_get(url: &str, timeout_secs: u64) -> Option<String> {
+    match http_get(url, Duration::from_secs(timeout_secs)) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::debug!("autokeybox public get failed url={url} err={e}");
+            None
+        }
+    }
+}
+
+/// 一个 raw.githubusercontent.com 链接的备选镜像。顺序按机房实测的可用性和速度
+/// 排：gh-proxy 和 jsdelivr 都是秒回，raw 本身放最后兜底。
+fn raw_url_mirrors(url: &str) -> Vec<String> {
+    let Some(rest) = url.strip_prefix("https://raw.githubusercontent.com/") else {
+        return Vec::new();
+    };
+    // rest 是 <owner>/<repo>/<branch>/<path...>
+    let parts: Vec<&str> = rest.splitn(4, '/').collect();
+    if parts.len() < 4 {
+        return Vec::new();
+    }
+    vec![
+        format!("https://gh-proxy.com/{url}"),
+        format!(
+            "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}",
+            owner = parts[0],
+            repo = parts[1],
+            branch = parts[2],
+            path = parts[3]
+        ),
+    ]
+}
+
+/// 一个文件的几条候选取法：源自己配的镜像排最前，然后是上面的公共镜像，
+/// raw 本身放最后兜底。
+fn public_file_urls(src: &KeyboxSource, full: &str, branch: &str, path: &str) -> Vec<String> {
+    let raw = format!("https://raw.githubusercontent.com/{full}/{branch}/{path}");
+    let mut out: Vec<String> = Vec::new();
+    let mirror = src.url_mirror.trim_end_matches('/');
+    if !mirror.is_empty() {
+        out.push(format!("{mirror}/{raw}"));
+    }
+    out.extend(raw_url_mirrors(&raw));
+    out.push(raw);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|u| seen.insert(u.clone()));
+    out
 }
 
 /// Refresh an API-list source: fetch the keybox list, filter `valid` entries,
@@ -668,4 +893,102 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn src_for_test() -> KeyboxSource {
+        KeyboxSource {
+            name: "public".to_string(),
+            device_id: "device-b-2".to_string(),
+            url_primary: DEFAULT_PUBLIC_SEARCH_URL.to_string(),
+            url_mirror: "https://gh-proxy.com/".to_string(),
+            decode_hex: false,
+            api_list: false,
+            search_repos: true,
+        }
+    }
+
+    /// 没有 `<?xml` 声明、直接 `<AndroidAttestation>` 开头的 keybox（yurikey 那
+    /// 个 base64 解出来就是这形状，公开仓库里也有一半是）必须原样过 —— 一旦掉进
+    /// PEM 合成分支，证书链就变空，拿去入库必然被校验拒掉。
+    #[test]
+    fn keybox_xml_without_a_declaration_passes_through() {
+        let xml =
+            "<AndroidAttestation>\n<NumberOfKeyboxes>1</NumberOfKeyboxes>\n</AndroidAttestation>";
+        assert_eq!(build_keybox_xml(xml, "public"), xml);
+    }
+
+    /// 拆散的 PEM（私钥 + 证书各一段）合出来的 XML 得把证书真的挂到链接里，
+    /// 不能只留一个空的 `<CertificateChain>`。
+    #[test]
+    fn synthesised_xml_pairs_the_certificate_with_the_key() {
+        const KEY: &str = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----";
+        const CERT: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+        let xml = build_keybox_xml(&format!("{KEY}\n{CERT}\n"), "public");
+        let parsed = crate::keybox::parse_keybox_xml_all(&xml).expect("synth xml should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].cert_count, 1);
+        assert!(parsed[0].private_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(parsed[0]
+            .certificate_chain_pem
+            .contains("BEGIN CERTIFICATE"));
+    }
+
+    /// 取文件的候选 URL：源自己配的镜像排最前，raw 兜底，重复的去掉。重复的
+    /// 请求看着无害，但一轮 240 个 URL 里白白多打几十个。
+    #[test]
+    fn file_urls_put_the_configured_mirror_first_and_dedupe() {
+        let src = src_for_test();
+        let urls = public_file_urls(&src, "a/b", "main", "keybox.xml");
+        let raw = "https://raw.githubusercontent.com/a/b/main/keybox.xml";
+        assert_eq!(urls[0], format!("https://gh-proxy.com/{raw}"));
+        assert_eq!(urls.last().unwrap(), raw);
+        assert_eq!(urls.len(), 3, "{urls:?}");
+        let mut sorted = urls.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), urls.len(), "{urls:?}");
+    }
+
+    /// 编号方案要和 A 端取公开 keybox 的接口对得上：第一份必须在主 id 上。
+    #[test]
+    fn public_device_ids_start_at_the_base_id() {
+        assert_eq!(public_device_id("device-b-2", 0), "device-b-2");
+        assert_eq!(public_device_id("device-b-2", 1), "device-b-2-1");
+        assert_eq!(
+            public_device_id("device-b-2", PUBLIC_MAX_IDENTITIES - 1),
+            format!("device-b-2-{}", PUBLIC_MAX_IDENTITIES - 1)
+        );
+    }
+
+    /// raw 主址先走镜像、直连兜底；普通 API 主址还是主址优先。顺序错了不会
+    /// 致命，但 raw 那条会先白等 30s 超时，而且真通了还要跟 CF 磨。
+    #[test]
+    fn fetch_order_puts_mirrors_before_a_raw_primary() {
+        let raw = "https://raw.githubusercontent.com/Yurii0307/yurikey/main/key";
+        let mut src = src_for_test();
+        src.url_primary = raw.to_string();
+        src.url_mirror = String::new();
+        let got = fetch_candidates(&src);
+        assert_eq!(got[0], format!("https://gh-proxy.com/{raw}"));
+        assert_eq!(got.last().unwrap(), raw);
+
+        let mut api = src_for_test();
+        api.url_primary = "https://keybox.example.com/api/keyboxes".to_string();
+        api.url_mirror = "https://mirror.example.com/api/keyboxes".to_string();
+        assert_eq!(
+            fetch_candidates(&api),
+            vec![api.url_primary.clone(), api.url_mirror.clone()]
+        );
+    }
+
+    /// raw 链接拆不干净时不要瞎拼镜像地址。
+    #[test]
+    fn raw_url_mirrors_ignores_foreign_hosts() {
+        assert!(raw_url_mirrors("https://example.com/keybox.xml").is_empty());
+        assert!(raw_url_mirrors("https://raw.githubusercontent.com/a/b").is_empty());
+    }
 }

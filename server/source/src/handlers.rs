@@ -1254,6 +1254,62 @@ pub async fn admin_cancel_task(
     }
 }
 
+/// GET /api/keybox/public/ — 把服务端池子里的公开 keybox 发给 A 端。
+///
+/// A 端那边是用 curl 取下来再 atob 的，所以这里直接回 base64 文本，不是 JSON。
+/// 匿名可取：里面的东西本来就是从公开仓库采的，没什么可保护的。
+pub async fn public_keybox(State(state): State<AppState>) -> Response {
+    let Some(db) = state.db.as_ref() else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, "no database");
+    };
+    // EC 优先（体积小，A 端拿它铸 leaf 也快），取不到再退 RSA。采到的身份可能挂在
+    // 主 device_id 上，也可能挂在 -1/-2 这样的后缀上 —— 后缀范围跟着采集端的上限走，
+    // 两边写死后加了一边另一边就白搭。
+    let base = crate::autokeybox::device_id_for("public");
+    let mut candidates = vec![base.clone()];
+    for n in 1..crate::autokeybox::PUBLIC_MAX_IDENTITIES {
+        candidates.push(format!("{base}-{n}"));
+    }
+    let mut picked: Option<(String, crate::db::DeviceIdentity)> = None;
+    'scan: for algo in ["ec", "rsa"] {
+        for device_id in &candidates {
+            match db.get_device_identity_by_id(device_id, algo) {
+                Ok(Some(id)) => {
+                    picked = Some((device_id.clone(), id));
+                    break 'scan;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("public_keybox lookup failed device_id={device_id} err={e}")
+                }
+            }
+        }
+    }
+    let Some((device_id, id)) = picked else {
+        return json_err(StatusCode::NOT_FOUND, "no public keybox collected yet");
+    };
+    let xml = crate::keybox::build_keybox_xml(
+        &device_id,
+        &id.algorithm,
+        &id.private_key_pem_cipher,
+        &id.certificate_chain_pem,
+    );
+    tracing::info!(
+        "public_keybox served device_id={} algorithm={} xml_bytes={}",
+        device_id,
+        id.algorithm,
+        xml.len()
+    );
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(xml.as_bytes());
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        b64,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod strongbox_smart_tests {
     use super::{chain_attestation_security_level, refuse_strongbox_json, strongbox_b_kind};

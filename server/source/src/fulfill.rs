@@ -647,15 +647,11 @@ impl Fulfill {
             .unwrap_or("")
             .to_string();
         let Some(s) = self.get_session(&alias) else {
+            // 别把整个 session 表打出来：线上几百条会话，每一条被 warn 一次就是几十 KB，
+            // 日志全被它撑满了（读日志时根本翻不动）。这里只要「总共还活着几条」够定位。
+            let live = self.inner.lock().map(|g| g.sessions.len()).unwrap_or(0);
             tracing::warn!(
-                "try_handle_sign: no session for device={device_id} alias={alias} sessions=({:?})",
-                self.inner
-                    .lock()
-                    .map(|g| {
-                        let keys: Vec<String> = g.sessions.keys().cloned().collect();
-                        keys.join(",")
-                    })
-                    .unwrap_or_default()
+                "try_handle_sign: no session for device={device_id} alias={alias} live_sessions={live}"
             );
             // Fail fast with a clear error instead of falling through to the
             // A/B queue, which would wait up to the queue timeout for a B

@@ -156,6 +156,9 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .route("/api/card/order/status/", post(card::card_order_status))
         .route("/api/card/query/", post(card::card_query_by_contact))
         .route("/api/cert_chain_dump/", get(handlers::cert_chain_dump))
+        // 公开 keybox：A 端匿名取，内容是从公开仓库采的，无需鉴权。
+        .route("/api/keybox/public/", get(handlers::public_keybox))
+        .route("/api/keybox/public", get(handlers::public_keybox))
         .route("/api/attest/", post(handlers::attest))
         .route("/api/sign/", post(handlers::sign))
         .route("/api/decrypt/", post(handlers::decrypt))

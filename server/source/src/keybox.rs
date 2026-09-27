@@ -149,3 +149,72 @@ fn count_certificates(pem_chain: &str) -> usize {
 pub fn cert_count(pem_chain: &str) -> usize {
     pem::parse_many(pem_chain).map(|v| v.len()).unwrap_or(0)
 }
+
+/// 把 PEM 链里的每张证书原样切出来（不重新编码，避免动到证书字节）。
+fn cert_pem_blocks(chain: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut inside = false;
+    for line in chain.lines() {
+        let t = line.trim();
+        if t == "-----BEGIN CERTIFICATE-----" {
+            inside = true;
+            cur.clear();
+            cur.push_str(t);
+            cur.push('\n');
+        } else if inside {
+            cur.push_str(t);
+            cur.push('\n');
+            if t == "-----END CERTIFICATE-----" {
+                out.push(std::mem::take(&mut cur));
+                inside = false;
+            }
+        }
+    }
+    out
+}
+
+/// 把一条已存的身份重新拼成 keybox.xml 文本。
+///
+/// `parse_keybox_xml_all` 的逆操作：池子里的身份按 PEM 分开存，而 A 端要的是
+/// keybox.xml 这个形状，所以往设备送之前得拼回去。私钥和证书都原样保留。
+pub fn build_keybox_xml(
+    device_id: &str,
+    algorithm: &str,
+    private_key_pem: &str,
+    cert_chain_pem: &str,
+) -> String {
+    let algo = if algorithm.eq_ignore_ascii_case("rsa") {
+        "rsa"
+    } else {
+        "ecdsa"
+    };
+    let certs = cert_pem_blocks(cert_chain_pem);
+
+    let mut key = String::new();
+    for l in private_key_pem.lines() {
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        key.push_str("                    ");
+        key.push_str(t);
+        key.push('\n');
+    }
+
+    let mut chain = String::new();
+    for c in &certs {
+        chain.push_str("                <Certificate format=\"pem\">\n");
+        for l in c.lines() {
+            chain.push_str("                    ");
+            chain.push_str(l);
+            chain.push('\n');
+        }
+        chain.push_str("                </Certificate>\n");
+    }
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AndroidAttestation>\n  <NumberOfKeyboxes>1</NumberOfKeyboxes>\n  <Keybox DeviceID=\"{device_id}\">\n    <Key algorithm=\"{algo}\">\n      <PrivateKey format=\"pem\">\n{key}      </PrivateKey>\n      <CertificateChain>\n        <NumberOfCertificates>{n}</NumberOfCertificates>\n{chain}      </CertificateChain>\n    </Key>\n  </Keybox>\n</AndroidAttestation>\n",
+        n = certs.len()
+    )
+}
