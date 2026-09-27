@@ -22,6 +22,7 @@
 - **A 端不再预设 SOTER HAL 长什么样**：以前只认高通那套 AIDL 接口和一两个进程名，换台机器（一加 PLC110 是联发科 + Trustonic）就整个瞎掉。现在 HAL 进程名和 service/interface 都是候选表，qti、trustonic 两套 AIDL 挨个试，HIDL 那套（`@1.0::`）也认得出来 —— 先只记账不拦，免得答复的形状不对把它带歪。
 - **SOTER 宿主和 HAL 里的日志能写出来了**：注入到 app 域的进程（宿主、HAL）以前日志整条哑掉，因为写日志那一层的建目录在「目录已存在但自己没 getattr」的域里会返回 EEXIST，整个写日志的组件就建不起来，报错还只往 stderr 丢、没人看得见。现在改成先开文件、开不动才建目录；顺带把日志目录/log_flag 的权限按各机器真实的 uid 补齐（一加上宿主是 u0_a292，既不是属主也不在 system 组）。
 - **要不要写日志现在看得见**：每个 payload 起来会沿 RPC 报一条自己的日志状态（装在哪个文件、开关是开还是关、两个候选路径各自开得开不开），排查时不用再猜。
+- **SELinux 规则不再挑机器**：宿主和 SOTER HAL 的域名各家 ROM 都不一样（一加 13 / ColorOS 16 上是 `platform_app` + `vendor_hal_soter_qti`，一加 PLC110 上是 `platform_app` + `hal_soter_trustonic`，AOSP 上是 `system_app` + `hal_soter`），以前只写一组，换台机器就变成「注进去了但日志写不出来、答复也连不上」。现在三类目标进程的域名各列一张表，顺手把递 payload 那侧的域名也列全；policy 里没有的域名 kernel 会跳过那条规则，不会连累别的，以后碰到新域名往表里加个名字就行。
 
 **稳定性**
 
