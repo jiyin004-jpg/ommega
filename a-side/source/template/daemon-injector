@@ -150,7 +150,10 @@ sync_log_flag() {
   # 的时候也不多做别的事。
   mkdir -p "$APP_LOG_DIR" 2>/dev/null
   chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
-  chmod 0770 "$APP_LOG_DIR" 2>/dev/null
+  # 0777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
+  # 上它是 u0_a292(10292) —— 既不是属主也不在 system 组，只有 other 那一档能救。
+  # 代价是这个目录谁都能写，但里面只有我们自己的调试日志，放它去。
+  chmod 0777 "$APP_LOG_DIR" 2>/dev/null
   # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
   # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
   # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
@@ -159,16 +162,30 @@ sync_log_flag() {
   for f in "$APP_LOG_DIR"/*; do
     [ -f "$f" ] && chcon u:object_r:system_app_data_file:s0 "$f" 2>/dev/null
   done
+  # 那份日志是先到的那个进程建的（HAL 是 system(1000)，宿主是一加上的 u0_a292(10292)），
+  # 属主只有一个，另一个只能靠 other 那一档写。这里统一放到 0666，谁续写都行；
+  # 里面只有我们自己的调试日志，不怕被读。文件不在就先放一个空的。
+  APP_LOG_FILE=$APP_LOG_DIR/injector.log
+  [ -f "$APP_LOG_FILE" ] || : > "$APP_LOG_FILE" 2>/dev/null
+  chmod 0666 "$APP_LOG_FILE" 2>/dev/null
+  chcon u:object_r:system_app_data_file:s0 "$APP_LOG_FILE" 2>/dev/null
+  mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
+  # 这个目录里可能放着用户自己替换的 soter_ask.pem（本地兜底的私钥），
+  # 所以不能让 other 进得来读：属主给 system(1000) 是因为 app 域的 payload
+  # 要进来读开关和钥匙。
+  chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
+  # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_ask.pem（本地兜底
+  # 私钥，0640）还在别的权限保护着，列不出来也读不到；但宿主得能穿过这一层去
+  # 写 logs/，所以 x 必须给。每轮都补：boot 时的 restorecon 不碰权限，但用户
+  # 手动改过或者从别的版本升上来就不一定了。
+  chmod 0711 "$LOG_FLAG_DIR" 2>/dev/null
   cur=$(sed -n 's/^log_flag:[[:space:]]*//p' "$LOG_FLAG" 2>/dev/null | head -n1 | tr -d ' \r')
   if [ "$cur" != "$want" ]; then
-    mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
-    # 这个目录里可能放着用户自己替换的 soter_ask.pem（本地兜底的私钥），
-    # 所以不能让 other 进来：0755 的话任何 app 都能读到那把钥匙。属主给
-    # system(1000) 是因为 app 域的 payload 要进来读开关和钥匙。
-    chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
-    chmod 0750 "$LOG_FLAG_DIR" 2>/dev/null
     printf 'log_flag: %s\n' "$want" > "$LOG_FLAG" 2>/dev/null
-    chmod 0640 "$LOG_FLAG" 2>/dev/null
+    # 0644 而不是 0640：一加 PLC110 上宿主是 u0_a292(10292)，不在 system 组里，
+    # 0640 它读不到 —— 开关读不到就等于关着，它那份日志永远不会写出来。
+    # 内容就一行 log_flag，不算秘密。
+    chmod 0644 "$LOG_FLAG" 2>/dev/null
   fi
 }
 

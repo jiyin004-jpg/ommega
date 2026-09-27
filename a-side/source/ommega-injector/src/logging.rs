@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -12,6 +13,41 @@ const APP_DOMAIN_LOG_PATH: &str = "/data/misc/ommega/logs/injector.log";
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
+/// 实际装上 logger 的那个位置（两个候选里先成的那个）。给诊断用：用 `entry` 里
+/// 那条 RPC 报给 daemon 记一笔，不然 app 域的进程只能靠猜。
+static ACTIVE_PATH: Mutex<Option<String>> = Mutex::new(None);
+/// 两个位置都没装上时记下的原因。同上，只为了能看见。
+static INIT_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// 每个候选日志路径的自开结果（`<path>: ok` 或 `<path>: <errno>`）。
+static PROBES: Mutex<Option<String>> = Mutex::new(None);
+
+/// 装上 logger 的位置，没装上就是 `<none>`。
+pub fn active_path() -> String {
+    ACTIVE_PATH
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+/// 两个位置都没装上时的原因（一段文字），没失败就是空串。
+pub fn init_error() -> String {
+    INIT_ERROR
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// 两个候选路径各自开得开不开。
+pub fn path_probes() -> String {
+    PROBES
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_default()
+}
 /// The WebUI log switch, re-read by the watcher thread (see `refresh_switch`).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// 配置里那个级别（`[main] log_level`）。开关只管开/关，级别记在这儿，
@@ -106,7 +142,19 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
     // keystore 那个 0770 目录，但它自己那份位置是能写的（那个目录的 SELinux
     // 标签必须是 system_app_data_file，由 daemon-injector 负责打）。
     let mut last_error: Option<anyhow::Error> = None;
-    for path in [DEFAULT_LOG_PATH, APP_DOMAIN_LOG_PATH] {
+    let mut probes: Vec<String> = Vec::new();
+    for (label, path) in [("keystore", DEFAULT_LOG_PATH), ("app", APP_DOMAIN_LOG_PATH)] {
+        // 先自己开一次，只为了把 errno 记下来：appender 那边把错误咽了（只 eprintln，
+        // 而注入进去的进程 stderr 根本没人看），光靠“没写出来”分不清是 DAC、SELinux
+        // 还是路径本身不对。这份探针文本会顺 RPC 报给 daemon。
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(_) => probes.push(format!("{label}=ok")),
+            Err(error) => probes.push(format!("{label}={error}")),
+        }
         let (config, file_logging_ready) = match kmr_common::runtime::logging::build_file_config(
             path,
             PATTERN,
@@ -129,6 +177,10 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
             continue;
         }
         apply_level_now();
+        loosen_app_domain_path(path);
+        if let Ok(mut guard) = ACTIVE_PATH.lock() {
+            *guard = Some(path.to_string());
+        }
         log::info!(
             "initialized fallback logging at {} with configured level {:?}",
             path,
@@ -139,8 +191,36 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
 
     // 两个位置都写不进去：没地方落就不写，不装 logger，也不退回 logcat。
     log::set_max_level(LevelFilter::Off);
+    if let Ok(mut guard) = INIT_ERROR.lock() {
+        let reason = match &last_error {
+            Some(error) => format!("{error:#}"),
+            None => "no candidate path was writable".to_string(),
+        };
+        *guard = Some(format!("{reason} [{}]", probes.join(", ")));
+    }
+    // 没失败也记一份，看看是不是第一个位置恰好能开（那就不用管第二个）。
+    if let Ok(mut guard) = PROBES.lock() {
+        *guard = Some(probes.join(", "));
+    }
     match last_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// app 域那份日志是好几个 uid 共用的：SOTER HAL 是 system(1000)、SOTER 宿主在某些
+/// 机型上是 system、在一加 PLC110 上是 u0_a292(10292)。谁先起来谁建文件，权限按各自
+/// 的 umask 来（HAL 的 umask 是 0077，建出来就是 0600），后面那个连开都开不了。
+/// 建完就把它放开成 0666，目录也跟着放开 —— 只动这第二个位置，keystore 那个
+/// 0660 keystore:keystore 的目录保持原样。
+fn loosen_app_domain_path(path: &str) {
+    if path != APP_DOMAIN_LOG_PATH {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        // 目录属主是 root，payload 多半不是 —— 改不动就算了，daemon-injector
+        // 那边每轮都会补一刀。
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777));
     }
 }

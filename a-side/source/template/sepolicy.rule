@@ -21,5 +21,39 @@ allow shell default_android_service service_manager find
 # SOTER 宿主（system_app）也要能把自己的日志落文件：payload 只走文件、不走 logcat
 # 之后，它得进得去这个目录。实测系统只放行了 file 的 read（log_flag 它能读），
 # 目录本身的 open/read 和建文件都被拒，所以这里把 dir 那一侧补齐。
-allow system_app system_data_file dir { open read write add_name remove_name rename search lock }
+allow system_app system_data_file dir { getattr open read write add_name remove_name rename search lock }
 allow system_app system_data_file file { open read write create append getattr setattr }
+
+# 一加 PLC110（联发科 + Trustonic）上实测：宿主跑在 platform_app 域，不是上面那个
+# system_app，所以那一组一条都不匹配（日志写不出、RPC socket 连不上，dmesg 里全是
+# avc denied connectto ... tcontext=keystore）。这里补一组同样的。
+allow platform_app system_file unix_dgram_socket { getattr read recvfrom }
+allow system_file platform_app unix_dgram_socket sendto
+allow platform_app system_file file { execute getattr map read receive }
+allow platform_app keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+allow platform_app system_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow platform_app system_data_file file { open read write create append getattr setattr }
+# daemon 把日志目录打成 system_app_data_file，这个标签在 platform_app 域下也得放行。
+allow platform_app system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow platform_app system_app_data_file file { open read write create append getattr setattr }
+
+# SOTER HAL 服务进程本身也是注入目标（宿主不在时，`service call` 那种直连只有注进
+# HAL 才看得见）。高通机器上它叫 vendor.qti.hardware.soter-service、域是 hal_soter；
+# 一加上是 vendor.trustonic.soter@1.0-service、域是 hal_soter_trustonic。两个域都
+# 给同一组，免得换台机器又是「注进去了但什么都写不出来」。
+allow hal_soter_trustonic system_file unix_dgram_socket { getattr read recvfrom }
+allow system_file hal_soter_trustonic unix_dgram_socket sendto
+allow hal_soter_trustonic system_file file { execute getattr map read receive }
+allow hal_soter_trustonic keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+allow hal_soter_trustonic system_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow hal_soter_trustonic system_data_file file { open read write create append getattr setattr }
+allow hal_soter_trustonic system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow hal_soter_trustonic system_app_data_file file { open read write create append getattr setattr }
+allow hal_soter system_file unix_dgram_socket { getattr read recvfrom }
+allow system_file hal_soter unix_dgram_socket sendto
+allow hal_soter system_file file { execute getattr map read receive }
+allow hal_soter keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+allow hal_soter system_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow hal_soter system_data_file file { open read write create append getattr setattr }
+allow hal_soter system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow hal_soter system_app_data_file file { open read write create append getattr setattr }

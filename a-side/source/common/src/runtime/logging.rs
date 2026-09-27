@@ -65,8 +65,20 @@ impl LockedRotatingFileAppender {
     }
 
     fn open_log_file(path: &Path) -> io::Result<File> {
-        fs::create_dir_all(Self::parent_dir(path))?;
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // 先直接开，开不动再说建目录的事。以前是先 `create_dir_all` 再开，看着更
+        // 保险，其实反过来：目录一般都在，而 `create_dir_all` 在“目录已存在但自己
+        // 对它没有 getattr”的域里（SOTER 宿主、SOTER HAL 就是，日志目录是 system
+        // 的、标签还是 system_app_data_file）会返回 EEXIST —— 那个 `?` 一挂，整个
+        // appender 就建不起来，本地日志整条哑掉，还只 eprintln 一句没人看的话。
+        let open = || OpenOptions::new().create(true).append(true).open(path);
+        let file = match open() {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(Self::parent_dir(path))?;
+                open()?
+            }
+            Err(error) => return Err(error),
+        };
         let fd = file.as_raw_fd();
         if let Ok(parent_metadata) = fs::metadata(Self::parent_dir(path)) {
             let _ = unsafe { libc::fchown(fd, parent_metadata.uid(), parent_metadata.gid()) };
