@@ -264,9 +264,6 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
         // AIDL 里 -1 表示 null
         return None;
     }
-    if len == 0 {
-        return Some((String::new(), cursor.at));
-    }
     let len = len as usize;
     if len > 512 {
         return None;
@@ -280,7 +277,12 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
         .take_while(|unit| *unit != 0)
         .collect();
     let text = String::from_utf16(&units).ok()?;
-    cursor.skip_padding(len * 2)?;
+    // Android 的 writeString16 是「字符 + 一个 NUL」，再把 (len+1)*2 补到 4 字节对齐。
+    // 空串也带着这个 NUL。之前空串直接返回、非空串只按 2*len 补位，两种情况下游标都少走
+    // 4 字节，于是紧跟在字符串后面的那个字段被读成空串 —— 微信 initSigh 的 challenge
+    // （50 多个字符）就是这么丢的，B 端签出来的 JSON 里 raw 是空的。
+    cursor.take(2)?;
+    cursor.skip_padding(len * 2 + 2)?;
     Some((text, cursor.at))
 }
 
@@ -450,17 +452,18 @@ mod tests {
     use crate::hook::binder::TF_STATUS_CODE;
 
     /// 造一条现代的 interface token（含 strict-mode policy 前缀）。
+    ///
+    /// 长度写的是**字符数，不含 NUL**，后面才是 NUL 和补齐 —— 跟 `push_string` 一样
+    /// 跟着 Android `writeString16` 的真实布局来，别再写成「长度含 NUL」那套。
     fn interface_token(descriptor: &str) -> Vec<u8> {
-        let units: Vec<u16> = descriptor
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let units: Vec<u16> = descriptor.encode_utf16().collect();
         let mut out = Vec::new();
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&(units.len() as u32).to_le_bytes());
         for unit in &units {
             out.extend_from_slice(&unit.to_le_bytes());
         }
+        out.extend_from_slice(&[0, 0]);
         while !out.len().is_multiple_of(4) {
             out.push(0);
         }
@@ -475,15 +478,16 @@ mod tests {
         out.extend_from_slice(&value.to_le_bytes());
     }
 
-    /// AIDL 的 String16：字符数 + UTF-16LE + 补齐。（跟 Cursor::string 一份布局，
-    /// 别再造一套出来，不然测试绿着、真机流量照样读错。）
+    /// AIDL 的 String16：字符数 + UTF-16LE + NUL 终结符 + 补齐。（跟 Cursor::string 一份
+    /// 布局，别再造一套出来，不然测试绿着、真机流量照样读错。）
     fn push_string(out: &mut Vec<u8>, value: &str) {
         let units: Vec<u16> = value.encode_utf16().collect();
         push_i32(out, units.len() as i32);
         for unit in &units {
             out.extend_from_slice(&unit.to_le_bytes());
         }
-        let written = units.len() * 2;
+        out.extend_from_slice(&[0, 0]);
+        let written = (units.len() + 1) * 2;
         let pad = written.next_multiple_of(4) - written;
         for _ in 0..pad {
             out.push(0);
@@ -595,6 +599,34 @@ mod tests {
         assert_eq!(call.challenge.as_deref(), Some("0102030405"));
     }
 
+    /// 真机上的 alias 正好是 34 个字符（偶数长度），后面紧跟 challenge。之前少算 4 字节
+    /// 补齐，读出来的 challenge 是空串 —— 这条专门盯住那个坑。
+    #[test]
+    fn a_challenge_after_a_34_char_alias_is_not_swallowed() {
+        let alias = "SoterAuthKeyV2_salt11d8ba34_scene1";
+        assert_eq!(alias.len(), 34);
+        let challenge = "a".repeat(52);
+        let mut data = interface_token(APP_DESCRIPTOR);
+        push_i32(&mut data, 10490);
+        push_string(&mut data, alias);
+        push_string(&mut data, &challenge);
+        let call = parse(&data, 9).expect("the app side parses");
+        assert_eq!(call.alias.as_deref(), Some(alias));
+        assert_eq!(call.challenge.as_deref(), Some(challenge.as_str()));
+    }
+
+    /// 空串也带 NUL + 补齐（4 字节），下一个字段不能被这 4 个零顶掉。
+    #[test]
+    fn an_empty_string_still_advances_by_its_nul_and_padding() {
+        let mut data = interface_token(APP_DESCRIPTOR);
+        push_i32(&mut data, 7);
+        push_string(&mut data, "");
+        push_string(&mut data, "after");
+        let call = parse(&data, 9).expect("the app side parses");
+        assert_eq!(call.alias.as_deref(), Some(""));
+        assert_eq!(call.challenge.as_deref(), Some("after"));
+    }
+
     #[test]
     fn finish_sign_parses_the_session() {
         let data = request(&|out| push_i64(out, 0x1234_5678));
@@ -642,15 +674,13 @@ mod tests {
     #[test]
     fn token_without_the_strict_mode_prefix_still_parses() {
         // 老布局：没有前面那个 policy 的 i32。
-        let units: Vec<u16> = HAL_DESCRIPTOR
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let units: Vec<u16> = HAL_DESCRIPTOR.encode_utf16().collect();
         let mut data = Vec::new();
         data.extend_from_slice(&(units.len() as u32).to_le_bytes());
         for unit in &units {
             data.extend_from_slice(&unit.to_le_bytes());
         }
+        data.extend_from_slice(&[0, 0]);
         while !data.len().is_multiple_of(4) {
             data.push(0);
         }
