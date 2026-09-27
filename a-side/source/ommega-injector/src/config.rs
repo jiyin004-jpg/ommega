@@ -34,6 +34,10 @@ const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
 /// 它连 `/data/adb`（0700 root）的门都进不去，读不到就回落到「日志关」。
 /// `/data/misc/ommega` 的 context 是 `system_data_file`，system_app 读得动。
 const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/ommega/log_flag";
+/// 同一份开关的另一个副本（root / `su` 域看这个）。曾经 daemon-injector 只写这一份、
+/// payload 只读上面那一份，两边对不上：SOTER 宿主读到的是一份没人更新的旧值，
+/// 于是日志在 03:21 之后一个字都不再写。现在两份都写、两份都读，先读能读到的那个。
+const CLIENTA_LOG_FLAG_FALLBACK_PATH: &str = "/data/adb/ommega/log_flag";
 const CURRENT_CONFIG_VERSION: u32 = 1;
 const REPLACE_SAVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REPLACE_SAVE_RETRY_LIMIT: usize = 10;
@@ -289,12 +293,13 @@ fn clienta_global_scope_override() -> Option<bool> {
 /// lives in a 0770 keystore-owned directory — the read fails and logging falls
 /// back to off.
 pub fn clienta_debug_logging() -> Option<bool> {
-    // 先看启动器（daemon-injector，root）读完之后写下的那份副本：它放在
-    // system_app 也读得到的地方（见 CLIENTA_LOG_FLAG_PATH），payload 落进读不到
-    // /data/misc/keystore 的域时（SOTER 宿主是 uid1000）就靠它。副本没有或读不到
-    // 才回落到真配置本身。
-    if let Some(value) = clienta_config_bool(Path::new(CLIENTA_LOG_FLAG_PATH), &["log_flag"]) {
-        return Some(value);
+    // 先看启动器（daemon-injector，root）读完之后写下的两份副本：`/data/misc` 那份
+    // system_app 读得到（SOTER 宿主走它），`/data/adb` 那份 root/su 域读得到。
+    // 两份都没有或都读不到才回落到真配置本身。
+    for path in [CLIENTA_LOG_FLAG_PATH, CLIENTA_LOG_FLAG_FALLBACK_PATH] {
+        if let Some(value) = clienta_config_bool(Path::new(path), &["log_flag"]) {
+            return Some(value);
+        }
     }
     clienta_config_bool(
         Path::new(CLIENTA_CONFIG_PATH),
@@ -438,8 +443,16 @@ fn load_or_seed(path: &Path, context: LoadContext) -> Option<InjectorConfig> {
                 error
             );
             if matches!(context, LoadContext::Startup) {
+                // 启动时读不到（典型：payload 落进读不到 keystore 目录的域，
+                // 比如 SOTER 宿主 uid 1000）就把注入关了——这是故意的，宁可什么都不做
+                // 也别拿默认配置去拦。说清楚是“关了”，别写成“保持现有配置”让人以为
+                // 还在干活。
                 let mut config = current_config_snapshot();
                 config.main.enabled = false;
+                log::warn!(
+                    "config at {} is out of reach from this domain; injector disabled here",
+                    path.display()
+                );
                 Some(config)
             } else {
                 None

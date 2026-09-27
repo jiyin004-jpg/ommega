@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use log::LevelFilter;
@@ -12,8 +12,14 @@ const APP_DOMAIN_LOG_PATH: &str = "/data/misc/ommega/logs/injector.log";
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
-/// The WebUI log switch, decided once during logger init (see `enabled`).
+/// The WebUI log switch, re-read by the watcher thread (see `refresh_switch`).
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// 配置里那个级别（`[main] log_level`）。开关只管开/关，级别记在这儿，
+/// 开关从关拨回开的时候要回到这个级别，而不是回到 Debug。
+static DESIRED_LEVEL: Mutex<LevelFilter> = Mutex::new(LevelFilter::Off);
+/// 开关复查的间隔。SOTER 宿主重启很频繁，开关关着的时候起来的那个实例
+/// 不主动回来复查，就一辈子哑着（日志那份文件就是这么停在 03:21 的）。
+const SWITCH_POLL_SECS: u64 = 30;
 
 /// True when logging is switched on (WebUI "启用调试日志").  The file appender and
 /// the stderr fallbacks are both gated on this.
@@ -21,13 +27,53 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Sets the runtime level, unless logging is switched off — in that case the
-/// level has to stay Off, so a later `log::set_max_level` from a config reload
-/// cannot silently turn the (absent) sinks back on.
-pub fn apply_level(level: LevelFilter) {
-    if ENABLED.load(Ordering::Relaxed) {
-        log::set_max_level(level);
+/// 重新读一次 WebUI 的日志开关，并且把级别按新状态落下去。返回是否发生了变化。
+///
+/// 这里必须真去读文件：payload 落进读不到 keystore 目录的域时，开关只能从
+/// daemon-injector 写下的副本里看，那个副本是会变的。
+pub fn refresh_switch() -> bool {
+    let now_enabled = crate::config::clienta_debug_logging().unwrap_or(false);
+    if now_enabled == ENABLED.load(Ordering::Relaxed) {
+        return false;
     }
+    ENABLED.store(now_enabled, Ordering::Relaxed);
+    apply_level_now();
+    true
+}
+
+/// Sets the runtime level.  When the WebUI switch is off the level stays Off no
+/// matter what the config asks for, but the requested level is remembered so
+/// turning the switch back on restores it.
+pub fn apply_level(level: LevelFilter) {
+    if let Ok(mut guard) = DESIRED_LEVEL.lock() {
+        *guard = level;
+    }
+    apply_level_now();
+}
+
+fn apply_level_now() {
+    let desired = DESIRED_LEVEL
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or(LevelFilter::Off);
+    let level = if enabled() { desired } else { LevelFilter::Off };
+    log::set_max_level(level);
+}
+
+/// 盯着开关的后台线程。一个被注入的进程里就一个，开销是 30 秒一次 stat/open。
+fn spawn_switch_watcher() {
+    static WATCHER: OnceLock<()> = OnceLock::new();
+    WATCHER.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("ommega-log-switch".to_string())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(SWITCH_POLL_SECS));
+                refresh_switch();
+            });
+        if let Err(error) = spawned {
+            log::warn!("failed to start the log switch watcher: {error}");
+        }
+    });
 }
 
 /// Fallback logger setup.  `configured_level` is the `[main] log_level` from
@@ -39,37 +85,52 @@ pub fn apply_level(level: LevelFilter) {
 /// keystore 那个目录。两处都读不到就当关着。
 pub fn init_logger_fallback(level: LevelFilter) {
     let _ = LOGGER_INIT.get_or_init(|| {
+        if let Ok(mut guard) = DESIRED_LEVEL.lock() {
+            *guard = level;
+        }
         let enabled = crate::config::clienta_debug_logging().unwrap_or(false);
         ENABLED.store(enabled, Ordering::Relaxed);
-        if !enabled {
-            log::set_max_level(LevelFilter::Off);
-            return;
-        }
         if let Err(error) = init_logger_inner(level) {
             eprintln!("injector logging failed to initialize: {error:#}");
         }
+        // 开关关着就只装 logger 不写字，但开关回头一变，这个线程能把它打开。
+        spawn_switch_watcher();
     });
 }
 
 fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
     // 只落文件。不用 logcat：那条线在 app 域里本来就不可靠，而且 A 端的日志
     // 统一走文件。目录有两个候选，哪个先装上就用哪个。
+    //
+    // 每个候选都单独试、失败就接着下一个：SOTER 宿主是 uid 1000，进不去
+    // keystore 那个 0770 目录，但它自己那份位置是能写的（那个目录的 SELinux
+    // 标签必须是 system_app_data_file，由 daemon-injector 负责打）。
+    let mut last_error: Option<anyhow::Error> = None;
     for path in [DEFAULT_LOG_PATH, APP_DOMAIN_LOG_PATH] {
-        let (config, file_logging_ready) = kmr_common::runtime::logging::build_file_config(
+        let (config, file_logging_ready) = match kmr_common::runtime::logging::build_file_config(
             path,
             PATTERN,
             LevelFilter::Trace,
             "injector logging",
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
 
         if !file_logging_ready {
             continue;
         }
 
-        log4rs::init_config(config)?;
-        log::set_max_level(configured_level);
+        if let Err(error) = log4rs::init_config(config) {
+            last_error = Some(error.into());
+            continue;
+        }
+        apply_level_now();
         log::info!(
-            "initialized fallback logging at {} with fixed level {:?}",
+            "initialized fallback logging at {} with configured level {:?}",
             path,
             configured_level
         );
@@ -78,5 +139,8 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
 
     // 两个位置都写不进去：没地方落就不写，不装 logger，也不退回 logcat。
     log::set_max_level(LevelFilter::Off);
-    Ok(())
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }

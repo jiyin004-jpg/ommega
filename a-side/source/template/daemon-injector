@@ -23,6 +23,9 @@ LOG_FILE=$LOG_DIR/daemon-injector.log
 # app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
 # 得给它一个自己写得动的位置，权限开到 system 组。
 APP_LOG_DIR=$LOG_FLAG_DIR/logs
+# 换本地兜底 ASK 的通道：往真配置目录里放一份 soter_ask.pem（PKCS#8 PEM），
+# 这里抄到 app 域读得到的位置，再把 SOTER 宿主踢一次让新 key 生效。
+SOTER_ASK_DST=/data/misc/ommega/soter_ask.pem
 SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
 
@@ -148,6 +151,14 @@ sync_log_flag() {
   mkdir -p "$APP_LOG_DIR" 2>/dev/null
   chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
   chmod 0770 "$APP_LOG_DIR" 2>/dev/null
+  # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
+  # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
+  # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
+  # 它改回去，所以每轮都补一次。已经打开的 fd 不受重新打标影响。
+  chcon u:object_r:system_app_data_file:s0 "$APP_LOG_DIR" 2>/dev/null
+  for f in "$APP_LOG_DIR"/*; do
+    [ -f "$f" ] && chcon u:object_r:system_app_data_file:s0 "$f" 2>/dev/null
+  done
   cur=$(sed -n 's/^log_flag:[[:space:]]*//p' "$LOG_FLAG" 2>/dev/null | head -n1 | tr -d ' \r')
   if [ "$cur" != "$want" ]; then
     mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
@@ -159,6 +170,50 @@ sync_log_flag() {
 
 soter_pid() {
   pidof "$SOTER_PKG" 2>/dev/null | awk '{print $1}'
+}
+
+# 配置目录里的 soter_ask.pem 变过就抄一份到 app 域能读的位置（宿主进不去 keystore
+# 目录）。抄完置 soter_ask_changed=1，主循环把宿主踢掉重来。
+sync_soter_ask() {
+  soter_ask_changed=0
+  src=$(dirname "$CONF_PATH")/soter_ask.pem
+
+  # 源没了就把镜像那份也删掉，回到 payload 里编进去的那把。只做单向镜像不改的话，
+  # 换过一次钥匙之后，就算把文件删了也还是那把旧的（镜像还在）。
+  if [ ! -f "$src" ]; then
+    if [ -f "$SOTER_ASK_DST" ]; then
+      if rm -f "$SOTER_ASK_DST" 2>/dev/null; then
+        soter_ask_changed=1
+        log "[injector-daemon] local soter ask removed; back to the built-in key"
+      fi
+    fi
+    return 0
+  fi
+
+  if [ -f "$SOTER_ASK_DST" ] \
+    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_ASK_DST" 2>/dev/null)" ]; then
+    return 0
+  fi
+
+  if cp -f "$src" "$SOTER_ASK_DST" 2>/dev/null; then
+    chmod 0644 "$SOTER_ASK_DST" 2>/dev/null
+    soter_ask_changed=1
+    log "[injector-daemon] local soter ask updated from $src"
+  else
+    log "[injector-daemon] failed to copy $src to $SOTER_ASK_DST"
+  fi
+}
+
+# 换 key 之后把 SOTER 宿主停掉：key 是进程启动时加载的，它下一次被 bind 起来
+# 的时候会重新加载。
+restart_soter_host() {
+  pid=$(soter_pid)
+  [ -n "$pid" ] || return 0
+  log "[injector-daemon] stopping $SOTER_PKG pid=$pid so the new soter ask takes effect"
+  kill -TERM "$pid" 2>/dev/null
+  sleep 2
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+  return 0
 }
 
 # SOTER 宿主是 bind-only 的服务：没人要就不起来，所以开关开着时得替客户端先喊一声。
@@ -217,6 +272,7 @@ restart_keystore() {
 
 mkdir -p "$STATE_DIR"
 LOG_ON=0
+soter_ask_changed=0
 pending_restart=0
 last_attempt_pid=
 last_attempt_at=0
@@ -233,6 +289,10 @@ while true; do
   LOG_ON=0
   debug_logging_enabled && LOG_ON=1
   sync_log_flag
+  sync_soter_ask
+  if [ "$soter_ask_changed" = "1" ]; then
+    restart_soter_host
+  fi
 
   if ! prepare_injector; then
     sleep 5

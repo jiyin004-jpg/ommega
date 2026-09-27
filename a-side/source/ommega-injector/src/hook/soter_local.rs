@@ -51,8 +51,20 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// ASK 里写死的盐长，也正好是 SHA-256 的摘要长度。
 const SALT_LEN: i32 = 32;
-/// 编译进来的那把私钥（PKCS#8 PEM）。
+/// 编译进来的那把私钥（PKCS#8 PEM）—— 候选文件都没有时才用它。
 const ASK_PEM: &[u8] = include_bytes!("../../assets/soter_ask.pem");
+/// 换本地兜底 ASK 用的文件（PKCS#8 PEM，`openssl genpkey -algorithm RSA` 那种）。
+/// 存在且解析得过就用它，跟 keybox.xml 一个路子：丢文件进去、重启 SOTER 宿主就生效。
+///
+/// 两个位置对应两个域，谁在哪个域里读得到就认谁：
+/// - `/data/misc/ommega/`：payload 落进 app 域（SOTER 宿主是 uid 1000）时读得到；
+/// - `/data/misc/keystore/ommega/`：跟真配置同一个目录，keystore 域读得到。
+const ASK_FILE_PATHS: [&str; 2] = [
+    "/data/misc/ommega/soter_ask.pem",
+    "/data/misc/keystore/ommega/soter_ask.pem",
+];
+/// 环境变量覆盖，写测试和临时探针用。
+const ASK_FILE_ENV: &str = "OMMEGA_SOTER_ASK_PEM";
 /// 读不到序列号时的兜底种子。正常情况 `cpu_id` 是按本机 `ro.boot.serialno` 派生的
 /// （每台机器一个号，同一台机器每次都一样），只有序列号都读不到才用得上它。
 const FALLBACK_SEED: &str = "ommega-a-side-local";
@@ -113,12 +125,56 @@ struct State {
     next_session: Mutex<i64>,
 }
 
+/// 这把 ASK 到底从哪儿来的（换 key 之后一眼看得出生效没有）。
+static ASK_ORIGIN: OnceLock<String> = OnceLock::new();
+
+/// 本地这把 ASK 的来源描述，`state()` 初始化之前是 `None`。
+#[cfg(test)]
+pub(crate) fn ask_origin() -> Option<&'static str> {
+    ASK_ORIGIN.get().map(String::as_str)
+}
+
+/// 按候选顺序找一把可用的 ASK：环境变量指定的文件 → 两个候选文件 → 编进来的那把。
+///
+/// `override_path` 是给测试用的显式覆盖（不去碰进程环境变量，免得多线程下互相干扰）。
+fn load_ask_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let from_env =
+        override_path.or_else(|| std::env::var_os(ASK_FILE_ENV).map(std::path::PathBuf::from));
+    if let Some(path) = from_env {
+        candidates.push(path);
+    }
+    candidates.extend(ASK_FILE_PATHS.iter().map(std::path::PathBuf::from));
+
+    for path in candidates {
+        let Ok(pem) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match Key::from_pem(&pem) {
+            Some(key) => return Some((key, path.display().to_string())),
+            // 文件在那儿但读不出私钥：别当没事，也别拿它顶，继续往下找。
+            None => log::warn!(
+                "soter local ask at {} is not a usable PKCS#8 PEM; ignoring it",
+                path.display()
+            ),
+        }
+    }
+
+    let pem = std::str::from_utf8(ASK_PEM).ok()?;
+    Some((Key::from_pem(pem)?, "embedded asset".to_string()))
+}
+
+fn load_ask_key() -> Option<(Key, String)> {
+    load_ask_key_with(None)
+}
+
 fn state() -> Option<&'static State> {
     static STATE: OnceLock<Option<State>> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            let pem = std::str::from_utf8(ASK_PEM).ok()?;
-            let ask = Key::from_pem(pem)?;
+            let (ask, origin) = load_ask_key()?;
+            log::info!("soter local ASK loaded from {origin}");
+            let _ = ASK_ORIGIN.set(origin);
             Some(State {
                 ask,
                 auth: Mutex::new(HashMap::new()),
@@ -909,5 +965,72 @@ mod tests {
     fn json_string_escapes_the_pem() {
         let escaped = json_string("a\"b\\c\nd");
         assert_eq!(escaped, "\"a\\\"b\\\\c\\nd\"");
+    }
+
+    /// 写一份临时 PEM，返回路径（测试完不删，临时目录自有清理）。
+    fn temp_pem(name: &str, contents: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ommega-soter-ask-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// 一把随机 RSA 的私钥 PEM（PKCS#8）。
+    fn fresh_pem() -> String {
+        use rsa::pkcs8::EncodePrivateKey;
+        let mut rng = OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        private
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string()
+    }
+
+    /// 编进 binary 的那把（不经 `state()`，免得受 OnceLock 初始化顺序影响）。
+    fn embedded_ask() -> Key {
+        Key::from_pem(std::str::from_utf8(ASK_PEM).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_supplied_ask_file_wins_over_the_embedded_one() {
+        let pem = fresh_pem();
+        let path = temp_pem("soter_ask.pem", &pem);
+        let (key, origin) = load_ask_key_with(Some(path.clone())).expect("the file must be used");
+
+        // 用的确实是文件里那把，不是编进来的那把
+        assert_eq!(key.pem, Key::from_pem(&pem).unwrap().pem);
+        assert_ne!(key.pem, embedded_ask().pem, "换 key 得真换掉");
+        assert_eq!(origin, path.display().to_string());
+    }
+
+    #[test]
+    fn a_missing_ask_file_falls_back_to_the_embedded_one() {
+        let missing = std::env::temp_dir().join("ommega-soter-ask-does-not-exist.pem");
+        let _ = std::fs::remove_file(&missing);
+        let (key, origin) = load_ask_key_with(Some(missing)).expect("embedded key must load");
+        assert_eq!(key.pem, embedded_ask().pem);
+        assert_eq!(origin, "embedded asset");
+    }
+
+    #[test]
+    fn a_broken_ask_file_falls_back_to_the_embedded_one() {
+        let path = temp_pem("broken.pem", "-----BEGIN PRIVATE KEY-----\nnope\n");
+        let (key, origin) = load_ask_key_with(Some(path)).expect("embedded key must load");
+        assert_eq!(key.pem, embedded_ask().pem);
+        assert_eq!(origin, "embedded asset");
+    }
+
+    #[test]
+    fn the_loaded_ask_reports_where_it_came_from() {
+        // 这个进程里 `state()` 建过之后，来源一定是非空的（换 key 之后靠它看生效）
+        assert!(state().is_some());
+        let origin = ask_origin().expect("state() 初始化时写下了来源");
+        assert!(!origin.is_empty());
     }
 }
