@@ -30,6 +30,8 @@
 
 pub mod fixtures;
 pub mod hal;
+pub mod hidl;
+pub mod hwbinder;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;

@@ -18,7 +18,11 @@ use crate::soter;
 /// it treats as "not reported" and is still willing to try.
 pub fn report() -> String {
     let mut caps: Vec<&str> = Vec::new();
-    if soter::service_present() && soter_usable() {
+    // 只用 `soter_usable` 这一道：它内部是 `soter::probe`，会把 AIDL 两家
+    // 和 HIDL 两家都真探一遍，而且带 5 分钟缓存。以前这里还有一层
+    // `service_present()` 预筛，但那个只认 AIDL（HIDL 那边没有同样廉价的
+    // 探法），`&&` 一短路就把 HIDL-only 的机器漏掉了。
+    if soter_usable() {
         caps.push("soter");
     }
     if strongbox_present() {
@@ -37,8 +41,8 @@ static SOTER_VERDICT: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 ///
 /// 实测踩过的坑：一台骁龙机器上 `vendor.qti.hardware.soter.ISoter/default` 好端端注册
 /// 着，`getDeviceId` 却回 -20，KeyMint 那边 `generateKey` 也是 -49，TEE 里那套 TA 根本
-/// 没起来。只看 [`soter::service_present`] 会照报 `caps=soter`，服务端于是把别人的
-/// SOTER 任务派过来 —— 而 SOTER 只有 B 层、没有兜底，等于把请求直接做废。
+/// 没起来。服务端会把别人的 SOTER 任务派过来 —— 而 SOTER 只有 B 层、没有兜底，
+/// 等于把请求直接做废。
 ///
 /// 探一次要开 binder 发个事务，心跳每 20 秒一次扛不住，所以结果缓存；失败也缓存（坏掉的
 /// TEE 不会自己好），但给 TTL，免得 TA 修好了还一直报空。

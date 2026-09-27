@@ -45,6 +45,8 @@ use rsbinder::{hub, FromIBinder, Parcel, RemoteProxy, SIBinder, StatusCode};
 use crate::vendor::qti::hardware::soter::ISoter::ISoter;
 use crate::vendor::trustonic::hardware::soter::ITrustonicSoter::ITrustonicSoter;
 
+use super::hidl;
+
 /// Trustonic service name, as registered with the (vendor) service manager.
 pub const SERVICE: &str = "vendor.trustonic.hardware.soter.ITrustonicSoter/default";
 
@@ -58,28 +60,45 @@ pub const QTI_SERVICE: &str = "vendor.qti.hardware.soter.ISoter/default";
 pub const QTI_INTERFACE: &str = "vendor.qti.hardware.soter.ISoter";
 
 /// Which vendor HAL answered.
+///
+/// 同一家 vendor 可能以两种形态出现：老的 HIDL（`@1.0::`，跑 `/dev/hwbinder`）
+/// 和新的 AIDL（跑 `/dev/binder`）。Android 13 以后厂商陆续搬到 AIDL，但过渡期
+/// 两种都可能有，所以四个后端都要认。两个名字对不上别当成一家。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Trustonic,
     Qti,
+    TrustonicHidl,
+    QtiHidl,
 }
 
 impl Backend {
-    /// Resolution order.  Trustonic first because that is what the fleet has
-    /// been running on; a device only ever registers one of the two.
-    pub const ALL: [Backend; 2] = [Backend::Trustonic, Backend::Qti];
+    /// 解析顺序。AIDL 在前：Android 13 以后厂商都搬过去了，HIDL 是过渡期的兜底。
+    /// 同一家 vendor 只会注册其中一种形态。
+    pub const ALL: [Backend; 4] = [
+        Backend::Trustonic,
+        Backend::Qti,
+        Backend::TrustonicHidl,
+        Backend::QtiHidl,
+    ];
 
+    /// 服务名。HIDL 那边是 fqName（`@1.0::` 那个），instance 统一是 `default`。
     pub fn service(self) -> &'static str {
         match self {
             Backend::Trustonic => SERVICE,
             Backend::Qti => QTI_SERVICE,
+            Backend::TrustonicHidl => hidl::HIDL_TRUSTONIC_FQNAME,
+            Backend::QtiHidl => hidl::HIDL_QTI_FQNAME,
         }
     }
 
+    /// 事务里要写的 interface token。
     pub fn interface(self) -> &'static str {
         match self {
             Backend::Trustonic => INTERFACE,
             Backend::Qti => QTI_INTERFACE,
+            Backend::TrustonicHidl => hidl::HIDL_TRUSTONIC_FQNAME,
+            Backend::QtiHidl => hidl::HIDL_QTI_FQNAME,
         }
     }
 
@@ -88,23 +107,34 @@ impl Backend {
         match self {
             Backend::Trustonic => "trustonic",
             Backend::Qti => "qti",
+            Backend::TrustonicHidl => "trustonic-hidl",
+            Backend::QtiHidl => "qti-hidl",
         }
+    }
+
+    /// 是不是跑在 `/dev/hwbinder` 上的那套。
+    pub fn is_hidl(self) -> bool {
+        matches!(self, Backend::TrustonicHidl | Backend::QtiHidl)
     }
 
     /// qti declares the payload methods as `int xxx(..., out SoterData data)`, so
     /// the reply carries the SOTER error code as an extra leading value and the
-    /// parcelable itself holds only the payload.
+    /// parcelable itself holds only the payload.  HIDL 那边没这层：回包只有一
+    /// 个 `Status`（跟 AIDL 同样的位置），所以不算 qti。
     fn has_return_code(self) -> bool {
         self == Backend::Qti
     }
 
     /// Whether the ATTK family (codes 2/6/14) can be addressed.
     ///
+    /// 这是 vendor 的差别而不是 AIDL/HIDL 的差别：联发科那套（Trustonic）上是真
+    /// 实现，高通那边是空号。所以两个 Trustonic 后端都算支持。
+    ///
     /// The host never sends those three, so the vendor's declarations for them
     /// were never observable on Qualcomm, and guessing is not an option: on the
     /// Trustonic HAL code 6 is `generateAttkKeyPair`, i.e. a TEE state change.
     fn supports_attk_extras(self) -> bool {
-        self == Backend::Trustonic
+        matches!(self, Backend::Trustonic | Backend::TrustonicHidl)
     }
 }
 
@@ -164,8 +194,14 @@ pub struct SoterSession {
 
 /// A live SOTER HAL proxy.
 pub struct Soter {
-    binder: SIBinder,
-    backend: Backend,
+    inner: Inner,
+}
+
+/// 两种形态各存各的：AIDL 那套靠 rsbinder 进程级的 proxy 缓存，HIDL 那套自己
+/// 拿着 `/dev/hwbinder` 的连接和句柄。上层不用管区别。
+enum Inner {
+    Aidl { binder: SIBinder, backend: Backend },
+    Hidl { proxy: hidl::HidlSoter, backend: Backend },
 }
 
 impl Soter {
@@ -193,12 +229,24 @@ impl Soter {
     /// One backend: resolve the service, then stamp our descriptor onto the
     /// (process-wide cached) proxy.
     ///
-    /// Stamping is not optional — the HAL checks the interface token on every
-    /// transaction, and rsbinder writes it from the proxy's descriptor.  The
-    /// cast doubles as the compile-time check that our reconstruction of the
-    /// interface still matches what we declared.
+    /// AIDL 那边 stamping 不是可选的 —— HAL 每笔事务都校验 interface token，
+    /// 而 rsbinder 从 proxy 的 descriptor 写这个 token；那次 cast 同时是编译期
+    /// 检查，确认我们重建的接口跟声明还对得上。HIDL 那边 token 由
+    /// [`hidl::HidlSoter::call`] 自己写，服务要么有要么没有，不存在“名字对但
+    /// 描述符不对”这种半吊子状态。
     fn open_backend(backend: Backend) -> Result<Option<Soter>> {
         let service = backend.service();
+        if backend.is_hidl() {
+            let proxy =
+                match hidl::HidlSoter::open_named(service, hidl::HIDL_DEFAULT_INSTANCE, service)? {
+                    Some(proxy) => proxy,
+                    None => return Ok(None),
+                };
+            return Ok(Some(Soter {
+                inner: Inner::Hidl { proxy, backend },
+            }));
+        }
+
         let binder = match hub::try_get_service(service) {
             Ok(Some(binder)) => binder,
             Ok(None) | Err(StatusCode::NameNotFound) => return Ok(None),
@@ -220,35 +268,55 @@ impl Soter {
                 let _typed: rsbinder::Strong<dyn ISoter> =
                     FromIBinder::try_from(binder.clone()).map_err(descriptor_error)?;
             }
+            Backend::TrustonicHidl | Backend::QtiHidl => unreachable!("handled above"),
         }
 
-        Ok(Some(Soter { binder, backend }))
+        Ok(Some(Soter {
+            inner: Inner::Aidl { binder, backend },
+        }))
     }
 
     /// Which vendor backend answered.
     pub fn backend(&self) -> Backend {
-        self.backend
+        match &self.inner {
+            Inner::Aidl { backend, .. } | Inner::Hidl { backend, .. } => *backend,
+        }
     }
 
-    /// 这台机器有没有 SOTER HAL。
+    /// 这台机器有没有 AIDL 那套 SOTER HAL。
     ///
-    /// 心跳上报能力用的，只问 servicemanager 要个 handle，不发起任何事务 ——
-    /// 心跳每 20 秒一次，这里不能有副作用（尤其不能碰 TEE 里的签名计数器）。
+    /// 只问 servicemanager 要个 handle，不发起任何事务 —— 心跳每 20 秒一次，这里
+    /// 不能有副作用（尤其不能碰 TEE 里的签名计数器）。HIDL 那边没有同样廉价的
+    /// 探法（要让 hwservicemanager 发一笔 `get`，还得开 `/dev/hwbinder` 并 mmap
+    /// 一兆），所以这里只报 AIDL；HIDL-only 的机器靠 [`super::probe`] 真探那一
+    /// 步认出来。
     pub(crate) fn service_present() -> bool {
         Backend::ALL
             .iter()
+            .filter(|backend| !backend.is_hidl())
             .any(|backend| hub::check_service(backend.service()).is_some())
+    }
+
+    /// AIDL 那套的 proxy；走到 HIDL 后端就是内部调用错了。
+    fn aidl_binder(&self) -> Result<&SIBinder> {
+        match &self.inner {
+            Inner::Aidl { binder, .. } => Ok(binder),
+            Inner::Hidl { backend, .. } => {
+                bail!("{} is a HIDL backend and has no AIDL proxy", backend.label())
+            }
+        }
     }
 
     /// 只在不支持 ATTK 那三个号的后端上拦一下，见 [`Backend::supports_attk_extras`]。
     fn attk_only(&self, op: &str) -> Result<()> {
-        if self.backend.supports_attk_extras() {
+        let backend = self.backend();
+        if backend.supports_attk_extras() {
             return Ok(());
         }
         bail!(
             "{op} is not wired up for the {} SOTER HAL: the vendor's transaction numbers for the \
              ATTK family were never observable there (the host does not use them)",
-            self.backend.label()
+            backend.label()
         )
     }
 
@@ -257,8 +325,8 @@ impl Soter {
     where
         F: FnOnce(&mut Parcel) -> Result<()>,
     {
-        let remote: &dyn RemoteProxy = self
-            .binder
+        let binder = self.aidl_binder()?;
+        let remote: &dyn RemoteProxy = binder
             .as_remote()
             .ok_or_else(|| anyhow!("SOTER proxy is not remote"))?;
         let mut data = remote
@@ -280,7 +348,7 @@ impl Soter {
         F: FnOnce(&mut Parcel) -> Result<()>,
     {
         let mut reply = self.call(code, write_args)?;
-        read_soter_data(&mut reply, self.backend)
+        read_soter_data(&mut reply, self.backend())
     }
 
     fn call_error<F>(&self, code: u32, write_args: F) -> Result<i32>
@@ -293,125 +361,173 @@ impl Soter {
 
     /// Stable device id (32 hex characters).
     pub fn get_device_id(&self) -> Result<SoterData> {
-        self.call_data(TX_GET_DEVICE_ID, |_| Ok(()))
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_data(TX_GET_DEVICE_ID, |_| Ok(())),
+            Inner::Hidl { proxy, .. } => proxy.get_device_id(),
+        }
     }
 
     /// ATTK (attestation key) public key as a PEM block.
     pub fn export_attk_public_key(&self) -> Result<SoterData> {
         self.attk_only("export_attk_public_key")?;
-        self.call_data(TX_EXPORT_ATTK_PUBLIC_KEY, |_| Ok(()))
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_data(TX_EXPORT_ATTK_PUBLIC_KEY, |_| Ok(())),
+            Inner::Hidl { proxy, .. } => proxy.export_attk_public_key(),
+        }
     }
 
     /// ASK (app signing key) public key plus TEE signature for `uid`.
     pub fn export_ask_public_key(&self, uid: i32) -> Result<SoterData> {
-        self.call_data(TX_EXPORT_ASK_PUBLIC_KEY, |p| {
-            p.write_i32(uid)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_data(TX_EXPORT_ASK_PUBLIC_KEY, |p| {
+                p.write_i32(uid)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.export_ask_public_key(uid),
+        }
     }
 
     /// Per-uid auth key public key.
     pub fn export_auth_key_public_key(&self, uid: i32, alias: &str) -> Result<SoterData> {
-        self.call_data(TX_EXPORT_AUTH_KEY_PUBLIC_KEY, |p| {
-            p.write_i32(uid)?;
-            p.write::<str>(alias)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_data(TX_EXPORT_AUTH_KEY_PUBLIC_KEY, |p| {
+                p.write_i32(uid)?;
+                p.write::<str>(alias)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.export_auth_key_public_key(uid, alias),
+        }
     }
 
     /// Complete a signing session started by [`Self::init_sign`].
     pub fn finish_sign(&self, session: i64) -> Result<SoterData> {
-        self.call_data(TX_FINISH_SIGN, |p| {
-            p.write_i64(session)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_data(TX_FINISH_SIGN, |p| {
+                p.write_i64(session)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.finish_sign(session),
+        }
     }
 
     /// Start a signing session against a per-uid auth key.
     pub fn init_sign(&self, uid: i32, alias: &str, challenge: &str) -> Result<SoterSession> {
+        if let Inner::Hidl { proxy, .. } = &self.inner {
+            return proxy.init_sign(uid, alias, challenge);
+        }
+        let backend = self.backend();
         let mut reply = self.call(TX_INIT_SIGN, |p| {
             p.write_i32(uid)?;
             p.write::<str>(alias)?;
             p.write::<str>(challenge)?;
             Ok(())
         })?;
-        read_soter_session(&mut reply, self.backend)
+        read_soter_session(&mut reply, backend)
     }
 
     /// 0 when `uid` already owns an ASK, -5 when it does not.
     pub fn has_ask_already(&self, uid: i32) -> Result<i32> {
-        self.call_error(TX_HAS_ASK_ALREADY, |p| {
-            p.write_i32(uid)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_HAS_ASK_ALREADY, |p| {
+                p.write_i32(uid)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.has_ask_already(uid),
+        }
     }
 
     /// 0 when the auth key exists.
     pub fn has_auth_key(&self, uid: i32, alias: &str) -> Result<i32> {
-        self.call_error(TX_HAS_AUTH_KEY, |p| {
-            p.write_i32(uid)?;
-            p.write::<str>(alias)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_HAS_AUTH_KEY, |p| {
+                p.write_i32(uid)?;
+                p.write::<str>(alias)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.has_auth_key(uid, alias),
+        }
     }
 
     /// Verify the device ATTK key pair.
     pub fn verify_attk_key_pair(&self) -> Result<i32> {
         self.attk_only("verify_attk_key_pair")?;
-        self.call_error(TX_VERIFY_ATTK_KEY_PAIR, |_| Ok(()))
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_VERIFY_ATTK_KEY_PAIR, |_| Ok(())),
+            Inner::Hidl { proxy, .. } => proxy.verify_attk_key_pair(),
+        }
     }
 
     /// Create the ASK for `uid`.  **Device state change.**
     pub fn generate_ask_key_pair(&self, uid: i32) -> Result<i32> {
-        self.call_error(TX_GENERATE_ASK_KEY_PAIR, |p| {
-            p.write_i32(uid)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_GENERATE_ASK_KEY_PAIR, |p| {
+                p.write_i32(uid)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.generate_ask_key_pair(uid),
+        }
     }
 
     /// Create the device ATTK.  **Device state change.**
     ///
     /// The vendor takes the caller id as an AIDL `byte`, which the binder
     /// protocol carries as a 4-byte value (that is how both AOSP and rsbinder
-    /// marshal a scalar `byte`).
+    /// marshal a scalar `byte`).  HIDL 那边声明的是 `uint8_t copyNum`，同様 4 字节。
     pub fn generate_attk_key_pair(&self, user_id: i8) -> Result<i32> {
         self.attk_only("generate_attk_key_pair")?;
-        self.call_error(TX_GENERATE_ATTK_KEY_PAIR, |p| {
-            p.write_i32(i32::from(user_id))?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_GENERATE_ATTK_KEY_PAIR, |p| {
+                p.write_i32(i32::from(user_id))?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.generate_attk_key_pair(user_id),
+        }
     }
 
     /// Create a per-uid, per-alias auth key.  **Device state change.**
     pub fn generate_auth_key_pair(&self, uid: i32, alias: &str) -> Result<i32> {
-        self.call_error(TX_GENERATE_AUTH_KEY_PAIR, |p| {
-            p.write_i32(uid)?;
-            p.write::<str>(alias)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_GENERATE_AUTH_KEY_PAIR, |p| {
+                p.write_i32(uid)?;
+                p.write::<str>(alias)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.generate_auth_key_pair(uid, alias),
+        }
     }
 
     /// Remove every key belonging to `uid`.  **Device state change.**
     pub fn remove_all_uid_key(&self, uid: i32) -> Result<i32> {
-        self.call_error(TX_REMOVE_ALL_UID_KEY, |p| {
-            p.write_i32(uid)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_REMOVE_ALL_UID_KEY, |p| {
+                p.write_i32(uid)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.remove_all_uid_key(uid),
+        }
     }
 
     /// Remove one auth key.  **Device state change.**
     pub fn remove_auth_key(&self, uid: i32, alias: &str) -> Result<i32> {
-        self.call_error(TX_REMOVE_AUTH_KEY, |p| {
-            p.write_i32(uid)?;
-            p.write::<str>(alias)?;
-            Ok(())
-        })
+        match &self.inner {
+            Inner::Aidl { .. } => self.call_error(TX_REMOVE_AUTH_KEY, |p| {
+                p.write_i32(uid)?;
+                p.write::<str>(alias)?;
+                Ok(())
+            }),
+            Inner::Hidl { proxy, .. } => proxy.remove_auth_key(uid, alias),
+        }
     }
 
-    /// HAL interface version (both vendors ship version 1).
+    /// HAL interface version (every vendor here ships version 1).
     pub fn interface_version(&self) -> Result<i32> {
-        let mut reply = self.call(TX_GET_INTERFACE_VERSION, |_| Ok(()))?;
-        reply.read_i32().context("SOTER reply: interface version")
+        match &self.inner {
+            Inner::Aidl { .. } => {
+                let mut reply = self.call(TX_GET_INTERFACE_VERSION, |_| Ok(()))?;
+                reply.read_i32().context("SOTER reply: interface version")
+            }
+            Inner::Hidl { proxy, .. } => Ok(proxy.interface_version()),
+        }
     }
 }
 
