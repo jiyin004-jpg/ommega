@@ -1275,6 +1275,16 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
         for device_id in &candidates {
             match db.get_device_identity_by_id(device_id, algo) {
                 Ok(Some(id)) => {
+                    // 只认采集器写进去的那些。device-b-2 这类名字是自动源专用槽位，
+                    // 但有台真设备恰好叫这个名字的话，它的私钥不能就这么匿名发出去。
+                    let mid = id.machine_id.as_str();
+                    if mid != "auto:public" && mid != "auto-cover:public" {
+                        tracing::warn!(
+                            "public_keybox device_id={device_id} 是 {} 写的，不是公开源，跳过",
+                            mid
+                        );
+                        continue;
+                    }
                     picked = Some((device_id.clone(), id));
                     break 'scan;
                 }
