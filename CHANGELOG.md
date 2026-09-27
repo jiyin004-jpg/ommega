@@ -30,7 +30,7 @@
 
 **稳定性**
 
-- **SOTER HAL 注进去之后还能干活**：HAL 进程拿到 payload 后有两个动作会被 SELinux 拦下 —— 往自己那个 memfd 镜像里写、日志涨到阈值时轮转删旧件。规则表里把 `tmpfs` 的写权限和 `unlink` / 目录 `setattr` 补上就干净了（努比亚 Z60 Ultra 实测，域 `vendor_hal_soter_qti`）。
+- **SOTER HAL 注进去之后还能干活**：HAL 进程拿到 payload 后有几个动作会被 SELinux 拦下 —— 往自己那个 memfd 镜像里写、dlopen 它（`mmap` 读 + 执行，还得 `getattr`）、日志涨到阈值时轮转（改名、删旧件、改目录时间戳）。规则表里把这几个词补上就干净了（努比亚 Z60 Ultra 实测，域 `vendor_hal_soter_qti`；这几个词是一条条 avc 试出来的，不是照抄别家）。
 - 提升系统稳定性。
 
 ## 1.5.1
