@@ -32,6 +32,15 @@
     - **真机结果**：往 keystore2 打一发 HAL 形状的 `exportAskPublicKey(uid=10373)`，daemon 日志里落下 `hook event: event=soter side=hal code=1 op=exportAskPublicKey uid=10373 …`，注入进程自己那条 `event=soter` 也同时落盘 —— 解析出的 uid 和发出去的完全一致。
     - **生成代码的 clippy 放行补全**：`build.rs` 原来只给第一棵包树（`top`）加 `#[allow(clippy::all)]`，新增的 `vendor` 包树没盖到，clippy 在生成的 `FIRST_CALL_TRANSACTION + 0` 上报 `identity_op` 直接失败。现在 `android` / `top` / `vendor` 三棵都加，只动刚生成出来的那个文件。
 
+- **微信指纹支付「开启失败」的根因修掉了**：`read_string16` 把尾部 NUL 和补齐字节落下了，`initSigh` 的 challenge 一直被读成空串。现在按 `[i32 字符数][字符][NUL][补齐到 4 字节]` 的布局读，跳过补齐那一步是 `skip_padding(len * 2 + 2)`。
+  - **真机结果**：修之前 `challenge_len=0`、回包 488 字节；修完 `challenge_len=50`、回包 538 字节（488 + 50，字节级对得上）。微信这边指纹支付的开启流程从「开启失败」变成开启成功。
+- **A 端 uid 替身**（配置项 `soter_uid_map`）：A 端把请求里的 uid 换成 B 端上现铸的那个再发出去，B 端用自己的 TEE 给 A 的槽位出证。真机实测 `10490 → 10373`，ASK、认证公钥、签名三条链都验得过。
+- **本地兜底层（第 4 层）**：B 端层和服务端两层都不行的时候，A 端用本机自己的设备信息（cpu_id、指纹名与版本、TEE 名与版本、fid）按真机形状出信封，签的是 JSON 原文，不是把 A 端 uid 写死。
+- **服务端槽位钉层**：同一台 A 端设备的同一个 uid，换层成功之后这个槽位就钉在那一层，钉子有 30 分钟寿命；App 重新 `generate_ask_key_pair`、或者服务端删掉这个 uid 的 key 时自动拔钉。SOTER 那趟的超时单独放成 15 秒（认证请求还是 3 秒快速失败）——SOTER 换层等于换钥匙，宁慢勿错。
+- **SOTER 域日志哑掉的根因是 SELinux 标签**：宿主跑在 `system_app` 域，写 `/data/misc/ommega/logs`（标签 `system_data_file`）被拒，而且不报错也不落字，日志就静静断在那儿。现在 `daemon-injector` 每轮把目录和文件 `chcon` 成 `system_app_data_file`（开机 `restorecon` 会改回去，所以每轮补；已经打开的 fd 不受重新打标影响）。
+- **日志开关改成运行期可复查**：原来只在进程启动那一次读，现在 30 秒一轮复查（线程 `ommega-log-switch`），关着起来的实例回头能把日志恢复回去，恢复时回到配置里的等级而不是 Debug。payload 的日志后端也改成「候选路径各自独立试」，一个位置出错不会把另一个候选带下去。
+- **本地兜底那把 ASK 私钥可换了**：顺序是环境变量 `OMMEGA_SOTER_ASK_PEM` → `/data/misc/ommega/soter_ask.pem` → `/data/misc/keystore/ommega/soter_ask.pem` → 编在二进制里那把；文件损坏或读不到就回落内嵌。`daemon-injector` 负责镜像并重启宿主让新 key 生效，源文件删掉时镜像跟着删。自己生成一把：`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out soter_ask.pem`。
+
 ## 1.5.1
 
 本版四端同号：A 端模块、B 端模块、b-app、服务端都是 1.5.1。
