@@ -8,6 +8,9 @@
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
 CONF_FILE=$STATE_DIR/relay.conf
+LOCK_DIR=$STATE_DIR/relay-service.lock
+RELAY_PID_FILE=$STATE_DIR/relay.pid
+LOG_FILE=$STATE_DIR/logs/service.log
 
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/vendor/lib64/:/system/lib64/:/apex/com.android.runtime/lib64/bionic/"
 
@@ -88,13 +91,72 @@ load_relay_env() {
   fi
 }
 
-# Wait up to ~10s for the relay binary to actually start. We check by process
-# name only (no pid files), so a manual `sh service.sh` can be trusted to have
-# brought up the full service.
+# ---------------------------------------------------------------------------
+# 单例：一轮启动里 service.sh 会被并发执行好几次
+# ---------------------------------------------------------------------------
+# 实测（一加 PLC110 / KernelSU 3.3.0，2026-09-28 00:35:48 那次重启）：同一秒里
+# service.sh 被拉起 6 份，每份都自己 fork 一个 while 守护循环，而各自的 kill_all
+# 几乎同时执行、谁也杀不掉谁 —— 结果一台设备挂着 6 个 relay，全都拿同一个
+# device_id 去抢同一台设备的任务，日志也互相打（service.log 被 6 份一起追加，
+# 涨到 100MB 以上）。
+#
+# 锁借 mkdir 的原子性：抢到的负责起守护循环，并且一直持有（锁跟着守护循环那个
+# 子 shell 活）；抢不到的只把现役 relay 杀一下就走 —— 旧守护两秒后会把它拉起来，
+# 所以手动 `sh service.sh` 依旧是“重启 relay”的意思，只是不会再长出第二个循环。
+# 陈锁（持有者早没了：强杀、断电）会被清掉重抢。
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "$$" > "$LOCK_DIR/pid"
+    return 0
+  fi
+
+  local holder
+  holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    return 1
+  fi
+
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  echo "$$" > "$LOCK_DIR/pid"
+  return 0
+}
+
+# service.log 是纯追加的，以前没有任何上限。守护循环每次看见 relay 异常退出都会
+# 写两行，多份实例并存时更是成倍增长（实测到过 125MB）。启动时超过 8MB 就轮转
+# 一次，只留一份 .1。
+rotate_log() {
+  local size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null)
+  case "$size" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if [ "$size" -gt 8388608 ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+  fi
+}
+
+# 判断 relay 到底起来没有。原来用 `pgrep -x relay`，但在这台机器上它的退出码
+# 一直不对 —— service.log 里 "relay is up" 从来没出现过一次，永远走 else 分支，
+# 于是启动结果永远显示不准确（实际 relay 是好的，靠它自己改 module.prop 兜住）。
+# 现在认守护循环写下的 pid：进程还在、cmdline 里带 relay，就算起来了。
+pid_is_relay() {
+  local pid=$1
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
+    *relay*) return 0 ;;
+  esac
+  return 1
+}
+
+# Wait up to ~10s for the relay binary to actually start, so a manual
+# `sh service.sh` can be trusted to have brought up the full service.
 wait_for_relay() {
   local tries=0
   while [ $tries -lt 20 ]; do
-    if pgrep -x relay >/dev/null 2>&1; then
+    if pid_is_relay "$(cat "$RELAY_PID_FILE" 2>/dev/null)"; then
       return 0
     fi
     sleep 0.5
@@ -110,6 +172,14 @@ kill_all() {
   pkill -9 -x relay 2>/dev/null
 }
 
+if ! acquire_lock; then
+  echo "[service] another instance already owns $LOCK_DIR; restarting the running relay"
+  kill_all
+  exit 0
+fi
+
+rotate_log
+
 kill_all
 
 update_status "Ommega Attestation Relay Module ⏳ 启动中"
@@ -117,6 +187,7 @@ update_status "Ommega Attestation Relay Module ⏳ 启动中"
 TARGET=$(find_module_relay)
 if [ -z "$TARGET" ]; then
   echo "[service] relay binary not found"
+  rm -rf "$LOCK_DIR"
   exit 1
 fi
 
@@ -129,6 +200,8 @@ load_relay_env
 # 等 10s 就退出，进程一挂设备就静默地不再领任务了。A 端 daemon 早就有
 # 这个 while 循环，B 端现在对齐。
 (
+  # 锁由这个子 shell 拿着，它活多久算多久；主脚本退出不影响它。
+  trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM HUP
   while true; do
     TARGET=$(find_module_relay)
     if [ -z "$TARGET" ]; then
@@ -141,13 +214,19 @@ load_relay_env
     load_relay_env
     "$TARGET" &
     child=$!
+    echo "$child" > "$RELAY_PID_FILE"
     echo "[service] relay started (pid $child)"
     wait "$child"
     rc=$?
+    rm -f "$RELAY_PID_FILE" 2>/dev/null
     echo "[service] relay exited (code $rc); restarting in 2s"
     sleep 2
   done
-) >> "$STATE_DIR/logs/service.log" 2>&1 &
+) >> "$LOG_FILE" 2>&1 &
+
+# 锁里记守护循环（= 子 shell）的 pid：子 shell 里的 $$ 仍是父 shell 的 pid，
+# 所以只能由主脚本用 $! 写。
+echo "$!" > "$LOCK_DIR/pid"
 
 # 先确认第一次是否真的起来了，好在模块日志里给出可见结果。
 if wait_for_relay; then
