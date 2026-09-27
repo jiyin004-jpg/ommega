@@ -6,12 +6,25 @@
 //! 的 SOTER 应答出来。
 //!
 //! 形状跟服务端 `soter_mint.rs` 一模一样（那边的测试验过：ASK 的签名拿导出的
-//! ATTK 公钥验得过）：
+//! ATTK 公钥验得过）。要吐信封的三处都是同一个形状：
 //!
 //! ```text
-//! ASK = [i32 le JSON 长度][JSON][256 字节 RSA-PSS-SHA256 签名]
-//! JSON 键序 pub_key / cpu_id / counter / uid / rsa_pss_saltlen，uid 是字符串
+//! [i32 le JSON 长度][JSON][256 字节 RSA-PSS-SHA256 签名]
 //! ```
+//!
+//! - `exportAskPublicKey`：JSON 是 ASK 的自描述（`pub_key` 就是本机 ASK 公钥），
+//!   拿 ASK 自己签 —— 本地模式里 ASK 兼 ATTK，跟服务端 self_signed 那层一个道理；
+//! - `exportAuthKeyPublicKey`：JSON 是 AuthKey 的自描述，**拿 ASK 私钥签**。App 是
+//!   先拿到 ASK 公钥、再拿它验这个信封的，签错了它验不过；
+//! - `finishSign`：JSON 是这次签名的现场（`raw` / `fid` / `counter` / `tee_*` /
+//!   `fp_*` / `cpu_id` / `uid`），**拿 AuthKey 签那段 JSON 原文**。真机签的不是
+//!   challenge 的字节，而是这段 JSON（B 端实测：App 验的也是 JSON 原文）。
+//!
+//! 键序全照真机现场抓到的来，字段名一个都别改，`uid` 是字符串不是数字。
+//!
+//! 设备信息（`cpu_id` / `fp_n` / `fp_v` / `tee_n` / `tee_v` / `fid`）按本机属性推：
+//! `cpu_id` 由 `ro.boot.serialno` 派生，指纹和 TEE 也从属性读，读不到才退回兜底值。
+//! 不要把它写成编死的常量 —— 那样装过这套的机器全是同一个设备，业务侧一眼假。
 //!
 //! 心里得有数的边界：自签的链**骗得过 App 本地**（它拿我们给的公钥验我们签的
 //! 东西，当然验得过），**骗不过业务服务端的证书链校验**。私钥就编在 binary 里，
@@ -40,9 +53,9 @@ const NOT_FOUND: i32 = -5;
 const SALT_LEN: i32 = 32;
 /// 编译进来的那把私钥（PKCS#8 PEM）。
 const ASK_PEM: &[u8] = include_bytes!("../../assets/soter_ask.pem");
-/// 本机 SOTER 设备号的种子。真机上是 `09000000` + 12 字节随机，我们按种子派生，
-/// 好处是同一台机器每次算出来都一样（设备身份不能今天一个明天一个）。
-const DEVICE_SEED: &str = "ommega-a-side-local";
+/// 读不到序列号时的兜底种子。正常情况 `cpu_id` 是按本机 `ro.boot.serialno` 派生的
+/// （每台机器一个号，同一台机器每次都一样），只有序列号都读不到才用得上它。
+const FALLBACK_SEED: &str = "ommega-a-side-local";
 
 /// 一对 RSA，加它的公钥 PEM（SOTER 里的"证书"就是拿这个验的）。
 struct Key {
@@ -81,7 +94,9 @@ impl Key {
 struct SignSession {
     uid: i32,
     alias: String,
-    challenge: Vec<u8>,
+    /// 挑战原文，宿主传下来什么样就存什么样。真机把它写进签名 JSON 的 `raw` 里，
+    /// 我们照做，不去解它（解了反而签的不是 App 要的东西）。
+    raw: String,
 }
 
 /// 后端状态。签发用的 key 一开始就加载好（编译进来的，失败就是编坏了）。
@@ -124,19 +139,146 @@ fn now_millis() -> i64 {
 
 /// 一台"看起来像真机"的设备号：`09000000` + 12 字节十六进制。
 ///
-/// 真机上是 `09000000` + 12 字节随机；我们按固定种子派生，这样同一台 A 端设备
-/// 每次都是同一个号 —— 换个号 App 会当成换了设备，那就要重走一遍建 key 流程。
+/// 按本机序列号派生，同一台机器每次都一样（换号 App 会当成换了设备，得重走一遍
+/// 建 key 流程），不同机器不一样 —— 这才叫设备身份。
 pub(crate) fn device_id() -> String {
+    device_info().cpu_id.clone()
+}
+
+// ---------------------------------------------------------------------------
+// 本机设备信息：本地模式该拿这台机器自己的东西填，不编常量
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "android")]
+extern "C" {
+    /// bionic 里现成的属性读取，返回写进 value 的长度（0 = 没这条属性）。
+    fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
+}
+
+/// 读一条系统属性。payload 跑在 uid 1000 的系统进程里，直接调 bionic 比 fork 一个
+/// `getprop` 便宜几个数量级（签名这条路径上每毫秒都算数）。
+#[cfg(target_os = "android")]
+fn prop(name: &str) -> Option<String> {
+    use std::ffi::CStr;
+    let name = std::ffi::CString::new(name).ok()?;
+    // bionic 的 PROP_VALUE_MAX 是 92，留点余量。
+    let mut buf = [0 as libc::c_char; 128];
+    let len = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
+    if len <= 0 {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// 非 Android（开发机上 `cargo check` 这种）读不到属性，一律当没有，走兜底值。
+#[cfg(not(target_os = "android"))]
+fn prop(_name: &str) -> Option<String> {
+    None
+}
+
+/// 这台机器的 SOTER 设备信息。属性只读一次，之后复用。
+struct DeviceInfo {
+    /// `09000000` + 12 字节十六进制。
+    cpu_id: String,
+    fp_n: String,
+    fp_v: String,
+    tee_n: String,
+    tee_v: String,
+    /// 签名 JSON 里那个 `fid`（指纹 id）。
+    fid: String,
+}
+
+fn device_info() -> &'static DeviceInfo {
+    static INFO: OnceLock<DeviceInfo> = OnceLock::new();
+    INFO.get_or_init(|| {
+        let serial = prop("ro.boot.serialno").or_else(|| prop("ro.serialno"));
+        DeviceInfo {
+            cpu_id: cpu_id_from(serial.as_deref()),
+            fp_n: fingerprint_name(),
+            fp_v: fingerprint_version(),
+            tee_n: tee_name(),
+            tee_v: tee_version(),
+            fid: fid_from(serial.as_deref()),
+        }
+    })
+}
+
+/// 一台像真机的设备号：`09000000` + 12 字节十六进制。
+fn cpu_id_from(serial: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"ommega-a-side-soter:");
-    hasher.update(DEVICE_SEED.as_bytes());
+    hasher.update(serial.unwrap_or(FALLBACK_SEED).as_bytes());
     let digest = hasher.finalize();
     let mut out = String::from("09000000");
     for byte in &digest[..12] {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// 指纹 id。真值在 TA 里，本地拿不到 —— 按本机派生一个稳定的十进制串，形状跟真机
+/// 一致（B 端是 `3650688678` 这种十位）。
+fn fid_from(serial: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ommega-a-side-soter-fid:");
+    hasher.update(serial.unwrap_or(FALLBACK_SEED).as_bytes());
+    let digest = hasher.finalize();
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 4_000_000_000;
+    (1_000_000_000u64 + n as u64).to_string()
+}
+
+/// 指纹厂商。ZTE/nubia 把型号写在 feature 开关里，认不出来就看 `ro.hardware.fingerprint`。
+fn fingerprint_name() -> String {
+    if prop("ro.vendor.feature.zte_fingerprint_default_goodix_g7_aidl").is_some()
+        || prop("ro.vendor.feature.zte_fingerprint_default_goodix_gf96xx_g7_cali").is_some()
+    {
+        return "Goodix".to_string();
+    }
+    prop("ro.hardware.fingerprint").unwrap_or_else(|| "unknown".to_string())
+}
+
+/// 指纹固件版本。有真版本号就用真的，没有就退回传感器型号。
+fn fingerprint_version() -> String {
+    for name in [
+        "persist.vendor.fingerprint.fw_version",
+        "vendor.fingerprint.fw_version",
+        "persist.goodix.fw_version",
+    ] {
+        if let Some(value) = prop(name) {
+            return value;
+        }
+    }
+    if prop("ro.vendor.feature.zte_fingerprint_default_goodix_gf96xx_g7_cali").is_some() {
+        return "GF96xx".to_string();
+    }
+    "unknown".to_string()
+}
+
+/// TEE 名字。A 端这批是 QTI 平台，跑的是 QSEE。
+fn tee_name() -> String {
+    match prop("ro.soc.manufacturer").as_deref() {
+        Some("QTI") | Some("Qualcomm") | Some("Qualcomm Technologies, Inc") => "QSEE".to_string(),
+        _ => prop("ro.hardware").unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+/// TEE 版本。真机上是 TA 报的版本串，本地拿不到 —— 拿本机的 SoC 型号加安全补丁拼
+/// 一个：都是真的、每台机器不一样、也不会变来变去。
+fn tee_version() -> String {
+    let soc = prop("ro.soc.model").unwrap_or_default();
+    let patch = prop("ro.vendor.build.security_patch")
+        .or_else(|| prop("ro.build.version.security_patch"))
+        .unwrap_or_default();
+    match (soc.is_empty(), patch.is_empty()) {
+        (false, false) => format!("{soc}-{patch}"),
+        (false, true) => soc,
+        (true, false) => patch,
+        (true, true) => "unknown".to_string(),
+    }
 }
 
 /// 后端给出来的一笔应答。
@@ -175,45 +317,53 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
     }
     let state = state()?;
     match call.code {
-        // exportAskPublicKey(uid)
+        // exportAskPublicKey(uid) —— ASK 的自描述，拿 ASK 自己签（本地 ASK 兼 ATTK）
         1 => {
             let uid = call.uid?;
             let counter = bump_counter(state, uid);
             let document = ask_json(&state.ask, uid, counter).ok()?;
             let signature = state.ask.sign(&document)?;
-            let mut data = Vec::with_capacity(4 + document.len() + signature.len());
-            data.extend_from_slice(&(document.len() as i32).to_le_bytes());
-            data.extend_from_slice(&document);
-            data.extend_from_slice(&signature);
             Some(Answer::Buffer {
                 code: OK,
-                data: Some(data),
+                data: Some(envelope(&document, &signature)),
             })
         }
-        // exportAuthKeyPublicKey(uid, alias)
+        // exportAuthKeyPublicKey(uid, alias) —— 回的是 AuthKey 的自描述信封，
+        // 拿 ASK 私钥签（App 先有 ASK 公钥，验的就是这把）。
         3 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
             match auth_key(state, uid, alias) {
-                Some(key) => Some(Answer::Buffer {
-                    code: OK,
-                    data: Some(key.pem.clone().into_bytes()),
-                }),
+                Some(key) => {
+                    let counter = bump_counter(state, uid);
+                    let document = auth_json(&key, uid, counter);
+                    let signature = state.ask.sign(&document)?;
+                    Some(Answer::Buffer {
+                        code: OK,
+                        data: Some(envelope(&document, &signature)),
+                    })
+                }
                 None => Some(Answer::Buffer {
                     code: NOT_FOUND,
                     data: None,
                 }),
             }
         }
-        // finishSign(session)
+        // finishSign(session) —— 签的是那段 JSON 原文（不是 challenge 的字节），
+        // 拿 AuthKey 签，回「JSON + 签名」的信封。
         4 => {
             let session = call.session?;
             let pending = state.sessions.lock().ok()?.remove(&session);
             let found = pending.and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
             match found {
-                Some((s, key)) => Some(Answer::Buffer {
-                    code: OK,
-                    data: Some(key.sign(&s.challenge)?),
-                }),
+                Some((s, key)) => {
+                    let counter = bump_counter(state, s.uid);
+                    let document = sign_json(s.uid, &s.raw, counter);
+                    let signature = key.sign(&document)?;
+                    Some(Answer::Buffer {
+                        code: OK,
+                        data: Some(envelope(&document, &signature)),
+                    })
+                }
                 // 会话丢了就是丢了，跟真机一个码；别透给真 HAL（那条腿本来就是废的）
                 None => Some(Answer::Buffer {
                     code: NOT_FOUND,
@@ -263,8 +413,8 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
                     session: 0,
                 });
             }
-            // 挑战是十六进制串，转回字节再签（宿主那边也是这么处理的）。
-            let challenge = decode_challenge(call.challenge.as_deref()?);
+            // 挑战原文照存：真机把它写进签名 JSON 的 `raw` 里，我们照做。
+            let raw = call.challenge.as_deref()?.to_string();
             let mut next = state.next_session.lock().ok()?;
             *next += 1;
             let session = *next;
@@ -273,7 +423,7 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
                 SignSession {
                     uid,
                     alias: alias.to_string(),
-                    challenge,
+                    raw,
                 },
             );
             Some(Answer::Init {
@@ -324,30 +474,48 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
     *entry
 }
 
-/// 挑战的编码：宿主传下来的是十六进制串。解不成十六进制就按原样当字节用，
-/// 宁可签一份"看起来像"的也不要在这一步就把调用打死。
-fn decode_challenge(text: &str) -> Vec<u8> {
-    let trimmed = text.trim();
-    if trimmed.len().is_multiple_of(2) && !trimmed.is_empty() {
-        let mut out = Vec::with_capacity(trimmed.len() / 2);
-        let bytes = trimmed.as_bytes();
-        let mut ok = true;
-        for pair in bytes.chunks(2) {
-            let hi = (pair[0] as char).to_digit(16);
-            let lo = (pair[1] as char).to_digit(16);
-            match (hi, lo) {
-                (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return out;
-        }
-    }
-    trimmed.as_bytes().to_vec()
+/// 包 SOTER 的信封：`[i32 le JSON 长度][JSON][签名]`。三处回信封的地方都走它，
+/// 字节序跟真机一致（小端）。
+fn envelope(document: &[u8], signature: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + document.len() + signature.len());
+    out.extend_from_slice(&(document.len() as i32).to_le_bytes());
+    out.extend_from_slice(document);
+    out.extend_from_slice(signature);
+    out
+}
+
+/// AuthKey 那份 JSON，`pub_key` 是 AuthKey 自己的公钥 —— **拿 ASK 私钥签**。
+fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
+    let info = device_info();
+    format!(
+        "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
+        json_string(&key.pem),
+        info.cpu_id,
+        counter,
+        uid,
+        SALT_LEN
+    )
+    .into_bytes()
+}
+
+/// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
+/// 都不能少 —— App 会把它们存下来当设备指纹。
+fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
+    let info = device_info();
+    format!(
+        "{{\"raw\":{},\"fid\":{},\"counter\":{},\"tee_n\":{},\"tee_v\":{},\"fp_n\":{},\"fp_v\":{},\"cpu_id\":{},\"uid\":{},\"rsa_pss_saltlen\":{}}}",
+        json_string(raw),
+        json_string(&info.fid),
+        counter,
+        json_string(&info.tee_n),
+        json_string(&info.tee_v),
+        json_string(&info.fp_n),
+        json_string(&info.fp_v),
+        json_string(&info.cpu_id),
+        json_string(&uid.to_string()),
+        SALT_LEN
+    )
+    .into_bytes()
 }
 
 /// ASK 那份 JSON。键序照现场抓到的来，`uid` 是字符串别写成数字。
@@ -531,9 +699,11 @@ mod tests {
             OK
         );
 
-        let pem = as_buffer(answer(&call(3, Some(uid), Some("SoterAuthKey"))));
-        let text = String::from_utf8(pem).unwrap();
-        assert!(text.starts_with("-----BEGIN PUBLIC KEY-----"), "got {text}");
+        // 导出 AuthKey 公钥：回的是信封，里面那把公钥的自描述得拿 ASK 公钥验得过
+        let auth_envelope = as_buffer(answer(&call(3, Some(uid), Some("SoterAuthKey"))));
+        let (auth_document, _) = split_envelope(&auth_envelope);
+        let text = String::from_utf8(auth_document).unwrap();
+        assert!(text.contains("BEGIN PUBLIC KEY"), "got {text}");
 
         assert_eq!(
             as_code(answer(&call(13, Some(uid), Some("SoterAuthKey")))),
@@ -574,21 +744,27 @@ mod tests {
 
         let mut finish = call(4, None, None);
         finish.session = Some(session);
-        let signature = as_buffer(answer(&finish));
-        assert_eq!(signature.len(), 256);
+        let envelope = as_buffer(answer(&finish));
+        let (document, signature) = split_envelope(&envelope);
+        assert_eq!(signature.len(), 256, "RSA-2048 signature is 256 bytes");
 
-        // 拿导出的那把公钥验签，验得过才算数
-        let pem = String::from_utf8(as_buffer(answer(&call(3, Some(uid), Some(alias))))).unwrap();
-        use rsa::pkcs8::DecodePublicKey;
-        use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
-        use rsa::signature::Verifier;
-        let public = rsa::RsaPublicKey::from_public_key_pem(&pem).expect("exported pem parses");
-        PssVerifyingKey::<PssSha256>::new(public)
-            .verify(
-                &decode_challenge("deadbeef"),
-                &PssSignature::try_from(&signature[..]).unwrap(),
-            )
-            .expect("the challenge signature must verify");
+        // 签的是 JSON 原文，`raw` 就是宿主传下来的挑战原文
+        let text = String::from_utf8(document.clone()).unwrap();
+        assert!(text.contains("\"raw\":\"deadbeef\""), "got {text}");
+
+        // 拿导出的那把 AuthKey 公钥验这段 JSON —— 验得过才叫闭环
+        let auth_envelope = as_buffer(answer(&call(3, Some(uid), Some(alias))));
+        let (auth_document, _) = split_envelope(&auth_envelope);
+        let auth_pem = pem_of(&String::from_utf8(auth_document).unwrap());
+        assert!(
+            verifies(&auth_pem, &document, &signature),
+            "the sign document must verify with the exported AuthKey"
+        );
+        // 反过来，拿 ASK 的公钥是验不过的（签名那把确实是 AuthKey）
+        assert!(
+            !verifies(&ask_pem(), &document, &signature),
+            "the sign document must not verify with the ASK key"
+        );
     }
 
     #[test]
@@ -608,13 +784,125 @@ mod tests {
         assert_eq!(as_buffer_code(answer(&c)), NOT_FOUND);
     }
 
+    /// 拆信封：`[i32 le JSON 长度][JSON][签名]`。
+    fn split_envelope(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let len = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        (data[4..4 + len].to_vec(), data[4 + len..].to_vec())
+    }
+
+    /// 从一份 JSON 里抠出 `pub_key` 的 PEM（够用就行，不引 JSON 库）。
+    fn pem_of(document: &str) -> String {
+        const BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
+        const END: &str = "-----END PUBLIC KEY-----";
+        let start = document.find(BEGIN).expect("the document carries a pem");
+        let end = document.find(END).expect("the pem has a tail") + END.len();
+        document[start..end].replace("\\n", "\n")
+    }
+
+    /// 拿一把 PEM 公钥验一段签名（RSA-PSS-SHA256）。
+    fn verifies(pem: &str, message: &[u8], signature: &[u8]) -> bool {
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
+        use rsa::signature::Verifier;
+        let Ok(public) = rsa::RsaPublicKey::from_public_key_pem(pem) else {
+            return false;
+        };
+        let Ok(signature) = PssSignature::try_from(signature) else {
+            return false;
+        };
+        PssVerifyingKey::<PssSha256>::new(public)
+            .verify(message, &signature)
+            .is_ok()
+    }
+
+    /// 本机 ASK 的公钥 PEM。
+    fn ask_pem() -> String {
+        state().unwrap().ask.pem.clone()
+    }
+
     #[test]
-    fn challenge_decoding_handles_hex_and_falls_back_to_raw() {
-        assert_eq!(decode_challenge("deadbeef"), vec![0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(decode_challenge("00"), vec![0x00]);
-        // 奇数长度或者带非十六进制字符就按原样
-        assert_eq!(decode_challenge("abc"), b"abc".to_vec());
-        assert_eq!(decode_challenge("zz"), b"zz".to_vec());
+    fn the_auth_key_document_is_signed_by_the_ask() {
+        let uid = 6100;
+        let alias = "SoterAuthKeyPay";
+        assert_eq!(as_code(answer(&call(7, Some(uid), Some(alias)))), OK);
+
+        let envelope = as_buffer(answer(&call(3, Some(uid), Some(alias))));
+        let (document, signature) = split_envelope(&envelope);
+        let text = String::from_utf8(document.clone()).unwrap();
+
+        // 字段名和键序照真机抓的来
+        let order: Vec<usize> = ["pub_key", "cpu_id", "counter", "uid", "rsa_pss_saltlen"]
+            .iter()
+            .map(|k| text.find(&format!("\"{k}\"")).expect("key present"))
+            .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "key order changed: {text}"
+        );
+
+        // App 是拿 ASK 公钥验这个信封的 —— 这一步验得过，AuthKey 这条链才算自洽
+        assert!(
+            verifies(&ask_pem(), &document, &signature),
+            "the AuthKey document must verify with the ASK key"
+        );
+    }
+
+    #[test]
+    fn the_sign_document_carries_the_device_fields() {
+        let uid = 6200;
+        let alias = "SignFields";
+        assert_eq!(as_code(answer(&call(7, Some(uid), Some(alias)))), OK);
+
+        let mut init = call(11, Some(uid), Some(alias));
+        init.challenge = Some("0a1b2c3d".to_string());
+        let session = match answer(&init) {
+            Some(Answer::Init { session, .. }) => session,
+            _ => panic!("initSign must answer with a session"),
+        };
+        let mut finish = call(4, None, None);
+        finish.session = Some(session);
+        let (document, _) = split_envelope(&as_buffer(answer(&finish)));
+        let text = String::from_utf8(document).unwrap();
+
+        // 字段和键序照 B 端 TEE 现场抓的来，一个都不能少
+        let order: Vec<usize> = [
+            "raw",
+            "fid",
+            "counter",
+            "tee_n",
+            "tee_v",
+            "fp_n",
+            "fp_v",
+            "cpu_id",
+            "uid",
+            "rsa_pss_saltlen",
+        ]
+        .iter()
+        .map(|k| text.find(&format!("\"{k}\":")).expect("key present"))
+        .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "key order changed: {text}"
+        );
+        assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
+        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
+    }
+
+    #[test]
+    fn the_device_info_is_derived_from_this_machine() {
+        let info = device_info();
+        assert_eq!(info.cpu_id.len(), 32, "SOTER device ids are 32 hex chars");
+        assert!(info.cpu_id.starts_with("09000000"));
+        assert!(info.cpu_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(info.cpu_id, device_id(), "device_id() 就是那个 cpu_id");
+        assert_eq!(device_info().cpu_id, info.cpu_id, "属性只读一次，值要稳定");
+
+        assert!(!info.fp_n.is_empty());
+        assert!(!info.fp_v.is_empty());
+        assert!(!info.tee_n.is_empty());
+        assert!(!info.tee_v.is_empty());
+        assert!(info.fid.len() >= 10, "fid 像真机那样是十位数字");
+        assert!(info.fid.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
