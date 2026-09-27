@@ -1,59 +1,76 @@
+# ommega A 端的 SELinux 放行规则。
+#
+# 注入目标一共三类进程：keystore2（keymint 那边）、SOTER 宿主
+# （com.tencent.soter.soterserver）、SOTER HAL 服务进程。东西只有两条路走：注入器（root）
+# 把 payload 镜像的 fd 通过 unix dgram socket 递进目标进程；目标进程带着 payload 去连
+# daemon 开的抽象 unix socket（套接字算在 keystore 域）拿答复，顺带把日志落文件。
+#
+# 麻烦的地方在于**域名各个 ROM 不一样**：宿主在一加 PLC110 上是 platform_app、AOSP 上是
+# system_app；SOTER HAL 在骁龙 ColorOS 上是 vendor_hal_soter_qti、联发科 Trustonic 上是
+# hal_soter_trustonic、按 AOSP 惯例命名的 AIDL HAL 一般叫 hal_soter_default。以前只写
+# 一组，换台机器就变成「注进去了但日志写不出来、RPC 也连不上」。
+#
+# 所以这里把可能的名字都列进列表里：**policy 里不存在的域名，kernel 会直接跳过那条规则**
+# （实测一加 PLC110 的 policy 里既没有 hal_soter 也没有 system_app，整份文件照样生效），
+# 宁滥勿缺。以后碰到新域名，往下面几个列表里加个名字就行，规则形状不用动。
+#
+# 一个坑：ksud 的规则解析器**一个列表最多 5 个名字**，写 6 个整行会被丢掉（check 报
+# parse 失败、apply 里直接跳过），所以 HAL 那几个域分成了 H1 / H2 两组，加名字时挑
+# 没满 5 个的那组放。
+
+# keystore2：payload 进去之后它得能 dlopen 我们镜像里的库。
 allow keystore system_file unix_dgram_socket { getattr read recvfrom }
-allow system_file keystore unix_dgram_socket sendto
 allow keystore system_file file { execute getattr map read receive }
 
-# SOTER 的宿主进程（com.tencent.soter.soterserver）也要能收下我们的 payload：
-# 注入器把 payload 镜像的 fd 经 unix dgram socket 递进去，它自己在进程里 dlopen。
-# 各机器上这个进程的域不一定一样，A 端这台（红魔 9 Pro / Android 16）是 system_app。
-allow system_app system_file unix_dgram_socket { getattr read recvfrom }
-allow system_file system_app unix_dgram_socket sendto
-allow system_app system_file file { execute getattr map read receive }
+# 递 payload 的那条 dgram：target 侧收，注入器那侧发。发送方域可能落在
+# system_file（ColorOS 上实测就是这个）、ksu、magisk 这些里，列全了不吃亏。
+allow { system_file ksu magisk su } { keystore } unix_dgram_socket sendto
+
+# 注入目标是普通 app 域的那些（SOTER 宿主以及以后另外的 apk 宿主）。
+# system_app = AOSP，platform_app = 一加/ColorOS 实测，priv_app = 系统特权 app。
+allow { system_app platform_app priv_app } system_file unix_dgram_socket { getattr read recvfrom }
+allow { system_file ksu magisk su } { system_app platform_app priv_app } unix_dgram_socket sendto
+allow { system_app platform_app priv_app } system_file file { execute getattr map read receive }
+
+# 宿主进不去 /data/misc/keystore（0700 keystore），所以 daemon 另开了一个抽象 unix
+# socket 当第二会合点：不落文件，DAC 管不着，能不能连上就只看这条规则了。
+allow { system_app platform_app priv_app } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+
+# 宿主自己要落日志：payload 只走文件、不走 logcat，它得进得去那个目录。
+# 实测系统只放行了 file 的 read（读 log_flag 够了），目录本身的 open/read 和建文件
+# 全被拒，所以 dir 那一侧得补齐。
+allow { system_app platform_app priv_app } system_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow { system_app platform_app priv_app } system_data_file file { open read write create append getattr setattr }
+# 日志目录另外会被 daemon 打成 system_app_data_file，这个标签也得放行。
+allow { system_app platform_app priv_app } system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow { system_app platform_app priv_app } system_app_data_file file { open read write create append getattr setattr }
 
 allow crash_dump keystore process *
 
-# SOTER 的宿主（system_app）进不去 /data/misc/keystore（0700 keystore），所以 daemon
-# 另开了一个抽象 unix socket 当第二会合点：不打文件，DAC 管不着，放行只能靠这条。
-allow system_app keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+# SOTER HAL 服务进程本身也是注入目标（宿主不在时，`service call` 那种直连只有注进
+# HAL 才看得见）。它跟宿主一样要收 payload、连 RPC socket、写日志，所以上面那组
+# 一条不落再来两份，只是域换成 HAL 的几种叫法。
+# H1 = hal_soter（高通 AOSP）、hal_soter_default（AOSP AIDL 惯例命名）、
+#      hal_soter_qti（高通自家命名）
+allow { hal_soter hal_soter_default hal_soter_qti } system_file unix_dgram_socket { getattr read recvfrom }
+allow { system_file ksu magisk su } { hal_soter hal_soter_default hal_soter_qti } unix_dgram_socket sendto
+allow { hal_soter hal_soter_default hal_soter_qti } system_file file { execute getattr map read receive }
+allow { hal_soter hal_soter_default hal_soter_qti } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+allow { hal_soter hal_soter_default hal_soter_qti } system_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow { hal_soter hal_soter_default hal_soter_qti } system_data_file file { open read write create append getattr setattr }
+allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file file { open read write create append getattr setattr }
+
+# H2 = vendor_hal_soter_qti（一加 13 / ColorOS 16 实测就是这个）、hal_soter_trustonic
+#      （一加 PLC110 / 联发科 Trustonic）、hal_soter_service（联发科那套里另一个名字）
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_file unix_dgram_socket { getattr read recvfrom }
+allow { system_file ksu magisk su } { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } unix_dgram_socket sendto
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_file file { execute getattr map read receive }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file file { open read write create append getattr setattr }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file file { open read write create append getattr setattr }
 
 allow keystore default_android_service service_manager find
 allow shell default_android_service service_manager find
-
-# SOTER 宿主（system_app）也要能把自己的日志落文件：payload 只走文件、不走 logcat
-# 之后，它得进得去这个目录。实测系统只放行了 file 的 read（log_flag 它能读），
-# 目录本身的 open/read 和建文件都被拒，所以这里把 dir 那一侧补齐。
-allow system_app system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow system_app system_data_file file { open read write create append getattr setattr }
-
-# 一加 PLC110（联发科 + Trustonic）上实测：宿主跑在 platform_app 域，不是上面那个
-# system_app，所以那一组一条都不匹配（日志写不出、RPC socket 连不上，dmesg 里全是
-# avc denied connectto ... tcontext=keystore）。这里补一组同样的。
-allow platform_app system_file unix_dgram_socket { getattr read recvfrom }
-allow system_file platform_app unix_dgram_socket sendto
-allow platform_app system_file file { execute getattr map read receive }
-allow platform_app keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow platform_app system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow platform_app system_data_file file { open read write create append getattr setattr }
-# daemon 把日志目录打成 system_app_data_file，这个标签在 platform_app 域下也得放行。
-allow platform_app system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow platform_app system_app_data_file file { open read write create append getattr setattr }
-
-# SOTER HAL 服务进程本身也是注入目标（宿主不在时，`service call` 那种直连只有注进
-# HAL 才看得见）。高通机器上它叫 vendor.qti.hardware.soter-service、域是 hal_soter；
-# 一加上是 vendor.trustonic.soter@1.0-service、域是 hal_soter_trustonic。两个域都
-# 给同一组，免得换台机器又是「注进去了但什么都写不出来」。
-allow hal_soter_trustonic system_file unix_dgram_socket { getattr read recvfrom }
-allow system_file hal_soter_trustonic unix_dgram_socket sendto
-allow hal_soter_trustonic system_file file { execute getattr map read receive }
-allow hal_soter_trustonic keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow hal_soter_trustonic system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow hal_soter_trustonic system_data_file file { open read write create append getattr setattr }
-allow hal_soter_trustonic system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow hal_soter_trustonic system_app_data_file file { open read write create append getattr setattr }
-allow hal_soter system_file unix_dgram_socket { getattr read recvfrom }
-allow system_file hal_soter unix_dgram_socket sendto
-allow hal_soter system_file file { execute getattr map read receive }
-allow hal_soter keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow hal_soter system_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow hal_soter system_data_file file { open read write create append getattr setattr }
-allow hal_soter system_app_data_file dir { getattr open read write add_name remove_name rename search lock }
-allow hal_soter system_app_data_file file { open read write create append getattr setattr }
