@@ -14,6 +14,11 @@
 //! operation, but note that the HAL re-signs its answer and therefore advances
 //! the device's TEE attestation counter.  The last entry asks for a key
 //! generation with mutation still disabled, which must be refused.
+//!
+//! `init_sign` + `finish_sign` close the loop (step 3 of the 1.6.0 SOTER
+//! feedback): they are the two calls that reveal whether this device's TA wants
+//! a live fingerprint before it will sign at all.  Arguments are optional:
+//! `soter_probe [uid] [alias] [challenge-hex]`.
 
 use serde_json::{json, Value};
 
@@ -22,9 +27,21 @@ fn main() {
     // any HAL call is possible.
     let _ = rsbinder::ProcessState::init_default();
 
+    // 跟 auth key 有关的那几个调用需要一个真实存在的 uid + alias，命令行可以覆盖：
+    // `soter_probe [uid] [alias] [challenge-hex]`。默认抄 A 端真机抓到的微信流量。
+    let mut args = std::env::args().skip(1);
+    let uid: i32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(10373);
+    let alias = args
+        .next()
+        .unwrap_or_else(|| "SoterAuthKeyV2_salt11d8ba34_scene1".to_string());
+    let challenge = args
+        .next()
+        .unwrap_or_else(|| "0a1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788".to_string());
+
     // What the relay advertises with every poll (the server routes SOTER with
     // it and the status page shows it).
     println!("caps: {}", ommegaclient_b::caps::report());
+    println!("target: uid={uid} alias={alias}");
 
     let payloads = [
         json!({ "op": "selftest" }),
@@ -35,11 +52,46 @@ fn main() {
         json!({ "op": "has_ask_already", "uid": 10371 }),
         json!({ "op": "export_attk_public_key" }),
         json!({ "op": "export_ask_public_key", "uid": 10373 }),
+        // 这个 alias 到底在不在：在的话 init_sign 失败只能解释成 TA 要现场认证，
+        // 不在的话 init_sign 返回的就是正儿八经的「找不到」。
+        json!({ "op": "has_auth_key", "uid": uid, "alias": alias }),
+        json!({ "op": "export_auth_key_public_key", "uid": uid, "alias": alias }),
         // Must be refused: mutating ops need the relay config opt-in.
         json!({ "op": "generate_ask_key_pair", "uid": 10373 }),
     ];
     for payload in payloads {
         report(&payload);
+    }
+
+    // 反馈三问的那件事：TA 到底要不要现场指纹。这两步跟上面那些只读的调用不一样，
+    // init_sign 会真的开一个签名会话，finish_sign 会让 TEE 出签名 —— 过不过得去
+    // 就是答案。
+    println!("--- 签名会话（uid={uid} alias={alias} challenge={challenge}）---");
+    let mut session = None;
+    match ommegaclient_b::soter::handle(
+        &json!({
+            "op": "init_sign",
+            "uid": uid,
+            "alias": alias,
+            "challenge": challenge,
+        }),
+        false,
+    ) {
+        Ok(value) => {
+            println!("OK   init_sign: {}", summarize(&value));
+            session = value.get("session").and_then(Value::as_i64);
+        }
+        Err(e) => println!("ERR  init_sign: {e:#}"),
+    }
+    match session {
+        Some(session) => match ommegaclient_b::soter::handle(
+            &json!({ "op": "finish_sign", "session": session }),
+            false,
+        ) {
+            Ok(value) => println!("OK   finish_sign: {}", summarize(&value)),
+            Err(e) => println!("ERR  finish_sign: {e:#}"),
+        },
+        None => println!("SKIP finish_sign: init_sign 没给出 session，TA 在第一步就没过"),
     }
 }
 
