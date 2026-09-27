@@ -17,7 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rsbinder::Parcel;
 use serde_json::{json, Value};
 
-use super::hal::{read_soter_data, read_status, SoterData};
+use super::hal::{read_soter_data, read_status, Backend, SoterData};
 
 /// Device id contained in the captures (also the value `getDeviceId` returns).
 pub const DEVICE_ID: &str = "090000005171734c42866bea148b21f5";
@@ -67,9 +67,14 @@ pub const ASK_REPLY: &str = concat!(
 
 /// Decode a `SoterData` reply captured as hex.
 pub fn decode_soter_data_reply(hex: &str) -> Result<SoterData> {
+    decode_soter_data_reply_as(hex, Backend::Trustonic)
+}
+
+/// Same, for a given vendor backend (the outer framing differs, see [`super::hal`]).
+pub fn decode_soter_data_reply_as(hex: &str, backend: Backend) -> Result<SoterData> {
     let mut parcel = Parcel::from_vec(hex_decode(hex)?);
     read_status(&mut parcel)?;
-    read_soter_data(&mut parcel)
+    read_soter_data(&mut parcel, backend)
 }
 
 /// Decode hex, rejecting anything that is not a whole number of bytes.
@@ -101,7 +106,12 @@ fn hex_nibble(c: u8) -> Result<u8> {
 /// Returns `{"ok": bool, "checks": [...]}`; a failing check carries the reason
 /// instead of aborting, so one bad fixture does not hide the others.
 pub fn selftest() -> Value {
-    let checks = vec![check_device_id(), check_attk(), check_ask()];
+    let checks = vec![
+        check_device_id(),
+        check_attk(),
+        check_ask(),
+        check_qti_framing(),
+    ];
     let ok = checks.iter().all(|c| c.get("ok") == Some(&json!(true)));
     json!({ "ok": ok, "checks": checks })
 }
@@ -179,6 +189,44 @@ fn check_ask() -> Value {
             "uid": doc.get("uid").cloned().unwrap_or(Value::Null),
             "counter": doc.get("counter").cloned().unwrap_or(Value::Null),
         }))
+    })
+}
+
+/// The Qualcomm framing: `[status][returnCode][notNull][totalSize][byte[]][length]`.
+///
+/// Not a device capture — the bytes are hand-built from the SOTER host APK's own
+/// parcelable (`b.b`: size header, `byte[]`, length), which is exactly what a
+/// Qualcomm HAL has to be writing for that host to read it back.  Keeps
+/// `read_soter_data` pinned to that layout, and checks that the Trustonic framing
+/// refuses the same bytes (it is one leading value and four bytes of totalSize
+/// away, so a silent mix-up would otherwise decode into plausible nonsense).
+fn check_qti_framing() -> Value {
+    check("qti SoterData framing", || {
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let mut bytes: Vec<u8> = Vec::new();
+        for field in [0i32, 0, 1, 48, 33] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        bytes.extend_from_slice(ID.as_bytes());
+        bytes.extend_from_slice(&[0u8; 4]); // NUL terminator plus padding to 36
+        bytes.extend_from_slice(&33i32.to_le_bytes());
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+
+        let data = decode_soter_data_reply_as(&hex, Backend::Qti)?;
+        if data.error_code != 0 {
+            bail!("error code {} (expected 0)", data.error_code);
+        }
+        if data.length != 33 {
+            bail!("length field {} (expected 33)", data.length);
+        }
+        let text = data.text().ok_or_else(|| anyhow!("payload is not UTF-8"))?;
+        if text != ID {
+            bail!("device id {text:?} does not match {ID:?}");
+        }
+        if decode_soter_data_reply(&hex).is_ok() {
+            bail!("the Trustonic framing accepted a qti reply");
+        }
+        Ok(json!({ "error_code": data.error_code, "length": data.length, "device_id": text }))
     })
 }
 

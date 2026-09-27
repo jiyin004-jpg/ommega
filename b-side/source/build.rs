@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=aidl");
     println!("cargo:rerun-if-changed=aidl/vendor/trustonic/hardware/soter");
+    println!("cargo:rerun-if-changed=aidl/vendor/qti/hardware/soter");
     println!("cargo:rerun-if-changed=build.rs");
 
     // The relay / real-TEE forwarding path only needs the keymint HAL types
@@ -17,6 +18,7 @@ fn main() {
         // interface descriptor onto the proxy); the traffic itself is
         // marshalled by hand in `src/soter/`.
         .include_dir(PathBuf::from("aidl/vendor/trustonic/hardware/soter"))
+        .include_dir(PathBuf::from("aidl/vendor/qti/hardware/soter"))
         .output(PathBuf::from("aidl.rs"));
 
     let keymint_dir = "aidl/android/hardware/security/keymint";
@@ -33,11 +35,15 @@ fn main() {
         aidl = aidl.source(path);
     }
 
-    let soter_dir = "aidl/vendor/trustonic/hardware/soter";
-    for entry in fs::read_dir(soter_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|s| s.to_str()) == Some("aidl") {
-            aidl = aidl.source(path);
+    for soter_dir in [
+        "aidl/vendor/trustonic/hardware/soter",
+        "aidl/vendor/qti/hardware/soter",
+    ] {
+        for entry in fs::read_dir(soter_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) == Some("aidl") {
+                aidl = aidl.source(path);
+            }
         }
     }
 

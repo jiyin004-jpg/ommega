@@ -171,8 +171,9 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
 fn open_soter(op: &str) -> Result<Soter> {
     Soter::open()?.ok_or_else(|| {
         anyhow!(
-            "this device has no SOTER HAL ({}), cannot forward '{op}'",
-            hal::SERVICE
+            "this device has no SOTER HAL ({} / {}), cannot forward '{op}'",
+            hal::SERVICE,
+            hal::QTI_SERVICE
         )
     })
 }
@@ -194,8 +195,9 @@ pub fn probe() -> Value {
         Ok(Some(soter)) => {
             let mut out = json!({
                 "op": "probe",
-                "service": hal::SERVICE,
-                "interface": hal::INTERFACE,
+                "backend": soter.backend().label(),
+                "service": soter.backend().service(),
+                "interface": soter.backend().interface(),
                 "version": soter.interface_version().ok(),
             });
             // A device id read proves the HAL actually serves requests; a
