@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull relay assets (mihomo nodes + attestation status) from GitHub raw
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ommega-relay-assets.sh

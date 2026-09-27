@@ -1,0 +1,41 @@
+mixed-port: 7890
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: warning
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: 'off'
+external-controller: 127.0.0.1:9091
+
+profile:
+  store-selected: true
+  store-fake-ip: false
+
+dns:
+  enable: true
+  ipv6: false
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+proxy-providers:
+  sub:
+    type: file
+    path: ./providers/sub.yaml
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+
+proxy-groups:
+  - name: PROXY
+    type: url-test
+    use: [sub]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+rules:
+  - MATCH,PROXY

@@ -1,0 +1,20 @@
+[Unit]
+Description=mihomo local proxy (only for pulling blocked resources from this host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+# 这台机器常年内存吃满 + swap 拉满，给它套上限，别把别人的 java 挤到 OOM
+Environment=GOMEMLIMIT=80MiB
+Environment=GOGC=50
+MemoryHigh=140M
+MemoryMax=192M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

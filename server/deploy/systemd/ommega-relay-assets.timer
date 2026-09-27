@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh relay assets every 6 hours
+
+[Timer]
+# workflow 也是每 6 小时跑一次（UTC 23 分），这里错开半小时再拉，免得扑空
+OnBootSec=3min
+OnUnitActiveSec=6h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
