@@ -121,7 +121,7 @@ The relay daemon supports every task type the relay_server can dispatch:
   RUSTUP_TOOLCHAIN=nightly python build.py --debug --abi arm64-v8a
   ```
 
-  then install the produced `target/ommegaclient-b-*.zip`, or push the `relay`
+  then install the produced `target/ommega-b-*.zip`, or push the `relay`
   binary to the device.
 - Verify the relay daemon is running and polling after deployment
   (`logcat` tag `ommegaclient-b`, or `/data/adb/ommega/logs/relay.log`).

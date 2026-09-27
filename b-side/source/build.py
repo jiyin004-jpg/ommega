@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build script for ommegaclient-b Android targets.
+Build script for ommega-b Android targets.
 """
 
 from __future__ import annotations
@@ -229,7 +229,7 @@ def delete_old_zips(release: bool) -> None:
     """Remove every previously built zip of this build type, whatever its
     naming (with or without an ABI tag) or which ABIs it carried."""
     build_type = "release" if release else "debug"
-    old_zips = glob.glob(os.fspath(TARGET_ROOT / f"ommegaclient-b-{build_type}-*.zip"))
+    old_zips = glob.glob(os.fspath(TARGET_ROOT / f"ommega-b-{build_type}-*.zip"))
     if not old_zips:
         print(f"No old zip files found for build type {build_type}")
         return
@@ -250,7 +250,7 @@ def create_zip_package(
 ) -> Path:
     build_type = "release" if release else "debug"
     abi_suffix = f"-{abi}" if abi else ""
-    zip_path = TARGET_ROOT / f"ommegaclient-b-{build_type}{abi_suffix}-{version}-{git_hash}.zip"
+    zip_path = TARGET_ROOT / f"ommega-b-{build_type}{abi_suffix}-{version}-{git_hash}.zip"
     print(f"Creating zip package: {zip_path}")
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -376,7 +376,7 @@ def build_combined_package(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build ommegaclient-b Magisk packages for Android")
+    parser = argparse.ArgumentParser(description="Build ommega-b Magisk packages for Android")
     parser.add_argument("--release", action="store_true", help="Build in release mode")
     parser.add_argument("--debug", action="store_true", help="Build in debug mode (default)")
     parser.add_argument(
@@ -410,7 +410,7 @@ def main() -> None:
     git_hash = get_git_commit_hash()
     selected_abis = args.abis or sorted(ABI_TO_TARGET)
 
-    print(f"Building ommegaclient-b version {version} (versionCode {vcode}, hash {git_hash})")
+    print(f"Building ommega-b version {version} (versionCode {vcode}, hash {git_hash})")
     print(f"Build mode: {'Release' if args.release else 'Debug'}")
     print(f"Target ABIs: {', '.join(selected_abis)}")
 

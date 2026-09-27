@@ -12,6 +12,7 @@
 **关于 B 端 App**
 
 - 版本号同步到 1.6.0。App 走的是系统 Keystore 接口，只做认证和签名的中继，不提供 SOTER 转发 —— 需要 SOTER 的场合用 B 端模块。App 连上服务端时会把这一点明确报上去，服务端不会把 SOTER 的活派给它。
+- 模块 zip 改名成 `ommega-b-release-<版本>.zip`（原来叫 `ommegaclient-b-release-…`），安装时按新名字找就行；模块内更新读的是 `b-update.json` 里的地址，不用手动改。
 
 **稳定性**
 
