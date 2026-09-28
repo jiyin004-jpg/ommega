@@ -855,22 +855,44 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
 
     let mut last_error: Option<String> = None;
 
+    // B 端这一层有没有能接活的设备，先问一次：没有就是「这层结构性地做不了」，
+    // 顺带让下面不用再解析一遍。
+    let needs_sign = matches!(op, "init_sign" | "finish_sign");
+    let b_target = state
+        .store
+        .resolve_soter_target(requested, needs_sign)
+        .await;
+
     // 这个槽位已经定过层就把它排到最前面：同一槽位的材料必须只出自一层，否则 App
     // 手里会出现一半 B 的一半 keybox 的状态（导出的公钥和签名的私钥都对不上）。
-    // 它这会儿不灵就照旧往下换 —— 换层是策略，只是换成了钉子跟着挪。
+    //
+    // 但钉子只在「B 端这层结构性地做不了」（一台能接的设备都没有）的时候才作数：
+    // 一次超时、一次 `-26`（这会儿没人按指纹）都可能只是这一笔没答好，那种时候
+    // 把槽位挪到服务端自签那两层，App 手里就换成假料了，真机再也轮不上 —— 实测
+    // PLC110 的 uid 10490 就是这么被钉到 self_signed 上，之后每轮第一个 op 又把
+    // 钉子续上，一轮流程都回不到真机。
     let uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     let mut layers: Vec<&str> = Vec::with_capacity(order.len());
     if let (false, Some(uid)) = (requested.is_empty(), uid) {
         if let Some(pinned) = crate::soter_mint::pinned_layer(requested, uid) {
-            if let Some(pos) = order.iter().position(|layer| *layer == pinned) {
-                layers.push(order[pos]);
-                layers.extend(
-                    order
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != pos)
-                        .map(|(_, layer)| *layer),
+            let honour = pinned == "b" || b_target.is_none();
+            if !honour {
+                tracing::info!(
+                    "soter: slot {requested}|{uid} is pinned to {pinned} but the B-side layer can \
+                     serve it again; going back to the device first"
                 );
+            }
+            if honour {
+                if let Some(pos) = order.iter().position(|layer| *layer == pinned) {
+                    layers.push(order[pos]);
+                    layers.extend(
+                        order
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != pos)
+                            .map(|(_, layer)| *layer),
+                    );
+                }
             }
         }
     }
@@ -878,18 +900,29 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         layers.extend(order.iter().copied());
     }
 
+    // B 端这层到底是不是结构性地做不了（没有设备、设备没报 SOTER、TA 结构性报错）。
+    // 只有它成立，服务端那两层接上之后才允许把槽位挪过去。
+    let mut b_structural = b_target.is_none();
+
     for &layer in &layers {
         let result = match layer {
-            "b" => try_b_soter_layer(state, body, requested).await,
+            "b" => match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
+                Some(b) => {
+                    b_structural = b.unavailable;
+                    Some(b.value)
+                }
+                None => None,
+            },
             "keybox" | "self_signed" => run_layer_soter(state, layer, body, requested).await,
             _ => None,
         };
         match result {
             Some(v) if v.get("error").is_none() => {
                 tracing::info!("soter: op={op} layer={layer} ok");
-                // 谁服务了这个槽位就把它钉在谁身上，下次先问它。
                 if let Some(uid) = uid {
-                    crate::soter_mint::pin_layer(requested, uid, layer);
+                    if let Some(pin) = layer_to_pin(layer, b_structural) {
+                        crate::soter_mint::pin_layer(requested, uid, pin);
+                    }
                 }
                 return Json(v).into_response();
             }
@@ -921,20 +954,20 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
 ///
 /// 一台都没有不算"这层不管这个 op"，而是这层没做成，所以返回带 `error` 的对象，
 /// 让上层接着试服务端那两层。
-async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> Option<Value> {
-    // 先看这一步要不要真签名：签名只能由“真能现场签”的设备做。远端那台一加 11
-    // 的 TA 非要新鲜指纹（回 -26），它自己已经上报 `soter_nosign` 了，这里就别
-    // 再把签名任务排给它白跑一趟。
+async fn try_b_soter_layer(
+    state: &AppState,
+    body: &Value,
+    requested: &str,
+    target: Option<&str>,
+) -> Option<BSoterLayer> {
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
-    let needs_sign = matches!(op, "init_sign" | "finish_sign");
-    let Some(target) = state
-        .store
-        .resolve_soter_target(requested, needs_sign)
-        .await
-    else {
-        return Some(json!({
-            "error": "no B-side device reporting SOTER support is online",
-        }));
+    let Some(target) = target else {
+        return Some(BSoterLayer {
+            value: json!({
+                "error": "no B-side device reporting SOTER support is online",
+            }),
+            unavailable: true,
+        });
     };
     if !requested.is_empty() && target != requested {
         tracing::warn!(
@@ -945,50 +978,88 @@ async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> O
         state,
         "soter",
         body,
-        &target,
+        target,
         state.cfg.soter_wait_result_timeout_secs,
     )
     .await;
     if let Some(code) = soter_device_hard_failure(op, &reply) {
-        return Some(json!({
-            "error": format!(
-                "B-side device {target} failed SOTER op '{op}' with error_code {code} ({})",
-                soter_error_name(code)
-            ),
-        }));
+        return Some(BSoterLayer {
+            value: json!({
+                "error": format!(
+                    "B-side device {target} failed SOTER op '{op}' with error_code {code} ({})",
+                    soter_error_name(code)
+                ),
+            }),
+            unavailable: true,
+        });
     }
-    Some(reply)
+    // 这里返回的是设备自己的答复，包括 `-26`「这会儿没人按指纹」和超时 —— 那是
+    // 这笔没答好，不是这层做不了，得原样递给 App 让它重试。
+    Some(BSoterLayer {
+        value: reply,
+        unavailable: false,
+    })
 }
 
-/// 设备层答复里的 `error_code` 非 0 时，算不算“这轮流程做不成了”。
+/// B 端这一层的结论，外加「结构性地做不了」这个标记。
 ///
-/// 设备层的答复是 B 端 relay 把 SOTER HAL 的结果原样带回来的，`error_code` 是腾讯
-/// 那套 `SoterErrorCode`（TEE 那边给的）。查询类 op（`has_*` / `export_*`）的负码是
-/// “这东西还没建”的正常回答，App 就是靠它决定要不要 generate，必须原样递上去 ——
-/// 当成失败会让槽位在两层之间来回跳，App 手里就会出现一半 B 一半 keybox 的材料。
+/// 标记只影响槽位钉层：没在线设备 / 设备没报 SOTER / TA 结构性报错（没开、ATTK
+/// 没配、安全通道不通）算真做不了，可以考虑把钉子挪到服务端那两层；一次超时、
+/// 一次 `-26` 都不算。
+struct BSoterLayer {
+    value: Value,
+    unavailable: bool,
+}
+
+/// 这一轮下来该把 `(device, uid)` 槽位钉在哪一层（`None` = 别碰钉子）。
 ///
-/// 建和签这几类不一样：`generate_*` / `init_sign` / `finish_sign` 一失败，这轮流程
-/// 就死在这台设备上了。这种答复再往上递，App 只会白报一次失败；更要命的是
-/// `run_soter_task` 会把答复当成“这层做成了”，顺手把 `(device, uid)` 槽位钉在这台
-/// 设备上（30 分钟，而下一轮流程的 *第一个 op* 又会把它续上）—— 于是这轮之后每轮
-/// 都还来问它，永远好不了。实测一加 11（PHB110）上 WeChat 的 `finish_sign` 一直是
-/// `-26 SOTER_ERROR_VERIFICATION_FAILED`，就是被这么钉死的。这类失败要明说成
-/// “这层没做成”，让服务端那两层接上，钉子也跟着挪过去。
+/// 一句话：真机接了这个 op 就钉真机；只有真机结构性地做不了，兜底层才有资格拿到
+/// 钉子。真机接了却答个错（参数不齐、超时）时，钉子必须留在 `b` 上 —— 兜底层
+/// 抢走钉子等于以后每轮都拿服务端自签的假料，App 手里的身份跟着换（PLC110 的
+/// uid 10490 就是这么被钉到 self_signed 上的）。
+fn layer_to_pin(served_layer: &str, b_structural: bool) -> Option<&str> {
+    if served_layer == "b" || b_structural {
+        Some(served_layer)
+    } else {
+        None
+    }
+}
+
+/// 设备层答复里的 `error_code` 什么时候算「这层结构性地做不了」。
+///
+/// 只有结构性毛病才算：SOTER 没开（-12）、ATTK 没配（-13）、安全通道不通（-18）。
+/// 其余负码都是「这笔没成」，得原样递给 App，不然会误判一台好机器：
+///
+/// - `-26 VERIFICATION_FAILED`：TA 要新鲜指纹，人不在/没按而已，按下就能成；
+/// - `-5` / `-6`：材料还没建，App 就是靠它决定要不要 generate；
+/// - `-7` / `-8` / `-9`：会话过期、没有匹配的 auth key、正在验证 —— 流程状态。
+///
+/// 把这些当成「这层没做成」，`run_soter_task` 就会把 `(device, uid)` 槽位挪到
+/// 服务端自签那两层：App 手里换成假料，真机再也轮不到（PLC110 的 uid 10490
+/// 就这么被钉到 self_signed 上，之后一轮流程都回不到真机）。
 fn soter_device_hard_failure(op: &str, reply: &Value) -> Option<i64> {
     let code = reply.get("error_code").and_then(Value::as_i64)?;
-    if code == 0 {
-        return None;
-    }
-    matches!(
+    if !matches!(
         op,
         "get_device_id"
             | "generate_ask_key_pair"
             | "generate_auth_key_pair"
             | "init_sign"
             | "finish_sign"
+    ) {
+        return None;
+    }
+    matches!(
+        code,
+        SOTER_NOT_ENABLED | SOTER_ATTK_NOT_PROVISIONED | SOTER_SECURE_HW_FAILED
     )
     .then_some(code)
 }
+
+/// 结构性错误码：这几种换下一层不算亏，设备这会儿真的做不了。
+const SOTER_NOT_ENABLED: i64 = -12;
+const SOTER_ATTK_NOT_PROVISIONED: i64 = -13;
+const SOTER_SECURE_HW_FAILED: i64 = -18;
 
 /// SOTER 错误码的名字（腾讯 `SoterErrorCode`），只为日志好读。只列跟换层判断有关的。
 fn soter_error_name(code: i64) -> &'static str {
@@ -1001,6 +1072,7 @@ fn soter_error_name(code: i64) -> &'static str {
         -9 => "SOTER_ERROR_IS_AUTHING",
         -12 => "SOTER_ERROR_SOTER_NOT_ENABLED",
         -13 => "SOTER_ERROR_ATTK_NOT_PROVISIONED",
+        -18 => "SOTER_ERROR_SECURE_HW_COMMUNICATION_FAILED",
         -20 => "SOTER_ERROR_ATTK_ALREADY_PROVISIONED",
         -25 => "SOTER_ERROR_INVALID_KEY_BLOB",
         -26 => "SOTER_ERROR_VERIFICATION_FAILED",
@@ -1417,24 +1489,36 @@ mod soter_device_layer_tests {
     use serde_json::json;
 
     #[test]
-    fn a_device_sign_failure_is_a_layer_failure() {
-        // 实测一加 11：会话是真的（编解码没问题），TEE 就是不给签。
-        assert_eq!(
-            soter_device_hard_failure("finish_sign", &json!({ "error_code": -26 })),
-            Some(-26)
-        );
-        assert_eq!(
-            soter_device_hard_failure("init_sign", &json!({ "error_code": -6 })),
-            Some(-6)
-        );
+    fn only_structural_device_errors_are_a_layer_failure() {
+        // 设备真的做不了：没开 SOTER、ATTK 没配、安全通道不通。
         assert_eq!(
             soter_device_hard_failure("generate_auth_key_pair", &json!({ "error_code": -13 })),
             Some(-13)
         );
         assert_eq!(
-            soter_device_hard_failure("get_device_id", &json!({ "error_code": -1000 })),
-            Some(-1000)
+            soter_device_hard_failure("init_sign", &json!({ "error_code": -12 })),
+            Some(-12)
         );
+        assert_eq!(
+            soter_device_hard_failure("finish_sign", &json!({ "error_code": -18 })),
+            Some(-18)
+        );
+    }
+
+    #[test]
+    fn a_sign_failure_that_is_not_structural_stays_an_answer() {
+        // 实测的两种误判，都把一个好好的机器弄瘸过：
+        // - 一加 11 的 `finish_sign` 回 -26：TA 要新鲜指纹，人不在而已，按下就能签；
+        // - PLC110 的 op 被 15s 超时打断，槽位从此挪到 self_signed。
+        for op in ["init_sign", "finish_sign", "generate_auth_key_pair"] {
+            for code in [-26, -25, -5, -6, -7, -8, -9, -20, -1000] {
+                assert_eq!(
+                    soter_device_hard_failure(op, &json!({ "error_code": code })),
+                    None,
+                    "{op} {code}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1468,6 +1552,21 @@ mod soter_device_layer_tests {
             soter_device_hard_failure("finish_sign", &json!({ "error": "task timeout" })),
             None
         );
+    }
+
+    #[test]
+    fn a_real_device_keeps_the_slot_pin() {
+        use super::layer_to_pin;
+        // 真机答上了：钉它。
+        assert_eq!(layer_to_pin("b", false), Some("b"));
+        // 真机没接住（参数不齐 / 超时 / -26），兜底层接上了也不能留钉子。
+        assert_eq!(layer_to_pin("self_signed", false), None);
+        assert_eq!(layer_to_pin("keybox", false), None);
+        // 真机结构性地做不了（一台能接的设备都没有），兜底层把流程接上就该钉住，
+        // 下一轮别再拿同一份请求去碰一台做不了的机器。
+        assert_eq!(layer_to_pin("self_signed", true), Some("self_signed"));
+        assert_eq!(layer_to_pin("keybox", true), Some("keybox"));
+        assert_eq!(layer_to_pin("b", true), Some("b"));
     }
 
     #[test]
