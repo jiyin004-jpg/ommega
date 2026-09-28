@@ -12,7 +12,7 @@ use anyhow::Result;
 
 use ommegaclient_b::soter::hal::Soter;
 
-const ALIAS: &str = "SoterAuthKeyV2_saltc2e99f57_scene1";
+const DEFAULT_ALIAS: &str = "SoterAuthKeyV2_saltc2e99f57_scene1";
 const CHALLENGE: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 fn main() -> Result<()> {
@@ -24,27 +24,38 @@ fn main() -> Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10503);
+    // 第二个参数是 alias：换 uid 时得跟着换，比如设备本地 App 自己用的那份。
+    let alias = std::env::args().nth(2).unwrap_or_else(|| DEFAULT_ALIAS.to_string());
+    // 第三个参数是模式：`gen` 先现造一份材料再看能不能签，`rm` 收尾把这个 uid 的钥匙清掉。
+    let mode = std::env::args().nth(3).unwrap_or_default();
 
     let Some(soter) = Soter::open()? else {
         println!("[direct] uid={uid}: no SOTER service on this device");
         return Ok(());
     };
-    println!("[direct] uid={uid} alias={ALIAS}");
+    println!("[direct] uid={uid} alias={alias} mode={}", if mode.is_empty() { "probe" } else { &mode });
+
+    if mode == "gen" {
+        let ask = soter.generate_ask_key_pair(uid)?;
+        println!("[direct] generate_ask_key_pair -> {ask}");
+        let auth = soter.generate_auth_key_pair(uid, &alias)?;
+        println!("[direct] generate_auth_key_pair-> {auth}");
+    }
 
     let ask = soter.has_ask_already(uid)?;
     println!("[direct] has_ask_already      -> {ask}");
 
-    let has = soter.has_auth_key(uid, ALIAS)?;
+    let has = soter.has_auth_key(uid, &alias)?;
     println!("[direct] has_auth_key         -> {has}");
 
-    let pub_key = soter.export_auth_key_public_key(uid, ALIAS)?;
+    let pub_key = soter.export_auth_key_public_key(uid, &alias)?;
     println!(
         "[direct] export_auth_key_pub  -> {} ({} bytes)",
         pub_key.error_code,
         pub_key.data.len()
     );
 
-    let session = soter.init_sign(uid, ALIAS, CHALLENGE)?;
+    let session = soter.init_sign(uid, &alias, CHALLENGE)?;
     println!(
         "[direct] init_sign            -> {} session={}",
         session.error_code, session.session
@@ -65,7 +76,12 @@ fn main() -> Result<()> {
         println!("[direct] finish_sign          -> skipped (no session)");
     }
 
-    let again = soter.has_auth_key(uid, ALIAS)?;
+    let again = soter.has_auth_key(uid, &alias)?;
     println!("[direct] has_auth_key (again) -> {again}");
+
+    if mode == "rm" {
+        let removed = soter.remove_all_uid_key(uid)?;
+        println!("[direct] remove_all_uid_key    -> {removed}");
+    }
     Ok(())
 }
