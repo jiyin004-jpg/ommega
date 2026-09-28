@@ -490,12 +490,20 @@ def main() -> None:
             f"for the Android API/linker (default: {DEFAULT_PLATFORM})"
         ),
     )
+    parser.add_argument(
+        "--version-code",
+        type=int,
+        default=None,
+        help="Override versionCode (default: derived from VERSION). "
+        "Use it to re-release the same version number as a hotfix, otherwise "
+        "the module manager sees no update to install.",
+    )
     args = parser.parse_args()
 
     ensure_cargo_config()
 
     version = get_version()
-    vcode = version_code(version)
+    vcode = str(args.version_code) if args.version_code else version_code(version)
     git_hash = get_git_commit_hash()
     selected_abis = args.abis or sorted(ABI_TO_TARGET)
 
