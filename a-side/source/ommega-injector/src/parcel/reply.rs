@@ -383,34 +383,39 @@ pub fn build_soter_buffer_reply(
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
-/// `SoterInitReturn initSign(...)` 的回复，同样按家分两种。
+/// `SoterInitReturn initSign(...)` 的回复。**两家 AIDL 一模一样**，不按家分：
 ///
 /// ```text
-/// 联发科 [Status][非空标记][总长=16][错误码][session]
-/// 高通   [Status][返回值][非空标记][总长=16][session][错误码]
+/// [Status][非空标记=1][总长=16][错误码][session]
 /// ```
 ///
-/// 那个 parcelable 自己一段固定 16 字节：先 4 的总长，再错误码和 8 的 session；
-/// 两家就是后两个字段前后对调。
-pub fn build_soter_init_reply(
-    code: i32,
-    session: i64,
-    has_return_code: bool,
-) -> Result<OwnedReply> {
+/// 这形状是宿主 dex 里的生成代码定的，不是照着别的方法推的：
+///
+/// - 高通 AIDL（`vendor.qti.hardware.soter.ISoter`，A 端 soterserver 的
+///   `vendor/qti/hardware/soter/ISoter$Stub$Proxy`）：`initSign` 的返回值就是那个
+///   parcelable 本身，代理里只有一句 `readTypedObject(SoterInitReturn.CREATOR)`，
+///   **没有**「方法返回值」那一格；`SoterInitReturn.writeToParcel` 是 `[总长][status][session]`。
+/// - 联发科 AIDL（`vendor.trustonic.hardware.soter.ITrustonicSoter`）：`void initSign(..., out c)`，
+///   代理是 `readInt() != 0` 之后再读那个 parcelable，里面同样 `[总长][int status][long session]`。
+///
+/// 两家都是 4+4+8 = 24 字节。别再加「方法返回值」那一格、也别把两个字段对调：
+/// 多一格的话宿主 `readTypedObject` 读到的第一个 i32 正好是我们写的错误码，成功时它是 0，
+/// 于是 parcelable 被判成 **null**，soterserver 那边 `initSigh` 的 `if (initSign != null)`
+/// 不成立、把 `SoterSessionResult` 留在默认值（`resultCode = 0`、`session = 0`）交回，
+/// 微信拿 0 去 `finishSign`，又被它自己那句 `if (j == 0) resultCode = -204;` 挡下 ——
+/// 现象就是按完指纹「开通失败」。
+///
+/// 现场日志对号的时候别被旁边那条 `<<< BC_REPLY ... data_size: 20` 带跑：那是**下一跳**
+/// ——soterserver 自己回给微信的 `SoterSessionResult`（`[Status][标记=1][session i64]`
+/// `[resultCode i32]` = 4+4+12=20 字节，偏移 8 起就是 session）。这份回复走 synthetic
+/// 伪造 BR_REPLY 那条路，不经过 `log_write_transaction`，所以日志里看不到它的 24 字节原文。
+pub fn build_soter_init_reply(code: i32, session: i64) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
-    if has_return_code {
-        parcel.write(&code)?;
-    }
     parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
     parcel.write(&16i32)?;
-    if has_return_code {
-        parcel.write(&session)?;
-        parcel.write(&code)?;
-    } else {
-        parcel.write(&code)?;
-        parcel.write(&session)?;
-    }
+    parcel.write(&code)?;
+    parcel.write(&session)?;
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 

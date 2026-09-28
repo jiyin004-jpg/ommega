@@ -204,8 +204,11 @@ fn a_missing_payload_still_comes_back_as_a_present_parcelable() {
 }
 
 #[test]
-fn trustonic_soter_init_reply_carries_error_code_then_session() {
-    let mut reply = build_soter_init_reply(-5, 0x1122334455667788, false).unwrap();
+fn soter_init_reply_has_no_return_value_slot_and_the_error_code_comes_first() {
+    // 两家 AIDL 的 initSign 都是这一份。高通是 `SoterInitReturn initSign(...)`，代理里
+    // 直接 `readTypedObject`；联发科是 `void initSign(..., out c)`，先 `readInt() != 0`
+    // 再读同一个 parcelable。里面都是 `[总长][int status][long session]`，一共 24 字节。
+    let mut reply = build_soter_init_reply(-5, 0x1122334455667788).unwrap();
     let bytes = soter_bytes(&mut reply);
     assert_eq!(bytes.len(), 24, "got {bytes:02x?}");
     assert_eq!(le_i32(&bytes, 0), 0, "binder status");
@@ -220,20 +223,28 @@ fn trustonic_soter_init_reply_carries_error_code_then_session() {
 }
 
 #[test]
-fn qti_soter_init_reply_carries_session_then_error_code() {
-    let mut reply = build_soter_init_reply(-5, 0x1122334455667788, true).unwrap();
-    let bytes = soter_bytes(&mut reply);
-    assert_eq!(bytes.len(), 28, "got {bytes:02x?}");
-    assert_eq!(le_i32(&bytes, 0), 0, "binder status");
-    assert_eq!(le_i32(&bytes, 4), -5, "方法返回值就是错误码");
-    assert_eq!(le_i32(&bytes, 8), 1, "非空标记");
-    assert_eq!(le_i32(&bytes, 12), 16, "总长一样是 16");
+fn a_return_value_slot_in_the_init_reply_makes_the_host_read_a_null_session() {
+    // 回归防线。给这份回复多写一格「方法返回值」的话，宿主 `readTypedObject` 读到的
+    // 第一个 i32 就是那个错误码 —— 成功的时候它恰好吃到 0，于是整个 parcelable 被判成
+    // null；soterserver 里 `if (initSign != null)` 不成立，`SoterSessionResult` 留在默认值
+    // （resultCode = 0、session = 0）交回微信，微信拿 0 去 finishSign，又被它自己那句
+    // `if (j == 0) resultCode = -204;` 挡下。当初「能按指纹、开通失败」就是这么来的。
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok)).unwrap();
+    parcel.write(&0i32).unwrap();
+    parcel.write(&NON_NULL_PARCELABLE_FLAG).unwrap();
+    parcel.write(&16i32).unwrap();
+    parcel.write(&0i32).unwrap();
+    parcel.write(&0x1122334455667788i64).unwrap();
+    let mut reply = owned_reply_from_parcel(parcel, std::iter::empty::<usize>());
+    let (data, data_size, offsets, offsets_size) = raw_parts(&mut reply);
+    let mut parcel = unsafe { parcel_from_ipc_parts(data, data_size, offsets, offsets_size) };
+    read_ok_status(&mut parcel).unwrap();
+    let typed_object_tag: i32 = parcel.read().unwrap();
     assert_eq!(
-        i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-        0x1122334455667788,
-        "session 在前"
+        typed_object_tag, 0,
+        "非 0 才是非空 parcelable：多出的这一格只要为 0，宿主就当没答"
     );
-    assert_eq!(le_i32(&bytes, 24), -5, "parcelable 里再带一份错误码");
 }
 
 #[test]

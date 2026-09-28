@@ -113,8 +113,10 @@ pub(crate) struct SoterCall {
     pub(crate) hal: bool,
     /// 走的是 HIDL（`@1.0::` 那种描述符）。只影响拦截：HIDL 现在只观察。
     pub(crate) hidl: bool,
-    /// 回包里有没有「方法返回值」那一格。高通那套签名是 `int xxx(...)`、联发科是 `void`，
-    /// 这一格有没有决定了错误码放哪、答复总长怎么算（见 `parcel::reply` 里那两个构造器）。
+    /// 回包里「方法返回值」那一格有没有。这**只对 buffer 形状的那几个方法**成立（`finishSign`
+    /// 和几个 `export*` / `getDeviceId`）：高通那套签名是 `int xxx(..., out SoterBufferReturn)`、
+    /// 联发科是 `void`，错误码放哪、总长怎么算都跟着它走（见 `parcel::reply` 里那两个构造器）。
+    /// `initSign` 是例外，两家都没有这一格（高通返回 parcelable 本身），别拿它去拼 init 的回复。
     pub(crate) has_return_code: bool,
     pub(crate) code: u32,
     /// 线上那个号。HIDL 那套号跟内部（AIDL）那套不是一个排列，解析时已经换算成内部号了，
@@ -367,8 +369,9 @@ impl<'a> Cursor<'a> {
 /// 两种都试，谁的 UTF-16 解出来正好等于我们认的串就用谁。
 /// 别省这一步：少了 12 字节那个前缀，App 侧的 SOTER 流量一条都认不出来。
 ///
-/// 第二个返回值是「这个接口的方法带不带 int 返回值」，跟着描述符一起定：
+/// 第二个返回值是「这个接口的 buffer 形状方法带不带 int 返回值」，跟着描述符一起定：
 /// 高通那两条（AIDL 与 HIDL）都是 `int`，联发科那两条都是 `void`。
+/// `initSign` 两家都不带（高通直接返回 `SoterInitReturn`），所以那个号的回复不走这一格。
 fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
     for prefix in [0usize, 4, 8, 12] {
         let variants: &[bool] = if prefix == 12 {
@@ -612,7 +615,7 @@ pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> 
             if call.hidl {
                 build_hidl_soter_init_reply(status, session).ok()?
             } else {
-                build_soter_init_reply(status, session, call.has_return_code).ok()?
+                build_soter_init_reply(status, session).ok()?
             }
         }
     };
