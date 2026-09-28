@@ -182,6 +182,12 @@ function kvRow(k, v) { return `<div class="k">${esc(k)}</div><div class="v">${es
 const CAP_TEXT = v => v === true ? '支持' : v === false ? '不支持' : '未上报（老版本 relay）';
 const capRows = d => [
   kvRow('SOTER 转发', CAP_TEXT(d.soter)),
+  // 「转发」说的是身份/公钥导出那一半；签名那一步要 B 端现场指纹，远程给不了，
+  // 于是设备会明说 soter_nosign。
+  kvRow('SOTER 签名', d.soter === false ? '不支持（没有 SOTER HAL）'
+    : d.soter_nosign === true ? '不支持（签名要本机指纹）'
+    : d.soter_nosign === false ? '支持'
+    : '未上报（老版本 relay，仍会试）'),
   kvRow('StrongBox', CAP_TEXT(d.strongbox)),
 ];
 

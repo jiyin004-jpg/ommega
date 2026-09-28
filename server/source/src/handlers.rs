@@ -922,7 +922,12 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
 /// 一台都没有不算"这层不管这个 op"，而是这层没做成，所以返回带 `error` 的对象，
 /// 让上层接着试服务端那两层。
 async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> Option<Value> {
-    let Some(target) = state.store.resolve_soter_target(requested).await else {
+    // 先看这一步要不要真签名：签名只能由“真能现场签”的设备做。远端那台一加 11
+    // 的 TA 非要新鲜指纹（回 -26），它自己已经上报 `soter_nosign` 了，这里就别
+    // 再把签名任务排给它白跑一趟。
+    let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+    let needs_sign = matches!(op, "init_sign" | "finish_sign");
+    let Some(target) = state.store.resolve_soter_target(requested, needs_sign).await else {
         return Some(json!({
             "error": "no B-side device reporting SOTER support is online",
         }));
@@ -932,7 +937,6 @@ async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> O
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
         );
     }
-    let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
     let reply = enqueue_and_wait(
         state,
         "soter",
