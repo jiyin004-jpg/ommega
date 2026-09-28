@@ -56,7 +56,7 @@ rm -rf "$OMMEGA_DIR"
 
 # ---------------------------------------------------------------------------
 # 3. Remove A-side files under the shared state dir
-#    /data/adb/ommega is shared with the B-side module (ommegaclient_b), so we
+#    /data/adb/ommega is shared with the B-side module (ommega-b), so we
 #    only touch A-side-owned entries and leave relay/relay.conf/logs intact.
 # ---------------------------------------------------------------------------
 rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/keystore/ommega

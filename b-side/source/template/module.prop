@@ -1,7 +1,7 @@
-id=ommegaclient_b
-name=Ommegaclient B
+id=ommega-b
+name=Ommega-B
 version=${versionName}
 versionCode=${versionCode}
 author=jiyin004
-description=B-side relay agent: real-TEE attestation forwarding for the ommega keystore
+description=Ommega B-side relay: real-TEE attestation forwarding for the ommega keystore
 updateJson=https://raw.githubusercontent.com/jiyin004-jpg/ommega/master/b-update.json

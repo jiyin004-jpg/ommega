@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-# ommegaclient-b relay daemon wrapper.
+# ommega-b relay daemon wrapper.
 # Loops over the `relay` binary (the relay_server B-side client) so that it is
 # restarted if it ever exits.  The relay daemon mints real-TEE attestation
 # chains with an A-side-supplied appid (tag 709).

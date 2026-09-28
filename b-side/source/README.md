@@ -1,4 +1,4 @@
-# ommegaclient-b (B-side relay agent)
+# Ommega B-side Relay (module id `ommega-b`)
 
 B-side relay agent for the ommega remote-TEE attestation setup.
 
@@ -50,7 +50,7 @@ OMMEGA_RELAY_LOGCAT_LEVEL=info
   - `OMMEGA_RELAY_LOG_LEVEL` — file log level when enabled:
     `off|error|warn|info|debug|trace` (default `debug`).
   - `OMMEGA_RELAY_LOGCAT_ENABLED` — `true` keeps Android logcat output (tag
-    `ommegaclient-b`, default), `false` silences logcat completely.
+    `ommega-b`, default), `false` silences logcat completely.
   - `OMMEGA_RELAY_LOGCAT_LEVEL` — logcat level:
     `off|error|warn|info|debug|trace` (default `info`).
 
@@ -71,7 +71,7 @@ The module ships one daemon, `relay`. It is started directly by
 `relay` process itself monitors `/data/adb/ommega/relay.conf` and reloads on
 change; the wrapper never kills it, so the two never conflict.
 
-Logs go to logcat (tag `ommegaclient-b`) and `/data/adb/ommega/logs/relay.log`.
+Logs go to logcat (tag `ommega-b`) and `/data/adb/ommega/logs/relay.log`.
 Each poll, config reload, task receipt, task outcome (with duration), and
 `b/result` submission is logged.
 
@@ -84,7 +84,7 @@ Task types handled: `attest`, `sign`, and `decrypt`.
 `AGPL-3.0-or-later`
 
 ```plaintext
-ommegaclient-b - B-side relay agent for the ommega remote-TEE attestation setup
+ommega-b - B-side relay agent for the ommega remote-TEE attestation setup
 Copyright (C) 2026 ommegaclient
 
 This program is free software: you can redistribute it and/or modify

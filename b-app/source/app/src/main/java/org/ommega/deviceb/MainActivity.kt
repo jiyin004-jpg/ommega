@@ -141,7 +141,7 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(0xFF888888.toInt())
                 text =
                     "本应用通过 Android Keystore 中继认证与签名请求。" +
-                        "SOTER 转发由 B 端模块（ommegaclient_b）提供，本应用不支持 SOTER。"
+                        "SOTER 转发由 B 端模块（ommega-b）提供，本应用不支持 SOTER。"
             },
         )
 

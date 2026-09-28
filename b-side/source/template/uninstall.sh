@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Ommegaclient-B module uninstall hook.
+# ommega-b module uninstall hook.
 #
 # Runs automatically when the module is removed via a root manager
 # (KernelSU / Magisk / APatch). Kills the relay agent and removes the B-side

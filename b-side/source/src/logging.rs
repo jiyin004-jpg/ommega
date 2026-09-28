@@ -14,7 +14,7 @@ static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 ///
 /// * `file_enabled` + `file_level` — on-disk log at `DEFAULT_LOG_PATH`
 ///   (`OMMEGA_RELAY_LOG_ENABLED` / `OMMEGA_RELAY_LOG_LEVEL`).
-/// * `logcat_enabled` + `logcat_level` — Android logcat (tag `ommegaclient-b`)
+/// * `logcat_enabled` + `logcat_level` — Android logcat (tag `ommega-b`)
 ///   (`OMMEGA_RELAY_LOGCAT_ENABLED` / `OMMEGA_RELAY_LOGCAT_LEVEL`).
 ///
 /// Either sink can be silenced independently; if both are `Off` the relay is
@@ -54,7 +54,7 @@ fn init_logger_inner(
     if logcat_enabled && logcat_level != LevelFilter::Off {
         let config = android_logger::Config::default()
             .with_max_level(logcat_level)
-            .with_tag("ommegaclient-b");
+            .with_tag("ommega-b");
         loggers.push(Box::new(android_logger::AndroidLogger::new(config)));
         min_level = min_level.max(logcat_level);
         logcat_ready = true;

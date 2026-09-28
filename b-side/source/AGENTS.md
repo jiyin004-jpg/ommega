@@ -1,4 +1,4 @@
-# ommegaclient-b Agent Guide
+# ommega-b Agent Guide
 
 This repository is the **new B-side relay agent**. It receives tasks from the
 relay_server (ommega-old), calls the **real on-device hardware TEE** to mint
@@ -124,6 +124,6 @@ The relay daemon supports every task type the relay_server can dispatch:
   then install the produced `target/ommega-b-*.zip`, or push the `relay`
   binary to the device.
 - Verify the relay daemon is running and polling after deployment
-  (`logcat` tag `ommegaclient-b`, or `/data/adb/ommega/logs/relay.log`).
+  (`logcat` tag `ommega-b`, or `/data/adb/ommega/logs/relay.log`).
 - Do not add `#[allow(...)]` solely to silence Clippy. Any necessary exception
   must have a concrete, documented reason and direct approval from user.

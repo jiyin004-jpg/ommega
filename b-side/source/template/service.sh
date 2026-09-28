@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-# ommegaclient-b relay module service.
+# ommega-b relay module service.
 # Single entry point for relay process management: before starting, it always
 # kills any stale relay processes (from a previous run or a manual launch),
 # then spawns a fresh relay binary directly.  No daemon wrapper is used.
@@ -230,7 +230,7 @@ echo "$!" > "$LOCK_DIR/pid"
 
 # 先确认第一次是否真的起来了，好在模块日志里给出可见结果。
 if wait_for_relay; then
-  echo "[service] ommegaclient-b relay is up"
+  echo "[service] ommega-b relay is up"
 else
   echo "[service] relay did not come up within 10s; watchdog will keep retrying"
 fi

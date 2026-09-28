@@ -67,7 +67,7 @@ const RESTART_MARKER: &str = "/data/adb/ommega/restart.all";
 const RELOAD_POLL_MS: u64 = 1000;
 /// Only used when the module root cannot be derived from the running binary
 /// (relay started from a user-placed copy under `/data/adb/ommega/`).
-const FALLBACK_MODULE_PROP: &str = "/data/adb/modules/ommegaclient_b/module.prop";
+const FALLBACK_MODULE_PROP: &str = "/data/adb/modules/ommega-b/module.prop";
 
 /// Module dir of the running binary: relay lives in
 /// `/data/adb/modules/<id>/libs/<abi>/relay` (or `<id>/relay`), so walking up to

@@ -19,15 +19,15 @@ echo "=== 3. 清 pid 文件 ==="
 rm -f /data/adb/ommega/relay.pid /data/adb/ommega/relay-daemon.pid
 
 echo "=== 4. 替换为新版 daemon-relay ==="
-cp /data/local/tmp/daemon-relay /data/adb/modules/ommegaclient_b/daemon-relay
-chmod 0755 /data/adb/modules/ommegaclient_b/daemon-relay
+cp /data/local/tmp/daemon-relay /data/adb/modules/ommega-b/daemon-relay
+chmod 0755 /data/adb/modules/ommega-b/daemon-relay
 
 echo "=== 5. 验证新版无 kill 逻辑 ==="
-grep -c kill_duplicates /data/adb/modules/ommegaclient_b/daemon-relay || true
-wc -c /data/adb/modules/ommegaclient_b/daemon-relay
+grep -c kill_duplicates /data/adb/modules/ommega-b/daemon-relay || true
+wc -c /data/adb/modules/ommega-b/daemon-relay
 
 echo "=== 6. 启动单个 daemon ==="
-nohup sh /data/adb/modules/ommegaclient_b/daemon-relay >/dev/null 2>&1 &
+nohup sh /data/adb/modules/ommega-b/daemon-relay >/dev/null 2>&1 &
 echo "daemon started, pid=$!"
 sleep 3
 
