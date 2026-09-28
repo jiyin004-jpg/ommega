@@ -700,13 +700,12 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
     // WebUI 的「远程不通就退回本地」开关，落盘写的是 `local_hw`（老配置写
     // `local_depend_hardware`）。legacy client-a 一直都退，所以缺省就是 true —— 但这个键
     // 以前没人读（写下去的 `local_hw` 白写），现在归位：它就是 `remote.fallback_local`。
-    let fallback_local = match get(&["local_hw", "local_depend_hardware"])
-        .map(|v| v.to_lowercase())
-        .as_deref()
-    {
-        Some("0" | "false" | "no" | "off") => false,
-        _ => true,
-    };
+    let fallback_local = !matches!(
+        get(&["local_hw", "local_depend_hardware"])
+            .map(|v| v.to_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "no" | "off")
+    );
 
     // SOTER uid 替身映射（`soter_uid_map: 10490=10373`）。不解析成结构：这里只负责把
     // 原串交给 `soter_relay`，解析 + 单测都在那边，免得两处对格式的理解跑偏。
