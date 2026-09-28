@@ -1,18 +1,29 @@
 #!/bin/sh
 # 从仓库的 relay-assets 分支把两样东西拉回服务器：
-#   1. clash-subscription.yaml —— mihomo 的节点列表（写进 provider 文件，成功才换）
+#   1. clash-subscription.enc  —— mihomo 的节点表（**加密的**，解密校验过才换 provider 文件）
 #   2. attestation-status.json —— 吊销名单，落在 /opt/relay/ 当服务端的磁盘兜底缓存
 #
-# 规矩：只有「下载成功 + 内容看着像那么回事」才动现有文件，网络抖一下不能把好好的
-# 节点表清空 —— 那样代理就没了，服务端也就拉不到名单了。
+# 节点表为什么是密文：仓库是 public，明文等于把订阅挂公网（2026-09-28 出过这事）。
+# 加密参数要跟 .github/workflows/relay-assets.yml 里那条 openssl 命令一字不差，
+# 口令放在 root 600 的 $KEY 里（同一份也存进了仓库 secret SUB_PASSPHRASE）。
+#
+# 规矩：只有「下载成功 + 解密成功 + 内容看着像那么回事」才动现有文件，网络抖一下或者
+# 口令写错了都不能把好好的节点表清空 —— 那样代理就没了，服务端也就拉不到名单了。
 set -u
 
 RAW="https://raw.githubusercontent.com/jiyin004-jpg/ommega/relay-assets"
 PROV=/etc/mihomo/providers/sub.yaml
+KEY=${RELAY_ASSETS_KEY:-/etc/mihomo/relay-assets.key}
 
-# 1) 节点列表
+# 1) 节点表（密文 -> 解密 -> 写 provider）
+tmpenc="$(mktemp)"
 tmp="$(mktemp)"
-if curl -sSfL --max-time 60 -o "$tmp" "$RAW/clash-subscription.yaml" \
+if [ ! -r "$KEY" ]; then
+    echo "no passphrase file at $KEY, keep old subscription"
+elif curl -sSfL --max-time 60 -o "$tmpenc" "$RAW/clash-subscription.enc" \
+   && [ "$(wc -c < "$tmpenc")" -gt 100 ] \
+   && openssl enc -d -aes-256-cbc -pbkdf2 -iter 300000 -md sha256 \
+        -pass file:"$KEY" -in "$tmpenc" -out "$tmp" 2>/dev/null \
    && grep -q '^proxies:' "$tmp" \
    && [ "$(wc -c < "$tmp")" -gt 1000 ]; then
     if cmp -s "$tmp" "$PROV"; then
@@ -29,9 +40,9 @@ if curl -sSfL --max-time 60 -o "$tmp" "$RAW/clash-subscription.yaml" \
         fi
     fi
 else
-    echo "subscription fetch failed or looks bogus, keep old"
+    echo "subscription fetch/decrypt failed or looks bogus, keep old"
 fi
-rm -f "$tmp"
+rm -f "$tmpenc" "$tmp"
 
 # 2) 吊销名单兜底缓存（服务端自己也会经代理去拉官方那份，这条路是最后一道保险）
 tmp2="$(mktemp)"
