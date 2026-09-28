@@ -46,6 +46,26 @@ static KEYBOX_WATCHER: OnceLock<()> = OnceLock::new();
 static KEYBOX_DB_RETIRE_ALLOWED: AtomicBool = AtomicBool::new(false);
 static KEYBOX_RUNTIME_LOADED: AtomicBool = AtomicBool::new(false);
 
+/// 内置自签那套材料（`template/keybox.xml`），手上这套 keybox 缺算法时拿它顶上。
+///
+/// 上游给的 keybox 未必两种算法都带（服务端的公开池就是按算法挑一份发过来的），
+/// 请求落到缺的那一种上，以前直接回 `keybox has no Rsa signing key`，整条认证链
+/// 就断在这儿了。用自带的这份补上：leaf 照样签得出来、照样能链到自签根 —— 验签
+/// 方看到的跟「这台机器压根没配 keybox」是同一种结果，总比直接报错强。
+static BUNDLED_SIGNING_INFOS: OnceLock<(Option<CertSignAlgoInfo>, Option<CertSignAlgoInfo>)> =
+    OnceLock::new();
+/// 缺算法这件事只在第一次喊一声，每次请求都喊会把日志刷烂。
+static BUNDLED_FALLBACK_WARNED_RSA: AtomicBool = AtomicBool::new(false);
+static BUNDLED_FALLBACK_WARNED_EC: AtomicBool = AtomicBool::new(false);
+
+fn bundled_signing_infos() -> &'static (Option<CertSignAlgoInfo>, Option<CertSignAlgoInfo>) {
+    BUNDLED_SIGNING_INFOS.get_or_init(|| {
+        let keybox =
+            KeyBox::from_xml_str(BUNDLED_KEYBOX_XML).expect("bundled keybox.xml must be valid");
+        (keybox.rsa_info, keybox.ec_info)
+    })
+}
+
 #[derive(Clone)]
 pub struct CertSignAlgoInfo {
     key: KeyMaterial,
@@ -191,13 +211,30 @@ impl KeyBox {
             SigningAlgorithm::Rsa => self.rsa_info.as_ref(),
             SigningAlgorithm::Ec => self.ec_info.as_ref(),
         };
-        let info = info.ok_or_else(|| {
-            kmr_common::km_err!(
-                UnknownError,
-                "keybox has no {:?} signing key",
-                key_type.algo_hint
-            )
-        })?;
+        // 手上这套 keybox 缺这个算法：拿内置自签顶上，别让请求就这么断了。
+        let info = match info {
+            Some(info) => info,
+            None => {
+                let (bundled_rsa, bundled_ec) = bundled_signing_infos();
+                let (fallback, warned) = match key_type.algo_hint {
+                    SigningAlgorithm::Rsa => (bundled_rsa, &BUNDLED_FALLBACK_WARNED_RSA),
+                    SigningAlgorithm::Ec => (bundled_ec, &BUNDLED_FALLBACK_WARNED_EC),
+                };
+                if !warned.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "keybox has no {:?} signing key; falling back to the bundled self-signed one",
+                        key_type.algo_hint
+                    );
+                }
+                fallback.as_ref().ok_or_else(|| {
+                    kmr_common::km_err!(
+                        UnknownError,
+                        "keybox has no {:?} signing key (bundled template has none either)",
+                        key_type.algo_hint
+                    )
+                })?
+            }
+        };
 
         Ok(SigningInfoSnapshot {
             signing_key: info.key.clone(),
@@ -715,12 +752,18 @@ pub fn current_identity_digest() -> [u8; 32] {
 pub(crate) fn signing_certificate_ders_from_disk() -> Result<Vec<Vec<u8>>> {
     let _io_guard = KEYBOX_IO_LOCK.lock().unwrap();
     let (keybox, _) = load_keybox_with_fallback(KEYBOX_PATH)?;
+    let (bundled_rsa, bundled_ec) = bundled_signing_infos();
+    // 缺算法时实际签发用的就是内置自签那套，它的证书也得算进来，不然 DB 回填的
+    // keybox 身份跟真实签出来的 leaf 对不上号。
     let mut certs = Vec::new();
-    if let Some(rsa_info) = &keybox.rsa_info {
-        certs.push(rsa_info.chain[0].encoded_certificate.clone());
-    }
-    if let Some(ec_info) = &keybox.ec_info {
-        certs.push(ec_info.chain[0].encoded_certificate.clone());
+    for info in [
+        keybox.rsa_info.as_ref().or(bundled_rsa.as_ref()),
+        keybox.ec_info.as_ref().or(bundled_ec.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        certs.push(info.chain[0].encoded_certificate.clone());
     }
     Ok(certs)
 }
@@ -782,16 +825,81 @@ mod tests {
                 .cert_chain,
             keybox.ec_info.as_ref().unwrap().chain
         );
-        assert!(parsed
+        // RSA 缺了不再报错：拿内置自签那套顶上，链得是自洽的。
+        let rsa_snapshot = parsed
             .signing_info(SigningKeyType {
                 which: SigningKey::Batch,
                 algo_hint: SigningAlgorithm::Rsa,
             })
-            .is_err());
+            .expect("缺 RSA 时应该退回内置自签，而不是把请求判死");
+        assert_eq!(
+            rsa_snapshot.cert_chain,
+            keybox.rsa_info.as_ref().unwrap().chain,
+            "退回来的应该是内置自签那份链"
+        );
+        validate_chain_matches_key(
+            &rsa_snapshot.signing_key,
+            &rsa_snapshot.cert_chain,
+            KeyAlgorithm::Rsa,
+        )
+        .unwrap();
         assert_eq!(parsed.to_xml_string().matches("<Key algorithm=").count(), 1);
         // Round-trips to a valid, single-keybox document.
         let round_tripped = KeyBox::from_xml_str(&parsed.to_xml_string()).unwrap();
         assert_eq!(round_tripped.identity_digest(), parsed.identity_digest());
+    }
+
+    /// 退回内置自签不等于把它写进 keybox.xml —— 序列化出去、再落盘的还是磁盘上那一
+    /// 份。写进去的话下次加载就变成「这台设备的 keybox 里真混着自签材料」了。
+    #[test]
+    fn bundled_fallback_is_not_serialized_back_into_the_xml() {
+        let keybox = KeyBox::from_xml_str(BUNDLED_KEYBOX_XML).unwrap();
+        let ec_block = KeyBox::to_xml_block(
+            KeyAlgorithm::Ec,
+            "ecdsa",
+            "EC PRIVATE KEY",
+            keybox.ec_info.as_ref().unwrap(),
+        );
+        let ec_only_xml = format!(
+            "<?xml version=\"1.0\"?>\n<AndroidAttestation>\n<NumberOfKeyboxes>1</NumberOfKeyboxes>\n<Keybox DeviceID=\"yurikey\">\n{ec_block}\n</Keybox>\n</AndroidAttestation>\n"
+        );
+
+        let parsed = KeyBox::from_xml_str(&ec_only_xml).unwrap();
+        // 先真用一次 fallback，再序列化。
+        let _ = parsed
+            .signing_info(SigningKeyType {
+                which: SigningKey::Batch,
+                algo_hint: SigningAlgorithm::Rsa,
+            })
+            .unwrap();
+
+        assert_eq!(parsed.to_xml_string().matches("<Key algorithm=").count(), 1);
+        assert!(!parsed.to_xml_string().contains("RSA PRIVATE KEY"));
+        assert_eq!(
+            parsed.identity_digest(),
+            KeyBox::from_xml_str(&ec_only_xml)
+                .unwrap()
+                .identity_digest()
+        );
+    }
+
+    /// 两种算法都在时，走的还是磁盘上那份，不该被内置自签顶掉。
+    #[test]
+    fn complete_keybox_never_uses_the_bundled_fallback() {
+        let keybox = KeyBox::from_xml_str(BUNDLED_KEYBOX_XML).unwrap();
+        for (algo, expected) in [
+            (SigningAlgorithm::Rsa, keybox.rsa_info.as_ref().unwrap()),
+            (SigningAlgorithm::Ec, keybox.ec_info.as_ref().unwrap()),
+        ] {
+            let snapshot = keybox
+                .signing_info(SigningKeyType {
+                    which: SigningKey::Batch,
+                    algo_hint: algo,
+                })
+                .unwrap();
+            assert_eq!(snapshot.cert_chain, expected.chain);
+            assert_eq!(snapshot.identity_digest, keybox.identity_digest());
+        }
     }
 
     #[test]
