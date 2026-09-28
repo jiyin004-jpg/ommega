@@ -41,6 +41,10 @@ const SELFCHECK_ERROR_MAX_CHARS: usize = 300;
 /// 自检请求用的 alias。跟 A 端的 `ommega-remote-*` 分开，互不干扰。
 const SELFCHECK_ALIAS: &str = "ommega-selfcheck";
 
+/// 负载估算看的活动窗口（毫秒）。`device_events` 里每台设备一个小队列，
+/// 记的是 (时间戳, 权重)；只有落在窗口里的事件才算进负载。
+const ACTIVITY_WINDOW_MS: u64 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub task_id: String,
@@ -352,12 +356,32 @@ impl TaskStore {
             .or_default();
         q.push_back((now, weight));
         while let Some((ts, _)) = q.front() {
-            if now.saturating_sub(*ts) > 60_000 {
+            if now.saturating_sub(*ts) > ACTIVITY_WINDOW_MS {
                 q.pop_front();
             } else {
                 break;
             }
         }
+    }
+
+    /// 窗口内的活动量 —— 调度和状态页共用的那个“负载”。
+    ///
+    /// 队列只在 `record_event_locked` 里修剪，而那只有在该设备又冒出新事件时
+    /// 才会跑：设备一安静，队列就停在那里，里面的旧事件永远不会过期。所以求和
+    /// 时得自己按窗口筛一遍，不能信队列里的残留 —— 否则“曾经忙、现在闲着”的
+    /// 机器负载一直挂在高位，被排在负载 0 的新机器后面，越闲越派不到活。
+    fn window_activity_locked(inner: &Inner, device_id: &str) -> u64 {
+        let now = Self::now_ms();
+        inner
+            .device_events
+            .get(device_id)
+            .map(|q| {
+                q.iter()
+                    .filter(|(ts, _)| now.saturating_sub(*ts) <= ACTIVITY_WINDOW_MS)
+                    .map(|(_, w)| *w)
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     /// Pop the next pending task matching this device, with long-poll semantics.
@@ -988,11 +1012,7 @@ impl TaskStore {
 
     pub async fn get_device_load(&self, device_id: &str) -> u64 {
         let inner = self.inner.lock().await;
-        inner
-            .device_events
-            .get(device_id)
-            .map(|q| q.iter().map(|(_, w)| *w).sum())
-            .unwrap_or(0)
+        Self::window_activity_locked(&inner, device_id)
     }
 
     /// Resolve the target device_id for a new task, with load-balancing
@@ -1031,11 +1051,7 @@ impl TaskStore {
         let mut candidates: Vec<(String, u64, usize)> = online_ids
             .iter()
             .map(|id| {
-                let events: u64 = inner
-                    .device_events
-                    .get(id)
-                    .map(|q| q.iter().map(|(_, w)| *w).sum())
-                    .unwrap_or(0);
+                let events = Self::window_activity_locked(&inner, id);
                 let active = inner
                     .tasks
                     .values()
@@ -1109,11 +1125,7 @@ impl TaskStore {
                 .iter()
                 .filter(|(_, cap)| *cap == tier)
                 .map(|(id, _)| {
-                    let events: u64 = inner
-                        .device_events
-                        .get(id)
-                        .map(|q| q.iter().map(|(_, w)| *w).sum())
-                        .unwrap_or(0);
+                    let events = Self::window_activity_locked(&inner, id);
                     let active = inner
                         .tasks
                         .values()
@@ -1554,5 +1566,92 @@ mod selfcheck_tests {
             .find(|t| t.task_id == soter_task)
             .expect("任务应该还在");
         assert_eq!(still_pending.status, TaskStatus::Pending);
+    }
+}
+
+#[cfg(test)]
+mod device_load_window_tests {
+    use super::*;
+
+    /// 设备安静下来之后，窗口外的旧事件不能再算进负载。
+    #[tokio::test]
+    async fn load_forgets_events_outside_the_window() {
+        let now = TaskStore::now_ms();
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        {
+            let mut inner = store.inner.lock().await;
+            inner.device_events.insert(
+                "dev".into(),
+                [
+                    (now.saturating_sub(300_000), 40), // 5 分钟前，早该忘掉
+                    (now.saturating_sub(90_000), 18),  // 90 秒前，也在窗外
+                    (now.saturating_sub(5_000), 3),    // 5 秒前，还算
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
+        assert_eq!(
+            store.get_device_load("dev").await,
+            3,
+            "只有窗口内那 3 该算进来"
+        );
+    }
+
+    /// 边界：正好落在窗口边上（60 s）的还算，刚过一秒的就不算。
+    #[tokio::test]
+    async fn window_edge_is_inclusive() {
+        let now = TaskStore::now_ms();
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        {
+            let mut inner = store.inner.lock().await;
+            inner.device_events.insert(
+                "dev".into(),
+                [
+                    (now.saturating_sub(60_000), 4),
+                    (now.saturating_sub(60_001), 9),
+                ]
+                .into_iter()
+                .collect(),
+            );
+        }
+        assert_eq!(store.get_device_load("dev").await, 4);
+    }
+
+    /// 派活的口径得跟 `get_device_load` 一样：很久没动静的机器不能因为历史
+    /// 负载高就永远排在后面 —— 那正是“越闲越派不到活”的那个坑。
+    #[tokio::test]
+    async fn balancing_uses_the_same_fresh_window() {
+        let now = TaskStore::now_ms();
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        for id in ["dev-busy", "dev-idle"] {
+            assert!(store
+                .pop_for_b(
+                    id,
+                    "TEST-1",
+                    DeviceCaps::default(),
+                    Duration::from_millis(10)
+                )
+                .await
+                .is_none());
+        }
+        {
+            let mut inner = store.inner.lock().await;
+            // dev-busy 曾经很忙，但那些事件早出了窗口；dev-idle 刚干了点活。
+            inner.device_events.insert(
+                "dev-busy".into(),
+                [(now.saturating_sub(600_000), 99)].into_iter().collect(),
+            );
+            inner.device_events.insert(
+                "dev-idle".into(),
+                [(now.saturating_sub(1_000), 1)].into_iter().collect(),
+            );
+        }
+        // 点名一台不在线的，逼它走负载均衡那条路。
+        assert_eq!(
+            store.resolve_online_target("dev-absent").await,
+            "dev-busy",
+            "过期负载不该再压着它"
+        );
     }
 }
