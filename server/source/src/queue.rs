@@ -90,10 +90,14 @@ pub struct DeviceEntry {
     pub tee_error: Option<String>,
     /// 上次替这台设备排自检的时间戳（毫秒，0 = 从没排过）。只用来限流。
     pub tee_probe_at_ms: u64,
-    /// 心跳里上报"这台能不能做 SOTER"。`Some(false)` 是设备明确说了没有，
+    /// 心跳里上报“这台能不能做 SOTER”。`Some(false)` 是设备明确说了没有，
     /// `None` 是没上报过（老版本 relay），两者对路由的意义不同：说过没有的
     /// 设备不会再被派 SOTER 任务。
     pub supports_soter: Option<bool>,
+    /// 心跳里上报“签名真签出来过”（`soter_sign`）。`Some(true)` 是设备拿现成
+    /// 槽位真签过一次，才敢报的；`None` 是没上报，不代表签不了。状态页拿它
+    /// 区分“量过，行”和“没量过，还能试”。
+    pub soter_sign: Option<bool>,
     /// 心跳里上报“这台签名行不行”。`Some(true)` 是设备自己说签不了
     /// （`soter_nosign`），签名类 op 不再派给它；`None` 是没上报（老版本 relay），
     /// 还能试。
@@ -110,6 +114,8 @@ pub struct DeviceEntry {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeviceCaps {
     pub soter: Option<bool>,
+    /// 设备真签出来过一次（`soter_sign`）：签名那两个 op 派过去能做完。
+    pub soter_sign: Option<bool>,
     /// 设备明说“签名这步做不了”（`soter_nosign`）：HAL 能答话，但签名要现场指纹，
     /// 无人值守的 B 端给不了。跟 `soter = Some(false)`（压根没 HAL）分开记，因为它
     /// 仍然能做身份/导出那些 op，只是签名不行。
@@ -145,6 +151,9 @@ impl DeviceCaps {
                 let has = |name: &str| raw.split(',').any(|t| t.trim().eq_ignore_ascii_case(name));
                 DeviceCaps {
                     soter: Some(has("soter")),
+                    // 只有真签出来过的设备才会报这个名字；没报 = 没量过（或者量不
+                    // 出来），那是“还能试”，不是“不行”。
+                    soter_sign: Some(has("soter_sign")),
                     soter_nosign: Some(has("soter_nosign")),
                     strongbox: Some(has("strongbox")),
                 }
@@ -374,6 +383,7 @@ impl TaskStore {
                     known_tee_error,
                     known_probe_at,
                     known_supports_soter,
+                    known_soter_sign,
                     known_soter_nosign,
                     known_supports_strongbox,
                 ) = match inner.devices.get(device_id) {
@@ -383,10 +393,11 @@ impl TaskStore {
                         d.tee_error.clone(),
                         d.tee_probe_at_ms,
                         d.supports_soter,
+                        d.soter_sign,
                         d.soter_nosign,
                         d.supports_strongbox,
                     ),
-                    None => (None, None, None, 0, None, None, None),
+                    None => (None, None, None, 0, None, None, None, None),
                 };
                 let has_tee_verdict = known_boot.is_some() || known_tee_error.is_some();
                 inner.devices.insert(
@@ -402,6 +413,7 @@ impl TaskStore {
                         tee_probe_at_ms: known_probe_at,
                         // 这次心跳没提的能力保留上次的结论，提了就按最新的算。
                         supports_soter: caps.soter.or(known_supports_soter),
+                        soter_sign: caps.soter_sign.or(known_soter_sign),
                         soter_nosign: caps.soter_nosign.or(known_soter_nosign),
                         supports_strongbox: caps.strongbox.or(known_supports_strongbox),
                     },
@@ -1321,9 +1333,16 @@ mod selfcheck_tests {
         let nosign = DeviceCaps::parse(Some("soter,soter_nosign"));
         assert_eq!(nosign.soter, Some(true));
         assert_eq!(nosign.soter_nosign, Some(true));
+        // `soter_sign`（真拿现成槽位签出来过）是第三条，独立于上面两条：报告里
+        // 没有它就是“没量过”（还能试），不是“签不了”。
+        let signed = DeviceCaps::parse(Some("soter,soter_sign"));
+        assert_eq!(signed.soter, Some(true));
+        assert_eq!(signed.soter_sign, Some(true));
+        assert_eq!(signed.soter_nosign, Some(false));
         // 老版本 relay 只报 `soter`：那是“没说”，签名还能试（路由只看 != true）。
         let old = DeviceCaps::parse(Some("soter"));
         assert_eq!(old.soter_nosign, Some(false));
+        assert_eq!(old.soter_sign, Some(false));
     }
 
     /// 上报 `soter_nosign` 的设备（HAL 能答话、签名要现场指纹）：身份/导出还能领，
@@ -1332,6 +1351,7 @@ mod selfcheck_tests {
     async fn sign_ops_skip_a_device_that_reported_soter_nosign() {
         let store = TaskStore::new(30, 60, 100, 60, false);
         let nosign = DeviceCaps {
+            soter_sign: None,
             soter: Some(true),
             soter_nosign: Some(true),
             strongbox: None,
@@ -1360,6 +1380,7 @@ mod selfcheck_tests {
             .await
             .is_none());
         let none = DeviceCaps {
+            soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
             strongbox: None,
@@ -1397,12 +1418,14 @@ mod selfcheck_tests {
     async fn soter_target_prefers_a_device_that_reported_support() {
         let store = TaskStore::new(30, 60, 100, 60, false);
         let none = DeviceCaps {
+            soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
             strongbox: Some(false),
         };
         let unknown = DeviceCaps::default();
         let yes = DeviceCaps {
+            soter_sign: None,
             soter: Some(true),
             soter_nosign: None,
             strongbox: Some(true),
@@ -1437,6 +1460,7 @@ mod selfcheck_tests {
     async fn soter_target_never_lands_on_a_device_that_said_no() {
         let store = TaskStore::new(30, 60, 100, 60, false);
         let none = DeviceCaps {
+            soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
             strongbox: None,
@@ -1473,6 +1497,7 @@ mod selfcheck_tests {
     async fn unsupported_device_never_dequeues_a_soter_task() {
         let store = TaskStore::new(30, 60, 100, 60, false);
         let yes = DeviceCaps {
+            soter_sign: None,
             soter: Some(true),
             soter_nosign: None,
             strongbox: None,
@@ -1487,6 +1512,7 @@ mod selfcheck_tests {
 
         // 改口：明确说不支持了。
         let no = DeviceCaps {
+            soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
             strongbox: None,

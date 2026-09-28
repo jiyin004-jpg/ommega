@@ -233,6 +233,9 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
                 // 心跳里上报的能力（None = 没上报过）。管理页用它判断
                 // 这台能不能接 SOTER 任务。
                 "soter": d.supports_soter,
+                // 设备真签出来过一次才报这个（`soter_sign`）：状态页的“签名支持”
+                // 认这一条，而不是“没说不支持”。
+                "soter_sign": d.soter_sign,
                 // 设备自己说“签名做不了”（要本机指纹）：身份/导出还能用，
                 // 签名类 op 不会再派给它。
                 "soter_nosign": d.soter_nosign,
@@ -1213,6 +1216,9 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 // 心跳里上报的能力：`true` 支持 / `false` 明确不支持 / `null`
                 // 没上报过（老版本 relay）。状态页点开设备时显示。
                 "soter": d.supports_soter,
+                // 真签出来过才报这个（`soter_sign`），状态页拿它区分“量过，行”
+                // 和“没量过，还能试”。
+                "soter_sign": d.soter_sign,
                 // 另一条：设备明说“签名要本机指纹、远程做不了”（`soter_nosign`）。
                 "soter_nosign": d.soter_nosign,
                 "strongbox": d.supports_strongbox,
