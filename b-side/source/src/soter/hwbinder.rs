@@ -2,13 +2,15 @@
 //!
 //! HIDL 的 HAL 走 `/dev/hwbinder`，它跟 `/dev/binder` 是同一个内核驱动、同一套
 //! ioctl 协议（`BINDER_WRITE_READ` + `BC_TRANSACTION` + `binder_transaction_data`），
-//! 所以这里不重造协议，只把三处真不一样的地方补上：
+//! 所以这里不重造协议，只把四处真不一样的地方补上：
 //!
 //! 1. 设备节点换成 `/dev/hwbinder`；
 //! 2. interface token 是裸的 C 字符串（`Parcel::writeInterfaceToken` 在 libhwbinder
 //!    里就是 `writeCString`），不是普通 binder 那种「先 i32 字符数、再 UTF-16」；
 //! 3. 字符串和 vector 走 `binder_buffer_object`（`BINDER_TYPE_PTR`）：parcel 里只躺
 //!    对象，真正的数据结构在 parcel 外面，靠对象里写的地址去读，内核负责翻译。
+//! 4. 从应答里读出来的句柄得自己 `BC_ACQUIRE`：内核随应答给的那个 ref 只撑到该
+//!    应答 buffer 被 `BC_FREE_BUFFER` 交回为止，见 [`HwBinder::acquire_handle`]。
 //!
 //! 为什么不用 rsbinder：它能换驱动路径，但 `Parcel` 只实现了 `flat_binder_object`，
 //! 没有 `BINDER_TYPE_PTR` 的写入口，而 HIDL 传字符串和 vec 绕不开它。
@@ -81,6 +83,14 @@ pub const BC_TRANSACTION: u32 = io_arg(_IOC_WRITE, b'c', 0, 64);
 pub const BC_TRANSACTION_SG: u32 = io_arg(_IOC_WRITE, b'c', 17, 72);
 
 pub const BC_FREE_BUFFER: u32 = io_arg(_IOC_WRITE, b'c', 3, __SIZEOF_BINDER_UINTPTR);
+
+/// `BC_ACQUIRE` / `BC_RELEASE`：把本进程里的一个 `__u32` 句柄加减一次**强**引用。
+///
+/// 注意参数就是 `__u32`（4 字节），不是像 `BC_FREE_BUFFER` 那样的 `binder_uintptr_t`；
+/// 命令字里的 size 位因此是 4，跟内核 `_IOW('c', 5, __u32)` 对得上。
+pub const BC_ACQUIRE: u32 = io_arg(_IOC_WRITE, b'c', 5, 4);
+pub const BC_RELEASE: u32 = io_arg(_IOC_WRITE, b'c', 6, 4);
+
 const BC_ENTER_LOOPER: u32 = io_noarg(_IOC_WRITE, b'c', 12);
 const BC_EXIT_LOOPER: u32 = io_noarg(_IOC_WRITE, b'c', 13);
 
@@ -444,6 +454,11 @@ pub struct HwBinder {
     /// 体就躺在这块 buffer 里，调用方还要拿它拼 `hidl_string` / `hidl_vec`。AOSP 的
     /// libbinder 也是把释放挂在 `Parcel` 的析构上，而不是收到就交回。
     pending_free: Mutex<Vec<BinderSize>>,
+    /// 从应答里读出来、已经在我们这边 `BC_ACQUIRE` 过的句柄。
+    ///
+    /// 这些号在装着它们的那条应答 buffer 被 `BC_FREE_BUFFER` 交回后仍然有效（强
+    /// 引用是我们自己拿着的），连接析构时再一并 `BC_RELEASE`。
+    acquired: Mutex<Vec<u32>>,
 }
 
 // SAFETY: fd 和 mmap 都是进程级资源，只要不在没有同步的前提下并发收发就安全；
@@ -507,6 +522,7 @@ impl HwBinder {
             map_len,
             gate: Mutex::new(()),
             pending_free: Mutex::new(Vec::new()),
+            acquired: Mutex::new(Vec::new()),
         })
     }
 
@@ -530,6 +546,33 @@ impl HwBinder {
         }
         // SAFETY: 上面确认这段落在我们自己的映射里。
         Some(unsafe { std::slice::from_raw_parts(addr as *const u8, len) }.to_vec())
+    }
+
+    /// 把一条从应答里读出来的句柄在本进程里补一次强引用（`BC_ACQUIRE`）。
+    ///
+    /// `IServiceManager::get` 回来的 `flat_binder_object` 里那个号，是内核在翻译
+    /// 那笔应答时刚给本进程建的 ref。那条应答的 buffer 一旦用 `BC_FREE_BUFFER` 交
+    /// 回，`binder_transaction_buffer_release` 就会把这次翻译加的引用减回去；我们
+    /// 这边没有别的强引用，ref 的 `strong` 掉到 0 就被删掉，再拿这个号发事务内核
+    /// 会回 `BR_FAILED_REPLY`（“bad handle”）。libhwbinder 的做法是读到句柄就
+    /// `BC_ACQUIRE`（`BpBinder::onFirstStrongRef`），这里照做。
+    ///
+    /// 必须在装着这条对象的 buffer 被交回之前调用 —— 也就是 [`Self::transact`]
+    /// 返回之后、下一次事务（它开头会 `flush_pending_free`）之前。
+    pub fn acquire_handle(&self, handle: u32) -> Result<()> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("hwbinder 连接锁中毒"))?;
+        if self.acquired.lock().map_or(false, |held| held.contains(&handle)) {
+            return Ok(());
+        }
+        send_u32_command(self.fd.as_raw_fd(), BC_ACQUIRE, handle)
+            .with_context(|| format!("BC_ACQUIRE handle {handle}"))?;
+        if let Ok(mut held) = self.acquired.lock() {
+            held.push(handle);
+        }
+        Ok(())
     }
 
     /// 发一笔同步事务，等应答。
@@ -743,6 +786,14 @@ impl HwBinder {
 
 impl Drop for HwBinder {
     fn drop(&mut self) {
+        // 先交回拿过的强引用；fd 一关内核也会一并回收，失败不管。
+        let handles: Vec<u32> = match self.acquired.get_mut() {
+            Ok(held) => std::mem::take(held),
+            Err(_) => Vec::new(),
+        };
+        for handle in handles {
+            let _ = send_u32_command(self.fd.as_raw_fd(), BC_RELEASE, handle);
+        }
         // 尽力把还没交回的应答 buffer 还掉。fd 一关内核也会回收它们，所以失败不管。
         let ptrs: Vec<BinderSize> = match self.pending_free.get_mut() {
             Ok(pending) => std::mem::take(pending),
@@ -769,6 +820,24 @@ fn free_buffer_commands(ptrs: &[BinderSize]) -> Vec<u8> {
         out.extend_from_slice(&ptr.to_le_bytes());
     }
     out
+}
+
+/// 发一条只带一个 `__u32` 参数的命令（`BC_ACQUIRE` / `BC_RELEASE`）。
+fn send_u32_command(fd: i32, cmd: u32, value: u32) -> io::Result<()> {
+    let mut out = Vec::with_capacity(4 + std::mem::size_of::<u32>());
+    out.extend_from_slice(&cmd.to_le_bytes());
+    out.extend_from_slice(&value.to_le_bytes());
+    let mut wwr = BinderWriteRead {
+        write_size: out.len() as BinderSize,
+        write_buffer: out.as_ptr() as BinderSize,
+        ..BinderWriteRead::default()
+    };
+    // SAFETY: out 活到这次调用返回；只写不读，read_size 是 0。
+    let rc = unsafe { libc_ioctl_wwr(fd, &mut wwr) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// 把应答 buffer 交回内核。失败只是滞后释放，不影响已经拷出来的应答。
@@ -874,6 +943,10 @@ mod tests {
         assert_eq!(BC_TRANSACTION_SG, 0x4048_6311, "BC_TRANSACTION_SG");
         // _IOW('c', 3, binder_uintptr_t) = 0x40086303
         assert_eq!(BC_FREE_BUFFER, 0x4008_6303, "BC_FREE_BUFFER");
+        // _IOW('c', 5, __u32) = 0x40046305
+        assert_eq!(BC_ACQUIRE, 0x4004_6305, "BC_ACQUIRE");
+        // _IOW('c', 6, __u32) = 0x40046306
+        assert_eq!(BC_RELEASE, 0x4004_6306, "BC_RELEASE");
         // _IOWR('b', 1, struct binder_write_read) = 0xC0306201
         assert_eq!(BINDER_WRITE_READ, 0xC030_6201, "BINDER_WRITE_READ");
         // _IOWR('b', 9, struct binder_version) = 0xC0046209

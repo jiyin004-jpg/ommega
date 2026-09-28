@@ -278,7 +278,16 @@ fn fetch_service_handle(conn: &HwBinder, fq_name: &str, instance: &str) -> Resul
     let mut cur = Cursor::new(&reply);
     cur.status()?;
     // 回包是一个 `interface service`，HIDL 那边就是个 hidl_binder。
-    cur.binder_handle()
+    let handle = cur.binder_handle()?;
+    if let Some(handle) = handle {
+        // 趁那条应答 buffer 还没交回，先把句柄在本进程里做成一次强引用。不这么做
+        // 的话，下一次事务开头会 `BC_FREE_BUFFER`，内核把翻译应答时给的那个 ref
+        // 减掉，句柄就作废了，再拿它发事务就是 `BR_FAILED_REPLY`。
+        // 见 `HwBinder::acquire_handle`。
+        conn.acquire_handle(handle)
+            .with_context(|| format!("acquire the handle for {fq_name}/{instance}"))?;
+    }
+    Ok(handle)
 }
 
 /// 解析应答的游标。所有方法都是「先一个 Status，再方法自己的字段」。

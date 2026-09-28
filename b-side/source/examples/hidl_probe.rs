@@ -123,11 +123,17 @@ fn main() -> Result<()> {
                 println!("   原始应答 {} 字节: {}", r.data.len(), hex.join(" "));
                 if r.data.len() >= 28 {
                     let h = u32::from_le_bytes([r.data[12], r.data[13], r.data[14], r.data[15]]);
-                    let mut q = Parcel::new();
-                    q.write_interface_token(IBASE_DESCRIPTOR);
-                    match conn.transact(h, TX_IBASE_PING, &q) {
-                        Ok(p) => println!("   ✓ 用它自己返回的句柄 {h} ping 通了，应答 {} 字节", p.data.len()),
-                        Err(e) => println!("   ✗ 句柄 {h} ping 挂了：{e:#}"),
+                    // `get` 回来的句柄得先在自己这边 `BC_ACQUIRE`：不然这条应答 buffer
+                    // 下一次事务开头交回内核时，ref 会被减掉，再发就是 BR_FAILED_REPLY。
+                    if let Err(e) = conn.acquire_handle(h) {
+                        println!("   ✗ 句柄 {h} BC_ACQUIRE 失败：{e:#}");
+                    } else {
+                        let mut q = Parcel::new();
+                        q.write_interface_token(IBASE_DESCRIPTOR);
+                        match conn.transact(h, TX_IBASE_PING, &q) {
+                            Ok(p) => println!("   ✓ 用它自己返回的句柄 {h} ping 通了，应答 {} 字节", p.data.len()),
+                            Err(e) => println!("   ✗ 句柄 {h} ping 挂了：{e:#}"),
+                        }
                     }
                 }
             }
