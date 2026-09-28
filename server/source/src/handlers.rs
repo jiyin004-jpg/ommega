@@ -927,7 +927,11 @@ async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> O
     // 再把签名任务排给它白跑一趟。
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
     let needs_sign = matches!(op, "init_sign" | "finish_sign");
-    let Some(target) = state.store.resolve_soter_target(requested, needs_sign).await else {
+    let Some(target) = state
+        .store
+        .resolve_soter_target(requested, needs_sign)
+        .await
+    else {
         return Some(json!({
             "error": "no B-side device reporting SOTER support is online",
         }));

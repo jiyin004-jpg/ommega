@@ -498,7 +498,12 @@ impl TaskStore {
         let (soter_ok, soter_sign_ok) = inner
             .devices
             .get(device_id)
-            .map(|d| (d.supports_soter != Some(false), d.soter_nosign != Some(true)))
+            .map(|d| {
+                (
+                    d.supports_soter != Some(false),
+                    d.soter_nosign != Some(true),
+                )
+            })
             .unwrap_or((true, true));
         // 1) Try device-specific queue first.
         //
@@ -1442,13 +1447,19 @@ mod selfcheck_tests {
         }
 
         assert_eq!(
-            store.resolve_soter_target("dev-yes", false).await.as_deref(),
+            store
+                .resolve_soter_target("dev-yes", false)
+                .await
+                .as_deref(),
             Some("dev-yes"),
             "点名的设备支持就应该用它"
         );
         for requested in ["dev-none", "dev-unknown", "dev-absent", ""] {
             assert_eq!(
-                store.resolve_soter_target(requested, false).await.as_deref(),
+                store
+                    .resolve_soter_target(requested, false)
+                    .await
+                    .as_deref(),
                 Some("dev-yes"),
                 "requested={requested} 时应该落到唯一支持的设备"
             );
