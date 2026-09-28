@@ -36,6 +36,7 @@ use rsbinder::{ExceptionCode, Status, StatusCode, Strong};
 
 mod mirror;
 mod pending;
+mod replay;
 mod reply;
 mod request;
 mod synthetic;
@@ -43,6 +44,9 @@ mod synthetic;
 pub(super) use mirror::start_mirror_recovery_worker;
 use mirror::*;
 use pending::*;
+/// The ipc layer calls this before a request is allowed to reach the shadow.
+pub(crate) use replay::sync_ommega_state_after_reconnect;
+use replay::*;
 use reply::*;
 use request::*;
 use synthetic::*;

@@ -547,9 +547,15 @@ fn execute_authorization_mirror(
             })
         }
         ParsedAuthorizationRequest::OnDeviceUnlocked { user_id, password } => {
-            ipc::with_ommega_authorization_once(|auth| {
+            let result = ipc::with_ommega_authorization_once(|auth| {
                 Ok(auth.r#onDeviceUnlocked(Some(caller), *user_id, password.as_deref())?)
-            })
+            });
+            if result.is_ok() {
+                // Only the shadow's own answer proves it now holds this unlock, and
+                // that is what makes a later shadow restart recoverable.
+                remember_device_unlock(*user_id, password.as_deref(), caller);
+            }
+            result
         }
         ParsedAuthorizationRequest::OnDeviceLocked {
             user_id,
@@ -642,23 +648,39 @@ fn execute_maintenance_mirror(
             user_id,
             password,
             allow_existing,
-        } => ipc::with_ommega_maintenance_once(|maintenance| {
-            Ok(maintenance.r#initUserSuperKeys(
-                Some(caller),
-                *user_id,
-                password,
-                *allow_existing,
-            )?)
-        }),
+        } => {
+            let result = ipc::with_ommega_maintenance_once(|maintenance| {
+                Ok(maintenance.r#initUserSuperKeys(
+                    Some(caller),
+                    *user_id,
+                    password,
+                    *allow_existing,
+                )?)
+            });
+            if result.is_ok() {
+                remember_device_unlock(*user_id, Some(password.as_slice()), caller);
+            }
+            result
+        }
         ParsedMaintenanceRequest::OnUserRemoved { user_id } => {
-            ipc::with_ommega_maintenance_once(|maintenance| {
+            let result = ipc::with_ommega_maintenance_once(|maintenance| {
                 Ok(maintenance.r#onUserRemoved(Some(caller), *user_id)?)
-            })
+            });
+            if result.is_ok() {
+                forget_device_unlock(*user_id);
+            }
+            result
         }
         ParsedMaintenanceRequest::OnUserLskfRemoved { user_id } => {
-            ipc::with_ommega_maintenance_once(|maintenance| {
+            let result = ipc::with_ommega_maintenance_once(|maintenance| {
                 Ok(maintenance.r#onUserLskfRemoved(Some(caller), *user_id)?)
-            })
+            });
+            if result.is_ok() {
+                // The super keys were just re-wrapped without a password, so the material
+                // kept here is stale; the next (password-less) unlock repopulates it.
+                forget_device_unlock(*user_id);
+            }
+            result
         }
         ParsedMaintenanceRequest::ClearNamespace { domain, nspace } => {
             ipc::with_ommega_maintenance_once(|maintenance| {
@@ -679,13 +701,17 @@ fn execute_maintenance_mirror(
             })
         }
         ParsedMaintenanceRequest::OnUserPasswordChanged { user_id, password } => {
-            ipc::with_ommega_maintenance_once(|maintenance| {
+            let result = ipc::with_ommega_maintenance_once(|maintenance| {
                 Ok(maintenance.r#onUserPasswordChanged(
                     Some(caller),
                     *user_id,
                     password.as_deref(),
                 )?)
-            })
+            });
+            if result.is_ok() {
+                remember_device_unlock(*user_id, password.as_deref(), caller);
+            }
+            result
         }
         ParsedMaintenanceRequest::GetState { .. }
         | ParsedMaintenanceRequest::OnDeviceOffBody
