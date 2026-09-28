@@ -1402,17 +1402,20 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
     let Some(db) = state.db.as_ref() else {
         return json_err(StatusCode::SERVICE_UNAVAILABLE, "no database");
     };
-    // EC 优先（体积小，A 端拿它铸 leaf 也快），取不到再退 RSA。采到的身份可能挂在
-    // 主 device_id 上，也可能挂在 -1/-2 这样的后缀上 —— 后缀范围跟着采集端的上限走，
-    // 两边写死后加了一边另一边就白搭。
+    // EC 和 RSA 各捞一份 —— 以前是「EC 优先，拿到就停」，A 端因此永远只拿到半套
+    // 材料，请求落到缺的那种算法上就只能报错。同一份 keybox 文件里的 EC/RSA 两段
+    // 入库时本就是分开的两行，这里按算法各扫一遍；只凑得到一种就发一种（A 端会用
+    // 自己内置的自签材料补缺）。采到的身份可能挂在主 device_id 上，也可能挂在
+    // -1/-2 这样的后缀上 —— 后缀范围跟着采集端的上限走，两边写死后加了一边另一边
+    // 就白搭。
     let base = crate::autokeybox::device_id_for("public");
     let mut candidates = vec![base.clone()];
     for n in 1..crate::autokeybox::PUBLIC_MAX_IDENTITIES {
         candidates.push(format!("{base}-{n}"));
     }
-    let mut picked: Option<(String, crate::db::DeviceIdentity)> = None;
-    'scan: for algo in ["ec", "rsa"] {
-        for device_id in &candidates {
+    let mut picked: Vec<(String, crate::db::DeviceIdentity)> = Vec::new();
+    for algo in ["ec", "rsa"] {
+        'scan: for device_id in &candidates {
             match db.get_device_identity_by_id(device_id, algo) {
                 Ok(Some(id)) => {
                     // 只认采集器写进去的那些。device-b-2 这类名字是自动源专用槽位，
@@ -1438,7 +1441,7 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
                         }
                         continue;
                     }
-                    picked = Some((device_id.clone(), id));
+                    picked.push((device_id.clone(), id));
                     break 'scan;
                 }
                 Ok(None) => {}
@@ -1448,7 +1451,7 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
             }
         }
     }
-    let Some((device_id, id)) = picked else {
+    if picked.is_empty() {
         // 池子里一个能用的都没有：要么还没采到，要么采到的全进了吊销名单。
         // 这里特意回「404 + 空 body」而不是 JSON 错误体 —— A 端拿 curl 取完只判断
         // 「有没有输出」，输出为空它就弹自己那句「未找到有效密钥箱」；回 JSON 的话
@@ -1460,17 +1463,26 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
             "",
         )
             .into_response();
-    };
-    let xml = crate::keybox::build_keybox_xml(
-        &device_id,
-        &id.algorithm,
-        &id.private_key_pem_cipher,
-        &id.certificate_chain_pem,
-    );
+    }
+    // 两种算法可能落在不同槽位上，XML 上挂哪个 device_id 都无所谓，A 端只认材料。
+    let xml_device_id = picked[0].0.clone();
+    let keys: Vec<(String, String, String)> = picked
+        .iter()
+        .map(|(_, id)| {
+            (
+                id.algorithm.clone(),
+                id.private_key_pem_cipher.clone(),
+                id.certificate_chain_pem.clone(),
+            )
+        })
+        .collect();
+    let xml = crate::keybox::build_keybox_xml_with_keys(&xml_device_id, &keys);
     tracing::info!(
-        "public_keybox served device_id={} algorithm={} xml_bytes={}",
-        device_id,
-        id.algorithm,
+        "public_keybox served device_id={} algorithms={:?} xml_bytes={}",
+        xml_device_id,
+        keys.iter()
+            .map(|(algo, _, _)| algo.as_str())
+            .collect::<Vec<_>>(),
         xml.len()
     );
     use base64::Engine;
