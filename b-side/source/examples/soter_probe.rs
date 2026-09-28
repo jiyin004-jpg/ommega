@@ -40,7 +40,16 @@ fn main() {
 
     // What the relay advertises with every poll (the server routes SOTER with
     // it and the status page shows it).
-    println!("caps: {}", ommegaclient_b::caps::report());
+    // 顺手把命令行的 uid/alias 当探针目标传进去：能力声明里到底是
+    // `soter_sign` 还是 `soter_nosign`，就看这一次真签名签不签得动。
+    let probe_target = ommegaclient_b::caps::SignProbeTarget {
+        uid,
+        alias: alias.to_string(),
+    };
+    println!(
+        "caps: {}",
+        ommegaclient_b::caps::report(Some(&probe_target))
+    );
     println!("target: uid={uid} alias={alias}");
 
     let payloads = [

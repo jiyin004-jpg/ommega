@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     if let Err(e) = rsbinder::ProcessState::init_default() {
         return Err(anyhow!("init binder process state failed: {e}"));
     }
-    let caps = ommegaclient_b::caps::report();
+    let caps = ommegaclient_b::caps::report(None);
     println!("link test: server={server} device={device_id} caps={caps:?}");
 
     let client = reqwest::blocking::Client::builder()

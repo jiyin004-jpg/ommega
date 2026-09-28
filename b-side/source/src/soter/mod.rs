@@ -285,6 +285,57 @@ fn open_soter(op: &str) -> Result<Soter> {
     })
 }
 
+/// 探针签名用的挑战值（十六进制字符串，跟 A 端传下来的形状一样）。
+const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
+
+/// 真去签一次：拿一个现成的槽位走 `init_sign` + `finish_sign`。
+///
+/// 这是能力上报用的。`getDeviceId` 只能证明 HAL 活着，证明不了它肯签 —— 一加 11
+/// （PHB110）这类机器的 AuthKey 锁在「刚匹配过指纹」后面，没人按指纹时
+/// `finish_sign` 一律回 -26（TA 给的原话就是「没有新鲜指纹」）。所以「能不能签」
+/// 只能靠真签一次来量，别猜。
+///
+/// 只用槽位上现成的材料，不建不删（改设备密钥状态得先问操作者）：没配探针目标，
+/// 或者目标槽位上根本没材料（-5 / -6）时，结论都是「签不了」——比默默声称能签诚实，
+/// 服务端也就不会把注定失败的签名任务派过来。
+///
+/// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
+pub fn sign_probe(uid: i32, alias: &str) -> Value {
+    let mut out = json!({ "op": "sign_probe", "uid": uid, "alias": alias });
+    let soter = match Soter::open() {
+        Ok(Some(soter)) => soter,
+        Ok(None) => {
+            out["error"] = json!("this device has no SOTER HAL");
+            return out;
+        }
+        Err(e) => {
+            out["error"] = json!(format!("{e:#}"));
+            return out;
+        }
+    };
+    let session = match soter.init_sign(uid, alias, PROBE_CHALLENGE) {
+        Ok(session) => session,
+        Err(e) => {
+            out["error"] = json!(format!("{e:#}"));
+            return out;
+        }
+    };
+    out["init_sign"] = json!(session.error_code);
+    if session.error_code != 0 {
+        // -5 / -6：槽位上没有 ASK / AuthKey，探不出签名能力。
+        out["signed"] = json!(false);
+        return out;
+    }
+    match soter.finish_sign(session.session) {
+        Ok(data) => {
+            out["finish_sign"] = json!(data.error_code);
+            out["signed"] = json!(data.error_code == 0);
+        }
+        Err(e) => out["error"] = json!(format!("{e:#}")),
+    }
+    out
+}
+
 /// 这台机器有没有 SOTER HAL —— 心跳能力上报用的。
 ///
 /// 与 [`probe`] 的区别：`probe` 会真的调一次 HAL（能证明它确实能用，但有开销），

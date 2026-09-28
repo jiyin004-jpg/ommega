@@ -152,6 +152,11 @@ struct RelayConfig {
     /// Allow SOTER ops that create or remove keys on the device.  Off by
     /// default: those ops change the real payment-key state.
     soter_allow_mutation: bool,
+    /// Slot to try a real signature on when reporting the `soter_sign`
+    /// capability.  Without it the relay says `soter_nosign` out loud: a
+    /// headless device cannot prove it can sign, and guessing would send it
+    /// every SOTER sign op just to fail with `-26`.
+    soter_probe: Option<ommegaclient_b::caps::SignProbeTarget>,
 }
 
 impl RelayConfig {
@@ -190,6 +195,25 @@ fn parse_bool(v: &str) -> bool {
     )
 }
 
+/// 签名探针目标：uid 和 alias 都给全了才认 —— 只有 uid 时不知道该拿哪个槽位
+/// 去签。缺一个就当没配：照旧报能答话，但报签不了。
+fn parse_probe_target(
+    uid: Option<&str>,
+    alias: Option<&str>,
+) -> Option<ommegaclient_b::caps::SignProbeTarget> {
+    let (uid, alias) = (uid?, alias?);
+    match uid.trim().parse::<i32>() {
+        Ok(uid) => Some(ommegaclient_b::caps::SignProbeTarget {
+            uid,
+            alias: alias.trim().to_string(),
+        }),
+        Err(e) => {
+            log::warn!("OMMEGA_RELAY_SOTER_PROBE_UID 不是整数（{uid:?}：{e}），当作没配");
+            None
+        }
+    }
+}
+
 /// Load config from `/data/adb/ommega/relay.conf` (KEY=VALUE lines).
 fn load_config_from_file() -> Result<RelayConfig> {
     let raw = std::fs::read_to_string(CONF_PATH).with_context(|| format!("read {CONF_PATH}"))?;
@@ -226,6 +250,10 @@ fn load_config_from_file() -> Result<RelayConfig> {
     let soter_allow_mutation = m
         .get("OMMEGA_RELAY_SOTER_MUTATION")
         .is_some_and(|v| parse_bool(v));
+    let soter_probe = parse_probe_target(
+        m.get("OMMEGA_RELAY_SOTER_PROBE_UID").map(|s| s.as_str()),
+        m.get("OMMEGA_RELAY_SOTER_PROBE_ALIAS").map(|s| s.as_str()),
+    );
     let server = server.trim_end_matches('/').to_string();
     Ok(RelayConfig {
         server,
@@ -233,6 +261,7 @@ fn load_config_from_file() -> Result<RelayConfig> {
         machine_id,
         token,
         soter_allow_mutation,
+        soter_probe,
     })
 }
 
@@ -323,6 +352,10 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         .context("OMMEGA_RELAY_TOKEN not set and relay.conf unreadable")?;
     let machine_id = env("OMMEGA_RELAY_MACHINE_ID").unwrap_or_default();
     let soter_allow_mutation = env("OMMEGA_RELAY_SOTER_MUTATION").is_some_and(|v| parse_bool(&v));
+    let soter_probe = parse_probe_target(
+        env("OMMEGA_RELAY_SOTER_PROBE_UID").as_deref(),
+        env("OMMEGA_RELAY_SOTER_PROBE_ALIAS").as_deref(),
+    );
     let server = server.trim_end_matches('/').to_string();
     let cfg = RelayConfig {
         server,
@@ -330,6 +363,7 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         machine_id,
         token,
         soter_allow_mutation,
+        soter_probe,
     };
     cfg.validate()?;
     Ok((cfg, "env"))
@@ -441,8 +475,9 @@ fn http_request(
 
 fn poll_tasks(cfg: &RelayConfig) -> Result<Option<(String, String, Value)>> {
     // 带上本机能力声明：服务端靠它把 SOTER 任务路由到真能做的设备上，状态页也
-    // 显示这两个。只查服务实例在不在，不做 HAL 调用、没有副作用。
-    let caps = ommegaclient_b::caps::report();
+    // 显示这几个。SOTER 那一支会真去签一次（命中缓存时不再碰 HAL），其余只查
+    // 服务实例在不在，没有副作用。
+    let caps = ommegaclient_b::caps::report(cfg.soter_probe.as_ref());
     let url = format!(
         "{}/api/b/poll/?device_id={}&machine_id={}&timeout={}&caps={}",
         cfg.server, cfg.device_id, cfg.machine_id, POLL_TIMEOUT_SEC, caps
@@ -964,6 +999,7 @@ fn main() {
             machine_id: String::new(),
             token: String::new(),
             soter_allow_mutation: false,
+            soter_probe: None,
         });
         log::info!(
             "relay daemon starting (config from {source}) server={} device={} machine={}",
