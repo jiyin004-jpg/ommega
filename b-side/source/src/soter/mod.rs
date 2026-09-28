@@ -36,6 +36,8 @@ pub mod hwbinder;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use hal::{Soter, SoterData};
 
@@ -68,6 +70,76 @@ const KNOWN_OPS: &[&str] = &[
     "remove_auth_key",
 ];
 
+/// 这些 op 要真拿 uid 的密钥材料（问状态、导公钥、签名）——被本设备判过「签不了」
+/// 之后，一律不再由本设备回答。
+const SLOT_DENY_OPS: &[&str] = &[
+    "get_device_id",
+    "export_ask_public_key",
+    "export_auth_key_public_key",
+    "has_ask_already",
+    "has_auth_key",
+    "init_sign",
+    "finish_sign",
+];
+
+/// 这些 op 把槽位的材料换掉了，之前那条「签不了」的记录跟着作废：让本设备重新
+/// 挣一次机会（服务端那边 ASK 重建也会把槽位的层钉清掉，这里对齐）。
+const SLOT_REBUILD_OPS: &[&str] = &[
+    "generate_ask_key_pair",
+    "remove_all_uid_key",
+    "remove_auth_key",
+];
+
+/// 只有签名这两步的结论能说明「这份材料行不行」。
+const SLOT_SIGN_OPS: &[&str] = &["init_sign", "finish_sign"];
+
+/// SOTER_ERROR_VERIFICATION_FAILED。TA 说这份材料验不过 —— 不是「还没建好」。
+const SOTER_VERIFICATION_FAILED: i64 = -26;
+
+/// 记多久。一天：同一天的支付流程都交给后面那层，又不至于把一次偶发的 -26 永久
+/// 钉死；手机重启/重装模块后进程重来，记录自然清空。
+const SLOT_DENY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// uid -> 记下来的时刻。只放内存：AGENTS.md 里说了，要落盘得先问用户。
+static SLOT_DENY: Mutex<Vec<(i32, Instant)>> = Mutex::new(Vec::new());
+
+fn slot_deny_list() -> MutexGuard<'static, Vec<(i32, Instant)>> {
+    // 锁中毒（哪个线程在持锁时 panic 了）不该让后面每个请求都失败：记录本来就是
+    // 个提示，拿到脏数据顶多多问一次 HAL。
+    SLOT_DENY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn slot_denied(uid: i32) -> bool {
+    let now = Instant::now();
+    let mut list = slot_deny_list();
+    list.retain(|(_, at)| now.saturating_duration_since(*at) < SLOT_DENY_TTL);
+    list.iter().any(|(recorded, _)| *recorded == uid)
+}
+
+fn deny_slot(uid: i32) {
+    let now = Instant::now();
+    let mut list = slot_deny_list();
+    list.retain(|(_, at)| now.saturating_duration_since(*at) < SLOT_DENY_TTL);
+    match list.iter_mut().find(|(recorded, _)| *recorded == uid) {
+        Some(slot) => slot.1 = now,
+        None => list.push((uid, now)),
+    }
+}
+
+fn clear_slot_deny(uid: i32) {
+    slot_deny_list().retain(|(recorded, _)| *recorded != uid);
+}
+
+/// -26 落在签名步骤上，就是「这份材料签不了」，重试也不会有别的结果。
+fn is_hard_slot_failure(op: &str, result: &Value) -> bool {
+    if !SLOT_SIGN_OPS.contains(&op) {
+        return false;
+    }
+    result.get("error_code").and_then(Value::as_i64) == Some(SOTER_VERIFICATION_FAILED)
+}
+
 /// Handle one `soter` task payload.
 ///
 /// `allow_mutation` comes from the relay config; it gates the ops that create
@@ -94,9 +166,25 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
         return Ok(probe());
     }
 
+    // 这个 uid 之前已经被 TA 判过「签不了」：别再摸 HAL，直接说这层做不了，服务端
+    // 自然会把它交给后面那层（keybox/mint 那两层照样能把流程走完）。重建槽位的 op
+    // 例外 —— 它们就是来换材料的，顺手把记录清掉。
+    if let Ok(uid) = uid_of(payload) {
+        if SLOT_REBUILD_OPS.contains(&op) {
+            clear_slot_deny(uid);
+        } else if SLOT_DENY_OPS.contains(&op) && slot_denied(uid) {
+            bail!(
+                "soter op '{op}' for uid {uid} is not served by this device: its TEE \
+                 rejected the key material for this slot (SOTER error \
+                 {SOTER_VERIFICATION_FAILED} / VERIFICATION_FAILED), so this layer steps \
+                 aside and the caller's next layer answers instead"
+            );
+        }
+    }
+
     // 参数先取、HAL 后开：请求本身缺参数的话就别去碰 HAL。不然「服务没起」或者
     // SELinux 拦下来这种错误会盖掉「你 uid 没给」这种更该先说的话。
-    match op {
+    let result: Result<Value> = match op {
         "get_device_id" => Ok(data_result(op, open_soter(op)?.get_device_id()?)),
         "export_attk_public_key" => Ok(data_result(op, open_soter(op)?.export_attk_public_key()?)),
         "export_ask_public_key" => {
@@ -166,7 +254,24 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
             ))
         }
         other => bail!("unknown soter op: {other}"),
+    };
+    let result = result?;
+
+    // 签名回 -26：这层把活让出去。回 error 而不是把码原样递上去，服务端就不会把
+    // 这台设备当成「能把活干完的那层」，也就不会把 (device, uid) 槽位钉在这儿；
+    // 不这么改的话，光是把 -26 递上去，槽位照样被钉住，下一轮流程还得从这儿起步。
+    if let Ok(uid) = uid_of(payload) {
+        if is_hard_slot_failure(op, &result) {
+            deny_slot(uid);
+            bail!(
+                "soter op '{op}' for uid {uid} got SOTER error {SOTER_VERIFICATION_FAILED} \
+                 (VERIFICATION_FAILED): this device cannot sign the slot, so this layer \
+                 steps aside and the caller's next layer answers instead"
+            );
+        }
     }
+
+    Ok(result)
 }
 
 /// 打开 SOTER HAL；这台机器没有就明确说没有。
@@ -371,6 +476,73 @@ mod tests {
     fn user_id_must_fit_in_a_byte() {
         assert_eq!(user_id_of(&json!({ "user_id": 1 })).unwrap(), 1);
         assert!(user_id_of(&json!({ "user_id": 300 })).is_err());
+    }
+
+    #[test]
+    fn a_sign_failure_takes_the_slot_off_this_device() {
+        let uid = 900001;
+        assert!(!slot_denied(uid));
+        deny_slot(uid);
+        assert!(slot_denied(uid), "uid {uid} must be remembered");
+        clear_slot_deny(uid);
+        assert!(!slot_denied(uid));
+    }
+
+    #[test]
+    fn only_a_verification_failure_is_a_hard_sign_failure() {
+        assert!(is_hard_slot_failure(
+            "finish_sign",
+            &json!({ "error_code": -26 })
+        ));
+        assert!(is_hard_slot_failure(
+            "init_sign",
+            &json!({ "error_code": -26 })
+        ));
+        // -5/-6 是「还没建」，App 靠它决定要不要建密钥；-7/-9 是会话过期/正在认证，
+        // 都是正常答复，不能让这层退下去。
+        for code in [0, -5, -6, -7, -9, -1000] {
+            assert!(!is_hard_slot_failure(
+                "finish_sign",
+                &json!({ "error_code": code })
+            ));
+        }
+        // 查询类的 -26 不进这条路（host 只对签名步骤的结论负责）。
+        assert!(!is_hard_slot_failure(
+            "has_auth_key",
+            &json!({ "error_code": -26 })
+        ));
+    }
+
+    #[test]
+    fn rebuilding_the_slot_clears_the_verdict() {
+        let uid = 900002;
+        deny_slot(uid);
+        assert!(slot_denied(uid));
+        // handle() 里对这几个 op 先清记录再干活，这里直接对清记录这一步验。
+        clear_slot_deny(uid);
+        assert!(!slot_denied(uid));
+        for op in SLOT_REBUILD_OPS {
+            assert!(
+                MUTATING_OPS.contains(op),
+                "{op} must stay behind the opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denied_slot_is_answered_before_the_hal_is_touched() {
+        let uid = 900003;
+        let payload = json!({ "op": "has_auth_key", "uid": uid, "alias": "whatever" });
+        deny_slot(uid);
+        let err = handle(&payload, true).expect_err("a denied slot must not be answered");
+        let text = format!("{err:#}");
+        assert!(text.contains("not served by this device"), "err: {text}");
+        assert!(
+            !text.contains("no SOTER HAL"),
+            "must bail before opening the HAL: {text}"
+        );
+        clear_slot_deny(uid);
+        assert!(!slot_denied(uid));
     }
 
     #[test]

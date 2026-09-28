@@ -55,6 +55,11 @@ fn soter_usable() -> bool {
     }
     let probe = soter::probe();
     let usable = probe["supported"].as_bool().unwrap_or(false);
+    if !usable {
+        // 探失败的时候把原因写进日志：光看 caps= 是空的，没人知道是 HAL 没注册、
+        // 还是 TA 答了个错误码。
+        log::info!("soter capability probe: not usable ({probe})");
+    }
     *cache = Some((Instant::now(), usable));
     usable
 }
