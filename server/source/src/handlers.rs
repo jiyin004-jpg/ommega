@@ -232,6 +232,35 @@ fn attest_chain_empty(task_type: &str, v: &Value) -> bool {
     }
 }
 
+/// 这一层失败的原因（日志 + 最终返回给 A 端的错误都用它）。
+///
+/// 各层回的东西有两个来源：`error`（B 端跑挂了、任务超时、keybox 层没这个
+/// 设备的身份）和一条空链（跑通了但没链）。以前先看空链 —— 于是 B 端明明回了
+/// `real keymint ... generateKey failed [km_error=-49]`，日志里照样写成
+/// "empty cert chain from B device"，真正的原因全被吞掉：分不清是 HAL 报错、
+/// 超时，还是真交了一条空链。现在 `error` 优先，只有它没给原因才说空链。
+///
+/// 注意跟成功判定分开：那边必须是 `error` 为空 **且** 链非空才算这一层过了，
+/// 这里只管失败时怎么描述。
+fn layer_failure_msg(task_type: &str, layer: &str, v: &Value) -> String {
+    if let Some(e) = v
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return e.to_string();
+    }
+    if attest_chain_empty(task_type, v) {
+        return if layer == "b" {
+            "empty cert chain from B device".to_string()
+        } else {
+            format!("empty cert chain from layer '{layer}'")
+        };
+    }
+    "unknown error".to_string()
+}
+
 /// Layer ② — server keybox (stored identity) local fulfilment.
 /// Synchronous version that takes &Fulfill directly, for use inside spawn_blocking.
 fn try_keybox_layer_sync(
@@ -626,23 +655,10 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                 return Json(v).into_response();
             }
             Some(v) => {
-                // The empty-chain text must name the layer that produced it: the
-                // keybox/self_signed layers return the same shape, so the old
-                // wording ("from B device") sent operators looking at the wrong
-                // side. `device` is the *requested* device — the `b_poll` line
-                // right above shows which device actually served a substitution.
-                let msg = if attest_chain_empty(task_type, &v) {
-                    if layer == "b" {
-                        "empty cert chain from B device".to_string()
-                    } else {
-                        format!("empty cert chain from layer '{layer}'")
-                    }
-                } else {
-                    v.get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                        .to_string()
-                };
+                // 失败原因交给 `layer_failure_msg`：各层回的 `error` 优先，只有它
+                // 没给原因时才说空链。`device` 是 *请求的* 设备 —— 正上方的
+                // `b_poll` 行会显示实际接管的是哪一台。
+                let msg = layer_failure_msg(task_type, layer, &v);
                 tracing::info!(
                     "run_a_side_task: type={task_type} layer={layer} device={device_id} failed: {msg}"
                 );
@@ -671,14 +687,7 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                             );
                             return Json(dv).into_response();
                         }
-                        let dmsg = if attest_chain_empty(task_type, &dv) {
-                            "empty cert chain".to_string()
-                        } else {
-                            dv.get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown error")
-                                .to_string()
-                        };
+                        let dmsg = layer_failure_msg(task_type, layer, &dv);
                         tracing::info!(
                             "run_a_side_task: type={task_type} layer=b strongbox demotion retry failed: {dmsg}"
                         );
@@ -1680,6 +1689,84 @@ mod strongbox_smart_tests {
         assert_eq!(
             chain_attestation_security_level(&json!({ "cert_chain": ["bm90IGRlcg=="] })),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod layer_failure_msg_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 关键回归：B 端回了真实错误、且没交链 —— 报的必须是那个错误本身，
+    /// 不能再被吞成 "empty cert chain from B device"。
+    #[test]
+    fn error_wins_over_missing_chain() {
+        let v = json!({
+            "error": "real keymint android.hardware.security.keymint.IKeyMintDevice/default \
+                      generateKey failed [km_error=-49]: ServiceSpecific"
+        });
+        let msg = layer_failure_msg("attest", "b", &v);
+        assert!(msg.contains("km_error=-49"), "got: {msg}");
+        assert!(!msg.contains("empty cert chain"), "got: {msg}");
+    }
+
+    /// 任务超时也是 `error`，同样不能被说成空链。
+    #[test]
+    fn timeout_error_is_reported() {
+        let v = json!({ "error": "task timeout: no B-side result" });
+        assert_eq!(
+            layer_failure_msg("attest", "b", &v),
+            "task timeout: no B-side result"
+        );
+    }
+
+    /// keybox 层“没这个设备的身份”也该说人话地透出来。
+    #[test]
+    fn layer_error_is_reported() {
+        let v = json!({ "error": "no stored identity for device-b-xxxx" });
+        assert_eq!(
+            layer_failure_msg("attest", "keybox", &v),
+            "no stored identity for device-b-xxxx"
+        );
+    }
+
+    /// 真的只给了空链（没有 error）时才说空链，并且要指明是哪一层。
+    #[test]
+    fn empty_chain_is_reported_per_layer() {
+        let v = json!({ "cert_chain": [] });
+        assert_eq!(
+            layer_failure_msg("attest", "b", &v),
+            "empty cert chain from B device"
+        );
+        assert_eq!(
+            layer_failure_msg("attest", "keybox", &v),
+            "empty cert chain from layer 'keybox'"
+        );
+        // 链字段干脆没有，对 attest 来说同样是空链。
+        assert_eq!(
+            layer_failure_msg("attest", "b", &json!({})),
+            "empty cert chain from B device"
+        );
+    }
+
+    /// sign/decrypt 不涉及链：没 error 就是 unknown error，不会被说成空链。
+    #[test]
+    fn non_attest_without_error_is_unknown() {
+        assert_eq!(layer_failure_msg("sign", "b", &json!({})), "unknown error");
+        assert_eq!(
+            layer_failure_msg("decrypt", "b", &json!({})),
+            "unknown error"
+        );
+    }
+
+    /// 空白 error 不算“给了原因”，退回空链判定。
+    #[test]
+    fn blank_error_is_not_a_reason() {
+        let v = json!({ "error": "   ", "cert_chain": [] });
+        assert_eq!(
+            layer_failure_msg("attest", "b", &v),
+            "empty cert chain from B device"
         );
     }
 }
