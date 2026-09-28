@@ -13,10 +13,13 @@
 //!   `finish_sign` both answered 0).  This is the only honest way to claim it:
 //!   the TA signs only inside a fresh fingerprint match, so on a headless
 //!   device the answer is `-26` and there is nothing to advertise.
-//! - `soter_nosign` — the OPPOSITE, stated out loud: this device has the HAL
-//!   but cannot sign unattended.  Without it a device that can never sign looks
-//!   exactly like an old relay that never said anything, and the server pays a
-//!   wasted round trip (task → `-26` → next layer) on every single flow.
+//! - `soter_nosign` — the OPPOSITE, stated out loud, and only on evidence:
+//!   several real sign ops in a row came back `-26` (the TA wants a fresh
+//!   fingerprint and nobody is there to press).  Anything we merely could not
+//!   measure (no slot to try, no material, one refused probe) reports nothing
+//!   extra — claiming `soter_nosign` there would make the server route sign ops
+//!   away from a device that can sign perfectly well (a phone whose owner is
+//!   simply not touching it right now).
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,9 +30,9 @@ use crate::soter;
 /// Which key slot to try a real signature on: `relay.conf` carries
 /// `OMMEGA_RELAY_SOTER_PROBE_UID` / `OMMEGA_RELAY_SOTER_PROBE_ALIAS`.
 ///
-/// No target configured means no material to try — and then the honest answer is
-/// "cannot sign", not a guess.  The probe only ever uses keys that are already
-/// there; creating them is a mutation and needs the operator's opt-in.
+/// 没配也不等于签不了：那只是「手上还没有能试的槽位」，这时候什么都不上报（只报
+/// `soter`），服务端照旧会试着派活；等这台机器真跑过一次 `init_sign`，槽位会被
+/// 记下来当探针目标，下一次心跳就能量出结论。探针只用现成材料，**不建不删**。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignProbeTarget {
     pub uid: i32,
@@ -51,11 +54,17 @@ pub fn report(sign_target: Option<&SignProbeTarget>) -> String {
         caps.push("soter");
         // HAL 肯答话只够说明身份/导出能用。签名那一步骗不了人：一加 11
         // （PHB110）、MIX 4 这些机器的 TA 只在「刚匹配过指纹」时才肯签，没人
-        // 按指纹时 `finish_sign` 一律回 -26。所以「能签」得探出来，不能猜。
-        if soter_sign_usable(sign_target) {
-            caps.push("soter_sign");
-        } else {
-            caps.push("soter_nosign");
+        // 按指纹时 `finish_sign` 一律回 -26。所以「能签」得真签出来一次才算。
+        //
+        // 探针目标优先听配置的；没配就退到这台机器真跑过一次 `init_sign` 的那个
+        // 槽位 —— 探针只为了挣正面结论（真签出来过），量不出来就什么都不说。
+        probe_sign_capability(sign_target.cloned().or_else(learned_target).as_ref());
+        // 「行」和「不行」都只认实测：行 = 真签出来过；不行 = 连续几次真派下来
+        // 的签名 op 全被 -26 顶回来（没人按指纹）。没量出来就只报 `soter`。
+        match soter::sign_state() {
+            soter::SignState::Proven => caps.push("soter_sign"),
+            soter::SignState::Refused => caps.push("soter_nosign"),
+            soter::SignState::Unknown => {}
         }
     }
     if strongbox_present() {
@@ -64,15 +73,20 @@ pub fn report(sign_target: Option<&SignProbeTarget>) -> String {
     caps.join(",")
 }
 
+fn learned_target() -> Option<SignProbeTarget> {
+    let (uid, alias) = soter::learned_probe_target()?;
+    Some(SignProbeTarget { uid, alias })
+}
+
 /// How long a probed verdict is trusted before probing again.
 const SOTER_PROBE_TTL: Duration = Duration::from_secs(300);
 
 /// Last verdict as `(when, usable)`; `None` means never probed.
 static SOTER_VERDICT: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
-/// Last sign verdict as `(when, target, usable)`.  The target is part of the
-/// key so a config change (another uid/alias to try) re-probes immediately.
-static SOTER_SIGN_VERDICT: Mutex<Option<(Instant, SignProbeTarget, bool)>> = Mutex::new(None);
+/// 上一次签名探针的时间和目标，用来限流（探一次要开 HAL、走一遍 TA，心跳
+/// 20 秒一次扛不住）。
+static SIGN_PROBED_AT: Mutex<Option<(Instant, Option<SignProbeTarget>)>> = Mutex::new(None);
 
 /// 光看 HAL 注册没注册不够 —— 得让它真的答一次。
 ///
@@ -101,34 +115,38 @@ fn soter_usable() -> bool {
     usable
 }
 
-/// 真去签一次，签得动才算。缓存跟 `soter_usable` 一个路子：探一次要开 HAL、
-/// 走一遍 TA，心跳 20 秒一次扛不住；失败也缓存（TA 那边「没有新鲜指纹」这种
-/// 状态不会自己好，指纹按下去的时候服务端本来也会重新走流程）。
-fn soter_sign_usable(target: Option<&SignProbeTarget>) -> bool {
-    let Some(target) = target else {
-        // 没配探针目标：手上没有现成的槽位可试。
-        return false;
-    };
-    let mut cache = SOTER_SIGN_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, cached, usable)) = cache.as_ref() {
-        if cached == target && at.elapsed() < SOTER_PROBE_TTL {
-            return *usable;
+/// 探针只能挣到正面结论（真签出来过），永远不能拿它去下「签不了」的断言。
+///
+/// 探针撞上「指纹窗口关着」会回 -26，但同一台机器指纹刚按过的时候是签得出来
+/// 的（PLC110 上实测过）。拿一次 -26 当证据报 `soter_nosign`，服务端就会把一台
+/// 明明能签的机器从签名链路上踢掉 —— 比不报还糟。「签不了」只认别的证据：连续
+/// 几次真派下来的签名 op 都被 -26 顶回来（见 `soter::sign_state`）。
+fn probe_sign_capability(target: Option<&SignProbeTarget>) {
+    let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, cached)) = cache.as_ref() {
+        // 已经挣到结论就不用再探了；另外同一个目标 5 分钟内也不重复探。
+        if soter::sign_state() != soter::SignState::Unknown
+            || (cached.as_ref() == target && at.elapsed() < SOTER_PROBE_TTL)
+        {
+            return;
         }
     }
-    let probe = soter::sign_probe(target.uid, &target.alias);
-    let usable = sign_capability(true, probe["signed"].as_bool().unwrap_or(false));
-    if !usable {
-        // 探不出能签就把原因写进日志：光看 caps 里没有 `soter_sign`，谁也不知道
-        // 是槽位上没材料、还是 TA 非要指纹。
-        log::info!("soter sign capability probe: not usable ({probe})");
+    match target {
+        Some(target) => {
+            let probe = soter::sign_probe(target.uid, &target.alias);
+            let verdict = soter::SignVerdict::from_probe(&probe);
+            if verdict != soter::SignVerdict::Signed {
+                // 探不出能签就把原因写进日志：光看 caps 里没有 `soter_sign`，谁也
+                // 不知道是槽位上没材料、还是 TA 非要指纹。
+                log::info!("soter sign capability probe: {verdict} ({probe})");
+            }
+        }
+        None => {
+            // 手上没有能试的槽位：什么都不说，等服务端派活或者学到一个槽位。
+            log::debug!("soter sign capability probe: no slot to try yet");
+        }
     }
-    *cache = Some((Instant::now(), target.clone(), usable));
-    usable
-}
-
-/// 只按「配没配探针目标」和「探针结论」算能不能签 —— 不含设备，主机上也能测。
-fn sign_capability(target_configured: bool, probe_passed: bool) -> bool {
-    target_configured && probe_passed
+    *cache = Some((Instant::now(), target.cloned()));
 }
 
 /// StrongBox is a second instance of the KeyMint HAL, so its presence is a
@@ -140,17 +158,21 @@ fn strongbox_present() -> bool {
 #[cfg(all(test, target_os = "android"))]
 mod tests {
     use super::*;
+    use crate::soter::SignVerdict;
 
-    /// 只按「配没配探针目标」和「探针结论」算能不能签 —— 纯函数，不碰设备。
-    ///
-    /// 没探针目标（没配、或槽位上没材料）就不许声称能签 —— 这正是那台一加 11
-    /// 的处境：HAL 好端端的，签名那步永远回 -26。
+    /// 探针只用现成槽位试签，量不出结论（没目标 / 没材料 / 要新鲜指纹 / HAL 没
+    /// 答话）时什么都不说。说「签不了」的活不归探针管：那要看连续几次真派下来
+    /// 的签名 op 是不是全被 -26 顶回来（`soter::sign_state`）。
     #[test]
-    fn signing_is_never_claimed_without_a_passing_probe() {
-        assert!(!sign_capability(false, false));
-        assert!(!sign_capability(false, true));
-        assert!(!sign_capability(true, false));
-        assert!(sign_capability(true, true));
+    fn a_probe_never_publishes_a_negative_verdict() {
+        for verdict in [
+            SignVerdict::BiometricRequired,
+            SignVerdict::NoMaterial,
+            SignVerdict::Unavailable,
+            SignVerdict::Unknown,
+        ] {
+            assert_ne!(verdict, SignVerdict::Signed, "{verdict:?} 不该当成签出来过");
+        }
     }
 
     /// 探针目标带 uid + alias，比的是整体（uid 或 alias 换一个都得重新探）。
@@ -200,19 +222,17 @@ mod tests {
         assert_eq!(first, second, "cached verdict changed between two polls");
     }
 
-    /// 没有探针目标（默认配置）时不许报 `soter_sign`：有 HAL 就该报
-    /// `soter_nosign`，报告里说的跟这台机器真干得了的事一致。
+    /// 没有探针目标（默认配置、也还没学过槽位）时既不许报 `soter_sign`，也不许报
+    /// `soter_nosign`：有 HAL 就只说 `soter`，剩下的交给服务端去试。
     #[test]
-    fn no_probe_target_means_no_sign_claim() {
+    fn no_probe_target_means_no_probe_claim() {
         crate::init_binder();
         let caps = report(None);
         let names: Vec<&str> = caps.split(',').filter(|s| !s.is_empty()).collect();
         assert!(!names.contains(&"soter_sign"), "没有探针目标还报了能签: {caps:?}");
-        if names.contains(&"soter") {
-            assert!(
-                names.contains(&"soter_nosign"),
-                "SOTER 能答话但不该声称能签: {caps:?}"
-            );
-        }
+        assert!(
+            !names.contains(&"soter_nosign"),
+            "没有探针目标就报签不了，会把能签的机器误伤: {caps:?}"
+        );
     }
 }

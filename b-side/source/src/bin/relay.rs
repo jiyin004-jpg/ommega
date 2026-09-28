@@ -153,9 +153,9 @@ struct RelayConfig {
     /// default: those ops change the real payment-key state.
     soter_allow_mutation: bool,
     /// Slot to try a real signature on when reporting the `soter_sign`
-    /// capability.  Without it the relay says `soter_nosign` out loud: a
-    /// headless device cannot prove it can sign, and guessing would send it
-    /// every SOTER sign op just to fail with `-26`.
+    /// capability.  Optional: without it the relay reports only `soter` until it
+    /// has learnt a slot from real traffic, and never claims `soter_nosign` on
+    /// evidence it does not have.
     soter_probe: Option<ommegaclient_b::caps::SignProbeTarget>,
 }
 
@@ -196,7 +196,7 @@ fn parse_bool(v: &str) -> bool {
 }
 
 /// 签名探针目标：uid 和 alias 都给全了才认 —— 只有 uid 时不知道该拿哪个槽位
-/// 去签。缺一个就当没配：照旧报能答话，但报签不了。
+/// 去签。缺一个就当没配：只报能答话，不报能签也不报签不了。
 fn parse_probe_target(
     uid: Option<&str>,
     alias: Option<&str>,

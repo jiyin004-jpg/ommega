@@ -96,6 +96,78 @@ const SLOT_SIGN_OPS: &[&str] = &["init_sign", "finish_sign"];
 /// SOTER_ERROR_VERIFICATION_FAILED。TA 说这份材料验不过 —— 不是「还没建好」。
 const SOTER_VERIFICATION_FAILED: i64 = -26;
 
+/// SOTER_ASK_NOT_READY / SOTER_AUTH_KEY_NOT_READY：这个槽位上还没有对应材料。
+const SOTER_ASK_NOT_READY: i64 = -5;
+const SOTER_AUTH_KEY_NOT_READY: i64 = -6;
+
+/// SOTER 结构性不可用：没开（-12）、ATTK 没配（-13）、安全通道不通（-18）、
+/// TA 拿不到（-20）。这些是「这台现在真做不了」，跟「这次没签成」不是一回事。
+const SOTER_NOT_ENABLED: i64 = -12;
+const SOTER_ATTK_NOT_PROVISIONED: i64 = -13;
+const SOTER_SECURE_HW_FAILED: i64 = -18;
+const SOTER_TA_UNAVAILABLE: i64 = -20;
+
+/// 能力探针量出来的结论。
+///
+/// 只有 [`SignVerdict::Unavailable`] 算「这台现在签不了」的硬证据（SOTER 没开、
+/// ATTK 没配、安全通道不通这类结构性毛病）。`-26` 不算：那是「这一刻没人按指纹」，
+/// 不是「这台签不了」—— 自己人的手机上量到过同一台设备指纹窗口开着时签得出来、
+/// 关着时回 -26。把 -26 当成签不了上报，服务端会把一台明明能签的机器从签名链路
+/// 上踢掉（之前那个假阴性就是这么来的）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignVerdict {
+    /// 真签出来了一次。
+    Signed,
+    /// 槽位有料，TA 说必须刚匹配过指纹（-26）：这次没签成，但这台能不能签还得再看。
+    BiometricRequired,
+    /// 这个槽位上没材料（-5 / -6），探不出签名能力。
+    NoMaterial,
+    /// SOTER 本身不可用（没开 / ATTK 没配 / 安全通道不通 / host 拿不到 TA）。
+    Unavailable,
+    /// HAL 没答话、答了个没见过的码、或者压根没目标可探。
+    Unknown,
+}
+
+impl SignVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignVerdict::Signed => "signed",
+            SignVerdict::BiometricRequired => "biometric_required",
+            SignVerdict::NoMaterial => "no_material",
+            SignVerdict::Unavailable => "unavailable",
+            SignVerdict::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_probe(probe: &Value) -> Self {
+        match probe.get("verdict").and_then(Value::as_str) {
+            Some("signed") => SignVerdict::Signed,
+            Some("biometric_required") => SignVerdict::BiometricRequired,
+            Some("no_material") => SignVerdict::NoMaterial,
+            Some("unavailable") => SignVerdict::Unavailable,
+            _ => SignVerdict::Unknown,
+        }
+    }
+
+    /// `init_sign` / `finish_sign` 回的那个码说明什么。
+    fn from_code(code: i64) -> Self {
+        match code {
+            0 => SignVerdict::Signed,
+            SOTER_VERIFICATION_FAILED => SignVerdict::BiometricRequired,
+            SOTER_ASK_NOT_READY | SOTER_AUTH_KEY_NOT_READY => SignVerdict::NoMaterial,
+            SOTER_NOT_ENABLED | SOTER_ATTK_NOT_PROVISIONED | SOTER_SECURE_HW_FAILED
+            | SOTER_TA_UNAVAILABLE => SignVerdict::Unavailable,
+            _ => SignVerdict::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for SignVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 记多久。一天：同一天的支付流程都交给后面那层，又不至于把一次偶发的 -26 永久
 /// 钉死；手机重启/重装模块后进程重来，记录自然清空。
 const SLOT_DENY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -130,6 +202,122 @@ fn deny_slot(uid: i32) {
 
 fn clear_slot_deny(uid: i32) {
     slot_deny_list().retain(|(recorded, _)| *recorded != uid);
+}
+
+/// 最近一次「真拿这个槽位发起了签名」的 (uid, alias)，给能力探针当目标用。
+///
+/// 只放内存：要落盘得先问用户，而重启后重新学一次就够了 —— 没上报能力的设备
+/// 服务端照样会派活。
+static LEARNED_PROBE_TARGET: Mutex<Option<(i32, String)>> = Mutex::new(None);
+
+/// 探针要试的那个槽位；没配 OMMEGA_RELAY_SOTER_PROBE_* 的时候就用这里学到的。
+pub fn learned_probe_target() -> Option<(i32, String)> {
+    LEARNED_PROBE_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// 连续几次真派下来的签名 op 都被 -26 顶回来（TA 说“没有新鲜指纹”），就认这台
+/// 不接签名。只用**真活**计数，不用探针：探针撞上指纹窗口关着只是「这次没量
+/// 出来」，拿它当证据会把一台明明能签的机器踢出签名链路（PLC110 上真踩过）。
+const SIGN_REFUSAL_LIMIT: u32 = 3;
+
+/// 这台机器签名到底行不行。三个值对应上报给服务端的三件事。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignState {
+    /// 真签出来过（真实 op 或探针）：报 `soter_sign`。
+    Proven,
+    /// 连续几次真签名 op 都被 -26 顶回来：报 `soter_nosign`，服务端不再把签名
+    /// op 派过来。材料重建后会清掉，重新学。
+    Refused,
+    /// 还没量出来：什么都不报，服务端照旧会试。
+    Unknown,
+}
+
+static SIGN_STATE: Mutex<SignState> = Mutex::new(SignState::Unknown);
+/// 连续 -26 次数（碰上一次成功就清零）。
+static SIGN_REFUSALS: Mutex<u32> = Mutex::new(0);
+
+pub fn sign_state() -> SignState {
+    *SIGN_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn mark_sign_proven() {
+    let mut state = SIGN_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *state != SignState::Proven {
+        log::info!("soter: signed once, this device can sign (keeping the verdict)");
+        *state = SignState::Proven;
+    }
+    *SIGN_REFUSALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+}
+
+/// 一个真签名 op 的结果。`-26` 累加，够了就改口说签不了；成功就把之前那条
+/// 否定的结论推翻（真签出来过比什么都硬）。
+fn note_sign_result(error_code: i64) {
+    if error_code == 0 {
+        mark_sign_proven();
+        return;
+    }
+    if error_code != SOTER_VERIFICATION_FAILED {
+        return;
+    }
+    // 已经签出来过的机器，不会因为「这会儿没人按指纹」被改口 —— 它明明能签，
+    // 服务端该继续把签名 op 派过来，人回来按一下就成。
+    if sign_state() == SignState::Proven {
+        return;
+    }
+    let mut refusals = SIGN_REFUSALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *refusals += 1;
+    let count = *refusals;
+    drop(refusals);
+    if count < SIGN_REFUSAL_LIMIT {
+        return;
+    }
+    let mut state = SIGN_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *state != SignState::Refused {
+        log::warn!(
+            "soter: {count} sign ops in a row came back -26 (no fresh fingerprint); \
+             reporting this device as unable to sign"
+        );
+        *state = SignState::Refused;
+    }
+}
+
+/// 槽位被重建 / 删掉：之前那条结论跟着作废（材料换了，能不能签得重新量）。
+pub fn clear_sign_state() {
+    let mut state = SIGN_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *state = SignState::Unknown;
+    *SIGN_REFUSALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
+}
+
+/// `init_sign` 回了 0 说明这个槽位真有材料，记下来给探针用（探针只用现成材料，
+/// 不建不删）。没这一步，没配探针目标的机器只能一直“量不出来”。
+fn remember_probe_target(uid: i32, alias: &str) {
+    if alias.is_empty() {
+        return;
+    }
+    let mut slot = LEARNED_PROBE_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.as_ref().map(|(u, a)| (*u, a.as_str())) != Some((uid, alias)) {
+        log::info!("soter: slot uid={uid} alias={alias} can be signed on, using it for the sign probe");
+        *slot = Some((uid, alias.to_string()));
+    }
 }
 
 /// -26 落在签名步骤上，就是「这份材料签不了」，重试也不会有别的结果。
@@ -172,6 +360,8 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
     if let Ok(uid) = uid_of(payload) {
         if SLOT_REBUILD_OPS.contains(&op) {
             clear_slot_deny(uid);
+            // 材料换了，“之前能签/签不了”这话就得重新量。
+            clear_sign_state();
         } else if SLOT_DENY_OPS.contains(&op) && slot_denied(uid) {
             bail!(
                 "soter op '{op}' for uid {uid} is not served by this device: its TEE \
@@ -200,7 +390,11 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
         }
         "finish_sign" => {
             let session = session_of(payload)?;
-            Ok(data_result(op, open_soter(op)?.finish_sign(session)?))
+            let data = open_soter(op)?.finish_sign(session)?;
+            // 真替上层签出来就是一整条链路的成功证据；回 -26 就是「没人按指纹」的
+            // 一次实测，都交给同一个判定函数累。
+            note_sign_result(data.error_code as i64);
+            Ok(data_result(op, data))
         }
         "init_sign" => {
             let (uid, alias, challenge) = (
@@ -209,6 +403,14 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
                 string_arg(payload, "challenge")?,
             );
             let session = open_soter(op)?.init_sign(uid, &alias, &challenge)?;
+            if session.error_code == 0 {
+                // 只是建了会话，还没签出东西来：能签的证据不在这；不过槽位记住了，
+                // 探针以后可以拿它去试签。
+                remember_probe_target(uid, &alias);
+            } else {
+                // TA 连会话都不给建（-26 = 要新鲜指纹）：也是一次实测。
+                note_sign_result(session.error_code as i64);
+            }
             Ok(json!({
                 "op": op,
                 "error_code": session.error_code,
@@ -221,7 +423,13 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
         }
         "has_auth_key" => {
             let (uid, alias) = (uid_of(payload)?, alias_of(payload)?);
-            Ok(code_result(op, open_soter(op)?.has_auth_key(uid, &alias)?))
+            let result = code_result(op, open_soter(op)?.has_auth_key(uid, &alias)?);
+            // 0 = 这个槽位有材料。除了 init_sign，从这里也能学到一个能拿去试签的
+            // 槽位 —— 学到的机会多一点，能力上报就能早点变准。
+            if result.get("error_code").and_then(Value::as_i64) == Some(0) {
+                remember_probe_target(uid, &alias);
+            }
+            Ok(result)
         }
         "verify_attk_key_pair" => Ok(code_result(op, open_soter(op)?.verify_attk_key_pair()?)),
         "generate_ask_key_pair" => {
@@ -295,10 +503,11 @@ const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
 /// `finish_sign` 一律回 -26（TA 给的原话就是「没有新鲜指纹」）。所以「能不能签」
 /// 只能靠真签一次来量，别猜。
 ///
-/// 只用槽位上现成的材料，不建不删（改设备密钥状态得先问操作者）：没配探针目标，
-/// 或者目标槽位上根本没材料（-5 / -6）时，结论都是「签不了」——比默默声称能签诚实，
-/// 服务端也就不会把注定失败的签名任务派过来。
+/// 只用槽位上现成的材料，不建不删（改设备密钥状态得先问操作者）：槽位上没材料
+/// （-5 / -6）时结论是「没量出来」，不是「签不了」。这点很要紧 —— 把量不出来
+/// 当成签不了上报，服务端会把一台其实能签的机器从签名链路上踢掉。
 ///
+/// 结论写在 `verdict` 里（见 [`SignVerdict`]），`signed` 只为看日志方便。
 /// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
 pub fn sign_probe(uid: i32, alias: &str) -> Value {
     let mut out = json!({ "op": "sign_probe", "uid": uid, "alias": alias });
@@ -306,10 +515,14 @@ pub fn sign_probe(uid: i32, alias: &str) -> Value {
         Ok(Some(soter)) => soter,
         Ok(None) => {
             out["error"] = json!("this device has no SOTER HAL");
+            out["verdict"] = json!(SignVerdict::Unknown.as_str());
+            out["signed"] = json!(false);
             return out;
         }
         Err(e) => {
             out["error"] = json!(format!("{e:#}"));
+            out["verdict"] = json!(SignVerdict::Unknown.as_str());
+            out["signed"] = json!(false);
             return out;
         }
     };
@@ -317,21 +530,34 @@ pub fn sign_probe(uid: i32, alias: &str) -> Value {
         Ok(session) => session,
         Err(e) => {
             out["error"] = json!(format!("{e:#}"));
+            out["verdict"] = json!(SignVerdict::Unknown.as_str());
+            out["signed"] = json!(false);
             return out;
         }
     };
     out["init_sign"] = json!(session.error_code);
     if session.error_code != 0 {
-        // -5 / -6：槽位上没有 ASK / AuthKey，探不出签名能力。
+        // -5 / -6：槽位上没有 ASK / AuthKey。-26：TA 连签名会话都不给建。
+        let verdict = SignVerdict::from_code(session.error_code as i64);
+        out["verdict"] = json!(verdict.as_str());
         out["signed"] = json!(false);
         return out;
     }
     match soter.finish_sign(session.session) {
         Ok(data) => {
             out["finish_sign"] = json!(data.error_code);
+            let verdict = SignVerdict::from_code(data.error_code as i64);
+            if verdict == SignVerdict::Signed {
+                mark_sign_proven();
+            }
+            out["verdict"] = json!(verdict.as_str());
             out["signed"] = json!(data.error_code == 0);
         }
-        Err(e) => out["error"] = json!(format!("{e:#}")),
+        Err(e) => {
+            out["error"] = json!(format!("{e:#}"));
+            out["verdict"] = json!(SignVerdict::Unknown.as_str());
+            out["signed"] = json!(false);
+        }
     }
     out
 }
@@ -562,6 +788,41 @@ mod tests {
             "has_auth_key",
             &json!({ "error_code": -26 })
         ));
+    }
+
+    /// 签出来过一次就咬死；之后 -26 再多也不翻。反过来，连续几次真活都回 -26
+    /// 才会改口说签不了，而且再来一次成功就推翻。
+    #[test]
+    fn a_signature_is_proof_and_three_refusals_are_the_opposite() {
+        clear_sign_state();
+        assert_eq!(sign_state(), SignState::Unknown);
+
+        // 两次 -26 还不够：等指纹按下去的时候同台机器是签得出来的。
+        note_sign_result(-26);
+        note_sign_result(-26);
+        assert_eq!(sign_state(), SignState::Unknown);
+
+        // 第三次真活又被顶回来：这台就不接签名了。
+        note_sign_result(-26);
+        assert_eq!(sign_state(), SignState::Refused);
+
+        // 真签出来一次比什么都硬，否定结论直接丢。
+        note_sign_result(0);
+        assert_eq!(sign_state(), SignState::Proven);
+
+        // 已经证明能签了，后面几次 -26（指纹窗口关着）不该把结论抽回去。
+        for _ in 0..5 {
+            note_sign_result(-26);
+        }
+        assert_eq!(sign_state(), SignState::Proven);
+
+        // 只有别的错误码（没建好 / 会话过期）不算数。
+        clear_sign_state();
+        for code in [-5, -6, -7, -9, -1000] {
+            note_sign_result(code);
+        }
+        assert_eq!(sign_state(), SignState::Unknown);
+        clear_sign_state();
     }
 
     #[test]
