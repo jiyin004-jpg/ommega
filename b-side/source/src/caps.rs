@@ -206,7 +206,10 @@ mod tests {
         }
         for name in caps.split(',') {
             assert!(
-                name == "soter" || name == "soter_sign" || name == "soter_nosign" || name == "strongbox",
+                name == "soter"
+                    || name == "soter_sign"
+                    || name == "soter_nosign"
+                    || name == "strongbox",
                 "unexpected capability {name:?} in {caps:?}"
             );
         }
@@ -229,7 +232,10 @@ mod tests {
         crate::init_binder();
         let caps = report(None);
         let names: Vec<&str> = caps.split(',').filter(|s| !s.is_empty()).collect();
-        assert!(!names.contains(&"soter_sign"), "没有探针目标还报了能签: {caps:?}");
+        assert!(
+            !names.contains(&"soter_sign"),
+            "没有探针目标还报了能签: {caps:?}"
+        );
         assert!(
             !names.contains(&"soter_nosign"),
             "没有探针目标就报签不了，会把能签的机器误伤: {caps:?}"

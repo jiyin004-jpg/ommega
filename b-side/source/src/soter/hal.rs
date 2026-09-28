@@ -200,8 +200,14 @@ pub struct Soter {
 /// 两种形态各存各的：AIDL 那套靠 rsbinder 进程级的 proxy 缓存，HIDL 那套自己
 /// 拿着 `/dev/hwbinder` 的连接和句柄。上层不用管区别。
 enum Inner {
-    Aidl { binder: SIBinder, backend: Backend },
-    Hidl { proxy: hidl::HidlSoter, backend: Backend },
+    Aidl {
+        binder: SIBinder,
+        backend: Backend,
+    },
+    Hidl {
+        proxy: hidl::HidlSoter,
+        backend: Backend,
+    },
 }
 
 impl Soter {
@@ -302,7 +308,10 @@ impl Soter {
         match &self.inner {
             Inner::Aidl { binder, .. } => Ok(binder),
             Inner::Hidl { backend, .. } => {
-                bail!("{} is a HIDL backend and has no AIDL proxy", backend.label())
+                bail!(
+                    "{} is a HIDL backend and has no AIDL proxy",
+                    backend.label()
+                )
             }
         }
     }

@@ -25,7 +25,9 @@ use anyhow::{bail, Context, Result};
 
 use super::hal::{SoterData, SoterSession};
 use super::hwbinder::{HwBinder, Parcel, Reply};
-use super::hwbinder::{BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE};
+use super::hwbinder::{
+    BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE,
+};
 
 /// HIDL 的服务全名。注意 instance 是单独一个参数，不在这个名字里。
 pub const HIDL_QTI_FQNAME: &str = "vendor.qti.hardware.soter@1.0::ISoter";
@@ -91,7 +93,11 @@ impl HidlSoter {
     }
 
     /// 指定 fqName / instance / 之后用来写 interface token 的描述符。
-    pub fn open_named(fq_name: &str, instance: &str, descriptor: &'static str) -> Result<Option<Self>> {
+    pub fn open_named(
+        fq_name: &str,
+        instance: &str,
+        descriptor: &'static str,
+    ) -> Result<Option<Self>> {
         // 没有 /dev/hwbinder 就是这台设备根本不跑 HIDL，直接说没有。
         let conn = match HwBinder::open() {
             Ok(conn) => conn,
@@ -302,10 +308,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .at
-            .checked_add(n)
-            .context("reply cursor overflow")?;
+        let end = self.at.checked_add(n).context("reply cursor overflow")?;
         if end > self.reply.data.len() {
             bail!(
                 "reply truncated: want {n} bytes at {}, only {} available",
@@ -442,7 +445,10 @@ impl<'a> Cursor<'a> {
         // 可能就在自己进程里（passthrough / 同进程 HAL）。
         if !matches!(
             mark,
-            BINDER_TYPE_HANDLE | BINDER_TYPE_BINDER | BINDER_TYPE_WEAK_HANDLE | BINDER_TYPE_WEAK_BINDER
+            BINDER_TYPE_HANDLE
+                | BINDER_TYPE_BINDER
+                | BINDER_TYPE_WEAK_HANDLE
+                | BINDER_TYPE_WEAK_BINDER
         ) {
             bail!("unexpected binder object type {mark:#x} in an interface reply");
         }
@@ -562,8 +568,16 @@ mod tests {
             &1u32.to_le_bytes(),
             "HAS_PARENT"
         );
-        assert_eq!(&data[second + 16..second + 24], &4u64.to_le_bytes(), "abc + NUL");
-        assert_eq!(&data[second + 24..second + 32], &0u64.to_le_bytes(), "parent index");
+        assert_eq!(
+            &data[second + 16..second + 24],
+            &4u64.to_le_bytes(),
+            "abc + NUL"
+        );
+        assert_eq!(
+            &data[second + 24..second + 32],
+            &0u64.to_le_bytes(),
+            "parent index"
+        );
         assert_eq!(p.offsets(), &[0u64, 40u64]);
     }
 
@@ -580,7 +594,11 @@ mod tests {
         assert_eq!(u64::from_le_bytes(raw) as usize, chars_addr);
         let mut size_raw = [0u8; 4];
         size_raw.copy_from_slice(&head[8..12]);
-        assert_eq!(u32::from_le_bytes(size_raw), 5, "mSize is the string length, not +1");
+        assert_eq!(
+            u32::from_le_bytes(size_raw),
+            5,
+            "mSize is the string length, not +1"
+        );
     }
 
     #[test]
@@ -591,7 +609,11 @@ mod tests {
         assert_eq!(p.offsets().len(), 1, "a null buffer is not registered");
         let data = p.data();
         assert_eq!(&data[40..44], &0x7074_2A85u32.to_le_bytes());
-        assert_eq!(&data[44..48], &0u32.to_le_bytes(), "the placeholder has no flags");
+        assert_eq!(
+            &data[44..48],
+            &0u32.to_le_bytes(),
+            "the placeholder has no flags"
+        );
         assert_eq!(&data[48..56], &0u64.to_le_bytes(), "and no buffer");
     }
 

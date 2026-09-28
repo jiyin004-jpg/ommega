@@ -337,11 +337,7 @@ impl Parcel {
         // SAFETY: 刚挂上去的块地址有效、可写，长度就是 HIDL_STRUCT_SIZE。
         unsafe {
             let head = self.last_block_mut();
-            std::ptr::copy_nonoverlapping(
-                (char_addr as u64).to_le_bytes().as_ptr(),
-                head,
-                8,
-            );
+            std::ptr::copy_nonoverlapping((char_addr as u64).to_le_bytes().as_ptr(), head, 8);
             std::ptr::copy_nonoverlapping(
                 (value.len() as u32).to_le_bytes().as_ptr(),
                 head.add(8),
@@ -564,7 +560,11 @@ impl HwBinder {
             .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("hwbinder 连接锁中毒"))?;
-        if self.acquired.lock().map_or(false, |held| held.contains(&handle)) {
+        if self
+            .acquired
+            .lock()
+            .map_or(false, |held| held.contains(&handle))
+        {
             return Ok(());
         }
         send_u32_command(self.fd.as_raw_fd(), BC_ACQUIRE, handle)
@@ -595,7 +595,8 @@ impl HwBinder {
             sender_euid: 0,
             data_size: parcel.data().len() as BinderSize,
             // 内核这里是字节数，不是元素个数。
-            offsets_size: (parcel.offsets().len() * std::mem::size_of::<BinderSize>()) as BinderSize,
+            offsets_size: (parcel.offsets().len() * std::mem::size_of::<BinderSize>())
+                as BinderSize,
             data_buffer: parcel.data().as_ptr() as u64,
             data_offsets: if parcel.offsets().is_empty() {
                 0
@@ -654,9 +655,8 @@ impl HwBinder {
 
         // read_buffer 是内核写进来的命令流，长度是 read_consumed。
         // SAFETY: 内核保证 read_consumed <= read_size，也就是 <= inbox.len()。
-        let reply_bytes = unsafe {
-            std::slice::from_raw_parts(inbox.as_ptr(), wwr.read_consumed as usize)
-        };
+        let reply_bytes =
+            unsafe { std::slice::from_raw_parts(inbox.as_ptr(), wwr.read_consumed as usize) };
         self.parse_commands(reply_bytes, code)
     }
 
@@ -672,7 +672,11 @@ impl HwBinder {
             }
             let nr = cmd_nr(cmd);
             match cmd {
-                BR_NOOP | BR_OK | BR_TRANSACTION_COMPLETE | BR_SPAWN_LOOPER | BR_FINISHED
+                BR_NOOP
+                | BR_OK
+                | BR_TRANSACTION_COMPLETE
+                | BR_SPAWN_LOOPER
+                | BR_FINISHED
                 | BR_ONEWAY_SPAM_SUSPECT => {}
                 BR_DEAD_REPLY => bail!("binder target died while handling code {code}"),
                 BR_FAILED_REPLY => bail!("binder failed to deliver code {code} (bad handle?)"),
@@ -928,7 +932,12 @@ unsafe fn libc_munmap(addr: *mut c_void, length: usize) {
 /// 用不上，但留着是为了以后要收异步事务时不用再翻一遍 uapi。
 #[allow(dead_code)]
 fn _keep_alive() {
-    let _ = (BC_ENTER_LOOPER, BC_EXIT_LOOPER, BINDER_TYPE_HANDLE, TF_ONE_WAY);
+    let _ = (
+        BC_ENTER_LOOPER,
+        BC_EXIT_LOOPER,
+        BINDER_TYPE_HANDLE,
+        TF_ONE_WAY,
+    );
 }
 
 #[cfg(test)]
@@ -987,7 +996,11 @@ mod tests {
         let mut p = Parcel::new();
         p.write_i32(0); // 让对象不在 0 偏移上，顺便验证下标记的是字节位置
         p.write_buffer_object(0x1234_5678, 16, 0, 0, 0, true);
-        assert_eq!(p.data().len(), 4 + 40, "one buffer object is 40 bytes at 64-bit");
+        assert_eq!(
+            p.data().len(),
+            4 + 40,
+            "one buffer object is 40 bytes at 64-bit"
+        );
         assert_eq!(p.offsets(), &[4u64]);
         // type / flags / buffer / length / parent / parent_offset
         assert_eq!(&p.data()[4..8], &BINDER_TYPE_PTR.to_le_bytes());

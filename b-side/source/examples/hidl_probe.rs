@@ -15,8 +15,8 @@
 
 use anyhow::Result;
 
-use ommegaclient_b::soter::hwbinder::{HwBinder, Parcel};
 use ommegaclient_b::soter::hidl::{HidlSoter, HW_SERVICE_MANAGER_DESCRIPTOR};
+use ommegaclient_b::soter::hwbinder::{HwBinder, Parcel};
 
 /// `android.hidl.base@1.0::IBase` 的 `ping()`，无参无返。
 const TX_IBASE_PING: u32 = 6;
@@ -96,7 +96,10 @@ fn main() -> Result<()> {
     // 句柄号只在收到它的那条 `/dev/hwbinder` 上有意义（每开一次就是内核里一个新
     // `binder_proc`），所以必须走 `svc` 自己的连接，不能借 `conn`。
     match svc.call_on_own_connection(IBASE_DESCRIPTOR, TX_IBASE_PING) {
-        Ok(r) => println!("   ✓ 句柄 {handle} 的 ping 通了，应答 {} 字节", r.data.len()),
+        Ok(r) => println!(
+            "   ✓ 句柄 {handle} 的 ping 通了，应答 {} 字节",
+            r.data.len()
+        ),
         Err(e) => println!("   ✗ 句柄 {handle} 的 ping 挂了：{e:#}"),
     }
     println!("== 5b. 反面教材：把同一个句柄号拿到另一条连接上（预期 BR_FAILED_REPLY）==");
@@ -131,7 +134,10 @@ fn main() -> Result<()> {
                         let mut q = Parcel::new();
                         q.write_interface_token(IBASE_DESCRIPTOR);
                         match conn.transact(h, TX_IBASE_PING, &q) {
-                            Ok(p) => println!("   ✓ 用它自己返回的句柄 {h} ping 通了，应答 {} 字节", p.data.len()),
+                            Ok(p) => println!(
+                                "   ✓ 用它自己返回的句柄 {h} ping 通了，应答 {} 字节",
+                                p.data.len()
+                            ),
                             Err(e) => println!("   ✗ 句柄 {h} ping 挂了：{e:#}"),
                         }
                     }

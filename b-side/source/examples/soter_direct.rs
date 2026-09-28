@@ -25,7 +25,9 @@ fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10503);
     // 第二个参数是 alias：换 uid 时得跟着换，比如设备本地 App 自己用的那份。
-    let alias = std::env::args().nth(2).unwrap_or_else(|| DEFAULT_ALIAS.to_string());
+    let alias = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| DEFAULT_ALIAS.to_string());
     // 第三个参数是模式：`gen` 先现造一份材料再看能不能签，`rm` 收尾把这个 uid 的钥匙清掉。
     let mode = std::env::args().nth(3).unwrap_or_default();
 
@@ -33,7 +35,10 @@ fn main() -> Result<()> {
         println!("[direct] uid={uid}: no SOTER service on this device");
         return Ok(());
     };
-    println!("[direct] uid={uid} alias={alias} mode={}", if mode.is_empty() { "probe" } else { &mode });
+    println!(
+        "[direct] uid={uid} alias={alias} mode={}",
+        if mode.is_empty() { "probe" } else { &mode }
+    );
 
     if mode == "gen" {
         let ask = soter.generate_ask_key_pair(uid)?;
@@ -69,7 +74,10 @@ fn main() -> Result<()> {
             signed.data.len()
         );
         if signed.data.len() > 24 {
-            let head: Vec<String> = signed.data[..24].iter().map(|b| format!("{b:02x}")).collect();
+            let head: Vec<String> = signed.data[..24]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             println!("[direct]   head: {}", head.join(" "));
         }
     } else {
