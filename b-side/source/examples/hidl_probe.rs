@@ -91,20 +91,22 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("== 5. 用 handle 1 发 IBase::ping() ==");
+    println!("== 5. 用刚拿到的句柄 {handle} 发 IBase::ping() ==");
     println!("   本进程 pid = {}", std::process::id());
-    {
+    // 句柄号只在收到它的那条 `/dev/hwbinder` 上有意义（每开一次就是内核里一个新
+    // `binder_proc`），所以必须走 `svc` 自己的连接，不能借 `conn`。
+    match svc.call_on_own_connection(IBASE_DESCRIPTOR, TX_IBASE_PING) {
+        Ok(r) => println!("   ✓ 句柄 {handle} 的 ping 通了，应答 {} 字节", r.data.len()),
+        Err(e) => println!("   ✗ 句柄 {handle} 的 ping 挂了：{e:#}"),
+    }
+    println!("== 5b. 反面教材：把同一个句柄号拿到另一条连接上（预期 BR_FAILED_REPLY）==");
+    match HwBinder::open().and_then(|other| {
         let mut p = Parcel::new();
         p.write_interface_token(IBASE_DESCRIPTOR);
-        match conn.transact(1, TX_IBASE_PING, &p) {
-            Ok(r) => println!("   ✓ handle 1 的 ping 通了，应答 {} 字节", r.data.len()),
-            Err(e) => println!("   ✗ handle 1 的 ping 挂了：{e:#}"),
-        }
-    }
-    println!("== 5b. 换成 svc 自己的连接再试同一个句柄 ==");
-    match svc.call(TX_IBASE_PING, |_| {}) {
-        Ok(r) => println!("   ✓ svc 的 ping 通了，应答 {} 字节", r.data.len()),
-        Err(e) => println!("   ✗ svc 的 ping 挂了：{e:#}"),
+        other.transact(handle, TX_IBASE_PING, &p)
+    }) {
+        Ok(r) => println!("   ? 另一条连接也通了，应答 {} 字节", r.data.len()),
+        Err(e) => println!("   ✓ 如预期挂了（句柄是 per-proc 的）：{e:#}"),
     }
 
     // 顺手把 hwservicemanager 自己列一遍，证明同一套编码对 1.0 的 manager 也成立。

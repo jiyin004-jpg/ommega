@@ -124,9 +124,23 @@ impl HidlSoter {
         1
     }
 
-    /// 拿到的服务句柄，探针要拿它去发别的接口的事务。
+    /// 拿到的服务句柄。
+    ///
+    /// **只能在 `self` 自己的连接上使**（见 [`Self::call_on_own_connection`]）。
+    /// 句柄号是 per-`binder_proc` 的：每开一次 `/dev/hwbinder` 就是内核里一个新
+    /// proc，换条连接这个号就作废，内核会回 `BR_FAILED_REPLY`。
     pub fn handle(&self) -> u32 {
         self.handle
+    }
+
+    /// 用本代理自己的连接和句柄发一笔别的事务（探针拿它问 `IBase::ping`）。
+    ///
+    /// 这个入口存在的意义就是不给「把句柄借到别的连接上发」留口子：内核按
+    /// 发送方 proc 的 refs 表翻句柄，句柄只有在收到它的那条连接上才算数。
+    pub fn call_on_own_connection(&self, descriptor: &str, code: u32) -> Result<Reply> {
+        let mut parcel = Parcel::new();
+        parcel.write_interface_token(descriptor);
+        self.conn.transact(self.handle, code, &parcel)
     }
 
     /// 发一笔先把 interface token 写好的事务。
@@ -390,10 +404,29 @@ impl<'a> Cursor<'a> {
     /// `interface T` 在 parcel 里是一个 `hidl_binder`：非 null 就是 `flat_binder_object`，
     /// null 就是单个 i32 的 0。返回句柄（`BINDER_TYPE_HANDLE` 那格，远程对象的情形）。
     fn binder_handle(&mut self) -> Result<Option<u32>> {
+        let object_at = self.at;
+
+        // 内核把应答里每个对象的字节位置记在偏移表里。有表就得对得上：对不上说明
+        // 「Status 之后紧跟对象」这个假设在这条回包上不成立，硬读出来的只可能是别的
+        // 字段里的一串字节。拿它当句柄使，下一笔事务就是 `BR_FAILED_REPLY`（内核：
+        // 这个 proc 里没有这个 ref）。所以宁可报错，也不交出一个来路不明的句柄。
+        if !self.reply.offsets.is_empty() && !self.reply.offsets.contains(&(object_at as u64)) {
+            bail!(
+                "reply object at {object_at} is outside the kernel's offset table {:?}",
+                self.reply.offsets
+            );
+        }
+
         // 先判 null 的情形：parcel 里只有 4 个字节的 0。
         let mark = self.u32()?;
         if mark == 0 {
             return Ok(None);
+        }
+        if object_at + 24 > self.reply.data.len() {
+            bail!(
+                "truncated reply binder object at {object_at}: only {} bytes left",
+                self.reply.data.len() - object_at
+            );
         }
         // 非 null：这一格其实是 `flat_binder_object` 的 type，接着是 flags，再往后
         // 是 `binder` / `handle` 那格和 cookie。本地对象和远程句柄都接受 —— 服务
@@ -405,12 +438,17 @@ impl<'a> Cursor<'a> {
             bail!("unexpected binder object type {mark:#x} in an interface reply");
         }
         let _flags = self.u32()?;
-        let handle = self.abi_usize()?;
-        let _cookie = self.abi_usize()?;
+        // `union { binder_uintptr_t binder; __u32 handle; }` —— uapi 里 HANDLE 那格
+        // 就是 `__u32`，后面 4 个字节按 ABI 属于 union 的另一半（实际是 `cookie` 的
+        // 头半截）。读 8 字节再截断只在对方把 cookie 后半填成 0 时才碰巧对，读 4 字节
+        // 才是照着结构来。
+        let handle = self.u32()?;
+        let _union_upper = self.u32()?;
+        let _cookie = self.u64()?;
         if handle == 0 {
             return Ok(None);
         }
-        Ok(Some(handle as u32))
+        Ok(Some(handle))
     }
 }
 
@@ -449,6 +487,15 @@ mod tests {
         push_buffer_object(&mut out, 0, 0, 0, 0);
         out.extend_from_slice(&0u32.to_le_bytes()); // length
         out
+    }
+
+    /// 造一个 `flat_binder_object`：`type / flags / union(8) / cookie(8)`，共 24 字节。
+    fn push_binder_object(out: &mut Vec<u8>, handle: u32, ty: u32) {
+        out.extend_from_slice(&ty.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&handle.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
     }
 
     fn push_buffer_object(out: &mut Vec<u8>, buffer: u64, length: u64, flags: u32, parent: u64) {
@@ -603,6 +650,50 @@ mod tests {
         assert_eq!(buffer, 0, "an empty vector has a null element object");
         assert_eq!(length, 0);
         assert_eq!(cur.u32().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_handle_object_yields_the_uapi_u32_descriptor() {
+        let mut data = 0i32.to_le_bytes().to_vec(); // Status
+        push_binder_object(&mut data, 7, BINDER_TYPE_HANDLE);
+        let reply = Reply {
+            data,
+            offsets: vec![4],
+        };
+        let mut cur = Cursor::new(&reply);
+        assert!(cur.status().is_ok());
+        assert_eq!(cur.binder_handle().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn an_object_off_the_kernel_offset_table_is_refused() {
+        // 假如回包在 Status 和对象之间还有一格（内核的偏移表会说对象在 8），我们按
+        // `[Status][object]` 算出来的 4 就对不上表 —— 硬读出来的那串字节不是句柄。
+        let mut data = 0i32.to_le_bytes().to_vec();
+        data.extend_from_slice(&7i32.to_le_bytes());
+        push_binder_object(&mut data, 1, BINDER_TYPE_HANDLE);
+        let reply = Reply {
+            data,
+            offsets: vec![8],
+        };
+        let mut cur = Cursor::new(&reply);
+        assert!(cur.status().is_ok());
+        let err = cur.binder_handle().unwrap_err().to_string();
+        assert!(err.contains("offset table"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_binder_object_is_an_error_not_a_panic() {
+        // Status 后面只剩半截对象。
+        let mut data = 0i32.to_le_bytes().to_vec();
+        data.extend_from_slice(&BINDER_TYPE_HANDLE.to_le_bytes());
+        let reply = Reply {
+            data,
+            offsets: vec![4],
+        };
+        let mut cur = Cursor::new(&reply);
+        assert!(cur.status().is_ok());
+        assert!(cur.binder_handle().is_err());
     }
 
     #[test]

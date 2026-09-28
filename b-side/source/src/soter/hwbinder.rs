@@ -438,6 +438,12 @@ pub struct HwBinder {
     map_len: usize,
     /// 整条连接上只能有一轮「发命令 → 收应答」在跑，不然会串包。
     gate: Mutex<()>,
+    /// 上一轮收下、还没交回内核的应答 buffer。
+    ///
+    /// 不在 `collect_reply` 里当场 `BC_FREE_BUFFER`：应答里 buffer 对象指向的数据
+    /// 体就躺在这块 buffer 里，调用方还要拿它拼 `hidl_string` / `hidl_vec`。AOSP 的
+    /// libbinder 也是把释放挂在 `Parcel` 的析构上，而不是收到就交回。
+    pending_free: Mutex<Vec<BinderSize>>,
 }
 
 // SAFETY: fd 和 mmap 都是进程级资源，只要不在没有同步的前提下并发收发就安全；
@@ -500,6 +506,7 @@ impl HwBinder {
             map: map as *mut u8,
             map_len,
             gate: Mutex::new(()),
+            pending_free: Mutex::new(Vec::new()),
         })
     }
 
@@ -533,6 +540,8 @@ impl HwBinder {
             .gate
             .lock()
             .map_err(|_| anyhow::anyhow!("hwbinder 连接锁中毒"))?;
+        // 上一轮收下的应答 buffer 这时候才交回：它的数据体调用方已经读完了。
+        self.flush_pending_free();
         let mut tr = BinderTransactionData {
             target: handle as u64,
             cookie: 0,
@@ -590,6 +599,15 @@ impl HwBinder {
             let err = io::Error::last_os_error();
             return Err(err).with_context(|| format!("BINDER_WRITE_READ for code {code} failed"));
         }
+        if wwr.write_consumed != wwr.write_size {
+            // 内核没把命令流吃完，说明这笔事务没能完整交出去。此时读侧通常只有一条
+            // `BR_FAILED_REPLY`，跟「对端收到但答不出来」是两回事，别混在一起。
+            bail!(
+                "binder consumed only {} of {} command bytes for code {code}",
+                wwr.write_consumed,
+                wwr.write_size
+            );
+        }
 
         // read_buffer 是内核写进来的命令流，长度是 read_consumed。
         // SAFETY: 内核保证 read_consumed <= read_size，也就是 <= inbox.len()。
@@ -599,7 +617,7 @@ impl HwBinder {
         self.parse_commands(reply_bytes, code)
     }
 
-    /// 走一遍应答里的命令流，挑出 `BR_REPLY`；顺手把要释放的 buffer 还回内核。
+    /// 走一遍应答里的命令流，挑出 `BR_REPLY`；应答 buffer 交给 `pending_free` 推迟释放。
     fn parse_commands(&self, bytes: &[u8], code: u32) -> Result<Reply> {
         let mut at = 0usize;
         let mut reply: Option<Reply> = None;
@@ -667,7 +685,16 @@ impl HwBinder {
         reply.ok_or_else(|| anyhow::anyhow!("no BR_REPLY for code {code} in the binder stream"))
     }
 
-    /// 把内核放进 mmap 区的应答 parcel 拷出来，然后把这块 buffer 交回去。
+    /// 把上一轮攒下的应答 buffer 一次性交回内核（多条 `BC_FREE_BUFFER` 串在一个写流里）。
+    fn flush_pending_free(&self) {
+        let ptrs: Vec<BinderSize> = match self.pending_free.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(_) => return,
+        };
+        free_reply_buffers(self.fd.as_raw_fd(), &ptrs);
+    }
+
+    /// 把内核放进 mmap 区的应答 parcel 拷出来（buffer 本体留给 [`Self::flush_pending_free`]）。
     fn collect_reply(&self, tr: &BinderTransactionData) -> Result<Reply> {
         let size = tr.data_size as usize;
         let offsets_size = tr.offsets_size as usize;
@@ -702,27 +729,11 @@ impl HwBinder {
             .to_vec();
         }
 
-        // 交回 buffer，不然内核那块一直占着。
+        // 记下这块 buffer，等着下一轮事务（或连接析构）再交回内核 —— 现在还不能
+        // 放：应答里 buffer 对象指向的数据体就在这块里，调用方还没读。
         if data_ptr != 0 {
-            let mut cmd = Vec::with_capacity(4 + 8);
-            cmd.extend_from_slice(&BC_FREE_BUFFER.to_le_bytes());
-            cmd.extend_from_slice(&(data_ptr as BinderSize).to_le_bytes());
-            let mut wwr = BinderWriteRead {
-                write_size: cmd.len() as BinderSize,
-                write_consumed: 0,
-                write_buffer: cmd.as_ptr() as BinderSize,
-                read_size: 0,
-                read_consumed: 0,
-                read_buffer: 0,
-            };
-            // SAFETY: cmd 活到 ioctl 返回。失败了也只是泄漏一块内核 buffer，不影响
-            // 已经拷出来的应答，所以只记日志。
-            let rc = unsafe { libc_ioctl_wwr(self.fd.as_raw_fd(), &mut wwr) };
-            if rc != 0 {
-                log::warn!(
-                    "BC_FREE_BUFFER for {data_ptr:#x} failed: {}",
-                    io::Error::last_os_error()
-                );
+            if let Ok(mut pending) = self.pending_free.lock() {
+                pending.push(data_ptr as BinderSize);
             }
         }
 
@@ -732,6 +743,12 @@ impl HwBinder {
 
 impl Drop for HwBinder {
     fn drop(&mut self) {
+        // 尽力把还没交回的应答 buffer 还掉。fd 一关内核也会回收它们，所以失败不管。
+        let ptrs: Vec<BinderSize> = match self.pending_free.get_mut() {
+            Ok(pending) => std::mem::take(pending),
+            Err(_) => Vec::new(),
+        };
+        free_reply_buffers(self.fd.as_raw_fd(), &ptrs);
         if !self.map.is_null() {
             // SAFETY: map 是 open 时 mmap 出来、还没解映射的。
             unsafe {
@@ -743,6 +760,37 @@ impl Drop for HwBinder {
 
 /// AOSP 的 `ProcessState` 默认 1MB；relay 的事务都很小，够用。
 const DEFAULT_MAP_LEN: usize = 1024 * 1024;
+
+/// 若干块 `BC_FREE_BUFFER` 命令串成一条写流。空表就是空流（什么也不发）。
+fn free_buffer_commands(ptrs: &[BinderSize]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ptrs.len() * (4 + std::mem::size_of::<BinderSize>()));
+    for &ptr in ptrs {
+        out.extend_from_slice(&BC_FREE_BUFFER.to_le_bytes());
+        out.extend_from_slice(&ptr.to_le_bytes());
+    }
+    out
+}
+
+/// 把应答 buffer 交回内核。失败只是滞后释放，不影响已经拷出来的应答。
+fn free_reply_buffers(fd: i32, ptrs: &[BinderSize]) {
+    if ptrs.is_empty() {
+        return;
+    }
+    let cmd = free_buffer_commands(ptrs);
+    let mut wwr = BinderWriteRead {
+        write_size: cmd.len() as BinderSize,
+        write_buffer: cmd.as_ptr() as BinderSize,
+        ..BinderWriteRead::default()
+    };
+    // SAFETY: cmd 活到这次调用返回；只写不读，read_size 是 0。
+    let rc = unsafe { libc_ioctl_wwr(fd, &mut wwr) };
+    if rc != 0 {
+        log::warn!(
+            "BC_FREE_BUFFER({ptrs:?}) failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // libc 摘要 —— B 端只在这里需要几个符号，不值得为它引一个 libc 依赖。
@@ -873,6 +921,17 @@ mod tests {
         assert_eq!(&p.data()[8..12], &0u32.to_le_bytes());
         assert_eq!(&p.data()[12..20], &0x1234_5678u64.to_le_bytes());
         assert_eq!(&p.data()[20..28], &16u64.to_le_bytes());
+    }
+
+    #[test]
+    fn free_buffer_commands_carry_the_cmd_and_the_pointer() {
+        let cmd = free_buffer_commands(&[0x1000, 0x2000]);
+        assert_eq!(cmd.len(), 2 * (4 + 8));
+        assert_eq!(&cmd[0..4], &BC_FREE_BUFFER.to_le_bytes());
+        assert_eq!(&cmd[4..12], &0x1000u64.to_le_bytes());
+        assert_eq!(&cmd[12..16], &BC_FREE_BUFFER.to_le_bytes());
+        assert_eq!(&cmd[16..24], &0x2000u64.to_le_bytes());
+        assert!(free_buffer_commands(&[]).is_empty());
     }
 
     #[test]
