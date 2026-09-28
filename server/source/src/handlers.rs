@@ -932,16 +932,76 @@ async fn try_b_soter_layer(state: &AppState, body: &Value, requested: &str) -> O
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
         );
     }
-    Some(
-        enqueue_and_wait(
-            state,
-            "soter",
-            body,
-            &target,
-            state.cfg.soter_wait_result_timeout_secs,
-        )
-        .await,
+    let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+    let reply = enqueue_and_wait(
+        state,
+        "soter",
+        body,
+        &target,
+        state.cfg.soter_wait_result_timeout_secs,
     )
+    .await;
+    if let Some(code) = soter_device_hard_failure(op, &reply) {
+        return Some(json!({
+            "error": format!(
+                "B-side device {target} failed SOTER op '{op}' with error_code {code} ({})",
+                soter_error_name(code)
+            ),
+        }));
+    }
+    Some(reply)
+}
+
+/// 设备层答复里的 `error_code` 非 0 时，算不算“这轮流程做不成了”。
+///
+/// 设备层的答复是 B 端 relay 把 SOTER HAL 的结果原样带回来的，`error_code` 是腾讯
+/// 那套 `SoterErrorCode`（TEE 那边给的）。查询类 op（`has_*` / `export_*`）的负码是
+/// “这东西还没建”的正常回答，App 就是靠它决定要不要 generate，必须原样递上去 ——
+/// 当成失败会让槽位在两层之间来回跳，App 手里就会出现一半 B 一半 keybox 的材料。
+///
+/// 建和签这几类不一样：`generate_*` / `init_sign` / `finish_sign` 一失败，这轮流程
+/// 就死在这台设备上了。这种答复再往上递，App 只会白报一次失败；更要命的是
+/// `run_soter_task` 会把答复当成“这层做成了”，顺手把 `(device, uid)` 槽位钉在这台
+/// 设备上（30 分钟，而下一轮流程的 *第一个 op* 又会把它续上）—— 于是这轮之后每轮
+/// 都还来问它，永远好不了。实测一加 11（PHB110）上 WeChat 的 `finish_sign` 一直是
+/// `-26 SOTER_ERROR_VERIFICATION_FAILED`，就是被这么钉死的。这类失败要明说成
+/// “这层没做成”，让服务端那两层接上，钉子也跟着挪过去。
+fn soter_device_hard_failure(op: &str, reply: &Value) -> Option<i64> {
+    let code = reply.get("error_code").and_then(Value::as_i64)?;
+    if code == 0 {
+        return None;
+    }
+    matches!(
+        op,
+        "get_device_id"
+            | "generate_ask_key_pair"
+            | "generate_auth_key_pair"
+            | "init_sign"
+            | "finish_sign"
+    )
+    .then_some(code)
+}
+
+/// SOTER 错误码的名字（腾讯 `SoterErrorCode`），只为日志好读。只列跟换层判断有关的。
+fn soter_error_name(code: i64) -> &'static str {
+    match code {
+        0 => "SOTER_ERROR_OK",
+        -5 => "SOTER_ERROR_ASK_NOT_READY",
+        -6 => "SOTER_ERROR_AUTH_KEY_NOT_READY",
+        -7 => "SOTER_ERROR_SESSION_OUT_OF_TIME",
+        -8 => "SOTER_ERROR_NO_AUTH_KEY_MATCHED",
+        -9 => "SOTER_ERROR_IS_AUTHING",
+        -12 => "SOTER_ERROR_SOTER_NOT_ENABLED",
+        -13 => "SOTER_ERROR_ATTK_NOT_PROVISIONED",
+        -20 => "SOTER_ERROR_ATTK_ALREADY_PROVISIONED",
+        -25 => "SOTER_ERROR_INVALID_KEY_BLOB",
+        -26 => "SOTER_ERROR_VERIFICATION_FAILED",
+        -29 => "SOTER_ERROR_UNEXPECTED_NULL_POINTER",
+        -201 => "SOTER_ERROR_UID_NULL",
+        -204 => "SOTER_ERROR_OPERATEID_NULL",
+        -1000 => "SOTER_ERROR_UNKNOWN_ERROR",
+        _ => "unknown SOTER error",
+    }
 }
 
 /// 服务端那两层：`keybox` 层得先从库里把这台设备名下的服务端身份私钥拿出来
@@ -1341,6 +1401,73 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
         b64,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod soter_device_layer_tests {
+    use super::{soter_device_hard_failure, soter_error_name};
+    use serde_json::json;
+
+    #[test]
+    fn a_device_sign_failure_is_a_layer_failure() {
+        // 实测一加 11：会话是真的（编解码没问题），TEE 就是不给签。
+        assert_eq!(
+            soter_device_hard_failure("finish_sign", &json!({ "error_code": -26 })),
+            Some(-26)
+        );
+        assert_eq!(
+            soter_device_hard_failure("init_sign", &json!({ "error_code": -6 })),
+            Some(-6)
+        );
+        assert_eq!(
+            soter_device_hard_failure("generate_auth_key_pair", &json!({ "error_code": -13 })),
+            Some(-13)
+        );
+        assert_eq!(
+            soter_device_hard_failure("get_device_id", &json!({ "error_code": -1000 })),
+            Some(-1000)
+        );
+    }
+
+    #[test]
+    fn a_lookup_answer_stays_an_answer() {
+        // “还没建”是 App 要看的正常回答，不能当失败。
+        for op in [
+            "has_ask_already",
+            "has_auth_key",
+            "export_ask_public_key",
+            "export_auth_key_public_key",
+            "remove_auth_key",
+            "remove_all_uid_key",
+        ] {
+            assert_eq!(
+                soter_device_hard_failure(op, &json!({ "error_code": -5 })),
+                None,
+                "{op}"
+            );
+            assert_eq!(
+                soter_device_hard_failure(op, &json!({ "error_code": -6 })),
+                None,
+                "{op}"
+            );
+        }
+        // 成功、以及 relay 自己报的失败（没有 error_code），都轮不到这条判断。
+        assert_eq!(
+            soter_device_hard_failure("finish_sign", &json!({ "error_code": 0 })),
+            None
+        );
+        assert_eq!(
+            soter_device_hard_failure("finish_sign", &json!({ "error": "task timeout" })),
+            None
+        );
+    }
+
+    #[test]
+    fn known_codes_are_named_for_the_log() {
+        assert_eq!(soter_error_name(-26), "SOTER_ERROR_VERIFICATION_FAILED");
+        assert_eq!(soter_error_name(-8), "SOTER_ERROR_NO_AUTH_KEY_MATCHED");
+        assert_eq!(soter_error_name(-3), "unknown SOTER error");
+    }
 }
 
 #[cfg(test)]
