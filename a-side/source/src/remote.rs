@@ -24,14 +24,14 @@
 //! `tls_insecure` (default true) accepts any server certificate — matching the
 //! B-side client behaviour.
 //!
-//! Two long-lived reqwest clients (insecure / verify) are kept in `OnceLock`s
-//! and selected per request based on the current `tls_insecure` config value.
+//! A reqwest client is kept in a process-wide slot and handed out per request;
+//! it is rebuilt only when `tls_insecure` or the outgoing interface changes.
 //! Each client has its own internal connection pool, so concurrent requests
-//! are not serialised through a single Mutex — fixing the previous single-
+//! are not serialised through a single connection — fixing the previous single-
 //! connection pool bottleneck.  reqwest also natively supports chunked transfer
 //! encoding and HTTP keep-alive, both of which the hand-written client did not.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -50,38 +50,255 @@ pub struct RemoteRelay;
 
 // ── reqwest client management ──────────────────────────────────────────
 
-/// Returns a reqwest blocking client configured for the current `tls_insecure`
-/// setting.  Two clients (insecure / verify) are lazily initialised and cached
-/// in `OnceLock`s — each carries its own connection pool, so flipping
-/// `tls_insecure` at runtime just picks the other pool.
-fn get_client() -> Result<Client> {
-    let insecure = config::config()
-        .read()
-        .map(|c| c.remote.tls_insecure)
-        .unwrap_or(true);
-
-    if insecure {
-        static INSECURE_CLIENT: OnceLock<Client> = OnceLock::new();
-        Ok(INSECURE_CLIENT.get_or_init(|| build_client(true)).clone())
-    } else {
-        static VERIFY_CLIENT: OnceLock<Client> = OnceLock::new();
-        Ok(VERIFY_CLIENT.get_or_init(|| build_client(false)).clone())
-    }
+/// A cached client together with the inputs it was built from.
+///
+/// The interface is part of the identity because it follows VPN state: pinning
+/// it in a `OnceLock` the way `tls_insecure` used to be pinned would freeze
+/// whatever was decided the first time a request went out.
+struct CachedClient {
+    insecure: bool,
+    iface: Option<String>,
+    client: Client,
 }
 
-fn build_client(insecure: bool) -> Client {
+/// The connection pool.  Rebuilt only when `tls_insecure` or the chosen
+/// interface changes; otherwise the same client (and its pool) is reused.
+static CLIENT_CACHE: Mutex<Option<CachedClient>> = Mutex::new(None);
+
+/// Returns a reqwest blocking client for the current `tls_insecure` setting and
+/// the interface traffic should leave from.
+fn get_client() -> Result<Client> {
+    let (insecure, iface) = {
+        let guard = config::config()
+            .read()
+            .map_err(|_| anyhow!("config lock poisoned"))?;
+        (guard.remote.tls_insecure, desired_iface(&guard.remote))
+    };
+
+    let mut slot = CLIENT_CACHE
+        .lock()
+        .map_err(|_| anyhow!("client cache lock poisoned"))?;
+
+    if let Some(cached) = slot.as_ref() {
+        if cached.insecure == insecure && cached.iface == iface {
+            return Ok(cached.client.clone());
+        }
+    }
+
+    if let Some(name) = iface.as_deref() {
+        log::info!("relay traffic bound to interface {name}");
+    }
+    let client = build_client(insecure, iface.as_deref());
+    *slot = Some(CachedClient {
+        insecure,
+        iface,
+        client,
+    });
+
+    Ok(slot
+        .as_ref()
+        .expect("client was just stored")
+        .client
+        .clone())
+}
+
+fn build_client(insecure: bool, iface: Option<&str>) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .timeout(Duration::from_millis(READ_TIMEOUT_MS))
+        // This client only ever talks to our own relay server.  The environment
+        // proxies reqwest picks up by default exist for tools that browse the
+        // open internet; on a forwarding path they only redirect the request
+        // somewhere it does not belong.
+        .no_proxy()
         .user_agent("ommegaclient-a/1.3");
 
     if insecure {
         builder = builder.danger_accept_invalid_certs(true);
     }
 
+    if let Some(name) = iface {
+        // `SO_BINDTODEVICE`: pin the socket to a physical uplink so the routing
+        // rules that steer traffic into a VPN tunnel do not capture it.
+        builder = builder.interface(name);
+    }
+
     builder
         .build()
         .expect("failed to build reqwest blocking client")
+}
+
+// ── outgoing interface selection ───────────────────────────────────────
+
+/// What the `bind_iface` config value means.
+#[derive(Debug, PartialEq, Eq)]
+enum BindChoice {
+    /// `none` / `off` — never bind.
+    Never,
+    /// Empty or `auto` (the default) — bind only while a VPN is up.
+    Auto,
+    /// `always` / `on` — always bind to a physical uplink.
+    Always,
+    /// A literal interface name, used as given.
+    Named(String),
+}
+
+fn classify_bind_iface(raw: &str) -> BindChoice {
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+        BindChoice::Never
+    } else if v.eq_ignore_ascii_case("always") || v.eq_ignore_ascii_case("on") {
+        BindChoice::Always
+    } else if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+        BindChoice::Auto
+    } else {
+        BindChoice::Named(v.to_string())
+    }
+}
+
+const SYS_CLASS_NET: &str = "/sys/class/net";
+
+/// Decides which interface (if any) this request should leave from.
+///
+/// Why bind at all: with a VPN up, the OS steers ordinary traffic into the
+/// tunnel — netd points the connection's fwmark at the VPN network and the
+/// default route ends up on `tun`.  Traffic to our own relay server gets caught
+/// by the same rules, so it goes through the tunnel too: slower, jittery, and in
+/// the bad cases simply unreachable.  The only way to keep a socket out of that
+/// is to name its outgoing device (`SO_BINDTODEVICE`, which is what reqwest's
+/// `.interface()` sets).
+///
+/// Why `auto` binds only when a VPN is present: pinning one interface would also
+/// throw away the OS's own "WiFi dropped, fall back to cellular" switching,
+/// which is pure downside when there is no VPN to avoid.  Deployments that want
+/// a fixed interface can name it explicitly.
+fn desired_iface(cfg: &config::RemoteConfig) -> Option<String> {
+    match classify_bind_iface(&cfg.bind_iface) {
+        BindChoice::Never => None,
+        BindChoice::Always => pick_uplink_iface(),
+        BindChoice::Auto if vpn_active() => pick_uplink_iface(),
+        BindChoice::Auto => None,
+        // An explicit name is taken at face value: whether it exists or works is
+        // the kernel's call, not ours.
+        BindChoice::Named(name) => Some(name),
+    }
+}
+
+/// Whether a VPN is currently up.  `VpnService` always leaves a `tun` device in
+/// `/sys/class/net` and the older pptp/l2tp paths leave a `ppp`; the names are
+/// always `tun0` / `ppp0` shaped, so a prefix check is enough.
+fn vpn_active() -> bool {
+    let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("tun") || n.starts_with("ppp") || n.starts_with("tap"))
+    })
+}
+
+/// Picks a physical uplink interface.
+///
+/// Measured on a Z60 Ultra (Android 16), two traps: `dummy0` and `lo` both
+/// report `operstate=unknown` with `carrier=1`, indistinguishable from a real
+/// NIC by state alone, so virtual devices have to be excluded by name; and the
+/// cellular `rmnet_data*` interfaces also report `unknown` (they have no real
+/// link-layer state), so testing for `up` alone would skip them.
+///
+/// That is still not enough: `rmnet_data0/1` sit at `operstate=unknown` with no
+/// IP address most of the time, and binding to one of those means binding to a
+/// device with no route.  `/proc/net/route` lists exactly the interfaces that
+/// currently hold an IPv4 address (two rows on the device above: `wlan0` and
+/// `rmnet_data3`), which makes it a precise cross-filter.
+fn pick_uplink_iface() -> Option<String> {
+    let with_ip = ifaces_with_ipv4();
+    if with_ip.is_empty() {
+        return None;
+    }
+
+    let entries = std::fs::read_dir(SYS_CLASS_NET).ok()?;
+    let mut best: Option<(u8, String)> = None;
+    for e in entries.flatten() {
+        let entry_name = e.file_name();
+        let Some(name) = entry_name.to_str() else {
+            continue;
+        };
+        if is_virtual_iface(name) || !with_ip.iter().any(|n| n == name) {
+            continue;
+        }
+        let state = std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/operstate"))
+            .unwrap_or_default();
+        let state = state.trim();
+        if state != "up" && state != "unknown" {
+            continue;
+        }
+        let rank = uplink_rank(name);
+        if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+            best = Some((rank, name.to_string()));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// The interfaces currently holding an IPv4 address, as listed in
+/// `/proc/net/route` (header row skipped).
+fn ifaces_with_ipv4() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Ok(text) = std::fs::read_to_string("/proc/net/route") else {
+        return names;
+    };
+    for line in text.lines().skip(1) {
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Virtual or otherwise unsuitable devices: tunnels, bridges, loopback, dummy,
+/// and the VPN's own interfaces.
+fn is_virtual_iface(name: &str) -> bool {
+    const VIRTUAL: &[&str] = &[
+        "lo",
+        "dummy",
+        "tun",
+        "tap",
+        "ppp",
+        "sit",
+        "ip6",
+        "ip_",
+        "gre",
+        "gretap",
+        "erspan",
+        "ifb",
+        "p2p",
+        "r_rmnet",
+        "veth",
+        "br",
+        "bond",
+        "vlan",
+        "nrm",
+        "rmnet_ipa",
+    ];
+    VIRTUAL.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// Preference among physical uplinks: wired, then WiFi, then cellular, then
+/// anything else.  Matches how Android itself ranks networks.
+fn uplink_rank(name: &str) -> u8 {
+    if name.starts_with("eth") {
+        0
+    } else if name.starts_with("wlan") {
+        1
+    } else if name.starts_with("rmnet") {
+        2
+    } else {
+        3
+    }
 }
 
 /// Minimal HTTP(S) request helper backed by reqwest.
@@ -588,5 +805,62 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
 
     fn fallback_local(&self) -> bool {
         fallback_local()
+    }
+}
+
+#[cfg(test)]
+mod iface_choice_tests {
+    use super::*;
+
+    #[test]
+    fn bind_iface_spellings_map_to_the_right_choice() {
+        assert_eq!(classify_bind_iface(""), BindChoice::Auto);
+        assert_eq!(classify_bind_iface("  auto "), BindChoice::Auto);
+        assert_eq!(classify_bind_iface("none"), BindChoice::Never);
+        assert_eq!(classify_bind_iface("OFF"), BindChoice::Never);
+        assert_eq!(classify_bind_iface("always"), BindChoice::Always);
+        assert_eq!(classify_bind_iface("On"), BindChoice::Always);
+        assert_eq!(
+            classify_bind_iface(" wlan0 "),
+            BindChoice::Named("wlan0".to_string())
+        );
+        // A real device name that happens to start with a keyword must not be
+        // mistaken for the keyword itself.
+        assert_eq!(
+            classify_bind_iface("offload0"),
+            BindChoice::Named("offload0".to_string())
+        );
+    }
+
+    #[test]
+    fn virtual_devices_are_never_picked() {
+        for name in [
+            "lo",
+            "dummy0",
+            "tun0",
+            "ppp0",
+            "ip6tnl0",
+            "ip_vti0",
+            "ifb0",
+            "sit0",
+            "gre0",
+            "gretap0",
+            "erspan0",
+            "p2p0",
+            "r_rmnet_data3",
+            "rmnet_ipa0",
+        ] {
+            assert!(is_virtual_iface(name), "{name} must count as virtual");
+        }
+        for name in ["wlan0", "wlan1", "eth0", "rmnet_data0", "rmnet_data3"] {
+            assert!(!is_virtual_iface(name), "{name} is a real uplink");
+        }
+    }
+
+    #[test]
+    fn wired_beats_wifi_beats_cellular() {
+        assert!(uplink_rank("eth0") < uplink_rank("wlan0"));
+        assert!(uplink_rank("wlan0") < uplink_rank("rmnet_data3"));
+        assert!(uplink_rank("rmnet_data0") < uplink_rank("something0"));
     }
 }

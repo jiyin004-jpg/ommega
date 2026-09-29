@@ -68,6 +68,27 @@ restart of the injector or keystore2. Whether a handled request is served
 locally or by the remote relay is decided elsewhere and does **not** change
 with this switch.
 
+### Outbound interface (VPN bypass)
+
+While a VPN is up, the OS routes ordinary traffic into its tunnel. The relay
+connection to our own server gets caught by the same rules, so it also leaves
+through the tunnel: slower, jittery, and in the bad cases unreachable. The
+daemon therefore binds its sockets to a physical uplink (`SO_BINDTODEVICE`) so
+they stay out of the tunnel.
+
+`bind_iface` in that same `config` file controls it:
+
+- absent or `auto` — bind only while a VPN is up (default)
+- `none` / `off` — never bind
+- `always` / `on` — always bind to the detected uplink
+- any other value — treated as a device name and used as-is (`wlan0`)
+
+Auto-detection prefers wired, then WiFi, then cellular, and only considers
+devices that currently hold an IPv4 address; `lo`, `dummy*`, `tun*`, `tap*`,
+`ppp*` and the other virtual devices are never picked.
+
+Without a VPN nothing is bound, so the OS keeps its own WiFi/cellular failover.
+
 ### Bundled PathMask kernel module (`kmod-loader.sh`)
 
 The module ships the official PathMask `.ko` builds (see

@@ -713,6 +713,11 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         .unwrap_or_default()
         .to_string();
 
+    // 转发流量要不要绑网卡（绕开 VPN）。缺省是 auto，语义见 remote::desired_iface。
+    let bind_iface = get(&["bind_iface", "iface", "bind_interface", "uplink_iface"])
+        .unwrap_or_default()
+        .to_string();
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
@@ -720,6 +725,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         device_id,
         tls_insecure,
         fallback_local,
+        bind_iface,
         debug_logging,
         hide_strongbox,
         soter_hide,
@@ -776,6 +782,12 @@ pub struct RemoteConfig {
     pub tls_insecure: bool,
     /// Fall back to local software keybox attestation when the remote is unreachable.
     pub fallback_local: bool,
+    /// 连 relay server 时把 socket 绑到哪个网卡（`/data/adb/ommega/config` 的
+    /// `bind_iface`）。空（或缺省）= `auto`：只在检测到 VPN 时才绑到物理上行网卡，
+    /// 让转发流量绕开 VPN 的路由；`none` / `off` 表示永不绑；`always` / `on`
+    /// 表示无条件绑；其余值当作网卡名直接用。见 `remote::desired_iface`。
+    #[serde(default)]
+    pub bind_iface: String,
     /// Extra remote-relay diagnostic logging (`debug_logging` / `debug` /
     /// `verbose` in `/data/adb/ommega/config`, client-a semantics).
     #[serde(default)]
@@ -825,6 +837,7 @@ impl Default for RemoteConfig {
             // operators who pin a proper CA set `tls_insecure = false`.
             tls_insecure: true,
             fallback_local: true,
+            bind_iface: String::new(),
             debug_logging: false,
             hide_strongbox: false,
             soter_hide: false,
