@@ -99,9 +99,9 @@ the choice follows the network rather than a cached guess: a WiFi link whose
 upstream died simply never answers and loses on its own, with nobody having to
 notice and nothing waiting for a cached decision to expire.  A single candidate
 is never probed — with only mobile data, or only WiFi, up there is nothing to
-pick between, so it is used straight away.  If nothing answers, the preferred
-interface is used anyway, so the request still goes out and fails into the
-normal retry.
+pick between, so it is used straight away.  If nothing answers, the socket is
+left unbound rather than pinned to a link that just proved it cannot reach the
+relay — pinning one anyway is the original bug.
 
 Only the probe races.  The real request still goes out exactly once, over the
 winner: attestation is not idempotent, and sending it down both links would make

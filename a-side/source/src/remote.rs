@@ -351,17 +351,19 @@ fn race_with(
                     );
                     Some(winner)
                 }
-                // Nothing answered.  Keep the preferred link rather than binding
-                // nothing: the request then fails and is retried like before,
-                // whereas an unbound socket would silently fall back into the
-                // tunnel this whole mechanism exists to avoid.
+                // Nothing answered.  Leave the socket unbound rather than
+                // pinning a link that just failed to reach the relay: binding
+                // one anyway would put us back where this started — stuck on a
+                // WiFi link that carries nothing — and an unbound socket at
+                // least lets the OS follow the network.  This also covers a
+                // `url` that resolves through the tunnel (Clash fake-IP), where
+                // no physical link can ever answer.
                 Err(_) => {
                     log::warn!(
-                        "no uplink answered a probe; using {} anyway (candidates: {})",
-                        candidates[0],
+                        "no uplink answered a probe; leaving the socket unbound (candidates: {})",
                         candidates.join(",")
                     );
-                    Some(candidates[0].clone())
+                    None
                 }
             }
         }
@@ -1039,14 +1041,14 @@ mod iface_choice_tests {
         );
     }
 
-    /// If nothing answers, the preferred link is kept so the request still goes
-    /// out (and fails, and is retried) instead of the socket ending up unbound.
-    /// No candidates at all means no binding.
+    /// If nothing answers, the socket is left unbound instead of pinned to a
+    /// link that just proved it cannot reach the relay — pinning one anyway is
+    /// the original bug.  No candidates at all means the same thing.
     #[test]
-    fn when_nothing_answers_the_preferred_link_is_kept() {
+    fn when_nothing_answers_the_socket_is_left_unbound() {
         let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
         let dead: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_: &str| false);
-        assert_eq!(race_with(&cands, dead).as_deref(), Some("wlan0"));
+        assert_eq!(race_with(&cands, dead), None);
         let any: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_: &str| true);
         assert_eq!(race_with(&[], any), None);
     }
