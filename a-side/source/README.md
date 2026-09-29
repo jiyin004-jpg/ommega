@@ -94,7 +94,10 @@ alone then pins WiFi forever and forwarding stays broken until you find a
 working network.
 
 So when there is actually something to choose between, the candidates are probed
-at the same time and the first one to answer wins.  Every request re-races, so
+at the same time and the first one to answer wins.  The probe goes to the relay's
+own liveness endpoint (`/api/ping/`) and only counts if the body comes back as
+`pong`, so a captive portal or a carrier interstitial that swallows the request
+cannot pass itself off as a working link.  Every request re-races, so
 the choice follows the network rather than a cached guess: a WiFi link whose
 upstream died simply never answers and loses on its own, with nobody having to
 notice and nothing waiting for a cached decision to expire.  A single candidate
