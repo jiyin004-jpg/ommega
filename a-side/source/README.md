@@ -89,6 +89,13 @@ devices that currently hold an IPv4 address; `lo`, `dummy*`, `tun*`, `tap*`,
 
 Without a VPN nothing is bound, so the OS keeps its own WiFi/cellular failover.
 
+One caveat: if `url:` is a hostname, the system resolver may answer from the
+VPN's fake-IP pool while a VPN is up (`198.18.0.0/16` is the Clash default).
+Those addresses are only reachable through the tunnel, so a socket bound to a
+physical uplink cannot reach them — it will just time out. Point `url:` at an
+IP address if you rely on this. The default `auto` mode hits this too, since it
+binds exactly when a VPN is up.
+
 ### Bundled PathMask kernel module (`kmod-loader.sh`)
 
 The module ships the official PathMask `.ko` builds (see
