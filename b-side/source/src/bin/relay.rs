@@ -59,9 +59,15 @@ use serde_json::{json, Value};
 use ommegaclient_b::keymaster::attest_proxy::{check_app_id_der, SYSTEM_KEYMINT_STRONGBOX};
 use ommegaclient_b::keymaster::tee_ops::{self, KeyAlgorithm, KeySpec};
 
-const POLL_TIMEOUT_SEC: u32 = 20;
+const POLL_TIMEOUT_SEC: u32 = 15;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
+/// 一轮 poll 最多允许的墙钟时间。刻意比上面的 READ_TIMEOUT_MS 早一步收网：那个
+/// 30s 是 reqwest 自己的总超时，用单调钟算，设备 suspend 之后就不作数了。
+const POLL_WALL_LIMIT: Duration = Duration::from_secs(25);
+/// 处理一个任务的上限。任务里有真 TEE 调用、还有带重试的结果回传（最坏 4×33s
+/// 再加退避），所以给得宽一点，这一条只用来兜「整个循环不再往前转」。
+const TASK_WALL_LIMIT: Duration = Duration::from_secs(180);
 const CONF_PATH: &str = "/data/adb/ommega/relay.conf";
 const RESTART_MARKER: &str = "/data/adb/ommega/restart.all";
 const RELOAD_POLL_MS: u64 = 1000;
@@ -933,11 +939,25 @@ fn spawn_config_watcher(shared: Arc<RwLock<RelayConfig>>, last_mtime: u64) {
 }
 
 fn run_loop(shared: Arc<RwLock<RelayConfig>>) {
-    // 正常情况下服务端会挂着 20s 长轮询，一轮一个请求。但它要是立刻回 204
+    // 正常情况下服务端会挂着 15s 长轮询，一轮一个请求。但它要是立刻回 204
     // （老版本服务端、代理提前收掉连接等），这里不设下限就变成“能跑多快跑多快”，
     // 直接把服务器打满。失败路径同理，用指数退避兜住。
     const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
     const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(30);
+    // 长轮询卡死之后没人管，是线上那几次几小时静默 gap 的成因：请求停在 reqwest
+    // 的 read 上，那一路超时都用单调钟算，设备 suspend 之后永远不到 —— 进程活着，
+    // 却再也不发轮询，service.sh 的 wait 也一直陪着等。这里按开机时长盯住，超了
+    // 就退出去让 service.sh 重启。细节见 watchdog 模块。
+    let watchdog = ommegaclient_b::watchdog::SuspendWatchdog::spawn(
+        ommegaclient_b::watchdog::DEFAULT_TICK,
+        |over_ms| {
+            log::error!(
+                "已经卡了 {over_ms}ms 没往前走（设备多半刚从 suspend 醒来），退出让 service.sh 重新拉起"
+            );
+            log::Log::flush(log::logger());
+            std::process::exit(2);
+        },
+    );
     let mut error_backoff = Duration::from_secs(1);
     loop {
         // Read the latest live config (may be updated by the watcher).
@@ -950,11 +970,17 @@ fn run_loop(shared: Arc<RwLock<RelayConfig>>) {
             }
         };
         let started = Instant::now();
-        match poll_tasks(&cfg) {
+        watchdog.arm(POLL_WALL_LIMIT);
+        let polled = poll_tasks(&cfg);
+        watchdog.disarm();
+        match polled {
             Ok(Some((task_id, task_type, payload))) => {
                 error_backoff = Duration::from_secs(1);
                 log::info!("poll received task {task_id} type={task_type}");
-                if let Err(e) = handle_task(&cfg, &task_id, &task_type, &payload) {
+                watchdog.arm(TASK_WALL_LIMIT);
+                let handled = handle_task(&cfg, &task_id, &task_type, &payload);
+                watchdog.disarm();
+                if let Err(e) = handled {
                     log::error!("handle_task failed: {e:#}");
                 }
             }

@@ -16,6 +16,7 @@ pub mod logging;
 pub mod macros;
 pub mod plat;
 pub mod soter;
+pub mod watchdog;
 
 /// 测试进程里要问 servicemanager 就得先把 binder 的 ProcessState 起来。
 /// rsbinder 没初始化就直接 panic，之前有几个用例就是这么挂的（不是业务代码挂的）。
