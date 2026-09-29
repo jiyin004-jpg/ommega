@@ -261,6 +261,22 @@ fn uplink_candidates() -> Vec<String> {
     found.into_iter().map(|(_, name)| name).collect()
 }
 
+/// The relay's liveness endpoint, and the body it answers with.
+///
+/// `/api/ping/` returns a fixed `pong` without touching any state, which makes
+/// it the right probe target: cheap enough to hit on every request, and its body
+/// identifies the relay.  Probing `/` instead would accept any HTTP answer,
+/// including one from a captive portal or a carrier interstitial that swallowed
+/// the request.
+const PING_PATH: &str = "/api/ping/";
+const PING_BODY: &str = "pong";
+
+/// Where a reachability probe goes.  A trailing slash on the configured URL must
+/// not double up.
+fn probe_url(base_url: &str) -> String {
+    format!("{}{PING_PATH}", base_url.trim_end_matches('/'))
+}
+
 /// Whether traffic sent through `iface` actually reaches the relay server.
 ///
 /// Holding an IPv4 address is not the same as having a working route.  A phone
@@ -269,9 +285,9 @@ fn uplink_candidates() -> Vec<String> {
 /// everything sent through it disappears.  Ranking by name alone then picks
 /// WiFi forever and forwarding is dead until the user finds a working network.
 ///
-/// A short request is the only honest test.  Any answer counts, including 404
-/// or 500: it proves the path works.  Only a transport failure means the
-/// interface cannot carry the request.
+/// A short request is the only honest test, and the endpoint answers a known
+/// body: a transport failure means the interface cannot carry the request, while
+/// an answer that is not `pong` means something in between swallowed it.
 fn probe_iface(iface: &str, base_url: &str) -> bool {
     // Nothing to probe against (unconfigured or malformed URL) — do not turn a
     // configuration problem into "no interface works".
@@ -290,7 +306,10 @@ fn probe_iface(iface: &str, base_url: &str) -> bool {
     else {
         return false;
     };
-    client.get(base_url).send().is_ok()
+    let Ok(resp) = client.get(probe_url(base_url)).send() else {
+        return false;
+    };
+    resp.status().is_success() && resp.text().is_ok_and(|body| body.trim() == PING_BODY)
 }
 
 /// Races the candidate uplinks against each other and returns whichever one
@@ -994,6 +1013,21 @@ mod iface_choice_tests {
         assert!(uplink_rank("eth0") < uplink_rank("wlan0"));
         assert!(uplink_rank("wlan0") < uplink_rank("rmnet_data3"));
         assert!(uplink_rank("rmnet_data0") < uplink_rank("something0"));
+    }
+
+    /// The probe must hit the liveness endpoint, not the root: only `/api/ping/`
+    /// answers a body that identifies the relay.
+    #[test]
+    fn the_probe_goes_to_the_liveness_endpoint() {
+        assert_eq!(
+            probe_url("http://1.2.3.4:10886"),
+            "http://1.2.3.4:10886/api/ping/"
+        );
+        // A trailing slash on the configured URL must not double up.
+        assert_eq!(
+            probe_url("http://1.2.3.4:10886/"),
+            "http://1.2.3.4:10886/api/ping/"
+        );
     }
 
     /// The reported failure: the phone is joined to a WiFi network with no
