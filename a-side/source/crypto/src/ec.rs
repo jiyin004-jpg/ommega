@@ -254,7 +254,7 @@ impl crypto::AccumulatingOperation for OmmegaEcAgreeOperation {
                         let vk = p256::PublicKey::from_sec1_bytes(peer_raw)
                             .map_err(|e| km_err!(InvalidArgument, "peer P-256 key: {e:?}"))?;
                         let shared =
-                            p256::ecdh::diffie_hellman(&sk.to_nonzero_scalar(), vk.as_affine());
+                            p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), vk.as_affine());
                         shared.raw_secret_bytes().to_vec()
                     }
                     ec::NistCurve::P384 => {
@@ -263,7 +263,7 @@ impl crypto::AccumulatingOperation for OmmegaEcAgreeOperation {
                         let vk = p384::PublicKey::from_sec1_bytes(peer_raw)
                             .map_err(|e| km_err!(InvalidArgument, "peer P-384 key: {e:?}"))?;
                         let shared =
-                            p384::ecdh::diffie_hellman(&sk.to_nonzero_scalar(), vk.as_affine());
+                            p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), vk.as_affine());
                         shared.raw_secret_bytes().to_vec()
                     }
                     ec::NistCurve::P521 => {
@@ -272,7 +272,7 @@ impl crypto::AccumulatingOperation for OmmegaEcAgreeOperation {
                         let vk = p521::PublicKey::from_sec1_bytes(peer_raw)
                             .map_err(|e| km_err!(InvalidArgument, "peer P-521 key: {e:?}"))?;
                         let shared =
-                            p521::ecdh::diffie_hellman(&sk.to_nonzero_scalar(), vk.as_affine());
+                            p521::ecdh::diffie_hellman(sk.to_nonzero_scalar(), vk.as_affine());
                         shared.raw_secret_bytes().to_vec()
                     }
                 };
