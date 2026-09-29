@@ -87,6 +87,17 @@ Auto-detection prefers wired, then WiFi, then cellular, and only considers
 devices that currently hold an IPv4 address; `lo`, `dummy*`, `tun*`, `tap*`,
 `ppp*` and the other virtual devices are never picked.
 
+Holding an address is not the same as having a working route. A phone joined to
+a WiFi network whose upstream is down still gets a DHCP lease, so `wlan0` looks
+perfectly healthy while everything sent through it disappears — ranking by name
+alone then pins WiFi forever and forwarding stays broken until you find a
+working network. Each candidate is therefore probed with a short request to the
+relay server and the first one that answers wins: WiFi keeps the lead only while
+it actually works, and cellular takes over when it does not. The decision is
+cached for a minute, a request that fails in transit marks its interface bad so
+the retry leaves by another link, and if nothing answers, the preferred
+interface is used anyway — the pre-probe behaviour.
+
 Without a VPN nothing is bound, so the OS keeps its own WiFi/cellular failover.
 
 One caveat: if `url:` is a hostname, the system resolver may answer from the

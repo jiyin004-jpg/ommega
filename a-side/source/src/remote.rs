@@ -32,7 +32,7 @@
 //! encoding and HTTP keep-alive, both of which the hand-written client did not.
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -44,6 +44,13 @@ use crate::config;
 
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
+
+/// How long a single candidate interface gets to answer a reachability probe.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+/// How long a picked interface is trusted before the candidates are re-probed.
+const PICK_TTL: Duration = Duration::from_millis(60_000);
+/// How long an interface is skipped after a request through it failed.
+const FAIL_TTL: Duration = Duration::from_millis(30_000);
 
 /// A relay-server client.  All configuration is read from `config().remote`.
 pub struct RemoteRelay;
@@ -68,12 +75,20 @@ static CLIENT_CACHE: Mutex<Option<CachedClient>> = Mutex::new(None);
 /// Returns a reqwest blocking client for the current `tls_insecure` setting and
 /// the interface traffic should leave from.
 fn get_client() -> Result<Client> {
-    let (insecure, iface) = {
+    // Snapshot just the fields we need.  Picking an interface can probe the
+    // candidate links, which blocks for up to `PROBE_TIMEOUT` per candidate, and
+    // that must not happen while the config lock is held.
+    let (insecure, bind_iface, base_url) = {
         let guard = config::config()
             .read()
             .map_err(|_| anyhow!("config lock poisoned"))?;
-        (guard.remote.tls_insecure, desired_iface(&guard.remote))
+        (
+            guard.remote.tls_insecure,
+            guard.remote.bind_iface.clone(),
+            guard.remote.url.clone(),
+        )
     };
+    let iface = desired_iface(&bind_iface, &base_url);
 
     let mut slot = CLIENT_CACHE
         .lock()
@@ -172,11 +187,11 @@ const SYS_CLASS_NET: &str = "/sys/class/net";
 /// throw away the OS's own "WiFi dropped, fall back to cellular" switching,
 /// which is pure downside when there is no VPN to avoid.  Deployments that want
 /// a fixed interface can name it explicitly.
-fn desired_iface(cfg: &config::RemoteConfig) -> Option<String> {
-    match classify_bind_iface(&cfg.bind_iface) {
+fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
+    match classify_bind_iface(bind_iface) {
         BindChoice::Never => None,
-        BindChoice::Always => pick_uplink_iface(),
-        BindChoice::Auto if vpn_active() => pick_uplink_iface(),
+        BindChoice::Always => resolve_uplink(bind_iface, base_url),
+        BindChoice::Auto if vpn_active() => resolve_uplink(bind_iface, base_url),
         BindChoice::Auto => None,
         // An explicit name is taken at face value: whether it exists or works is
         // the kernel's call, not ours.
@@ -198,7 +213,7 @@ fn vpn_active() -> bool {
     })
 }
 
-/// Picks a physical uplink interface.
+/// The physical uplinks that could carry relay traffic right now, best first.
 ///
 /// Measured on a Z60 Ultra (Android 16), two traps: `dummy0` and `lo` both
 /// report `operstate=unknown` with `carrier=1`, indistinguishable from a real
@@ -211,14 +226,19 @@ fn vpn_active() -> bool {
 /// device with no route.  `/proc/net/route` lists exactly the interfaces that
 /// currently hold an IPv4 address (two rows on the device above: `wlan0` and
 /// `rmnet_data3`), which makes it a precise cross-filter.
-fn pick_uplink_iface() -> Option<String> {
+///
+/// Note this says nothing about whether the link actually reaches anywhere —
+/// see `probe_iface`.
+fn uplink_candidates() -> Vec<String> {
     let with_ip = ifaces_with_ipv4();
     if with_ip.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let entries = std::fs::read_dir(SYS_CLASS_NET).ok()?;
-    let mut best: Option<(u8, String)> = None;
+    let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(u8, String)> = Vec::new();
     for e in entries.flatten() {
         let entry_name = e.file_name();
         let Some(name) = entry_name.to_str() else {
@@ -228,17 +248,172 @@ fn pick_uplink_iface() -> Option<String> {
             continue;
         }
         let state = std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/operstate"))
+            .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let state = state.trim();
-        if state != "up" && state != "unknown" {
+        // An unreadable `operstate` (SELinux denies it in some domains) must not
+        // disqualify the device: `/proc/net/route` already proved it carries an
+        // IPv4 route, and the reachability probe is the real check.
+        if !state.is_empty() && state != "up" && state != "unknown" {
             continue;
         }
-        let rank = uplink_rank(name);
-        if best.as_ref().is_none_or(|(r, _)| rank < *r) {
-            best = Some((rank, name.to_string()));
+        found.push((uplink_rank(name), name.to_string()));
+    }
+    found.sort();
+    found.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Whether traffic sent through `iface` actually reaches the relay server.
+///
+/// Holding an IPv4 address is not the same as having a working route.  A phone
+/// joined to a WiFi network whose upstream is down — or stuck behind a captive
+/// portal — still gets a DHCP lease, so `wlan0` looks perfectly healthy while
+/// everything sent through it disappears.  Ranking by name alone then picks
+/// WiFi forever and forwarding is dead until the user finds a working network.
+///
+/// A short request is the only honest test.  Any answer counts, including 404
+/// or 500: it proves the path works.  Only a transport failure means the
+/// interface cannot carry the request.
+fn probe_iface(iface: &str, base_url: &str) -> bool {
+    // Nothing to probe against (unconfigured or malformed URL) — do not turn a
+    // configuration problem into "no interface works".
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return true;
+    }
+    let Ok(client) = Client::builder()
+        .interface(iface)
+        .no_proxy()
+        .connect_timeout(PROBE_TIMEOUT)
+        .timeout(PROBE_TIMEOUT)
+        // The probe only asks whether packets get there; a certificate problem
+        // is not a routing problem.
+        .danger_accept_invalid_certs(true)
+        .build()
+    else {
+        return false;
+    };
+    client.get(base_url).send().is_ok()
+}
+
+/// Selection state, kept across requests so the candidate links are not probed
+/// on every single one.
+struct PickState {
+    /// Candidate list plus `bind_iface` setting this decision was made under.
+    fingerprint: String,
+    picked: Option<String>,
+    decided_at: Option<Instant>,
+    /// Interfaces whose traffic recently did not get through.
+    failed: Vec<(String, Instant)>,
+}
+
+static PICK_STATE: Mutex<PickState> = Mutex::new(PickState {
+    fingerprint: String::new(),
+    picked: None,
+    decided_at: None,
+    failed: Vec::new(),
+});
+
+/// Walks `candidates` and returns the first one the probe answers for, plus
+/// whether it actually answered.
+///
+/// Recently failed interfaces are skipped; if that leaves nothing, the whole
+/// list is retried, because a recorded failure may have been a one-off.  When
+/// nothing answers at all, the preferred candidate still comes back — with
+/// `false` — rather than binding nothing at all.
+///
+/// Kept separate from `resolve_uplink` so the ordering rule can be tested
+/// without a network or a real `/sys/class/net`.
+fn first_reachable<'a>(
+    candidates: &'a [String],
+    failed: &[String],
+    probe: &dyn Fn(&str) -> bool,
+) -> Option<(&'a str, bool)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let usable: Vec<&String> = candidates
+        .iter()
+        .filter(|c| !failed.iter().any(|f| f == *c))
+        .collect();
+    let pool: Vec<&String> = if usable.is_empty() {
+        candidates.iter().collect()
+    } else {
+        usable
+    };
+    match pool.iter().find(|c| probe(c)) {
+        Some(hit) => Some((hit.as_str(), true)),
+        None => Some((pool[0].as_str(), false)),
+    }
+}
+
+/// Picks the interface relay traffic should leave from, probing the candidates
+/// when the previous decision is stale or its interface has since failed.
+///
+/// Returns `None` when no physical uplink holds an address; the caller then
+/// leaves the socket unbound so the OS can route it however it likes.
+fn resolve_uplink(bind_iface: &str, base_url: &str) -> Option<String> {
+    let candidates = uplink_candidates();
+    if candidates.is_empty() {
+        return None;
+    }
+    let fingerprint = format!("{bind_iface}|{}", candidates.join(","));
+    let now = Instant::now();
+
+    // Reuse the previous decision while it is fresh and its interface has not
+    // since been marked bad.
+    {
+        let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        st.failed
+            .retain(|(_, at)| now.duration_since(*at) < FAIL_TTL);
+        let fresh = st
+            .decided_at
+            .is_some_and(|at| now.duration_since(at) < PICK_TTL);
+        if fresh && st.fingerprint == fingerprint {
+            if let Some(picked) = st.picked.clone() {
+                if !st.failed.iter().any(|(name, _)| *name == picked) {
+                    return Some(picked);
+                }
+            }
         }
     }
-    best.map(|(_, name)| name)
+
+    // Probe outside the lock: this is the slow part.
+    let failed: Vec<String> = {
+        let st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        st.failed.iter().map(|(name, _)| name.clone()).collect()
+    };
+    let (picked, reachable) =
+        first_reachable(&candidates, &failed, &|c: &str| probe_iface(c, base_url))?;
+    let picked = picked.to_string();
+    if reachable {
+        log::info!(
+            "relay uplink resolved to {picked} (candidates: {})",
+            candidates.join(",")
+        );
+    } else {
+        log::warn!(
+            "no uplink answered a probe; falling back to {picked} (candidates: {})",
+            candidates.join(",")
+        );
+    }
+
+    {
+        let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        st.fingerprint = fingerprint;
+        st.picked = Some(picked.clone());
+        st.decided_at = Some(now);
+    }
+    Some(picked)
+}
+
+/// Records that the interface currently in use just failed to carry a request,
+/// so the next selection skips it and the retry uses a different link.
+fn note_current_iface_failure() {
+    let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = st.picked.clone() {
+        log::warn!("interface {current} did not carry the request; trying another link");
+        st.failed.push((current, Instant::now()));
+    }
+    st.decided_at = None;
 }
 
 /// The interfaces currently holding an IPv4 address, as listed in
@@ -394,6 +569,11 @@ impl RemoteRelay {
             Ok(v) => v,
             Err(first) => {
                 log::warn!("remote {path} transport error, retrying once: {first:#}");
+                // A transport failure usually means the link we pinned the
+                // socket to cannot carry traffic — a phone on a WiFi network
+                // with no upstream still has a healthy-looking `wlan0`.  Note it
+                // so the retry goes out a different interface.
+                note_current_iface_failure();
                 http_request("POST", &url, &headers, Some(body_str.as_bytes()))
                     .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
             }
@@ -862,5 +1042,81 @@ mod iface_choice_tests {
         assert!(uplink_rank("eth0") < uplink_rank("wlan0"));
         assert!(uplink_rank("wlan0") < uplink_rank("rmnet_data3"));
         assert!(uplink_rank("rmnet_data0") < uplink_rank("something0"));
+    }
+
+    /// The reported failure: the phone is joined to a WiFi network with no
+    /// upstream, so `wlan0` holds a lease and looks healthy while nothing sent
+    /// through it arrives.  Cellular is up and does work, and the picker has to
+    /// notice — pinning WiFi regardless is what forced the user to stay on a
+    /// working WiFi instead of using mobile data.
+    #[test]
+    fn a_wifi_link_with_no_upstream_gives_way_to_cellular() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
+        let probe = |name: &str| name == "rmnet_data3";
+        assert_eq!(
+            first_reachable(&cands, &[], &probe),
+            Some(("rmnet_data3", true))
+        );
+    }
+
+    /// Reachability decides, not the name: a WiFi link that answers stays
+    /// preferred over cellular.
+    #[test]
+    fn a_working_wifi_link_is_still_preferred() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
+        let probe = |_: &str| true;
+        assert_eq!(first_reachable(&cands, &[], &probe), Some(("wlan0", true)));
+    }
+
+    /// A link that just failed a real request is skipped, so the retry inside
+    /// `post_json` leaves by a different interface.
+    #[test]
+    fn a_recently_failed_link_is_skipped() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
+        let probe = |_: &str| true;
+        assert_eq!(
+            first_reachable(&cands, &["wlan0".to_string()], &probe),
+            Some(("rmnet_data3", true))
+        );
+    }
+
+    /// A transient probe failure must not leave the socket unbound: the
+    /// preferred link comes back anyway, flagged as unreachable.  Same when
+    /// every link is blacklisted, and nothing at all when there are no
+    /// candidates.
+    #[test]
+    fn the_preferred_link_survives_a_total_probe_failure() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
+        let dead = |_: &str| false;
+        assert_eq!(first_reachable(&cands, &[], &dead), Some(("wlan0", false)));
+        let all_bad = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
+        assert_eq!(
+            first_reachable(&cands, &all_bad, &dead),
+            Some(("wlan0", false))
+        );
+        assert_eq!(first_reachable(&[], &[], &dead), None);
+    }
+
+    /// Manual on-device check, kept out of the normal run because it needs a
+    /// real device with a live uplink and a reachable relay.  On the device:
+    ///
+    ///     OMMEGA_PROBE_URL=http://1.2.3.4:10886 ./keymint_t \
+    ///         on_device_pick_report --ignored --nocapture
+    ///
+    /// Prints the candidate uplinks, what a reachability probe says about each,
+    /// and which one the picker would use.
+    #[test]
+    #[ignore]
+    fn on_device_pick_report() {
+        let base_url = std::env::var("OMMEGA_PROBE_URL").unwrap_or_default();
+        let candidates = uplink_candidates();
+        println!("candidates = {candidates:?}");
+        for c in &candidates {
+            println!("  probe {c} -> {}", probe_iface(c, &base_url));
+        }
+        println!(
+            "pick = {:?}",
+            first_reachable(&candidates, &[], &|c: &str| probe_iface(c, &base_url))
+        );
     }
 }
