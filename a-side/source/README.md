@@ -94,15 +94,18 @@ alone then pins WiFi forever and forwarding stays broken until you find a
 working network.
 
 So when there is actually something to choose between, the candidates are probed
-with a short request (800 ms) to the relay server and the first one that answers
-wins: WiFi keeps the lead only while it actually works, and cellular takes over
-when it does not. A single candidate is never probed — with only mobile data, or
-only WiFi, up there is nothing to pick between, so it is used straight away.
+at the same time and the first one to answer wins.  Every request re-races, so
+the choice follows the network rather than a cached guess: a WiFi link whose
+upstream died simply never answers and loses on its own, with nobody having to
+notice and nothing waiting for a cached decision to expire.  A single candidate
+is never probed — with only mobile data, or only WiFi, up there is nothing to
+pick between, so it is used straight away.  If nothing answers, the preferred
+interface is used anyway, so the request still goes out and fails into the
+normal retry.
 
-The decision is then cached for a minute, and a link that failed a probe or a
-request is skipped for three minutes, so a dead WiFi link is not re-probed every
-cycle. If nothing answers, the preferred interface is used anyway — the
-pre-probe behaviour.
+Only the probe races.  The real request still goes out exactly once, over the
+winner: attestation is not idempotent, and sending it down both links would make
+the B-side TEE do the work twice.
 
 Without a VPN nothing is bound, so the OS keeps its own WiFi/cellular failover.
 

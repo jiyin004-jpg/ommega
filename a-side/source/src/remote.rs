@@ -31,8 +31,8 @@
 //! connection pool bottleneck.  reqwest also natively supports chunked transfer
 //! encoding and HTTP keep-alive, both of which the hand-written client did not.
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -50,13 +50,6 @@ const READ_TIMEOUT_MS: u64 = 30_000;
 /// under 250 ms, and the whole point of probing is to get off a dead link
 /// quickly.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
-/// How long a picked interface is trusted before the candidates are re-probed.
-const PICK_TTL: Duration = Duration::from_millis(60_000);
-/// How long an interface is skipped after a request through it, or a probe of
-/// it, failed.  Longer than `PICK_TTL` on purpose: a WiFi link with no upstream
-/// stays dead, so re-probing it every minute would only add an 800 ms stall to
-/// one request per minute for no chance of a different answer.
-const FAIL_TTL: Duration = Duration::from_millis(180_000);
 
 /// A relay-server client.  All configuration is read from `config().remote`.
 pub struct RemoteRelay;
@@ -196,8 +189,8 @@ const SYS_CLASS_NET: &str = "/sys/class/net";
 fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
     match classify_bind_iface(bind_iface) {
         BindChoice::Never => None,
-        BindChoice::Always => resolve_uplink(bind_iface, base_url),
-        BindChoice::Auto if vpn_active() => resolve_uplink(bind_iface, base_url),
+        BindChoice::Always => race_uplink(&uplink_candidates(), base_url),
+        BindChoice::Auto if vpn_active() => race_uplink(&uplink_candidates(), base_url),
         BindChoice::Auto => None,
         // An explicit name is taken at face value: whether it exists or works is
         // the kernel's call, not ours.
@@ -300,149 +293,79 @@ fn probe_iface(iface: &str, base_url: &str) -> bool {
     client.get(base_url).send().is_ok()
 }
 
-/// Selection state, kept across requests so the candidate links are not probed
-/// on every single one.
-struct PickState {
-    /// Candidate list plus `bind_iface` setting this decision was made under.
-    fingerprint: String,
-    picked: Option<String>,
-    decided_at: Option<Instant>,
-    /// Interfaces whose traffic recently did not get through.
-    failed: Vec<(String, Instant)>,
+/// Races the candidate uplinks against each other and returns whichever one
+/// answers the probe first.
+///
+/// Racing rather than ranking is what makes the choice self-correcting: a WiFi
+/// link whose upstream died simply never answers, so it loses on its own —
+/// nobody has to notice it is dead and nobody waits for a cached decision to
+/// expire.  The losers' probes only ever send a harmless GET and are dropped;
+/// a blocking request cannot be cancelled, and none is needed.
+///
+/// Only the probe races.  The real request still goes out exactly once, over the
+/// winner: attestation is not idempotent, and sending it down both links would
+/// make the B-side TEE do the work twice.
+fn race_uplink(candidates: &[String], base_url: &str) -> Option<String> {
+    // The closure must be `'static` to move into the probe threads, so the URL is
+    // captured by value instead of borrowed.
+    let url = base_url.to_string();
+    let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+        Arc::new(move |name: &str| probe_iface(name, &url));
+    race_with(candidates, probe)
 }
 
-static PICK_STATE: Mutex<PickState> = Mutex::new(PickState {
-    fingerprint: String::new(),
-    picked: None,
-    decided_at: None,
-    failed: Vec::new(),
-});
-
-/// Walks `candidates` and returns the first one the probe answers for, plus
-/// whether it actually answered.
-///
-/// Recently failed interfaces are skipped; if that leaves nothing, the whole
-/// list is retried, because a recorded failure may have been a one-off.  When
-/// nothing answers at all, the preferred candidate still comes back — with
-/// `false` — rather than binding nothing at all.
-///
-/// Kept separate from `resolve_uplink` so the ordering rule can be tested
-/// without a network or a real `/sys/class/net`.
-fn first_reachable<'a>(
-    candidates: &'a [String],
-    failed: &[String],
-    probe: &dyn Fn(&str) -> bool,
-) -> Option<(&'a str, bool)> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let usable: Vec<&String> = candidates
-        .iter()
-        .filter(|c| !failed.iter().any(|f| f == *c))
-        .collect();
-    let pool: Vec<&String> = if usable.is_empty() {
-        candidates.iter().collect()
-    } else {
-        usable
-    };
-    // One link left to choose from is not a choice: probing it cannot change the
-    // answer, so do not make the caller wait a round trip to learn nothing.
-    // This covers both "only one uplink is up" (mobile data only, WiFi only) and
-    // "everything else is blacklisted".  `true` here means "take it", not "a
-    // probe accepted it".
-    if pool.len() == 1 {
-        return Some((pool[0].as_str(), true));
-    }
-    match pool.iter().find(|c| probe(c)) {
-        Some(hit) => Some((hit.as_str(), true)),
-        None => Some((pool[0].as_str(), false)),
-    }
-}
-
-/// Picks the interface relay traffic should leave from, probing the candidates
-/// when the previous decision is stale or its interface has since failed.
-///
-/// Returns `None` when no physical uplink holds an address; the caller then
-/// leaves the socket unbound so the OS can route it however it likes.
-fn resolve_uplink(bind_iface: &str, base_url: &str) -> Option<String> {
-    let candidates = uplink_candidates();
-    if candidates.is_empty() {
-        return None;
-    }
-    let fingerprint = format!("{bind_iface}|{}", candidates.join(","));
-    let now = Instant::now();
-
-    // Reuse the previous decision while it is fresh and its interface has not
-    // since been marked bad.
-    {
-        let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        st.failed
-            .retain(|(_, at)| now.duration_since(*at) < FAIL_TTL);
-        let fresh = st
-            .decided_at
-            .is_some_and(|at| now.duration_since(at) < PICK_TTL);
-        if fresh && st.fingerprint == fingerprint {
-            if let Some(picked) = st.picked.clone() {
-                if !st.failed.iter().any(|(name, _)| *name == picked) {
-                    return Some(picked);
+/// The racing itself, with the probe injected so it can be tested without a
+/// network.
+fn race_with(
+    candidates: &[String],
+    probe: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+) -> Option<String> {
+    match candidates.len() {
+        0 => None,
+        // One link is not a choice: probing it cannot change the answer, so do
+        // not make the caller wait a round trip to learn nothing.  This is the
+        // "only mobile data" and "only WiFi" case.
+        1 => Some(candidates[0].clone()),
+        _ => {
+            let (tx, rx) = mpsc::channel();
+            for name in candidates {
+                let tx = tx.clone();
+                let name = name.clone();
+                let probe = Arc::clone(&probe);
+                std::thread::spawn(move || {
+                    if probe(&name) {
+                        let _ = tx.send(name);
+                    }
+                });
+            }
+            // Without this the channel would stay open as long as any clone of
+            // the sender lives, so a race where every probe fails would block for
+            // the full timeout instead of returning as soon as the last probe
+            // reports.
+            drop(tx);
+            match rx.recv_timeout(PROBE_TIMEOUT + Duration::from_millis(200)) {
+                Ok(winner) => {
+                    log::info!(
+                        "relay uplink race won by {winner} (candidates: {})",
+                        candidates.join(",")
+                    );
+                    Some(winner)
+                }
+                // Nothing answered.  Keep the preferred link rather than binding
+                // nothing: the request then fails and is retried like before,
+                // whereas an unbound socket would silently fall back into the
+                // tunnel this whole mechanism exists to avoid.
+                Err(_) => {
+                    log::warn!(
+                        "no uplink answered a probe; using {} anyway (candidates: {})",
+                        candidates[0],
+                        candidates.join(",")
+                    );
+                    Some(candidates[0].clone())
                 }
             }
         }
     }
-
-    // Probe outside the lock: this is the slow part.
-    let failed: Vec<String> = {
-        let st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        st.failed.iter().map(|(name, _)| name.clone()).collect()
-    };
-    let (picked, reachable) = first_reachable(&candidates, &failed, &|c: &str| {
-        let ok = probe_iface(c, base_url);
-        if !ok {
-            // Remember it immediately.  Otherwise, once `PICK_TTL` expires a
-            // minute later, the same dead link gets probed again and stalls
-            // another request for `PROBE_TIMEOUT` to reach the same conclusion.
-            mark_iface_failed(c);
-        }
-        ok
-    })?;
-    let picked = picked.to_string();
-    if reachable {
-        log::info!(
-            "relay uplink resolved to {picked} (candidates: {})",
-            candidates.join(",")
-        );
-    } else {
-        log::warn!(
-            "no uplink answered a probe; falling back to {picked} (candidates: {})",
-            candidates.join(",")
-        );
-    }
-
-    {
-        let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        st.fingerprint = fingerprint;
-        st.picked = Some(picked.clone());
-        st.decided_at = Some(now);
-    }
-    Some(picked)
-}
-
-/// Records that `iface` cannot currently carry traffic, so the next selection
-/// skips it until its entry expires.
-fn mark_iface_failed(iface: &str) {
-    let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.failed.push((iface.to_string(), Instant::now()));
-}
-
-/// Records that the interface currently in use just failed to carry a request,
-/// so the next selection skips it and the retry uses a different link.
-fn note_current_iface_failure() {
-    let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(current) = st.picked.clone() {
-        log::warn!("interface {current} did not carry the request; trying another link");
-        st.failed.push((current, Instant::now()));
-    }
-    st.decided_at = None;
 }
 
 /// The interfaces currently holding an IPv4 address, as listed in
@@ -599,10 +522,8 @@ impl RemoteRelay {
             Err(first) => {
                 log::warn!("remote {path} transport error, retrying once: {first:#}");
                 // A transport failure usually means the link we pinned the
-                // socket to cannot carry traffic — a phone on a WiFi network
-                // with no upstream still has a healthy-looking `wlan0`.  Note it
-                // so the retry goes out a different interface.
-                note_current_iface_failure();
+                // socket to cannot carry traffic.  The retry re-races the
+                // candidates, so it leaves by whichever link answers now.
                 http_request("POST", &url, &headers, Some(body_str.as_bytes()))
                     .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
             }
@@ -1075,79 +996,59 @@ mod iface_choice_tests {
 
     /// The reported failure: the phone is joined to a WiFi network with no
     /// upstream, so `wlan0` holds a lease and looks healthy while nothing sent
-    /// through it arrives.  Cellular is up and does work, and the picker has to
-    /// notice — pinning WiFi regardless is what forced the user to stay on a
-    /// working WiFi instead of using mobile data.
+    /// through it arrives.  It never answers the probe, so it loses the race on
+    /// its own and cellular carries the traffic — no ranking involved, nothing to
+    /// notice, no cached decision to expire.
     #[test]
-    fn a_wifi_link_with_no_upstream_gives_way_to_cellular() {
-        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
-        let probe = |name: &str| name == "rmnet_data3";
-        assert_eq!(
-            first_reachable(&cands, &[], &probe),
-            Some(("rmnet_data3", true))
-        );
+    fn a_wifi_link_with_no_upstream_loses_the_race() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+            Arc::new(|name: &str| name == "rmnet_data2");
+        assert_eq!(race_with(&cands, probe).as_deref(), Some("rmnet_data2"));
     }
 
-    /// Reachability decides, not the name: a WiFi link that answers stays
-    /// preferred over cellular.
+    /// The link that answers first wins, whatever its name — this is what makes
+    /// the choice follow the network rather than a fixed preference.
     #[test]
-    fn a_working_wifi_link_is_still_preferred() {
-        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
-        let probe = |_: &str| true;
-        assert_eq!(first_reachable(&cands, &[], &probe), Some(("wlan0", true)));
+    fn the_faster_link_wins_the_race() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|name: &str| {
+            if name == "wlan0" {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            true
+        });
+        assert_eq!(race_with(&cands, probe).as_deref(), Some("rmnet_data2"));
     }
 
-    /// A link that just failed a real request is skipped, so the retry inside
-    /// `post_json` leaves by a different interface.
+    /// One uplink is not a choice: it must be taken with no probe at all.  The
+    /// probe closure panics if it is ever called.
     #[test]
-    fn a_recently_failed_link_is_skipped() {
-        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
-        let probe = |_: &str| true;
-        assert_eq!(
-            first_reachable(&cands, &["wlan0".to_string()], &probe),
-            Some(("rmnet_data3", true))
-        );
-    }
-
-    /// A transient probe failure must not leave the socket unbound: the
-    /// preferred link comes back anyway, flagged as unreachable.  Same when
-    /// every link is blacklisted, and nothing at all when there are no
-    /// candidates.
-    #[test]
-    fn the_preferred_link_survives_a_total_probe_failure() {
-        let cands = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
-        let dead = |_: &str| false;
-        assert_eq!(first_reachable(&cands, &[], &dead), Some(("wlan0", false)));
-        let all_bad = vec!["wlan0".to_string(), "rmnet_data3".to_string()];
-        assert_eq!(
-            first_reachable(&cands, &all_bad, &dead),
-            Some(("wlan0", false))
-        );
-        assert_eq!(first_reachable(&[], &[], &dead), None);
-    }
-
-    /// One uplink is not a choice: probing it cannot change the answer, so it
-    /// must be taken with no round trip.  The probe closure panics if called.
-    #[test]
-    fn a_single_usable_uplink_is_taken_without_a_probe() {
-        let no_probe = |_: &str| panic!("a lone uplink must not be probed");
+    fn a_single_uplink_is_never_probed() {
+        let no_probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+            Arc::new(|_: &str| panic!("a lone uplink must not be probed"));
         let wifi_only = vec!["wlan0".to_string()];
         assert_eq!(
-            first_reachable(&wifi_only, &[], &no_probe),
-            Some(("wlan0", true))
+            race_with(&wifi_only, Arc::clone(&no_probe)).as_deref(),
+            Some("wlan0")
         );
         let cell_only = vec!["rmnet_data2".to_string()];
         assert_eq!(
-            first_reachable(&cell_only, &[], &no_probe),
-            Some(("rmnet_data2", true))
+            race_with(&cell_only, Arc::clone(&no_probe)).as_deref(),
+            Some("rmnet_data2")
         );
-        // Blacklisting everything but one leaves the same situation: the dead
-        // WiFi is skipped and cellular is taken without probing.
-        let both = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
-        assert_eq!(
-            first_reachable(&both, &["wlan0".to_string()], &no_probe),
-            Some(("rmnet_data2", true))
-        );
+    }
+
+    /// If nothing answers, the preferred link is kept so the request still goes
+    /// out (and fails, and is retried) instead of the socket ending up unbound.
+    /// No candidates at all means no binding.
+    #[test]
+    fn when_nothing_answers_the_preferred_link_is_kept() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        let dead: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_: &str| false);
+        assert_eq!(race_with(&cands, dead).as_deref(), Some("wlan0"));
+        let any: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_: &str| true);
+        assert_eq!(race_with(&[], any), None);
     }
 
     /// Manual on-device check, kept out of the normal run because it needs a
@@ -1167,9 +1068,6 @@ mod iface_choice_tests {
         for c in &candidates {
             println!("  probe {c} -> {}", probe_iface(c, &base_url));
         }
-        println!(
-            "pick = {:?}",
-            first_reachable(&candidates, &[], &|c: &str| probe_iface(c, &base_url))
-        );
+        println!("race winner = {:?}", race_uplink(&candidates, &base_url));
     }
 }
