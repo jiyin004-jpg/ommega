@@ -91,12 +91,18 @@ Holding an address is not the same as having a working route. A phone joined to
 a WiFi network whose upstream is down still gets a DHCP lease, so `wlan0` looks
 perfectly healthy while everything sent through it disappears — ranking by name
 alone then pins WiFi forever and forwarding stays broken until you find a
-working network. Each candidate is therefore probed with a short request to the
-relay server and the first one that answers wins: WiFi keeps the lead only while
-it actually works, and cellular takes over when it does not. The decision is
-cached for a minute, a request that fails in transit marks its interface bad so
-the retry leaves by another link, and if nothing answers, the preferred
-interface is used anyway — the pre-probe behaviour.
+working network.
+
+So when there is actually something to choose between, the candidates are probed
+with a short request (800 ms) to the relay server and the first one that answers
+wins: WiFi keeps the lead only while it actually works, and cellular takes over
+when it does not. A single candidate is never probed — with only mobile data, or
+only WiFi, up there is nothing to pick between, so it is used straight away.
+
+The decision is then cached for a minute, and a link that failed a probe or a
+request is skipped for three minutes, so a dead WiFi link is not re-probed every
+cycle. If nothing answers, the preferred interface is used anyway — the
+pre-probe behaviour.
 
 Without a VPN nothing is bound, so the OS keeps its own WiFi/cellular failover.
 

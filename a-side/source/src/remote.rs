@@ -42,15 +42,21 @@ use serde_json::{json, Value};
 
 use crate::config;
 
-const CONNECT_TIMEOUT_MS: u64 = 3000;
+const CONNECT_TIMEOUT_MS: u64 = 2000;
 const READ_TIMEOUT_MS: u64 = 30_000;
 
 /// How long a single candidate interface gets to answer a reachability probe.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
+/// Deliberately short: a working link on this kind of network answers in well
+/// under 250 ms, and the whole point of probing is to get off a dead link
+/// quickly.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// How long a picked interface is trusted before the candidates are re-probed.
 const PICK_TTL: Duration = Duration::from_millis(60_000);
-/// How long an interface is skipped after a request through it failed.
-const FAIL_TTL: Duration = Duration::from_millis(30_000);
+/// How long an interface is skipped after a request through it, or a probe of
+/// it, failed.  Longer than `PICK_TTL` on purpose: a WiFi link with no upstream
+/// stays dead, so re-probing it every minute would only add an 800 ms stall to
+/// one request per minute for no chance of a different answer.
+const FAIL_TTL: Duration = Duration::from_millis(180_000);
 
 /// A relay-server client.  All configuration is read from `config().remote`.
 pub struct RemoteRelay;
@@ -339,6 +345,14 @@ fn first_reachable<'a>(
     } else {
         usable
     };
+    // One link left to choose from is not a choice: probing it cannot change the
+    // answer, so do not make the caller wait a round trip to learn nothing.
+    // This covers both "only one uplink is up" (mobile data only, WiFi only) and
+    // "everything else is blacklisted".  `true` here means "take it", not "a
+    // probe accepted it".
+    if pool.len() == 1 {
+        return Some((pool[0].as_str(), true));
+    }
     match pool.iter().find(|c| probe(c)) {
         Some(hit) => Some((hit.as_str(), true)),
         None => Some((pool[0].as_str(), false)),
@@ -381,8 +395,16 @@ fn resolve_uplink(bind_iface: &str, base_url: &str) -> Option<String> {
         let st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
         st.failed.iter().map(|(name, _)| name.clone()).collect()
     };
-    let (picked, reachable) =
-        first_reachable(&candidates, &failed, &|c: &str| probe_iface(c, base_url))?;
+    let (picked, reachable) = first_reachable(&candidates, &failed, &|c: &str| {
+        let ok = probe_iface(c, base_url);
+        if !ok {
+            // Remember it immediately.  Otherwise, once `PICK_TTL` expires a
+            // minute later, the same dead link gets probed again and stalls
+            // another request for `PROBE_TIMEOUT` to reach the same conclusion.
+            mark_iface_failed(c);
+        }
+        ok
+    })?;
     let picked = picked.to_string();
     if reachable {
         log::info!(
@@ -403,6 +425,13 @@ fn resolve_uplink(bind_iface: &str, base_url: &str) -> Option<String> {
         st.decided_at = Some(now);
     }
     Some(picked)
+}
+
+/// Records that `iface` cannot currently carry traffic, so the next selection
+/// skips it until its entry expires.
+fn mark_iface_failed(iface: &str) {
+    let mut st = PICK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.failed.push((iface.to_string(), Instant::now()));
 }
 
 /// Records that the interface currently in use just failed to carry a request,
@@ -1095,6 +1124,30 @@ mod iface_choice_tests {
             Some(("wlan0", false))
         );
         assert_eq!(first_reachable(&[], &[], &dead), None);
+    }
+
+    /// One uplink is not a choice: probing it cannot change the answer, so it
+    /// must be taken with no round trip.  The probe closure panics if called.
+    #[test]
+    fn a_single_usable_uplink_is_taken_without_a_probe() {
+        let no_probe = |_: &str| panic!("a lone uplink must not be probed");
+        let wifi_only = vec!["wlan0".to_string()];
+        assert_eq!(
+            first_reachable(&wifi_only, &[], &no_probe),
+            Some(("wlan0", true))
+        );
+        let cell_only = vec!["rmnet_data2".to_string()];
+        assert_eq!(
+            first_reachable(&cell_only, &[], &no_probe),
+            Some(("rmnet_data2", true))
+        );
+        // Blacklisting everything but one leaves the same situation: the dead
+        // WiFi is skipped and cellular is taken without probing.
+        let both = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        assert_eq!(
+            first_reachable(&both, &["wlan0".to_string()], &no_probe),
+            Some(("rmnet_data2", true))
+        );
     }
 
     /// Manual on-device check, kept out of the normal run because it needs a
