@@ -290,14 +290,6 @@ pub enum ErrorCode {
     VersionMismatch = -101,
     UnknownError = -1000,
     // Implementer's namespace for error codes starts at -10000.
-    /// Ommega extension: the A-side keystore holds a remote key entry, but every
-    /// fulfilment layer on the relay (any online B-side device and the server's
-    /// own keybox session) reports that this alias has no private key. The
-    /// A-side relay backend raises this instead of `UnknownError`, and the
-    /// Keystore operation layer turns it into `ResponseCode::KEY_NOT_FOUND`, so
-    /// an app that retries on `UNKNOWN_ERROR` stops instead of hammering sign
-    /// forever.
-    RemoteKeyNotFound = -10001,
     EncodingError = -20000,
     BoringSslError = -30000,
 }

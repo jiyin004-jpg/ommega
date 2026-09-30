@@ -35,11 +35,8 @@ pub(crate) fn strongbox_keymint_present() -> bool {
 }
 
 pub(crate) fn resolve_hardware_profile(security_level: SecurityLevel) -> KeyMintHardwareProfile {
-    let version_number = resolve_keymint_version(
-        learned_served_keymint_version(),
-        probe_keymint_version_from_vintf(security_level),
-        fallback_keymint_version_from_android,
-    );
+    let version_number = probe_keymint_version_from_vintf(security_level)
+        .unwrap_or_else(fallback_keymint_version_from_android);
 
     if let Some(profile) = resolve_property_profile_with(
         security_level,
@@ -263,34 +260,8 @@ fn system_keymint_service_name(security_level: SecurityLevel) -> Option<&'static
     }
 }
 
-/// KeyMint version learned from a chain that was served through the remote relay,
-/// if any.
-///
-/// Only consulted while the remote relay is in use: with the remote disabled the
-/// A-side signs locally as before and must keep the VINTF/Android-derived version,
-/// even if a stale persisted value is still on disk.
-fn learned_served_keymint_version() -> Option<i32> {
-    if !crate::remote::remote_enabled() {
-        return None;
-    }
-    kmr_common::served_keymint_version::served_keymint_version()
-}
-
-/// Pick the KeyMint version to advertise: a version observed in a chain served by
-/// the remote device wins over the local VINTF declaration, which in turn wins
-/// over the version implied by the Android release.
-fn resolve_keymint_version(
-    served: Option<i32>,
-    vintf: Option<i32>,
-    from_android: impl FnOnce() -> i32,
-) -> i32 {
-    served.or(vintf).unwrap_or_else(from_android)
-}
-
 fn probe_keymint_version_from_vintf(security_level: SecurityLevel) -> Option<i32> {
-    let Some(instance) = security_level_instance(security_level) else {
-        return None;
-    };
+    let instance = security_level_instance(security_level)?;
 
     for path in kmr_common::vintf::manifest_paths() {
         let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -355,6 +326,23 @@ fn fallback_keymint_version_from_android() -> i32 {
         Some(12) => KEYMINT_V1,
         _ => KEYMINT_V4,
     }
+}
+
+/// KeyMint 版本从远端那条链里学到了没——1.6.2 这里还没跟着搬 `0e862c5` 引入的
+/// `kmr_common::served_keymint_version` 模块，所以先一律返回 None：宣你本机
+/// vintf / Android 版本推导出来的那个值。等模块搬过来再改成真读。
+fn learned_served_keymint_version() -> Option<i32> {
+    None
+}
+
+/// 宣哪个 KeyMint 版本：远端链里学到的优先，其次本机 VINTF 声明，最后按 Android
+/// 版本推。
+fn resolve_keymint_version(
+    served: Option<i32>,
+    vintf: Option<i32>,
+    from_android: impl FnOnce() -> i32,
+) -> i32 {
+    served.or(vintf).unwrap_or_else(from_android)
 }
 
 fn normalize_keymint_version(version: i32) -> Option<i32> {
@@ -516,22 +504,6 @@ mod tests {
         assert!(strongbox.unique_id.len() <= 32);
         assert!(tee.unique_id.is_ascii());
         assert!(strongbox.unique_id.is_ascii());
-    }
-
-    #[test]
-    fn served_version_overrides_vintf_and_android() {
-        assert_eq!(
-            resolve_keymint_version(Some(KEYMINT_V4), Some(KEYMINT_V3), || KEYMINT_V4),
-            KEYMINT_V4
-        );
-        assert_eq!(
-            resolve_keymint_version(None, Some(KEYMINT_V3), || KEYMINT_V4),
-            KEYMINT_V3
-        );
-        assert_eq!(
-            resolve_keymint_version(None, None, || KEYMINT_V4),
-            KEYMINT_V4
-        );
     }
 
     #[test]

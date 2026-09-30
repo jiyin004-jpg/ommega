@@ -206,17 +206,6 @@ pub struct RemoteAttestParams {
     /// extension (`attestationSecurityLevel`/`keymasterSecurityLevel`) with the
     /// same level the A-side reported. Defaults to TEE when absent.
     pub security_level: Option<i32>,
-    /// Device-property / ID-attestation values the app asked to be attested, as
-    /// `(KeyMint tag, raw value)` pairs (710..=717, plus 723 for the second
-    /// IMEI). Forwarded verbatim so
-    /// the minted certificate carries the same `KM_TAG_ATTESTATION_ID_*`
-    /// entries a real device would emit: Android 15's
-    /// `setDevicePropertiesAttestationIncluded(true)` makes the framework add
-    /// brand/device/product/manufacturer/model to every key-generation request,
-    /// and classic ID attestation adds serial/IMEI/MEID. Dropping them here is
-    /// what makes a relay-minted chain look like it has no device properties at
-    /// all (TrustAttestor: `hardware.attestation.device_properties`).
-    pub attestation_ids: Vec<(u32, Vec<u8>)>,
     /// User-authentication / authorization-list entries the app asked for, as
     /// `(KeyMint tag, raw value)` pairs:
     ///

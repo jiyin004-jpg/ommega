@@ -126,7 +126,6 @@ ErrorCode = &(
     ErrorCode_Unimplemented: -100,
     ErrorCode_VersionMismatch: -101,
     ErrorCode_UnknownError: -1000,
-    ErrorCode_RemoteKeyNotFound: -10001,
     ErrorCode_EncodingError: -20000,
     ErrorCode_BoringSslError: -30000,
 )

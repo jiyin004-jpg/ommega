@@ -1389,7 +1389,7 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
     }
 
     if profile.version_number >= KeyMintDevice::KEY_MINT_V4 {
-        if let Some(bundle) = crate::global::module_hash_attestation_bundle() {
+        if let Some(bundle) = crate::global::module_info_bundle() {
             let resp = ta.process_req(PerformOpReq::SetAdditionalAttestationInfo(
                 kmr_wire::SetAdditionalAttestationInfoRequest {
                     info: vec![KeyParam::ModuleHash(bundle.sha256.clone())],
@@ -1400,7 +1400,7 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
                     .context(err!("Failed to set additional attestation info"));
             }
         } else {
-            warn!("moduleHash attestation bootstrap skipped: APEX module info bundle unavailable or remote attestation is enabled");
+            warn!("moduleHash attestation bootstrap skipped because APEX module info bundle is unavailable");
         }
     } else {
         info!(

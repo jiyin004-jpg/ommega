@@ -68,57 +68,6 @@ restart of the injector or keystore2. Whether a handled request is served
 locally or by the remote relay is decided elsewhere and does **not** change
 with this switch.
 
-### Outbound interface (VPN bypass)
-
-While a VPN is up, the OS routes ordinary traffic into its tunnel. The relay
-connection to our own server gets caught by the same rules, so it also leaves
-through the tunnel: slower, jittery, and in the bad cases unreachable. The
-daemon therefore binds its sockets to a physical uplink (`SO_BINDTODEVICE`) so
-they stay out of the tunnel.
-
-`bind_iface` in that same `config` file controls it:
-
-- absent or `auto` — bind only while a VPN is up (default)
-- `none` / `off` — never bind
-- `always` / `on` — always bind to the detected uplink
-- any other value — treated as a device name and used as-is (`wlan0`)
-
-Auto-detection prefers wired, then WiFi, then cellular, and only considers
-devices that currently hold an IPv4 address; `lo`, `dummy*`, `tun*`, `tap*`,
-`ppp*` and the other virtual devices are never picked.
-
-Holding an address is not the same as having a working route. A phone joined to
-a WiFi network whose upstream is down still gets a DHCP lease, so `wlan0` looks
-perfectly healthy while everything sent through it disappears — ranking by name
-alone then pins WiFi forever and forwarding stays broken until you find a
-working network.
-
-So when there is actually something to choose between, the candidates are probed
-at the same time and the first one to answer wins.  The probe goes to the relay's
-own liveness endpoint (`/api/ping/`) and only counts if the body comes back as
-`pong`, so a captive portal or a carrier interstitial that swallows the request
-cannot pass itself off as a working link.  Every request re-races, so
-the choice follows the network rather than a cached guess: a WiFi link whose
-upstream died simply never answers and loses on its own, with nobody having to
-notice and nothing waiting for a cached decision to expire.  A single candidate
-is never probed — with only mobile data, or only WiFi, up there is nothing to
-pick between, so it is used straight away.  If nothing answers, the socket is
-left unbound rather than pinned to a link that just proved it cannot reach the
-relay — pinning one anyway is the original bug.
-
-Only the probe races.  The real request still goes out exactly once, over the
-winner: attestation is not idempotent, and sending it down both links would make
-the B-side TEE do the work twice.
-
-Without a VPN nothing is bound, so the OS keeps its own WiFi/cellular failover.
-
-One caveat: if `url:` is a hostname, the system resolver may answer from the
-VPN's fake-IP pool while a VPN is up (`198.18.0.0/16` is the Clash default).
-Those addresses are only reachable through the tunnel, so a socket bound to a
-physical uplink cannot reach them — it will just time out. Point `url:` at an
-IP address if you rely on this. The default `auto` mode hits this too, since it
-binds exactly when a VPN is up.
-
 ### Bundled PathMask kernel module (`kmod-loader.sh`)
 
 The module ships the official PathMask `.ko` builds (see

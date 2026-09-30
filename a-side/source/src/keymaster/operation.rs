@@ -151,7 +151,7 @@ use crate::watchdog as wd;
 use anyhow::{anyhow, Context, Result};
 use log::{error, warn};
 use rsbinder as binder;
-use rsbinder::{ExceptionCode, Status, Strong};
+use rsbinder::{Status, Strong};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, Weak},
@@ -452,29 +452,13 @@ impl Operation {
         let output = self
             .update_outcome(&mut outcome, {
                 let _wp = self.watch("Operation::finish: calling IKeyMintOperation::finish");
-                let result = self.km_op.finish(
+                map_km_error(self.km_op.finish(
                     input,
                     signature,
                     hat.as_ref(),
                     tst.as_ref(),
                     confirmation_token.as_deref(),
-                );
-                // Ommega: the A-side relay backend reports a remote key whose
-                // private half exists on no fulfilment layer with the private
-                // `RemoteKeyNotFound` KeyMint code.  Map it (and only it) onto
-                // the Keystore `KEY_NOT_FOUND` the app expects, so a retrying
-                // client stops.  Every other KeyMint result keeps the standard
-                // `map_km_error` treatment.
-                match result {
-                    Err(status)
-                        if status.exception_code() == ExceptionCode::ServiceSpecific
-                            && status.service_specific_error()
-                                == kmr_wire::keymint::ErrorCode::RemoteKeyNotFound as i32 =>
-                    {
-                        Err(Error::Rc(ResponseCode::KEY_NOT_FOUND))
-                    }
-                    other => map_km_error(other),
-                }
+                ))
             })
             .context(ks_err!("Finish failed for {:?}", self.owner))?;
 

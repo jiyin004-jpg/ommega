@@ -96,8 +96,8 @@ impl<const N: usize> SecureDeletionSecretManager for InMemorySlotManager<N> {
 
     fn delete_all(&mut self) {
         self.factory_secret = None;
-        for slot in self.slots.iter_mut() {
-            *slot = None;
+        for idx in 0..N {
+            self.slots[idx] = None;
         }
     }
 }

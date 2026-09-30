@@ -700,21 +700,17 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
     // WebUI 的「远程不通就退回本地」开关，落盘写的是 `local_hw`（老配置写
     // `local_depend_hardware`）。legacy client-a 一直都退，所以缺省就是 true —— 但这个键
     // 以前没人读（写下去的 `local_hw` 白写），现在归位：它就是 `remote.fallback_local`。
-    let fallback_local = !matches!(
-        get(&["local_hw", "local_depend_hardware"])
-            .map(|v| v.to_lowercase())
-            .as_deref(),
-        Some("0" | "false" | "no" | "off")
-    );
+    let fallback_local = match get(&["local_hw", "local_depend_hardware"])
+        .map(|v| v.to_lowercase())
+        .as_deref()
+    {
+        Some("0" | "false" | "no" | "off") => false,
+        _ => true,
+    };
 
     // SOTER uid 替身映射（`soter_uid_map: 10490=10373`）。不解析成结构：这里只负责把
     // 原串交给 `soter_relay`，解析 + 单测都在那边，免得两处对格式的理解跑偏。
     let soter_uid_map = get(&["soter_uid_map", "soter_uid_replace"])
-        .unwrap_or_default()
-        .to_string();
-
-    // 转发流量要不要绑网卡（绕开 VPN）。缺省是 auto，语义见 remote::desired_iface。
-    let bind_iface = get(&["bind_iface", "iface", "bind_interface", "uplink_iface"])
         .unwrap_or_default()
         .to_string();
 
@@ -725,7 +721,6 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         device_id,
         tls_insecure,
         fallback_local,
-        bind_iface,
         debug_logging,
         hide_strongbox,
         soter_hide,
@@ -782,12 +777,6 @@ pub struct RemoteConfig {
     pub tls_insecure: bool,
     /// Fall back to local software keybox attestation when the remote is unreachable.
     pub fallback_local: bool,
-    /// 连 relay server 时把 socket 绑到哪个网卡（`/data/adb/ommega/config` 的
-    /// `bind_iface`）。空（或缺省）= `auto`：只在检测到 VPN 时才绑到物理上行网卡，
-    /// 让转发流量绕开 VPN 的路由；`none` / `off` 表示永不绑；`always` / `on`
-    /// 表示无条件绑；其余值当作网卡名直接用。见 `remote::desired_iface`。
-    #[serde(default)]
-    pub bind_iface: String,
     /// Extra remote-relay diagnostic logging (`debug_logging` / `debug` /
     /// `verbose` in `/data/adb/ommega/config`, client-a semantics).
     #[serde(default)]
@@ -837,7 +826,6 @@ impl Default for RemoteConfig {
             // operators who pin a proper CA set `tls_insecure = false`.
             tls_insecure: true,
             fallback_local: true,
-            bind_iface: String::new(),
             debug_logging: false,
             hide_strongbox: false,
             soter_hide: false,

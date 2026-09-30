@@ -553,20 +553,6 @@ impl crate::KeyMintTa {
         self.add_keymint_tags(&mut chars, KeyOrigin::Generated)?;
         let _ = keygen_info;
         let root_of_trust = crate::cert::parse_remote_root_of_trust(leaf_der)?;
-        // Remember the KeyMint version the serving device stamped into the
-        // chain. The A-side HAL must report the same version (see
-        // `kmr_common::served_keymint_version`), otherwise the served chain
-        // disagrees with `getHardwareInfo()` / the A-side VINTF declaration
-        // and detectors flag a KeyMint version mismatch. Persisted so it also
-        // survives a process restart.
-        if let Some(rot) = root_of_trust.as_ref() {
-            let version = if rot.attestation_version > 0 {
-                rot.attestation_version
-            } else {
-                rot.keymaster_version
-            };
-            kmr_common::served_keymint_version::record_served_keymint_version(version);
-        }
         let remote_key = KeyMaterial::Remote(crypto::RemoteRef {
             alias,
             public_key,
@@ -1282,24 +1268,6 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
             KeyParam::CertificateNotAfter(date) => {
                 out.certificate_not_after_ms = Some(date.ms_since_epoch)
             }
-            // Device properties / ID attestation (710..=717, plus the second IMEI
-            // at 723). The local software path
-            // (`cert::AttestationIds::new_from_key_params`) writes these into the
-            // certificate from the *device's* provisioned IDs; the remote path has
-            // to forward the requested values instead, or the B-side leaf comes
-            // back without any of them.
-            KeyParam::AttestationIdBrand(v) => out.attestation_ids.push((710, v.clone())),
-            KeyParam::AttestationIdDevice(v) => out.attestation_ids.push((711, v.clone())),
-            KeyParam::AttestationIdProduct(v) => out.attestation_ids.push((712, v.clone())),
-            KeyParam::AttestationIdSerial(v) => out.attestation_ids.push((713, v.clone())),
-            KeyParam::AttestationIdImei(v) => out.attestation_ids.push((714, v.clone())),
-            KeyParam::AttestationIdMeid(v) => out.attestation_ids.push((715, v.clone())),
-            KeyParam::AttestationIdManufacturer(v) => out.attestation_ids.push((716, v.clone())),
-            KeyParam::AttestationIdModel(v) => out.attestation_ids.push((717, v.clone())),
-            // 723, not 718: 718 is `VENDOR_PATCHLEVEL` (`TagType.UINT | 718`), so
-            // forwarding the second IMEI as 718 makes the other side read it as a
-            // vendor patch level.
-            KeyParam::AttestationIdSecondImei(v) => out.attestation_ids.push((723, v.clone())),
             // User-authentication / authorization-list tags. These are copy-only
             // in the leaf: the local software path enforces the policy from the
             // key blob and derives the AuthorizationList from the *key params*

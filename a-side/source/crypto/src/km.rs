@@ -247,7 +247,7 @@ pub fn ecdh_compute_key(
 ) -> Result<ZVec, Error> {
     let peer =
         p521::PublicKey::from_sec1_bytes(pub_key).map_err(|_| Error::ECDHComputeKeyFailed)?;
-    let shared = p521::ecdh::diffie_hellman(priv_key.0.to_nonzero_scalar(), peer.as_affine());
+    let shared = p521::ecdh::diffie_hellman(&priv_key.0.to_nonzero_scalar(), peer.as_affine());
     let mut out = ZVec::new(ECDH_P521_OUTPUT_LEN)?;
     let bytes = shared.raw_secret_bytes();
     let pad = ECDH_P521_OUTPUT_LEN.saturating_sub(bytes.len());
