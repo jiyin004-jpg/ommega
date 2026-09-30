@@ -415,9 +415,11 @@ impl crate::KeyMintTa {
         // `/strongbox` HAL here was tried but failed on devices where that HAL
         // is declared but not servable from the keystore context (Unknown error
         // -1000), so it is not wired in.
+        // 这里看的是 `attest_remote` 而不是 `enabled`：A 端可以被告知把认证链改成本地
+        // 铸（`attest_local`），同时 relay 继续为远程 key 提供 sign/decrypt。
         let remote_attest = get_opt_tag_value!(params, AttestationChallenge)?.is_some()
             && attestation_key.is_none()
-            && self.dev.remote.as_ref().is_some_and(|r| r.enabled());
+            && self.dev.remote.as_ref().is_some_and(|r| r.attest_remote());
         if remote_attest {
             // `Ok(None)` from the remote backend means it was unavailable; fall
             // back to the local software keybox when `fallback_local` allows.

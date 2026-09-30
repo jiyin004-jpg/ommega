@@ -697,6 +697,17 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
+    // WebUI 的「认证出链走本地」开关：远端整体照用（sign/decrypt 继续转发），只有带
+    // challenge、又没带 ATTEST_KEY 的那条认证出链改成 A 端自己签。
+    // 为什么要有它：远端出链比本地那条臂慢一个网络往返，同一台机器上拿两条臂的耗时
+    // 对比就能看出流量被中转（实测 ~131ms vs ~8ms），检测方据此判定「证书被后处理」。
+    let attest_local = matches!(
+        get(&["attest_local", "local_attest", "attest_local_only"])
+            .map(|v| v.to_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    );
+
     // WebUI 的「远程不通就退回本地」开关，落盘写的是 `local_hw`（老配置写
     // `local_depend_hardware`）。legacy client-a 一直都退，所以缺省就是 true —— 但这个键
     // 以前没人读（写下去的 `local_hw` 白写），现在归位：它就是 `remote.fallback_local`。
@@ -725,6 +736,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         device_id,
         tls_insecure,
         fallback_local,
+        attest_local,
         bind_iface,
         debug_logging,
         hide_strongbox,
@@ -782,6 +794,15 @@ pub struct RemoteConfig {
     pub tls_insecure: bool,
     /// Fall back to local software keybox attestation when the remote is unreachable.
     pub fallback_local: bool,
+    /// WebUI 的「认证出链走本地」开关（flat 配置里的 `attest_local`）。开着时
+    /// 远端整体照用——远程 key 的 sign/decrypt 继续转发——但带 attestation
+    /// challenge 且调用方没自带 attest key 的那条 `generateKey` 改成用本地
+    /// keybox 铸链，不上 B 端 TEE。缺省 false（认证走远端，历史行为）。
+    ///
+    /// 留着它是为了不让「本地那条臂 vs 远端那条臂」的耗时差被当成时序侧信道
+    /// 测出来（实测 ~131ms vs ~8ms）。
+    #[serde(default)]
+    pub attest_local: bool,
     /// 连 relay server 时把 socket 绑到哪个网卡（`/data/adb/ommega/config` 的
     /// `bind_iface`）。空（或缺省）= `auto`：只在检测到 VPN 时才绑到物理上行网卡，
     /// 让转发流量绕开 VPN 的路由；`none` / `off` 表示永不绑；`always` / `on`
@@ -837,6 +858,7 @@ impl Default for RemoteConfig {
             // operators who pin a proper CA set `tls_insecure = false`.
             tls_insecure: true,
             fallback_local: true,
+            attest_local: false,
             bind_iface: String::new(),
             debug_logging: false,
             hide_strongbox: false,
