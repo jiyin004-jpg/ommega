@@ -706,6 +706,20 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                 {
                     key_missing = Some(msg.clone());
                 }
+                // 设备自己说「这个 alias 的私钥不在我这」时，后面的顶替层
+                // （keybox / self_signed）一律不许接手：它们手里的钥匙跟 App
+                // 那把不是一对，签出来的东西 App 一验就废，只会原地无限重试
+                // （线上 `ommega-remote-80a3ffcdf5153abf` 就这么刷了 9 万条
+                // 日志，把 B 那条单线程队列占满，顺带拖慢所有远端 op）。
+                // 把原因原样交回 A 端，让它在那台设备上原地重建。
+                if b_said_key_missing(layer, &msg) {
+                    tracing::info!(
+                        "run_a_side_task: type={task_type} layer=b reported missing key; \
+                         skipping keybox/self_signed substitution for {device_id}"
+                    );
+                    last_error = Some(msg.clone());
+                    break;
+                }
                 last_error = Some(msg);
             }
             None => {
@@ -731,6 +745,15 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
 // ---------------------------------------------------------------------------
 // Basic endpoints
 // ---------------------------------------------------------------------------
+
+/// 设备层（`layer == "b"`）是否明确回了「这个 alias 没私钥」。
+///
+/// 只认这一种措辞，因为它是「不是网络、不是时序，而是 key 真不在这」的意思：
+/// 真机说了这句之后，再把服务端自己那把 keybox 的签名顶上去就是另一把钥匙，
+/// 拿不回原样。
+fn b_said_key_missing(layer: &str, msg: &str) -> bool {
+    layer == "b" && msg.contains("no key for alias")
+}
 
 pub async fn ping() -> &'static str {
     "pong"
@@ -1737,6 +1760,35 @@ mod strongbox_smart_tests {
             chain_attestation_security_level(&json!({ "cert_chain": ["bm90IGRlcg=="] })),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod key_missing_substitution_tests {
+    use super::*;
+
+    /// 真机说了「没这个 key」⇒ 后面的层不许顶替。
+    #[test]
+    fn device_layer_missing_key_blocks_substitution() {
+        assert!(b_said_key_missing(
+            "b",
+            "no key for alias 'ommega-remote-80a3ffcdf5153abf' (call attest first)"
+        ));
+    }
+
+    /// 别的层的同类措辞不算：keybox 自己说没 session 是另一回事。
+    #[test]
+    fn other_layers_do_not_block() {
+        assert!(!b_said_key_missing("keybox", "no key for alias 'x'"));
+        assert!(!b_said_key_missing("self_signed", "no key for alias 'x'"));
+    }
+
+    /// 超时 / 没设备在线这类不是「key 不在这」，该走回退阶梯。
+    #[test]
+    fn timeouts_are_not_key_missing() {
+        assert!(!b_said_key_missing("b", "task timeout: no B-side result"));
+        assert!(!b_said_key_missing("b", "no B-side device online"));
+        assert!(!b_said_key_missing("b", "empty cert chain from B device"));
     }
 }
 
