@@ -35,6 +35,7 @@ const SERVICE_CANDIDATES: &[&str] = &[
     "vendor.qti.hardware.soter@1.0-service",
     "vendor.trustonic.soter@1.0-service",
     "vendor.trustonic.soter-1-0",
+    "vendor.xiaomi.hardware.soterservice@1.0-service",
 ];
 
 static FAILURES: Mutex<u32> = Mutex::new(0);
