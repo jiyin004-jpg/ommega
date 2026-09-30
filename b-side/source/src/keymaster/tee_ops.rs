@@ -542,8 +542,12 @@ fn build_attestation_params(
     // A-side's auth token cannot reach the B-side real TEE.  Without
     // NO_AUTH_REQUIRED the TEE mints a user-auth-gated key and every relay
     // begin(SIGN) fails with KEY_USER_NOT_AUTHENTICATED (-26).  The relay
-    // always signs without a token, so the key must be usable without auth.
-    params.push(KeyParam::NoAuthRequired);
+    // always signs without a token, so the key must be usable without auth —
+    // but only as long as the app's own authorization list has not already
+    // answered the question (see `needs_relay_no_auth_required`).
+    if needs_relay_no_auth_required(&spec.user_auth) {
+        params.push(KeyParam::NoAuthRequired);
+    }
 
     match algo {
         KmAlgorithm::Rsa => {
@@ -656,6 +660,20 @@ fn attestation_id_param(tag: u32, value: Vec<u8>) -> Result<KeyParam> {
 // ---------------------------------------------------------------------------
 // Read-only helpers.
 // ---------------------------------------------------------------------------
+
+/// Whether the relay still has to add `NO_AUTH_REQUIRED` itself.
+///
+/// The A-side forwards `NO_AUTH_REQUIRED` (503) for every ordinary key, so the
+/// relay adding a second one is a *duplicate tag*; and `USER_SECURE_ID` (502)
+/// is the opposite requirement, so `NO_AUTH_REQUIRED` next to it is a
+/// *contradiction*.  The qti TEE answers `ServiceSpecific(-40)` for both, which
+/// made every such request fail on the B side and fall through to the server
+/// keybox layer (whose public keybox is on Google's revocation list) instead of
+/// getting a real-TEE chain.  The A-side's keybox layer drops 503 in exactly the
+/// same situation (`server/src/cert.rs`), so this keeps both layers consistent.
+fn needs_relay_no_auth_required(user_auth: &[(u32, i64)]) -> bool {
+    !user_auth.iter().any(|(tag, _)| *tag == 502 || *tag == 503)
+}
 
 /// Rebuild the `KeyParam` variant for a user-auth tag the A-side forwarded inside
 /// `device_attest_context.user_auth`. A tag that is not part of the
@@ -900,4 +918,87 @@ fn spki_from_cert_der(der: &[u8]) -> Result<Vec<u8>> {
 fn is_dead_object_status(status: &rsbinder::Status) -> bool {
     status.exception_code() == rsbinder::ExceptionCode::TransactionFailed
         && status.transaction_error() == rsbinder::StatusCode::DeadObject
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key the app never said anything about user auth for still has to be
+    /// usable without a token, so the relay adds the tag itself.
+    #[test]
+    fn relay_adds_no_auth_required_when_app_is_silent() {
+        assert!(needs_relay_no_auth_required(&[]));
+        assert!(needs_relay_no_auth_required(&[(504, 2)]));
+        assert!(needs_relay_no_auth_required(&[(504, 2), (505, 30_000)]));
+        assert!(needs_relay_no_auth_required(&[(506, 1)]));
+        assert!(needs_relay_no_auth_required(&[(509, 1)]));
+    }
+
+    /// The A-side forwards `NO_AUTH_REQUIRED` (503) for every ordinary key. A
+    /// second copy is a duplicate tag, which the qti TEE answers with
+    /// `ServiceSpecific(-40)` — that is what pushed every ordinary request to
+    /// the server keybox layer. Regression guard for the `user_auth=[[503,1]]`
+    /// shape (200 requests in one TrustAttestor scan).
+    #[test]
+    fn relay_does_not_duplicate_app_no_auth_required() {
+        assert!(!needs_relay_no_auth_required(&[(503, 1)]));
+        assert!(!needs_relay_no_auth_required(&[(503, 1), (503, 1)]));
+        assert!(!needs_relay_no_auth_required(&[
+            (503, 1),
+            (504, 2),
+            (505, 30_000)
+        ]));
+        assert!(!needs_relay_no_auth_required(&[(509, 1), (503, 1)]));
+    }
+
+    /// `USER_SECURE_ID` asks for the opposite of NO_AUTH_REQUIRED; the pair is
+    /// contradictory, so the relay leaves the auth binding to the app (the
+    /// server keybox layer drops 503 the same way).
+    #[test]
+    fn relay_does_not_contradict_user_secure_id() {
+        assert!(!needs_relay_no_auth_required(&[(502, 4242)]));
+        assert!(!needs_relay_no_auth_required(&[(502, 4242), (504, 2)]));
+        assert!(!needs_relay_no_auth_required(&[
+            (502, 6_862_392_016_876_761_225),
+            (504, 2)
+        ]));
+    }
+
+    #[test]
+    fn user_auth_tags_map_to_the_authorization_list() {
+        assert!(matches!(
+            user_auth_param(502, 4242).unwrap(),
+            KeyParam::UserSecureId(4242)
+        ));
+        assert!(matches!(
+            user_auth_param(503, 1).unwrap(),
+            KeyParam::NoAuthRequired
+        ));
+        assert!(matches!(
+            user_auth_param(504, 2).unwrap(),
+            KeyParam::UserAuthType(2)
+        ));
+        assert!(matches!(
+            user_auth_param(505, 30_000).unwrap(),
+            KeyParam::AuthTimeout(30_000)
+        ));
+        assert!(matches!(
+            user_auth_param(506, 1).unwrap(),
+            KeyParam::AllowWhileOnBody
+        ));
+        assert!(matches!(
+            user_auth_param(507, 1).unwrap(),
+            KeyParam::TrustedUserPresenceRequired
+        ));
+        assert!(matches!(
+            user_auth_param(508, 1).unwrap(),
+            KeyParam::TrustedConfirmationRequired
+        ));
+        assert!(matches!(
+            user_auth_param(509, 1).unwrap(),
+            KeyParam::UnlockedDeviceRequired
+        ));
+        assert!(user_auth_param(510, 1).is_err());
+    }
 }
