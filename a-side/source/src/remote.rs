@@ -1087,6 +1087,23 @@ impl RemoteRelay {
                 Value::from(i64::from(security_level)),
             );
         }
+        // 把本机对外宣称的 KeyMint 版本也带上：服务端 keybox 层原来只能按
+        // `os_version` 猜（Android 16 → 400），而本机实际是 300，于是同一次认证里
+        // 只要一个算法落到 B 的 TEE、另一个落到 keybox，两条链的
+        // attestationVersion/keymasterVersion 就对不上（TrustAttestor 的
+        // `hardware.attestation.algorithm_differential`）。
+        let advertised_version =
+            crate::plat::keymint_profile::advertised_version(params.security_level.unwrap_or(1));
+        if advertised_version > 0 {
+            ctx.insert(
+                "attest_record_version".to_string(),
+                Value::from(i64::from(advertised_version)),
+            );
+            ctx.insert(
+                "keymint_record_version".to_string(),
+                Value::from(i64::from(advertised_version)),
+            );
+        }
         // Device properties / ID attestation the app asked to be attested, as
         // `[tag, base64(value)]` pairs (710..=717, plus 723 for the second IMEI). A
         // real device puts

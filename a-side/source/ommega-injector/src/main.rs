@@ -30,10 +30,14 @@ const SOTER_HOST_PROCESS: &str = "com.tencent.soter.soterserver";
 ///
 /// 各家 HAL 的进程名不一样，摆一起挨个试：高通是 `vendor.qti.hardware.soter-service`，
 /// 联发科走 Trustonic 那套的叫 `vendor.trustonic.soter@1.0-service`（一加 PLC110 实测，
-/// 它上面根本没有高通那个进程）。两个都没有也不当事 —— 宿主那条路照样是通的。
-const SOTER_HAL_PROCESSES: [&str; 2] = [
+/// 它上面根本没有高通那个进程），小米是个单独的 HIDL 服务，按 HIDL 的老规矩叫
+/// `vendor.xiaomi.hardware.soterservice@1.0-service`。一个都没匹配上也不当事 ——
+/// 宿主那条路（app → 宿主 → HAL）本来就在宿主进程里，这条只为了 `service call` 那种
+/// 绕开宿主直接打 HAL 的流量。
+const SOTER_HAL_PROCESSES: [&str; 3] = [
     "vendor.qti.hardware.soter-service",
     "vendor.trustonic.soter@1.0-service",
+    "vendor.xiaomi.hardware.soterservice@1.0-service",
 ];
 
 /// 已经注过的目标不要再注第二遍：payload 是同一个可执行文件，dlopen 第二次就是第二份

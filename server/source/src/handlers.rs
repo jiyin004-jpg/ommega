@@ -991,12 +991,18 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     // B 端这层到底是不是结构性地做不了（没有设备、设备没报 SOTER、TA 结构性报错）。
     // 只有它成立，服务端那两层接上之后才允许把槽位挪过去。
     let mut b_structural = b_target.is_none();
+    // 设备层那个失败答复（结构性失败也带着真错误码）。服务端两层都接不了这个槽位的时候
+    // 把它原样还回去 —— 比递一个「钥匙不在这层」的 -5 准得多。
+    let mut b_error_reply: Option<Value> = None;
 
     for &layer in &layers {
         let result = match layer {
             "b" => match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
                 Some(b) => {
                     b_structural = b.unavailable;
+                    if let Some(reply) = b.hardware_reply.clone() {
+                        b_error_reply = Some(reply);
+                    }
                     Some(b.value)
                 }
                 None => None,
@@ -1006,7 +1012,22 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         };
         match result {
             Some(v) if v.get("error").is_none() => {
-                tracing::info!("soter: op={op} layer={layer} ok");
+                // 服务端这两层的钥匙各是各的（`soter_mint` 的 `Store::auth` 按
+                // `{device}|{uid}|{alias}` 存），槽位建在 B 上的钥匙它们手里没有，于是
+                // 「用已有钥匙」的 op 会回 -5/-6/-8。那不是「做成了」，是「这层没这把
+                // 钥匙」；当成成功递出去，App 会以为钥匙丢了 —— 实测 Duck Detector 就是
+                // 这么报 soter damaged 的。这种答复不算数，接着往下走。
+                if let Some(code) = server_layer_missed_the_slot(layer, op, &v) {
+                    let detail = format!(
+                        "{layer}: 这层没有这个槽位的材料（{code} {}）",
+                        soter_error_name(code)
+                    );
+                    tracing::info!("soter: op={op} layer={layer} cannot serve this slot: {detail}");
+                    last_error = Some(detail);
+                    continue;
+                }
+                let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+                tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
                 state
                     .soter_gate
                     .record(requested, op, gate_uid, alias_arg, layer == "b", &v);
@@ -1034,6 +1055,19 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     }
 
     let detail = last_error.unwrap_or_else(|| "no layer could serve the request".to_string());
+    if let Some(reply) = b_error_reply {
+        // 服务端那两层接不了这笔（材料在真机上，它们手里没有），把设备层的答复还回去：
+        // App 该看到的是「这台设备真实出了什么毛病」，而不是「这把钥匙不在这层」。
+        //
+        // 码先取出来：`tracing` 宏展开里自带一个叫 `Value` 的东西，写在宏参数里会被它抢走
+        // （`error[E0782]: expected a type, found a trait`）。
+        let code = reply.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+        tracing::warn!(
+            "soter: op={op} requested={requested} 服务端两层都接不了这个槽位（{detail}），\
+             把设备层的答复还回去 code={code}"
+        );
+        return Json(reply).into_response();
+    }
     tracing::warn!("soter: op={op} requested={requested} all layers failed (last: {detail})");
     json_err(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1058,6 +1092,7 @@ async fn try_b_soter_layer(
                 "error": "no B-side device reporting SOTER support is online",
             }),
             unavailable: true,
+            hardware_reply: None,
         });
     };
     if !requested.is_empty() && target != requested {
@@ -1082,6 +1117,7 @@ async fn try_b_soter_layer(
                 ),
             }),
             unavailable: true,
+            hardware_reply: Some(reply),
         });
     }
     // 这里返回的是设备自己的答复，包括 `-26`「这会儿没人按指纹」和超时 —— 那是
@@ -1089,6 +1125,7 @@ async fn try_b_soter_layer(
     Some(BSoterLayer {
         value: reply,
         unavailable: false,
+        hardware_reply: None,
     })
 }
 
@@ -1100,6 +1137,10 @@ async fn try_b_soter_layer(
 struct BSoterLayer {
     value: Value,
     unavailable: bool,
+    /// 结构性失败时设备层那个原始答复（带着真错误码）。服务端那两层接不了同一个
+    /// 槽位的时候要把它还给 App —— 该让人看见的是「这台设备真实出了什么毛病」，
+    /// 而不是「这把钥匙不在这层」的 -5。
+    hardware_reply: Option<Value>,
 }
 
 /// 这一轮下来该把 `(device, uid)` 槽位钉在哪一层（`None` = 别碰钉子）。
@@ -1173,6 +1214,37 @@ fn soter_error_name(code: i64) -> &'static str {
         -1000 => "SOTER_ERROR_UNKNOWN_ERROR",
         _ => "unknown SOTER error",
     }
+}
+
+/// 「用已有钥匙」的 op：槽位得在同一层里把 ASK/AuthKey 建出来过，这几笔才可能成。
+///
+/// `has_auth_key` / `remove_auth_key` 这类不在里面 —— 它们的 -5 是正经答案
+/// （「你这把钥匙不在」），App 就是靠它决定要不要重建。
+const SOTER_KEY_USING_OPS: &[&str] = &["init_sign", "finish_sign", "export_auth_key_public_key"];
+
+/// 服务端那两层答成「这层没这个槽位的材料」时的那几个码。
+const SOTER_ASK_NOT_READY: i64 = -5;
+const SOTER_AUTH_KEY_NOT_READY: i64 = -6;
+const SOTER_NO_AUTH_KEY_MATCHED: i64 = -8;
+
+/// 服务端那两层（keybox / self_signed）这答复算不算「没材料、干不了这一笔」。
+///
+/// 这两层各自维护自己的 ASK/AuthKey，槽位在真机上建的钥匙它们手里没有，
+/// `init_sign` / `finish_sign` / `export_auth_key_public_key` 就会回 -5/-6/-8。
+/// 那不是说操作成功了，得当成「这层不管这一笔」继续往下试。
+///
+/// 设备层（`b`）不适用：那是这套流程里权威的那台，它的 -5 就是「这把钥匙不在」，
+/// 必须原样递给 App（`soter_device_hard_failure` 的注释里说的是同一件事）。
+fn server_layer_missed_the_slot(layer: &str, op: &str, reply: &Value) -> Option<i64> {
+    if layer == "b" || !SOTER_KEY_USING_OPS.contains(&op) {
+        return None;
+    }
+    let code = reply.get("error_code").and_then(Value::as_i64)?;
+    matches!(
+        code,
+        SOTER_ASK_NOT_READY | SOTER_AUTH_KEY_NOT_READY | SOTER_NO_AUTH_KEY_MATCHED
+    )
+    .then_some(code)
 }
 
 /// 服务端那两层：`keybox` 层得先从库里把这台设备名下的服务端身份私钥拿出来
@@ -1878,6 +1950,84 @@ mod layer_failure_msg_tests {
         assert_eq!(
             layer_failure_msg("attest", "b", &v),
             "empty cert chain from B device"
+        );
+    }
+}
+
+#[cfg(test)]
+mod soter_slot_miss_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 回归（2026-09-30，Duck Detector 那个 -5）：槽位的钥匙建在真机上，keybox 层
+    /// 手里没有，`init_sign` 回 -5 —— 这不是「签好了」，得接着往下试。
+    #[test]
+    fn a_server_layer_without_the_slot_material_is_not_a_success() {
+        for layer in ["keybox", "self_signed"] {
+            let reply = json!({ "op": "init_sign", "error_code": -5 });
+            assert_eq!(
+                server_layer_missed_the_slot(layer, "init_sign", &reply),
+                Some(-5),
+                "{layer} 回 -5 不该被当成成功"
+            );
+        }
+        for (op, code) in [
+            ("finish_sign", -5),
+            ("finish_sign", -6),
+            ("export_auth_key_public_key", -8),
+        ] {
+            let reply = json!({ "op": op, "error_code": code });
+            assert_eq!(
+                server_layer_missed_the_slot("keybox", op, &reply),
+                Some(code)
+            );
+        }
+    }
+
+    /// 真机是权威：它回什么就是什么，不能因为 -5 就把这台设备的话丢掉。
+    #[test]
+    fn the_device_layer_keeps_its_own_verdict() {
+        let reply = json!({ "op": "init_sign", "error_code": -5 });
+        assert_eq!(server_layer_missed_the_slot("b", "init_sign", &reply), None);
+    }
+
+    /// `has_auth_key` / `remove_auth_key` 这类 op 的 -5 是正经答案（「你没这把钥匙」），
+    /// App 就是靠它决定重建，不能被当成层失败。
+    #[test]
+    fn a_probe_op_keeps_its_not_found_answer() {
+        let reply = json!({ "op": "has_auth_key", "error_code": -5 });
+        assert_eq!(
+            server_layer_missed_the_slot("keybox", "has_auth_key", &reply),
+            None
+        );
+        let reply = json!({ "op": "remove_auth_key", "error_code": -6 });
+        assert_eq!(
+            server_layer_missed_the_slot("keybox", "remove_auth_key", &reply),
+            None
+        );
+    }
+
+    /// 真做成的答复照旧算成功。
+    #[test]
+    fn a_real_answer_is_still_a_success() {
+        let reply = json!({ "op": "init_sign", "error_code": 0, "session": 42 });
+        assert_eq!(
+            server_layer_missed_the_slot("keybox", "init_sign", &reply),
+            None
+        );
+    }
+
+    /// 别的码（比如 -26 没指纹）也不该被吃掉：那是 App 自己那套错误码。
+    #[test]
+    fn other_codes_are_left_alone() {
+        let reply = json!({ "op": "init_sign", "error_code": -26 });
+        assert_eq!(
+            server_layer_missed_the_slot("keybox", "init_sign", &reply),
+            None
+        );
+        assert_eq!(
+            server_layer_missed_the_slot("keybox", "init_sign", &json!({ "op": "init_sign" })),
+            None
         );
     }
 }

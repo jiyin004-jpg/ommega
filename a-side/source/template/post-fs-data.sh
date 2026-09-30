@@ -129,6 +129,38 @@ if [ -f "$TARGET_INJECTOR_CONFIG" ]; then
   chown 1017:1017 "$TARGET_INJECTOR_CONFIG"
 fi
 
+# ---- 开机期声明（config.toml 的 [trust]）----
+# 检测类 App 比对的是「链里的补丁 tag ↔ 设备属性」，而属性区是 init 开机时加载的：
+# 等 zygote/框架起来之后再写运行时属性，已 fork 出去的进程看不到（实测运行期
+# resetprop 改不动 App 的 SPL 视图）。所以显式声明必须在这一阶段写进属性区。
+# 运行期那条路（daemon 启动时写）保留，管的是我们自己铸链用的 ctx。
+# 只有显式写了值才动；auto 一律保持设备原值。
+DECLARED_CONF=$TARGET_DIR/config.toml
+if [ -f "$DECLARED_CONF" ]; then
+  # cfg_val <key>：取 config.toml 里 "key = \"value\"" 的 value（[trust] 下的键）
+  cfg_val() {
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*$/\1/p" "$DECLARED_CONF" 2>/dev/null | head -n1 | tr -d '\r'
+  }
+  d_patch=$(cfg_val security_patch)
+  # 没单写就跟着 security_patch 走，跟 Rust 侧 resolve_patch_levels 的继承顺序一致
+  d_os=$(cfg_val os_patchlevel); [ "$d_os" = auto ] && d_os=$d_patch
+  d_vendor=$(cfg_val vendor_patchlevel); [ "$d_vendor" = auto ] && d_vendor=$d_patch
+  # boot 不继承：设备原本没这个属性，凭空造一个反而多一处马脚，只认显式声明
+  d_boot=$(cfg_val boot_patchlevel)
+  for pair in "$d_os|ro.build.version.security_patch" "$d_vendor|ro.vendor.build.security_patch" "$d_boot|ro.vendor.boot_security_patch"; do
+    value=${pair%%|*}
+    prop=${pair##*|}
+    case "$value" in ""|auto) continue ;; esac
+    resetprop "$prop" "$value"
+    log_line "ommega: declared $prop=$value (boot stage)"
+  done
+  d_vbkey=$(cfg_val vb_key)
+  case "$d_vbkey" in ""|auto|random) ;; *) resetprop ro.boot.vbmeta.public_key_digest "$d_vbkey"; log_line "ommega: declared vbmeta key (boot stage)" ;; esac
+  d_vbhash=$(cfg_val vb_hash)
+  case "$d_vbhash" in ""|auto|random) ;; *) resetprop ro.boot.vbmeta.digest "$d_vbhash"; log_line "ommega: declared vbmeta hash (boot stage)" ;; esac
+  unset d_patch d_os d_vendor d_boot d_vbkey d_vbhash
+fi
+
 # ---- "声明不支持 StrongBox"（flat config 键 hide_strongbox）----
 # 挂载完全交给 root 管理器（Magisk magic mount / KernelSU overlayfs）：
 # customize.sh 安装时按设备实际情况在模块 system/<分区>/etc/permissions/ 下

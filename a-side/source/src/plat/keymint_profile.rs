@@ -60,6 +60,37 @@ pub(crate) fn resolve_hardware_profile(security_level: SecurityLevel) -> KeyMint
     }
 }
 
+/// 对外宣称的 KeyMint 版本，给中继铸链用：先看“被服务过的链里学到的版本”，
+/// 再看本机 VINTF 声明，最后才按 Android 版本推 —— 跟 `resolve_hardware_profile`
+/// 同一套优先级。VINTF 那步会摸清单/碰 HAL，这里按 level 记住；学到的值每次都
+/// 重读，所以刚学到的新版本立刻生效。
+///
+/// `security_level` 用请求里的原始值（0=software，1=TEE，2=StrongBox，3=keystore）。
+pub(crate) fn advertised_version(security_level: i32) -> i32 {
+    let level = match security_level {
+        2 => SecurityLevel::STRONGBOX,
+        1 => SecurityLevel::TRUSTED_ENVIRONMENT,
+        _ => SecurityLevel::SOFTWARE,
+    };
+    resolve_keymint_version(
+        learned_served_keymint_version(),
+        memoised_vintf_version(level),
+        fallback_keymint_version_from_android,
+    )
+}
+
+fn memoised_vintf_version(security_level: SecurityLevel) -> Option<i32> {
+    static TEE: OnceLock<Option<i32>> = OnceLock::new();
+    static STRONGBOX: OnceLock<Option<i32>> = OnceLock::new();
+    static SOFTWARE: OnceLock<Option<i32>> = OnceLock::new();
+    let slot = match security_level {
+        SecurityLevel::STRONGBOX => &STRONGBOX,
+        SecurityLevel::TRUSTED_ENVIRONMENT => &TEE,
+        _ => &SOFTWARE,
+    };
+    *slot.get_or_init(|| probe_keymint_version_from_vintf(security_level))
+}
+
 fn detect_strongbox_keymint_present() -> bool {
     let security_level = SecurityLevel::STRONGBOX;
     if system_keymint_service_name(security_level).is_some_and(|service| {

@@ -30,6 +30,7 @@
 
 pub mod fixtures;
 pub mod hal;
+pub mod hal_restart;
 pub mod hidl;
 pub mod hwbinder;
 
@@ -521,6 +522,17 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
     // 签名链路上踢掉（见 `is_hard_slot_failure`）。
     let _ = is_hard_slot_failure(op, &result);
 
+    // 顺手把这笔的结果喂给 HAL 自愈：连续 -18（安全通道不通）就重启一次那个服务。
+    // 这台机器会卡成「建料类 op 全正常、只有签名恒 -18」的半死状态，不收拾的话服务端
+    // 会把它当「结构性做不了」，把槽位换到自签那两层 —— App 拿到假料和一个误导性的
+    // -5（2026-09-30 Duck Detector 那轮就是这么来的）。见 `hal_restart`。
+    hal_restart::note(
+        result
+            .get("error_code")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    );
+
     Ok(result)
 }
 
@@ -801,12 +813,22 @@ mod tests {
     fn a_sign_failure_does_not_take_the_slot_off_this_device() {
         // 以前这里会记下 uid、24 小时不服务这个槽位。现在没有了：`handle()` 里
         // 对 `has_auth_key` 这种 op 的回包必须是 TA 自己的答复，不是我们编的。
+        //
+        // 真机（有 SOTER HAL）上跑也成立：那时候 HAL 自己会回一个 `error_code`，
+        // 同样不能带我们编的那句。原来这里写死 `expect_err`（默认跑测试的机器没
+        // 有 HAL），在一台真有 HAL 的机器上就变成必红，跟代码对错无关。
         let uid = 900001;
         let payload = json!({ "op": "has_auth_key", "uid": uid, "alias": "whatever" });
-        let text = format!(
-            "{:#}",
-            handle(&payload, true).expect_err("no HAL on a host")
-        );
+        let text = match handle(&payload, true) {
+            Err(e) => format!("{e:#}"),
+            Ok(v) => {
+                assert!(
+                    v.get("error_code").is_some(),
+                    "HAL 在的时候回包要带上它自己的 error_code: {v}"
+                );
+                String::new()
+            }
+        };
         assert!(!text.contains("not served by this device"), "err: {text}");
     }
 

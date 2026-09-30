@@ -147,14 +147,12 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("== 7. 顺带问 hwservicemanager 拿一下 SOTER 的句柄（预期没有）==");
-    match HidlSoter::open_named(
-        "vendor.qti.hardware.soter@1.0::ISoter",
-        "default",
-        IBASE_DESCRIPTOR,
-    )? {
-        Some(svc) => println!("   这台机器上居然有 HIDL 版 SOTER，句柄 {}", svc.handle()),
-        None => println!("   如预期，没有（这台机器是 AIDL 那套）"),
+    println!("== 7. 顺带问 hwservicemanager 拿一下各家 SOTER 的句柄 ==");
+    for fq_name in ommegaclient_b::soter::hidl::BACKENDS {
+        match HidlSoter::open_named(fq_name, "default", IBASE_DESCRIPTOR)? {
+            Some(svc) => println!("   {fq_name}：有，句柄 {}", svc.handle()),
+            None => println!("   {fq_name}：没有"),
+        }
     }
 
     println!("\n全部通过。");

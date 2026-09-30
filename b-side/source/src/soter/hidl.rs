@@ -2,7 +2,7 @@
 //!
 //! AIDL 那两家（`vendor.trustonic.hardware.soter.ITrustonicSoter` /
 //! `vendor.qti.hardware.soter.ISoter`）走的是 `/dev/binder`，见 [`super::hal`]。
-//! 这一家跑在 `/dev/hwbinder` 上，事务号和参数形状跟 AIDL 那两套都不一样：
+//! HIDL 这几家跑在 `/dev/hwbinder` 上，事务号和参数形状跟 AIDL 那两套都不一样：
 //!
 //! ```text
 //! HIDL  = `.hal` 里的声明顺序 1..14
@@ -37,8 +37,12 @@ pub const HIDL_QTI_FQNAME: &str = "vendor.qti.hardware.soter@1.0::ISoter";
 /// `@1.0::ITrustonicSoter@Proxy` 两个代理类都在，哪条通得看系统装的是哪种）。
 pub const HIDL_TRUSTONIC_FQNAME: &str = "vendor.trustonic.hardware.soter@1.0::ITrustonicSoter";
 
-/// 两家 HIDL 后端，按解析顺序（跟 AIDL 那份 [`super::hal::Backend::ALL`] 同序）。
-pub const BACKENDS: [&str; 2] = [HIDL_TRUSTONIC_FQNAME, HIDL_QTI_FQNAME];
+/// 小米那套的 HIDL 名字。小米把 SOTER 单独做成了 `vendor.xiaomi.hardware.soterservice`
+/// （天玑机型上常见），接口名还是 `ISoter`，方法声明顺序跟另外两家一致。
+pub const HIDL_XIAOMI_FQNAME: &str = "vendor.xiaomi.hardware.soterservice@1.0::ISoter";
+
+/// 三家 HIDL 后端，按解析顺序（跟 AIDL 那份 [`super::hal::Backend::ALL`] 同序）。
+pub const BACKENDS: [&str; 3] = [HIDL_TRUSTONIC_FQNAME, HIDL_QTI_FQNAME, HIDL_XIAOMI_FQNAME];
 
 /// 默认实例名。设备上只注册这一个。
 pub const HIDL_DEFAULT_INSTANCE: &str = "default";
@@ -79,7 +83,7 @@ pub struct HidlSoter {
 }
 
 impl HidlSoter {
-    /// 顺着 `hwservicemanager` 把服务找出来，两家vendor依次试。
+    /// 顺着 `hwservicemanager` 把服务找出来，三家vendor依次试。
     ///
     /// `Ok(None)` 是「这台机器上两家都没注册」；「有 /dev/hwbinder 但没这家服务」
     /// 也归到 `Ok(None)`（跟 AIDL 那边的语义对齐）。
