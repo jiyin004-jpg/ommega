@@ -20,7 +20,6 @@ use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -115,8 +114,6 @@ struct Inner {
 pub struct Fulfill {
     inner: Mutex<Inner>,
     enabled: AtomicBool,
-    /// 目标设备白名单：命中就走 keybox 层（`RELAY_KEYBOX_FIRST_DEVICES`）。
-    keybox_first: HashSet<String>,
     /// Cache of generated self-signed identities per (device_id, algorithm) so
     /// a device without a stored identity doesn't regenerate a fresh key (RSA
     /// keygen is slow) on every attestation.
@@ -125,11 +122,10 @@ pub struct Fulfill {
 }
 
 impl Fulfill {
-    pub fn new(enabled: bool, keybox_first: Vec<String>, db: Option<Arc<Db>>) -> Arc<Self> {
+    pub fn new(enabled: bool, db: Option<Arc<Db>>) -> Arc<Self> {
         let f = Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             enabled: AtomicBool::new(enabled),
-            keybox_first: keybox_first.into_iter().collect(),
             self_signed_cache: Mutex::new(HashMap::new()),
             db,
         });
@@ -141,12 +137,6 @@ impl Fulfill {
     /// A-side requests fall back to the physical (A/B queue) path when off.
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
-    }
-
-    /// 认证投影时要不要把 keybox 层排在 B 前面：全局开了算，或者这台目标设备
-    /// 在白名单里也算。
-    pub fn prefers_keybox(&self, device_id: &str) -> bool {
-        self.is_enabled() || self.keybox_first.contains(device_id)
     }
 
     pub fn set_enabled(&self, on: bool) {
