@@ -174,6 +174,36 @@ pub fn module_info_bundle() -> Option<&'static ModuleInfoBundle> {
     MODULE_INFO_BUNDLE.get()
 }
 
+/// APEX module info bundle to inject into a chain this device signs itself, or
+/// `None` when the A-side will not sign with a `moduleHash`.
+///
+/// Remote (B-side TEE) attestation is minted by another device and can never
+/// carry this device's APEX module info, so the A-side must not claim it. The
+/// very same predicate drives both the attestation bootstrap and
+/// `getSupplementaryAttestationInfo(Tag::MODULE_HASH)`, so the served chain and
+/// the supplementary info can never disagree (the finding where the chain
+/// omitted `moduleHash` while the supplementary query still returned a usable
+/// `Modules` DER).
+///
+/// With the remote disabled this is exactly `module_info_bundle()`, keeping the
+/// existing Android 16+ local behaviour unchanged.
+pub fn module_hash_attestation_bundle() -> Option<&'static ModuleInfoBundle> {
+    if module_hash_attestation_available(
+        module_info_bundle().is_some(),
+        crate::remote::remote_enabled(),
+    ) {
+        module_info_bundle()
+    } else {
+        None
+    }
+}
+
+/// Pure decision table behind [`module_hash_attestation_bundle`]: advertise the
+/// APEX `moduleHash` only when a bundle exists and this device signs locally.
+fn module_hash_attestation_available(has_bundle: bool, remote_enabled: bool) -> bool {
+    has_bundle && !remote_enabled
+}
+
 /// Timestamp service.
 static TIME_STAMP_DEVICE: Mutex<Option<Strong<dyn ISecureClock>>> = Mutex::new(None);
 
@@ -200,3 +230,19 @@ fn connect_secureclock() -> Result<Strong<dyn ISecureClock>> {
 /// Per RFC 5280 4.1.2.5, an undefined expiration (not-after) field should be set to GeneralizedTime
 /// 999912312359559, which is 253402300799000 ms from Jan 1, 1970.
 pub const UNDEFINED_NOT_AFTER: i64 = 253402300799000i64;
+
+#[cfg(test)]
+mod tests {
+    use super::module_hash_attestation_available;
+
+    #[test]
+    fn module_hash_is_advertised_only_for_local_signing() {
+        // Local signing with a bundle: advertise, as before.
+        assert!(module_hash_attestation_available(true, false));
+        // Remote (B-side TEE) chain: never advertise, even with a bundle.
+        assert!(!module_hash_attestation_available(true, true));
+        assert!(!module_hash_attestation_available(false, true));
+        // No bundle: nothing to advertise.
+        assert!(!module_hash_attestation_available(false, false));
+    }
+}

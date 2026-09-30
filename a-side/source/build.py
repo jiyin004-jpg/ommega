@@ -6,6 +6,7 @@ Build script for ommega-a Android targets.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import glob
 import hashlib
@@ -409,6 +410,7 @@ def build_combined_package(
     version: str,
     vcode: str,
     git_hash: str,
+    serial: bool = False,
 ) -> Path:
     """Build every selected ABI into a single module zip.
 
@@ -424,16 +426,38 @@ def build_combined_package(
 
     try:
         built: dict[str, dict[str, Path]] = {}
-        for abi in abis:
-            built[abi] = {}
+
+        def compile_one_abi(abi: str) -> tuple[str, dict[str, Path]]:
+            """Compile every binary of one ABI (kept sequential inside the ABI:
+            those builds share target/<triple>/ and cargo would serialise them
+            anyway)."""
+            compiled: dict[str, Path] = {}
             for spec in BINARY_SPECS:
-                built[abi][spec["output_name"]] = build_binary(
+                compiled[spec["output_name"]] = build_binary(
                     abi=abi,
                     target=ABI_TO_TARGET[abi],
                     release=release,
                     package=spec["package"],
                     bin_name=spec["bin"],
                 )
+            return abi, compiled
+
+        # Different ABIs land in disjoint target/<triple>/ directories with their
+        # own cargo build locks, so they are safe to compile at the same time.
+        # With lto=true + codegen-units=1 the final link of each binary is
+        # single-threaded, so running the ABIs concurrently is where the wall
+        # time actually goes.  Everything below (staging, zip) stays serial
+        # because it writes into one shared stage directory.
+        if len(abis) > 1 and not serial:
+            jobs = len(abis)
+            print(f"Compiling {len(abis)} ABIs in parallel ({jobs} jobs)...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+                for abi, compiled in pool.map(compile_one_abi, abis):
+                    built[abi] = compiled
+        else:
+            for abi in abis:
+                _, compiled = compile_one_abi(abi)
+                built[abi] = compiled
 
         if any(abi in ("arm64-v8a", "arm64") for abi in abis):
             verify_pathmask_kos()
@@ -491,6 +515,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--serial",
+        action="store_true",
+        help="Compile the selected ABIs one after another instead of in "
+        "parallel (slower; only useful to make the build log readable).",
+    )
+    parser.add_argument(
         "--version-code",
         type=int,
         default=None,
@@ -534,6 +564,7 @@ def main() -> None:
                 version=version,
                 vcode=vcode,
                 git_hash=git_hash,
+                serial=args.serial,
             )
         )
 

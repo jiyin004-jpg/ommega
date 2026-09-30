@@ -547,7 +547,7 @@ impl KeystoreService {
 
     fn get_supplementary_attestation_info(&self, tag: Tag) -> Result<Vec<u8>> {
         match tag {
-            Tag::MODULE_HASH => crate::global::module_info_bundle()
+            Tag::MODULE_HASH => crate::global::module_hash_attestation_bundle()
                 .map(|bundle| bundle.encoded_der.clone())
                 .ok_or(Error::Rc(ResponseCode::INFO_NOT_AVAILABLE))
                 .context(err!("MODULE_HASH supplementary info is unavailable")),

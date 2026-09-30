@@ -35,8 +35,11 @@ pub(crate) fn strongbox_keymint_present() -> bool {
 }
 
 pub(crate) fn resolve_hardware_profile(security_level: SecurityLevel) -> KeyMintHardwareProfile {
-    let version_number = probe_keymint_version_from_vintf(security_level)
-        .unwrap_or_else(fallback_keymint_version_from_android);
+    let version_number = resolve_keymint_version(
+        learned_served_keymint_version(),
+        probe_keymint_version_from_vintf(security_level),
+        fallback_keymint_version_from_android,
+    );
 
     if let Some(profile) = resolve_property_profile_with(
         security_level,
@@ -229,8 +232,34 @@ fn system_keymint_service_name(security_level: SecurityLevel) -> Option<&'static
     }
 }
 
+/// KeyMint version learned from a chain that was served through the remote relay,
+/// if any.
+///
+/// Only consulted while the remote relay is in use: with the remote disabled the
+/// A-side signs locally as before and must keep the VINTF/Android-derived version,
+/// even if a stale persisted value is still on disk.
+fn learned_served_keymint_version() -> Option<i32> {
+    if !crate::remote::remote_enabled() {
+        return None;
+    }
+    kmr_common::served_keymint_version::served_keymint_version()
+}
+
+/// Pick the KeyMint version to advertise: a version observed in a chain served by
+/// the remote device wins over the local VINTF declaration, which in turn wins
+/// over the version implied by the Android release.
+fn resolve_keymint_version(
+    served: Option<i32>,
+    vintf: Option<i32>,
+    from_android: impl FnOnce() -> i32,
+) -> i32 {
+    served.or(vintf).unwrap_or_else(from_android)
+}
+
 fn probe_keymint_version_from_vintf(security_level: SecurityLevel) -> Option<i32> {
-    let instance = security_level_instance(security_level)?;
+    let Some(instance) = security_level_instance(security_level) else {
+        return None;
+    };
 
     for path in kmr_common::vintf::manifest_paths() {
         let Ok(contents) = std::fs::read_to_string(&path) else {
@@ -456,6 +485,22 @@ mod tests {
         assert!(strongbox.unique_id.len() <= 32);
         assert!(tee.unique_id.is_ascii());
         assert!(strongbox.unique_id.is_ascii());
+    }
+
+    #[test]
+    fn served_version_overrides_vintf_and_android() {
+        assert_eq!(
+            resolve_keymint_version(Some(KEYMINT_V4), Some(KEYMINT_V3), || KEYMINT_V4),
+            KEYMINT_V4
+        );
+        assert_eq!(
+            resolve_keymint_version(None, Some(KEYMINT_V3), || KEYMINT_V4),
+            KEYMINT_V3
+        );
+        assert_eq!(
+            resolve_keymint_version(None, None, || KEYMINT_V4),
+            KEYMINT_V4
+        );
     }
 
     #[test]

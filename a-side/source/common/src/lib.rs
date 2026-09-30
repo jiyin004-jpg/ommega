@@ -32,6 +32,7 @@ pub mod keyblob;
 pub mod rpc;
 pub mod runtime;
 pub mod selinux;
+pub mod served_keymint_version;
 pub mod soter_relay;
 pub mod tag;
 pub mod vintf;
