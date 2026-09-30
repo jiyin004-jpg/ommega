@@ -27,6 +27,8 @@ pub struct AppState {
     pub fulfill: Arc<Fulfill>,
     pub db: Option<Arc<Db>>,
     pub geo: Option<Arc<crate::geo::Ip2Region>>,
+    /// SOTER 短 TTL 合并（削峰用），见 `crate::soter_gate`。
+    pub soter_gate: Arc<crate::soter_gate::SoterGate>,
 }
 
 fn token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -638,6 +640,11 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
     };
 
     let mut last_error: Option<String> = None;
+    // 第一处「这台设备根本没有这个 alias 的私钥」的原因，原样带到最终错误里。
+    // A 端靠这段文本（或 error_kind=no_such_key）判断「不是网络/时序问题，而是 key 不在这」，
+    // 从而决定在原地重建或回确定错误码；只在 self_signed 那层含糊地写一句
+    // 「produced no result」会把原因丢掉，A 端就只能当普通失败无限重试。
+    let mut key_missing: Option<String> = None;
     for &layer in order {
         let result = match layer {
             "b" => try_b_device_layer(state, task_type, body, &device_id, any_b_online).await,
@@ -693,6 +700,12 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                         );
                     }
                 }
+                if key_missing.is_none()
+                    && (msg.contains("no key for alias")
+                        || msg.contains("no server_keybox session"))
+                {
+                    key_missing = Some(msg.clone());
+                }
                 last_error = Some(msg);
             }
             None => {
@@ -705,7 +718,11 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
     json_err(
         StatusCode::INTERNAL_SERVER_ERROR,
         &format!(
-            "all fulfilment layers failed for device {device_id}: {}",
+            "all fulfilment layers failed for device {device_id}: {}{}",
+            key_missing
+                .as_deref()
+                .map(|m| format!("{m}; "))
+                .unwrap_or_default(),
             last_error.unwrap_or_else(|| "unknown".to_string())
         ),
     )
@@ -849,14 +866,38 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     }
     let requested = body.get("device_id").and_then(Value::as_str).unwrap_or("");
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+    let probe_uid = body
+        .get("uid")
+        .and_then(Value::as_i64)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let probe_alias = body
+        .get("alias")
+        .and_then(Value::as_str)
+        .unwrap_or("-")
+        .to_string();
     tracing::info!(
-        "soter: op={op} requested={}",
+        "soter: op={op} uid={probe_uid} alias={probe_alias} requested={}",
         if requested.is_empty() {
             "<any>"
         } else {
             requested
         }
     );
+
+    let gate_uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+    let alias_arg = body.get("alias").and_then(Value::as_str);
+    // 削峰：同一台设备上同一份只读 op（`has_auth_key` / `has_ask_already` / `export_*`）
+    // 会被 App 的 SOTER 初始化循环反复问，几秒内答案不会变；重建类 op 也会被反复重放。
+    // 命中的前提是上一次**真由这台设备答出来**（见 `soter_gate`），而且窗口极短，
+    // 设备一旦恢复下一笔就问得着。
+    if let Some(hit) = state.soter_gate.lookup(requested, op, gate_uid, alias_arg) {
+        tracing::info!(
+            "soter: op={op} uid={probe_uid} alias={} coalesced (short-TTL window)",
+            alias_arg.unwrap_or("-")
+        );
+        return Json(hit).into_response();
+    }
 
     let serverbox = state.fulfill.is_enabled();
     let order: &[&str] = if serverbox {
@@ -931,6 +972,9 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         match result {
             Some(v) if v.get("error").is_none() => {
                 tracing::info!("soter: op={op} layer={layer} ok");
+                state
+                    .soter_gate
+                    .record(requested, op, gate_uid, alias_arg, layer == "b", &v);
                 if let Some(uid) = uid {
                     if let Some(pin) = layer_to_pin(layer, b_structural) {
                         crate::soter_mint::pin_layer(requested, uid, pin);

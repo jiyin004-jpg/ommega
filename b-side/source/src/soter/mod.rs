@@ -38,7 +38,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
-use hal::{Soter, SoterData};
+use hal::{Soter, SoterData, SoterSession};
 
 /// Ops that create or delete keys on the device.
 const MUTATING_OPS: &[&str] = &[
@@ -284,6 +284,92 @@ fn is_hard_slot_failure(op: &str, result: &Value) -> bool {
     false
 }
 
+/// `-5` / `-6`：TA 说这个槽位上的 ASK / AuthKey 没就绪 —— 这两码才值得原地重建。
+/// 别的非零码（-18 安全通道、-8、-26 没指纹）都是另一回事，动设备状态只会更糟。
+const SOTER_ASK_NOT_READY_CODE: i32 = -5;
+const SOTER_AUTH_KEY_NOT_READY_CODE: i32 = -6;
+
+/// 「B 端手上没这批材料」就地补齐再重试签名。
+///
+/// 只在 mutation 开关打开时调用。先问 HAL 到底缺哪一样（ASK / AuthKey），缺什么铸
+/// 什么，然后重新建一次签名会话；补齐失败就把原始错误原样递上去 —— 宁可让上层
+/// 看到「这台真没有」，也绝不假装签成功。
+fn rebuild_material_then_sign(
+    soter: &Soter,
+    uid: i32,
+    alias: &str,
+    challenge: &str,
+    original: SoterSession,
+) -> SoterSession {
+    // 探 HAL 的返回码：0 = 有材料，非 0（-5 / -6）= 缺。探不动（HAL 报错）就当
+    // "不缺"，免得在别的问题上乱改设备状态。
+    let ask_missing = soter.has_ask_already(uid).map(|c| c != 0).unwrap_or(false);
+    let auth_missing = soter
+        .has_auth_key(uid, alias)
+        .map(|c| c != 0)
+        .unwrap_or(false);
+    if !ask_missing && !auth_missing {
+        log::warn!(
+            "soter: init_sign uid={uid} alias={alias} returned {} but the slot has material; \
+             not touching device state",
+            original.error_code
+        );
+        return original;
+    }
+    log::info!(
+        "soter: init_sign uid={uid} alias={alias} returned {}; rebuilding the slot \
+         (ask_missing={ask_missing} auth_missing={auth_missing})",
+        original.error_code
+    );
+    if ask_missing {
+        match soter.generate_ask_key_pair(uid) {
+            Ok(0) => {}
+            Ok(code) => {
+                log::warn!(
+                    "soter: rebuild ASK for uid={uid} returned {code}; keeping the original error"
+                );
+                return original;
+            }
+            Err(e) => {
+                log::warn!(
+                    "soter: rebuild ASK for uid={uid} failed: {e:#}; keeping the original error"
+                );
+                return original;
+            }
+        }
+    }
+    if auth_missing {
+        match soter.generate_auth_key_pair(uid, alias) {
+            Ok(0) => {}
+            Ok(code) => {
+                log::warn!(
+                    "soter: rebuild AuthKey uid={uid} alias={alias} returned {code}; keeping the original error"
+                );
+                return original;
+            }
+            Err(e) => {
+                log::warn!(
+                    "soter: rebuild AuthKey uid={uid} alias={alias} failed: {e:#}; keeping the original error"
+                );
+                return original;
+            }
+        }
+    }
+    match soter.init_sign(uid, alias, challenge) {
+        Ok(session) => {
+            log::info!(
+                "soter: rebuilt slot uid={uid} alias={alias}; init_sign now returns {}",
+                session.error_code
+            );
+            session
+        }
+        Err(e) => {
+            log::warn!("soter: init_sign retry after rebuild failed: {e:#}");
+            original
+        }
+    }
+}
+
 /// Handle one `soter` task payload.
 ///
 /// `allow_mutation` comes from the relay config; it gates the ops that create
@@ -348,7 +434,25 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
                 alias_of(payload)?,
                 string_arg(payload, "challenge")?,
             );
-            let session = open_soter(op)?.init_sign(uid, &alias, &challenge)?;
+            let soter = open_soter(op)?;
+            let mut session = soter.init_sign(uid, &alias, &challenge)?;
+            // 这台机器上没有这批材料：就地在原地补齐再签一次。
+            //
+            // 背景（PLC110 2026-09-30 实测）：A 端 App 的 AuthKey/SoterAuthKey 是
+            // 在 A 端本地建的，B 端手上不一定有，TA 会回 -5（ASK 没就绪）/ -6
+            // （AuthKey 没就绪）。以前这里原样递上去，服务端只能拿自签的假料顶上，
+            // App 一验不过，整个 SOTER 支付流程就炸。
+            // 用户规矩：指定的那台 B 说没有，就在原地重建，不换机器、也不退回自签。
+            //
+            // 只认 -5 / -6 这两个「没料」的码：-18（安全通道不通）、-8 这些是 TA
+            // 自己的结构性毛病，材料没问题，重建既没用、还会把人家真钥匙重铸掉。
+            if matches!(
+                session.error_code,
+                SOTER_ASK_NOT_READY_CODE | SOTER_AUTH_KEY_NOT_READY_CODE
+            ) && allow_mutation
+            {
+                session = rebuild_material_then_sign(&soter, uid, &alias, &challenge, session);
+            }
             if session.error_code == 0 {
                 // 只是建了会话，还没签出东西来：能签的证据不在这；不过槽位记住了，
                 // 探针以后可以拿它去试签。

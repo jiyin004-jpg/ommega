@@ -15,6 +15,7 @@ pub mod http;
 pub mod keybox;
 pub mod pay;
 pub mod queue;
+pub mod soter_gate;
 pub mod soter_mint;
 pub mod strongbox;
 pub mod util;
