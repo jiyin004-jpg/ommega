@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{watch, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -212,7 +212,8 @@ struct Inner {
 pub struct TaskStore {
     inner: Mutex<Inner>,
     /// Woken whenever a new pending task appears (long-poll support).
-    notify: Notify,
+    /// 有新任务、或有结果落地时递增的版本号。等的人订阅它，见 [`Self::bump_tick`]。
+    tick: watch::Sender<u64>,
     /// Sync snapshot of recently-polling device ids (seen within the online
     /// window) so blocking threads (e.g. the auto-keybox loop) can read "who is
     /// online" without taking the async `inner` lock.
@@ -273,7 +274,7 @@ impl TaskStore {
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
-            notify: Notify::new(),
+            tick: watch::channel(0u64).0,
             online_seen: std::sync::RwLock::new(HashMap::new()),
             assignment_timeout: Duration::from_secs(assignment_timeout_secs),
             pending_ttl: Duration::from_secs(pending_ttl_secs),
@@ -355,8 +356,20 @@ impl TaskStore {
                 .push_back(task_id.clone());
         }
         drop(inner);
-        self.notify.notify_waiters();
+        self.bump_tick();
         task_id
+    }
+
+    /// 叫醒所有挂着等的请求（B 端等活、A 端等结果，两处都用它）。
+    ///
+    /// 用 `watch` 的版本号，而不是 `Notify::notify_waiters()`：后者只唤醒「此刻已经
+    /// 注册上」的等待者，入队与注册之间那一瞬的通知会丢，等的人只能靠兜底轮询醒过来
+    /// —— 2026-09-30 实测，那就是远端一跳 ~180ms 的主要来源（Duck Detector 量到的
+    /// `medianRkpPath` 就是它）。`watch` 记的是版本号，迟到的等待者一 `changed()`
+    /// 立刻看见，不会丢。没有订阅者时 `send` 返回 Err，无所谓。
+    fn bump_tick(&self) {
+        let next = self.tick.borrow().wrapping_add(1);
+        let _ = self.tick.send(next);
     }
 
     /// Record a device event (must be called while holding `inner`).
@@ -406,6 +419,8 @@ impl TaskStore {
         timeout: Duration,
     ) -> Option<Task> {
         let deadline = Instant::now() + timeout;
+        // 订阅版本号：入队那一刻不管我们有没有注册上，`changed()` 都会立刻返回。
+        let mut rx = self.tick.subscribe();
         loop {
             {
                 let mut inner = self.inner.lock().await;
@@ -513,11 +528,10 @@ impl TaskStore {
             if remaining.is_zero() {
                 return None;
             }
-            // Wait for a new task or the timeout (short fallback poll prevents
-            // a lost `notify_waiters` from stalling until the full timeout).
-            let poll_interval = remaining.min(Duration::from_millis(250));
+            // 版本号变了就是有新任务或新结果；兜底轮询只防「消息真丢了」。
+            let poll_interval = remaining.min(Duration::from_millis(100));
             tokio::select! {
-                _ = self.notify.notified() => {},
+                _ = rx.changed() => {},
                 _ = tokio::time::sleep(poll_interval) => {},
             }
         }
@@ -844,6 +858,21 @@ impl TaskStore {
         } else {
             TaskStatus::Completed
         };
+        // 一段远端跳到底慢在哪里：入队→被领走（等轮询/排队）与
+        // 被领走→结果回来（B 自己干活 + 回传）分开打。A 端看到的
+        // 「RKP 路径延迟」就是这两段加上两端各自的网络往返。
+        {
+            let queued_ms = task.assigned_at_ms.saturating_sub(task.created_at_ms);
+            let served_ms = now.saturating_sub(task.assigned_at_ms);
+            tracing::info!(
+                "b_latency: task={} type={} wait={}ms served={}ms total={}ms",
+                task.task_id,
+                task.task_type,
+                queued_ms,
+                served_ms,
+                now.saturating_sub(task.created_at_ms)
+            );
+        }
         // 空 device_id 不覆盖已记录的归属，否则归属信息会被抹掉。
         if !device_id.is_empty() {
             task.assigned_device_id = Some(device_id.to_string());
@@ -859,7 +888,7 @@ impl TaskStore {
         // A 端的 wait_for_result 只认 status，所以 notify 一响它立刻就能取走结果。
         // 下面那串"状态页的活儿"不该再挡在它前面。
         drop(inner);
-        self.notify.notify_waiters();
+        self.bump_tick();
 
         // 锁外解析：两次纯 CPU 的 DER/CBOR 遍历，不碰任何共享状态，也不用排队。
         let (boot, chain_aaid) = match leaf {
@@ -917,6 +946,8 @@ impl TaskStore {
     /// Wait for a task result, polling internally. Returns the result or None on timeout.
     pub async fn wait_for_result(&self, task_id: &str, timeout: Duration) -> Option<Value> {
         let deadline = Instant::now() + timeout;
+        // 订阅版本号：结果落地那一刻不管我们有没有注册上，`changed()` 都会立刻返回。
+        let mut rx = self.tick.subscribe();
         loop {
             {
                 let inner = self.inner.lock().await;
@@ -930,12 +961,10 @@ impl TaskStore {
             if remaining.is_zero() {
                 return None;
             }
-            // Poll with a short fallback interval: `notify_waiters` only wakes
-            // waiters currently registered, so a notify that lands while this
-            // future is not registered would otherwise be lost.
-            let poll_interval = remaining.min(Duration::from_millis(250));
+            // 版本号变了就是结果落地了；兜底轮询只防「消息真丢了」。
+            let poll_interval = remaining.min(Duration::from_millis(100));
             tokio::select! {
-                _ = self.notify.notified() => {},
+                _ = rx.changed() => {},
                 _ = tokio::time::sleep(poll_interval) => {},
             }
         }
