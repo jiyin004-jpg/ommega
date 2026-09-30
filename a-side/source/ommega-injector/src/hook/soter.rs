@@ -74,10 +74,15 @@ pub(crate) const HAL_DESCRIPTOR: &str = "vendor.qti.hardware.soter.ISoter";
 pub(crate) const TRUSTONIC_DESCRIPTOR: &str = "vendor.trustonic.hardware.soter.ITrustonicSoter";
 /// HIDL 那一版的描述符。名字里带版本号（`@1.0::`），跟 AIDL 那两条完全不是一回事：
 /// 宿主 dex 里两种代理类都在（`...@1.0::ISoter@Proxy` / `...@1.0::ITrustonicSoter@Proxy`），
-/// 哪条路通得看系统里装的是哪种实现，所以两条都得认。
+/// 哪条路通得看系统里装的是哪种实现；小米又是另一个包名（`vendor.xiaomi.hardware.soterservice`）。
+/// 三条都得认 —— 号码、参数、回复形状是同一套（`.hal` 的声明顺序）。
 pub(crate) const QTI_HIDL_DESCRIPTOR: &str = "vendor.qti.hardware.soter@1.0::ISoter";
 pub(crate) const TRUSTONIC_HIDL_DESCRIPTOR: &str =
     "vendor.trustonic.hardware.soter@1.0::ITrustonicSoter";
+/// 小米那套（天玑机型实测）：SOTER 单独一个 HIDL 服务 `vendor.xiaomi.hardware.soterservice`，
+/// 接口名、方法声明顺序跟上面两条 HIDL 一模一样，只是包名不同。
+/// 不认这条的话，小米机上宿主发往 HAL 的那条路就归到「不认识的流量」里，转不出去。
+pub(crate) const XIAOMI_HIDL_DESCRIPTOR: &str = "vendor.xiaomi.hardware.soterservice@1.0::ISoter";
 /// App 面向的接口描述符（App 发给 SoterService 的那条，走的是入站 transaction）。
 pub(crate) const APP_DESCRIPTOR: &str = "com.tencent.soter.soterserver.ISoterService";
 
@@ -400,6 +405,11 @@ fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
                 return Some((Side::HalHidl, true, next));
             }
             if text == TRUSTONIC_HIDL_DESCRIPTOR {
+                return Some((Side::HalHidl, false, next));
+            }
+            if text == XIAOMI_HIDL_DESCRIPTOR {
+                // 第二个值在 HIDL 这条路上用不上（回复按 [`Side::HalHidl`] 另拼，
+                // 不读这一格），统一填 false。
                 return Some((Side::HalHidl, false, next));
             }
             if text == APP_DESCRIPTOR {
@@ -910,7 +920,11 @@ mod tests {
         // 宿主 dex 里 HIDL 那套代理类（`...@1.0::ISoter@Proxy`）也在，描述符跟 AIDL 不是
         // 同一条。现在照样拦 —— 答复换成 HIDL 的布局（`build_hidl_*`），不再只观察。
         // hasAuthKey 在 HIDL 线上是声明顺序的第 12 个，AIDL 那边是 10。
-        for descriptor in [QTI_HIDL_DESCRIPTOR, TRUSTONIC_HIDL_DESCRIPTOR] {
+        for descriptor in [
+            QTI_HIDL_DESCRIPTOR,
+            TRUSTONIC_HIDL_DESCRIPTOR,
+            XIAOMI_HIDL_DESCRIPTOR,
+        ] {
             let mut keep: Vec<Box<[u8]>> = Vec::new();
             let mut data = hidl_token(descriptor);
             push_i32(&mut data, 1000);
