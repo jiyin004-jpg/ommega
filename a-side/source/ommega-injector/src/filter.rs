@@ -2,6 +2,28 @@ use kmr_common::consts::{AID_APP_START, AID_USER_OFFSET};
 
 use crate::config::FilterConfig;
 
+/// Whether `uid` may drive keystore's *global* state interfaces
+/// (`IKeystoreMaintenance` / `IKeystoreAuthorization`).
+///
+/// Both of those interfaces are platform entry points (init, system_server, the
+/// keystore updater, vold) that a third-party app cannot reach through
+/// keystore2's own nodes.  The injector used to pick the maintenance /
+/// authorization branch from the parcel's interface token alone, so an app
+/// could dial a maintenance-token transaction into the *service* node and still
+/// be handed a maintenance-shaped (and state-changing) reply, while the real
+/// keystore2 answers BAD_TYPE and changes nothing.  That divergence is directly
+/// observable from an app - TrustAttestor reports it as
+/// `hardware.attestation.interface_token_dispatch` ("wrong interface token
+/// dispatched to a Keystore maintenance transaction").
+///
+/// The token therefore never decides on its own: both branches additionally
+/// require a non-app caller, exactly like the system-backend rule in
+/// [`evaluate`].  The uid comes from the binder header (`sender_euid`), which the
+/// kernel fills in, so a caller cannot forge it.
+pub fn is_global_state_caller(uid: i64) -> bool {
+    u32::try_from(uid).is_ok_and(|uid| uid % AID_USER_OFFSET < AID_APP_START)
+}
+
 #[derive(Debug, Clone)]
 pub enum PackageResolution {
     Known(Vec<String>),

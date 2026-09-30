@@ -9,15 +9,24 @@
 //!
 //! Real keystore2 only avoids this because nobody restarts it. The injector is the
 //! one place that sees the unlock material the framework hands to keystore2, so the
-//! material is kept here (memory only, never on disk) and replayed into the shadow as
-//! soon as a new shadow generation shows up.
+//! material is kept here and replayed into the shadow as soon as a new shadow
+//! generation shows up.
+//!
+//! "Here" cannot be memory alone, because the injector itself lives inside keystore2: a
+//! keystore2 restart (a crash, a module update, a hot-update) would take the material
+//! down with it and leave the shadow locked until the user happens to unlock again. A
+//! mirror on disk (`state.rs`) survives that; see that module for where it lives and
+//! what it costs.
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use super::*;
+
+mod state;
 
 /// No shadow generation has been fed yet.
 const UNSYNCED_GENERATION: u64 = u64::MAX;
@@ -30,10 +39,11 @@ struct StandingDeviceUnlock {
     caller: CallerInfo,
 }
 
-/// The last unlock material keystore2 was given, per user. Memory only: it dies with
-/// the host process, same as the real keystore2's own copy.
+/// The last unlock material keystore2 was given, per user. Reloaded from the disk mirror
+/// the first time it is touched, so a payload that starts after a keystore2 restart still
+/// has something to replay into the new shadow.
 static DEVICE_UNLOCK: LazyLock<Mutex<HashMap<i32, StandingDeviceUnlock>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(restore_from_disk()));
 
 /// The shadow generation that already holds the state above; `UNSYNCED_GENERATION`
 /// means nothing has been replayed yet.
@@ -53,6 +63,17 @@ thread_local! {
 /// fills in a user we have no material for. Losing an LSKF for real arrives as
 /// `onUserLskfRemoved`, which forgets the user outright.
 pub(super) fn remember_device_unlock(user_id: i32, password: Option<&[u8]>, caller: &CallerInfo) {
+    remember_device_unlock_at(state::state_path().as_deref(), user_id, password, caller);
+}
+
+/// [`remember_device_unlock`] against an explicit mirror: `None` keeps the material in
+/// memory only, which is what tests and `OMMEGA_UNLOCK_STATE=off` ask for.
+fn remember_device_unlock_at(
+    path: Option<&Path>,
+    user_id: i32,
+    password: Option<&[u8]>,
+    caller: &CallerInfo,
+) {
     let has_password = {
         let mut cache = DEVICE_UNLOCK
             .lock()
@@ -75,6 +96,7 @@ pub(super) fn remember_device_unlock(user_id: i32, password: Option<&[u8]>, call
 
     // The shadow just took this one in, so the generation it belongs to is fed.
     SYNCED_GENERATION.store(ipc::rpc_generation(), Ordering::SeqCst);
+    persist(path);
     debug!(
         "event=replay standing device unlock remembered user={} has_password={}",
         user_id, has_password
@@ -83,6 +105,10 @@ pub(super) fn remember_device_unlock(user_id: i32, password: Option<&[u8]>, call
 
 /// Forget one user's material (user removed, LSKF removed, or the shadow rejected it).
 pub(super) fn forget_device_unlock(user_id: i32) {
+    forget_device_unlock_at(state::state_path().as_deref(), user_id);
+}
+
+fn forget_device_unlock_at(path: Option<&Path>, user_id: i32) {
     let removed = DEVICE_UNLOCK
         .lock()
         .expect("ommega device unlock cache poisoned")
@@ -93,6 +119,7 @@ pub(super) fn forget_device_unlock(user_id: i32) {
         }
         debug!("event=replay standing device unlock forgotten user={user_id}");
     }
+    persist(path);
 }
 
 fn wipe(mut bytes: Vec<u8>) {
@@ -141,15 +168,7 @@ pub(crate) fn sync_ommega_state_after_reconnect() {
 }
 
 fn replay_standing_device_unlocks() -> anyhow::Result<()> {
-    let pending: Vec<(i32, Option<Vec<u8>>, CallerInfo)> = {
-        let cache = DEVICE_UNLOCK
-            .lock()
-            .expect("ommega device unlock cache poisoned");
-        cache
-            .iter()
-            .map(|(user_id, entry)| (*user_id, entry.password.clone(), entry.caller.clone()))
-            .collect()
-    };
+    let pending = cached_entries();
     if pending.is_empty() {
         return Ok(());
     }
@@ -200,6 +219,45 @@ fn shadow_rejected_device_unlock(error: &anyhow::Error) -> bool {
         .chain()
         .find_map(|cause| cause.downcast_ref::<Status>())
         .is_some_and(|status| status.exception_code() != ExceptionCode::TransactionFailed)
+}
+
+/// What the previous payload (or this one) left behind, so a keystore2 restart does not
+/// cost the shadow its unlock.
+fn restore_from_disk() -> HashMap<i32, StandingDeviceUnlock> {
+    let Some(path) = state::state_path() else {
+        return HashMap::new();
+    };
+    let restored = state::load_from(&path);
+    if !restored.is_empty() {
+        info!(
+            "event=replay restored {} standing device unlock(s) from {path:?}",
+            restored.len()
+        );
+    }
+    restored
+        .into_iter()
+        .map(|(user_id, password, caller)| (user_id, StandingDeviceUnlock { password, caller }))
+        .collect()
+}
+
+/// Write the cache out so the next payload can pick it up. A failure here only costs a
+/// replay after a restart, never the running process, so it stays a warning.
+fn persist(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(error) = state::save_to(path, &cached_entries()) {
+        warn!("event=replay could not persist the standing device unlock: {error:#}");
+    }
+}
+
+fn cached_entries() -> Vec<(i32, Option<Vec<u8>>, CallerInfo)> {
+    DEVICE_UNLOCK
+        .lock()
+        .expect("ommega device unlock cache poisoned")
+        .iter()
+        .map(|(user_id, entry)| (*user_id, entry.password.clone(), entry.caller.clone()))
+        .collect()
 }
 
 #[cfg(test)]

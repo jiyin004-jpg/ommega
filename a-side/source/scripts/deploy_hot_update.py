@@ -6,6 +6,13 @@ The script never reboots the device. It updates /data/adb/ommega/keymint and
 /data/adb/ommega/ommega-inject, then requests the module daemons to restart through the
 restart marker file path. With --full, it builds the full module package through
 build.py and installs it with ksud module install.
+
+--restart defaults to `auto`: the target is derived from what actually changed, because
+restarting keystore2 costs more than it looks. The payload inside it is the only place
+that holds the framework's unlock material, so replacing it makes the shadow answer
+LOCKED to every auth-bound key init until the user unlocks the device again (see
+ommega-injector/src/hook/rewrite/replay). A keymint-only change therefore restarts only
+keymint, and a no-op deploy does not restart anything.
 """
 
 from __future__ import annotations
@@ -38,6 +45,8 @@ RESTART_TARGETS = {
     "keymint": "restart.keymint",
     "injector": "restart.injector",
 }
+
+AUTO_RESTART = "auto"
 
 REMOTE_DIR = "/data/adb/ommega"
 
@@ -326,7 +335,6 @@ def trigger_restart(serial: str | None, restart: str) -> None:
     if restart == "none":
         print_status("Restart skipped.")
         return
-
     marker = RESTART_TARGETS[restart]
     marker_path = remote_path(REMOTE_DIR, marker)
     command = (
@@ -359,6 +367,32 @@ def restarted(
     if restart in ("all", "injector") and after.get("injected") != ("yes",):
         return False
     return True
+
+
+def resolve_restart(
+    requested: str,
+    remote_before: dict[str, str],
+    remote_after: dict[str, str],
+) -> str:
+    """Pick the smallest restart that still applies the deployed binaries.
+
+    `restart.injector` and `restart.all` replace keystore2, which throws away the unlock
+    material the payload holds in memory; every auth-bound key init then answers LOCKED
+    until the next unlock. `restart.keymint` only replaces the shadow, so it keeps that
+    material and is the right choice whenever the payload did not change.
+    """
+    if requested != AUTO_RESTART:
+        return requested
+
+    keymint_changed = remote_before.get("keymint") != remote_after.get("keymint")
+    injector_changed = remote_before.get("ommega-inject") != remote_after.get("ommega-inject")
+    if injector_changed:
+        # A changed payload only runs in a fresh keystore2 (the old process has the old
+        # code mapped), and the new shadow is only needed if its binary moved too.
+        return "all" if keymint_changed else "injector"
+    if keymint_changed:
+        return "keymint"
+    return "none"
 
 
 def wait_for_restart(
@@ -402,9 +436,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-staging", action="store_true", help="leave pushed files in the staging directory")
     parser.add_argument(
         "--restart",
-        choices=["all", "keymint", "ommega-injector", "none"],
-        default="all",
-        help="hot-restart target",
+        choices=[AUTO_RESTART, "all", "keymint", "injector", "none"],
+        default=AUTO_RESTART,
+        help=(
+            "hot-restart target; 'auto' derives it from which binary changed "
+            "(keymint-only deploys never touch keystore2)"
+        ),
     )
     parser.add_argument("--wait-seconds", type=int, default=DEFAULT_WAIT_SECONDS, help="restart observation timeout")
     return parser.parse_args()
@@ -429,6 +466,7 @@ def main() -> int:
     require_file(keymint, "keymint binary")
     require_file(injector, "injector binary")
 
+    remote_before = remote_sha256s(args.serial)
     local_shas = deploy_binaries(
         args.serial,
         keymint,
@@ -438,10 +476,15 @@ def main() -> int:
     )
     verify_remote_sha(args.serial, local_shas)
 
+    restart = resolve_restart(args.restart, remote_before, local_shas)
+    if restart == "none":
+        print_status("Binaries unchanged; restart skipped.")
+        return 0
+
     before = service_state(args.serial)
     print_service_state("Before restart", before)
-    trigger_restart(args.serial, args.restart)
-    after = wait_for_restart(args.serial, args.restart, before, args.wait_seconds)
+    trigger_restart(args.serial, restart)
+    after = wait_for_restart(args.serial, restart, before, args.wait_seconds)
     print_service_state("After restart", after)
     return 0
 

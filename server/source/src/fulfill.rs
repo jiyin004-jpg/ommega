@@ -274,23 +274,29 @@ impl Fulfill {
             .to_string()
     }
 
-    /// Lookup a stored identity for `(device_id, algorithm)`. If no exact
-    /// algorithm match exists, fall back to any identity for the same device
-    /// (mirrors Django's `_get_identity` fallback_algo behaviour) so a device
-    /// that only uploaded an EC key can still serve an RSA-flavoured request
-    /// (and vice versa) when the certificate chain is algorithm-agnostic.
+    /// Lookup a stored identity for `(device_id, algorithm)`.
+    ///
+    /// The identity is chosen **per device, not per algorithm**. A real device
+    /// attests EC and RSA keys with the *same* keybox chain, so both algorithms
+    /// have to be signed by one stored identity; picking a different row per
+    /// algorithm made the two chains carry different intermediates / issuers and
+    /// the app sees the two attestations of one device disagree
+    /// (TrustAttestor: `hardware.attestation.algorithm_differential`). The leaf's
+    /// algorithm is independent of the issuer's key type (`build_attested_chain`
+    /// mints the requested EC/RSA leaf and signs it with the identity's key), so a
+    /// single identity serves both.
+    ///
+    /// `algorithm` is therefore only used for the last-resort lookup, which
+    /// covers a device whose rows are all inactive (that query keeps the old
+    /// per-algorithm behaviour so such a device can still be served).
     fn identity_for(&self, device_id: &str, algorithm: &str) -> Option<DeviceIdentity> {
         let db = self.db.as_ref()?;
-        if let Some(id) = db
-            .get_device_identity_by_id(device_id, algorithm)
-            .ok()
-            .flatten()
-        {
+        if let Some(id) = db.get_any_device_identity(device_id).ok().flatten() {
             return Some(id);
         }
-        // Fallback: any active identity for this device (targeted query, no
-        // full-table scan).
-        db.get_any_device_identity(device_id).ok().flatten()
+        db.get_device_identity_by_id(device_id, algorithm)
+            .ok()
+            .flatten()
     }
 
     /// Parse the A-side `device_attest_context` object into AttestationParams.
@@ -433,6 +439,46 @@ impl Fulfill {
             .filter(|b| !b.is_empty())
         {
             p.subject_name = Some(v);
+        }
+        // Device properties / ID attestation (710..=717, plus 723 for the second
+        // IMEI), forwarded by the A-side as `[tag, base64(value)]` pairs. A real
+        // device includes these in
+        // the leaf's tee-enforced list whenever the caller asked for them, so
+        // dropping them here is what makes a server-minted chain look like it has
+        // no device properties at all (TrustAttestor:
+        // `hardware.attestation.device_properties`).
+        if let Some(pairs) = ctx.get("attestation_ids").and_then(Value::as_array) {
+            p.attestation_ids = pairs
+                .iter()
+                .filter_map(|pair| {
+                    let pair = pair.as_array()?;
+                    let tag = u64::try_from(pair.first()?.as_i64()?).ok()?;
+                    let value = base64::engine::general_purpose::STANDARD
+                        .decode(pair.get(1)?.as_str()?)
+                        .ok()?;
+                    // 718 stays out: this path uses it for VENDOR_PATCHLEVEL.
+                    // The second IMEI is 723 (`TagType.BYTES | 723`), not 718.
+                    ((710..=717).contains(&tag) || tag == 723).then_some((tag, value))
+                })
+                .collect();
+        }
+        // User-authentication / authorization-list entries ([tag, value] pairs,
+        // tags 502..=509) — the policy the app asked for. Dropping them is what
+        // makes a server-minted leaf claim `NO_AUTH_REQUIRED` for an auth-bound
+        // key (TrustAttestor: `hardware.attestation.user_auth_metadata` and
+        // `hardware.attestation.user_auth_policy`). 502 is kept in the list so
+        // the B-side layer can use it; `write_auth_list` skips it when writing
+        // the leaf (AOSP emits the SID for `importWrappedKey()` only).
+        if let Some(pairs) = ctx.get("user_auth").and_then(Value::as_array) {
+            p.user_auth = pairs
+                .iter()
+                .filter_map(|pair| {
+                    let pair = pair.as_array()?;
+                    let tag = u64::try_from(pair.first()?.as_i64()?).ok()?;
+                    let value = pair.get(1).and_then(Value::as_i64).unwrap_or(1);
+                    matches!(tag, 502..=509).then_some((tag, value))
+                })
+                .collect();
         }
         // certificate_not_before_ms / certificate_not_after_ms: leaf validity.
         if let Some(v) = ctx.get("certificate_not_before_ms").and_then(Value::as_u64) {

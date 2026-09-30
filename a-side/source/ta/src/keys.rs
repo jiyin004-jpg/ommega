@@ -1268,6 +1268,45 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
             KeyParam::CertificateNotAfter(date) => {
                 out.certificate_not_after_ms = Some(date.ms_since_epoch)
             }
+            // Device properties / ID attestation (710..=717, plus the second IMEI
+            // at 723). The local software path
+            // (`cert::AttestationIds::new_from_key_params`) writes these into the
+            // certificate from the *device's* provisioned IDs; the remote path has
+            // to forward the requested values instead, or the B-side leaf comes
+            // back without any of them.
+            KeyParam::AttestationIdBrand(v) => out.attestation_ids.push((710, v.clone())),
+            KeyParam::AttestationIdDevice(v) => out.attestation_ids.push((711, v.clone())),
+            KeyParam::AttestationIdProduct(v) => out.attestation_ids.push((712, v.clone())),
+            KeyParam::AttestationIdSerial(v) => out.attestation_ids.push((713, v.clone())),
+            KeyParam::AttestationIdImei(v) => out.attestation_ids.push((714, v.clone())),
+            KeyParam::AttestationIdMeid(v) => out.attestation_ids.push((715, v.clone())),
+            KeyParam::AttestationIdManufacturer(v) => out.attestation_ids.push((716, v.clone())),
+            KeyParam::AttestationIdModel(v) => out.attestation_ids.push((717, v.clone())),
+            // 723, not 718: 718 is `VENDOR_PATCHLEVEL` (`TagType.UINT | 718`), so
+            // forwarding the second IMEI as 718 makes the other side read it as a
+            // vendor patch level.
+            KeyParam::AttestationIdSecondImei(v) => out.attestation_ids.push((723, v.clone())),
+            // User-authentication / authorization-list tags. These are copy-only
+            // in the leaf: the local software path enforces the policy from the
+            // key blob and derives the AuthorizationList from the *key params*
+            // (`cert::AuthorizationList::new`), so the remote path has to carry
+            // them too — otherwise a remotely minted leaf claims
+            // `NO_AUTH_REQUIRED` for an auth-bound key (TrustAttestor:
+            // `hardware.attestation.user_auth_metadata` /
+            // `hardware.attestation.user_auth_policy`).
+            //
+            // `UserSecureId` (502) *is* forwarded: the B-side real TEE needs it
+            // to bind the key to a user, and it is the only auth tag the server
+            // keybox layer deliberately skips when writing the leaf (AOSP emits
+            // the SID for `importWrappedKey()` only).
+            KeyParam::UserSecureId(sid) => out.user_auth.push((502, *sid as i64)),
+            KeyParam::NoAuthRequired => out.user_auth.push((503, 1)),
+            KeyParam::UserAuthType(v) => out.user_auth.push((504, i64::from(*v))),
+            KeyParam::AuthTimeout(v) => out.user_auth.push((505, i64::from(*v))),
+            KeyParam::AllowWhileOnBody => out.user_auth.push((506, 1)),
+            KeyParam::TrustedUserPresenceRequired => out.user_auth.push((507, 1)),
+            KeyParam::TrustedConfirmationRequired => out.user_auth.push((508, 1)),
+            KeyParam::UnlockedDeviceRequired => out.user_auth.push((509, 1)),
             _ => {}
         }
     }

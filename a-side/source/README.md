@@ -154,10 +154,20 @@ The module ships two background daemons: one for `keymint`, one for `injector`.
 Restart them with:
 
 ```sh
+# only the shadow TA: keystore2 keeps running
 touch /data/adb/ommega/restart.keymint
+# only the injected payload: keystore2 is replaced and re-injected
 touch /data/adb/ommega/restart.injector
+# both
 touch /data/adb/ommega/restart.all
 ```
+
+**Prefer the smallest target that applies your change.** The payload inside keystore2 is
+the only place that holds the framework's unlock material (the LSKF material behind
+auth-bound keys), so replacing keystore2 leaves every auth-bound key init answering
+`LOCKED` until the user unlocks the device again. A new `keymint` binary only needs
+`restart.keymint`, which leaves that material alone; `scripts/deploy_hot_update.py`
+derives the target from which binary actually changed (`--restart auto`, the default).
 
 ## License
 

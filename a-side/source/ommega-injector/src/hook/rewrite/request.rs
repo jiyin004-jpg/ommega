@@ -90,6 +90,17 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
     // app that later uses an auth-bound key. Mirror this global keystore state
     // after the system service accepts it; scoop still gates app key traffic.
     if request_interface == identify::KEYSTORE_AUTHORIZATION_INTERFACE {
+        // An interface token alone must never be enough to hand a caller global
+        // keystore state (see `filter::is_global_state_caller`): an app that
+        // dials an authorization token into a node real keystore2 knows gets
+        // BAD_TYPE, so answering it here is a fingerprint.
+        if !crate::filter::is_global_state_caller(caller_uid) {
+            debug!(
+                "event=decision command={} interface=authorization uid={} pid={} is not a platform caller; forwarding to system without mirroring",
+                command_name, caller_uid, tr.sender_pid
+            );
+            return false;
+        }
         let request = match parcel::parse_authorization_request(
             data,
             data_size,
@@ -163,6 +174,15 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
     // system success. migrateKeyNamespace moves app keys, so scoop-routed callers
     // use ommega as the authoritative business path.
     if request_interface == identify::KEYSTORE_MAINTENANCE_INTERFACE {
+        // Same rule as authorization above: maintenance is a platform-only
+        // interface, so an app-supplied token is not a licence to intercept it.
+        if !crate::filter::is_global_state_caller(caller_uid) {
+            debug!(
+                "event=decision command={} interface=maintenance uid={} pid={} is not a platform caller; forwarding to system without interception",
+                command_name, caller_uid, tr.sender_pid
+            );
+            return false;
+        }
         let request = match parcel::parse_maintenance_request(
             data,
             data_size,

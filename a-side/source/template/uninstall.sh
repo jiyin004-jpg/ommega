@@ -50,8 +50,11 @@ rm -f "$STATE_DIR/pathmask.state" "$STATE_DIR/kmod-loader.log"
 # ---------------------------------------------------------------------------
 # 2. Remove the A-side data tree
 #    Keymaster DB, config, keybox, logs, RPC socket, crash counter, webroot
-#    cache, etc. This is A-side-only, so deleting it wholesale is safe.
+#    cache, and the standing-unlock mirror (unlock.state) — that last one holds the
+#    LSKF material the framework handed to keystore2, so it must not outlive the
+#    module. This is A-side-only, so deleting it wholesale is safe.
 # ---------------------------------------------------------------------------
+rm -f "$OMMEGA_DIR/unlock.state"
 rm -rf "$OMMEGA_DIR"
 
 # ---------------------------------------------------------------------------

@@ -108,6 +108,30 @@ pub struct KeySpec {
     pub cert_not_after: Option<DateTime>,
     /// Certificate serial (A-side CERTIFICATE_SERIAL tag); optional.
     pub cert_serial: Option<Vec<u8>>,
+    /// Device-property / ID-attestation values requested by the app, as
+    /// `(KeyMint tag, value)` pairs (710..=717 plus 723, the second IMEI).
+    /// Forwarded verbatim into the real TEE request: Android 15's
+    /// `setDevicePropertiesAttestationIncluded`
+    /// fills brand/device/product/manufacturer/model from the *requesting*
+    /// device and classic ID attestation adds serial/IMEI/MEID. The TEE itself
+    /// validates every value against what it was provisioned with and fails with
+    /// `CannotAttestIds` when the values do not belong to *this* device, so a
+    /// heterogeneous B device rejects rather than attesting a foreign device.
+    pub attestation_ids: Vec<(u32, Vec<u8>)>,
+    /// User-authentication / authorization-list entries requested by the app, as
+    /// `(KeyMint tag, value)` pairs (502 `USER_SECURE_ID`, 503
+    /// `NO_AUTH_REQUIRED`, 504 `USER_AUTH_TYPE`, 505 `AUTH_TIMEOUT`, 506
+    /// `ALLOW_WHILE_ON_BODY`, 507 `TRUSTED_USER_PRESENCE_REQUIRED`, 508
+    /// `TRUSTED_CONFIRMATION_REQUIRED`, 509 `UNLOCKED_DEVICE_REQUIRED`).
+    ///
+    /// The A-side forwards these so the real TEE mints an auth-bound key with the
+    /// SAME policy the app asked for — the TEE enforces `USER_AUTH_TYPE` /
+    /// `AUTH_TIMEOUT` itself and stamps them into the leaf, so sending them is
+    /// also what keeps the minted chain's authorization list matching the
+    /// request (TrustAttestor: `hardware.attestation.user_auth_metadata` /
+    /// `user_auth_policy`). `USER_SECURE_ID` is required here even though it is
+    /// never attested: without it the TEE cannot bind the key to the user.
+    pub user_auth: Vec<(u32, i64)>,
 }
 
 /// A single generated key, held for the lifetime of the relay process.
@@ -565,6 +589,28 @@ fn build_attestation_params(
         _ => {}
     }
 
+    // Device properties / ID attestation: forward the values the app asked to be
+    // attested. The A-side software path writes these from the device's own
+    // provisioned IDs (`cert::AttestationIds`), so a relay-minted chain that
+    // silently lacks KM_TAG_ATTESTATION_ID_* is immediately distinguishable from
+    // a real one (TrustAttestor: `hardware.attestation.device_properties`).
+    // A real TEE validates the values and answers `CannotAttestIds` (-75) when
+    // they are not this device's own; the A-side then falls back to its local
+    // software keybox, which is the honest answer for a foreign device.
+    for (tag, value) in &spec.attestation_ids {
+        params.push(attestation_id_param(*tag, value.clone())?);
+    }
+
+    // User-authentication / authorization-list entries. A real TEE is the
+    // authority on these: it validates `USER_AUTH_TYPE`/`AUTH_TIMEOUT`, retains
+    // `USER_SECURE_ID` inside the key blob (never in the attestation) and
+    // stamps 504/505 — but not 503 NO_AUTH_REQUIRED — into the leaf. Without
+    // them the minted chain contradicts an auth-bound request (TrustAttestor:
+    // `hardware.attestation.user_auth_metadata` / `user_auth_policy`).
+    for (tag, value) in &spec.user_auth {
+        params.push(user_auth_param(*tag, *value)?);
+    }
+
     // Certificate validity bounds (app-specified or default now / now+10y);
     // real TEEs require NOT_BEFORE/NOT_AFTER (else MISSING_NOT_BEFORE -80).
     params.push(KeyParam::CertificateNotBefore(
@@ -588,9 +634,46 @@ fn build_attestation_params(
         .with_context(|| ks_err!("encode real TEE attestation parameters"))
 }
 
+/// Rebuild the `KeyParam` variant for a `KM_TAG_ATTESTATION_ID_*` tag - the only
+/// tags the A-side forwards inside `device_attest_context.attestation_ids`.
+/// Anything else is rejected loudly instead of being silently dropped.
+fn attestation_id_param(tag: u32, value: Vec<u8>) -> Result<KeyParam> {
+    Ok(match tag {
+        710 => KeyParam::AttestationIdBrand(value),
+        711 => KeyParam::AttestationIdDevice(value),
+        712 => KeyParam::AttestationIdProduct(value),
+        713 => KeyParam::AttestationIdSerial(value),
+        714 => KeyParam::AttestationIdImei(value),
+        715 => KeyParam::AttestationIdMeid(value),
+        716 => KeyParam::AttestationIdManufacturer(value),
+        717 => KeyParam::AttestationIdModel(value),
+        // 723 (`TagType.BYTES | 723`); 718 is VENDOR_PATCHLEVEL, not an ID.
+        723 => KeyParam::AttestationIdSecondImei(value),
+        other => return Err(anyhow!("unsupported attestation ID tag {other}")),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Read-only helpers.
 // ---------------------------------------------------------------------------
+
+/// Rebuild the `KeyParam` variant for a user-auth tag the A-side forwarded inside
+/// `device_attest_context.user_auth`. A tag that is not part of the
+/// authorization list is rejected loudly instead of being silently dropped (the
+/// A-side only ever sends 502..=509, so this is a wire-format guard).
+fn user_auth_param(tag: u32, value: i64) -> Result<KeyParam> {
+    Ok(match tag {
+        502 => KeyParam::UserSecureId(value as u64),
+        503 => KeyParam::NoAuthRequired,
+        504 => KeyParam::UserAuthType(value as u32),
+        505 => KeyParam::AuthTimeout(value as u32),
+        506 => KeyParam::AllowWhileOnBody,
+        507 => KeyParam::TrustedUserPresenceRequired,
+        508 => KeyParam::TrustedConfirmationRequired,
+        509 => KeyParam::UnlockedDeviceRequired,
+        other => return Err(anyhow!("unsupported user-auth tag {other}")),
+    })
+}
 
 /// Returns the certificate chain (DER) for `alias`, leaf first.
 pub fn get_cert_chain(alias: &str) -> Result<Vec<Vec<u8>>> {

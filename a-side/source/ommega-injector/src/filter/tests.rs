@@ -279,3 +279,22 @@ fn disabled_filter_wins_over_global_scope() {
     assert!(decision.allowed);
     assert_eq!(decision.reason, FilterReason::Disabled);
 }
+
+/// The maintenance / authorization branches in `hook::rewrite::request` only
+/// fire for non-app callers, so an app cannot have its wrong-interface-token
+/// transaction answered from ommega's synthetic maintenance path.
+#[test]
+fn global_state_interfaces_are_platform_callers_only() {
+    // init, system_server, keystore itself, shell, root
+    assert!(is_global_state_caller(0));
+    assert!(is_global_state_caller(1000));
+    assert!(is_global_state_caller(2000));
+
+    // ordinary apps, including secondary users / work profiles
+    assert!(!is_global_state_caller(10_000));
+    assert!(!is_global_state_caller(10_540));
+    assert!(!is_global_state_caller(10_540 + AID_USER_OFFSET as i64));
+
+    // an unset/garbage uid must not be read as uid 0
+    assert!(!is_global_state_caller(-1));
+}

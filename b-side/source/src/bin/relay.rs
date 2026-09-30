@@ -663,6 +663,72 @@ fn parse_key_spec(payload: &Value) -> Result<KeySpec> {
         cert_serial: get("certificate_serial")
             .map(|v| b64_decode(v).with_context(|| "decode certificate_serial"))
             .transpose()?,
+        // Device properties / ID attestation (710..=717, plus 723 for the second
+        // IMEI; 718 is VENDOR_PATCHLEVEL, never an ID) forwarded by the A-side as
+        // `[tag, base64(value)]` pairs. These are the values the *A-side*
+        // device wants attested, so a TEE that does not own them answers
+        // `CannotAttestIds` (-66) — expected when the balancer serves this request
+        // with a different B端. The task then fails, the A-side gets no chain from
+        // this layer, and the server keybox layer (which writes the IDs into the
+        // minted leaf itself) takes over with values that actually match the
+        // requesting device. Minting a chain while silently dropping the IDs would
+        // be worse: the chain would claim to come from a real TEE and carry no
+        // device properties at all. Malformed entries are dropped so a request
+        // carrying junk still mints a key.
+        attestation_ids: get("attestation_ids")
+            .and_then(Value::as_array)
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|pair| {
+                        let pair = pair.as_array()?;
+                        let tag = u32::try_from(pair.first()?.as_i64()?).ok()?;
+                        let value = b64_decode(pair.get(1)?).ok()?;
+                        // 718 is VENDOR_PATCHLEVEL, so it is not an ID tag; the
+                        // second IMEI is 723 (`TagType.BYTES | 723`).
+                        ((710..=717).contains(&tag) || tag == 723).then_some((tag, value))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        // User-authentication / authorization-list entries forwarded by the
+        // A-side as `[tag, value]` pairs (502 USER_SECURE_ID, 503
+        // NO_AUTH_REQUIRED, 504 USER_AUTH_TYPE, 505 AUTH_TIMEOUT, 506
+        // ALLOW_WHILE_ON_BODY, 507 TRUSTED_USER_PRESENCE_REQUIRED, 508
+        // TRUSTED_CONFIRMATION_REQUIRED, 509 UNLOCKED_DEVICE_REQUIRED). These go
+        // straight into the real TEE request: the TEE keeps USER_SECURE_ID inside
+        // the key blob, enforces USER_AUTH_TYPE/AUTH_TIMEOUT, and stamps them (but
+        // not NO_AUTH_REQUIRED) into the leaf. Duplicated tags are dropped, and
+        // NO_AUTH_REQUIRED is dropped whenever a real auth requirement came along
+        // — KeyMint rejects that contradictory combination, and the A-side
+        // fallback (the server keybox layer) drops it the same way.
+        user_auth: {
+            let mut tags = Vec::new();
+            for pair in get("user_auth")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(pair) = pair.as_array() else {
+                    continue;
+                };
+                let Some(tag) = pair.first().and_then(Value::as_i64) else {
+                    continue;
+                };
+                let Ok(tag) = u32::try_from(tag) else {
+                    continue;
+                };
+                if !(502..=509).contains(&tag) || tags.iter().any(|(t, _)| *t == tag) {
+                    continue;
+                }
+                let value = pair.get(1).and_then(Value::as_i64).unwrap_or(1);
+                tags.push((tag, value));
+            }
+            if tags.iter().any(|(tag, _)| *tag != 503) {
+                tags.retain(|(tag, _)| *tag != 503);
+            }
+            tags
+        },
     })
 }
 

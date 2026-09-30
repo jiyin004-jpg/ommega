@@ -76,6 +76,32 @@ pub struct AttestationParams {
     /// Leaf certificate subject (DER Name) requested by the caller; defaults to
     /// "CN=Android Keystore Key" when absent.
     pub subject_name: Option<Vec<u8>>,
+    /// Device-property / ID-attestation values the app asked to be attested, as
+    /// `(KeyMint tag, value)` pairs (710..=717 plus 723 for the second IMEI). A real device's leaf
+    /// carries these whenever the caller requested them - Android 15's
+    /// `setDevicePropertiesAttestationIncluded(true)` makes the framework add
+    /// brand/device/product/manufacturer/model to every key-generation request -
+    /// so minting a leaf without them is trivially detectable from an app
+    /// (TrustAttestor reports it as `hardware.attestation.device_properties`).
+    pub attestation_ids: Vec<(u64, Vec<u8>)>,
+    /// User-authentication / authorization-list entries the app asked to be
+    /// attested, as `(KeyMint tag, value)` pairs:
+    ///
+    /// * `503` `NO_AUTH_REQUIRED`, `506` `ALLOW_WHILE_ON_BODY`,
+    ///   `507` `TRUSTED_USER_PRESENCE_REQUIRED`, `508`
+    ///   `TRUSTED_CONFIRMATION_REQUIRED`, `509` `UNLOCKED_DEVICE_REQUIRED` —
+    ///   NULL-valued, presence only (the value is ignored),
+    /// * `504` `USER_AUTH_TYPE` / `505` `AUTH_TIMEOUT` — INTEGER.
+    ///
+    /// `502 USER_SECURE_ID` is accepted on the wire (the B-side real TEE needs
+    /// it) but deliberately **not** written into the leaf: AOSP's KeyMint emits
+    /// the SID only for `importWrappedKey()`, so every normal attested key shows
+    /// `USER_AUTH_TYPE` + `AUTH_TIMEOUT` instead. A leaf that says
+    /// `NO_AUTH_REQUIRED` for a key the app created with
+    /// `setUserAuthenticationRequired(true)` is self-contradictory and is what
+    /// TrustAttestor reports as `hardware.attestation.user_auth_metadata` /
+    /// `hardware.attestation.user_auth_policy`.
+    pub user_auth: Vec<(u64, i64)>,
     /// Leaf validity window requested by the caller (epoch ms); 0/None falls
     /// back to creation time / the fixed 2048 notAfter.
     pub not_before_ms: Option<u64>,
@@ -110,6 +136,8 @@ impl Default for AttestationParams {
             app_id: None,
             creation_datetime_ms: 0,
             subject_name: None,
+            attestation_ids: Vec::new(),
+            user_auth: Vec::new(),
             not_before_ms: None,
             not_after_ms: None,
             // Match Django's `_parse_device_attest_context` defaults:
@@ -199,7 +227,33 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
     if !p.mgf_digest.is_empty() {
         tags.push(203);
     } // RSA_OAEP_MGF_DIGEST (RSA only)
-    tags.push(503); // NO_AUTH_REQUIRED — always present
+      // User-auth / authorization list. Real KeyMint marks an auth-bound key with
+      // USER_AUTH_TYPE (504) + AUTH_TIMEOUT (505) and *omits* NO_AUTH_REQUIRED, so
+      // a leaf saying "no auth required" for a key the app created with
+      // `setUserAuthenticationRequired(true)` is self-contradictory; conversely a
+      // key that needs no authentication carries NO_AUTH_REQUIRED only. 502
+      // (USER_SECURE_ID) is dropped here on purpose — AOSP only emits the SID for
+      // `importWrappedKey()`. Non-auth requests keep the previous behaviour
+      // (NO_AUTH_REQUIRED present).
+    let mut user_auth: Vec<u64> = p
+        .user_auth
+        .iter()
+        .map(|(tag, _)| *tag)
+        .filter(|tag| matches!(tag, 503 | 504 | 505 | 506 | 507 | 508 | 509))
+        .collect();
+    user_auth.sort_unstable();
+    user_auth.dedup();
+    if user_auth.iter().any(|tag| *tag != 503) {
+        user_auth.retain(|tag| *tag != 503);
+    }
+    if user_auth.is_empty() {
+        user_auth.push(503);
+    }
+    for tag in user_auth {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
     tags.push(702); // ORIGIN — always present
     tags.push(704); // ROOT_OF_TRUST — always present (Django defaults to 32 zero bytes)
     if p.os_version.is_some() {
@@ -215,6 +269,15 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
     }
     if p.boot_patch_level.is_some() {
         tags.push(719);
+    }
+    // Device properties / ID attestation (710..=717, plus 723 for the second
+    // IMEI). 718 is deliberately not emitted from here: this path already uses
+    // 718 for VENDOR_PATCHLEVEL (see the comment above), so a 718 in
+    // `attestation_ids` is a patch level, not an ID.
+    for (tag, _) in &p.attestation_ids {
+        if ((710..=717).contains(tag) || *tag == 723) && !tags.contains(tag) {
+            tags.push(*tag);
+        }
     }
     tags.sort();
 
@@ -277,10 +340,24 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                         })
                     });
                 }
-                503 => {
-                    w.next().write_tagged(yasna::Tag::context(503), |w| {
+                503 | 506 | 507 | 508 | 509 => {
+                    w.next().write_tagged(yasna::Tag::context(tag), |w| {
                         w.write_null();
                     });
+                }
+                504 | 505 => {
+                    // USER_AUTH_TYPE / AUTH_TIMEOUT. A timeout of 0 means "authenticate
+                    // for every use" and is the value real TEEs emit for
+                    // `setUserAuthenticationParameters(0, ...)`, so it must be sent
+                    // as an explicit INTEGER 0 rather than omitted.
+                    let value = p
+                        .user_auth
+                        .iter()
+                        .find(|(t, _)| *t == tag)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0);
+                    w.next()
+                        .write_tagged(yasna::Tag::context(tag), |w| w.write_i64(value));
                 }
                 702 => {
                     w.next().write_tagged(yasna::Tag::context(702), |w| {
@@ -320,6 +397,13 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                     if let Some(v) = p.os_patch_level {
                         w.next()
                             .write_tagged(yasna::Tag::context(706), |w| w.write_i64(v));
+                    }
+                }
+                710..=717 | 723 => {
+                    if let Some((_, value)) = p.attestation_ids.iter().find(|(t, _)| *t == tag) {
+                        w.next().write_tagged(yasna::Tag::context(tag), |w| {
+                            w.write_bytes(value);
+                        });
                     }
                 }
                 718 => {
@@ -2754,6 +2838,103 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
 
     /// AAID 是「这条链是谁的身份出的」唯一硬证据（服务端判读法就是靠它），
     /// 所以两种编码都要能读出来，而且不能把没有 AAID 的链读成有。
+    /// Device properties / ID attestation: the minted leaf must carry the
+    /// `KM_TAG_ATTESTATION_ID_*` entries the caller asked for. Without them a
+    /// chain that claims to come from a real TEE looks like one that never saw
+    /// device properties at all (TrustAttestor:
+    /// `hardware.attestation.device_properties`).
+    #[test]
+    fn key_description_carries_requested_device_properties() {
+        let with_ids = AttestationParams {
+            attestation_ids: vec![
+                (710, b"nubia".to_vec()),
+                (717, b"NX721J".to_vec()),
+                // SECOND_IMEI is 723 in the AIDL, *not* 718 — 718 is
+                // VENDOR_PATCHLEVEL, so a 718 here must not turn into an ID.
+                (723, b"359876543210987".to_vec()),
+                (718, b"bogus-patch".to_vec()),
+            ],
+            ..Default::default()
+        };
+        let der = build_attestation_extension_der(&with_ids);
+        assert!(
+            der.windows(5).any(|w| w == b"nubia"),
+            "ATTESTATION_ID_BRAND (710) missing from the KeyDescription"
+        );
+        assert!(
+            der.windows(6).any(|w| w == b"NX721J"),
+            "ATTESTATION_ID_MODEL (717) missing from the KeyDescription"
+        );
+        assert!(
+            der.windows(15).any(|w| w == b"359876543210987"),
+            "ATTESTATION_ID_SECOND_IMEI (723) missing from the KeyDescription"
+        );
+        assert!(
+            !der.windows(11).any(|w| w == b"bogus-patch"),
+            "a 718 entry in attestation_ids must stay out: 718 is VENDOR_PATCHLEVEL"
+        );
+
+        // A request without ID attestation must not grow the tags either.
+        let der = build_attestation_extension_der(&AttestationParams::default());
+        assert!(!der.windows(5).any(|w| w == b"nubia"));
+    }
+
+    /// A key the app created with `setUserAuthenticationRequired(true)` must be
+    /// attested with `USER_AUTH_TYPE` (504) + `AUTH_TIMEOUT` (505) and *without*
+    /// `NO_AUTH_REQUIRED` (503) — the framework expands that call into 502 + 504 +
+    /// 505, and a leaf claiming "no auth required" is self-contradictory. That
+    /// contradiction is what TrustAttestor reports as
+    /// `hardware.attestation.user_auth_metadata` / `user_auth_policy`. The SID
+    /// (502) must stay out of the leaf: AOSP emits it for `importWrappedKey()`
+    /// only.
+    #[test]
+    fn key_description_carries_requested_user_auth_policy() {
+        /// Whether the DER contains a context-specific tag `n` (high-tag-number
+        /// form, primitive or constructed).
+        fn has_context_tag(der: &[u8], n: u64) -> bool {
+            assert!(n >= 31, "low tag numbers are not covered by this helper");
+            let hi = (((n >> 7) & 0x7f) | 0x80) as u8;
+            let lo = (n & 0x7f) as u8;
+            [0x9fu8, 0xbfu8].iter().any(|first| {
+                der.windows(3)
+                    .any(|w| w[0] == *first && w[1] == hi && w[2] == lo)
+            })
+        }
+
+        // setUserAuthenticationRequired(true) + setUserAuthenticationParameters(
+        // 0, AUTH_BIOMETRIC_STRONG) => per-use biometric auth.
+        let auth_bound = AttestationParams {
+            user_auth: vec![(502, 0x1234_5678_9abc_def0u64 as i64), (504, 2), (505, 0)],
+            ..Default::default()
+        };
+        let der = build_attestation_extension_der(&auth_bound);
+        assert!(has_context_tag(&der, 504), "USER_AUTH_TYPE (504) missing");
+        assert!(has_context_tag(&der, 505), "AUTH_TIMEOUT (505) missing");
+        assert!(
+            !has_context_tag(&der, 503),
+            "NO_AUTH_REQUIRED (503) contradicts the requested auth policy"
+        );
+        assert!(
+            !has_context_tag(&der, 502),
+            "USER_SECURE_ID (502) must not be attested"
+        );
+
+        // No auth tags in the request (and no user_auth at all): keep the previous
+        // behaviour — NO_AUTH_REQUIRED only, no spurious auth tags.
+        for plain in [
+            AttestationParams::default(),
+            AttestationParams {
+                user_auth: vec![(503, 1)],
+                ..Default::default()
+            },
+        ] {
+            let der = build_attestation_extension_der(&plain);
+            assert!(has_context_tag(&der, 503), "NO_AUTH_REQUIRED (503) missing");
+            assert!(!has_context_tag(&der, 504));
+            assert!(!has_context_tag(&der, 505));
+        }
+    }
+
     #[test]
     fn asn1_chain_exposes_the_attestation_application_id() {
         let identity = generate_self_signed("ec").unwrap();

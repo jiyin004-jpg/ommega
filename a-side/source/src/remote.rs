@@ -664,6 +664,51 @@ impl RemoteRelay {
                 Value::from(i64::from(security_level)),
             );
         }
+        // Device properties / ID attestation the app asked to be attested, as
+        // `[tag, base64(value)]` pairs (710..=717, plus 723 for the second IMEI). A
+        // real device puts
+        // these in the leaf's teeEnforced list whenever the app requested them
+        // (Android 15 fills brand/device/product/manufacturer/model itself), so
+        // the relay and the server keybox layer have to reproduce them instead
+        // of minting a chain with no IDs at all.
+        if !params.attestation_ids.is_empty() {
+            ctx.insert(
+                "attestation_ids".to_string(),
+                Value::Array(
+                    params
+                        .attestation_ids
+                        .iter()
+                        .map(|(tag, value)| json!([*tag, base64_encode(value)]))
+                        .collect(),
+                ),
+            );
+        }
+        // User-authentication / authorization-list entries the app asked for, as
+        // `[tag, value]` pairs (502/503/504/505/506/507/508/509; the value is
+        // only meaningful for 504 USER_AUTH_TYPE and 505 AUTH_TIMEOUT, the rest
+        // are presence markers). The A-side software KeyMint does enforce the
+        // policy locally, but the *attestation* is minted remotely, so the
+        // entries have to travel with the request: a leaf that says
+        // `NO_AUTH_REQUIRED` for a key created with
+        // `setUserAuthenticationRequired(true)` contradicts itself, and one
+        // without `USER_AUTH_TYPE`/`AUTH_TIMEOUT` drops the policy — both are
+        // detectable from an app (TrustAttestor:
+        // `hardware.attestation.user_auth_metadata` / `user_auth_policy`).
+        // The server keybox layer writes every tag here except 502 (AOSP emits
+        // the SID for `importWrappedKey()` only); the B-side real TEE needs 502
+        // as well.
+        if !params.user_auth.is_empty() {
+            ctx.insert(
+                "user_auth".to_string(),
+                Value::Array(
+                    params
+                        .user_auth
+                        .iter()
+                        .map(|(tag, value)| json!([*tag, *value]))
+                        .collect(),
+                ),
+            );
+        }
         // Forward the device's OS version + security patch level so the relay
         // can emit KM_TAG_OS_VERSION (705) / KM_TAG_OS_PATCH_LEVEL (706) in the
         // teeEnforced authorization list. Software attestations that omit these

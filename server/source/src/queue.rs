@@ -193,6 +193,18 @@ struct Inner {
     /// Rotating index used to break load ties round-robin so the balancer
     /// doesn't always pick the same (first) device when several are idle.
     load_balance_index: usize,
+    /// Sticky substitute per requested-but-offline device_id: `(target, chosen_at_ms)`.
+    ///
+    /// A B device's identity is its keybox chain, and the A-side app sees that
+    /// chain. EC and RSA attestation for one app are two separate requests, so
+    /// letting the balancer round-robin them onto different B端 hands the app two
+    /// chains with different intermediates / issuers for the same device - which
+    /// self-check apps report as an RSA/EC attestation profile mismatch
+    /// (TrustAttestor: `hardware.attestation.algorithm_differential`). Keeping an
+    /// offline requested device on one substitute for [`SUBSTITUTE_TTL_MS`] makes
+    /// consecutive requests agree while still allowing a re-pick once that
+    /// substitute disappears.
+    substitutes: HashMap<String, (String, u64)>,
     /// 上次跑 `sweep_locked` 的时间戳（毫秒，0 = 还没跑过）。见 `SWEEP_INTERVAL_MS`。
     last_sweep_ms: u64,
 }
@@ -1043,6 +1055,22 @@ impl TaskStore {
             return requested_did.to_string();
         }
 
+        // The named device is offline. Keep using the same substitute for a while
+        // (see `Inner::substitutes`) instead of re-balancing per request: the
+        // substitute decides which keybox identity the app sees, and two keys
+        // minted back-to-back must not come from two different B端.
+        const SUBSTITUTE_TTL_MS: u64 = 10 * 60 * 1000;
+        inner
+            .substitutes
+            .retain(|_, (_, at)| now.saturating_sub(*at) < SUBSTITUTE_TTL_MS);
+        if !requested_did.is_empty() {
+            if let Some((target, _)) = inner.substitutes.get(requested_did) {
+                if online_ids.iter().any(|id| id == target) {
+                    return target.clone();
+                }
+            }
+        }
+
         // Load-balance: primary load = recent task activity within the last
         // 60 s (`device_events`), the SAME metric the admin UI displays via
         // `get_device_load`. Secondary = currently active (pending/assigned)
@@ -1069,12 +1097,19 @@ impl TaskStore {
         let min = (candidates[0].1, candidates[0].2);
         let tied: Vec<&(String, u64, usize)> =
             candidates.iter().filter(|c| (c.1, c.2) == min).collect();
-        if tied.len() > 1 {
+        let chosen = if tied.len() > 1 {
             let i = inner.load_balance_index % tied.len();
             inner.load_balance_index = inner.load_balance_index.wrapping_add(1);
-            return tied[i].0.clone();
+            tied[i].0.clone()
+        } else {
+            candidates[0].0.clone()
+        };
+        if !requested_did.is_empty() {
+            inner
+                .substitutes
+                .insert(requested_did.to_string(), (chosen.clone(), now));
         }
-        candidates[0].0.clone()
+        chosen
     }
 
     /// Resolve the target for a SOTER task.
