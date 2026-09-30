@@ -33,6 +33,10 @@ const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 const OID_COUNTRY_NAME: &[u64] = &[2, 5, 4, 6];
 const OID_ORG_NAME: &[u64] = &[2, 5, 4, 10];
 const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
+/// Google keybox 那两张「TEE」中间证书用的两个属性。真机链是
+/// (title, serialNumber)，2019 年流出的公开 keybox 是反的 —— 见 `RdnShape`。
+const OID_TITLE: &[u64] = &[2, 5, 4, 12];
+const OID_SERIAL_NUMBER: &[u64] = &[2, 5, 4, 5];
 
 pub const KM_ALG_EC: i64 = 3;
 pub const KM_ALG_RSA: i64 = 1;
@@ -735,6 +739,81 @@ fn looks_generated(name: &str) -> bool {
         }
         false
     })
+}
+
+/// 链里那几张「TEE」证书的 subject RDN 顺序 —— 真机出链和公开 keybox 之间
+/// 唯一一处形状差异。
+///
+/// 实测（2026-09-30，服务端同一套参数）：Pixel 6a（Google 自家）、22041211AC、
+/// PLC110 三台真机出的链都是 `title=TEE` 在前、`serialNumber` 在后；而池子里那份
+/// 公开 keybox（2019 年的中间证书）是 `serialNumber` 在前。属性 OID 一样、字符串
+/// 类型一样（title=UTF8String，serialNumber=PrintableString）、签名一样能验到
+/// Google 根，唯独顺序不同 —— 这正是 TrustAttestor 那条
+/// `cloud.attestation.subject_rdn_order`（“证书编码序列异常”）能一眼认出回退链的原因。
+///
+/// 顺序写在已经签好名的证书 DER 里：改动一个字节，子证书的 issuer 就对不上上级的
+/// subject（逐字节比较），整条链立刻失效；而这两张中间证书是 Google 签的，我们手上
+/// 没有签发者的私钥，重签不出来。所以这份材料只能**识别**、不能就地修 —— 服务端能做
+/// 的事是别再把它当成“和真机一样”的链发出去（见 `fulfill::attest_and_cache` 的告警）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RdnShape {
+    /// `title=TEE` 在 `serialNumber` 之前：真机出链的形状。
+    DeviceLike,
+    /// `serialNumber` 在 `title` 之前：老公开 keybox 的形状。
+    LegacyKeybox,
+    /// 链里没有同时带这两个属性的证书（比如我们自签的链），判不出来。
+    Unknown,
+}
+
+impl RdnShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RdnShape::DeviceLike => "device-like",
+            RdnShape::LegacyKeybox => "legacy-keybox",
+            RdnShape::Unknown => "unknown",
+        }
+    }
+
+    /// 是不是那份一眼能被认出来的老 keybox 形状。
+    pub fn is_legacy(self) -> bool {
+        matches!(self, RdnShape::LegacyKeybox)
+    }
+}
+
+/// 2.5.4.12 (title) 与 2.5.4.5 (serialNumber) 的 AttributeType OID 编码。
+/// 直接找字节比走 ASN.1 解析省事，也不会被名字里别的属性干扰。
+const DER_ATTR_TITLE: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x0c];
+const DER_ATTR_SERIAL_NUMBER: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x05];
+
+/// 一个 Name 的原始 DER 里两个属性谁在前面；缺一个就判不出来。
+fn name_rdn_shape(raw_name: &[u8]) -> Option<RdnShape> {
+    let title = raw_name
+        .windows(DER_ATTR_TITLE.len())
+        .position(|w| w == DER_ATTR_TITLE)?;
+    let serial = raw_name
+        .windows(DER_ATTR_SERIAL_NUMBER.len())
+        .position(|w| w == DER_ATTR_SERIAL_NUMBER)?;
+    Some(if title < serial {
+        RdnShape::DeviceLike
+    } else {
+        RdnShape::LegacyKeybox
+    })
+}
+
+/// 一份 keybox 材料的形状：看链上第一张同时带 `title`/`serialNumber` 的证书
+/// （叶子只有 CN，根只有一个 serialNumber，都算不出来）。
+pub fn chain_rdn_shape(chain_pem: &str) -> RdnShape {
+    let Ok(ders) = parse_chain_pem(chain_pem) else {
+        return RdnShape::Unknown;
+    };
+    for der in ders.iter().skip(1) {
+        if let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) {
+            if let Some(shape) = name_rdn_shape(cert.subject().as_raw()) {
+                return shape;
+            }
+        }
+    }
+    RdnShape::Unknown
 }
 
 fn sign_tbs(key: &KeyMaterial, tbs: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
@@ -2179,6 +2258,31 @@ mod bench {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    /// 真机链（Pixel 6a / qti / 小米实测）的中间证书是
+    /// `(title=TEE, serialNumber=…)`，2019 年流出的公开 keybox 是反的。这个形状是
+    /// keybox 材料自带的指纹：顺序写在已签名的 DER 里，改一个字节就断链，所以只能
+    /// 识别、不能就地修 —— 服务端据此判断“这条链发出去会不会被一眼认成假链”。
+    #[test]
+    fn rdn_shape_tells_device_chains_from_legacy_keyboxes() {
+        let device_like = make_name(&[
+            (OID_TITLE, b"TEE"),
+            (OID_SERIAL_NUMBER, b"803328a6c69184bc"),
+        ]);
+        assert_eq!(name_rdn_shape(&device_like), Some(RdnShape::DeviceLike));
+
+        let legacy = make_name(&[
+            (OID_SERIAL_NUMBER, b"803328a6c69184bc"),
+            (OID_TITLE, b"TEE"),
+        ]);
+        assert_eq!(name_rdn_shape(&legacy), Some(RdnShape::LegacyKeybox));
+        assert!(RdnShape::LegacyKeybox.is_legacy());
+
+        // 只有 CN 的叶子/根判不出来，不能当成异常；自签链同理。
+        assert_eq!(name_rdn_shape(&default_name()), None);
+        assert_eq!(chain_rdn_shape(MOCK_LEAF), RdnShape::Unknown);
+        assert!(!RdnShape::Unknown.is_legacy());
+    }
 
     // -----------------------------------------------------------------
     // 质量门（identity_problem / chain_problem）的测试素材：几张现造的证书，

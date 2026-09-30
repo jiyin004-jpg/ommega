@@ -764,6 +764,9 @@ pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) 
             "device_id": id.device_id,
             "algorithm": id.algorithm,
             "active": id.active,
+            // 链的形状：真机出链是 `device-like`，老公开 keybox 是
+            // `legacy-keybox`（客户端的形状检查能一眼认出来）。
+            "rdn_shape": crate::cert::chain_rdn_shape(&id.certificate_chain_pem).as_str(),
             "certificate_chain_pem": id.certificate_chain_pem,
         }))
         .into_response(),

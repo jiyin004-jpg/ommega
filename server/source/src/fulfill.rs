@@ -577,6 +577,19 @@ impl Fulfill {
         let params = self.parse_ctx(ctx, challenge);
         let (chain_pem, new_leaf_key_pem) = cert::build_attested_chain(identity, &params)?;
 
+        // 这份材料的形状是发出去就会被认出来的那种（老公开 keybox：中间证书
+        // subject 是 serialNumber 在前）——真机出链不会长这样。修不了（见
+        // `cert::RdnShape`），但日志里必须留下痕迹：客户端报
+        // `cloud.attestation.subject_rdn_order` 时，对着这行就能知道是哪条链。
+        let shape = cert::chain_rdn_shape(&chain_pem);
+        if shape.is_legacy() {
+            tracing::warn!(
+                "attest_and_cache: device={} alias={alias} chain shape={} (serialNumber 在 title 之前，老公开 keybox 的指纹；真机是 device-like)",
+                identity.device_id,
+                shape.as_str()
+            );
+        }
+
         let key_fp = base64::engine::general_purpose::STANDARD
             .encode(Sha256::digest(new_leaf_key_pem.as_bytes()));
         tracing::info!(
