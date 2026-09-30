@@ -553,6 +553,20 @@ impl crate::KeyMintTa {
         self.add_keymint_tags(&mut chars, KeyOrigin::Generated)?;
         let _ = keygen_info;
         let root_of_trust = crate::cert::parse_remote_root_of_trust(leaf_der)?;
+        // Remember the KeyMint version the serving device stamped into the
+        // chain. The A-side HAL must report the same version (see
+        // `kmr_common::served_keymint_version`), otherwise the served chain
+        // disagrees with `getHardwareInfo()` / the A-side VINTF declaration
+        // and detectors flag a KeyMint version mismatch. Persisted so it also
+        // survives a process restart.
+        if let Some(rot) = root_of_trust.as_ref() {
+            let version = if rot.attestation_version > 0 {
+                rot.attestation_version
+            } else {
+                rot.keymaster_version
+            };
+            kmr_common::served_keymint_version::record_served_keymint_version(version);
+        }
         let remote_key = KeyMaterial::Remote(crypto::RemoteRef {
             alias,
             public_key,

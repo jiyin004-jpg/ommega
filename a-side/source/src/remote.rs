@@ -31,13 +31,15 @@
 //! connection pool bottleneck.  reqwest also natively supports chunked transfer
 //! encoding and HTTP keep-alive, both of which the hand-written client did not.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use reqwest::blocking::Client;
 use reqwest::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config;
@@ -53,6 +55,390 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// A relay-server client.  All configuration is read from `config().remote`.
 pub struct RemoteRelay;
+
+// ── dead remote aliases ────────────────────────────────────────────────
+
+/// Aliases the relay has definitively told us have no private key on any
+/// fulfilment layer (no B-side device holds it and the server keybox session
+/// does not either).
+///
+/// Why remember them: a client that ignores the "key not found" answer would
+/// otherwise drive one HTTP round trip per sign attempt — the observed bug was
+/// 21001 sign calls over 13 hours for an alias that never had a matching
+/// attestation. Once an alias is known dead, its sign/decrypt calls short-
+/// circuit to the same terminal result without touching the network.
+///
+/// Deliberately in-memory only: the mark is a hint learned from a *remote*
+/// answer, and a restart (or a successful attestation, which recreates the
+/// key) must be able to clear it. The alias space is effectively unbounded, so
+/// the map is capped; forgetting a dead alias only costs one more round trip.
+static DEAD_REMOTE_ALIASES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+const MAX_DEAD_ALIASES: usize = 4096;
+
+/// Result of a relay sign/decrypt request.
+#[derive(Clone, Debug)]
+pub enum RemoteReply {
+    /// The relay answered 2xx with a JSON body.
+    Json(Value),
+    /// The relay could not serve the request (transport failure, or a non-2xx
+    /// answer that does not identify a missing key). Callers may fall back to
+    /// local processing.
+    Unavailable,
+    /// The relay answered definitively that the alias has no private key on any
+    /// fulfilment layer. This is terminal for the alias.
+    KeyNotFound,
+}
+
+/// `true` if `alias` was already marked dead by a previous relay answer.
+fn is_alias_dead(alias: &str) -> bool {
+    DEAD_REMOTE_ALIASES
+        .lock()
+        .map(|guard| guard.as_ref().is_some_and(|set| set.contains(alias)))
+        .unwrap_or(false)
+}
+
+/// Remember that the relay has no key for `alias`.
+fn mark_alias_dead(alias: &str) {
+    let Ok(mut guard) = DEAD_REMOTE_ALIASES.lock() else {
+        return;
+    };
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.len() >= MAX_DEAD_ALIASES {
+        set.clear();
+    }
+    set.insert(alias.to_string());
+}
+
+/// Drop the dead mark for `alias`.  Called when an attestation for the alias
+/// succeeds, which means the relay has (re)created the key behind it.
+fn clear_alias_dead(alias: &str) {
+    if let Ok(mut guard) = DEAD_REMOTE_ALIASES.lock() {
+        if let Some(set) = guard.as_mut() {
+            set.remove(alias);
+        }
+    }
+}
+
+/// Whether a non-2xx relay response body identifies the terminal "this alias
+/// has no key" condition.
+///
+/// Two shapes have to be accepted: the current server adds
+/// `"error_kind": "no_such_key"`, while older builds only carried the message
+/// text (`no key for alias '…' (call attest first)`, or `no server_keybox
+/// session`). A body that does not parse as JSON is scanned as raw text.
+fn relay_body_says_no_key(text: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if value_has_no_such_key_kind(&value) {
+            return true;
+        }
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            if error_text_says_no_key(error) {
+                return true;
+            }
+        }
+    }
+    error_text_says_no_key(text)
+}
+
+/// Recursively look for an `error_kind` of `no_such_key` anywhere in a JSON
+/// body (the relay may wrap the failure in `result` or `detail`).
+fn value_has_no_such_key_kind(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("error_kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("no_such_key"))
+                || map.values().any(value_has_no_such_key_kind)
+        }
+        Value::Array(items) => items.iter().any(value_has_no_such_key_kind),
+        _ => false,
+    }
+}
+
+/// The relay's own wording for "this alias has no private key anywhere".
+fn error_text_says_no_key(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: [&str; 4] = [
+        "no key for alias",
+        "no server_keybox session",
+        "no_such_key",
+        "no such key",
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+// ── remote key rebuild recipes ─────────────────────────────────────────
+
+/// Serialisable mirror of [`kmr_ta::device::RemoteAttestParams`].
+///
+/// Why a mirror instead of storing the TA type directly: `RemoteAttestParams`
+/// lives in the TA crate, which does not depend on serde, and the key blob CBOR
+/// path cannot carry it either (`kmr_common`, which owns `RemoteRef`, cannot
+/// depend on `kmr_ta`).  Every field here is exactly one field of the TA type,
+/// so nothing the B-side needs to mint a matching key is dropped.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecipeParams {
+    pub key_algorithm: Option<i32>,
+    pub key_size: Option<i32>,
+    pub ec_curve: Option<i32>,
+    pub purpose: Vec<i32>,
+    pub digest: Vec<i32>,
+    pub mgf_digest: Option<i32>,
+    pub padding: Vec<i32>,
+    pub rsa_public_exponent: Option<u64>,
+    pub certificate_subject: Option<Vec<u8>>,
+    pub certificate_not_before_ms: Option<i64>,
+    pub certificate_not_after_ms: Option<i64>,
+    pub security_level: Option<i32>,
+    pub attestation_ids: Vec<(u32, Vec<u8>)>,
+    pub user_auth: Vec<(u32, i64)>,
+}
+
+impl RecipeParams {
+    /// Capture the parameters a key was minted with.
+    fn capture(params: &kmr_ta::device::RemoteAttestParams) -> Self {
+        Self {
+            key_algorithm: params.key_algorithm,
+            key_size: params.key_size,
+            ec_curve: params.ec_curve,
+            purpose: params.purpose.clone(),
+            digest: params.digest.clone(),
+            mgf_digest: params.mgf_digest,
+            padding: params.padding.clone(),
+            rsa_public_exponent: params.rsa_public_exponent,
+            certificate_subject: params.certificate_subject.clone(),
+            certificate_not_before_ms: params.certificate_not_before_ms,
+            certificate_not_after_ms: params.certificate_not_after_ms,
+            security_level: params.security_level,
+            attestation_ids: params.attestation_ids.clone(),
+            user_auth: params.user_auth.clone(),
+        }
+    }
+
+    /// Rebuild the TA parameters for a re-attestation.
+    fn to_attest_params(&self) -> kmr_ta::device::RemoteAttestParams {
+        kmr_ta::device::RemoteAttestParams {
+            key_algorithm: self.key_algorithm,
+            key_size: self.key_size,
+            ec_curve: self.ec_curve,
+            purpose: self.purpose.clone(),
+            digest: self.digest.clone(),
+            mgf_digest: self.mgf_digest,
+            padding: self.padding.clone(),
+            rsa_public_exponent: self.rsa_public_exponent,
+            certificate_subject: self.certificate_subject.clone(),
+            certificate_not_before_ms: self.certificate_not_before_ms,
+            certificate_not_after_ms: self.certificate_not_after_ms,
+            security_level: self.security_level,
+            attestation_ids: self.attestation_ids.clone(),
+            user_auth: self.user_auth.clone(),
+        }
+    }
+}
+
+/// Everything needed to recreate the private key behind one remote alias.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RemoteRecipe {
+    /// The challenge the key was minted with.
+    pub challenge: Vec<u8>,
+    /// The app's attestation application id (DER) the key was minted for.
+    pub app_id_der: Vec<u8>,
+    /// The effective certificate serial the key was minted with.
+    pub cert_serial: Option<Vec<u8>>,
+    /// Key-generation parameters the B-side TEE must reproduce.
+    pub params: RecipeParams,
+}
+
+/// Disk file (next to `config.toml`) that carries rebuild recipes across
+/// restarts.  A keyblob outlives a reboot, so the recipe that goes with it has
+/// to as well — otherwise the first lost B-side key after a restart would stay
+/// terminal.
+///
+/// Known tradeoff (see the delivery notes): the recipe is keyed by alias in
+/// this side file rather than inside the keyblob.  Losing this file (e.g. a
+/// factory reset of the A-side state dir) means an already-minted remote key
+/// can no longer be rebuilt in place; the alias then keeps the deterministic
+/// `KEY_NOT_FOUND` behaviour.  A keyblob copy is not reachable from here: the
+/// recipe would have to live in `kmr_common::crypto::RemoteRef`, but
+/// `kmr_common` cannot depend on `kmr_ta`, and this backend never sees the
+/// decrypted keyblob.
+const RECIPE_FILE: &str = "/data/misc/keystore/ommega/remote_recipes.json";
+
+/// Upper bound on remembered recipes.  The alias space is effectively
+/// unbounded; forgetting a recipe only costs one failed rebuild, so the map may
+/// be dropped wholesale when it grows too big.
+const MAX_RECIPES: usize = 4096;
+
+/// alias -> rebuild recipe, loaded from [`RECIPE_FILE`] on first use.
+#[derive(Default)]
+struct RecipeStoreState {
+    recipes: HashMap<String, RemoteRecipe>,
+}
+
+static RECIPE_STORE: Mutex<Option<RecipeStoreState>> = Mutex::new(None);
+
+fn load_recipes() -> RecipeStoreState {
+    let recipes = std::fs::read(RECIPE_FILE)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HashMap<String, RemoteRecipe>>(&bytes).ok())
+        .unwrap_or_default();
+    RecipeStoreState { recipes }
+}
+
+fn persist_recipes(recipes: &HashMap<String, RemoteRecipe>) {
+    // Tests never touch the device state directory.
+    if cfg!(test) {
+        let _ = recipes;
+        return;
+    }
+    let Ok(json) = serde_json::to_vec(recipes) else {
+        log::warn!("failed to serialize remote rebuild recipes");
+        return;
+    };
+    if let Some(parent) = std::path::Path::new(RECIPE_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Best effort: the in-memory copy still covers this process.
+    if let Err(e) = std::fs::write(RECIPE_FILE, json) {
+        log::debug!("failed to persist remote rebuild recipes: {e}");
+    }
+}
+
+/// Remember how the key behind `alias` was minted, so a later "no key" answer
+/// from the relay can be answered by recreating the key on the same device.
+fn store_recipe(alias: &str, recipe: RemoteRecipe) {
+    let Ok(mut guard) = RECIPE_STORE.lock() else {
+        return;
+    };
+    let state = guard.get_or_insert_with(load_recipes);
+    if state.recipes.len() >= MAX_RECIPES && !state.recipes.contains_key(alias) {
+        state.recipes.clear();
+    }
+    state.recipes.insert(alias.to_string(), recipe);
+    persist_recipes(&state.recipes);
+}
+
+/// The rebuild recipe for `alias`, if one was ever recorded.
+fn recipe_for(alias: &str) -> Option<RemoteRecipe> {
+    let Ok(mut guard) = RECIPE_STORE.lock() else {
+        return None;
+    };
+    let state = guard.get_or_insert_with(load_recipes);
+    state.recipes.get(alias).cloned()
+}
+
+/// Minimum interval between two rebuild attempts for the same alias.
+///
+/// A key that is gone for good would otherwise re-attest on every sign call,
+/// turning one lost key into a stream of attestation round trips.
+const REBUILD_THROTTLE: Duration = Duration::from_secs(10);
+
+/// alias -> when its last rebuild was allowed.
+static LAST_REBUILD: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// Claim the right to rebuild `alias` at `now`.  `true` at most once per
+/// [`REBUILD_THROTTLE`] window.  Time is a parameter so the policy can be
+/// tested without sleeping.
+fn take_rebuild_slot(alias: &str, now: Instant) -> bool {
+    let Ok(mut guard) = LAST_REBUILD.lock() else {
+        return false;
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= MAX_DEAD_ALIASES && !map.contains_key(alias) {
+        map.clear();
+    }
+    let allowed = match map.get(alias) {
+        Some(last) => now.saturating_duration_since(*last) >= REBUILD_THROTTLE,
+        None => true,
+    };
+    if allowed {
+        map.insert(alias.to_string(), now);
+    }
+    allowed
+}
+
+/// Run one remote sign/decrypt attempt and, when the relay answers that the
+/// alias has no private key *and* a rebuild recipe is available, recreate the
+/// key on the same B-side device and retry once.
+///
+/// Rebuilding produces a **new key pair**: a private key that went missing
+/// cannot be recovered, only recreated with the same attributes and the same
+/// alias.  The relay's binding table routes the re-attestation back to the
+/// device that holds the alias, and a successful attestation clears the remote
+/// side's dead-alias mark (and ours, via `clear_alias_dead`).
+///
+/// The attempt and rebuild closures are injected so the whole decision matrix
+/// can be exercised without HTTP.
+fn remote_op_with_rebuild<F, R>(alias: &str, mut attempt: F, mut rebuild: R) -> Result<RemoteReply>
+where
+    F: FnMut() -> Result<RemoteReply>,
+    R: FnMut() -> Result<bool>,
+{
+    let first = attempt()?;
+    if !matches!(first, RemoteReply::KeyNotFound) {
+        return Ok(first);
+    }
+    // At most one rebuild per call and at most one per alias per throttle
+    // window, so a permanently missing key cannot become an attestation loop.
+    if !take_rebuild_slot(alias, Instant::now()) {
+        log::debug!("remote rebuild for alias {alias} is throttled");
+        return Ok(RemoteReply::KeyNotFound);
+    }
+    match rebuild() {
+        Ok(true) => {}
+        Ok(false) => return Ok(RemoteReply::KeyNotFound),
+        Err(e) => {
+            log::warn!("remote rebuild for alias {alias} failed: {e:#}");
+            return Ok(RemoteReply::KeyNotFound);
+        }
+    }
+    // Retry exactly once, now that the key exists again.
+    attempt()
+}
+
+/// Re-attest `alias` with its stored recipe so the B-side device recreates the
+/// private key.  Returns `true` only when the relay answered a usable chain.
+fn rebuild_remote_key(alias: &str) -> Result<bool> {
+    let Some(recipe) = recipe_for(alias) else {
+        log::warn!(
+            "relay has no key for alias {alias} and no rebuild recipe is known; staying terminal"
+        );
+        return Ok(false);
+    };
+    let params = recipe.params.to_attest_params();
+    let resp = RemoteRelay::attest(
+        &recipe.challenge,
+        alias,
+        &recipe.app_id_der,
+        &params,
+        recipe.cert_serial.as_deref(),
+    )?;
+    let Some(resp) = resp else {
+        log::warn!("rebuild attestation for alias {alias} was refused by the relay");
+        return Ok(false);
+    };
+    if !attest_response_has_chain(&resp) {
+        log::warn!("rebuild attestation for alias {alias} returned no certificate chain");
+        return Ok(false);
+    }
+    // The key exists again; let the retried sign/decrypt reach the relay.
+    clear_alias_dead(alias);
+    log::info!("rebuilt remote key for alias {alias} after the B-side lost it");
+    Ok(true)
+}
+
+/// Whether a relay `/api/attest/` answer carries a usable leaf chain (and is not
+/// one of the marked smart-mode failures).
+fn attest_response_has_chain(resp: &Value) -> bool {
+    let result = resp.get("result").unwrap_or(resp);
+    if result.get("relay_error_kind").is_some() {
+        return false;
+    }
+    result
+        .get("cert_chain")
+        .and_then(Value::as_array)
+        .is_some_and(|certs| certs.iter().any(Value::is_string))
+}
 
 // ── reqwest client management ──────────────────────────────────────────
 
@@ -524,9 +910,11 @@ impl RemoteRelay {
         Ok(r.device_id)
     }
 
-    /// POST a JSON body to a relay endpoint.  Returns `Ok(Some(json))` on 2xx
-    /// with a JSON body, `Ok(None)` if the remote is unreachable/non-2xx.
-    fn post_json(path: &str, body: &Value) -> Result<Option<Value>> {
+    /// POST a JSON body to a relay endpoint and return the raw `(status, body)`
+    /// for every answer, including non-2xx ones (whose body carries the reason).
+    /// Only a transport failure or a body that cannot be serialised is `Err`;
+    /// transport failures are retried once.
+    fn post_raw(path: &str, body: &Value) -> Result<(u16, Vec<u8>)> {
         let url = format!("{}{}", Self::base_url()?, path);
         let body_str = serde_json::to_string(body)?;
         let headers = vec![
@@ -538,17 +926,23 @@ impl RemoteRelay {
         // single dropped attempt falls back to the local software keybox and
         // briefly emits a self-signed chain. HTTP error responses are NOT
         // retried — the server answered, and its body carries the real result.
-        let (status, resp) = match http_request("POST", &url, &headers, Some(body_str.as_bytes())) {
-            Ok(v) => v,
+        match http_request("POST", &url, &headers, Some(body_str.as_bytes())) {
+            Ok(v) => Ok(v),
             Err(first) => {
                 log::warn!("remote {path} transport error, retrying once: {first:#}");
                 // A transport failure usually means the link we pinned the
                 // socket to cannot carry traffic.  The retry re-races the
                 // candidates, so it leaves by whichever link answers now.
                 http_request("POST", &url, &headers, Some(body_str.as_bytes()))
-                    .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
+                    .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))
             }
-        };
+        }
+    }
+
+    /// POST a JSON body to a relay endpoint.  Returns `Ok(Some(json))` on 2xx
+    /// with a JSON body, `Ok(None)` if the remote is unreachable/non-2xx.
+    fn post_json(path: &str, body: &Value) -> Result<Option<Value>> {
+        let (status, resp) = Self::post_raw(path, body)?;
         if !(200..300).contains(&status) {
             log::warn!("remote {path} HTTP {status}");
             return Ok(None);
@@ -563,6 +957,35 @@ impl RemoteRelay {
         serde_json::from_slice(&resp)
             .map(Some)
             .map_err(|e| anyhow!("relay returned malformed JSON (status {status}): {e}"))
+    }
+
+    /// POST a sign/decrypt body and classify the answer.  A non-2xx body that
+    /// names a missing key marks `alias` dead (and short-circuits later calls),
+    /// while every other non-2xx answer stays "unavailable" so the caller can
+    /// keep its existing fallback behaviour.
+    fn post_reply(path: &str, body: &Value, alias: &str) -> Result<RemoteReply> {
+        if is_alias_dead(alias) {
+            return Ok(RemoteReply::KeyNotFound);
+        }
+        let (status, resp) = Self::post_raw(path, body)?;
+        if (200..300).contains(&status) {
+            if resp.is_empty() {
+                return Ok(RemoteReply::Unavailable);
+            }
+            return serde_json::from_slice(&resp)
+                .map(RemoteReply::Json)
+                .map_err(|e| anyhow!("relay returned malformed JSON (status {status}): {e}"));
+        }
+        let text = String::from_utf8_lossy(&resp);
+        if relay_body_says_no_key(&text) {
+            log::warn!(
+                "remote {path} HTTP {status}: relay has no key for alias {alias}; caching it as dead"
+            );
+            mark_alias_dead(alias);
+            return Ok(RemoteReply::KeyNotFound);
+        }
+        log::warn!("remote {path} HTTP {status}");
+        Ok(RemoteReply::Unavailable)
     }
 
     /// Forward an attestation request.  `challenge` is the caller's nonce.
@@ -793,26 +1216,29 @@ impl RemoteRelay {
         }
     }
 
-    /// Forward a sign request for a remote key.
-    pub fn sign(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
+    /// Forward a sign request for a remote key.  `RemoteReply::KeyNotFound`
+    /// means the relay has definitively answered that the alias has no private
+    /// key on any layer; the caller must turn that into a terminal error, not a
+    /// retryable one.
+    pub fn sign(alias: &str, data: &[u8], algorithm: &str) -> Result<RemoteReply> {
         let body = json!({
             "alias": alias,
             "data": base64_encode(data),
             "algorithm": algorithm,
             "device_id": Self::device_id()?,
         });
-        Self::post_json("/api/sign/", &body)
+        Self::post_reply("/api/sign/", &body, alias)
     }
 
-    /// Forward a decrypt request for a remote key.
-    pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
+    /// Forward a decrypt request for a remote key (see [`Self::sign`]).
+    pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<RemoteReply> {
         let body = json!({
             "alias": alias,
             "data": base64_encode(data),
             "algorithm": algorithm,
             "device_id": Self::device_id()?,
         });
-        Self::post_json("/api/decrypt/", &body)
+        Self::post_reply("/api/decrypt/", &body, alias)
     }
 
     /// Forward one SOTER operation to a B-side device.
@@ -946,6 +1372,21 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             log::warn!("remote attest returned empty cert chain");
             return Ok(None);
         }
+        // A successful attestation means the relay has (re)created the key for
+        // this alias, so a previous "no key" mark must not keep forwarding off.
+        clear_alias_dead(alias);
+        // Keep the recipe this key was minted with: it is what lets a later
+        // "the B-side lost the key" answer be repaired in place instead of
+        // failing the app's sign/decrypt.
+        store_recipe(
+            alias,
+            RemoteRecipe {
+                challenge: challenge.to_vec(),
+                app_id_der: app_id_der.to_vec(),
+                cert_serial: cert_serial.map(|s| s.to_vec()),
+                params: RecipeParams::capture(params),
+            },
+        );
         Ok(Some(chain))
     }
 
@@ -955,10 +1396,26 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         data: &[u8],
         algorithm: &str,
     ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
-        let Some(resp) = RemoteRelay::sign(alias, data, algorithm)
-            .map_err(|e| kmr_common::km_err!(UnknownError, "remote sign: {e:#}"))?
-        else {
-            return Ok(None);
+        let resp = match remote_op_with_rebuild(
+            alias,
+            || RemoteRelay::sign(alias, data, algorithm),
+            || rebuild_remote_key(alias),
+        ) {
+            Ok(RemoteReply::Json(resp)) => resp,
+            // The remote is unavailable (or answered something we cannot act
+            // on): fall back to local processing exactly as before.
+            Ok(RemoteReply::Unavailable) => return Ok(None),
+            // Terminal: no fulfilment layer has a private key for this alias,
+            // and the in-place rebuild (when one was possible) did not bring it
+            // back.  Report the dedicated code so Keystore returns KEY_NOT_FOUND
+            // to the app instead of the retryable UNKNOWN_ERROR.
+            Ok(RemoteReply::KeyNotFound) => {
+                return Err(kmr_common::km_err!(
+                    RemoteKeyNotFound,
+                    "remote sign: relay has no key for alias '{alias}'"
+                ))
+            }
+            Err(e) => return Err(kmr_common::km_err!(UnknownError, "remote sign: {e:#}")),
         };
         let result = resp.get("result").cloned().unwrap_or(resp);
         let sig_b64 = result
@@ -980,10 +1437,20 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         data: &[u8],
         algorithm: &str,
     ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
-        let Some(resp) = RemoteRelay::decrypt(alias, data, algorithm)
-            .map_err(|e| kmr_common::km_err!(UnknownError, "remote decrypt: {e:#}"))?
-        else {
-            return Ok(None);
+        let resp = match remote_op_with_rebuild(
+            alias,
+            || RemoteRelay::decrypt(alias, data, algorithm),
+            || rebuild_remote_key(alias),
+        ) {
+            Ok(RemoteReply::Json(resp)) => resp,
+            Ok(RemoteReply::Unavailable) => return Ok(None),
+            Ok(RemoteReply::KeyNotFound) => {
+                return Err(kmr_common::km_err!(
+                    RemoteKeyNotFound,
+                    "remote decrypt: relay has no key for alias '{alias}'"
+                ))
+            }
+            Err(e) => return Err(kmr_common::km_err!(UnknownError, "remote decrypt: {e:#}")),
         };
         let result = resp.get("result").cloned().unwrap_or(resp);
         let plain_b64 = result.get("data").and_then(Value::as_str).ok_or_else(|| {
@@ -1001,6 +1468,282 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
 
     fn fallback_local(&self) -> bool {
         fallback_local()
+    }
+}
+
+#[cfg(test)]
+mod relay_error_tests {
+    use super::*;
+
+    /// The current server annotates the terminal failure with
+    /// `"error_kind": "no_such_key"`, at the top level or nested.
+    #[test]
+    fn error_kind_no_such_key_is_recognized() {
+        assert!(relay_body_says_no_key(
+            r#"{"error_kind":"no_such_key","error":"boom"}"#
+        ));
+        assert!(relay_body_says_no_key(
+            r#"{"result":{"error_kind":"NO_SUCH_KEY"}}"#
+        ));
+        assert!(relay_body_says_no_key(
+            r#"{"detail":{"nested":{"error_kind":"no_such_key"}}}"#
+        ));
+    }
+
+    /// Older servers only carried the message text.  This is the exact body
+    /// observed in production.
+    #[test]
+    fn missing_alias_text_is_recognized() {
+        let body = concat!(
+            r#"{"error":"all fulfilment layers failed for device "#,
+            r#"device-b-c3f204aa: no key for alias 'ommega-remote-0123456789abcdef' "#,
+            r#"(call attest first)"}'"#,
+        );
+        assert!(relay_body_says_no_key(body));
+        // The keybox-session variant names the same condition differently.
+        assert!(relay_body_says_no_key(
+            "no server_keybox session for device"
+        ));
+        // A body that is not JSON at all must still be scanned as text.
+        assert!(relay_body_says_no_key("500 no key for alias 'x'"));
+    }
+
+    /// Anything that is not specifically "this alias has no key" must stay
+    /// `Unavailable`, so the existing local fallback keeps working.
+    #[test]
+    fn unrelated_failures_are_not_no_such_key() {
+        assert!(!relay_body_says_no_key(""));
+        assert!(!relay_body_says_no_key("pong"));
+        assert!(!relay_body_says_no_key("internal server error"));
+        assert!(!relay_body_says_no_key(
+            r#"{"error":"no B-side device reporting SOTER support is online"}"#
+        ));
+        assert!(!relay_body_says_no_key(
+            r#"{"error_kind":"strongbox_unavailable"}"#
+        ));
+    }
+
+    /// Marking is per-alias, and a successful attestation must clear it so the
+    /// rebuilt key is forwarded again.  Uses a private alias so the global map
+    /// is not shared with the other test.
+    #[test]
+    fn dead_alias_mark_is_scoped_and_clearable() {
+        let alias = "ommega-remote-cafebabecafebabe";
+        let other = "ommega-remote-feedfacefeedface";
+        clear_alias_dead(alias);
+        clear_alias_dead(other);
+        assert!(!is_alias_dead(alias));
+        mark_alias_dead(alias);
+        assert!(is_alias_dead(alias));
+        assert!(
+            !is_alias_dead(other),
+            "marking one alias must not affect another"
+        );
+        clear_alias_dead(alias);
+        assert!(!is_alias_dead(alias));
+    }
+}
+
+#[cfg(test)]
+mod remote_rebuild_tests {
+    use super::*;
+    use anyhow::anyhow;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    fn sample_recipe(challenge: &[u8]) -> RemoteRecipe {
+        RemoteRecipe {
+            challenge: challenge.to_vec(),
+            app_id_der: vec![1, 2, 3],
+            cert_serial: Some(vec![7]),
+            params: RecipeParams {
+                key_algorithm: Some(3),
+                key_size: Some(256),
+                ec_curve: Some(1),
+                purpose: vec![2],
+                digest: vec![4],
+                security_level: Some(1),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn json_reply() -> RemoteReply {
+        RemoteReply::Json(json!({ "signature": "AA==" }))
+    }
+
+    /// A recorded recipe is found by its own alias, and an alias with no recipe
+    /// reports none (the two cases the rebuild path branches on).
+    #[test]
+    fn recipes_are_scoped_to_their_alias() {
+        let alias = "ommega-remote-00000000000000a1";
+        let other = "ommega-remote-00000000000000a2";
+        store_recipe(alias, sample_recipe(b"c1"));
+        assert_eq!(recipe_for(alias).unwrap().challenge, b"c1".to_vec());
+        assert!(
+            recipe_for(other).is_none(),
+            "an unknown alias has no recipe"
+        );
+    }
+
+    /// The recipe survives its persistable form unchanged: every field the
+    /// B-side needs to mint a matching key must come back.
+    #[test]
+    fn recipe_params_survive_the_persistable_form() {
+        let original = kmr_ta::device::RemoteAttestParams {
+            key_algorithm: Some(1),
+            key_size: Some(2048),
+            ec_curve: None,
+            purpose: vec![2, 3],
+            digest: vec![4],
+            mgf_digest: Some(1),
+            padding: vec![1, 2],
+            rsa_public_exponent: Some(65537),
+            certificate_subject: Some(vec![0x30, 0x00]),
+            certificate_not_before_ms: Some(1_700_000_000_000),
+            certificate_not_after_ms: Some(1_800_000_000_000),
+            security_level: Some(2),
+            attestation_ids: vec![(710, b"brand".to_vec())],
+            user_auth: vec![(504, 2), (505, 30)],
+        };
+        let persisted = serde_json::to_vec(&RecipeParams::capture(&original)).unwrap();
+        let restored: RecipeParams = serde_json::from_slice(&persisted).unwrap();
+        let back = restored.to_attest_params();
+        assert_eq!(format!("{back:?}"), format!("{original:?}"));
+    }
+
+    /// A rebuild is allowed at most once per window per alias; another alias has
+    /// its own window; the window reopens after the throttle interval.
+    #[test]
+    fn rebuild_slots_are_throttled_per_alias_and_reopen() {
+        let alias = "ommega-remote-00000000000000b1";
+        let other = "ommega-remote-00000000000000b2";
+        let t0 = Instant::now();
+        assert!(take_rebuild_slot(alias, t0), "first rebuild is allowed");
+        assert!(
+            !take_rebuild_slot(alias, t0 + Duration::from_millis(1)),
+            "a second rebuild inside the window is refused"
+        );
+        assert!(
+            take_rebuild_slot(other, t0 + Duration::from_millis(2)),
+            "another alias is not throttled by this one"
+        );
+        assert!(
+            take_rebuild_slot(alias, t0 + REBUILD_THROTTLE),
+            "the window reopens after the throttle interval"
+        );
+    }
+
+    /// `KeyNotFound` -> rebuild -> one retry, and the retry's answer wins.
+    #[test]
+    fn key_not_found_rebuilds_then_retries() {
+        let alias = "ommega-remote-00000000000000c1";
+        let attempts = Cell::new(0);
+        let rebuilds = Cell::new(0);
+        let out = remote_op_with_rebuild(
+            alias,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Ok(RemoteReply::KeyNotFound)
+                } else {
+                    Ok(json_reply())
+                }
+            },
+            || {
+                rebuilds.set(rebuilds.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, RemoteReply::Json(_)));
+        assert_eq!(attempts.get(), 2, "exactly one retry");
+        assert_eq!(rebuilds.get(), 1, "exactly one rebuild");
+    }
+
+    /// A retry that is also refused must not loop: the terminal answer comes
+    /// back after exactly one rebuild.
+    #[test]
+    fn a_retry_that_also_fails_stays_terminal_after_one_rebuild() {
+        let alias = "ommega-remote-00000000000000c2";
+        let attempts = Cell::new(0);
+        let rebuilds = Cell::new(0);
+        let out = remote_op_with_rebuild(
+            alias,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(RemoteReply::KeyNotFound)
+            },
+            || {
+                rebuilds.set(rebuilds.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, RemoteReply::KeyNotFound));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(rebuilds.get(), 1);
+    }
+
+    /// If the rebuild itself fails, the caller keeps the existing terminal
+    /// behaviour and does not retry.
+    #[test]
+    fn a_failed_rebuild_does_not_retry() {
+        let alias = "ommega-remote-00000000000000c3";
+        let attempts = Cell::new(0);
+        let out = remote_op_with_rebuild(
+            alias,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(RemoteReply::KeyNotFound)
+            },
+            || Ok(false),
+        )
+        .unwrap();
+        assert!(matches!(out, RemoteReply::KeyNotFound));
+        assert_eq!(attempts.get(), 1, "no retry when the rebuild failed");
+    }
+
+    /// A transport error while rebuilding must not change the outcome either.
+    #[test]
+    fn a_rebuild_error_does_not_retry() {
+        let alias = "ommega-remote-00000000000000c4";
+        let attempts = Cell::new(0);
+        let out = remote_op_with_rebuild(
+            alias,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(RemoteReply::KeyNotFound)
+            },
+            || Err(anyhow!("relay unreachable")),
+        )
+        .unwrap();
+        assert!(matches!(out, RemoteReply::KeyNotFound));
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// Only the "no such key" answer triggers a rebuild; every other answer is
+    /// passed straight through untouched.
+    #[test]
+    fn other_answers_never_trigger_a_rebuild() {
+        for reply in [RemoteReply::Unavailable, json_reply()] {
+            let alias = "ommega-remote-00000000000000c5";
+            let rebuilds = Cell::new(0);
+            let out = remote_op_with_rebuild(
+                alias,
+                || Ok(reply.clone()),
+                || {
+                    rebuilds.set(rebuilds.get() + 1);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(out, RemoteReply::Unavailable),
+                matches!(reply, RemoteReply::Unavailable)
+            );
+            assert_eq!(rebuilds.get(), 0, "no rebuild for a non-KeyNotFound answer");
+        }
     }
 }
 
