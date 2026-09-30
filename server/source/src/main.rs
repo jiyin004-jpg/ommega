@@ -108,7 +108,11 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .with_invalid_rate_limit(cfg.invalid_rate_limit_requests)
         .with_admin_credentials(&cfg.admin_user, &cfg.admin_password, &cfg.admin_extra),
     );
-    let fulfill = Fulfill::new(cfg.server_keybox_enabled(), db.clone());
+    let fulfill = Fulfill::new(
+        cfg.server_keybox_enabled(),
+        cfg.keybox_first_devices.clone(),
+        db.clone(),
+    );
 
     // Load the offline IP-to-region database (non-fatal if missing).
     let geo = crate::geo::Ip2Region::load(&cfg.geo_db_path).map(Arc::new);

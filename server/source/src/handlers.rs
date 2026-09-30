@@ -397,7 +397,7 @@ async fn run_smart_strongbox_attest(
     body: &Value,
     any_b_online: bool,
 ) -> Response {
-    let serverbox = state.fulfill.is_enabled();
+    let serverbox = state.fulfill.prefers_keybox(device_id);
     let task_type = "attest";
 
     if serverbox {
@@ -635,7 +635,11 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
         return run_refuse_strongbox_attest(state, &device_id, body, any_b_online).await;
     }
 
-    let serverbox = state.fulfill.is_enabled();
+    let serverbox = state.fulfill.prefers_keybox(&device_id);
+
+    if serverbox && !state.fulfill.is_enabled() {
+        tracing::info!("attest: device {device_id} 在白名单里，keybox 层排到 B 前面");
+    }
 
     // StrongBox (security_level=2) requests follow the SAME layer order as TEE.
     // Each layer handles them according to its own capability:

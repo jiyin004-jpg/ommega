@@ -34,6 +34,18 @@ pub struct Config {
     /// `physical` (default) routes A/B tasks through the queue; `server_keybox`
     /// fulfils tasks locally using the stored DeviceServerIdentity.
     pub attest_source: String,
+    /// 指定这些目标设备（逗号分隔，`RELAY_KEYBOX_FIRST_DEVICES`）的认证优先走
+    /// 服务端 keybox 层，别先去问 B 的 TEE。
+    ///
+    /// 为什么要有这个：B 的 TEE 链里带的是 **B 自己**的补丁级别和 vbmeta 信任
+    /// 根，而提出认证的是另一台 A 机。检测方（比如 TrustAttestor 的
+    /// `hardware.attestation.patch_level` / `algorithm_differential`）会拿链和本
+    /// 机对照，B 的链怎么都对不上，两条超危就都出来了。服务端 keybox 层是按 A 传
+    /// 上来的 ctx 铸的，补丁/ROT/设备 ID 全是 A 自己的声明值，才自洽。
+    ///
+    /// 只在列的设备上生效，不动 `RELAY_ATTEST_SOURCE` 的全局行为。空值就是全
+    /// 体保持原样（先 B 后 keybox）。
+    pub keybox_first_devices: Vec<String>,
     /// Seconds a B-side assignment may stay pending before being reclaimed.
     ///
     /// “设备接到任务后多久必须交结果”的死线，超时就把任务放回队列，免得一台卡住
@@ -116,6 +128,7 @@ impl Default for Config {
             keybox_refresh_enabled: true,
             keybox_refresh_interval_secs: 7200,
             attest_source: "physical".to_string(),
+            keybox_first_devices: Vec::new(),
             assignment_timeout_secs: 3,
             wait_result_timeout_secs: 3,
             soter_wait_result_timeout_secs: 15,
@@ -249,6 +262,14 @@ impl Config {
         );
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_ATTEST_SOURCE") {
             cfg.attest_source = v;
+        }
+        if let Some(v) = env_or_dotenv(&dotenv, "RELAY_KEYBOX_FIRST_DEVICES") {
+            cfg.keybox_first_devices = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
         }
         cfg.assignment_timeout_secs = env_u64("RELAY_ASSIGNMENT_TIMEOUT", 3);
         cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 3);
