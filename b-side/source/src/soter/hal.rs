@@ -1,12 +1,13 @@
 //! Vendor SOTER HAL client.
 //!
 //! The B-side relay agent forwards SOTER operations to the *real* vendor HAL on
-//! this device.  Two vendor backends ship in the wild, and the transaction
+//! this device.  Two vendor families ship in the wild, and the transaction
 //! numbers they use are the same (AIDL declaration order 1..14):
 //!
 //! ```text
 //! trustonic : vendor.trustonic.hardware.soter.ITrustonicSoter/default   (MTK / Kinibi)
 //! qti       : vendor.qti.hardware.soter.ISoter/default                  (Qualcomm)
+//! xiaomi    : vendor.xiaomi.hardware.soterservice@1.0::ISoter           (MTK, HIDL only)
 //! ```
 //!
 //! What differs is the outer reply framing:
@@ -63,23 +64,28 @@ pub const QTI_INTERFACE: &str = "vendor.qti.hardware.soter.ISoter";
 ///
 /// 同一家 vendor 可能以两种形态出现：老的 HIDL（`@1.0::`，跑 `/dev/hwbinder`）
 /// 和新的 AIDL（跑 `/dev/binder`）。Android 13 以后厂商陆续搬到 AIDL，但过渡期
-/// 两种都可能有，所以四个后端都要认。两个名字对不上别当成一家。
+/// 两种都可能有，所以这几个后端都要认。两个名字对不上别当成一家。
+///
+/// 小米只在 HIDL 上出现过（`vendor.xiaomi.hardware.soterservice@1.0::ISoter`，天玑机
+/// 实测能签），没有对应的 AIDL 形态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Trustonic,
     Qti,
     TrustonicHidl,
     QtiHidl,
+    XiaomiHidl,
 }
 
 impl Backend {
     /// 解析顺序。AIDL 在前：Android 13 以后厂商都搬过去了，HIDL 是过渡期的兜底。
     /// 同一家 vendor 只会注册其中一种形态。
-    pub const ALL: [Backend; 4] = [
+    pub const ALL: [Backend; 5] = [
         Backend::Trustonic,
         Backend::Qti,
         Backend::TrustonicHidl,
         Backend::QtiHidl,
+        Backend::XiaomiHidl,
     ];
 
     /// 服务名。HIDL 那边是 fqName（`@1.0::` 那个），instance 统一是 `default`。
@@ -89,6 +95,7 @@ impl Backend {
             Backend::Qti => QTI_SERVICE,
             Backend::TrustonicHidl => hidl::HIDL_TRUSTONIC_FQNAME,
             Backend::QtiHidl => hidl::HIDL_QTI_FQNAME,
+            Backend::XiaomiHidl => hidl::HIDL_XIAOMI_FQNAME,
         }
     }
 
@@ -99,6 +106,7 @@ impl Backend {
             Backend::Qti => QTI_INTERFACE,
             Backend::TrustonicHidl => hidl::HIDL_TRUSTONIC_FQNAME,
             Backend::QtiHidl => hidl::HIDL_QTI_FQNAME,
+            Backend::XiaomiHidl => hidl::HIDL_XIAOMI_FQNAME,
         }
     }
 
@@ -109,12 +117,16 @@ impl Backend {
             Backend::Qti => "qti",
             Backend::TrustonicHidl => "trustonic-hidl",
             Backend::QtiHidl => "qti-hidl",
+            Backend::XiaomiHidl => "xiaomi-hidl",
         }
     }
 
     /// 是不是跑在 `/dev/hwbinder` 上的那套。
     pub fn is_hidl(self) -> bool {
-        matches!(self, Backend::TrustonicHidl | Backend::QtiHidl)
+        matches!(
+            self,
+            Backend::TrustonicHidl | Backend::QtiHidl | Backend::XiaomiHidl
+        )
     }
 
     /// qti declares the payload methods as `int xxx(..., out SoterData data)`, so
@@ -274,7 +286,9 @@ impl Soter {
                 let _typed: rsbinder::Strong<dyn ISoter> =
                     FromIBinder::try_from(binder.clone()).map_err(descriptor_error)?;
             }
-            Backend::TrustonicHidl | Backend::QtiHidl => unreachable!("handled above"),
+            Backend::TrustonicHidl | Backend::QtiHidl | Backend::XiaomiHidl => {
+                unreachable!("handled above")
+            }
         }
 
         Ok(Some(Soter {
@@ -652,6 +666,36 @@ fn looks_like_soter_error(code: i32) -> bool {
 #[cfg(all(test, target_os = "android"))]
 mod tests {
     use super::*;
+
+    /// 后端名表：每家的服务名/标签不能撞，HIDL 的 token 跟服务名是同一份。
+    #[test]
+    fn every_backend_has_its_own_service_and_label() {
+        let mut seen: Vec<&str> = Vec::new();
+        for backend in Backend::ALL {
+            assert!(
+                !seen.contains(&backend.service()),
+                "{} 的服务名跟别的后端撞了",
+                backend.label()
+            );
+            seen.push(backend.service());
+            assert_eq!(backend.is_hidl(), backend.label().ends_with("-hidl"));
+            if backend.is_hidl() {
+                assert_eq!(backend.interface(), backend.service());
+            }
+        }
+        assert_eq!(Backend::XiaomiHidl.service(), hidl::HIDL_XIAOMI_FQNAME);
+        assert_eq!(Backend::XiaomiHidl.interface(), hidl::HIDL_XIAOMI_FQNAME);
+        assert_eq!(Backend::XiaomiHidl.label(), "xiaomi-hidl");
+        assert!(Backend::XiaomiHidl.is_hidl(), "小米只在 HIDL 上出现过");
+        assert!(
+            !Backend::XiaomiHidl.supports_attk_extras(),
+            "小米那边的 2/6/14 没验过，宿主也不发，别当它有"
+        );
+        assert!(
+            !Backend::XiaomiHidl.has_return_code(),
+            "HIDL 的回包只有 Status，没有方法返回值那一格"
+        );
+    }
 
     #[test]
     fn soter_error_codes_are_recognised() {
