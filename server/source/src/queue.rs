@@ -143,6 +143,20 @@ fn task_needs_soter_sign(task: &Task) -> bool {
         .unwrap_or(false)
 }
 
+/// 排队优先级：数字越小越先被 B 端领走。
+///
+/// attest 最靠前（RKP / 出链那条路，Duck Detector 拿它比延迟），sign / decrypt
+/// 次之，SOTER 垫底（那些 op 本来就有短 TTL 合并，晚几毫秒无所谓）。未知类型
+/// 排中间，免得以后加的新类型凭空插到 attest 前面。
+fn task_priority(task_type: &str) -> u8 {
+    match task_type {
+        "attest" => 0,
+        "sign" | "decrypt" => 1,
+        "soter" => 3,
+        _ => 2,
+    }
+}
+
 impl DeviceCaps {
     /// 解析心跳的 `caps` 字段：逗号分隔的能力名，例如 `soter,strongbox`。
     ///
@@ -562,28 +576,41 @@ impl TaskStore {
         let mut picked: Option<Task> = None;
         let mut deferred: Vec<String> = Vec::new();
         if let Some(q) = inner.pending_by_device.get_mut(device_id) {
-            let mut budget = q.len();
-            while budget > 0 {
-                budget -= 1;
-                let Some(candidate_id) = q.pop_front() else {
-                    break;
-                };
-                let Some(t) = inner.tasks.get_mut(&candidate_id) else {
-                    // Stale id (task no longer exists) — drop it.
+            // 按优先级挑，同优先级里仍是先来后到。
+            //
+            // 为什么不直接 pop_front：B 端一次只做一条，attest / sign / soter 全排
+            // 同一条队。RKP / attest 这一路是远端一跳，Duck Detector 拿它跟本地
+            // attest 的 13ms 比延迟（delta >= 120ms 就红），排在几十条别的活后面
+            // 必然红。soter 那些 op 本来就有短 TTL 合并，晚几毫秒无所谓。
+            let ids: Vec<String> = q.iter().cloned().collect();
+            let mut best: Option<(u8, usize)> = None;
+            for (idx, id) in ids.iter().enumerate() {
+                let Some(t) = inner.tasks.get(id) else {
                     continue;
                 };
                 let cannot_sign = !soter_sign_ok && task_needs_soter_sign(t);
                 if t.task_type == "soter" && (!soter_ok || cannot_sign) {
                     // 这台说它做不了 SOTER（或者只做不了签名那两步）。任务本身还等着人做，不能就这么
                     // 从队列里没了（那就只剩 TTL 扫到才被标失败），先收着。
-                    deferred.push(candidate_id);
+                    deferred.push(id.clone());
                     continue;
                 }
-                t.assigned_device_id = Some(device_id.to_string());
-                t.assigned_at_ms = Self::now_ms();
-                t.status = TaskStatus::Assigned;
-                picked = Some(t.clone());
-                break;
+                let p = task_priority(&t.task_type);
+                if best.map_or(true, |(bp, _)| p < bp) {
+                    best = Some((p, idx));
+                }
+            }
+            if let Some((_, idx)) = best {
+                let candidate_id = ids[idx].clone();
+                if let Some(t) = inner.tasks.get_mut(&candidate_id) {
+                    t.assigned_device_id = Some(device_id.to_string());
+                    t.assigned_at_ms = Self::now_ms();
+                    t.status = TaskStatus::Assigned;
+                    picked = Some(t.clone());
+                }
+                if let Some(pos) = q.iter().position(|x| *x == candidate_id) {
+                    q.remove(pos);
+                }
             }
             // Queue drained and nothing matched — drop the entry to save memory.
             if picked.is_none() && q.is_empty() {
@@ -865,9 +892,10 @@ impl TaskStore {
             let queued_ms = task.assigned_at_ms.saturating_sub(task.created_at_ms);
             let served_ms = now.saturating_sub(task.assigned_at_ms);
             tracing::info!(
-                "b_latency: task={} type={} wait={}ms served={}ms total={}ms",
+                "b_latency: task={} type={} device={} wait={}ms served={}ms total={}ms",
                 task.task_id,
                 task.task_type,
+                task.assigned_device_id.as_deref().unwrap_or("-"),
                 queued_ms,
                 served_ms,
                 now.saturating_sub(task.created_at_ms)
@@ -1716,6 +1744,65 @@ mod device_load_window_tests {
             store.resolve_online_target("dev-absent").await,
             "dev-busy",
             "过期负载不该再压着它"
+        );
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    /// 同一条队上：attest 排最前，sign 次之，soter 垫底。
+    #[tokio::test]
+    async fn attest_comes_before_sign_and_soter() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let dev = "device-b-prio";
+        let payload = serde_json::json!({ "alias": "ommega-remote-prio" });
+        // 排队顺序故意反过来：soter 先进、attest 最后进。
+        let soter = store.create_task("soter", payload.clone(), dev).await;
+        let sign = store.create_task("sign", payload.clone(), dev).await;
+        let attest = store.create_task("attest", payload.clone(), dev).await;
+
+        let t = Duration::from_millis(50);
+        let caps = DeviceCaps::default();
+        let first = store
+            .pop_for_b(dev, "M-1", caps.clone(), t)
+            .await
+            .expect("应该能领到活");
+        assert_eq!(first.task_id, attest, "attest 要先被领走（RKP 那条腿）");
+        let second = store
+            .pop_for_b(dev, "M-1", caps.clone(), t)
+            .await
+            .expect("应该能领到活");
+        assert_eq!(second.task_id, sign, "sign 次之");
+        let third = store
+            .pop_for_b(dev, "M-1", caps, t)
+            .await
+            .expect("应该能领到活");
+        assert_eq!(third.task_id, soter, "soter 垫底");
+    }
+
+    /// 同优先级里仍是先来后到，别把顺序搞反了。
+    #[tokio::test]
+    async fn same_priority_keeps_arrival_order() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let dev = "device-b-prio2";
+        let payload = serde_json::json!({ "alias": "ommega-remote-prio" });
+        let a = store.create_task("sign", payload.clone(), dev).await;
+        let b = store.create_task("sign", payload.clone(), dev).await;
+        let t = Duration::from_millis(50);
+        let caps = DeviceCaps::default();
+        assert_eq!(
+            store
+                .pop_for_b(dev, "M-1", caps.clone(), t)
+                .await
+                .unwrap()
+                .task_id,
+            a
+        );
+        assert_eq!(
+            store.pop_for_b(dev, "M-1", caps, t).await.unwrap().task_id,
+            b
         );
     }
 }

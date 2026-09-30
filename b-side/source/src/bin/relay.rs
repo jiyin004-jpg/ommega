@@ -1004,7 +1004,42 @@ fn spawn_config_watcher(shared: Arc<RwLock<RelayConfig>>, last_mtime: u64) {
     });
 }
 
+/// 一台 B 端能同时做几条活。
+///
+/// 2026-09-30 实测：这台机器上 attest 的排队平均 886ms，而它自己只跑 98ms ——
+/// 一条重活把整条队堵在后面，跟谁先谁后无关。所以默认开两路：取一条、做一条的
+/// 循环变成两路各自长轮询，下一单不用等上一单跑完。HAL 本身（KeyMint / soter）
+/// 就是多线程 binder 服务，两路并发不会打架。想回到单线程设
+/// `OMMEGA_RELAY_WORKERS=1`。
+fn worker_count() -> usize {
+    std::env::var("OMMEGA_RELAY_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=8).contains(n))
+        .unwrap_or(2)
+}
+
 fn run_loop(shared: Arc<RwLock<RelayConfig>>) {
+    let workers = worker_count();
+    log::info!("relay loop starting with {workers} worker(s)");
+    if workers <= 1 {
+        worker_loop(shared);
+        return;
+    }
+    let mut handles = Vec::with_capacity(workers);
+    for i in 0..workers {
+        let shared = Arc::clone(&shared);
+        handles.push(std::thread::spawn(move || {
+            log::info!("relay worker {i} up");
+            worker_loop(shared);
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
     // 正常情况下服务端会挂着 15s 长轮询，一轮一个请求。但它要是立刻回 204
     // （老版本服务端、代理提前收掉连接等），这里不设下限就变成“能跑多快跑多快”，
     // 直接把服务器打满。失败路径同理，用指数退避兜住。
