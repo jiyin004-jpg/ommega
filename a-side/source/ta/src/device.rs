@@ -265,13 +265,6 @@ pub trait RemoteBackend: Send {
     /// Indicate whether the remote backend is currently enabled.
     fn enabled(&self) -> bool;
 
-    /// 认证请求要不要转发到远端后端。缺省就是 [`Self::enabled`]。A 端开了
-    /// `attest_local` 时由 daemon 侧的实现覆盖：只把「带 attestation challenge、
-    /// 又没带 ATTEST_KEY」那条 `generateKey` 改成走本地，sign/decrypt 照旧。
-    fn attest_remote(&self) -> bool {
-        self.enabled()
-    }
-
     /// Whether the TA may fall back to the local software keybox when the
     /// remote is unavailable.  Defaults to `true`.
     fn fallback_local(&self) -> bool {

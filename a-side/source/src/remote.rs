@@ -1483,18 +1483,6 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         remote_enabled()
     }
 
-    /// 开了 `attest_local` 之后认证走本地：sign/decrypt 继续转发，只有带
-    /// attestation challenge 且调用方没自带 attest key 的那条出链不再上远端。
-    /// 检测方会拿它跟「自带 attest key」那条臂比耗时，差一个网络往返就看得出来
-    /// （实测 ~131ms vs ~8ms）。
-    fn attest_remote(&self) -> bool {
-        remote_enabled()
-            && !crate::config::config()
-                .read()
-                .map(|g| g.remote.attest_local)
-                .unwrap_or(false)
-    }
-
     fn fallback_local(&self) -> bool {
         fallback_local()
     }
