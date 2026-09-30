@@ -103,9 +103,21 @@ fn check_auth(
         return Err(Box::new(auth_fail()));
     }
 
-    // Valid auth: rate limit by token (or IP when no token).
-    let rl_key = if token.is_empty() { ip } else { token.clone() };
-    if !state.auth.allow(&rl_key) {
+    // 限流按客户端 IP 算，不按 token 算。
+    //
+    // 为什么换成 IP：B 端是长轮询（poll + result 一轮两个请求），单台跑到 7 次/秒
+    // 很正常。按 token 限的时候，这一台自己的额度先被自己的轮询吃满，超了就 429；
+    // B 收到 429 会退避 1 秒，这一秒没人领任务，任务在服务端干等 —— Duck Detector
+    // 上那 1~3 秒的 rkp 等待就是这么来的。改成按 IP 之后，同一台设备不管拿哪个
+    // token 都算同一份额度，正常轮询永远吃不满。
+    if !state.auth.allow(&ip) {
+        // 这行以前没有，429 打进日志 0 条，查了半天才发现是自己在限流。
+        tracing::warn!(
+            "rate limit hit ip={ip} role={} window={}s limit={}",
+            role.unwrap_or("-"),
+            state.auth.rate_limit_window.as_secs(),
+            state.auth.rate_limit_requests
+        );
         return Err(Box::new(json_err(
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded",

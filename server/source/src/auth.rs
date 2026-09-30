@@ -43,6 +43,9 @@ pub struct AuthState {
 /// Admin session TTL: 12 hours of inactivity.
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
+/// 限流表最多留多少条 key（按 IP 记），超了就清一遍空桶。
+const RATE_MAP_MAX: usize = 4096;
+
 impl AuthState {
     pub fn new(
         relay_token: String,
@@ -301,7 +304,7 @@ impl AuthState {
         false
     }
 
-    /// Sliding-window rate limit keyed by token (or client IP when no token).
+    /// Sliding-window rate limit. `key` 就是客户端 IP（见 check_auth）。
     /// Returns true if the request is allowed.
     pub fn allow(&self, key: &str) -> bool {
         self.allow_with_limit(&self.rate, key, self.rate_limit_requests)
@@ -338,6 +341,14 @@ impl AuthState {
     ) -> bool {
         let now = Instant::now();
         let mut map = crate::util::mu(rate);
+        // key 以前是 token（就那几把），现在是 IP，来源杂得多，扫一遍全表的 IP 都
+        // 会各留一个桶。桶空了不删，表只涨不消；攒到一定规模就把过期的清一遭。
+        if map.len() > RATE_MAP_MAX {
+            map.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < self.rate_limit_window);
+                !v.is_empty()
+            });
+        }
         let bucket = map.entry(key.to_string()).or_default();
         bucket.retain(|t| now.duration_since(*t) < self.rate_limit_window);
         if bucket.len() as u64 >= limit {

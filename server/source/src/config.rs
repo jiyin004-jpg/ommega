@@ -67,7 +67,7 @@ pub struct Config {
     pub mysql_time_zone: String,
     /// ip2region.xdb path for offline IP-to-region lookup. Empty => disabled.
     pub geo_db_path: String,
-    /// Rate limit: max valid requests per token per window.
+    /// Rate limit: max valid requests per client IP per window.
     pub rate_limit_requests: u64,
     /// Rate limit: max invalid (failed-auth) requests per IP per window.
     pub invalid_rate_limit_requests: u64,
@@ -123,9 +123,9 @@ impl Default for Config {
             mysql_url: String::new(),
             mysql_time_zone: "+08:00".to_string(),
             geo_db_path: "ip2region.xdb".to_string(),
-            rate_limit_requests: 800,
+            rate_limit_requests: 60000,
             invalid_rate_limit_requests: 40,
-            rate_limit_window_secs: 3600,
+            rate_limit_window_secs: 60,
             pay_gateway: String::new(),
             pay_pid: String::new(),
             pay_key: String::new(),
@@ -264,9 +264,12 @@ impl Config {
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_GEO_DB_PATH") {
             cfg.geo_db_path = v;
         }
-        cfg.rate_limit_requests = env_u64("RELAY_RATE_LIMIT_REQUESTS", 800);
+        // 按 IP 限、额度给得很宽：正常客户端（尤其 B 的长轮询）根本碰不到，
+        // 只有死循环或者刷接口的才会被拦。老默认值是 800/小时、按 token 算，
+        // 一台 B 端自己轮询就能吃满自己的额度，然后 429 -> 退避 -> 任务干等。
+        cfg.rate_limit_requests = env_u64("RELAY_RATE_LIMIT_REQUESTS", 60000);
         cfg.invalid_rate_limit_requests = env_u64("RELAY_INVALID_RATE_LIMIT_REQUESTS", 40);
-        cfg.rate_limit_window_secs = env_u64("RELAY_RATE_LIMIT_WINDOW", 3600);
+        cfg.rate_limit_window_secs = env_u64("RELAY_RATE_LIMIT_WINDOW", 60);
         if let Some(v) = env_or_dotenv(&dotenv, "PAY_GATEWAY") {
             cfg.pay_gateway = v;
         }
