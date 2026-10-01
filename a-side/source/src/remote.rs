@@ -24,14 +24,15 @@
 //! `tls_insecure` (default true) accepts any server certificate — matching the
 //! B-side client behaviour.
 //!
-//! Two long-lived reqwest clients (insecure / verify) are kept in `OnceLock`s
-//! and selected per request based on the current `tls_insecure` config value.
-//! Each client has its own internal connection pool, so concurrent requests
-//! are not serialised through a single Mutex — fixing the previous single-
-//! connection pool bottleneck.  reqwest also natively supports chunked transfer
-//! encoding and HTTP keep-alive, both of which the hand-written client did not.
+//! One long-lived reqwest client is kept in a cache and picked per request from
+//! the current `tls_insecure` config value and the outgoing interface the
+//! traffic should use (see `desired_iface`).  The client carries its own internal
+//! connection pool, so concurrent requests are not serialised through a single
+//! Mutex — fixing the previous single-connection pool bottleneck.  reqwest also
+//! natively supports chunked transfer encoding and HTTP keep-alive, both of which
+//! the hand-written client did not.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -50,26 +51,67 @@ pub struct RemoteRelay;
 
 // ── reqwest client management ──────────────────────────────────────────
 
-/// Returns a reqwest blocking client configured for the current `tls_insecure`
-/// setting.  Two clients (insecure / verify) are lazily initialised and cached
-/// in `OnceLock`s — each carries its own connection pool, so flipping
-/// `tls_insecure` at runtime just picks the other pool.
-fn get_client() -> Result<Client> {
-    let insecure = config::config()
-        .read()
-        .map(|c| c.remote.tls_insecure)
-        .unwrap_or(true);
-
-    if insecure {
-        static INSECURE_CLIENT: OnceLock<Client> = OnceLock::new();
-        Ok(INSECURE_CLIENT.get_or_init(|| build_client(true)).clone())
-    } else {
-        static VERIFY_CLIENT: OnceLock<Client> = OnceLock::new();
-        Ok(VERIFY_CLIENT.get_or_init(|| build_client(false)).clone())
-    }
+/// A cached client together with the inputs it was built from.
+///
+/// The interface is part of the identity because it follows VPN state: pinning
+/// it in a `OnceLock` the way `tls_insecure` used to be pinned would freeze
+/// whatever was decided the first time a request went out.
+struct CachedClient {
+    insecure: bool,
+    iface: Option<String>,
+    client: Client,
 }
 
-fn build_client(insecure: bool) -> Client {
+/// The connection pool.  Rebuilt only when `tls_insecure` or the chosen
+/// interface changes; otherwise the same client (and its pool) is reused.
+static CLIENT_CACHE: Mutex<Option<CachedClient>> = Mutex::new(None);
+
+/// Returns a reqwest blocking client for the current `tls_insecure` setting and
+/// the interface traffic should leave from.
+fn get_client() -> Result<Client> {
+    // Snapshot just the fields we need.  Picking an interface can probe the
+    // candidate links, which blocks for up to `PROBE_TIMEOUT` per candidate, and
+    // that must not happen while the config lock is held.
+    let (insecure, bind_iface, base_url) = {
+        let guard = config::config()
+            .read()
+            .map_err(|_| anyhow!("config lock poisoned"))?;
+        (
+            guard.remote.tls_insecure,
+            guard.remote.bind_iface.clone(),
+            guard.remote.url.clone(),
+        )
+    };
+    let iface = desired_iface(&bind_iface, &base_url);
+
+    let mut slot = CLIENT_CACHE
+        .lock()
+        .map_err(|_| anyhow!("client cache lock poisoned"))?;
+
+    if let Some(cached) = slot.as_ref() {
+        if cached.insecure == insecure && cached.iface == iface {
+            return Ok(cached.client.clone());
+        }
+    }
+
+    if let Some(name) = iface.as_deref() {
+        log::info!("relay traffic bound to interface {name}");
+    }
+    let client = build_client(insecure, iface.as_deref());
+    *slot = Some(CachedClient {
+        insecure,
+        iface,
+        client,
+    });
+
+    Ok(slot
+        .as_ref()
+        .expect("client was just stored")
+        .client
+        .clone())
+}
+
+fn build_client(insecure: bool, iface: Option<&str>) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .timeout(Duration::from_millis(READ_TIMEOUT_MS))
@@ -79,9 +121,368 @@ fn build_client(insecure: bool) -> Client {
         builder = builder.danger_accept_invalid_certs(true);
     }
 
+    if let Some(name) = iface {
+        // `SO_BINDTODEVICE`: pin the socket to a physical uplink so the routing
+        // rules that steer traffic into a VPN tunnel do not capture it.
+        builder = builder.interface(name);
+    }
+
     builder
         .build()
         .expect("failed to build reqwest blocking client")
+}
+
+// ── outgoing interface selection ───────────────────────────────────────
+
+/// What the `bind_iface` config value means.
+#[derive(Debug, PartialEq, Eq)]
+enum BindChoice {
+    /// `none` / `off` — never bind.
+    Never,
+    /// Empty or `auto` (the default) — try the OS default route first, bind only
+    /// when that route cannot reach the relay.
+    Auto,
+    /// `always` / `on` — always look for an uplink to bind to.
+    Always,
+    /// A literal interface name, used as given.
+    Named(String),
+}
+
+fn classify_bind_iface(raw: &str) -> BindChoice {
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+        BindChoice::Never
+    } else if v.eq_ignore_ascii_case("always") || v.eq_ignore_ascii_case("on") {
+        BindChoice::Always
+    } else if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+        BindChoice::Auto
+    } else {
+        BindChoice::Named(v.to_string())
+    }
+}
+
+const SYS_CLASS_NET: &str = "/sys/class/net";
+
+/// Decides which interface (if any) this request should leave from.
+///
+/// Why bind at all: with a VPN up, the OS steers ordinary traffic into the
+/// tunnel — netd points the connection's fwmark at the VPN network and the
+/// default route ends up on `tun`.  Traffic to our own relay server gets caught
+/// by the same rules, so it goes through the tunnel too: slower, jittery, and in
+/// the bad cases simply unreachable.  The only way to keep a socket out of that
+/// is to name its outgoing device (`SO_BINDTODEVICE`, which is what reqwest's
+/// `.interface()` sets).
+///
+/// With no VPN up nothing is touched at all: an unbound socket interferes least
+/// and keeps the OS's own "WiFi dropped, fall back to cellular" switching, so a
+/// healthy machine is finished right there.  A VPN is what triggers picking an
+/// uplink, and if nothing usable is found the socket still stays unbound (back
+/// to the OS default route).
+///
+/// This path only reads files: `desired_iface` is asked on every request, so no
+/// probe may run here.
+fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
+    match classify_bind_iface(bind_iface) {
+        BindChoice::Never => None,
+        // An explicit name is taken at face value: whether it exists or works is
+        // the kernel's call, not ours.
+        BindChoice::Named(name) => Some(name),
+        BindChoice::Auto if !vpn_present() => None,
+        BindChoice::Auto | BindChoice::Always => pick_uplink(base_url),
+    }
+}
+
+/// Whether a VPN is currently up.  `VpnService` always leaves a `tun` device in
+/// `/sys/class/net` and the older pptp/l2tp paths leave a `ppp`; the names are
+/// always `tun0` / `ppp0` shaped — an Android-wide convention, not something that
+/// varies per device model.
+///
+/// It only decides whether picking starts: missing one means "behave like there
+/// is no VPN" (nothing is bound), never a wrong link, and a false positive costs
+/// at most one extra probe.
+fn vpn_present() -> bool {
+    let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("tun") || n.starts_with("ppp") || n.starts_with("tap"))
+    })
+}
+
+/// Picks an uplink that can actually reach the relay.  Nothing usable leaves the
+/// socket unbound — pinning one that just proved it cannot carry traffic would
+/// throw away the OS's own ability to follow the network.
+fn pick_uplink(base_url: &str) -> Option<String> {
+    let (preferred, rest) = candidates();
+    if preferred.is_empty() && rest.is_empty() {
+        log::warn!("no interface holds an IPv4 route; leaving the socket unbound");
+        return None;
+    }
+    // Two rounds: the interfaces that look like real NICs race first, and only
+    // when none of them answers does the rest (tunnels, vendor devices) get a
+    // turn.  With more than one usable path that prefers physical links over
+    // whichever one happens to answer first.
+    if let Some(winner) = race_uplink(&preferred, base_url) {
+        return Some(winner);
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    log::warn!(
+        "no physical-looking uplink answered; trying the rest ({})",
+        rest.join(",")
+    );
+    race_uplink(&rest, base_url)
+}
+
+/// Whether this interface looks like a real network card rather than a tunnel,
+/// bridge or dummy device.
+///
+/// Names are never consulted: they are whatever the vendor and the kernel felt
+/// like calling things, and nobody can pre-list a vendor tunnel such as
+/// `vgate0`.  What the kernel says about the device is what counts:
+///
+/// - `/sys/class/net/<n>/device` exists only for devices hanging off a bus
+///   (PCIe / SDIO / USB); tun, dummy, bridges and vlan interfaces have none.
+/// - The link-layer `type` is 1 (ethernet) or 519 (RAWIP, which cellular
+///   `rmnet` / `ccmni` report).
+///
+/// Both unreadable (SELinux denies them in some domains) counts as "not
+/// physical": that only pushes the device to the second round, it is never
+/// dropped — the reachability probe has the final say either way.
+fn physical_like(name: &str) -> bool {
+    let base = format!("{SYS_CLASS_NET}/{name}");
+    if std::path::Path::new(&format!("{base}/device")).exists() {
+        return true;
+    }
+    match std::fs::read_to_string(format!("{base}/type")) {
+        Ok(t) => t.trim().parse::<u32>().is_ok_and(|n| n == 1 || n == 519),
+        Err(_) => false,
+    }
+}
+
+/// The relay's liveness endpoint, and the body it answers with.
+///
+/// `/api/ping/` returns a fixed `pong` without touching any state, which makes it
+/// the right probe target: cheap enough to hit while picking an interface, and
+/// its body identifies the relay.  Probing `/` instead would accept any HTTP
+/// answer, including one from a captive portal or a carrier interstitial that
+/// swallowed the request.
+const PING_PATH: &str = "/api/ping/";
+const PING_BODY: &str = "pong";
+
+/// How long a single reachability probe may take before that interface is
+/// written off.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Where a reachability probe goes.  A trailing slash on the configured URL must
+/// not double up.
+fn probe_url(base_url: &str) -> String {
+    format!("{}{PING_PATH}", base_url.trim_end_matches('/'))
+}
+
+/// Whether traffic sent through `iface` actually reaches the relay server.
+///
+/// Holding an IPv4 address is not the same as having a working route.  A phone
+/// joined to a WiFi network whose upstream is down — or stuck behind a captive
+/// portal — still gets a DHCP lease, so `wlan0` looks perfectly healthy while
+/// everything sent through it disappears.  Ranking by name alone then picks
+/// WiFi forever and forwarding is dead until the user finds a working network.
+///
+/// A short request is the only honest test, and the endpoint answers a known
+/// body: a transport failure means the interface cannot carry the request, while
+/// an answer that is not `pong` means something in between swallowed it.
+///
+/// `None` probes whichever route the OS picks on its own — the "does the default
+/// path reach the relay at all" question that decides whether anything has to be
+/// bound.
+fn probe_iface(iface: Option<&str>, base_url: &str) -> bool {
+    // Nothing to probe against (unconfigured or malformed URL) — do not turn a
+    // configuration problem into "no interface works".
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return true;
+    }
+    let mut builder = Client::builder()
+        .no_proxy()
+        .connect_timeout(PROBE_TIMEOUT)
+        .timeout(PROBE_TIMEOUT)
+        // The probe only asks whether packets get there; a certificate problem
+        // is not a routing problem.
+        .danger_accept_invalid_certs(true);
+    if let Some(name) = iface {
+        builder = builder.interface(name);
+    }
+    let Ok(client) = builder.build() else {
+        return false;
+    };
+    let Ok(resp) = client.get(probe_url(base_url)).send() else {
+        return false;
+    };
+    resp.status().is_success() && resp.text().is_ok_and(|body| body.trim() == PING_BODY)
+}
+
+/// Races the candidate uplinks against each other and returns whichever one
+/// answers the probe first.
+///
+/// Racing rather than ranking is what makes the choice self-correcting: a WiFi
+/// link whose upstream died simply never answers, so it loses on its own —
+/// nobody has to notice it is dead and nobody waits for a cached decision to
+/// expire.  The losers' probes only ever send a harmless GET and are dropped;
+/// a blocking request cannot be cancelled, and none is needed.
+///
+/// Only the probe races.  The real request still goes out exactly once, over the
+/// winner: attestation is not idempotent, and sending it down both links would
+/// make the B-side TEE do the work twice.
+fn race_uplink(candidates: &[String], base_url: &str) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // The closure must be `'static` to move into the probe threads, so the URL is
+    // captured by value instead of borrowed.
+    let url = base_url.to_string();
+    let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+        Arc::new(move |name: &str| probe_iface(Some(name), &url));
+    race_with(candidates, probe)
+}
+
+/// The racing itself, with the probe injected so it can be tested without a
+/// network.
+fn race_with(
+    candidates: &[String],
+    probe: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for name in candidates {
+        let tx = tx.clone();
+        let name = name.clone();
+        let probe = Arc::clone(&probe);
+        std::thread::spawn(move || {
+            if probe(&name) {
+                let _ = tx.send(name);
+            }
+        });
+    }
+    // Without this the channel would stay open as long as any clone of the
+    // sender lives, so a race where every probe fails would block for the full
+    // timeout instead of returning as soon as the last probe reports.
+    drop(tx);
+    match rx.recv_timeout(PROBE_TIMEOUT + Duration::from_millis(200)) {
+        Ok(winner) => {
+            log::info!(
+                "relay uplink race won by {winner} (candidates: {})",
+                candidates.join(",")
+            );
+            Some(winner)
+        }
+        // Nothing answered.  Leave the socket unbound rather than pinning a link
+        // that just failed to reach the relay: binding one anyway would put us
+        // back where this started — stuck on a WiFi link that carries nothing —
+        // and an unbound socket at least lets the OS follow the network.  This
+        // also covers a `url` that resolves through the tunnel (Clash fake-IP),
+        // where no physical link can ever answer.
+        Err(_) => {
+            log::warn!(
+                "no uplink answered a probe; leaving the socket unbound (candidates: {})",
+                candidates.join(",")
+            );
+            None
+        }
+    }
+}
+
+/// The interfaces currently holding an IPv4 address, as listed in
+/// `/proc/net/route` (header row skipped).
+fn ifaces_with_ipv4() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Ok(text) = std::fs::read_to_string("/proc/net/route") else {
+        return names;
+    };
+    for line in text.lines().skip(1) {
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The interfaces that hold an IPv4 route right now, split into (looks like a
+/// real NIC, everything else), each group best first.
+///
+/// An interface has to appear in `/proc/net/route` to count at all: that is what
+/// proves it currently carries an IPv4 route, and binding to a device without
+/// one means binding to an empty shell.  No name is filtered here — a name list
+/// goes stale the moment another vendor shows up, and a missed real uplink is a
+/// worse failure than an extra probe.  Reachability is decided by `probe_iface`.
+///
+/// `operstate` that says `down` is skipped, but an *unreadable* one is not
+/// (SELinux denies it in some domains): `/proc/net/route` already proved the
+/// route exists.  Cellular interfaces report `unknown`, so that value has to
+/// pass too.
+fn candidates() -> (Vec<String>, Vec<String>) {
+    let with_ip = ifaces_with_ipv4();
+    if with_ip.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let live: Vec<String> = with_ip
+        .into_iter()
+        .filter(|name| {
+            let state = std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/operstate"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            state.is_empty() || state == "up" || state == "unknown"
+        })
+        .collect();
+    split_candidates(live, physical_like)
+}
+
+/// Splits candidates by "does it look physical", best first inside each group.
+///
+/// Separate from `candidates` so a test can inject its own verdict: a dev box has
+/// no `/sys/class/net`, so `physical_like` is false for everything there.
+fn split_candidates(
+    live: Vec<String>,
+    is_physical: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut preferred: Vec<(u8, String)> = Vec::new();
+    let mut rest: Vec<(u8, String)> = Vec::new();
+    for name in live {
+        let ranked = (uplink_rank(&name), name);
+        if is_physical(&ranked.1) {
+            preferred.push(ranked);
+        } else {
+            rest.push(ranked);
+        }
+    }
+    preferred.sort();
+    rest.sort();
+    (
+        preferred.into_iter().map(|(_, name)| name).collect(),
+        rest.into_iter().map(|(_, name)| name).collect(),
+    )
+}
+
+/// Preference among physical uplinks: wired, then WiFi, then cellular, then
+/// anything else.  Matches how Android itself ranks networks.  This only orders
+/// the log output; which link is used is still decided by the probe race.
+fn uplink_rank(name: &str) -> u8 {
+    if name.starts_with("eth") {
+        0
+    } else if name.starts_with("wlan") {
+        1
+    } else if name.starts_with("rmnet") || name.starts_with("ccmni") || name.starts_with("pdp") {
+        2
+    } else {
+        3
+    }
 }
 
 /// Minimal HTTP(S) request helper backed by reqwest.
@@ -614,5 +1015,144 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
 
     fn fallback_local(&self) -> bool {
         fallback_local()
+    }
+}
+
+#[cfg(test)]
+mod iface_choice_tests {
+    use super::*;
+
+    #[test]
+    fn bind_iface_spellings_map_to_the_right_choice() {
+        assert_eq!(classify_bind_iface(""), BindChoice::Auto);
+        assert_eq!(classify_bind_iface("  auto "), BindChoice::Auto);
+        assert_eq!(classify_bind_iface("none"), BindChoice::Never);
+        assert_eq!(classify_bind_iface("OFF"), BindChoice::Never);
+        assert_eq!(classify_bind_iface("always"), BindChoice::Always);
+        assert_eq!(classify_bind_iface("On"), BindChoice::Always);
+        assert_eq!(
+            classify_bind_iface(" wlan0 "),
+            BindChoice::Named("wlan0".to_string())
+        );
+        // A real device name that happens to start with a keyword must not be
+        // mistaken for the keyword itself.
+        assert_eq!(
+            classify_bind_iface("offload0"),
+            BindChoice::Named("offload0".to_string())
+        );
+    }
+
+    /// A literal name is used as given, valid or not — the kernel's call.
+    #[test]
+    fn a_literal_name_is_taken_at_face_value() {
+        assert_eq!(
+            desired_iface("ccmni0", "http://1.2.3.4:10886"),
+            Some("ccmni0".to_string())
+        );
+    }
+
+    #[test]
+    fn never_binds() {
+        assert_eq!(desired_iface("none", "http://1.2.3.4:10886"), None);
+        assert_eq!(desired_iface("off", ""), None);
+    }
+
+    /// A name list is not what decides any more: whatever the kernel calls a
+    /// device, it still gets tried — the strange names simply land in the second
+    /// round instead of being thrown away.
+    #[test]
+    fn candidate_grouping_only_asks_the_kernel() {
+        let live: Vec<String> = ["vgate0", "wlan0", "rmnet_data3", "something0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Stand-in verdict: only wlan0 has a `device` link.
+        let (preferred, rest) = split_candidates(live, |n| n == "wlan0");
+        assert_eq!(preferred, vec!["wlan0"]);
+        // Nothing was dropped, it is only queued for round two.
+        assert_eq!(rest, vec!["rmnet_data3", "something0", "vgate0"]);
+    }
+
+    #[test]
+    fn host_without_sysfs_reports_nothing_physical() {
+        // A dev box has no `/sys/class/net`; unreadable counts as "not physical",
+        // which only pushes the device to the second round.
+        #[cfg(not(target_os = "android"))]
+        assert!(!physical_like("wlan0"));
+    }
+
+    #[test]
+    fn wired_beats_wifi_beats_cellular() {
+        assert!(uplink_rank("eth0") < uplink_rank("wlan0"));
+        assert!(uplink_rank("wlan0") < uplink_rank("rmnet_data3"));
+        assert!(uplink_rank("rmnet_data0") < uplink_rank("something0"));
+    }
+
+    /// The probe must hit the liveness endpoint, not the root: only `/api/ping/`
+    /// answers a body that identifies the relay.
+    #[test]
+    fn the_probe_goes_to_the_liveness_endpoint() {
+        assert_eq!(
+            probe_url("http://1.2.3.4:10886"),
+            "http://1.2.3.4:10886/api/ping/"
+        );
+        // A trailing slash on the configured URL must not double up.
+        assert_eq!(
+            probe_url("http://1.2.3.4:10886/"),
+            "http://1.2.3.4:10886/api/ping/"
+        );
+    }
+
+    /// The reported failure: the phone is joined to a WiFi network with no
+    /// upstream, so `wlan0` holds a lease and looks healthy while nothing sent
+    /// through it arrives.  It never answers the probe, so it loses the race on
+    /// its own and cellular carries the traffic — no ranking involved.
+    #[test]
+    fn a_wifi_link_with_no_upstream_loses_the_race() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+            Arc::new(|name: &str| name == "rmnet_data2");
+        assert_eq!(race_with(&cands, probe).as_deref(), Some("rmnet_data2"));
+    }
+
+    /// The link that answers first wins, whatever its name — this is what makes
+    /// the choice follow the network rather than a fixed preference.
+    #[test]
+    fn the_faster_link_wins_the_race() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|name: &str| {
+            if name == "wlan0" {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            true
+        });
+        assert_eq!(race_with(&cands, probe).as_deref(), Some("rmnet_data2"));
+    }
+
+    /// A lone candidate is probed like any other: if it cannot reach the relay
+    /// the socket stays unbound, which beats pinning a link that carries nothing.
+    #[test]
+    fn a_single_uplink_is_probed_too() {
+        let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_: &str| false);
+        assert_eq!(race_with(&["wlan0".to_string()], probe), None);
+    }
+
+    /// If nothing answers, the socket is left unbound instead of pinned to a
+    /// link that just proved it cannot reach the relay — pinning one anyway is
+    /// the original bug.
+    #[test]
+    fn when_nothing_answers_the_socket_is_left_unbound() {
+        let cands = vec!["wlan0".to_string(), "rmnet_data2".to_string()];
+        let dead: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(|_: &str| false);
+        assert_eq!(race_with(&cands, dead), None);
+    }
+
+    /// An empty candidate list is not a race at all — and must not make the
+    /// caller wait for a timeout that can never be won.
+    #[test]
+    fn no_candidates_is_not_a_race() {
+        let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+            Arc::new(|_: &str| panic!("an empty race must not probe"));
+        assert_eq!(race_with(&[], probe), None::<String>);
     }
 }

@@ -714,6 +714,11 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         .unwrap_or_default()
         .to_string();
 
+    // 转发流量要不要绑网卡（绕开 VPN）。缺省是 auto，语义见 remote::desired_iface。
+    let bind_iface = get(&["bind_iface", "iface", "bind_interface", "uplink_iface"])
+        .unwrap_or_default()
+        .to_string();
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
@@ -726,6 +731,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         soter_hide,
         soter_inject,
         soter_uid_map,
+        bind_iface,
     })
 }
 
@@ -812,6 +818,13 @@ pub struct RemoteConfig {
     /// 没配就原样转发（不做任何推断：uid 猜错了答出来的东西更坑）。
     #[serde(default)]
     pub soter_uid_map: String,
+    /// 连 relay server 时把 socket 绑到哪块网卡（`/data/adb/ommega/config` 的
+    /// `bind_iface`）。空（或缺省）＝ `auto`：先看系统默认那条路通不通，通了就不绑；
+    /// 不通才去挑一块真能打到服务端的网卡（优先物理链路）。`none` / `off` 表示
+    /// 永不绑；`always` / `on` 表示无条件挑；其余值当作网卡名直接用。
+    /// 见 `remote::desired_iface`。
+    #[serde(default)]
+    pub bind_iface: String,
 }
 
 impl Default for RemoteConfig {
@@ -831,6 +844,7 @@ impl Default for RemoteConfig {
             soter_hide: false,
             soter_inject: false,
             soter_uid_map: String::new(),
+            bind_iface: String::new(),
         }
     }
 }
