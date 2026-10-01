@@ -36,6 +36,13 @@ relay_server.
    debug_logging: false
    ```
 
+   `bind_iface` is optional (default `auto`): while no VPN is up nothing is
+   bound, so the OS keeps following the network on its own. With a VPN the
+   daemon looks for an uplink that actually reaches the relay — physical links
+   first, decided by a short reachability probe rather than by interface names —
+   and stays unbound if none of them answers. `none` never binds, `always`
+   always looks, any other value is taken as an interface name.
+
 3. Add the apps you want to intercept to `/data/adb/ommega/ommegadata/target.txt`
    (one package per line; `!` = force generate, `?` = force patch). The WebUI
    (`webroot/`) manages this for you under KernelSU.
