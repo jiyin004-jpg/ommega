@@ -17,6 +17,7 @@ pub mod macros;
 pub mod plat;
 pub mod soter;
 pub mod uplink;
+pub mod wakelock;
 pub mod watchdog;
 
 /// 测试进程里要问 servicemanager 就得先把 binder 的 ProcessState 起来。

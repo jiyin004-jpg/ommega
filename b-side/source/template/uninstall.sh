@@ -17,6 +17,15 @@ pkill -9 -f 'daemon-relay' 2>/dev/null
 sleep 1
 
 # ---------------------------------------------------------------------------
+# 1b. Drop the relay's wake lock. It is a named lock in /sys/power/wake_lock and
+#     is NOT tied to the process, so a killed relay leaves it behind -- and the
+#     device would never suspend again. Release it explicitly.
+# ---------------------------------------------------------------------------
+if [ -w /sys/power/wake_unlock ]; then
+  echo ommega_relay > /sys/power/wake_unlock 2>/dev/null
+fi
+
+# ---------------------------------------------------------------------------
 # 2. Remove B-side files under the shared state dir. A-side files
 #    (ommegadata symlink, keymint/inject, pid files, restart.*) are kept.
 # ---------------------------------------------------------------------------

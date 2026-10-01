@@ -31,6 +31,7 @@
 //!   OMMEGA_RELAY_LOGCAT_LEVEL   logcat level: off|error|warn|info|debug|trace (default info)
 //!   OMMEGA_RELAY_BIND_IFACE    outgoing interface: none|auto|always|<ifname> (default none)
 //!   OMMEGA_RELAY_PATH_PROBE    probe /api/ping/ before each long poll (default true)
+//!   OMMEGA_RELAY_WAKELOCK      hold a wake lock so the system never suspends (default false)
 //!
 //! Logging is read *before* the rest of the config is validated, so a broken
 //! `relay.conf` still honours its log settings while reporting the error.
@@ -60,6 +61,7 @@ use serde_json::{json, Value};
 
 use ommegaclient_b::keymaster::attest_proxy::{check_app_id_der, SYSTEM_KEYMINT_STRONGBOX};
 use ommegaclient_b::keymaster::tee_ops::{self, KeyAlgorithm, KeySpec};
+use ommegaclient_b::wakelock;
 
 const POLL_TIMEOUT_SEC: u32 = 15;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
@@ -75,6 +77,9 @@ const TASK_WALL_LIMIT: Duration = Duration::from_secs(180);
 /// 重试 —— 设备醒着的窗口很短，得挤进去。
 const PATH_TTL: Duration = Duration::from_secs(10);
 const PATH_FAIL_TTL: Duration = Duration::from_secs(1);
+/// 多久看一眼 wakelock 还在不在。它不是自己掉，而是可能被人解掉（卸载脚本、
+/// 手滑、别的工具），补回去要快，但也不用每秒看。
+const WAKELOCK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const CONF_PATH: &str = "/data/adb/ommega/relay.conf";
 const RESTART_MARKER: &str = "/data/adb/ommega/restart.all";
 const RELOAD_POLL_MS: u64 = 1000;
@@ -175,6 +180,9 @@ struct RelayConfig {
     /// 发长轮询之前先探一下路通不通。路死的时候挂 15s 长轮询没有意义，早点回来
     /// 重试反而能挤进设备醒着的那几个窗口。
     path_probe: bool,
+    /// 拿一把 wakelock 按住系统，别让它 suspend。开着的时候这个进程（以及整台机器）
+    /// 不会睡，代价是耗电 —— 专机、插着电的部署再开。见 `ommegaclient_b::wakelock`。
+    wakelock: bool,
 }
 
 impl RelayConfig {
@@ -282,6 +290,9 @@ fn load_config_from_file() -> Result<RelayConfig> {
         .get("OMMEGA_RELAY_PATH_PROBE")
         .map(|v| parse_bool(v))
         .unwrap_or(true);
+    let wakelock = m
+        .get("OMMEGA_RELAY_WAKELOCK")
+        .is_some_and(|v| parse_bool(v));
     let server = server.trim_end_matches('/').to_string();
     Ok(RelayConfig {
         server,
@@ -292,6 +303,7 @@ fn load_config_from_file() -> Result<RelayConfig> {
         soter_probe,
         bind_iface,
         path_probe,
+        wakelock,
     })
 }
 
@@ -390,6 +402,7 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
     let path_probe = env("OMMEGA_RELAY_PATH_PROBE")
         .map(|v| parse_bool(&v))
         .unwrap_or(true);
+    let wakelock = env("OMMEGA_RELAY_WAKELOCK").is_some_and(|v| parse_bool(&v));
     let server = server.trim_end_matches('/').to_string();
     let cfg = RelayConfig {
         server,
@@ -400,6 +413,7 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         soter_probe,
         bind_iface,
         path_probe,
+        wakelock,
     };
     cfg.validate()?;
     Ok((cfg, "env"))
@@ -1216,6 +1230,54 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
     }
 }
 
+/// 拿住 wakelock，让系统别 suspend。
+///
+/// 拿不到不算致命：没开 `CONFIG_PM_WAKELOCKS` 的内核根本没这个文件，那种机型上
+/// relay 就只能继续靠看门狗等醒过来。但要留一条明确日志，不能让「没按住」无声无息。
+fn hold_wakelock() -> Option<wakelock::WakeLock> {
+    let name = wakelock::DEFAULT_NAME;
+    let wl = match wakelock::WakeLock::acquire(name) {
+        Ok(wl) => wl,
+        Err(e) => {
+            log::warn!("拿 wakelock 失败（{e}），系统该睡还是会睡");
+            return None;
+        }
+    };
+    if !wl.held_now() {
+        log::warn!("写了 wakelock 但内核那边没记上（{name}），当做没拿住");
+        return None;
+    }
+    log::info!("wakelock {name} 已拿住，系统不会进 suspend");
+    spawn_wakelock_keeper(name.to_string());
+    Some(wl)
+}
+
+/// 锁得一直拿着。万一被谁解掉（或者重启后内核状态没了），自己补回去。
+/// 补不回去连试几次就算了 —— 内核没这个接口的时候别一直在日志里念叨。
+fn spawn_wakelock_keeper(name: String) {
+    thread::spawn(move || {
+        let mut failed = 0;
+        loop {
+            thread::sleep(WAKELOCK_CHECK_INTERVAL);
+            if wakelock::held(&name) {
+                failed = 0;
+                continue;
+            }
+            if wakelock::reacquire(&name) {
+                log::warn!("wakelock {name} 掉了，已经补回去");
+                failed = 0;
+            } else {
+                failed += 1;
+                log::warn!("wakelock {name} 掉了而且补不回去（第 {failed} 次）");
+                if failed >= 3 {
+                    log::warn!("wakelock {name} 补不回去，停止自检；系统会重新开始 suspend");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn main() {
     let (log_enabled, log_level, logcat_enabled, logcat_level) = preload_log_config();
     ommegaclient_b::logging::init_logger(log_enabled, log_level, logcat_enabled, logcat_level);
@@ -1228,6 +1290,13 @@ fn main() {
         }
     };
     let shared: Arc<RwLock<RelayConfig>> = Arc::new(RwLock::new(cfg));
+    // 先把系统按住再干活：醒着的时候才轮得到我们轮询。拿住之后这个变量要一直活着
+    // （所以是带名字的绑定，不是 `let _ =`），到进程结束才会 Drop 释放。
+    let _wakelock = if shared.read().map(|c| c.wakelock).unwrap_or(false) {
+        hold_wakelock()
+    } else {
+        None
+    };
     let last_mtime = file_mtime(CONF_PATH).unwrap_or(0);
     spawn_config_watcher(shared.clone(), last_mtime);
     // We drive the real hardware keymint (a binder HAL) directly, so a binder
@@ -1243,6 +1312,7 @@ fn main() {
             soter_probe: None,
             bind_iface: "none".to_string(),
             path_probe: true,
+            wakelock: false,
         });
         log::info!(
             "relay daemon starting (config from {source}) server={} device={} machine={}",
