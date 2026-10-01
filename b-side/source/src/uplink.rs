@@ -1,23 +1,25 @@
 //! 出口网卡：把 relay 的请求钉在一条真能通的物理链路上。
 //!
-//! 抄的是 A 端 `remote.rs` 那一套，理由一样：VPN 起来之后系统会把普通流量塞进
-//! 隧道（netd 把连接的 fwmark 指向 VPN 网络、默认路由落到 tun 上），去我们自己
-//! 服务端的那一份也被一起抓走 —— 慢、抖，坏的时候干脆不通。唯一能把 socket 从
-//! 隧道里摘出来的办法是点名出口设备（`SO_BINDTODEVICE`，reqwest 的
-//! `.interface()` 干的就是这个）。
+//! 跟 A 端 `remote.rs` 里那套是同一份逻辑（两边分开实现，判断口径要求一致）：
+//! VPN 起来之后系统会把普通流量塞进隧道（netd 把连接的 fwmark 指向 VPN 网络、
+//! 默认路由落到 tun 上），去我们自己服务端的那一份也被一起抓走 —— 慢、抖，坏的
+//! 时候干脆不通。唯一能把 socket 从隧道里摘出来的办法是点名出口设备
+//! （`SO_BINDTODEVICE`，reqwest 的 `.interface()` 干的就是这个）。
 //!
-//! 跟 A 端不一样的地方有两处，都是 B 这台机器上实测出来的：
+//! 跟 A 端不一样的地方：
 //!
-//! 1. 排除名单里加了厂商隧道。A 端那份名单不看 `vgate0`，而它确实查得到 IPv4
-//!    路由（`/proc/net/route` 里有它），于是会被当成候选去竞速 —— 可它正是要躲
-//!    的那条隧道。`tun0` 靠 `tun` 前缀就被排掉了，`vgate0` 得单独列。
-//! 2. 这里只管「谁算候选、谁答话」，选出来的结果由调用方缓存。B 端一秒能打几百
-//!    个请求，每条都探一次等于把流量翻倍；缓存几秒、只在失败时重选就够用了。
+//! 1. 候选和「谁先答话」这套逻辑在这里是独立模块（A 端塞在 `remote.rs` 里），
+//!    调用方负责缓存结果：B 端一秒能打几百个请求，每条都探一次等于把流量翻倍，
+//!    缓存几秒、只在失败时重选就够用了。
 //!
-//! 另外 `bind_iface` 默认是 `none`（不绑）。这台机器上 relay 的流量本来就出
-//! wlan0（`ip rule` 把所有本机进程的路由都送进 `table wlan0`，隧道是空的），
-//! 绑上去没有收益，反而会丢掉系统自己的「WiFi 断了切蜂窝」那套切换。要绑就
-//! 显式配 `auto` / `always` / 网卡名。
+//! 关于「哪张卡能用」：一个名字都不认。候选就是当前握着 IPv4 路由的那些接口
+//! （`/proc/net/route`），是不是真网卡只看内核对它的描述
+//! （`/sys/class/net/<n>/device` 挂载点、`type` 链路层类型），谁能用最后由探针
+//! 说了算。任何机型、插什么网卡都走同一条判断路径，不用照着机型补名单。
+//!
+//! `bind_iface` 默认是 `auto`：先试系统默认那条路，通了就不绑（一台正常机器到
+//! 这儿就结束了，系统自己的「WiFi 断了切蜂窝」也留着）；默认那条打不通才去挑。
+//! `none` 是永不绑，`always` 是总是挑，也可以直接写网卡名。
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -67,74 +69,114 @@ pub fn classify_bind_iface(raw: &str) -> BindChoice {
 
 /// 这条请求该从哪个网卡出去。`None` 就是不绑，交给系统自己决定。
 ///
-/// `auto` 只在 VPN 起着的时候才绑：钉死一条链路会连系统自己的「WiFi 掉线切蜂窝」
-/// 一起丢掉，没有隧道要躲的时候纯是亏。想要固定走某条网卡的部署直接写网卡名。
+/// 没 VPN 的时候什么都不动：不绑最省事，也把系统自己的「WiFi 掉了切蜂窝」留着 ——
+/// 一台正常机器到这儿就结束了。有 VPN 才去挑（挑不到也不绑，回系统默认那条）。
+/// 这一步只读文件、不发请求：每个请求都会问到它，探针不能放在这儿。
 pub fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
     match classify_bind_iface(bind_iface) {
         BindChoice::Never => None,
-        BindChoice::Always => race_uplink(&uplink_candidates(), base_url),
-        BindChoice::Auto if vpn_active() => race_uplink(&uplink_candidates(), base_url),
-        BindChoice::Auto => None,
         // 写死的名字就当它存在能用 —— 那是内核说了算，不是我们。
         BindChoice::Named(name) => Some(name),
+        BindChoice::Auto if !vpn_present() => None,
+        BindChoice::Auto | BindChoice::Always => pick_uplink(base_url),
     }
 }
 
 /// 现在有没有 VPN 起着。`VpnService` 一定会在 `/sys/class/net` 里留一个 `tun`
-/// 设备，老的 pptp/l2tp 路径留 `ppp`；名字都是 `tun0` / `ppp0` 这种形状，认前缀
-/// 就够了。
-fn vpn_active() -> bool {
+/// 设备，老的 pptp/l2tp 路径留 `ppp`，名字都是 `tun0` / `ppp0` 这种形状 —— 这是
+/// Android 的通用约定，跟机型无关。
+///
+/// 它只决定「要不要开始挑」：漏判的后果跟没 VPN 一样（不绑），不会把链路选错；
+/// 误判最多白花一次探针。
+fn vpn_present() -> bool {
     let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
         return false;
     };
     entries.flatten().any(|e| {
-        e.file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with("tun") || n.starts_with("ppp") || n.starts_with("tap"))
+        e.file_name().to_str().is_some_and(|n| {
+            n.starts_with("tun") || n.starts_with("ppp") || n.starts_with("tap")
+        })
     })
 }
 
-/// 现在能扛 relay 流量的物理网卡，好的排前面。
+/// 挑一条真能打到服务端的出口。挑不到就不绑 —— 硬钉一条刚证明打不通的链路，
+/// 等于把「系统自己跟着网络走」这点能力也丢掉。
+fn pick_uplink(base_url: &str) -> Option<String> {
+    let (preferred, rest) = candidates();
+    if preferred.is_empty() && rest.is_empty() {
+        log::warn!("没有接口握着 IPv4 路由，出口交给系统默认路由");
+        return None;
+    }
+    // 两轮：先让「看着像真网卡」的互相竞速，它们全都不答话才退到隧道那一类。
+    // 有条条路可选时优先走物理链路，而不是谁答话快就听谁的。
+    if let Some(winner) = race_uplink(&preferred, base_url) {
+        return Some(winner);
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    log::warn!(
+        "物理链路都没答话，退到其余接口再试一轮（候选: {}）",
+        rest.join(",")
+    );
+    race_uplink(&rest, base_url)
+}
+
+/// 这块接口看起来是不是一块真网卡（而不是隧道、网桥、dummy 这类东西）。
 ///
-/// 两个坑（A 端在 Z60 Ultra 上踩过、B 这台也一样）：
-/// `dummy0` 和 `lo` 都报 `operstate=unknown` 且 `carrier=1`，光看状态分不出是不是
-/// 真网卡，所以虚拟设备只能按名字排掉；而蜂窝那些 `rmnet_data*` / `ccmni*` 同样报
-/// `unknown`（它们没有真实的链路层状态），只看 `up` 又会把蜂窝漏掉。
+/// 不看名字 —— 名字是厂商和内核版本随口起的，`vgate0` 这种隧道谁也不会预先
+/// 知道。只看内核对它的描述：
 ///
-/// 这还不够：拿不到 IPv4 地址的网卡绑上去等于绑了个没有路由的设备。`/proc/net/route`
-/// 列的正好是当前持有 IPv4 路由的那些接口，拿它做交叉过滤最准。
+/// - `/sys/class/net/<n>/device` 有挂载点的是挂在总线上的真设备（PCIe/SDIO/USB）；
+///   tun / dummy / 网桥 / vlan 这类都没有。
+/// - 链路层类型 `type` 是 1（以太网）或 519（RAWIP，蜂窝 rmnet / ccmni 报这个）。
 ///
-/// 注意这只说明「有地址」，不代表「真通到外面」—— 那件事只看 `probe`。
-pub fn uplink_candidates() -> Vec<String> {
+/// 两个都读不到（SELinux 在有的域下会拒）就当它不是物理链路：那只是让它落到
+/// 第二轮，漏不了 —— 能不能用最终还是探针说了算。
+fn physical_like(name: &str) -> bool {
+    let base = format!("{SYS_CLASS_NET}/{name}");
+    if std::path::Path::new(&format!("{base}/device")).exists() {
+        return true;
+    }
+    match std::fs::read_to_string(format!("{base}/type")) {
+        Ok(t) => t.trim().parse::<u32>().is_ok_and(|n| n == 1 || n == 519),
+        Err(_) => false,
+    }
+}
+
+/// 现在握着 IPv4 路由的接口，分成两组：(看着像真网卡的，其余的)。
+///
+/// 一个接口得出现在 `/proc/net/route` 里才有意义 —— 那说明它当前真的扛着一条
+/// IPv4 路由；绑到一个没有路由的设备上等于绑了个空壳。这里一个名字都不排：
+/// 名单式的过滤换个机型就会漏掉真出口，能不能用交给探针。
+///
+/// `operstate` 看不顺眼的不算（`down` 这种），但 **读不到不算** —— 某些 SELinux
+/// 域下会被拒，而 `/proc/net/route` 已经证明它扛着 IPv4 路由了。蜂窝
+/// （`rmnet_data*` / `ccmni*`）报文报 `unknown`，所以 `unknown` 必须放行。
+///
+/// 两组内部按偏好排序（有线 > WiFi > 蜂窝 > 其它），只是让日志好读，不影响入选。
+pub fn candidates() -> (Vec<String>, Vec<String>) {
     let with_ip = ifaces_with_ipv4();
     if with_ip.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
+    let live: Vec<String> = with_ip
+        .into_iter()
+        .filter(|name| {
+            let state = std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/operstate"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            state.is_empty() || state == "up" || state == "unknown"
+        })
+        .collect();
+    split_candidates(live, physical_like)
+}
 
-    let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
-        return Vec::new();
-    };
-    let mut found: Vec<(u8, String)> = Vec::new();
-    for e in entries.flatten() {
-        let entry_name = e.file_name();
-        let Some(name) = entry_name.to_str() else {
-            continue;
-        };
-        if is_virtual_iface(name) || !with_ip.iter().any(|n| n == name) {
-            continue;
-        }
-        let state = std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/operstate"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        // `operstate` 读不到（某些 SELinux 域下会被拒）不该因此刷掉这个设备：
-        // `/proc/net/route` 已经证明它扛着 IPv4 路由，能不能通由探针说了算。
-        if !state.is_empty() && state != "up" && state != "unknown" {
-            continue;
-        }
-        found.push((uplink_rank(name), name.to_string()));
-    }
-    found.sort();
-    found.into_iter().map(|(_, name)| name).collect()
+/// 所有候选，物理的排前面。给日志和测试用。
+pub fn uplink_candidates() -> Vec<String> {
+    let (mut preferred, rest) = candidates();
+    preferred.extend(rest);
+    preferred
 }
 
 /// 探针打哪儿。配的 URL 末尾带斜杠时不能拼出双斜杠。
@@ -177,6 +219,9 @@ pub fn probe(base_url: &str, iface: Option<&str>) -> bool {
 /// 就是不会答话，自己就输了 —— 没人需要先发现它死了，也没人等某个缓存的判断过期。
 /// 输的那些探针只是发了个无害的 GET，丢掉就完了；阻塞请求取消不了，也不需要取消。
 fn race_uplink(candidates: &[String], base_url: &str) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
     // 闭包要 `'static` 才能搬进探针线程，所以 URL 按值拿走而不是借用。
     let url = base_url.to_string();
     let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
@@ -191,9 +236,8 @@ fn race_with(
 ) -> Option<String> {
     match candidates.len() {
         0 => None,
-        // 只有一条链路就没得选：探它不会改变答案，别让调用方白等一个来回。
-        // 「只有蜂窝」和「只有 WiFi」就是这种情况。
-        1 => Some(candidates[0].clone()),
+        // 单条也要探。两轮挑卡里，第一轮往往就一条候选，不探的话它就算死了
+        // 也会被选中 —— 白白钉在一条打不通的链路上。
         _ => {
             let (tx, rx) = mpsc::channel();
             for name in candidates {
@@ -249,37 +293,30 @@ fn ifaces_with_ipv4() -> Vec<String> {
     names
 }
 
-/// 虚拟设备、隧道、桥、回环、dummy，以及各家 VPN 自己开的接口。
-fn is_virtual_iface(name: &str) -> bool {
-    const VIRTUAL: &[&str] = &[
-        "lo",
-        "dummy",
-        "tun",
-        "tap",
-        "ppp",
-        "sit",
-        "ip6",
-        "ip_",
-        "gre",
-        "gretap",
-        "erspan",
-        "ifb",
-        "p2p",
-        "r_rmnet",
-        "veth",
-        "br",
-        "bond",
-        "vlan",
-        "nrm",
-        "rmnet_ipa",
-        // B 这台机器上实测到的厂商隧道：`vgate0` 跟在默认路由后面、真挂了的时候
-        // 就是它把包吞了，`ovnet*` / `wondertap*` 同族。名字排掉，别让探针去替
-        // 隧道背书。
-        "vgate",
-        "ovnet",
-        "wondertap",
-    ];
-    VIRTUAL.iter().any(|prefix| name.starts_with(prefix))
+/// 把候选按「像不像真网卡」分成两组，组内按偏好排序。
+///
+/// 单独拎出来是为了能注一个假的判据进去测：开发机上没 `/sys/class/net`，
+/// `physical_like` 一律返回 false，分组逻辑就测不着了。
+fn split_candidates(
+    live: Vec<String>,
+    is_physical: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut preferred: Vec<(u8, String)> = Vec::new();
+    let mut rest: Vec<(u8, String)> = Vec::new();
+    for name in live {
+        let ranked = (uplink_rank(&name), name);
+        if is_physical(&ranked.1) {
+            preferred.push(ranked);
+        } else {
+            rest.push(ranked);
+        }
+    }
+    preferred.sort();
+    rest.sort();
+    (
+        preferred.into_iter().map(|(_, name)| name).collect(),
+        rest.into_iter().map(|(_, name)| name).collect(),
+    )
 }
 
 /// 物理链路之间的偏好：有线 > WiFi > 蜂窝 > 其它。跟 Android 自己的排序一致。
@@ -329,28 +366,25 @@ mod tests {
         assert_eq!(desired_iface("off", ""), None);
     }
 
-    /// B 端最要紧的一条：`vgate0` 是厂商隧道，它查得到 IPv4 路由，绝不能当候选。
+    /// 名单不再参与选卡：名字长得再怪，只要内核说它像真网卡、探针能打通，就该走它。
     #[test]
-    fn vendor_tunnels_are_not_uplinks() {
-        for n in [
-            "vgate0",
-            "ovnet0",
-            "wondertap0",
-            "tun0",
-            "tap0",
-            "ppp0",
-            "dummy0",
-            "lo",
-            "ifb0",
-            "p2p0",
-            "ip6tnl0",
-            "gre0",
-        ] {
-            assert!(is_virtual_iface(n), "{n} 不该被当成物理出口");
-        }
-        for n in ["wlan0", "eth0", "rmnet_data0", "ccmni0"] {
-            assert!(!is_virtual_iface(n), "{n} 是正经出口");
-        }
+    fn candidate_grouping_only_asks_the_kernel() {
+        let live: Vec<String> = ["vgate0", "wlan0", "rmnet_data3", "something0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 假的判据：只有 wlan0 挂着 device。
+        let (preferred, rest) = split_candidates(live, |n| n == "wlan0");
+        assert_eq!(preferred, vec!["wlan0"]);
+        // 剩下的一个都没丢，只是在第二轮。
+        assert_eq!(rest, vec!["rmnet_data3", "something0", "vgate0"]);
+    }
+
+    #[test]
+    fn host_without_sysfs_reports_nothing_physical() {
+        // 开发机上没有 `/sys/class/net`；读不到就当不是物理链路，它只是落到第二轮。
+        #[cfg(not(target_os = "android"))]
+        assert!(!physical_like("wlan0"));
     }
 
     #[test]
@@ -394,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_candidate_is_not_probed() {
+    fn a_single_candidate_is_probed_too() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c2 = Arc::clone(&calls);
         let probe = Arc::new(move |_: &str| {
@@ -405,12 +439,8 @@ mod tests {
             &["wlan0".to_string()],
             probe as Arc<dyn Fn(&str) -> bool + Send + Sync>,
         );
-        assert_eq!(got, Some("wlan0".to_string()));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "只有一条链路时不该白跑一趟探针"
-        );
+        assert_eq!(got, None, "一条也得探：探不着就不绑，比钉死一条死链路强");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "单条候选也要真探一次");
     }
 
     #[test]
@@ -430,19 +460,15 @@ mod tests {
         assert!(probe("110.40.170.96:10886", Some("wlan0")));
     }
 
-    /// 拿真设备的状态过一遍：候选里不能出现虚拟设备，也不能出现没有 IPv4 路由
-    /// 的接口。在开发机上没这些文件，这条会空跑过去。
+    /// 拿真设备的状态过一遍：候选必须握着 IPv4 路由。开发机上没这些文件，
+    /// 这条会空跑过去。
     #[test]
-    fn candidates_are_real_uplinks_with_ipv4() {
+    fn candidates_hold_ipv4_routes() {
         let cands = uplink_candidates();
         eprintln!("候选出口: {cands:?}");
         let with_ip = ifaces_with_ipv4();
         for c in &cands {
-            assert!(!is_virtual_iface(c), "{c} 是虚拟设备，不该当候选");
-            assert!(with_ip.contains(c), "{c} 没有 IPv4 路由，绑上去也没用");
+            assert!(with_ip.contains(c), "{c} 没握着 IPv4 路由，绑上去也用不上");
         }
-        let mut sorted = cands.clone();
-        sorted.sort_by_key(|n| uplink_rank(n));
-        assert_eq!(cands, sorted, "候选应该按偏好排好序");
     }
 }

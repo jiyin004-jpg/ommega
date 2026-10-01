@@ -29,7 +29,7 @@
 //!   OMMEGA_RELAY_LOG_LEVEL     file log level: off|error|warn|info|debug|trace (default debug)
 //!   OMMEGA_RELAY_LOGCAT_ENABLED logcat on/off (default true)
 //!   OMMEGA_RELAY_LOGCAT_LEVEL   logcat level: off|error|warn|info|debug|trace (default info)
-//!   OMMEGA_RELAY_BIND_IFACE    outgoing interface: none|auto|always|<ifname> (default none)
+//!   OMMEGA_RELAY_BIND_IFACE    outgoing interface: none|auto|always|<ifname> (default auto)
 //!   OMMEGA_RELAY_PATH_PROBE    probe /api/ping/ before each long poll (default true)
 //!   OMMEGA_RELAY_WAKELOCK      hold a wake lock so the system never suspends (default true)
 //!
@@ -175,7 +175,8 @@ struct RelayConfig {
     /// has learnt a slot from real traffic, and never claims `soter_nosign` on
     /// evidence it does not have.
     soter_probe: Option<ommegaclient_b::caps::SignProbeTarget>,
-    /// 出口网卡策略，见 `uplink::desired_iface`。默认 `none`（不绑）。
+    /// 出口网卡策略，见 `uplink::desired_iface`。默认 `auto`：先试系统默认那条
+    /// 路，通了就不绑；不通再自己挑一块能打到服务端的网卡。
     bind_iface: String,
     /// 发长轮询之前先探一下路通不通。路死的时候挂 15s 长轮询没有意义，早点回来
     /// 重试反而能挤进设备醒着的那几个窗口。
@@ -282,12 +283,13 @@ fn load_config_from_file() -> Result<RelayConfig> {
         m.get("OMMEGA_RELAY_SOTER_PROBE_UID").map(|s| s.as_str()),
         m.get("OMMEGA_RELAY_SOTER_PROBE_ALIAS").map(|s| s.as_str()),
     );
-    // 没配就是 `none`：B 端这台机器上 relay 的流量本来就出 wlan0，绑上去没有
-    // 收益，还会丢掉系统自己的 WiFi→蜂窝 切换。要绑请显式配。
+    // 没配就是 `auto`：先走系统默认路由，通了就什么都不用绑（一台正常机器到这儿
+    // 就结束了，系统自己的 WiFi→蜂窝 切换也留着）；默认那条打不通时才去挑网卡。
+    // 想完全不绑配 `none`，想总是挑配 `always`，也可以直接写网卡名。
     let bind_iface = m
         .get("OMMEGA_RELAY_BIND_IFACE")
         .cloned()
-        .unwrap_or_else(|| "none".to_string());
+        .unwrap_or_else(|| "auto".to_string());
     let path_probe = m
         .get("OMMEGA_RELAY_PATH_PROBE")
         .map(|v| parse_bool(v))
@@ -401,7 +403,7 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         env("OMMEGA_RELAY_SOTER_PROBE_UID").as_deref(),
         env("OMMEGA_RELAY_SOTER_PROBE_ALIAS").as_deref(),
     );
-    let bind_iface = env("OMMEGA_RELAY_BIND_IFACE").unwrap_or_else(|| "none".to_string());
+    let bind_iface = env("OMMEGA_RELAY_BIND_IFACE").unwrap_or_else(|| "auto".to_string());
     let path_probe = env("OMMEGA_RELAY_PATH_PROBE")
         .map(|v| parse_bool(&v))
         .unwrap_or(true);
@@ -1323,7 +1325,7 @@ fn main() {
             token: String::new(),
             soter_allow_mutation: false,
             soter_probe: None,
-            bind_iface: "none".to_string(),
+            bind_iface: "auto".to_string(),
             path_probe: true,
             wakelock: true,
         });
