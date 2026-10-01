@@ -522,11 +522,12 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
     // 签名链路上踢掉（见 `is_hard_slot_failure`）。
     let _ = is_hard_slot_failure(op, &result);
 
-    // 顺手把这笔的结果喂给 HAL 自愈：连续 -18（安全通道不通）就重启一次那个服务。
-    // 这台机器会卡成「建料类 op 全正常、只有签名恒 -18」的半死状态，不收拾的话服务端
-    // 会把它当「结构性做不了」，把槽位换到自签那两层 —— App 拿到假料和一个误导性的
-    // -5（2026-09-30 Duck Detector 那轮就是这么来的）。见 `hal_restart`。
+    // 顺手把这笔的结果喂给 HAL 自愈：连着两笔真失败（-5/-6/-26 这几个正常答复除外）
+    // 就重启一次那个服务。这台机器会卡成「建料类 op 全正常、只有签名恒 -18」的半死状态，
+    // 不收拾的话服务端会把它当「结构性做不了」，把槽位换到自签那两层 —— App 拿到假料
+    // 和一个误导性的 -5（2026-09-30 Duck Detector 那轮就是这么来的）。见 `hal_restart`。
     hal_restart::note(
+        op,
         result
             .get("error_code")
             .and_then(Value::as_i64)

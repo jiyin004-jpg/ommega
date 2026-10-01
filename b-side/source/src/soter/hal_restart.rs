@@ -1,4 +1,4 @@
-//! SOTER HAL 半死状态的自愈：连续几次 -18 就把这个服务重启一次。
+//! SOTER HAL 半死状态的自愈：连着几次失败就把这个服务重启一次。
 //!
 //! 背景（PLC110 2026-09-30 实测）：HAL 会进一种半死状态 —— 建料类的 op
 //! （`generate_auth_key_pair` / `has_auth_key` / `export_auth_key_public_key`）
@@ -10,8 +10,16 @@
 //! App 手里变成假料，拿到的还是个误导性的 -5（「这把钥匙不在」）—— Duck Detector
 //! 就是这么报 soter damaged 的，微信那边整轮开启都拿不到真材料。
 //!
-//! 为什么是「计数 + 冷却」而不是见一次就重启：一次 -18 可能只是这一笔正好撞上什么，
-//! 连着几次才是结构性的；冷却是防 HAL 真坏的时候每个 op 都去 kill 一遍。
+//! 计数规则（2026-10-01 改）：
+//!
+//! - **阈值 2**：一次失败可能只是偶然撞上，连着两次就动手，先把 HAL 拉回来再说。
+//! - **凡非 0 都算**，只有几个「正常业务答复」不算：-5 / -6（这个槽位还没建料，
+//!   新装的 App 天天问）、-26（这会儿没人按指纹）。剩下的 -12/-13/-18/-20 以及
+//!   一切没见过的码，都是「这台现在真做不了」，一律计入。
+//! - **清零只认 TEE 会话 op 的成功**（`init_sign` / `finish_sign`）。半死状态下
+//!   建料类 op 照样成功，以前用它们清零，导致计数永远攒不满、HAL 一直坏着 ——
+//!   那台 PLC110 从开机到被我手动顶穿就是这么过来的。
+//! - 冷却照旧：刚重启过就先不动，免得 HAL 真坏的时候每一笔都去 kill 一遍。
 //!
 //! 冷却用 `Instant`（单调钟，不含 suspend）就够 —— 它是防抖，不是精确调度。
 
@@ -19,12 +27,19 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::SOTER_SECURE_HW_FAILED;
-
-/// 连续几次 -18 才动手。
-const FAILURE_LIMIT: u32 = 3;
+/// 连着几次算结构性故障。
+const FAILURE_LIMIT: u32 = 2;
 /// 两次重启之间的最短间隔。
 const RESTART_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// 正常的业务答复，不参与计数：这个槽位还没建料（-5 ASK / -6 AuthKey），
+/// 以及这会儿没人按指纹（-26）。
+const BENIGN_CODES: &[i64] = &[-5, -6, -26];
+
+/// 只有走 TEE 会话的 op 成功了才说明通道是好的。建料类 op 在半死状态下照样成功。
+fn is_session_op(op: &str) -> bool {
+    matches!(op, "init_sign" | "finish_sign")
+}
 
 /// 候选服务名：各家 HAL 在 init 里注册的名字不一样，`getprop init.svc.<名字>` 有值的
 /// 那个才算（PLC110 上是 `soter_hal`，rc 文件名反而是 `vendor.trustonic.soter@1.0-service.rc`，
@@ -45,27 +60,30 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 一笔真活的结果。`-18` 累加，够了就重启一次 HAL；成功清零；别的码一概不碰。
-pub fn note(error_code: i64) {
+/// 一笔真活的结果。非 0 且不属于 `BENIGN_CODES` 的累加，够了就重启一次 HAL；
+/// TEE 会话 op 成功清零；其余一概不碰。
+pub fn note(op: &str, error_code: i64) {
     let count_before = *lock(&FAILURES);
     let since_restart = lock(&LAST_RESTART).map(|at| at.elapsed());
-    let (count, verdict) = step(error_code, count_before, since_restart);
+    let (count, verdict) = step(op, error_code, count_before, since_restart);
     *lock(&FAILURES) = count;
     match verdict {
         Verdict::Reset | Verdict::Nothing => {}
         Verdict::Cooling => log::warn!(
-            "soter: 连续 {count} 次 -18（安全通道不通），但距上次重启才 {:.0}s，先不动 HAL",
+            "soter: 连续 {count} 次失败（op={op} code={error_code}），但距上次重启才 {:.0}s，先不动 HAL",
             since_restart.map(|d| d.as_secs_f64()).unwrap_or_default()
         ),
         Verdict::Restart => match restart_soter_hal() {
             Ok(what) => {
-                log::warn!("soter: 连续 {count} 次 -18（安全通道不通），重启 SOTER HAL：{what}");
+                log::warn!(
+                    "soter: 连续 {count} 次失败（op={op} code={error_code}），重启 SOTER HAL：{what}"
+                );
                 *lock(&LAST_RESTART) = Some(Instant::now());
                 *lock(&FAILURES) = 0;
             }
             Err(error) => {
                 // 没重启成就不记冷却，下一笔再试（顺手把计数留在这儿，日志能看出次数）。
-                log::warn!("soter: 连续 {count} 次 -18，想重启 SOTER HAL 但没成功：{error}");
+                log::warn!("soter: 连续 {count} 次失败，想重启 SOTER HAL 但没成功：{error}");
             }
         },
     }
@@ -75,7 +93,7 @@ pub fn note(error_code: i64) {
 enum Verdict {
     /// 计数动了（或者没动），但什么都不做。
     Nothing,
-    /// 成功：计数清零。
+    /// 通道证明是好的：计数清零。
     Reset,
     /// 该重启了。
     Restart,
@@ -83,15 +101,25 @@ enum Verdict {
     Cooling,
 }
 
-/// 纯判定：给定「这次的结果 / 已有计数 / 距上次重启多久」，回新的计数和该做什么。
+/// 纯判定：给定「这次是哪个 op / 什么结果 / 已有计数 / 距上次重启多久」，
+/// 回新的计数和该做什么。
 ///
 /// 从 `note` 里拆出来是为了能直接测，不用去碰设备、也不用和别的测试抢那几个 static。
-fn step(error_code: i64, count_before: u32, since_restart: Option<Duration>) -> (u32, Verdict) {
+fn step(
+    op: &str,
+    error_code: i64,
+    count_before: u32,
+    since_restart: Option<Duration>,
+) -> (u32, Verdict) {
     if error_code == 0 {
-        // 签出来了就是这条通道好的：之前攒的失败清零。
-        return (0, Verdict::Reset);
+        // 只有真走通了 TEE 会话才说明通道好了；建料类 op 成功不算数。
+        return if is_session_op(op) {
+            (0, Verdict::Reset)
+        } else {
+            (count_before, Verdict::Nothing)
+        };
     }
-    if error_code != SOTER_SECURE_HW_FAILED {
+    if BENIGN_CODES.contains(&error_code) {
         return (count_before, Verdict::Nothing);
     }
     let count = count_before + 1;
@@ -175,37 +203,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn three_in_a_row_is_what_triggers_it() {
-        let (count, verdict) = step(-18, 0, None);
+    fn two_in_a_row_is_what_triggers_it() {
+        let (count, verdict) = step("init_sign", -18, 0, None);
         assert_eq!((count, verdict), (1, Verdict::Nothing));
-        let (count, verdict) = step(-18, count, None);
-        assert_eq!((count, verdict), (2, Verdict::Nothing));
-        let (count, verdict) = step(-18, count, None);
-        assert_eq!((count, verdict), (3, Verdict::Restart));
+        let (count, verdict) = step("init_sign", -18, count, None);
+        assert_eq!((count, verdict), (2, Verdict::Restart));
     }
 
     #[test]
-    fn a_success_clears_the_count() {
-        assert_eq!(step(0, 2, None), (0, Verdict::Reset));
+    fn any_non_benign_code_counts() {
+        // -20（TA 拿不到）、-12（没开）这类结构性故障一样算，不只是 -18。
+        let (count, verdict) = step("init_sign", -20, 0, None);
+        assert_eq!((count, verdict), (1, Verdict::Nothing));
+        assert_eq!(step("init_sign", -20, 1, None), (2, Verdict::Restart));
+        // 没见过的码也算。
+        assert_eq!(step("has_auth_key", -999, 1, None).1, Verdict::Restart);
     }
 
     #[test]
-    fn other_error_codes_are_left_alone() {
-        // -26（要新鲜指纹）、-5（没材料）都不是通道问题，别去动 HAL。
-        assert_eq!(step(-26, 2, None), (2, Verdict::Nothing));
-        assert_eq!(step(-5, 2, None), (2, Verdict::Nothing));
-        assert_eq!(step(-6, 0, None), (0, Verdict::Nothing));
+    fn benign_codes_are_left_alone() {
+        // -5 / -6 是「这个槽位还没建料」，-26 是「这会儿没人按指纹」：正常答复，不计数。
+        for code in [-5i64, -6, -26] {
+            assert_eq!(step("has_auth_key", code, 1, None), (1, Verdict::Nothing));
+            assert_eq!(step("init_sign", code, 1, None), (1, Verdict::Nothing));
+        }
+    }
+
+    #[test]
+    fn only_a_session_op_success_clears_the_count() {
+        // init_sign / finish_sign 成功 = 通道确实好了。
+        assert_eq!(step("init_sign", 0, 2, None), (0, Verdict::Reset));
+        assert_eq!(step("finish_sign", 0, 2, None), (0, Verdict::Reset));
+        // 建料类 op 在半死状态下也会成功，不能让它把计数清掉。
+        assert_eq!(step("has_auth_key", 0, 2, None), (2, Verdict::Nothing));
+        assert_eq!(step("generate_auth_key_pair", 0, 2, None), (2, Verdict::Nothing));
+        assert_eq!(step("export_ask_public_key", 0, 2, None), (2, Verdict::Nothing));
     }
 
     #[test]
     fn the_cooldown_holds_it_back() {
-        let (count, verdict) = step(-18, 2, Some(Duration::from_secs(60)));
-        assert_eq!((count, verdict), (3, Verdict::Cooling));
+        let (count, verdict) = step("init_sign", -18, 1, Some(Duration::from_secs(60)));
+        assert_eq!((count, verdict), (2, Verdict::Cooling));
         // 冷却过了就重启。
-        let (_, verdict) = step(-18, 2, Some(RESTART_COOLDOWN + Duration::from_secs(1)));
+        let (_, verdict) = step("init_sign", -18, 1, Some(RESTART_COOLDOWN + Duration::from_secs(1)));
         assert_eq!(verdict, Verdict::Restart);
         // 从没重启过（None）也算过了冷却。
-        assert_eq!(step(-18, 2, None).1, Verdict::Restart);
+        assert_eq!(step("init_sign", -18, 1, None).1, Verdict::Restart);
     }
 
     #[test]
