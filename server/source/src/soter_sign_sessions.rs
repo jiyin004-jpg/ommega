@@ -19,8 +19,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// 一笔会话记多久。App 的 init->finish 正常是秒级，慢的时候是在等用户按指纹（几十秒
-/// 量级），给足 5 分钟；过期只是不再补救，没有别的副作用。
-const STASH_TTL: Duration = Duration::from_secs(300);
+/// 量级）。生产里能看到隔几分钟才收尾的（App 自己缓着 session 不急着签），所以给到
+/// 15 分钟；过期只是不再补救，没别的副作用，内存也被 [`MAX_ENTRIES`] 卡着。
+const STASH_TTL: Duration = Duration::from_secs(900);
 
 /// 最多记多少条，挡住异常增长（正常随 `finish_sign` 清掉）。
 const MAX_ENTRIES: usize = 8192;

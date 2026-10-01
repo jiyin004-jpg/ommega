@@ -924,7 +924,15 @@ async fn repair_clobbered_finish(
     target: Option<&str>,
 ) -> Option<Value> {
     let session = body.get("session").and_then(Value::as_i64)?;
-    let spec = state.sign_sessions.lookup(session)?;
+    let spec = match state.sign_sessions.lookup(session) {
+        Some(spec) => spec,
+        None => {
+            // 这张会话没登记（init 不是设备层答的）或者登记已经过期 —— 补不了，只能把
+            // 原来的 -204 还回去。留一行日志，好知道到底哪种情况多。
+            tracing::warn!("soter: 会话 {session} 没在登记表里（没记上或已过期），补不了");
+            return None;
+        }
+    };
     let (Some(alias), Some(challenge)) = (spec.alias.as_deref(), spec.challenge.as_deref()) else {
         return None;
     };
