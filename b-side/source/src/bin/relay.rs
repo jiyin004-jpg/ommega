@@ -508,6 +508,9 @@ fn get_http_client(cfg: &RelayConfig) -> Result<Arc<Client>> {
 fn reset_http_client() {
     if let Ok(mut guard) = HTTP_CLIENT.write() {
         *guard = None;
+        // 出口选择也跟着作废：下轮重建会重新探、重新挑，别抱着一个刚证明
+        // 打不通的结论不放。
+        ommegaclient_b::uplink::invalidate_pick();
         log::info!("HTTP client reset (connection pool cleared)");
     }
 }

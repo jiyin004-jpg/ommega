@@ -33,7 +33,7 @@
 //! the hand-written client did not.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -175,20 +175,89 @@ const SYS_CLASS_NET: &str = "/sys/class/net";
 ///
 /// With no VPN up nothing is touched at all: an unbound socket interferes least
 /// and keeps the OS's own "WiFi dropped, fall back to cellular" switching, so a
-/// healthy machine is finished right there.  A VPN is what triggers picking an
-/// uplink, and if nothing usable is found the socket still stays unbound (back
-/// to the OS default route).
+/// healthy machine is finished right there.  With a VPN the system default route
+/// is tried first — if the relay answers over it, nothing is bound either; only
+/// when that route cannot reach the relay (the VPN swallowed the traffic, or the
+/// default route points at a dead upstream) is an uplink picked.  Nothing usable
+/// leaves the socket unbound as well.
 ///
-/// This path only reads files: `desired_iface` is asked on every request, so no
-/// probe may run here.
+/// The file-reading step is not cached (it is cheap); the steps that send probes
+/// are, see `PICK_TTL`.
 fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
-    match classify_bind_iface(bind_iface) {
-        BindChoice::Never => None,
+    let choice = classify_bind_iface(bind_iface);
+    match &choice {
+        // These two need no probe, so there is nothing to cache.
+        BindChoice::Never => return None,
         // An explicit name is taken at face value: whether it exists or works is
         // the kernel's call, not ours.
-        BindChoice::Named(name) => Some(name),
-        BindChoice::Auto if !vpn_present() => None,
-        BindChoice::Auto | BindChoice::Always => pick_uplink(base_url),
+        BindChoice::Named(name) => return Some(name.clone()),
+        _ => {}
+    }
+    if choice == BindChoice::Auto && !vpn_present() {
+        return None;
+    }
+    if let Some(hit) = cached_pick(bind_iface, base_url) {
+        return hit;
+    }
+    let picked = match choice {
+        BindChoice::Always => pick_uplink(base_url),
+        // `auto`: try the OS default route first; only a route that cannot reach
+        // the relay is worth overriding.
+        _ if probe_iface(None, base_url) => {
+            log::info!("uplink: the OS default route reaches the relay, nothing bound");
+            None
+        }
+        _ => {
+            log::warn!("uplink: the OS default route cannot reach the relay, picking one");
+            pick_uplink(base_url)
+        }
+    };
+    store_pick(bind_iface, base_url, picked.clone());
+    match &picked {
+        Some(name) => log::info!("uplink: settled on {name} (cached for {PICK_TTL:?})"),
+        None => log::info!("uplink: unbound, using the OS default route"),
+    }
+    picked
+}
+
+/// A cached pick, and what it was computed from.
+///
+/// Picking sends probes, and `desired_iface` is asked on every request — holding
+/// the answer for a few seconds is what stops that from doubling the traffic.
+static PICK_CACHE: Mutex<Option<CachedPick>> = Mutex::new(None);
+
+struct CachedPick {
+    bind_iface: String,
+    base_url: String,
+    iface: Option<String>,
+    at: Instant,
+}
+
+/// How long a pick is trusted.  A link that dies is re-picked after at most this
+/// long; much shorter and the cache does nothing.
+const PICK_TTL: Duration = Duration::from_secs(5);
+
+fn cached_pick(bind_iface: &str, base_url: &str) -> Option<Option<String>> {
+    let guard = PICK_CACHE.lock().ok()?;
+    let cached = guard.as_ref()?;
+    if cached.bind_iface == bind_iface
+        && cached.base_url == base_url
+        && cached.at.elapsed() < PICK_TTL
+    {
+        Some(cached.iface.clone())
+    } else {
+        None
+    }
+}
+
+fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
+    if let Ok(mut guard) = PICK_CACHE.lock() {
+        *guard = Some(CachedPick {
+            bind_iface: bind_iface.to_string(),
+            base_url: base_url.to_string(),
+            iface,
+            at: Instant::now(),
+        });
     }
 }
 

@@ -21,9 +21,8 @@
 //! 这儿就结束了，系统自己的「WiFi 断了切蜂窝」也留着）；默认那条打不通才去挑。
 //! `none` 是永不绑，`always` 是总是挑，也可以直接写网卡名。
 
-use std::sync::mpsc;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 
@@ -70,15 +69,90 @@ pub fn classify_bind_iface(raw: &str) -> BindChoice {
 /// 这条请求该从哪个网卡出去。`None` 就是不绑，交给系统自己决定。
 ///
 /// 没 VPN 的时候什么都不动：不绑最省事，也把系统自己的「WiFi 掉了切蜂窝」留着 ——
-/// 一台正常机器到这儿就结束了。有 VPN 才去挑（挑不到也不绑，回系统默认那条）。
-/// 这一步只读文件、不发请求：每个请求都会问到它，探针不能放在这儿。
+/// 一台正常机器到这儿就结束了。有 VPN 才往下走：先试系统默认那条路，通了也不绑；
+/// 只有默认那条打不通（VPN 把流量拓死、或者默认路由指向上游已经挂掉的链路）才
+/// 自己挑一条。挑不到同样不绑，回系统默认。
+///
+/// 读文件那一步不缓存（便宜）；要发探针的那两步有缓存，见 [`PICK_TTL`]。
 pub fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
-    match classify_bind_iface(bind_iface) {
-        BindChoice::Never => None,
-        // 写死的名字就当它存在能用 —— 那是内核说了算，不是我们。
-        BindChoice::Named(name) => Some(name),
-        BindChoice::Auto if !vpn_present() => None,
-        BindChoice::Auto | BindChoice::Always => pick_uplink(base_url),
+    let choice = classify_bind_iface(bind_iface);
+    match &choice {
+        // 这两种不用探，缓存也没意义。
+        BindChoice::Never => return None,
+        BindChoice::Named(name) => return Some(name.clone()),
+        _ => {}
+    }
+    // 没 VPN 就不动，而且这一步只看文件，不必缓存。
+    if choice == BindChoice::Auto && !vpn_present() {
+        return None;
+    }
+    if let Some(hit) = cached_pick(bind_iface, base_url) {
+        return hit;
+    }
+    let picked = match choice {
+        BindChoice::Always => pick_uplink(base_url),
+        // auto：系统默认那条先试，通了就不绑。
+        _ if probe(base_url, None) => {
+            log::info!("出口：系统默认那条路能到 relay，这次不绑网卡");
+            None
+        }
+        _ => {
+            log::warn!("出口：系统默认那条路到不了 relay，自己挑一条");
+            pick_uplink(base_url)
+        }
+    };
+    store_pick(bind_iface, base_url, picked.clone());
+    match &picked {
+        Some(name) => log::info!("出口：定下来绑 {name}（缓存 {PICK_TTL:?}，过后重挑）"),
+        None => log::info!("出口：不绑，交给系统默认路由"),
+    }
+    picked
+}
+
+/// 上一次挑选的结论，以及它是对着哪份配置、哪个服务端地址算出来的。
+///
+/// 挑选要发探针，而 `desired_iface` 每个请求都会被问到（B 端一秒几百个）——
+/// 结论留几秒，不然等于把流量翻倍。
+static PICK_CACHE: Mutex<Option<CachedPick>> = Mutex::new(None);
+
+struct CachedPick {
+    bind_iface: String,
+    base_url: String,
+    iface: Option<String>,
+    at: Instant,
+}
+
+/// 结论留多久。链路断了最多等这么久就会重挑，再短就等于没缓存。
+const PICK_TTL: Duration = Duration::from_secs(5);
+
+/// 把缓存的结论扔掉，下次重新挑。调用方在「这条路刚证明打不通」时用。
+pub fn invalidate_pick() {
+    if let Ok(mut guard) = PICK_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+fn cached_pick(bind_iface: &str, base_url: &str) -> Option<Option<String>> {
+    let guard = PICK_CACHE.lock().ok()?;
+    let cached = guard.as_ref()?;
+    if cached.bind_iface == bind_iface
+        && cached.base_url == base_url
+        && cached.at.elapsed() < PICK_TTL
+    {
+        Some(cached.iface.clone())
+    } else {
+        None
+    }
+}
+
+fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
+    if let Ok(mut guard) = PICK_CACHE.lock() {
+        *guard = Some(CachedPick {
+            bind_iface: bind_iface.to_string(),
+            base_url: base_url.to_string(),
+            iface,
+            at: Instant::now(),
+        });
     }
 }
 
