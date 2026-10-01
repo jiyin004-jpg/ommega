@@ -28,7 +28,7 @@ mod pay;
 mod queue;
 mod soter_gate;
 mod soter_mint;
-mod soter_sign_gate;
+mod soter_sign_sessions;
 mod strongbox;
 mod util;
 
@@ -151,7 +151,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         db,
         geo,
         soter_gate: Arc::new(crate::soter_gate::SoterGate::new()),
-        sign_gate: Arc::new(crate::soter_sign_gate::SignGate::new()),
+        sign_sessions: Arc::new(crate::soter_sign_sessions::SignSessions::new()),
     };
 
     Router::new()

@@ -29,8 +29,9 @@ pub struct AppState {
     pub geo: Option<Arc<crate::geo::Ip2Region>>,
     /// SOTER 短 TTL 合并（削峰用），见 `crate::soter_gate`。
     pub soter_gate: Arc<crate::soter_gate::SoterGate>,
-    /// SOTER 签名会话的槽位排队（`init_sign` → `finish_sign`），见 `crate::soter_sign_gate`。
-    pub sign_gate: Arc<crate::soter_sign_gate::SignGate>,
+    /// SOTER 签名会话登记表：`init_sign` 记下槽位，`finish_sign` 回 -204 时拿它补签，
+    /// 见 `crate::soter_sign_sessions`。
+    pub sign_sessions: Arc<crate::soter_sign_sessions::SignSessions>,
 }
 
 fn token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -882,21 +883,85 @@ pub async fn soter(
     run_soter_task(&state, &body).await
 }
 
-/// SOTER 转发的收尾：`finish_sign` 不管成没成，回来就把这一笔会话占的设备放掉
-/// （放不掉也没关系，租约到期自己会松）。
+/// SOTER 转发的收尾：一笔 `finish_sign` 回来就把它的会话登记撤掉。
 ///
-/// 这里必须是「inner 跑完再放」：TA 那边是会话真没了才算收尾，提前放会让下一个
-/// `init_sign` 钻进来把上一笔正在走的 `finish_sign` 顶掉。
+/// 必须放 inner 之后：补签（见 `repair_clobbered_finish`）就在 inner 里查这份登记。
 async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     let resp = run_soter_task_inner(state, body).await;
     if body.get("op").and_then(Value::as_str) == Some("finish_sign") {
         if let Some(session) = body.get("session").and_then(Value::as_i64) {
-            if let Some(key) = state.sign_gate.take_session(session) {
-                tracing::info!("soter: finish_sign 收尾，放掉设备 {key}（session={session}）");
-            }
+            state.sign_sessions.forget(session);
         }
     }
     resp
+}
+
+/// `finish_sign` 回 -204 时的补救：拿 init 时缓存的参数重开一张会话，再签一次。
+///
+/// -204（`SOTER_ERROR_OPERATEID_NULL`）在设备上就一个意思：这张会话被后来的一笔
+/// `init_sign` 顶掉了 —— TA 一台设备只保留一个会话，跟槽位是谁的无关（2026-10-01 实测
+/// 见 `soter_sign_sessions` 的模块注释）。App 手上只有它自己那一张 session，没牌可打，
+/// 所以服务端替它重开：用同一个 uid / 别名 / challenge 再 `init_sign` 一次，拿新会话把
+/// 同一个 challenge 签了。同一把钥匙、同一个挑战 —— 签名值是等价的，App 那边就是一次
+/// 正常成功。
+///
+/// 只试一次；试不出来（拿不到新会话、或者补签本身也失败）就返回 `None`，外面照旧把
+/// 原来的 -204 还回去。
+async fn repair_clobbered_finish(
+    state: &AppState,
+    body: &Value,
+    requested: &str,
+    target: Option<&str>,
+) -> Option<Value> {
+    let session = body.get("session").and_then(Value::as_i64)?;
+    let spec = state.sign_sessions.lookup(session)?;
+    let (Some(alias), Some(challenge)) = (spec.alias.as_deref(), spec.challenge.as_deref()) else {
+        return None;
+    };
+    tracing::info!(
+        "soter: 会话 {session} 被顶掉了，拿缓存的参数重开一张再签（uid={} alias={alias}）",
+        spec.uid
+    );
+    let init_body = repair_init_body(body, spec.uid, alias, challenge);
+    let init = try_b_soter_layer(state, &init_body, requested, target).await?;
+    let init_code = init.value.get("error_code").and_then(Value::as_i64);
+    let Some(new_session) = init
+        .value
+        .get("session")
+        .and_then(Value::as_i64)
+        .filter(|s| *s != 0)
+    else {
+        tracing::info!("soter: 补签没拿到新会话（init error_code={init_code:?}），还是回 -204");
+        return None;
+    };
+    let mut fin_body = body.clone();
+    if let Some(obj) = fin_body.as_object_mut() {
+        obj.insert("session".to_string(), json!(new_session));
+    }
+    let done = try_b_soter_layer(state, &fin_body, requested, target).await?;
+    let code = done.value.get("error_code").and_then(Value::as_i64);
+    if code != Some(0) {
+        tracing::warn!("soter: 补签失败（finish error_code={code:?}），还是回 -204");
+        return None;
+    }
+    tracing::info!(
+        "soter: 补签成功，会话 {session} 的那个 challenge 由新会话 {new_session} 签出来了"
+    );
+    Some(done.value)
+}
+
+/// 把一笔 `finish_sign` 请求改写成「重开同一张槽位」的 `init_sign`：补签要的三个参数
+/// 全带上（App 的 finish 请求里只有 session，别的什么都没有）。
+fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Value {
+    let mut out = body.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("op".to_string(), json!("init_sign"));
+        obj.insert("uid".to_string(), json!(uid));
+        obj.insert("alias".to_string(), json!(alias));
+        obj.insert("challenge".to_string(), json!(challenge));
+        obj.remove("session");
+    }
+    out
 }
 
 /// SOTER 转发：跟认证共用同一套三层链，差别只在三层的实现。
@@ -970,35 +1035,10 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         .resolve_soter_target(requested, needs_sign)
         .await;
 
-    // 签名会话是**一台设备只留一个**：2026-10-01 实测两笔槽位不同的 `init_sign`（uid
-    // 不同、别名也不同）各拿到一张会话，回头哪笔先收尾哪笔算数，后收尾的那笔的
-    // `finish_sign` 就是 -204。B 端 relay 只是把句柄透传给 HAL / TA，自己的会话表没
-    // 有，这个“一个”改不动。既然要抢，就我们这边排队：`init_sign` 到它的
-    // `finish_sign` 之间占住这台设备，后来的等（最多 `SIGN_DEVICE_WAIT`），等不到回 -9
-    // （`SOTER_ERROR_IS_AUTHING`）让 App 退让重试。一笔真流程只要百来毫秒，正常排队
-    // 基本等不到 -9。
-    //
-    // 注意 B 端自己的「能不能签」能力探针也会在这台设备上跑 `init_sign` + `finish_sign`，
-    // 那是另一条顶人的路子（2026-10-01 直对着 B 的 logcat 对上的），已在 B 端给它加了
-    // 空闲门（`b-side/source/src/caps.rs` 的 `SIGN_PROBE_QUIET`）。
-    let mut lease_key: Option<String> = None;
-    if op == "init_sign" {
-        if let Some(device) = b_target.as_deref() {
-            if !state
-                .sign_gate
-                .acquire(device, crate::soter_sign_gate::SIGN_DEVICE_WAIT)
-                .await
-            {
-                tracing::warn!("soter: 设备 {device} 上还有一笔签名没收尾，回 -9 让 App 退让重试");
-                return Json(json!({
-                    "op": "init_sign",
-                    "error_code": crate::soter_sign_gate::BUSY_CODE,
-                }))
-                .into_response();
-            }
-            lease_key = Some(device.to_string());
-        }
-    }
+    // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：不拦、不排队，
+    // 只拿 `init_sign` 时缓存的参数重开一张会话再签一次。B 端自己的能力探针也会在这台
+    // 设备上跑 `init_sign`，那是另一条顶人的路子，已在 B 端给它加了空闲门
+    // （`b-side/source/src/caps.rs` 的 `SIGN_PROBE_QUIET`）。
 
     // 这个槽位已经定过层就把它排到最前面：同一槽位的材料必须只出自一层，否则 App
     // 手里会出现一半 B 的一半 keybox 的状态（导出的公钥和签名的私钥都对不上）。
@@ -1047,10 +1087,23 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     for &layer in &layers {
         let result = match layer {
             "b" => match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
-                Some(b) => {
+                Some(mut b) => {
                     b_structural = b.unavailable;
                     if let Some(reply) = b.hardware_reply.clone() {
                         b_error_reply = Some(reply);
+                    }
+                    // -204（`SOTER_ERROR_OPERATEID_NULL`）在这台设备上就一个意思：这张
+                    // 会话被后来的一笔 `init_sign` 顶掉了（TA 一台设备只留一个会话）。
+                    // 拿 init 时缓存的参数重开一张、用同一个 challenge 再签一次。
+                    if op == "finish_sign"
+                        && b.value.get("error_code").and_then(Value::as_i64) == Some(-204)
+                    {
+                        if let Some(fixed) =
+                            repair_clobbered_finish(state, body, requested, b_target.as_deref())
+                                .await
+                        {
+                            b.value = fixed;
+                        }
                     }
                     Some(b.value)
                 }
@@ -1085,17 +1138,21 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                         crate::soter_mint::pin_layer(requested, uid, pin);
                     }
                 }
-                // 拿到会话就把设备交给它的 `finish_sign` 去释放；这一笔没拿到会话
-                // （比如 -5 / -26，答复里的 session 是 0）就当场放掉，别占着让下一个白等。
-                if let Some(key) = lease_key.take() {
-                    match v.get("session").and_then(Value::as_i64).filter(|s| *s != 0) {
-                        Some(session) => {
-                            state.sign_gate.bind_session(session, &key);
-                            tracing::info!(
-                                "soter: init_sign 占住设备 {key}（session={session}），等它的 finish_sign"
-                            );
-                        }
-                        None => state.sign_gate.release(&key),
+                // 设备层的会话记下来：被顶掉的时候还能用同样的参数补一次（见
+                // `repair_clobbered_finish`）。
+                if layer == "b" && op == "init_sign" && code == 0 {
+                    if let Some(session) =
+                        v.get("session").and_then(Value::as_i64).filter(|s| *s != 0)
+                    {
+                        state.sign_sessions.record(
+                            session,
+                            uid.map(i64::from),
+                            alias_arg,
+                            body.get("challenge").and_then(Value::as_str),
+                        );
+                        tracing::info!(
+                            "soter: 记下会话 {session}（uid={probe_uid} alias={probe_alias}），被顶掉时可以重签"
+                        );
                     }
                 }
                 return Json(v).into_response();
@@ -1116,10 +1173,7 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         }
     }
 
-    // 三层都没接住（init_sign 的话就是一张会话都没拿到），别把设备攥着。
-    if let Some(key) = lease_key.take() {
-        state.sign_gate.release(&key);
-    }
+    // 三层都没接住（init_sign 的话就是一张会话都没拿到）。
     let detail = last_error.unwrap_or_else(|| "no layer could serve the request".to_string());
     if let Some(reply) = b_error_reply {
         // 服务端那两层接不了这笔（材料在真机上，它们手里没有），把设备层的答复还回去：
@@ -2024,6 +2078,28 @@ mod layer_failure_msg_tests {
 mod soter_slot_miss_tests {
     use super::*;
     use serde_json::json;
+
+    /// 补签的请求体：op 换成 init_sign，参数用缓存的那三个，session 拿掉。
+    #[test]
+    fn a_repair_request_turns_a_finish_into_an_init() {
+        let body = json!({
+            "op": "finish_sign",
+            "session": 123,
+            "device_id": "device-b-c3f204aa",
+            "machine_id": "PLC110",
+        });
+        let out = repair_init_body(&body, 10043, "slot_a", "aabbcc");
+        assert_eq!(out.get("op").and_then(Value::as_str), Some("init_sign"));
+        assert_eq!(out.get("uid").and_then(Value::as_i64), Some(10043));
+        assert_eq!(out.get("alias").and_then(Value::as_str), Some("slot_a"));
+        assert_eq!(out.get("challenge").and_then(Value::as_str), Some("aabbcc"));
+        assert!(out.get("session").is_none(), "init_sign 不该带着旧会话");
+        // 设备/机器的路由信息得留着，不然这层不知道该找谁。
+        assert_eq!(
+            out.get("device_id").and_then(Value::as_str),
+            Some("device-b-c3f204aa")
+        );
+    }
 
     /// 回归（2026-09-30，Duck Detector 那个 -5）：槽位的钥匙建在真机上，keybox 层
     /// 手里没有，`init_sign` 回 -5 —— 这不是「签好了」，得接着往下试。

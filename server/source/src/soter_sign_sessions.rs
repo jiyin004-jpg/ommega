@@ -1,0 +1,176 @@
+//! SOTER 签名会话的登记表 —— `finish_sign` 回 -204 时补救的依据。
+//!
+//! 背景（2026-10-01 实测）：设备上的 SOTER TA **一台设备同时只保留一个有效签名会话**。
+//! 后开的那张会把前一张顶掉，跟槽位（uid + 别名）没关系：uid 10043 与 uid 10373、
+//! 别名也各不同，各 init 一次，回头按顺序 finish —— 先 init 的那笔必回 -204
+//! （`SOTER_ERROR_OPERATEID_NULL`），4 轮 4 次都是如此。B 端的 relay 只是把句柄透传给
+//! HAL / TA，自己根本没有会话表，这个「一个」改不动。
+//!
+//! 生产日志里 `finish_sign -204` 一直占收尾的一成上下。拦是拦不住的（谁先谁后全看 App
+//! 的时序），所以这一层不拦、只留证据：`init_sign` 拿到会话的时候把 (uid, 别名,
+//! challenge) 记下来，等这笔 `finish_sign` 真回 -204 了，`handlers` 拿它重开一张会话、
+//! 把同一个 challenge 再签一遍 —— 同一把钥匙、同一个挑战，签名值是等价的，App 那边看到
+//! 的就是一次正常成功。
+//!
+//! 这里没有任何阻塞，所以也不会再回 -9（`IS_AUTHING`）去让 App 重试。
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// 一笔会话记多久。App 的 init->finish 正常是秒级，慢的时候是在等用户按指纹（几十秒
+/// 量级），给足 5 分钟；过期只是不再补救，没有别的副作用。
+const STASH_TTL: Duration = Duration::from_secs(300);
+
+/// 最多记多少条，挡住异常增长（正常随 `finish_sign` 清掉）。
+const MAX_ENTRIES: usize = 8192;
+
+/// 补救需要的东西：重开一张会话得用同样的 uid、别名和挑战。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotSpec {
+    pub uid: i64,
+    pub alias: Option<String>,
+    pub challenge: Option<String>,
+}
+
+/// 补救完整可用的槽位信息（缺 alias 或 challenge 就补不了）。
+impl SlotSpec {
+    pub fn usable(&self) -> bool {
+        self.alias.as_deref().is_some_and(|a| !a.is_empty())
+            && self.challenge.as_deref().is_some_and(|c| !c.is_empty())
+    }
+}
+
+struct Entry {
+    spec: SlotSpec,
+    at: Instant,
+}
+
+pub struct SignSessions {
+    ttl: Duration,
+    inner: Mutex<HashMap<i64, Entry>>,
+}
+
+impl SignSessions {
+    pub fn new() -> Self {
+        Self::with_ttl(STASH_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `init_sign` 拿到会话时登记。uid / 别名 / 挑战缺一不可，缺了就不记 ——
+    /// 记下来也补不了，白占内存。
+    pub fn record(
+        &self,
+        session: i64,
+        uid: Option<i64>,
+        alias: Option<&str>,
+        challenge: Option<&str>,
+    ) {
+        let Some(uid) = uid else { return };
+        let spec = SlotSpec {
+            uid,
+            alias: alias.map(str::to_string),
+            challenge: challenge.map(str::to_string),
+        };
+        if !spec.usable() {
+            return;
+        }
+        let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
+        if g.len() >= MAX_ENTRIES {
+            // 满了先扔一半最老的，别让它无限涨。
+            let mut ages: Vec<(i64, Instant)> = g.iter().map(|(s, e)| (*s, e.at)).collect();
+            ages.sort_by_key(|(_, at)| *at);
+            for (s, _) in ages.into_iter().take(g.len() / 2) {
+                g.remove(&s);
+            }
+        }
+        g.insert(session, Entry { spec, at: now });
+    }
+
+    /// 查这张会话是哪个槽位开的（顺手清掉过期的）。
+    pub fn lookup(&self, session: i64) -> Option<SlotSpec> {
+        let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
+        g.get(&session).map(|e| e.spec.clone())
+    }
+
+    /// 这一笔自己收尾了（或者补签完了），登记撤掉。
+    pub fn forget(&self, session: i64) {
+        self.hold()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.hold().lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    fn hold(&self) -> &Mutex<HashMap<i64, Entry>> {
+        &self.inner
+    }
+}
+
+impl Default for SignSessions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sessions() -> SignSessions {
+        SignSessions::with_ttl(Duration::from_millis(150))
+    }
+
+    #[test]
+    fn a_recorded_session_can_be_looked_up() {
+        let s = sessions();
+        s.record(42, Some(10043), Some("slot_a"), Some("aabb"));
+        let spec = s.lookup(42).expect("刚记下的会话应该查得到");
+        assert_eq!(spec.uid, 10043);
+        assert_eq!(spec.alias.as_deref(), Some("slot_a"));
+        assert_eq!(spec.challenge.as_deref(), Some("aabb"));
+        assert!(spec.usable());
+    }
+
+    #[test]
+    fn a_record_without_alias_or_challenge_is_not_kept() {
+        // 补救得重开一张会话，缺别名或挑战就补不了，记下来也没用。
+        let s = sessions();
+        s.record(1, Some(10043), None, Some("aabb"));
+        s.record(2, Some(10043), Some("slot_a"), None);
+        s.record(3, Some(10043), Some(""), Some("aabb"));
+        s.record(4, None, Some("slot_a"), Some("aabb"));
+        assert_eq!(s.len(), 0);
+        assert!(s.lookup(1).is_none());
+    }
+
+    #[test]
+    fn a_finished_session_is_dropped() {
+        let s = sessions();
+        s.record(7, Some(10043), Some("slot_a"), Some("aabb"));
+        s.forget(7);
+        assert!(s.lookup(7).is_none());
+    }
+
+    #[test]
+    fn an_old_session_is_not_used_for_repair() {
+        let s = sessions();
+        s.record(9, Some(10043), Some("slot_a"), Some("aabb"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(s.lookup(9).is_none(), "过期的登记不该再拿去补签");
+    }
+}
