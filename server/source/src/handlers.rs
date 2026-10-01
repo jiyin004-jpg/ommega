@@ -896,6 +896,12 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     resp
 }
 
+/// 补签最多试几次。第二次是给「设备层那一瞬没答出来」准备的 —— 那种是瞬时的。
+const REPAIR_ATTEMPTS: u32 = 2;
+
+/// 两次补签之间等多久。
+const REPAIR_RETRY_GAP: Duration = Duration::from_millis(150);
+
 /// `finish_sign` 回 -204 时的补救：拿 init 时缓存的参数重开一张会话，再签一次。
 ///
 /// -204（`SOTER_ERROR_OPERATEID_NULL`）在设备上就一个意思：这张会话被后来的一笔
@@ -905,8 +911,12 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
 /// 同一个 challenge 签了。同一把钥匙、同一个挑战 —— 签名值是等价的，App 那边就是一次
 /// 正常成功。
 ///
-/// 只试一次；试不出来（拿不到新会话、或者补签本身也失败）就返回 `None`，外面照旧把
-/// 原来的 -204 还回去。
+/// 只试 [`REPAIR_ATTEMPTS`] 次（中间隔 [`REPAIR_RETRY_GAP`]）；试不出来（拿不到新会话、
+/// 或者补签本身也失败）就返回 `None`，外面照旧把原来的 -204 还回去。
+///
+/// 为什么要试第二次：失败那几次看下来多半不是「会话抢不到」，而是设备层那一瞬答不出来
+/// （没有在线的 B、转发超时）。这种是瞬时的，隔一百多毫秒再来一次就够了；第一次已经
+/// 拿到签名就直接回，正常路径不因为重试多花一点时间。
 async fn repair_clobbered_finish(
     state: &AppState,
     body: &Value,
@@ -922,6 +932,30 @@ async fn repair_clobbered_finish(
         "soter: 会话 {session} 被顶掉了，拿缓存的参数重开一张再签（uid={} alias={alias}）",
         spec.uid
     );
+    for attempt in 1..=REPAIR_ATTEMPTS {
+        if attempt > 1 {
+            tracing::info!("soter: 补签第 {attempt} 次重试（会话 {session}）");
+            tokio::time::sleep(REPAIR_RETRY_GAP).await;
+        }
+        if let Some(done) = repair_once(state, body, requested, target, session, &spec).await {
+            return Some(done);
+        }
+    }
+    None
+}
+
+/// 补签的实际动作：重开一张会话、把同一个 challenge 签出来。
+async fn repair_once(
+    state: &AppState,
+    body: &Value,
+    requested: &str,
+    target: Option<&str>,
+    session: i64,
+    spec: &crate::soter_sign_sessions::SlotSpec,
+) -> Option<Value> {
+    let (Some(alias), Some(challenge)) = (spec.alias.as_deref(), spec.challenge.as_deref()) else {
+        return None;
+    };
     let init_body = repair_init_body(body, spec.uid, alias, challenge);
     let init = try_b_soter_layer(state, &init_body, requested, target).await?;
     let init_code = init.value.get("error_code").and_then(Value::as_i64);
@@ -931,7 +965,7 @@ async fn repair_clobbered_finish(
         .and_then(Value::as_i64)
         .filter(|s| *s != 0)
     else {
-        tracing::info!("soter: 补签没拿到新会话（init error_code={init_code:?}），还是回 -204");
+        tracing::info!("soter: 补签没拿到新会话（init error_code={init_code:?}）");
         return None;
     };
     let mut fin_body = body.clone();
@@ -941,7 +975,7 @@ async fn repair_clobbered_finish(
     let done = try_b_soter_layer(state, &fin_body, requested, target).await?;
     let code = done.value.get("error_code").and_then(Value::as_i64);
     if code != Some(0) {
-        tracing::warn!("soter: 补签失败（finish error_code={code:?}），还是回 -204");
+        tracing::warn!("soter: 补签的 finish 也失败了（error_code={code:?}）");
         return None;
     }
     tracing::info!(
