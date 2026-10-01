@@ -25,16 +25,23 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
-/// 一笔 `init_sign` 最多占住设备多久。正常 `finish_sign` 百毫秒级就来了（最慢的
-/// 也就是重试一次 429 退避，一点儿秒），这里只是兜底：没人来收尾就自己过期，不能
-/// 把设备卡住。不能拖得太久 —— 一笔被抛弃的租约会把它后面的兄弟全堵成 -9。
+/// 一笔 `init_sign` 最多占住设备多久。
+///
+/// 实测真流程 init->finish 是 46~336ms，但这里不能卡着实测值来 —— 用户在
+/// `finish_sign` 那一步按指纹可能要几秒。试过收到 2 秒：慢一点的那笔会被后来者
+/// 把会话抢走，回头它的 finish 就是 -204，反而把最需要顾的那笔干掉了。卡 3 秒
+/// 是跟「TEE 调用不能拖到几十秒」那条线对齐。
 const LEASE_TTL: Duration = Duration::from_secs(3);
 
 /// 后来者最多等前一笔收尾多久。超了就不再等，回 -9 让 App 退让重试。
 ///
-/// 上限卡在 3 秒：一是真流程百来毫秒就完了，二是“等”本身也是给 A 端看的耗时，
+/// 上限卡在 3 秒：一是真流程百来毫秒就完了，二是「等」本身也是给 A 端看的耗时，
 /// 不能把 TEE 那条路拖到几十秒去。
 pub const SIGN_DEVICE_WAIT: Duration = Duration::from_secs(3);
+
+/// 排队时的轮询间隔。租约过期是没人叫醒的（没有定时器），所以除了被人
+/// [`release`](SignGate::release) 唤醒，还得自己隔一会儿回去看一眼。
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 设备被占着的时候给调用方的码：`SOTER_ERROR_IS_AUTHING`。
 pub const BUSY_CODE: i64 = -9;
@@ -55,6 +62,18 @@ struct Inner {
     leases: HashMap<String, Lease>,
     /// 会话 -> 它占的设备。`init_sign` 拿到 session 时登记，`finish_sign` 用它解锁。
     sessions: HashMap<i64, (String, Instant)>,
+}
+
+impl Inner {
+    /// 顺手扔掉已经过期、也没人在排队的租约。没有定时器，全靠路过的人清。
+    fn reap(&mut self) {
+        if self.leases.len() <= 64 {
+            return;
+        }
+        let now = Instant::now();
+        self.leases
+            .retain(|_, l| l.waiters.is_empty() && l.until.is_some_and(|t| t > now));
+    }
 }
 
 pub struct SignGate {
@@ -83,6 +102,7 @@ impl SignGate {
         loop {
             let rx = {
                 let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
+                g.reap();
                 if g.leases
                     .get(device)
                     .and_then(|l| l.until)
@@ -106,10 +126,9 @@ impl SignGate {
             if left.is_zero() {
                 return false;
             }
-            if tokio::time::timeout(left, rx).await.is_err() {
-                return false;
-            }
-            // 被叫醒：回去再抢一次（可能被别人抢走，那就接着排）。
+            // 被叫醒、或者轮询到期，都回去再抢一次：租约可能是自己过期了（那没人
+            // 叫我们），也可能是被别人先抢走了（那就接着排）。
+            let _ = tokio::time::timeout(left.min(POLL_INTERVAL), rx).await;
         }
     }
 
@@ -198,11 +217,12 @@ mod tests {
         // 真流程 init->finish 实测 46~336ms（见 2026-10-01 的 sg3 验证），租约得比
         // 它长；但又不能长到把后面排队的人全耗死。
         assert!(LEASE_TTL >= Duration::from_secs(1));
-        assert!(LEASE_TTL <= Duration::from_secs(5));
+        assert!(LEASE_TTL <= Duration::from_secs(3));
         // 等待预算不短于租约：租约过期后排队的那位应该还来得及抢到，而不是白等。
         assert!(SIGN_DEVICE_WAIT >= LEASE_TTL);
         // 给 A 端看的等待不能拖到秒级以上。
         assert!(SIGN_DEVICE_WAIT <= Duration::from_secs(3));
+        assert!(POLL_INTERVAL < LEASE_TTL);
     }
 
     #[tokio::test]
@@ -231,6 +251,18 @@ mod tests {
         let (got, at) = waiter.await.expect("waiter 不该 panic");
         assert!(got, "前一笔收尾后，后来者应该拿到设备");
         assert!(at.duration_since(t0) < Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn a_waiter_picks_up_a_lease_that_expired_by_itself() {
+        // 前一笔被人抛弃（没 finish）：没人会唤醒排队的那位，他得自己发现租约
+        // 过期了并抢过来 —— 不然就白等到 -9。
+        let g = std::sync::Arc::new(gate());
+        assert!(g.acquire("dev-a", Duration::from_millis(50)).await);
+        let g2 = g.clone();
+        let waiter = tokio::spawn(async move { g2.acquire("dev-a", Duration::from_secs(2)).await });
+        let got = waiter.await.expect("waiter 不该 panic");
+        assert!(got, "过期租约应该被排队的人接手");
     }
 
     #[tokio::test]
