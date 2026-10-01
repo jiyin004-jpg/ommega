@@ -18,6 +18,12 @@
 //! 重建类 op 走的是「去重窗」：同一个 (设备, uid, 别名, op) 在窗口内重复打进来，
 //! 直接把上一次的结果还回去；同时把该 uid 名下所有只读缓存清掉 —— 设备状态变了，
 //! 之前量出来的「有没有料」就不能再用了。
+//!
+//! 2026-10-01 补的一条：**同一个写 op 记进来时，要把同 uid 上别的写记录丢掉**。
+//! 去重窗只认 (设备, op, uid, 别名)，认不出中间夹了一次 `remove`；实测 App 的循环
+//! 是 `remove` → `generate` → `has_auth_key`，那次 generate 落在前一笔 generate 的
+//! 窗里被原样回放（同一个 task_id、33ms、根本没到设备），App 收到「建成功」，紧接着
+//! 查还是删后那份 -8，去签名又 -65528，于是自删自重试 —— 请求量就是这么堆起来的。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,13 +78,15 @@ fn kind_of(op: &str) -> Kind {
     }
 }
 
-/// 缓存键里 uid 和别名都可能没有（uid 级 op 就没有别名）。
-fn key(device: &str, op: &str, uid: Option<i32>, alias: Option<&str>) -> String {
+/// 缓存键：`设备|uid|op|别名`。只读缓存和写去重窗共用这一套布局 ——
+/// 两边都按 `设备|uid|` 前缀清理，布局不一样就筛不干净。
+/// uid 和别名都可能没有（uid 级 op 就没有别名）。
+fn slot(device: &str, op: &str, uid: Option<i32>, alias: Option<&str>) -> String {
     let uid = uid
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
     let alias = alias.unwrap_or("-");
-    format!("{device}|{op}|{uid}|{alias}")
+    format!("{device}|{uid}|{op}|{alias}")
 }
 
 /// 清只读缓存用的前缀：这台设备 + 这个 uid 名下的全部别名。
@@ -87,15 +95,6 @@ fn uid_prefix(device: &str, uid: Option<i32>) -> String {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
     format!("{device}|{uid}|")
-}
-
-/// 只读缓存现在按 `设备|op|uid|别名` 存，前缀要能按 `设备|uid` 筛出来。
-fn read_slot(device: &str, op: &str, uid: Option<i32>, alias: Option<&str>) -> String {
-    let uid = uid
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let alias = alias.unwrap_or("-");
-    format!("{device}|{uid}|{op}|{alias}")
 }
 
 pub struct SoterGate {
@@ -145,12 +144,12 @@ impl SoterGate {
         alias: Option<&str>,
     ) -> Option<Value> {
         let (map, ttl, k) = match kind_of(op) {
-            Kind::Read => (
-                &self.reads,
-                self.read_ttl,
-                read_slot(device, op, uid, alias),
+            Kind::Read => (&self.reads, self.read_ttl, slot(device, op, uid, alias)),
+            Kind::Write => (
+                &self.writes,
+                self.write_window,
+                slot(device, op, uid, alias),
             ),
-            Kind::Write => (&self.writes, self.write_window, key(device, op, uid, alias)),
             Kind::None => return None,
         };
         let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -184,28 +183,62 @@ impl SoterGate {
         match kind_of(op) {
             Kind::Write => {
                 self.invalidate_reads(device, uid);
+                self.invalidate_sibling_writes(device, uid, op);
                 if from_device {
-                    let k = key(device, op, uid, alias);
+                    let k = slot(device, op, uid, alias);
+                    let ttl = self.write_window;
                     let mut guard = self
                         .writes
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.retain(|_, (_, at)| at.elapsed() <= ttl);
                     guard.insert(k, (value.clone(), Instant::now()));
                     self.stores.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Kind::Read => {
                 if from_device {
-                    let k = read_slot(device, op, uid, alias);
+                    let k = slot(device, op, uid, alias);
+                    let ttl = self.read_ttl;
                     let mut guard = self
                         .reads
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.retain(|_, (_, at)| at.elapsed() <= ttl);
                     guard.insert(k, (value.clone(), Instant::now()));
                     self.stores.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Kind::None => {}
+        }
+    }
+
+    /// 记下一笔写操作时，把同一 uid 上**别的**写去重记录丢掉：那些答案是「上一种
+    /// 状态」下的，中间已经夹了这次改动，回放出去就是骗人。
+    ///
+    /// 同 op 的记录留着（App 重复重放同一笔还是该走窗，这是这层的本意）；
+    /// `remove_all_uid_key` 是 uid 级的，把这个 uid 的写记录全清。
+    fn invalidate_sibling_writes(&self, device: &str, uid: Option<i32>, op: &str) {
+        let prefix = uid_prefix(device, uid);
+        let mut guard = self
+            .writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = guard.len();
+        guard.retain(|k, _| {
+            if !k.starts_with(&prefix) {
+                return true;
+            }
+            if op == "remove_all_uid_key" {
+                return false;
+            }
+            let other = k[prefix.len()..].split('|').next().unwrap_or("");
+            other == op
+        });
+        let dropped = before - guard.len();
+        if dropped > 0 {
+            self.writes_invalidated
+                .fetch_add(dropped as u64, Ordering::Relaxed);
         }
     }
 
@@ -347,6 +380,105 @@ mod tests {
             gate.lookup("dev", "generate_auth_key_pair", Some(10408), Some("A")),
             Some(first)
         );
+    }
+
+    #[test]
+    fn a_remove_kills_the_earlier_generate_replay() {
+        // 2026-10-01 实测的循环：remove → generate → has_auth_key。
+        // 那次 generate 曾经被前一笔 generate 的结果回放（同一个 task_id、33ms、
+        // 根本没到设备），App 收到「建成功」再查却还是没有，只能自删自重试。
+        let gate = gate();
+        gate.record(
+            "dev",
+            "generate_auth_key_pair",
+            Some(10408),
+            Some("A"),
+            true,
+            &json!({ "error_code": 0 }),
+        );
+        assert!(gate
+            .lookup("dev", "generate_auth_key_pair", Some(10408), Some("A"))
+            .is_some());
+        gate.record(
+            "dev",
+            "remove_auth_key",
+            Some(10408),
+            Some("A"),
+            true,
+            &json!({ "error_code": 0 }),
+        );
+        assert!(gate
+            .lookup("dev", "generate_auth_key_pair", Some(10408), Some("A"))
+            .is_none());
+        // 刚记下这笔 remove 自己的答案还在（同 op 的重复重放照旧走窗）。
+        assert!(gate
+            .lookup("dev", "remove_auth_key", Some(10408), Some("A"))
+            .is_some());
+    }
+
+    #[test]
+    fn a_generate_for_another_alias_leaves_the_replay_alone() {
+        let gate = gate();
+        gate.record(
+            "dev",
+            "generate_auth_key_pair",
+            Some(10408),
+            Some("A"),
+            true,
+            &json!({}),
+        );
+        gate.record(
+            "dev",
+            "generate_auth_key_pair",
+            Some(10408),
+            Some("B"),
+            true,
+            &json!({}),
+        );
+        assert!(gate
+            .lookup("dev", "generate_auth_key_pair", Some(10408), Some("A"))
+            .is_some());
+        assert!(gate
+            .lookup("dev", "generate_auth_key_pair", Some(10408), Some("B"))
+            .is_some());
+    }
+
+    #[test]
+    fn remove_all_clears_every_write_of_that_uid() {
+        let gate = gate();
+        gate.record(
+            "dev",
+            "generate_auth_key_pair",
+            Some(10408),
+            Some("A"),
+            true,
+            &json!({}),
+        );
+        gate.record(
+            "dev",
+            "remove_auth_key",
+            Some(10408),
+            Some("B"),
+            true,
+            &json!({}),
+        );
+        gate.record(
+            "dev",
+            "remove_all_uid_key",
+            Some(10408),
+            None,
+            true,
+            &json!({}),
+        );
+        assert!(gate
+            .lookup("dev", "generate_auth_key_pair", Some(10408), Some("A"))
+            .is_none());
+        assert!(gate
+            .lookup("dev", "remove_auth_key", Some(10408), Some("B"))
+            .is_none());
+        assert!(gate
+            .lookup("dev", "remove_all_uid_key", Some(10408), None)
+            .is_some());
     }
 
     #[test]
