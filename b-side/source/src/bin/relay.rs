@@ -29,6 +29,8 @@
 //!   OMMEGA_RELAY_LOG_LEVEL     file log level: off|error|warn|info|debug|trace (default debug)
 //!   OMMEGA_RELAY_LOGCAT_ENABLED logcat on/off (default true)
 //!   OMMEGA_RELAY_LOGCAT_LEVEL   logcat level: off|error|warn|info|debug|trace (default info)
+//!   OMMEGA_RELAY_BIND_IFACE    outgoing interface: none|auto|always|<ifname> (default none)
+//!   OMMEGA_RELAY_PATH_PROBE    probe /api/ping/ before each long poll (default true)
 //!
 //! Logging is read *before* the rest of the config is validated, so a broken
 //! `relay.conf` still honours its log settings while reporting the error.
@@ -42,7 +44,7 @@
 //! Both `http://` and `https://` are supported. The relay_server runs over
 //! HTTPS with a self-signed certificate, so any server certificate is accepted.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use x509_cert::der::Decode as _;
@@ -68,6 +70,11 @@ const POLL_WALL_LIMIT: Duration = Duration::from_secs(25);
 /// 处理一个任务的上限。任务里有真 TEE 调用、还有带重试的结果回传（最坏 4×33s
 /// 再加退避），所以给得宽一点，这一条只用来兜「整个循环不再往前转」。
 const TASK_WALL_LIMIT: Duration = Duration::from_secs(180);
+/// 探针结果缓存多久。B 端一秒能打几百个请求，每条都探一下等于把流量翻倍，
+/// 所以选出来的结果留一小会儿；失败的那一份只存一秒，路不通的时候就是要急着
+/// 重试 —— 设备醒着的窗口很短，得挤进去。
+const PATH_TTL: Duration = Duration::from_secs(10);
+const PATH_FAIL_TTL: Duration = Duration::from_secs(1);
 const CONF_PATH: &str = "/data/adb/ommega/relay.conf";
 const RESTART_MARKER: &str = "/data/adb/ommega/restart.all";
 const RELOAD_POLL_MS: u64 = 1000;
@@ -163,6 +170,11 @@ struct RelayConfig {
     /// has learnt a slot from real traffic, and never claims `soter_nosign` on
     /// evidence it does not have.
     soter_probe: Option<ommegaclient_b::caps::SignProbeTarget>,
+    /// 出口网卡策略，见 `uplink::desired_iface`。默认 `none`（不绑）。
+    bind_iface: String,
+    /// 发长轮询之前先探一下路通不通。路死的时候挂 15s 长轮询没有意义，早点回来
+    /// 重试反而能挤进设备醒着的那几个窗口。
+    path_probe: bool,
 }
 
 impl RelayConfig {
@@ -260,6 +272,16 @@ fn load_config_from_file() -> Result<RelayConfig> {
         m.get("OMMEGA_RELAY_SOTER_PROBE_UID").map(|s| s.as_str()),
         m.get("OMMEGA_RELAY_SOTER_PROBE_ALIAS").map(|s| s.as_str()),
     );
+    // 没配就是 `none`：B 端这台机器上 relay 的流量本来就出 wlan0，绑上去没有
+    // 收益，还会丢掉系统自己的 WiFi→蜂窝 切换。要绑请显式配。
+    let bind_iface = m
+        .get("OMMEGA_RELAY_BIND_IFACE")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+    let path_probe = m
+        .get("OMMEGA_RELAY_PATH_PROBE")
+        .map(|v| parse_bool(v))
+        .unwrap_or(true);
     let server = server.trim_end_matches('/').to_string();
     Ok(RelayConfig {
         server,
@@ -268,6 +290,8 @@ fn load_config_from_file() -> Result<RelayConfig> {
         token,
         soter_allow_mutation,
         soter_probe,
+        bind_iface,
+        path_probe,
     })
 }
 
@@ -362,6 +386,10 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         env("OMMEGA_RELAY_SOTER_PROBE_UID").as_deref(),
         env("OMMEGA_RELAY_SOTER_PROBE_ALIAS").as_deref(),
     );
+    let bind_iface = env("OMMEGA_RELAY_BIND_IFACE").unwrap_or_else(|| "none".to_string());
+    let path_probe = env("OMMEGA_RELAY_PATH_PROBE")
+        .map(|v| parse_bool(&v))
+        .unwrap_or(true);
     let server = server.trim_end_matches('/').to_string();
     let cfg = RelayConfig {
         server,
@@ -370,6 +398,8 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         token,
         soter_allow_mutation,
         soter_probe,
+        bind_iface,
+        path_probe,
     };
     cfg.validate()?;
     Ok((cfg, "env"))
@@ -387,42 +417,73 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
 // does not leave stale pooled connections pointing at the old address.
 // ---------------------------------------------------------------------------
 
-/// Shared reqwest blocking client.  Wrapped in `RwLock<Option<Arc<...>>>` so
-/// the config watcher can drop it (forcing a rebuild) without blocking
-/// in-flight requests (the old `Arc` stays alive until its last user drops it).
-static HTTP_CLIENT: RwLock<Option<Arc<Client>>> = RwLock::new(None);
-
-fn build_http_client() -> Result<Client> {
-    Client::builder()
-        .danger_accept_invalid_certs(true)
-        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
-        .timeout(Duration::from_millis(READ_TIMEOUT_MS))
-        .build()
-        .context("build reqwest client")
+/// 缓存里的客户端，连同它是照哪块出口网卡建的。网卡是这个身份的一部分：
+/// 它跟着网络状态变，照 A 端那样钉进 `OnceLock` 会把第一次的判断冻住。
+struct CachedClient {
+    iface: Option<String>,
+    client: Arc<Client>,
 }
 
-/// Returns the shared HTTP client, building it on first use.
-fn get_http_client() -> Result<Arc<Client>> {
-    // Fast path: read lock, return if present.
+/// Shared reqwest blocking client.  Wrapped in `RwLock<Option<CachedClient>>` so
+/// the config watcher can drop it (forcing a rebuild) without blocking
+/// in-flight requests (the old `Arc` stays alive until its last user drops it).
+static HTTP_CLIENT: RwLock<Option<CachedClient>> = RwLock::new(None);
+
+fn build_http_client(iface: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
+        .timeout(Duration::from_millis(READ_TIMEOUT_MS));
+    if let Some(name) = iface {
+        // `SO_BINDTODEVICE`：把 socket 钉在物理出口上，免得被路由规则抓进隧道。
+        builder = builder.interface(name);
+    }
+    builder.build().context("build reqwest client")
+}
+
+/// 这条请求该从哪块网卡出去。探针失败时调用方会把客户端丢掉，下次重建就会重新
+/// 竞速一遍 —— 链路换了、挂了都能自己跟上。
+fn resolve_iface(cfg: &RelayConfig) -> Option<String> {
+    ommegaclient_b::uplink::desired_iface(&cfg.bind_iface, &cfg.server)
+}
+
+/// Returns the shared HTTP client, building it on first use (or rebuilding it
+/// when the chosen outgoing interface changed).
+fn get_http_client(cfg: &RelayConfig) -> Result<Arc<Client>> {
+    let iface = resolve_iface(cfg);
+    // Fast path: read lock, return if present and still for the same uplink.
     if let Ok(guard) = HTTP_CLIENT.read() {
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
+        if let Some(cached) = guard.as_ref() {
+            if cached.iface == iface {
+                return Ok(cached.client.clone());
+            }
         }
     }
     // Slow path: write lock, build if still absent.
     let mut guard = HTTP_CLIENT
         .write()
         .map_err(|_| anyhow!("HTTP client lock poisoned"))?;
-    if let Some(client) = guard.as_ref() {
-        return Ok(client.clone());
+    if let Some(cached) = guard.as_ref() {
+        if cached.iface == iface {
+            return Ok(cached.client.clone());
+        }
     }
-    let client = Arc::new(build_http_client()?);
-    *guard = Some(client.clone());
+    if let Some(name) = iface.as_deref() {
+        log::info!("relay 出口绑定到网卡 {name}");
+    } else if guard.as_ref().is_some() {
+        log::info!("relay 出口改回系统默认路由（不再绑定）");
+    }
+    let client = Arc::new(build_http_client(iface.as_deref())?);
+    *guard = Some(CachedClient {
+        iface,
+        client: Arc::clone(&client),
+    });
     Ok(client)
 }
 
 /// Drops the shared HTTP client so the next request rebuilds it.
-/// Called from the config watcher when the server URL changes.
+/// Called from the config watcher when the server URL changes, and from the
+/// worker when a probe says the current uplink stopped carrying traffic.
 fn reset_http_client() {
     if let Ok(mut guard) = HTTP_CLIENT.write() {
         *guard = None;
@@ -430,13 +491,52 @@ fn reset_http_client() {
     }
 }
 
+/// 上一次探路的结果：哪块网卡、什么时候探的、通不通。
+static PATH_CHECK: Mutex<Option<(Option<String>, Instant, bool)>> = Mutex::new(None);
+
+/// 发长轮询之前先确认路还通着。
+///
+/// 链路已经死的时候，一个 15s 长轮询不会带回任何东西，只会把设备醒着的那点
+/// 窗口全耗在里面；探针几百毫秒就能给个答复，不通就早点回去重试。当前这条路
+/// 刚刚证明打不通的时候，顺手把客户端丢掉 —— 下一轮重建会重新竞速，自己换一条。
+///
+/// 代价是每 10 秒多一个几字节的 `/api/ping/`（相对 B 端一分钟几百个请求可以
+/// 忽略）；不想付这个代价就把 `OMMEGA_RELAY_PATH_PROBE` 关掉。
+fn path_ready(cfg: &RelayConfig) -> bool {
+    if !cfg.path_probe {
+        return true;
+    }
+    let iface = resolve_iface(cfg);
+    if let Ok(guard) = PATH_CHECK.lock() {
+        if let Some((cached_iface, at, ok)) = guard.as_ref() {
+            let ttl = if *ok { PATH_TTL } else { PATH_FAIL_TTL };
+            if *cached_iface == iface && at.elapsed() < ttl {
+                return *ok;
+            }
+        }
+    }
+    let ok = ommegaclient_b::uplink::probe(&cfg.server, iface.as_deref());
+    if let Ok(mut guard) = PATH_CHECK.lock() {
+        *guard = Some((iface.clone(), Instant::now(), ok));
+    }
+    if !ok {
+        log::warn!(
+            "出口探针没打通（网卡: {}），这轮不发长轮询",
+            iface.as_deref().unwrap_or("系统默认")
+        );
+        reset_http_client();
+    }
+    ok
+}
+
 fn http_request(
+    cfg: &RelayConfig,
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>)> {
-    let client = get_http_client()?;
+    let client = get_http_client(cfg)?;
     let mut req = match method {
         "GET" => client.get(url),
         "POST" => client.post(url),
@@ -490,7 +590,7 @@ fn poll_tasks(cfg: &RelayConfig) -> Result<Option<(String, String, Value)>> {
     );
     let headers = vec![("X-Relay-Token".to_string(), cfg.token.clone())];
     let (status, body) =
-        http_request("GET", &url, &headers, None).with_context(|| "b/poll failed")?;
+        http_request(cfg, "GET", &url, &headers, None).with_context(|| "b/poll failed")?;
     log::info!("b/poll status={status} body_len={}", body.len());
     match status {
         204 => Ok(None),
@@ -531,7 +631,13 @@ fn post_result(cfg: &RelayConfig, task_id: &str, result: &Value) -> Result<()> {
     ];
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match http_request("POST", &url, &headers, Some(body.to_string().as_bytes())) {
+        match http_request(
+            cfg,
+            "POST",
+            &url,
+            &headers,
+            Some(body.to_string().as_bytes()),
+        ) {
             Ok((200, _body)) => {
                 log::info!("b/result task={task_id} accepted (HTTP 200)");
                 return Ok(());
@@ -1072,6 +1178,14 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
         };
         let started = Instant::now();
         watchdog.arm(POLL_WALL_LIMIT);
+        // 先探路再发长轮询：链路死的时候挂 15s 长轮询只会把设备醒着的那点窗口
+        // 全耗完，快点回来重试才有机会。探针也放在看门狗底下：它一样会被
+        // suspend 冻住，超了还是得退出去重拉。
+        if !path_ready(&cfg) {
+            watchdog.disarm();
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
         let polled = poll_tasks(&cfg);
         watchdog.disarm();
         match polled {
@@ -1127,6 +1241,8 @@ fn main() {
             token: String::new(),
             soter_allow_mutation: false,
             soter_probe: None,
+            bind_iface: "none".to_string(),
+            path_probe: true,
         });
         log::info!(
             "relay daemon starting (config from {source}) server={} device={} machine={}",
