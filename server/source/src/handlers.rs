@@ -29,6 +29,8 @@ pub struct AppState {
     pub geo: Option<Arc<crate::geo::Ip2Region>>,
     /// SOTER 短 TTL 合并（削峰用），见 `crate::soter_gate`。
     pub soter_gate: Arc<crate::soter_gate::SoterGate>,
+    /// SOTER 签名会话的槽位排队（`init_sign` → `finish_sign`），见 `crate::soter_sign_gate`。
+    pub sign_gate: Arc<crate::soter_sign_gate::SignGate>,
 }
 
 fn token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -880,6 +882,23 @@ pub async fn soter(
     run_soter_task(&state, &body).await
 }
 
+/// SOTER 转发的收尾：`finish_sign` 不管成没成，回来就把这一笔会话占的设备放掉
+/// （放不掉也没关系，租约到期自己会松）。
+///
+/// 这里必须是「inner 跑完再放」：TA 那边是会话真没了才算收尾，提前放会让下一个
+/// `init_sign` 钻进来把上一笔正在走的 `finish_sign` 顶掉。
+async fn run_soter_task(state: &AppState, body: &Value) -> Response {
+    let resp = run_soter_task_inner(state, body).await;
+    if body.get("op").and_then(Value::as_str) == Some("finish_sign") {
+        if let Some(session) = body.get("session").and_then(Value::as_i64) {
+            if let Some(key) = state.sign_gate.take_session(session) {
+                tracing::info!("soter: finish_sign 收尾，放掉设备 {key}（session={session}）");
+            }
+        }
+    }
+    resp
+}
+
 /// SOTER 转发：跟认证共用同一套三层链，差别只在三层的实现。
 ///
 /// 层序（`physical` / `serverbox` 两种模式只差优先级）：
@@ -895,7 +914,7 @@ pub async fn soter(
 ///
 /// 服务端两层（见 `soter_mint`）用服务端自己的 RSA 物料现造一份自洽的 ASK，让
 /// A 端本地流程先闭环；腾讯那边的根谁也拿不到，这两层不假装自己是腾讯认得的东西。
-async fn run_soter_task(state: &AppState, body: &Value) -> Response {
+async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     if !body.is_object() {
         return json_err(StatusCode::BAD_REQUEST, "json object body required");
     }
@@ -950,6 +969,36 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         .store
         .resolve_soter_target(requested, needs_sign)
         .await;
+
+    // 签名会话是**一台设备只留一个**：2026-10-01 实测两笔槽位不同的 `init_sign`（uid
+    // 不同、别名也不同）各拿到一张会话，回头哪笔先收尾哪笔算数，后收尾的那笔的
+    // `finish_sign` 就是 -204。B 端 relay 只是把句柄透传给 HAL / TA，自己的会话表没
+    // 有，这个“一个”改不动。既然要抢，就我们这边排队：`init_sign` 到它的
+    // `finish_sign` 之间占住这台设备，后来的等（最多 `SIGN_DEVICE_WAIT`），等不到回 -9
+    // （`SOTER_ERROR_IS_AUTHING`）让 App 退让重试。一笔真流程只要百来毫秒，正常排队
+    // 基本等不到 -9。
+    //
+    // 注意 B 端自己的「能不能签」能力探针也会在这台设备上跑 `init_sign` + `finish_sign`，
+    // 那是另一条顶人的路子（2026-10-01 直对着 B 的 logcat 对上的），已在 B 端给它加了
+    // 空闲门（`b-side/source/src/caps.rs` 的 `SIGN_PROBE_QUIET`）。
+    let mut lease_key: Option<String> = None;
+    if op == "init_sign" {
+        if let Some(device) = b_target.as_deref() {
+            if !state
+                .sign_gate
+                .acquire(device, crate::soter_sign_gate::SIGN_DEVICE_WAIT)
+                .await
+            {
+                tracing::warn!("soter: 设备 {device} 上还有一笔签名没收尾，回 -9 让 App 退让重试");
+                return Json(json!({
+                    "op": "init_sign",
+                    "error_code": crate::soter_sign_gate::BUSY_CODE,
+                }))
+                .into_response();
+            }
+            lease_key = Some(device.to_string());
+        }
+    }
 
     // 这个槽位已经定过层就把它排到最前面：同一槽位的材料必须只出自一层，否则 App
     // 手里会出现一半 B 的一半 keybox 的状态（导出的公钥和签名的私钥都对不上）。
@@ -1036,6 +1085,19 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
                         crate::soter_mint::pin_layer(requested, uid, pin);
                     }
                 }
+                // 拿到会话就把设备交给它的 `finish_sign` 去释放；这一笔没拿到会话
+                // （比如 -5 / -26，答复里的 session 是 0）就当场放掉，别占着让下一个白等。
+                if let Some(key) = lease_key.take() {
+                    match v.get("session").and_then(Value::as_i64).filter(|s| *s != 0) {
+                        Some(session) => {
+                            state.sign_gate.bind_session(session, &key);
+                            tracing::info!(
+                                "soter: init_sign 占住设备 {key}（session={session}），等它的 finish_sign"
+                            );
+                        }
+                        None => state.sign_gate.release(&key),
+                    }
+                }
                 return Json(v).into_response();
             }
             Some(v) => {
@@ -1054,6 +1116,10 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         }
     }
 
+    // 三层都没接住（init_sign 的话就是一张会话都没拿到），别把设备攥着。
+    if let Some(key) = lease_key.take() {
+        state.sign_gate.release(&key);
+    }
     let detail = last_error.unwrap_or_else(|| "no layer could serve the request".to_string());
     if let Some(reply) = b_error_reply {
         // 服务端那两层接不了这笔（材料在真机上，它们手里没有），把设备层的答复还回去：
