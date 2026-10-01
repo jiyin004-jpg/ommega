@@ -243,8 +243,14 @@ mod tests {
         assert_eq!(step("finish_sign", 0, 2, None), (0, Verdict::Reset));
         // 建料类 op 在半死状态下也会成功，不能让它把计数清掉。
         assert_eq!(step("has_auth_key", 0, 2, None), (2, Verdict::Nothing));
-        assert_eq!(step("generate_auth_key_pair", 0, 2, None), (2, Verdict::Nothing));
-        assert_eq!(step("export_ask_public_key", 0, 2, None), (2, Verdict::Nothing));
+        assert_eq!(
+            step("generate_auth_key_pair", 0, 2, None),
+            (2, Verdict::Nothing)
+        );
+        assert_eq!(
+            step("export_ask_public_key", 0, 2, None),
+            (2, Verdict::Nothing)
+        );
     }
 
     #[test]
@@ -252,7 +258,12 @@ mod tests {
         let (count, verdict) = step("init_sign", -18, 1, Some(Duration::from_secs(60)));
         assert_eq!((count, verdict), (2, Verdict::Cooling));
         // 冷却过了就重启。
-        let (_, verdict) = step("init_sign", -18, 1, Some(RESTART_COOLDOWN + Duration::from_secs(1)));
+        let (_, verdict) = step(
+            "init_sign",
+            -18,
+            1,
+            Some(RESTART_COOLDOWN + Duration::from_secs(1)),
+        );
         assert_eq!(verdict, Verdict::Restart);
         // 从没重启过（None）也算过了冷却。
         assert_eq!(step("init_sign", -18, 1, None).1, Verdict::Restart);
