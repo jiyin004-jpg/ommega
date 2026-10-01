@@ -262,9 +262,14 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
 }
 
 /// Whether a VPN is currently up.  `VpnService` always leaves a `tun` device in
-/// `/sys/class/net` and the older pptp/l2tp paths leave a `ppp`; the names are
-/// always `tun0` / `ppp0` shaped — an Android-wide convention, not something that
-/// varies per device model.
+/// `/sys/class/net`, the older pptp/l2tp paths leave a `ppp` and bridged VPNs
+/// leave a `tap` — an Android-wide convention, not something that varies per
+/// device model.
+///
+/// The name alone is not enough, it has to actually be up: `tunl0` / `ip6tnl0`
+/// are kernel-default tunnel devices that sit in the same directory forever
+/// (measured `flags=0x80`, i.e. down, with no address); counting one of those as
+/// "a VPN is up" makes `auto` fire a useless probe every cycle.
 ///
 /// It only decides whether picking starts: missing one means "behave like there
 /// is no VPN" (nothing is bound), never a wrong link, and a false positive costs
@@ -276,8 +281,27 @@ fn vpn_present() -> bool {
     entries.flatten().any(|e| {
         e.file_name()
             .to_str()
-            .is_some_and(|n| n.starts_with("tun") || n.starts_with("ppp") || n.starts_with("tap"))
+            .is_some_and(|n| is_vpn_name(n) && iface_is_up(n))
     })
+}
+
+/// Whether the name looks like a VPN tunnel.
+fn is_vpn_name(name: &str) -> bool {
+    name.starts_with("tun") || name.starts_with("ppp") || name.starts_with("tap")
+}
+
+/// Whether the interface is up.  `/sys/class/net/<name>/flags` is a `0x...`
+/// hex string whose lowest bit is IFF_UP.
+///
+/// Unreadable (SELinux denies it in some domains) counts as up: one extra probe
+/// is cheaper than missing a real VPN, which would mean not picking at all and
+/// falling back to a default route the VPN may well have swallowed.
+fn iface_is_up(name: &str) -> bool {
+    match std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/flags")) {
+        Ok(text) => u32::from_str_radix(text.trim().trim_start_matches("0x"), 16)
+            .is_ok_and(|flags| flags & 0x1 != 0),
+        Err(_) => true,
+    }
 }
 
 /// Picks an uplink that can actually reach the relay.  Nothing usable leaves the

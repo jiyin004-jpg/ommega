@@ -157,8 +157,12 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
 }
 
 /// 现在有没有 VPN 起着。`VpnService` 一定会在 `/sys/class/net` 里留一个 `tun`
-/// 设备，老的 pptp/l2tp 路径留 `ppp`，名字都是 `tun0` / `ppp0` 这种形状 —— 这是
-/// Android 的通用约定，跟机型无关。
+/// 设备，老的 pptp/l2tp 路径留 `ppp`，以太网桥接的留 `tap` —— 这是 Android 的
+/// 通用约定，跟机型无关。
+///
+/// 光看名字不行，还得看它是不是真起来了：`tunl0` / `ip6tnl0` 是内核默认就建好
+/// 的隧道设备，一直躺在同一个目录里（实测 flags=0x80 即 down、也没有地址），
+/// 拿它当「有 VPN」会让 `auto` 每个周期都白探一次。
 ///
 /// 它只决定「要不要开始挑」：漏判的后果跟没 VPN 一样（不绑），不会把链路选错；
 /// 误判最多白花一次探针。
@@ -167,10 +171,28 @@ fn vpn_present() -> bool {
         return false;
     };
     entries.flatten().any(|e| {
-        e.file_name().to_str().is_some_and(|n| {
-            n.starts_with("tun") || n.starts_with("ppp") || n.starts_with("tap")
-        })
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| is_vpn_name(n) && iface_is_up(n))
     })
+}
+
+/// 名字像不像 VPN 隧道。
+fn is_vpn_name(name: &str) -> bool {
+    name.starts_with("tun") || name.starts_with("ppp") || name.starts_with("tap")
+}
+
+/// 接口是不是 up 的。`/sys/class/net/<name>/flags` 是个 `0x...` 十六进制串，
+/// 最低位就是 IFF_UP。
+///
+/// 读不到（SELinux 在有的域下会拒）就当它起来了：宁可多探一次，也别把真 VPN
+/// 漏掉 —— 漏掉就等于不挑，退回系统默认那条可能已经被 VPN 抓死的路。
+fn iface_is_up(name: &str) -> bool {
+    match std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/flags")) {
+        Ok(text) => u32::from_str_radix(text.trim().trim_start_matches("0x"), 16)
+            .is_ok_and(|flags| flags & 0x1 != 0),
+        Err(_) => true,
+    }
 }
 
 /// 挑一条真能打到服务端的出口。挑不到就不绑 —— 硬钉一条刚证明打不通的链路，
