@@ -99,6 +99,21 @@ pub fn reacquire(name: &str) -> bool {
     write_name(LOCK_PATH, name).is_ok() && held(name)
 }
 
+/// 把同名残留解掉。返回「本来有一条、现在解掉了」。
+///
+/// 自己不开这个功能时也得调一下：上一任（或者上一次开着的时候）留下的锁没人
+/// 解的话，配置里写 false 跟没写一样，系统还是睡不下去。
+pub fn clear_stale(name: &str) -> bool {
+    clear_stale_at(LOCK_PATH, UNLOCK_PATH, name)
+}
+
+fn clear_stale_at(lock: &str, unlock: &str, name: &str) -> bool {
+    if !held_at(lock, name) {
+        return false;
+    }
+    write_name(unlock, name).is_ok() && !held_at(lock, name)
+}
+
 /// 内核现在记不记得这个名字（路径可形参化，方便测）。
 pub fn held_at(lock_path: &str, name: &str) -> bool {
     std::fs::read_to_string(lock_path)
@@ -196,6 +211,16 @@ mod tests {
     fn a_nameless_lock_is_refused() {
         let (lock, unlock, dir) = fixtures();
         assert!(WakeLock::acquire_at(&lock, &unlock, "   ").is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // 「本来有一条、解掉了」那一半只能在真内核上验（测试里没有会把名字从 lock
+    // 文件里抹掉的内核）。这里只管住没锁的时候不去乱写。
+    #[test]
+    fn clearing_a_lock_that_is_not_held_writes_nothing() {
+        let (lock, unlock, dir) = fixtures();
+        assert!(!clear_stale_at(&lock, &unlock, "ommega_test"));
+        assert_eq!(std::fs::read_to_string(&unlock).unwrap(), "");
         std::fs::remove_dir_all(dir).ok();
     }
 }

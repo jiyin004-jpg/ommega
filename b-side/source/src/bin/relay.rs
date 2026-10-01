@@ -31,7 +31,7 @@
 //!   OMMEGA_RELAY_LOGCAT_LEVEL   logcat level: off|error|warn|info|debug|trace (default info)
 //!   OMMEGA_RELAY_BIND_IFACE    outgoing interface: none|auto|always|<ifname> (default none)
 //!   OMMEGA_RELAY_PATH_PROBE    probe /api/ping/ before each long poll (default true)
-//!   OMMEGA_RELAY_WAKELOCK      hold a wake lock so the system never suspends (default false)
+//!   OMMEGA_RELAY_WAKELOCK      hold a wake lock so the system never suspends (default true)
 //!
 //! Logging is read *before* the rest of the config is validated, so a broken
 //! `relay.conf` still honours its log settings while reporting the error.
@@ -181,7 +181,9 @@ struct RelayConfig {
     /// 重试反而能挤进设备醒着的那几个窗口。
     path_probe: bool,
     /// 拿一把 wakelock 按住系统，别让它 suspend。开着的时候这个进程（以及整台机器）
-    /// 不会睡，代价是耗电 —— 专机、插着电的部署再开。见 `ommegaclient_b::wakelock`。
+    /// 不会睡。**默认开** —— 灭屏掉线就是这么来的，默认把它按住才对；想要省电、
+    /// 允许它睡（靠看门狗在醒过来之后救）就设成 false。
+    /// 内核没这个接口时安静跳过，不算错。见 `ommegaclient_b::wakelock`。
     wakelock: bool,
 }
 
@@ -292,7 +294,8 @@ fn load_config_from_file() -> Result<RelayConfig> {
         .unwrap_or(true);
     let wakelock = m
         .get("OMMEGA_RELAY_WAKELOCK")
-        .is_some_and(|v| parse_bool(v));
+        .map(|v| parse_bool(v))
+        .unwrap_or(true);
     let server = server.trim_end_matches('/').to_string();
     Ok(RelayConfig {
         server,
@@ -402,7 +405,9 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
     let path_probe = env("OMMEGA_RELAY_PATH_PROBE")
         .map(|v| parse_bool(&v))
         .unwrap_or(true);
-    let wakelock = env("OMMEGA_RELAY_WAKELOCK").is_some_and(|v| parse_bool(&v));
+    let wakelock = env("OMMEGA_RELAY_WAKELOCK")
+        .map(|v| parse_bool(&v))
+        .unwrap_or(true);
     let server = server.trim_end_matches('/').to_string();
     let cfg = RelayConfig {
         server,
@@ -1232,19 +1237,20 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
 
 /// 拿住 wakelock，让系统别 suspend。
 ///
-/// 拿不到不算致命：没开 `CONFIG_PM_WAKELOCKS` 的内核根本没这个文件，那种机型上
-/// relay 就只能继续靠看门狗等醒过来。但要留一条明确日志，不能让「没按住」无声无息。
+/// 默认开。拿不到就安静跳过：没开 `CONFIG_PM_WAKELOCKS` 的内核根本没这个文件，
+/// 那种机型上 relay 就只能继续靠看门狗等醒过来 —— 少个能力，不是个错误，
+/// 不该每次都哀一声。
 fn hold_wakelock() -> Option<wakelock::WakeLock> {
     let name = wakelock::DEFAULT_NAME;
     let wl = match wakelock::WakeLock::acquire(name) {
         Ok(wl) => wl,
         Err(e) => {
-            log::warn!("拿 wakelock 失败（{e}），系统该睡还是会睡");
+            log::debug!("拿 wakelock 不成（{e}），这台机器只能继续靠看门狗");
             return None;
         }
     };
     if !wl.held_now() {
-        log::warn!("写了 wakelock 但内核那边没记上（{name}），当做没拿住");
+        log::debug!("写了 wakelock 但内核那边没记上（{name}），当做没拿住");
         return None;
     }
     log::info!("wakelock {name} 已拿住，系统不会进 suspend");
@@ -1264,13 +1270,13 @@ fn spawn_wakelock_keeper(name: String) {
                 continue;
             }
             if wakelock::reacquire(&name) {
-                log::warn!("wakelock {name} 掉了，已经补回去");
+                log::info!("wakelock {name} 掉了，已经补回去");
                 failed = 0;
             } else {
                 failed += 1;
-                log::warn!("wakelock {name} 掉了而且补不回去（第 {failed} 次）");
+                log::debug!("wakelock {name} 掉了而且补不回去（第 {failed} 次）");
                 if failed >= 3 {
-                    log::warn!("wakelock {name} 补不回去，停止自检；系统会重新开始 suspend");
+                    log::debug!("wakelock {name} 补不回去，停止自检");
                     return;
                 }
             }
@@ -1292,9 +1298,16 @@ fn main() {
     let shared: Arc<RwLock<RelayConfig>> = Arc::new(RwLock::new(cfg));
     // 先把系统按住再干活：醒着的时候才轮得到我们轮询。拿住之后这个变量要一直活着
     // （所以是带名字的绑定，不是 `let _ =`），到进程结束才会 Drop 释放。
-    let _wakelock = if shared.read().map(|c| c.wakelock).unwrap_or(false) {
+    let _wakelock = if shared.read().map(|c| c.wakelock).unwrap_or(true) {
         hold_wakelock()
     } else {
+        // 关掉的时候得把上一任留下的锁解掉，否则配置里写 false 等于没写。
+        if wakelock::clear_stale(wakelock::DEFAULT_NAME) {
+            log::info!(
+                "wakelock 关着，顺手把上次留下的 {} 解了",
+                wakelock::DEFAULT_NAME
+            );
+        }
         None
     };
     let last_mtime = file_mtime(CONF_PATH).unwrap_or(0);
@@ -1312,7 +1325,7 @@ fn main() {
             soter_probe: None,
             bind_iface: "none".to_string(),
             path_probe: true,
-            wakelock: false,
+            wakelock: true,
         });
         log::info!(
             "relay daemon starting (config from {source}) server={} device={} machine={}",
