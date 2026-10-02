@@ -103,7 +103,7 @@ ommega/
   B 端 arm64-v8a / x86_64），安装时由模块的 `customize.sh` 检查设备架构并释放对应的
   `libs/<abi>/` 二进制；运行时守护脚本也按 `ro.product.cpu.abi` 选二进制，不靠目录顺序。
   用 `--abi <name>` 可只把指定 ABI 打进包里（仍是单包，可重复传），`--split` 才会每个 ABI 各出一个 zip。
-- B 端 App：在 `b-app/source` 下执行 Gradle 构建生成 APK
+- B 端 App：在 `b-app/source` 下执行 `./gradlew :app:assembleRelease` 生成 APK（Windows 上用 `gradlew.bat`）
 
 构建完成后把 zip / APK / 服务端二进制作为 Release 附件上传即可，不需要提交进仓库。
 
