@@ -98,10 +98,6 @@
 - For injector or detector investigations, start from injector-visible routing, state, and fresh
   scooped/plain runtime evidence. Use `refs/keymint` and `refs/keystore2` as final contract checks,
   not as a reason for speculative production rewrites.
-- For every substantial change, check whether any documentation under `docs/` describes the
-  affected behavior and update it when needed.
-- Documentation under `docs/` must describe only the latest behavior. Never mix in previous
-  behavior, migration history, fixed-issue narratives, or comparisons with older releases.
 - When `config.rs` changes the `injector.toml` or `config.toml` schema, defaults, accepted values, or
   runtime semantics, keep `template` in sync.
 
