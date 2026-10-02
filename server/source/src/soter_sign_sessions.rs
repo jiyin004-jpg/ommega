@@ -10,10 +10,16 @@
 //! 设备占用内重开会话，签同一个 challenge。租约外的过期 finish 不再补签，以免顶掉
 //! 新流程；成功补签与原流程使用同一把钥匙、同一个挑战。
 //!
-//! 实际设备现在由租约串行化：init 前占位，成功后 session TTL 60 秒；
-//! finish 原子消费 requested+session，并在同一 guard 下补签。争用异步等待最多
-//! 3 秒（计入原网络 deadline），busy 回 -9。未知已派发结果隔离 60 秒；
-//! 活跃 await 的 guard 不因 TTL 被替换。HTTP 取消不能撤回已经进入 HAL 的操作。
+//! 实际设备由租约串行化：init 前占位，成功后 session TTL 60 秒；finish 原子消费
+//! requested+session，并在同一 guard 下补签。未知已派发结果隔离 60 秒；活跃 await
+//! 的 guard 不因 TTL 被替换。HTTP 取消不能撤回已经进入 HAL 的操作。
+//!
+//! 租约只在「HAL 上有操作在飞」或者「正在收尾」的时候真挡人；`init_sign` 成功之后
+//! 搁着等 `finish_sign` 的那种，下一笔可以直接接管。2026-10-02 的线上回归就出在这里：
+//! 只 init 不 finish 的流程（B 端自检、第三方的能力探针）把租约空挂满 60 秒，真实用户
+//! `init_sign` 等 3 秒抢不到就吃到 -9（`IS_AUTHING`），A 端连指纹圈都弹不出来。
+//! 现在抢不到不再硬拒，退成不带租约执行，被顶掉的会话仍走 -204 补救 —— 也就是 1.6.3
+//! 的性质，把租约只当成优化。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +33,14 @@ const STASH_TTL: Duration = Duration::from_secs(900);
 
 /// 最多记多少条，挡住异常增长（正常随 `finish_sign` 清掉）。
 const MAX_ENTRIES: usize = 8192;
+
+/// 抢设备租约最多等多久。还要被调用方自己的网络 deadline 卡着，取小的那个。
+const ACQUIRE_WAIT: Duration = Duration::from_secs(3);
+
+/// `init_sign` 成功之后，租约替这笔流程把会话留多久等 `finish_sign`。等用户按指纹是
+/// 几十秒量级，所以留够。它是上限而不是保守期限：停在这儿等 finish 的租约下一笔 init
+/// 可以直接接管（见 [`SignSessions::acquire`]）。
+const LEASE_HOLD: Duration = Duration::from_secs(60);
 
 /// 补救需要的东西：重开一张会话得用同样的 uid、别名和挑战。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +90,16 @@ pub struct SignLease {
     dispatched: bool,
 }
 
+/// 收尾时没拿到租约的原因。调用方靠它决定是硬拒还是退成不带租约执行。
+#[derive(Debug, PartialEq, Eq)]
+pub enum LeaseMiss {
+    /// 租约不是这一笔的：会话被顶掉、被接管，或者早就过期了。不该硬拒 ——
+    /// 送设备去让它自己回 -204，补救路径能接住。
+    NotOurs,
+    /// 同一笔 finish 已经在收尾了。这种才是真该拒的，免得同一张会话签两遍。
+    Busy,
+}
+
 impl SignLease {
     pub fn dispatch(&mut self) {
         self.dispatched = true;
@@ -93,7 +117,7 @@ impl SignLease {
         }
         lease.session = Some(session);
         lease.inflight = false;
-        lease.deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        lease.deadline = tokio::time::Instant::now() + LEASE_HOLD;
         self.retained = true;
         true
     }
@@ -112,7 +136,7 @@ impl Drop for SignLease {
                 let lease = leases.get_mut(&self.device).unwrap();
                 lease.inflight = false;
                 lease.session = None;
-                lease.deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                lease.deadline = tokio::time::Instant::now() + LEASE_HOLD;
             } else {
                 leases.remove(&self.device);
             }
@@ -133,23 +157,45 @@ impl SignSessions {
         }
     }
 
-    /// Reserve only the already-resolved physical device. Polling is async and
-    /// bounded by both three seconds and the caller's original network deadline.
+    /// 占住已经解析好的那台物理设备。
+    ///
+    /// 空位直接占；`init_sign` 成功、搁在那儿等 `finish_sign` 的租约也可以接管 ——
+    /// 只 init 不 finish 的流程本来就不会来收尾，让它把设备空挂满 [`LEASE_HOLD`] 正是
+    /// 2026-10-02 那次线上回归的直接原因。被接管的那一笔如果之后真来 finish，会走
+    /// [`LeaseMiss::NotOurs`] 退成不带租约执行，再靠 -204 补救。
+    ///
+    /// 派发过但结果不明的那种（quarantine，`session` 已经清掉）不碰：设备上可能真的
+    /// 还有一笔在跑。等待是异步的，同时被 [`ACQUIRE_WAIT`] 和调用方原来的网络 deadline
+    /// 卡着。
     pub async fn acquire(
         self: &Arc<Self>,
         device: &str,
         requested: &str,
         deadline: tokio::time::Instant,
     ) -> Option<SignLease> {
-        let wait_until = deadline.min(tokio::time::Instant::now() + Duration::from_secs(3));
+        let wait_until = deadline.min(tokio::time::Instant::now() + ACQUIRE_WAIT);
         loop {
             {
                 let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
                 let now = tokio::time::Instant::now();
                 leases.retain(|_, l| l.inflight || l.deadline > now);
-                if !leases.contains_key(device) && now < deadline {
+                let free = match leases.get(device) {
+                    None => true,
+                    Some(l) if l.session.is_some() && !l.inflight && !l.finishing => {
+                        tracing::warn!(
+                            "soter: {} 上的签名租约空挂等 finish（session={:?}，原请求 {}），交给 {} 接管",
+                            device,
+                            l.session,
+                            l.requested,
+                            requested
+                        );
+                        true
+                    }
+                    Some(_) => false,
+                };
+                if free && now < deadline {
                     let id = uuid::Uuid::new_v4();
-                    let expires = now + Duration::from_secs(60);
+                    let expires = now + LEASE_HOLD;
                     leases.insert(
                         device.to_owned(),
                         Lease {
@@ -181,27 +227,35 @@ impl SignSessions {
         }
     }
 
-    /// Atomically consume this flow; duplicate or expired finishes never send HAL work.
+    /// 原子消费这一笔；重复或者过期的 finish 不该真下发 HAL 工作。
+    ///
+    /// 没拿到的原因分两种（见 [`LeaseMiss`]）：同一笔正在收尾才是真拒，租约不是这一笔
+    /// 的退成不带租约执行，别把用户挡在门外。
     pub fn finish(
         self: &Arc<Self>,
         device: &str,
         requested: &str,
         session: i64,
         deadline: tokio::time::Instant,
-    ) -> Option<SignLease> {
+    ) -> Result<SignLease, LeaseMiss> {
         let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
-        let lease = leases.get_mut(device)?;
-        if lease.deadline <= tokio::time::Instant::now()
-            || deadline <= tokio::time::Instant::now()
+        let now = tokio::time::Instant::now();
+        let Some(lease) = leases.get_mut(device) else {
+            return Err(LeaseMiss::NotOurs);
+        };
+        if lease.finishing {
+            return Err(LeaseMiss::Busy);
+        }
+        if lease.deadline <= now
+            || deadline <= now
             || lease.requested != requested
             || lease.session != Some(session)
-            || lease.finishing
         {
-            return None;
+            return Err(LeaseMiss::NotOurs);
         }
         lease.finishing = true;
         lease.inflight = true;
-        Some(SignLease {
+        Ok(SignLease {
             owner: self.clone(),
             device: device.to_owned(),
             id: lease.id,
@@ -387,29 +441,50 @@ mod tests {
         assert!(first.retain_session(42));
         drop(first);
         let other = s.acquire("b", "caller", deadline).await.unwrap();
+        // 原来这一笔停在「等 finish」上，谁也别想进来；现在可以接管 —— 只 init
+        // 不 finish 的探针流程就卡在这个状态，不能让它把设备空挂满。
+        let mut takeover = s.acquire("a", "second", deadline).await.unwrap();
+        takeover.dispatch();
+        assert!(takeover.retain_session(42));
+        // 被接管的那一笔来收尾：租约不是它的了，退成不带租约执行，不硬拒。
+        assert!(matches!(
+            s.finish("a", "wrong", 42, deadline),
+            Err(LeaseMiss::NotOurs)
+        ));
+        assert!(matches!(
+            s.finish("a", "caller", 42, deadline),
+            Err(LeaseMiss::NotOurs)
+        ));
+        let mut finish = s.finish("a", "second", 42, deadline).unwrap();
+        // 同一笔重复收尾才是真该拒的。
+        assert!(matches!(
+            s.finish("a", "second", 42, deadline),
+            Err(LeaseMiss::Busy)
+        ));
         let waiting = {
             let s = s.clone();
-            tokio::spawn(async move { s.acquire("a", "second", deadline).await })
+            tokio::spawn(async move { s.acquire("a", "third", deadline).await })
         };
         tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-        assert!(s.finish("a", "wrong", 42, deadline).is_none());
-        let mut finish = s.finish("a", "caller", 42, deadline).unwrap();
+        assert!(!waiting.is_finished()); // 收尾在飞，别人得等
         finish.dispatch(); // original finish + repair init/finish share this guard
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(waiting.await.unwrap().is_none());
-        assert!(s.finish("a", "caller", 42, deadline).is_none());
         finish.completed();
         drop(finish);
+        drop(takeover);
         let next = s
             .acquire(
                 "a",
-                "second",
+                "third",
                 tokio::time::Instant::now() + Duration::from_secs(1),
             )
             .await
             .unwrap();
-        assert!(s.finish("a", "caller", 42, deadline).is_none());
+        assert!(matches!(
+            s.finish("a", "caller", 42, deadline),
+            Err(LeaseMiss::NotOurs)
+        ));
         drop(next);
         drop(other);
     }
@@ -431,31 +506,52 @@ mod tests {
         assert!(guard.retain_session(43));
         drop(guard);
         tokio::time::advance(Duration::from_secs(60)).await;
-        assert!(s.finish("a", "two", 43, deadline).is_none());
+        assert!(s.finish("a", "two", 43, deadline).is_err());
         assert!(s.acquire("a", "three", deadline).await.is_some());
     }
 
+    /// 停在原地等 finish 的租约不挡人；真有一笔在飞的时候才挡。
+    ///
+    /// 2026-10-02 的线上回归就出在前半句：探针只 init 不 finish，把这个状态空挂了
+    /// 60 秒，真实用户的 init 抢不到租约、A 端连指纹圈都弹不出来。
     #[tokio::test(start_paused = true)]
-    async fn waiting_init_starts_only_after_finish_releases_device() {
+    async fn only_inflight_work_holds_the_device() {
         let s = Arc::new(SignSessions::new());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut init = s.acquire("a", "first", deadline).await.unwrap();
         assert!(init.retain_session(7));
         drop(init);
+        // 等 finish 的租约可以接管。
+        let mut next = s.acquire("a", "second", deadline).await.unwrap();
+        next.dispatch();
+        assert!(next.retain_session(7));
+        // 被接管的那一笔来收尾，租约已经不是它的了。
+        assert!(matches!(
+            s.finish("a", "first", 7, deadline),
+            Err(LeaseMiss::NotOurs)
+        ));
+        // 接管者自己收尾配得上；收尾期间别人得等。
+        let mut finish = s.finish("a", "second", 7, deadline).unwrap();
         let waiter = {
             let s = s.clone();
-            tokio::spawn(async move { s.acquire("a", "second", deadline).await })
+            tokio::spawn(async move { s.acquire("a", "third", deadline).await })
         };
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
-        let finish = s.finish("a", "first", 7, deadline).unwrap();
-        tokio::time::advance(Duration::from_millis(20)).await;
-        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(waiter.await.unwrap().is_none());
+        finish.dispatch();
+        finish.completed();
         drop(finish);
-        tokio::time::advance(Duration::from_millis(20)).await;
-        let next = waiter.await.unwrap().unwrap();
-        assert!(s.finish("a", "first", 7, deadline).is_none());
         drop(next);
+        assert!(s
+            .acquire(
+                "a",
+                "third",
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -494,8 +590,8 @@ mod tests {
         drop(init);
         assert!(s
             .finish("a", "first", 7, tokio::time::Instant::now())
-            .is_none());
-        assert!(s.finish("a", "first", 7, deadline).is_some());
+            .is_err());
+        assert!(s.finish("a", "first", 7, deadline).is_ok());
     }
 
     fn sessions() -> SignSessions {

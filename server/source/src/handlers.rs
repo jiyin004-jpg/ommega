@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::fulfill::Fulfill;
 use crate::queue::TaskStore;
+use crate::soter_sign_sessions::LeaseMiss;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1342,15 +1343,43 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                 let mut lease = if needs_sign {
                     match b_target.as_deref() {
                         Some(device) if op == "init_sign" => {
-                            match state.sign_sessions.acquire(device, requested, request_deadline).await {
-                                Some(lease) => Some(lease),
-                                None => return Json(json!({"error_code": -9, "relay_error_kind": "soter_busy", "retryable": true})).into_response(),
+                            // 抢不到租约不再直接回 -9：那会让 A 端连指纹圈都弹不出来
+                            // （2026-10-02 线上回归）。退成不带租约执行，让 TA 自己顶掉
+                            // 旧会话，收尾交给 -204 补救路径，性质跟 1.6.3 一致。
+                            let lease = state
+                                .sign_sessions
+                                .acquire(device, requested, request_deadline)
+                                .await;
+                            if lease.is_none() {
+                                tracing::warn!(
+                                    "soter: 设备 {} 的签名租约没抢到，请求 {} 这单不带租约执行",
+                                    device,
+                                    requested
+                                );
                             }
+                            lease
                         }
                         Some(device) => {
-                            match body.get("session").and_then(Value::as_i64).and_then(|s| state.sign_sessions.finish(device, requested, s, request_deadline)) {
-                                Some(lease) => Some(lease),
-                                None => return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response(),
+                            // 租约不是这一笔的（会话被顶掉 / 被接管 / 早过期了）也照旧送
+                            // 设备，让它自己回 -204，再由补救路径重开补签；只有同一笔
+                            // finish 已经在收尾时才真拒，免得同一张会话签两遍。
+                            let miss = body
+                                .get("session")
+                                .and_then(Value::as_i64)
+                                .map(|s| state.sign_sessions.finish(device, requested, s, request_deadline));
+                            match miss {
+                                Some(Ok(lease)) => Some(lease),
+                                Some(Err(LeaseMiss::Busy)) => {
+                                    return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response();
+                                }
+                                Some(Err(LeaseMiss::NotOurs)) | None => {
+                                    tracing::warn!(
+                                        "soter: finish 没配上 {} 上属于 {} 的活跃租约，照旧送设备等它自己回 -204",
+                                        device,
+                                        requested
+                                    );
+                                    None
+                                }
                             }
                         }
                         None if op == "finish_sign" => return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response(),
