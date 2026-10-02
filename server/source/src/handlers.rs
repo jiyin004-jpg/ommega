@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,20 +153,25 @@ async fn enqueue_and_wait(
     target: &str,
     timeout_secs: u64,
 ) -> Value {
+    let cancel_token = Arc::new(AtomicBool::new(false));
     let task_id = state
         .store
-        .create_task(task_type, body.clone(), target)
+        .create_task_with_cancel_token(task_type, body.clone(), target, cancel_token.clone())
         .await;
-    // Dropping an HTTP future must also remove its queued SOTER work so it
-    // cannot be reclaimed/dispatched after the device lease was released.
+    // Dropping an HTTP future cancels pending SOTER work; assigned mutations
+    // retain a terminal unknown outcome rather than being removed/replayed.
     let mut cancel = (task_type == "soter").then(|| CancelSoterTask {
         store: state.store.clone(),
         task_id: task_id.clone(),
+        token: cancel_token,
         armed: true,
     });
     let timeout = Duration::from_secs(timeout_secs);
     match state.store.wait_for_result(&task_id, timeout).await {
         Some(mut result) => {
+            if task_type != "soter" {
+                TaskStore::take_result_assigned_device(&mut result);
+            }
             if let Some(cancel) = cancel.as_mut() {
                 cancel.armed = false;
             }
@@ -184,6 +190,7 @@ async fn enqueue_and_wait(
 struct CancelSoterTask {
     store: Arc<TaskStore>,
     task_id: String,
+    token: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -192,6 +199,7 @@ impl Drop for CancelSoterTask {
         if !self.armed {
             return;
         }
+        self.token.store(true, Ordering::Release);
         let store = self.store.clone();
         let task_id = self.task_id.clone();
         tokio::spawn(async move {
@@ -1006,7 +1014,14 @@ async fn repair_once(
     let init = try_b_soter_layer(state, &init_body, requested, target)
         .await
         .ok_or(())?;
-    repair_reply_known(&init.value, init.device.as_deref(), target)?;
+    repair_reply_known(
+        init.hardware_reply.as_ref().unwrap_or(&init.value),
+        init.device.as_deref(),
+        target,
+    )?;
+    if let Some(reply) = init.hardware_reply {
+        return Ok(Some(reply));
+    }
     let init_code = init.value.get("error_code").and_then(Value::as_i64);
     if init_code != Some(0) {
         return Ok(None);
@@ -1028,7 +1043,14 @@ async fn repair_once(
     let done = try_b_soter_layer(state, &fin_body, requested, init.device.as_deref())
         .await
         .ok_or(())?;
-    repair_reply_known(&done.value, done.device.as_deref(), init.device.as_deref())?;
+    repair_reply_known(
+        done.hardware_reply.as_ref().unwrap_or(&done.value),
+        done.device.as_deref(),
+        init.device.as_deref(),
+    )?;
+    if let Some(reply) = done.hardware_reply {
+        return Ok(Some(reply));
+    }
     let code = done.value.get("error_code").and_then(Value::as_i64);
     if code != Some(0) || done.device != init.device {
         tracing::warn!("soter: 补签的 finish 也失败了（error_code={code:?}）");
@@ -1326,7 +1348,7 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                             }
                         }
                         Some(device) => {
-                            match body.get("session").and_then(Value::as_i64).and_then(|s| state.sign_sessions.finish(device, requested, s)) {
+                            match body.get("session").and_then(Value::as_i64).and_then(|s| state.sign_sessions.finish(device, requested, s, request_deadline)) {
                                 Some(lease) => Some(lease),
                                 None => return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response(),
                             }
@@ -1347,6 +1369,9 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                     }
                     match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
                         Some(mut b) => {
+                            if b.mutation_outcome_unknown(op, b_target.as_deref()) {
+                                return Some(soter_unknown_reply());
+                            }
                             if needs_sign
                                 && b.device.as_deref() == b_target.as_deref()
                                 && b.value.get("error_code").and_then(Value::as_i64) == Some(-9)
@@ -1388,11 +1413,7 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                                 {
                                     Ok(Some(fixed)) => b.value = fixed,
                                     Ok(None) => {}
-                                    Err(()) => {
-                                        return Some(
-                                            json!({"error_code": -204, "relay_error_kind": "soter_dispatch_unknown", "retryable": true}),
-                                        )
-                                    }
+                                    Err(()) => return Some(soter_unknown_reply()),
                                 }
                             }
                             if op == "finish_sign" {
@@ -1403,14 +1424,21 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                                     state.sign_sessions.forget_for(device, requested, session);
                                 }
                             }
-                            if b.value.get("error").is_none() {
+                            if b.completed_on(b_target.as_deref()) || b.definitely_not_dispatched()
+                            {
                                 if let Some(guard) = lease.as_mut() {
                                     guard.completed();
                                 }
+                                // Structural HAL failures are wrapped for init fallback,
+                                // but finish must stay on its session's owner layer and
+                                // return the device's actual code, not an unknown verdict.
+                                if op == "finish_sign" {
+                                    if let Some(reply) = b.hardware_reply.take() {
+                                        b.value = reply;
+                                    }
+                                }
                             } else if needs_sign {
-                                return Some(
-                                    json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_dispatch_unknown", "retryable": true}),
-                                );
+                                return Some(soter_unknown_reply());
                             }
                             if op == "init_sign"
                                 && b.value.get("error_code").and_then(Value::as_i64) == Some(0)
@@ -1434,6 +1462,9 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                 };
                 match tokio::time::timeout_at(deadline, work).await {
                     Ok(result) => result,
+                    Err(_) if crate::queue::soter_op_is_mutation(op) => {
+                        return Json(soter_unknown_reply()).into_response();
+                    }
                     Err(_) => return Json(json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_deadline"})).into_response(),
                 }
             }
@@ -1441,6 +1472,9 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
             _ => None,
         };
         match result {
+            Some(v) if v.get("soter_outcome_unknown").and_then(Value::as_bool) == Some(true) => {
+                return Json(v).into_response();
+            }
             Some(mut v)
                 if layer == "b" && v.get("error_code").and_then(Value::as_i64) == Some(-9) =>
             {
@@ -1577,7 +1611,7 @@ async fn try_b_soter_layer(
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
         );
     }
-    let reply = enqueue_and_wait(
+    let mut reply = enqueue_and_wait(
         state,
         "soter",
         body,
@@ -1585,14 +1619,9 @@ async fn try_b_soter_layer(
         state.cfg.soter_wait_result_timeout_secs,
     )
     .await;
-    // Result device_id can be the TA's get_device_id output; use the dispatch
-    // metadata instead. Query only this task: never scan the full task table on
-    // the hot SOTER completion path.
-    let device = (match reply.get("task_id").and_then(Value::as_str) {
-        Some(task_id) => state.store.assigned_device_for_task(task_id).await,
-        None => None,
-    })
-    .filter(|d| !d.is_empty());
+    // Consume immutable dispatch metadata embedded in the result; the task
+    // table may already have been pruned. Never expose relay metadata to apps.
+    let device = TaskStore::take_result_assigned_device(&mut reply).filter(|d| !d.is_empty());
     if reply.get("error").is_none() && device.as_deref() != Some(target) {
         return Some(BSoterLayer {
             value: json!({"error": "SOTER completion device mismatch", "error_code": -204}),
@@ -1640,6 +1669,57 @@ struct BSoterLayer {
     /// 槽位的时候要把它还给 App —— 该让人看见的是「这台设备真实出了什么毛病」，
     /// 而不是「这把钥匙不在这层」的 -5。
     hardware_reply: Option<Value>,
+}
+
+fn soter_unknown_reply() -> Value {
+    json!({
+        "error": "SOTER mutation outcome unknown; refusing fallback",
+        "error_code": -1000,
+        "relay_error_kind": "soter_outcome_unknown",
+        "soter_outcome_unknown": true
+    })
+}
+
+impl BSoterLayer {
+    fn mutation_outcome_unknown(&self, op: &str, target: Option<&str>) -> bool {
+        crate::queue::soter_op_is_mutation(op)
+            && (self
+                .value
+                .get("soter_outcome_unknown")
+                .and_then(Value::as_bool)
+                == Some(true)
+                || matches!(
+                    self.value.get("relay_error_kind").and_then(Value::as_str),
+                    Some("soter_outcome_unknown" | "soter_dispatch_unknown")
+                )
+                || !(self.completed_on(target)
+                    || self.definitely_not_dispatched()
+                    || self.unavailable && target.is_none()))
+    }
+
+    fn definitely_not_dispatched(&self) -> bool {
+        self.device.is_none() && soter_relay_marks_unavailable(&self.value)
+    }
+
+    /// An error wrapper is not evidence of an unknown HAL result when it
+    /// preserves the definite hardware reply from the reserved device.
+    fn completed_on(&self, target: Option<&str>) -> bool {
+        self.device.as_deref() == target
+            && target.is_some()
+            && self
+                .hardware_reply
+                .as_ref()
+                .unwrap_or(&self.value)
+                .get("error")
+                .is_none()
+            && self
+                .hardware_reply
+                .as_ref()
+                .unwrap_or(&self.value)
+                .get("error_code")
+                .and_then(Value::as_i64)
+                .is_some()
+    }
 }
 
 /// 这一轮下来该把 `(device, uid)` 槽位钉在哪一层（`None` = 别碰钉子）。
@@ -2168,11 +2248,92 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod soter_device_layer_tests {
-    use super::{soter_device_hard_failure, soter_error_name, soter_relay_marks_unavailable};
+    use super::{
+        soter_device_hard_failure, soter_error_name, soter_relay_marks_unavailable, BSoterLayer,
+    };
+
+    #[test]
+    fn mutation_unknown_results_stop_fallback_but_definite_failures_do_not() {
+        for op in [
+            "generate_ask_key_pair",
+            "generate_attk_key_pair",
+            "generate_auth_key_pair",
+            "remove_auth_key",
+            "remove_all_uid_key",
+            "init_sign",
+            "finish_sign",
+        ] {
+            let mut result = BSoterLayer {
+                value: json!({"error": "network timeout"}),
+                device: None,
+                unavailable: false,
+                hardware_reply: None,
+            };
+            assert!(result.mutation_outcome_unknown(op, Some("a")));
+            result.value = json!({});
+            result.device = Some("a".into());
+            assert!(result.mutation_outcome_unknown(op, Some("a")));
+            result.value = json!({"error_code": 0, "soter_outcome_unknown": true});
+            assert!(result.mutation_outcome_unknown(op, Some("a")));
+            result.value = json!({"error_code": -26});
+            assert!(!result.mutation_outcome_unknown(op, Some("a")));
+            assert!(result.mutation_outcome_unknown(op, Some("other")));
+            result.value = json!({"error": "structural failure"});
+            result.hardware_reply = Some(json!({"error_code": -12}));
+            assert!(!result.mutation_outcome_unknown(op, Some("a")));
+            result.hardware_reply = None;
+            result.device = None;
+            result.value = json!({"error": "unsupported", "relay_error_kind": "soter_unsupported"});
+            assert!(!result.mutation_outcome_unknown(op, Some("a")));
+            result.value = json!({"error": "no device online"});
+            result.unavailable = true;
+            assert!(!result.mutation_outcome_unknown(op, None));
+        }
+        assert_eq!(super::soter_unknown_reply()["error_code"], -1000);
+    }
+
+    #[test]
+    fn structural_wrappers_are_known_only_on_the_reserved_device() {
+        for code in [-12, -13, -18] {
+            let mut result = BSoterLayer {
+                value: json!({"error": "structural HAL failure"}),
+                device: Some("a".into()),
+                unavailable: true,
+                hardware_reply: Some(json!({"error_code": code})),
+            };
+            assert!(result.completed_on(Some("a")));
+            assert!(!result.completed_on(Some("b")));
+            assert!(!result.completed_on(None));
+            result.hardware_reply = None;
+            assert!(!result.completed_on(Some("a")));
+            result.value = json!({"error_code": -26});
+            assert!(result.completed_on(Some("a")));
+            result.value = json!({"error": "task timeout"});
+            assert!(!result.completed_on(Some("a")));
+        }
+    }
     use serde_json::json;
 
     #[test]
     fn queue_relay_capability_markers_are_unavailable_but_timeout_is_not() {
+        for kind in [
+            "soter_unsupported",
+            "soter_nosign",
+            "soter_outcome_unknown",
+            "timeout",
+        ] {
+            let reply = BSoterLayer {
+                value: json!({"error": "queue failure", "relay_error_kind": kind}),
+                device: None,
+                unavailable: true,
+                hardware_reply: None,
+            };
+            assert_eq!(
+                reply.definitely_not_dispatched(),
+                matches!(kind, "soter_unsupported" | "soter_nosign")
+            );
+            assert!(!reply.completed_on(Some("a")));
+        }
         assert!(soter_relay_marks_unavailable(&json!({
             "error": "SOTER unsupported",
             "relay_error_kind": "soter_unsupported",

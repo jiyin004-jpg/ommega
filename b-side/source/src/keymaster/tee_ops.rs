@@ -22,7 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -421,12 +421,73 @@ pub fn generate_attest_key(
     generate_attest_key_on(SYSTEM_KEYMINT_DEFAULT, alias, challenge, app_id_der, spec)
 }
 
+/// Serialize check -> generate -> publish per alias, never across HAL services
+/// or unrelated aliases. Weak entries keep completed flights from retaining locks.
+#[derive(Default)]
+struct AliasFlights {
+    locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl AliasFlights {
+    fn get_or_generate(
+        &self,
+        alias: &str,
+        existing: impl FnOnce() -> Option<TeeSession>,
+        generate: impl FnOnce() -> Result<TeeSession>,
+        publish: impl FnOnce(&TeeSession),
+    ) -> Result<TeeSession> {
+        let lock = {
+            let mut locks = self.locks.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(alias).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(alias.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _flight = lock.lock().unwrap();
+        if let Some(session) = existing() {
+            // Alias identifies a key, not a request. Even changed parameters or
+            // StrongBox -> TEE demotion must not replace a delivered private key.
+            // Older persisted sessions have no request fingerprint; reuse them
+            // too. A genuinely new key requires a new alias.
+            return Ok(session);
+        }
+        // Failure publishes nothing, permitting retries (including demotion).
+        let session = generate()?;
+        publish(&session);
+        Ok(session)
+    }
+}
+
 /// Same as [`generate_attest_key`] but drives a caller-chosen real KeyMint HAL
 /// service. Used to mint a StrongBox attestation via the B-side device's real
 /// `/strongbox` HAL when the A-side requested `security_level=StrongBox`.
 pub fn generate_attest_key_on(
     service: &'static str,
     alias: &str,
+    challenge: &[u8],
+    app_id_der: &[u8],
+    spec: &KeySpec,
+) -> Result<TeeSession> {
+    static FLIGHTS: OnceLock<AliasFlights> = OnceLock::new();
+    let session = FLIGHTS.get_or_init(AliasFlights::default).get_or_generate(
+        alias,
+        || session_get(alias).ok(),
+        || mint_attest_key_on(service, challenge, app_id_der, spec),
+        |session| session_put(alias, session.clone()),
+    )?;
+    if session.algorithm != spec.algorithm {
+        bail!("alias already belongs to a different key algorithm");
+    }
+    Ok(session)
+}
+
+fn mint_attest_key_on(
+    service: &'static str,
     challenge: &[u8],
     app_id_der: &[u8],
     spec: &KeySpec,
@@ -475,14 +536,12 @@ pub fn generate_attest_key_on(
         ));
     }
 
-    let session = TeeSession {
+    Ok(TeeSession {
         key_blob: result.keyBlob,
         cert_chain,
         algorithm: spec.algorithm,
         hal_service: service,
-    };
-    session_put(alias, session.clone());
-    Ok(session)
+    })
 }
 
 fn build_attestation_params(
@@ -700,11 +759,16 @@ pub fn get_cert_chain(alias: &str) -> Result<Vec<Vec<u8>>> {
 
 /// Returns the SubjectPublicKeyInfo (SPKI, DER) of the leaf certificate.
 pub fn get_public_key(alias: &str) -> Result<Vec<u8>> {
-    let session = session_get(alias)?;
+    public_key_from_session(&session_get(alias)?)
+}
+
+/// Extract SPKI from the exact session returned by generation, without another
+/// alias lookup that could decouple the response's chain and public key.
+pub fn public_key_from_session(session: &TeeSession) -> Result<Vec<u8>> {
     let leaf = session
         .cert_chain
         .first()
-        .ok_or_else(|| anyhow!("certificate chain empty for '{alias}'"))?;
+        .ok_or_else(|| anyhow!("certificate chain empty"))?;
     spki_from_cert_der(leaf)
 }
 
@@ -812,10 +876,19 @@ fn sign_begin_params(algorithm: &str, key_algorithm: KeyAlgorithm) -> Result<Vec
     let params = match key_algorithm {
         KeyAlgorithm::EcP256 => vec![KeyParam::Digest(digest)],
         KeyAlgorithm::Rsa2048 => {
-            let padding = if algorithm.ends_with("/PSS") || algorithm.contains("PSS") {
+            let up = algorithm.to_ascii_uppercase();
+            let padding = if up.ends_with("WITHRSA/NOPADDING") {
+                if digest != KmDigest::None {
+                    return Err(anyhow!("RSA NoPadding signing requires digest NONE"));
+                }
+                KmPadding::None
+            } else if up.contains("PSS") {
+                // Keep legacy PSS algorithm names accepted.
                 KmPadding::RsaPss
-            } else {
+            } else if up.ends_with("WITHRSA") {
                 KmPadding::RsaPkcs115Sign
+            } else {
+                return Err(anyhow!("unsupported RSA sign padding: {algorithm}"));
             };
             let mut p = vec![KeyParam::Digest(digest), KeyParam::Padding(padding)];
             if padding == KmPadding::RsaPss {
@@ -840,9 +913,10 @@ fn decrypt_begin_params(
             return Err(anyhow!("EC keys cannot be used for decrypt"));
         }
         KeyAlgorithm::Rsa2048 => {
-            if algorithm.to_ascii_uppercase().contains("OAEP") {
+            let up = algorithm.to_ascii_uppercase();
+            if up.starts_with("RSA/OAEP/") {
                 let digest = digest_for_algorithm(algorithm)?;
-                let mgf = mgf_digest_for_algorithm(algorithm);
+                let mgf = mgf_digest_for_algorithm(algorithm)?;
                 // OAEP requires both the digest and the MGF digest at
                 // begin(DECRYPT); a real TEE fails without them (A-side -1000
                 // / empty plaintext), and the MGF digest must match the one the
@@ -852,8 +926,12 @@ fn decrypt_begin_params(
                     KeyParam::Digest(digest),
                     KeyParam::RsaOaepMgfDigest(mgf),
                 ]
-            } else {
+            } else if up == "RSA/ECB/PKCS1PADDING" {
                 vec![KeyParam::Padding(KmPadding::RsaPkcs115Encrypt)]
+            } else if up == "RSA/ECB/NOPADDING" {
+                vec![KeyParam::Padding(KmPadding::None)]
+            } else {
+                return Err(anyhow!("unsupported RSA decrypt padding: {algorithm}"));
             }
         }
     };
@@ -864,23 +942,22 @@ fn decrypt_begin_params(
 /// Parses the MGF1 digest from an OAEP algorithm string like
 /// `RSA/OAEP/SHA-256/MGF1-SHA1`. Defaults to SHA1 (the standard OAEP default
 /// when no MGF1 is specified).
-fn mgf_digest_for_algorithm(algorithm: &str) -> KmDigest {
-    let up = algorithm.to_uppercase();
+fn mgf_digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
+    let up = algorithm.to_ascii_uppercase();
     if let Some(pos) = up.find("/MGF1-") {
-        let rest = up[pos + 6..].replace('-', "");
-        if rest.starts_with("SHA256") {
-            return KmDigest::Sha256;
-        }
-        if rest.starts_with("SHA384") {
-            return KmDigest::Sha384;
-        }
-        if rest.starts_with("SHA512") {
-            return KmDigest::Sha512;
-        }
-        // SHA1 or unknown -> SHA1
-        return KmDigest::Sha1;
+        return match up[pos + 6..].replace('-', "").as_str() {
+            "SHA1" => Ok(KmDigest::Sha1),
+            "SHA224" => Ok(KmDigest::Sha224),
+            "SHA256" => Ok(KmDigest::Sha256),
+            "SHA384" => Ok(KmDigest::Sha384),
+            "SHA512" => Ok(KmDigest::Sha512),
+            _ => Err(anyhow!("unsupported MGF digest algorithm: {algorithm}")),
+        };
     }
-    KmDigest::Sha1
+    if up.contains("/MGF") {
+        return Err(anyhow!("unsupported MGF algorithm: {algorithm}"));
+    }
+    Ok(KmDigest::Sha1)
 }
 
 fn digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
@@ -889,6 +966,10 @@ fn digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
     let up = up.split("/MGF1-").next().unwrap_or(&up);
     if up.contains("SHA256") || up.contains("SHA-256") {
         Ok(KmDigest::Sha256)
+    } else if up.contains("SHA224") || up.contains("SHA-224") {
+        Ok(KmDigest::Sha224)
+    } else if up.contains("MD5") {
+        Ok(KmDigest::Md5)
     } else if up.contains("SHA1") || up.contains("SHA-1") {
         Ok(KmDigest::Sha1)
     } else if up.contains("SHA384") || up.contains("SHA-384") {
@@ -905,8 +986,240 @@ fn digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
 }
 
 #[cfg(test)]
+mod alias_flight_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Barrier};
+    use std::thread;
+
+    #[derive(Default)]
+    struct Store {
+        flights: AliasFlights,
+        sessions: Mutex<HashMap<String, TeeSession>>,
+        generated: AtomicUsize,
+    }
+
+    impl Store {
+        fn request(
+            &self,
+            alias: &str,
+            generate: impl FnOnce() -> Result<TeeSession>,
+        ) -> Result<TeeSession> {
+            self.flights.get_or_generate(
+                alias,
+                || self.sessions.lock().unwrap().get(alias).cloned(),
+                || {
+                    self.generated.fetch_add(1, Ordering::SeqCst);
+                    generate()
+                },
+                |session| {
+                    self.sessions
+                        .lock()
+                        .unwrap()
+                        .insert(alias.to_string(), session.clone());
+                },
+            )
+        }
+    }
+
+    fn session(service: &'static str, id: u8) -> TeeSession {
+        TeeSession {
+            key_blob: vec![id],
+            cert_chain: vec![vec![id, id]],
+            algorithm: KeyAlgorithm::EcP256,
+            hal_service: service,
+        }
+    }
+
+    #[test]
+    fn concurrent_same_alias_reuses_actual_blob_and_chain() {
+        let store = Store::default();
+        let start = Barrier::new(8);
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|id| {
+                    let store = &store;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        store
+                            .request("same", || Ok(session(SYSTEM_KEYMINT_STRONGBOX, id)))
+                            .unwrap()
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            for result in &results {
+                assert_eq!(result.key_blob, results[0].key_blob);
+                assert_eq!(result.cert_chain, results[0].cert_chain);
+                assert_eq!(result.hal_service, SYSTEM_KEYMINT_STRONGBOX);
+            }
+        });
+        assert_eq!(store.generated.load(Ordering::SeqCst), 1);
+        // A changed/demoted request after success cannot overwrite the key.
+        let result = store
+            .request("same", || panic!("successful alias must not mint again"))
+            .unwrap();
+        assert_eq!(result.hal_service, SYSTEM_KEYMINT_STRONGBOX);
+    }
+
+    #[test]
+    fn failed_strongbox_can_retry_on_tee_but_success_is_fixed() {
+        let store = Store::default();
+        assert!(store
+            .request("retry", || Err(anyhow!("StrongBox unavailable")))
+            .is_err());
+        assert!(store.sessions.lock().unwrap().is_empty());
+        let retry = store
+            .request("retry", || Ok(session(SYSTEM_KEYMINT_DEFAULT, 42)))
+            .unwrap();
+        let repeat = store
+            .request("retry", || panic!("must reuse after success"))
+            .unwrap();
+        assert_eq!(repeat.key_blob, retry.key_blob);
+        assert_eq!(repeat.cert_chain, retry.cert_chain);
+        assert_eq!(repeat.hal_service, SYSTEM_KEYMINT_DEFAULT);
+        assert_eq!(store.generated.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn existing_session_is_reused_without_generation() {
+        let store = Store::default();
+        let persisted = session(SYSTEM_KEYMINT_DEFAULT, 7);
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("loaded".to_string(), persisted.clone());
+        let result = store
+            .request("loaded", || panic!("loaded session must be reused"))
+            .unwrap();
+        assert_eq!(result.key_blob, persisted.key_blob);
+        assert_eq!(result.cert_chain, persisted.cert_chain);
+        assert_eq!(store.generated.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn different_alias_can_finish_while_first_is_generating() {
+        let store = Store::default();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let store = &store;
+            scope.spawn(move || {
+                store
+                    .request("blocked", || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(session(SYSTEM_KEYMINT_DEFAULT, 1))
+                    })
+                    .unwrap();
+            });
+            entered_rx.recv().unwrap();
+            scope.spawn(move || {
+                let result = store
+                    .request("other", || Ok(session(SYSTEM_KEYMINT_DEFAULT, 2)))
+                    .unwrap();
+                done_tx.send(result).unwrap();
+            });
+            let result = done_rx.recv_timeout(Duration::from_secs(5));
+            // Always release the first worker, including on regression failure.
+            release_tx.send(()).unwrap();
+            assert_eq!(result.unwrap().key_blob, vec![2]);
+        });
+        assert_eq!(store.generated.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
 mod algorithm_digest_tests {
     use super::*;
+    use crate::android::hardware::security::keymint::{
+        Digest::Digest, KeyParameterValue::KeyParameterValue, PaddingMode::PaddingMode, Tag::Tag,
+    };
+
+    fn digest_param(tag: Tag, digest: KmDigest) -> KmKeyParameter {
+        KmKeyParameter {
+            tag,
+            value: KeyParameterValue::Digest(Digest(digest as i32)),
+        }
+    }
+
+    fn padding_param(padding: KmPadding) -> KmKeyParameter {
+        KmKeyParameter {
+            tag: Tag::PADDING,
+            value: KeyParameterValue::PaddingMode(PaddingMode(padding as i32)),
+        }
+    }
+
+    #[test]
+    fn decrypt_padding_is_explicit_and_unknown_is_rejected() {
+        for (algorithm, padding) in [
+            ("RSA/ECB/NoPadding", KmPadding::None),
+            ("RSA/ECB/PKCS1Padding", KmPadding::RsaPkcs115Encrypt),
+        ] {
+            assert_eq!(
+                decrypt_begin_params(algorithm, KeyAlgorithm::Rsa2048).unwrap(),
+                vec![padding_param(padding)]
+            );
+        }
+        for algorithm in ["RSA/ECB/UNKNOWN", "RSA/ECB/PKCS7Padding", "UNKNOWN"] {
+            assert!(decrypt_begin_params(algorithm, KeyAlgorithm::Rsa2048).is_err());
+        }
+        assert!(decrypt_begin_params("RSA/ECB/NoPadding", KeyAlgorithm::EcP256).is_err());
+    }
+
+    #[test]
+    fn signing_begin_parameters_preserve_raw_pkcs1_and_legacy_pss() {
+        for (algorithm, digest, padding) in [
+            ("NONEwithRSA/NoPadding", KmDigest::None, KmPadding::None),
+            ("NONEwithRSA", KmDigest::None, KmPadding::RsaPkcs115Sign),
+            ("SHA224withRSA", KmDigest::Sha224, KmPadding::RsaPkcs115Sign),
+            ("MD5withRSA", KmDigest::Md5, KmPadding::RsaPkcs115Sign),
+            ("SHA256withRSA/PSS", KmDigest::Sha256, KmPadding::RsaPss),
+            (
+                "SHA256withRSAandMGF1/PSS",
+                KmDigest::Sha256,
+                KmPadding::RsaPss,
+            ),
+        ] {
+            let mut expected = vec![digest_param(Tag::DIGEST, digest), padding_param(padding)];
+            if padding == KmPadding::RsaPss {
+                expected.push(digest_param(Tag::RSA_OAEP_MGF_DIGEST, digest));
+            }
+            assert_eq!(
+                sign_begin_params(algorithm, KeyAlgorithm::Rsa2048).unwrap(),
+                expected
+            );
+        }
+        assert!(sign_begin_params("SHA256withRSA/NoPadding", KeyAlgorithm::Rsa2048).is_err());
+        assert!(sign_begin_params("SHA256withRSA/UNKNOWN", KeyAlgorithm::Rsa2048).is_err());
+        assert_eq!(
+            sign_begin_params("SHA224withECDSA", KeyAlgorithm::EcP256).unwrap(),
+            vec![digest_param(Tag::DIGEST, KmDigest::Sha224)]
+        );
+    }
+
+    #[test]
+    fn oaep_begin_parameters_have_independent_digest_tags() {
+        assert_eq!(
+            decrypt_begin_params("RSA/OAEP/SHA-384/MGF1-SHA224", KeyAlgorithm::Rsa2048).unwrap(),
+            vec![
+                padding_param(KmPadding::RsaOaep),
+                digest_param(Tag::DIGEST, KmDigest::Sha384),
+                digest_param(Tag::RSA_OAEP_MGF_DIGEST, KmDigest::Sha224),
+            ]
+        );
+        for algorithm in [
+            "RSA/OAEP/SHA256/MGF1-UNKNOWN",
+            "RSA/OAEP/SHA256/MGF1-SHA256junk",
+            "RSA/OAEP/SHA256/MGF2-SHA1",
+        ] {
+            assert!(mgf_digest_for_algorithm(algorithm).is_err());
+            assert!(decrypt_begin_params(algorithm, KeyAlgorithm::Rsa2048).is_err());
+        }
+    }
 
     #[test]
     fn oaep_message_and_mgf_digests_are_independent() {
@@ -934,7 +1247,7 @@ mod algorithm_digest_tests {
             ("RSA/OAEP/SHA256", KmDigest::Sha256, KmDigest::Sha1),
         ] {
             assert_eq!(digest_for_algorithm(algorithm).unwrap(), message);
-            assert_eq!(mgf_digest_for_algorithm(algorithm), mgf);
+            assert_eq!(mgf_digest_for_algorithm(algorithm).unwrap(), mgf);
         }
         assert!(digest_for_algorithm("RSA/OAEP/UNKNOWN/MGF1-SHA256").is_err());
     }

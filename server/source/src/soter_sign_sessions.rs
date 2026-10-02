@@ -187,10 +187,12 @@ impl SignSessions {
         device: &str,
         requested: &str,
         session: i64,
+        deadline: tokio::time::Instant,
     ) -> Option<SignLease> {
         let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
         let lease = leases.get_mut(device)?;
         if lease.deadline <= tokio::time::Instant::now()
+            || deadline <= tokio::time::Instant::now()
             || lease.requested != requested
             || lease.session != Some(session)
             || lease.finishing
@@ -203,7 +205,8 @@ impl SignSessions {
             owner: self.clone(),
             device: device.to_owned(),
             id: lease.id,
-            deadline: lease.deadline,
+            // TTL gates admission only; inflight now prevents replacement.
+            deadline,
             retained: false,
             dispatched: false,
         })
@@ -390,12 +393,12 @@ mod tests {
         };
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
-        assert!(s.finish("a", "wrong", 42).is_none());
-        let mut finish = s.finish("a", "caller", 42).unwrap();
+        assert!(s.finish("a", "wrong", 42, deadline).is_none());
+        let mut finish = s.finish("a", "caller", 42, deadline).unwrap();
         finish.dispatch(); // original finish + repair init/finish share this guard
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(waiting.await.unwrap().is_none());
-        assert!(s.finish("a", "caller", 42).is_none());
+        assert!(s.finish("a", "caller", 42, deadline).is_none());
         finish.completed();
         drop(finish);
         let next = s
@@ -406,7 +409,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(s.finish("a", "caller", 42).is_none());
+        assert!(s.finish("a", "caller", 42, deadline).is_none());
         drop(next);
         drop(other);
     }
@@ -428,7 +431,7 @@ mod tests {
         assert!(guard.retain_session(43));
         drop(guard);
         tokio::time::advance(Duration::from_secs(60)).await;
-        assert!(s.finish("a", "two", 43).is_none());
+        assert!(s.finish("a", "two", 43, deadline).is_none());
         assert!(s.acquire("a", "three", deadline).await.is_some());
     }
 
@@ -445,13 +448,13 @@ mod tests {
         };
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
-        let finish = s.finish("a", "first", 7).unwrap();
+        let finish = s.finish("a", "first", 7, deadline).unwrap();
         tokio::time::advance(Duration::from_millis(20)).await;
         assert!(!waiter.is_finished());
         drop(finish);
         tokio::time::advance(Duration::from_millis(20)).await;
         let next = waiter.await.unwrap().unwrap();
-        assert!(s.finish("a", "first", 7).is_none());
+        assert!(s.finish("a", "first", 7, deadline).is_none());
         drop(next);
     }
 
@@ -463,10 +466,16 @@ mod tests {
         assert!(init.retain_session(7));
         drop(init);
         tokio::time::advance(Duration::from_secs(59)).await;
-        let mut finish = s.finish("a", "first", 7).unwrap();
+        let request_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut finish = s.finish("a", "first", 7, request_deadline).unwrap();
+        assert_eq!(finish.deadline, request_deadline);
         finish.dispatch();
         tokio::time::advance(Duration::from_secs(2)).await;
+        // The old session TTL has elapsed, but this finish still has budget
+        // for the HAL response and same-owner repair.
+        assert!(tokio::time::Instant::now() < finish.deadline);
         assert!(s.acquire("a", "second", deadline).await.is_none());
+        assert!(tokio::time::Instant::now() < finish.deadline);
         finish.completed();
         drop(finish);
         assert!(s.acquire("a", "second", deadline).await.is_some());
@@ -474,6 +483,19 @@ mod tests {
             .acquire("b", "expired", tokio::time::Instant::now())
             .await
             .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_request_does_not_consume_live_session() {
+        let s = Arc::new(SignSessions::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut init = s.acquire("a", "first", deadline).await.unwrap();
+        assert!(init.retain_session(7));
+        drop(init);
+        assert!(s
+            .finish("a", "first", 7, tokio::time::Instant::now())
+            .is_none());
+        assert!(s.finish("a", "first", 7, deadline).is_some());
     }
 
     fn sessions() -> SignSessions {

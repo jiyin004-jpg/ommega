@@ -996,7 +996,7 @@ fn handle_generate_attest(_task_type: &str, payload: &Value) -> Result<Value> {
     Ok(json!({
         "alias": alias,
         "cert_chain": cert_chain_json(&session.cert_chain),
-        "public_key": b64(&tee_ops::get_public_key(&alias)?),
+        "public_key": b64(&tee_ops::public_key_from_session(&session)?),
     }))
 }
 

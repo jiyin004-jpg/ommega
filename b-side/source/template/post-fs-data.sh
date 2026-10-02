@@ -20,10 +20,49 @@ fi
 if [ -f "$TARGET_RELAY_CONFIG" ]; then
   cur_device_id=$(sed -n 's/^OMMEGA_RELAY_DEVICE_ID=//p' "$TARGET_RELAY_CONFIG")
   if [ -z "$cur_device_id" ] || [ "$cur_device_id" = "device-b-<random>" ]; then
-    rand_hex=$(tr -dc '0-9a-f' < /dev/urandom 2>/dev/null | head -c 8)
-    [ -z "$rand_hex" ] && rand_hex=$(date +%s | md5sum 2>/dev/null | cut -c1-8)
-    [ -z "$rand_hex" ] && rand_hex="$$"
-    sed -i "s/^OMMEGA_RELAY_DEVICE_ID=.*/OMMEGA_RELAY_DEVICE_ID=device-b-$rand_hex/" "$TARGET_RELAY_CONFIG"
+    # Require a full 128 bits of system entropy; never substitute time/PID.
+    rand_hex=
+    if entropy=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null); then
+      rand_hex=$(printf '%s' "$entropy" | tr -d '[:space:]')
+    fi
+    case "$rand_hex" in
+      *[!0-9a-f]*|'') rand_hex= ;;
+    esac
+    if [ "${#rand_hex}" -ne 32 ]; then
+      printf '%s\n' 'ommega: device ID generation failed: 128-bit system entropy unavailable; leaving ID unset/placeholder' >&2
+    else
+      # Properties are optional. Length-prefixed fields avoid ambiguous input;
+      # raw hardware identifiers are never written to the config or logs.
+      # Keep the public format compatible with earlier installs: 8 hex digits.
+      device_hex=$(printf '%.8s' "$rand_hex")
+      if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(
+          {
+            printf 'ommega/device-b/v1\nrandom:%s:%s\n' "${#rand_hex}" "$rand_hex"
+            for prop in ro.serialno ro.boot.serialno ro.boot.imei ro.ril.oem.imei ro.vendor.ril.imei vendor.ril.imei ril.imei ril.gsm.imei; do
+              value=$(getprop "$prop" 2>/dev/null) || value=
+              printf '%s:%s:%s\n' "$prop" "${#value}" "$value"
+            done
+          } | sha256sum 2>/dev/null
+        ) || digest=
+        digest=${digest%% *}
+        case "$digest" in
+          *[!0-9a-f]*|'') digest= ;;
+        esac
+        if [ "${#digest}" -eq 64 ]; then
+          device_hex=$(printf '%.8s' "$digest")
+        else
+          printf '%s\n' 'ommega: SHA-256 failed sanity check; using random 128-bit device ID' >&2
+        fi
+      else
+        printf '%s\n' 'ommega: SHA-256 unavailable; using random 128-bit device ID' >&2
+      fi
+      if grep -q '^OMMEGA_RELAY_DEVICE_ID=' "$TARGET_RELAY_CONFIG"; then
+        sed -i "s/^OMMEGA_RELAY_DEVICE_ID=.*/OMMEGA_RELAY_DEVICE_ID=device-b-$device_hex/" "$TARGET_RELAY_CONFIG"
+      else
+        printf '\nOMMEGA_RELAY_DEVICE_ID=device-b-%s\n' "$device_hex" >> "$TARGET_RELAY_CONFIG"
+      fi
+    fi
   fi
 
   cur_machine_id=$(sed -n 's/^OMMEGA_RELAY_MACHINE_ID=//p' "$TARGET_RELAY_CONFIG")

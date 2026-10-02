@@ -21,7 +21,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::cert::{self, AttestationParams, RootOfTrust};
@@ -114,6 +114,9 @@ struct Inner {
 pub struct Fulfill {
     inner: Mutex<Inner>,
     enabled: AtomicBool,
+    /// One generation gate per logical alias, shared across device/request
+    /// snapshots and fallback layers. Weak entries do not retain idle gates.
+    attest_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Cache of generated self-signed identities per (device_id, algorithm) so
     /// a device without a stored identity doesn't regenerate a fresh key (RSA
     /// keygen is slow) on every attestation.
@@ -126,6 +129,7 @@ impl Fulfill {
         let f = Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             enabled: AtomicBool::new(enabled),
+            attest_gates: Mutex::new(HashMap::new()),
             self_signed_cache: Mutex::new(HashMap::new()),
             db,
         });
@@ -238,17 +242,59 @@ impl Fulfill {
     fn get_session(&self, alias: &str) -> Option<Session> {
         let mut inner = crate::util::mu(&self.inner);
         Self::purge_if_due(&mut inner.sessions);
-        inner.sessions.get(alias).cloned()
+        inner
+            .sessions
+            .get(alias)
+            .filter(|s| !Self::session_expired(s))
+            .cloned()
     }
 
-    fn put_session(&self, alias: &str, mut s: Session) {
+    fn put_session(&self, alias: &str, mut s: Session) -> Session {
         // 密文在这里算一次，之后每轮落盘都直接复用（见 persist_sessions）。
         s.leaf_key_cipher = crate::crypto::encrypt_private_pem(&s.leaf_key_pem);
         let mut inner = crate::util::mu(&self.inner);
         Self::purge_if_due(&mut inner.sessions);
-        inner.sessions.insert(alias.to_string(), s);
-        drop(inner);
-        self.persist_sessions();
+        // First successful publication wins, even if a caller bypasses the gate.
+        if let Some(existing) = inner
+            .sessions
+            .get(alias)
+            .filter(|s| !Self::session_expired(s))
+        {
+            return existing.clone();
+        }
+        inner.sessions.insert(alias.to_string(), s.clone());
+        s
+    }
+
+    /// Serialize check -> generate -> publish for the alias, not globally.
+    /// A cancelled HTTP waiter cannot cancel its spawn_blocking worker: retries
+    /// must wait for that worker and reuse its key instead of replacing it.
+    /// Do not reject differing request snapshots (e.g. StrongBox -> TEE retry):
+    /// failures are not cached; after success the alias's key/chain is immutable
+    /// for the existing seven-day session lifetime. Attestation callers must
+    /// validate the cached leaf algorithm before returning it.
+    fn session_or_generate(
+        &self,
+        alias: &str,
+        generate: impl FnOnce() -> anyhow::Result<Session>,
+    ) -> anyhow::Result<(Session, bool)> {
+        let gate = {
+            let mut gates = crate::util::mu(&self.attest_gates);
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(alias).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(alias.to_string(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let _guard = crate::util::mu(&gate);
+        if let Some(session) = self.get_session(alias) {
+            return Ok((session, false));
+        }
+        let session = self.put_session(alias, generate()?);
+        Ok((session, true))
     }
 
     /// Algorithm string implied by an A-side attest context ("ec" | "rsa"),
@@ -575,7 +621,39 @@ impl Fulfill {
         challenge: &[u8],
     ) -> anyhow::Result<(String, String)> {
         let params = self.parse_ctx(ctx, challenge);
-        let (chain_pem, new_leaf_key_pem) = cert::build_attested_chain(identity, &params)?;
+        let (session, generated) = self.session_or_generate(alias, || {
+            let (chain_pem, leaf_key_pem) = cert::build_attested_chain(identity, &params)?;
+            Ok(Session {
+                chain_pem,
+                leaf_key_pem,
+                leaf_key_cipher: String::new(),
+                created_epoch_ms: Utc::now().timestamp_millis() as u64,
+            })
+        })?;
+        // Normal requests derive their alias from key parameters. Defend also
+        // against legacy/duplicate aliases: never return or replace an existing
+        // EC key for an RSA request (or vice versa).
+        let cached_algorithm = match parse_leaf_key(&session.leaf_key_pem).map_err(|e| {
+            anyhow::anyhow!("cached session for alias {alias}: invalid leaf key: {e}")
+        })? {
+            LeafKey::Ec(_) => cert::KM_ALG_EC,
+            LeafKey::Rsa(_) => cert::KM_ALG_RSA,
+        };
+        anyhow::ensure!(
+            cached_algorithm == params.algorithm,
+            "cached session algorithm mismatch for alias {alias}: cached {}, requested {}; existing session preserved",
+            if cached_algorithm == cert::KM_ALG_RSA { "RSA" } else { "EC" },
+            if params.algorithm == cert::KM_ALG_RSA { "RSA" } else { "EC" }
+        );
+        if let Some(error) = cert::validate_identity_pem(&session.leaf_key_pem, &session.chain_pem)
+        {
+            anyhow::bail!("cached session for alias {alias}: invalid leaf key/chain: {error}; existing session preserved");
+        }
+        if generated {
+            self.persist_sessions();
+        }
+        let chain_pem = session.chain_pem;
+        let new_leaf_key_pem = session.leaf_key_pem;
 
         // 这份材料的形状是发出去就会被认出来的那种（老公开 keybox：中间证书
         // subject 是 serialNumber 在前）——真机出链不会长这样。修不了（见
@@ -601,15 +679,6 @@ impl Fulfill {
             key_fp
         );
 
-        self.put_session(
-            alias,
-            Session {
-                chain_pem: chain_pem.clone(),
-                leaf_key_pem: new_leaf_key_pem,
-                leaf_key_cipher: String::new(),
-                created_epoch_ms: Utc::now().timestamp_millis() as u64,
-            },
-        );
         Ok((chain_pem, key_fp))
     }
 
@@ -975,5 +1044,223 @@ fn decrypt_data(key: &LeafKey, data: &[u8]) -> anyhow::Result<Vec<u8>> {
                 .map_err(|e| anyhow::anyhow!("rsa oaep decrypt failed (SHA-256 + SHA-1 MGF1): {e}"))
         }
         _ => anyhow::bail!("decrypt requires RSA key"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    // Isolated memory-only cache: tests must not load or replace real sessions.
+    fn fulfill() -> Fulfill {
+        Fulfill {
+            inner: Mutex::new(Inner::default()),
+            enabled: AtomicBool::new(true),
+            attest_gates: Mutex::new(HashMap::new()),
+            self_signed_cache: Mutex::new(HashMap::new()),
+            db: None,
+        }
+    }
+
+    fn session(key: &str) -> Session {
+        Session {
+            chain_pem: format!("chain-{key}"),
+            leaf_key_pem: key.to_string(),
+            leaf_key_cipher: String::new(),
+            created_epoch_ms: Utc::now().timestamp_millis() as u64,
+        }
+    }
+
+    #[test]
+    fn late_worker_and_retry_share_key_while_other_alias_proceeds() {
+        let f = fulfill();
+        let calls = AtomicUsize::new(0);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (other_tx, other_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_f = &f;
+            let worker_calls = &calls;
+            let late = scope.spawn(move || {
+                worker_f
+                    .session_or_generate("same", || {
+                        worker_calls.fetch_add(1, Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(session("original"))
+                    })
+                    .unwrap()
+                    .0
+            });
+            entered_rx.recv().unwrap();
+            let retry = scope.spawn(|| {
+                f.session_or_generate("same", || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(session("replacement"))
+                })
+                .unwrap()
+                .0
+            });
+            scope.spawn(|| {
+                let s = f
+                    .session_or_generate("other", || Ok(session("independent")))
+                    .unwrap()
+                    .0;
+                other_tx.send(s).unwrap();
+            });
+            // No sleep: the other alias must complete while the first is held.
+            let independent = other_rx.recv_timeout(Duration::from_secs(5));
+            release_tx.send(()).unwrap();
+            assert_eq!(independent.unwrap().leaf_key_pem, "independent");
+            let original = late.join().unwrap();
+            let returned = retry.join().unwrap();
+            assert_eq!(original.leaf_key_pem, returned.leaf_key_pem);
+            assert_eq!(original.chain_pem, returned.chain_pem);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                f.get_session("same").unwrap().leaf_key_pem,
+                returned.leaf_key_pem
+            );
+        });
+    }
+
+    #[test]
+    fn failed_snapshot_allows_demotion_but_success_cannot_be_replaced() {
+        let f = fulfill();
+        assert!(f
+            .session_or_generate("alias", || anyhow::bail!("StrongBox failed"))
+            .is_err());
+        let (tee, generated) = f
+            .session_or_generate("alias", || Ok(session("TEE")))
+            .unwrap();
+        assert!(generated);
+        let (retry, generated) = f
+            .session_or_generate("alias", || panic!("must reuse success"))
+            .unwrap();
+        assert!(!generated);
+        assert_eq!(retry.chain_pem, tee.chain_pem);
+        assert_eq!(retry.leaf_key_pem, tee.leaf_key_pem);
+        assert_eq!(retry.created_epoch_ms, tee.created_epoch_ms);
+        // Defensive publication also preserves an already returned key.
+        assert_eq!(
+            f.put_session("alias", session("StrongBox")).leaf_key_pem,
+            tee.leaf_key_pem
+        );
+    }
+
+    #[test]
+    fn cached_leaf_algorithm_mismatch_is_rejected_without_replacement() {
+        let f = fulfill();
+        for (cached, requested) in [("ec", cert::KM_ALG_RSA), ("rsa", cert::KM_ALG_EC)] {
+            let material = cert::generate_self_signed(cached).unwrap();
+            let mut original = session(&material.private_key_pem);
+            original.chain_pem = material.certificate_chain_pem;
+            crate::util::mu(&f.inner)
+                .sessions
+                .insert("legacy-alias".into(), original.clone());
+            // An invalid issuer proves rejection occurs on the actual cached
+            // material, without generating a replacement.
+            let identity = DeviceIdentity {
+                device_id: "device".into(),
+                algorithm: "ec".into(),
+                certificate_chain_pem: String::new(),
+                private_key_pem_cipher: String::new(),
+                active: true,
+                machine_id: String::new(),
+                created_at: String::new(),
+            };
+            let response = f.attest_from_identity(
+                &json!({"alias": "legacy-alias", "device_attest_context": {"key_algorithm": requested}}),
+                &identity,
+                "server_keybox",
+            )
+            .unwrap();
+            let error = response["error"].as_str().unwrap();
+            assert!(
+                error.contains("cached session algorithm mismatch"),
+                "{error}"
+            );
+            assert!(error.contains("existing session preserved"));
+            assert!(response.get("cert_chain").is_none());
+            let retained = f.get_session("legacy-alias").unwrap();
+            assert_eq!(retained.chain_pem, original.chain_pem);
+            assert_eq!(retained.leaf_key_pem, original.leaf_key_pem);
+            assert_eq!(retained.created_epoch_ms, original.created_epoch_ms);
+
+            // Matching private-key algorithm alone is insufficient: the chain
+            // leaf must match that key too.
+            let other =
+                cert::generate_self_signed(if cached == "ec" { "rsa" } else { "ec" }).unwrap();
+            crate::util::mu(&f.inner)
+                .sessions
+                .get_mut("legacy-alias")
+                .unwrap()
+                .chain_pem = other.certificate_chain_pem;
+            let error = f
+                .attest_and_cache(
+                    &identity,
+                    "legacy-alias",
+                    &json!({"algorithm": cached}),
+                    b"",
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid leaf key/chain"), "{error}");
+        }
+    }
+
+    #[test]
+    fn loaded_session_is_reused_and_expired_session_is_recreated() {
+        let f = fulfill();
+        let material = cert::generate_self_signed("ec").unwrap();
+        let mut old = session(&material.private_key_pem);
+        old.chain_pem = material.certificate_chain_pem;
+        old.created_epoch_ms -= 1000;
+        crate::util::mu(&f.inner)
+            .sessions
+            .insert("alias".into(), old.clone());
+        let (reused, generated) = f
+            .session_or_generate("alias", || panic!("loaded session must be reused"))
+            .unwrap();
+        assert!(!generated);
+        assert_eq!(reused.created_epoch_ms, old.created_epoch_ms);
+        // Even an identity rotation / differing device snapshot cannot mint a
+        // replacement. Invalid issuer material would fail if generation ran.
+        let identity = DeviceIdentity {
+            device_id: "rotated-device".into(),
+            algorithm: "ec".into(),
+            certificate_chain_pem: String::new(),
+            private_key_pem_cipher: String::new(),
+            active: true,
+            machine_id: String::new(),
+            created_at: String::new(),
+        };
+        let (chain, fingerprint) = f
+            .attest_and_cache(
+                &identity,
+                "alias",
+                &json!({"attestation_security_level": 2}),
+                b"different",
+            )
+            .unwrap();
+        assert_eq!(chain, old.chain_pem);
+        assert_eq!(
+            fingerprint,
+            base64::engine::general_purpose::STANDARD
+                .encode(Sha256::digest(old.leaf_key_pem.as_bytes()))
+        );
+        crate::util::mu(&f.inner)
+            .sessions
+            .get_mut("alias")
+            .unwrap()
+            .created_epoch_ms =
+            Utc::now().timestamp_millis() as u64 - SESSION_TTL.as_millis() as u64 - 1;
+        let (fresh, generated) = f
+            .session_or_generate("alias", || Ok(session("fresh")))
+            .unwrap();
+        assert!(generated);
+        assert_eq!(fresh.leaf_key_pem, "fresh");
     }
 }

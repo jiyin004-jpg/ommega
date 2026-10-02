@@ -550,50 +550,41 @@ fn remote_sign_algorithm(chars: &[KeyParam], params: &[KeyParam]) -> Result<Stri
     let algo = get_algorithm(chars)?;
     match algo {
         Algorithm::Rsa => {
+            // Apply the local policy before encoding: raw RSA requires NONE,
+            // PKCS#1 allows NONE, but PSS requires a real digest and enough key bits.
+            check_begin_rsa_params(chars, KeyPurpose::Sign, params)?;
             let padding = get_padding_mode(params)?;
-            if padding == PaddingMode::RsaPss {
-                let digest = get_digest(params)?;
-                let name = match digest {
-                    Digest::Sha1 => "SHA1withRSA/PSS",
-                    Digest::Sha256 => "SHA256withRSA/PSS",
-                    Digest::Sha384 => "SHA384withRSA/PSS",
-                    Digest::Sha512 => "SHA512withRSA/PSS",
-                    _ => {
-                        return Err(km_err!(
-                            UnsupportedDigest,
-                            "remote RSA-PSS sign for {digest:?}"
-                        ))
-                    }
-                };
-                Ok(name.to_string())
-            } else {
-                // PKCS#1 v1.5: carry the app's digest so an authorized digest
-                // is used, and an unauthorized one (e.g. SHA1 on a SHA256-only
-                // key) is rejected by the real TEE.
-                let digest = get_digest(params)?;
-                let name = match digest {
-                    Digest::Sha1 => "SHA1withRSA",
-                    Digest::Sha256 => "SHA256withRSA",
-                    Digest::Sha384 => "SHA384withRSA",
-                    Digest::Sha512 => "SHA512withRSA",
-                    _ => {
-                        return Err(km_err!(
-                            UnsupportedDigest,
-                            "remote RSA-PKCS1 sign for {digest:?}"
-                        ))
-                    }
-                };
-                Ok(name.to_string())
-            }
+            let digest = get_digest(params)?;
+            let prefix = match digest {
+                Digest::None => "NONE",
+                Digest::Md5 => "MD5",
+                Digest::Sha1 => "SHA1",
+                Digest::Sha224 => "SHA224",
+                Digest::Sha256 => "SHA256",
+                Digest::Sha384 => "SHA384",
+                Digest::Sha512 => "SHA512",
+            };
+            let suffix = match padding {
+                PaddingMode::None => "/NoPadding",
+                PaddingMode::RsaPss => "/PSS",
+                PaddingMode::RsaPkcs115Sign => "",
+                _ => {
+                    return Err(km_err!(
+                        UnsupportedPaddingMode,
+                        "remote RSA sign for {padding:?}"
+                    ))
+                }
+            };
+            Ok(format!("{prefix}withRSA{suffix}"))
         }
         Algorithm::Ec => {
-            // EC digest must match what the app verifies: a SHA-384/512
-            // signature over SHA-256 hashed input fails verification. Carry
-            // the begin-params digest; default to SHA-256 (previous behaviour)
-            // when absent so a digest-less begin still works.
-            let digest = get_opt_tag_value!(params, Digest)?.unwrap_or(&Digest::Sha256);
+            // Carry the exact begin digest, including un-hashed ECDSA.
+            // Missing digests are rejected by the same policy as local signing.
+            let digest = get_digest(params)?;
             let name = match digest {
+                Digest::None => "NONEwithECDSA",
                 Digest::Sha1 => "SHA1withECDSA",
+                Digest::Sha224 => "SHA224withECDSA",
                 Digest::Sha256 => "SHA256withECDSA",
                 Digest::Sha384 => "SHA384withECDSA",
                 Digest::Sha512 => "SHA512withECDSA",
@@ -1201,6 +1192,123 @@ mod tests {
             check_begin_params(&rsa_chars, KeyPurpose::Sign, &unauthorized_digest),
             "IncompatibleDigest"
         );
+    }
+
+    #[test]
+    fn remote_ec_digest_policy_and_mapping() {
+        for (digest, name) in [
+            (Digest::None, "NONEwithECDSA"),
+            (Digest::Sha1, "SHA1withECDSA"),
+            (Digest::Sha224, "SHA224withECDSA"),
+            (Digest::Sha256, "SHA256withECDSA"),
+            (Digest::Sha384, "SHA384withECDSA"),
+            (Digest::Sha512, "SHA512withECDSA"),
+        ] {
+            let chars = [
+                KeyParam::Algorithm(Algorithm::Ec),
+                KeyParam::EcCurve(EcCurve::P256),
+                KeyParam::Purpose(KeyPurpose::Sign),
+                KeyParam::Digest(digest),
+            ];
+            let params = [KeyParam::Digest(digest)];
+            check_begin_params(&chars, KeyPurpose::Sign, &params).unwrap();
+            assert_eq!(remote_sign_algorithm(&chars, &params).unwrap(), name);
+            expect_err!(
+                check_begin_params(&chars, KeyPurpose::Sign, &[]),
+                "UnsupportedDigest"
+            );
+            expect_err!(remote_sign_algorithm(&chars, &[]), "UnsupportedDigest");
+            let md5 = [KeyParam::Digest(Digest::Md5)];
+            expect_err!(
+                check_begin_params(&chars, KeyPurpose::Sign, &md5),
+                "UnsupportedDigest"
+            );
+            expect_err!(remote_sign_algorithm(&chars, &md5), "UnsupportedDigest");
+        }
+    }
+
+    #[test]
+    fn remote_rsa_digest_policy_and_mapping() {
+        for (digest, prefix) in [
+            (Digest::None, "NONE"),
+            (Digest::Md5, "MD5"),
+            (Digest::Sha1, "SHA1"),
+            (Digest::Sha224, "SHA224"),
+            (Digest::Sha256, "SHA256"),
+            (Digest::Sha384, "SHA384"),
+            (Digest::Sha512, "SHA512"),
+        ] {
+            for (padding, suffix) in [
+                (PaddingMode::None, "/NoPadding"),
+                (PaddingMode::RsaPkcs115Sign, ""),
+                (PaddingMode::RsaPss, "/PSS"),
+            ] {
+                let chars = [
+                    KeyParam::Algorithm(Algorithm::Rsa),
+                    KeyParam::KeySize(KeySizeInBits(2048)),
+                    KeyParam::Purpose(KeyPurpose::Sign),
+                    KeyParam::Padding(padding),
+                    KeyParam::Digest(digest),
+                ];
+                let params = [KeyParam::Padding(padding), KeyParam::Digest(digest)];
+                if (padding == PaddingMode::None && digest != Digest::None)
+                    || (padding == PaddingMode::RsaPss && digest == Digest::None)
+                {
+                    expect_err!(
+                        check_begin_params(&chars, KeyPurpose::Sign, &params),
+                        "IncompatibleDigest"
+                    );
+                    expect_err!(remote_sign_algorithm(&chars, &params), "IncompatibleDigest");
+                } else {
+                    check_begin_params(&chars, KeyPurpose::Sign, &params).unwrap();
+                    assert_eq!(
+                        remote_sign_algorithm(&chars, &params).unwrap(),
+                        format!("{prefix}withRSA{suffix}")
+                    );
+                }
+            }
+        }
+        let chars = [
+            KeyParam::Algorithm(Algorithm::Rsa),
+            KeyParam::KeySize(KeySizeInBits(1024)),
+            KeyParam::Purpose(KeyPurpose::Sign),
+            KeyParam::Padding(PaddingMode::RsaPss),
+            KeyParam::Digest(Digest::Sha512),
+        ];
+        let params = [
+            KeyParam::Padding(PaddingMode::RsaPss),
+            KeyParam::Digest(Digest::Sha512),
+        ];
+        expect_err!(
+            check_begin_params(&chars, KeyPurpose::Sign, &params),
+            "IncompatibleDigest"
+        );
+        expect_err!(remote_sign_algorithm(&chars, &params), "IncompatibleDigest");
+        let invalid_padding = [
+            KeyParam::Padding(PaddingMode::RsaPkcs115Encrypt),
+            KeyParam::Digest(Digest::Sha512),
+        ];
+        expect_err!(
+            remote_sign_algorithm(&chars, &invalid_padding),
+            "UnsupportedPaddingMode"
+        );
+    }
+
+    #[test]
+    fn remote_rsa_decrypt_no_padding_is_not_pkcs1() {
+        for (padding, name) in [
+            (PaddingMode::None, "RSA/ECB/NoPadding"),
+            (PaddingMode::RsaPkcs115Encrypt, "RSA/ECB/PKCS1Padding"),
+        ] {
+            let chars = [
+                KeyParam::Algorithm(Algorithm::Rsa),
+                KeyParam::Purpose(KeyPurpose::Decrypt),
+                KeyParam::Padding(padding),
+            ];
+            let params = [KeyParam::Padding(padding)];
+            check_begin_params(&chars, KeyPurpose::Decrypt, &params).unwrap();
+            assert_eq!(remote_decrypt_algorithm(&chars, &params).unwrap(), name);
+        }
     }
 
     #[test]
