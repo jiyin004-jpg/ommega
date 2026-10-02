@@ -23,6 +23,7 @@ Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真
 - **在线设备状态页**：server 提供公开的设备在线状态展示界面
 - **卡片计费体系**：server 内置卡片购买、激活与用量管理
 - **管理后台**：设备管理、任务查看、密钥盒上传与自动刷新
+- **路径遮罩**：A 端按内核版本装载 PathMask 内核模块，遮住指定路径的检测面（默认 `/system/priv-app/SoterService`）
 
 ## 快速使用（官方在线服务）
 
@@ -78,10 +79,13 @@ remote: on
 
 ```
 ommega/
+├── .github/workflows/       # CI：三端 fmt / clippy / 测试门禁
+├── .cargo-husky/hooks/      # 提交前钩子脚本（由 cargo-husky 装到 .git/hooks，只查格式）
 ├── a-side/source/           # A 端（Magisk 模块）Rust 源码：keymint 守护进程 + ommega-inject 注入器
 ├── b-side/source/           # B 端（Magisk 模块）Rust 源码：relay 守护进程
 ├── b-app/source/            # B 端 Android App（Kotlin + Gradle）
-└── server/source/           # 服务端 Rust 源码 + 运维脚本
+├── server/source/           # 服务端 Rust 源码 + 运维脚本
+└── VERSION                  # 四端共用的版本号
 ```
 
 仓库只保存源码与文档，构建产物（模块 zip、APK、服务端二进制）一律以 Release 附件形式发布。
@@ -110,6 +114,20 @@ ommega/
 > 加上目标平台就行：`cargo check --target aarch64-linux-android`（需先设好 NDK 环境变量
 > `ANDROID_NDK_ROOT` / `ANDROID_NDK_HOME`）。A 端与 server 没有这个限制。
 
+### 开发门禁
+
+三个工作区各自独立，CI（`.github/workflows/ci.yml`）对每个都跑同一套：`cargo clippy` 带
+`-D warnings`、`cargo fmt --all -- --check`、以及测试。server 是 host 目标，测试真跑；
+A / B 端只能编到 `aarch64-linux-android`，CI 里只编测试二进制（`--no-run`），真机那一层留给人。
+本地提交前另有一道轻量钩子，只查被改工作区的格式，脚本在仓库根的 `.cargo-husky/hooks/`。
+
+A 端本地开发还得自备两样东西，缺了编不过：
+
+- `protoc`：`build.rs` 用 prost 把 `proto/storage.proto` 生成到 `src/proto/`（生成物不入库）
+- `a-side/source/ommega-injector/assets/soter_ask.pem`：本地兜底 ASK 私钥，被 `.gitignore` 的
+  `**/*.pem` 排掉、不进仓库，但 injector 的 `include_bytes!` 要求它在场。CI 里是现生成一把
+  编译占位顶上的，它不参与任何发布产物
+
 ## 参考项目
 
 Ommega 参考并借鉴了以下开源项目，在此致谢（排名不分先后）：
@@ -121,6 +139,11 @@ Ommega 参考并借鉴了以下开源项目，在此致谢（排名不分先后�
 | OhMyKeymint | James Clef（qwq233） | [qwq233/OhMyKeymint](https://github.com/qwq233/OhMyKeymint) |
 | KeyAttestation | vvb2060 | [vvb2060/KeyAttestation](https://github.com/vvb2060/KeyAttestation) |
 | TEESimulator-RS | Enginex0 | [Enginex0/TEESimulator-RS](https://github.com/Enginex0/TEESimulator-RS) |
+| PathMask | Andrea-lyz | [Andrea-lyz/LKM-PathMask](https://github.com/Andrea-lyz/LKM-PathMask) |
+
+PathMask 不是代码层面的借鉴，而是作为第三方内核模块资产随 A 端模块直接分发：钉在上游
+v2.8.0 的官方 release 上，按内核版本挑对应 `.ko` 做路径遮罩，来源、哈希核对与选择逻辑见
+[a-side/source/template/pathmask/UPSTREAM.md](a-side/source/template/pathmask/UPSTREAM.md)。
 
 ## 交流与支持
 
