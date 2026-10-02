@@ -141,10 +141,6 @@ Ommega 参考并借鉴了以下开源项目，在此致谢（排名不分先后�
 | TEESimulator-RS | Enginex0 | [Enginex0/TEESimulator-RS](https://github.com/Enginex0/TEESimulator-RS) |
 | PathMask | Andrea-lyz | [Andrea-lyz/LKM-PathMask](https://github.com/Andrea-lyz/LKM-PathMask) |
 
-PathMask 不是代码层面的借鉴，而是作为第三方内核模块资产随 A 端模块直接分发：钉在上游
-v2.8.0 的官方 release 上，按内核版本挑对应 `.ko` 做路径遮罩，来源、哈希核对与选择逻辑见
-[a-side/source/template/pathmask/UPSTREAM.md](a-side/source/template/pathmask/UPSTREAM.md)。
-
 ## 交流与支持
 
 QQ 群：**2167063739**
