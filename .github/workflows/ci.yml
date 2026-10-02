@@ -1,14 +1,13 @@
-# 三端的代码门禁：格式、clippy、编译/跑测试。
+# 三端的代码门禁：clippy、格式、编译/跑测试。
 #
-# 为什么分两个 job、为什么 A/B 端只编不跑：
-#   A/B 端只能编到 aarch64 目标（b-side 依赖的 rsproperties 只对 Linux/Android 生效，
-#   裸 cargo check 必挂，看着像代码坏了），测试二进制也只能编、不能在 CI 里执行 ——
-#   真机那一层留给人，见 a-side/source/AGENTS.md 的「Validation and Deployment」。
-#   server 是 host 目标，测试能真跑，所以它跑 cargo test。
+# 为什么 A/B 端只编不跑测试：这两个 crate 只能编到 aarch64 目标（b-side 依赖的
+# rsproperties 只对 Linux/Android 生效，裸 cargo check 必挂，看着像代码坏了），
+# 测试二进制也只能编、不能在 CI 里执行 —— 真机那一层留给人，见
+# a-side/source/AGENTS.md 的 Validation and Deployment。server 是 host 目标，
+# 测试能真跑，所以它跑 cargo test。
 #
 # clippy 带 -D warnings：三端的警告已经清干净了，带上才拦得住回潮。
-# 本地那道 pre-commit 钩子只查格式（钩子脚本在仓库根的 .cargo-husky/hooks/），
-# 完整门禁在这里。
+# 本地那道 pre-commit 钩子只查格式（脚本在仓库根的 .cargo-husky/hooks/）。
 name: ci
 
 on:
@@ -25,25 +24,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 装工具链
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt
-          rustup default stable
-
-      - name: cargo fmt --check
-        run: |
-          set -euo pipefail
-          for ws in a-side/source b-side/source server/source; do
-            echo "== $ws =="
-            cargo fmt --manifest-path "$ws/Cargo.toml" --all -- --check
-          done
-
   gate:
     runs-on: ubuntu-24.04
     strategy:
@@ -67,8 +47,24 @@ jobs:
       - name: 装工具链
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup toolchain install stable --profile minimal --no-self-update \
+            --component clippy --component rustfmt
           rustup default stable
+          # minimal profile 不含 Android target，要单独装；缺了会报
+          # `can't find crate for core`。
+          if [ -n "${{ matrix.target }}" ]; then
+            rustup target add "${{ matrix.target }}"
+          fi
+
+      # a-side 的 build.rs 用 prost 把 proto/storage.proto 编译成 Rust 代码，
+      # 得有 protoc 在手边（prost-build 0.11 起不再自带）。
+      - name: 装 protoc
+        if: matrix.name == 'a-side'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          protoc --version
 
       - name: 取 NDK 缓存
         if: matrix.target != ''
@@ -114,12 +110,20 @@ jobs:
             cargo clippy --workspace --all-targets -- -D warnings
           fi
 
+      # 必须排在 clippy 后面：a-side 的 build.rs 会把 proto/storage.proto 生成到
+      # src/proto/，而那里被 src/.gitignore 排除、不进仓库 —— rustfmt 解析
+      # `pub mod proto;` 时要那两个文件在场，否则直接
+      # "failed to resolve mod `proto`"。clippy 编过一遍之后文件就在了。
+      - name: cargo fmt --check
+        working-directory: ${{ matrix.ws }}
+        run: cargo fmt --all -- --check
+
       - name: 测试
         working-directory: ${{ matrix.ws }}
         run: |
           set -euo pipefail
           if [ -n "${{ matrix.target }}" ]; then
-            # 只编不跑：这些测试二进制要在真机 aarch64 上执行，CI 里没有设备。
+            # 只编不跑：测试二进制要在真机 aarch64 上执行，CI 里没有设备。
             cargo test --target "${{ matrix.target }}" --workspace --no-run
           else
             cargo test --workspace
