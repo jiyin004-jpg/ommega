@@ -2,7 +2,8 @@
 
 Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真实硬件 TEE 能力通过网络提供给另一台设备（A 端）使用。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经过 server 中转调度，由 B 端设备的真实硬件 TEE（KeyMint / StrongBox）执行并返回结果，从而为 A 端应用提供真实可信的硬件级安全认证。
 
-源码版本：1.5.0（打包日期：2026-09-23）。版本号唯一来源是仓库根的 `VERSION`，A 端模块 / B 端模块 / b-app / 服务端 四端同号。
+版本号唯一来源是仓库根的 `VERSION`（A 端模块 / B 端模块 / b-app / 服务端 四端同号），正文里不写具体版本：
+当前版本和下载都以 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 页面为准。
 
 ## 系统组成
 
@@ -33,11 +34,11 @@ Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真
 | 配置 URL（A 端 / B 端 / App 统一填写） | `http://110.40.170.96:10886` |
 | A 端 Token | `aY7kRSDDR6PMmamlKwtgf7mQgr-X5uFd` |
 | B 端 Token | `Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0` |
-| 设备 ID（B 端默认） | `device-b-2` |
+| 设备 ID（B 端默认，也是官方预注册的那台） | `device-b-2` |
 
 ### B 端配置（b-side 模块 + b-app）
 
-1. 安装 `client-b-app-release.apk`，刷入 `ommega-b-release-1.6.1.zip` 并重启（该 zip 同时包含 arm64-v8a 与 x86_64，安装时按设备架构自动选）
+1. 安装 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 里的 `client-b-app-release.apk`，刷入同页的 `ommega-b-release-<版本>.zip` 并重启（该 zip 同时包含 arm64-v8a 与 x86_64，安装时按设备架构自动选）
 2. 编辑 `/data/adb/ommega/relay.conf`，填入官方配置：
 
 ```
@@ -50,7 +51,7 @@ OMMEGA_RELAY_TOKEN=Mytju8b0_lhLlqTKcEUhuwSbAsAtjom0
 
 ### A 端配置（a-side 模块）
 
-1. 刷入 `ommega-a-release-1.5.0.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
+1. 刷入 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 里的 `ommega-a-release-<版本>.zip` 并重启（该 zip 同时包含 arm64-v8a / armeabi-v7a / x86 / x86_64，安装时按设备架构自动选择）
 2. 编辑 `/data/adb/ommega/ommegadata/config`（或模块 WebUI 中配置），填入官方配置：
 
 ```
