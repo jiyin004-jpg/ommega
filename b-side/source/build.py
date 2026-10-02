@@ -25,7 +25,7 @@ except ModuleNotFoundError:
 REPO_ROOT = Path(__file__).resolve().parent
 TARGET_ROOT = REPO_ROOT / "target"
 
-# 版本号唯一来源：仓库根的 VERSION（A 模块 / B 模块 / b-app / 服务端 四端必须一致）。
+# 版本号唯一来源：仓库根的 VERSION（三端同号，b-app 跟 B 端一起走）。
 VERSION_FILE = REPO_ROOT.parent.parent / "VERSION"
 
 

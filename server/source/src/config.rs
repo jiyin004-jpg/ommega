@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-/// 版本号唯一来源 = 仓库根的 `VERSION`（A 模块 / B 模块 / b-app / 服务端 四端一致）。
+/// 版本号唯一来源 = 仓库根的 `VERSION`（三端同号，b-app 跟 B 端一起走）。
 ///
 /// `Cargo.toml` 的 version 在编译期被写进二进制，所以这里用 `env!` 读它，再由
 /// `version_tests` 里的单测强制它等于 `VERSION` 文件：只改一处会在 `cargo test` 直接红。

@@ -3,7 +3,7 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
-// 版本号唯一来源 = 仓库根的 VERSION（A 模块 / B 模块 / b-app / 服务端 四端一致）。
+// 版本号唯一来源 = 仓库根的 VERSION（三端同号，b-app 跟 B 端一起走）。
 val ommegaVersion = file("$rootDir/../../VERSION").readText().trim()
 
 // versionCode 由版本号推出：major*1000000 + minor*1000 + patch（1.5.0 -> 1500000），
