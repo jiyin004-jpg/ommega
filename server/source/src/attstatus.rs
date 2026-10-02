@@ -46,6 +46,11 @@ impl StatusList {
         self.entries.len()
     }
 
+    /// 表空不空。有 `len` 就得有它（clippy 的 `len_without_is_empty`）。
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -163,7 +168,7 @@ fn key_aliases(key: &str) -> Vec<String> {
 
 /// 十六进制字符串转字节。长度为奇、太长、含非 hex 字符都算不认。
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || s.len() > 128 || s.len() % 2 != 0 {
+    if s.is_empty() || s.len() > 128 || !s.len().is_multiple_of(2) {
         return None;
     }
     let b = s.as_bytes();

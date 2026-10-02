@@ -35,7 +35,9 @@ const OID_ORG_NAME: &[u64] = &[2, 5, 4, 10];
 const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
 /// Google keybox 那两张「TEE」中间证书用的两个属性。真机链是
 /// (title, serialNumber)，2019 年流出的公开 keybox 是反的 —— 见 `RdnShape`。
+#[cfg(test)]
 const OID_TITLE: &[u64] = &[2, 5, 4, 12];
+#[cfg(test)]
 const OID_SERIAL_NUMBER: &[u64] = &[2, 5, 4, 5];
 
 pub const KM_ALG_EC: i64 = 3;
@@ -243,7 +245,7 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
         .user_auth
         .iter()
         .map(|(tag, _)| *tag)
-        .filter(|tag| matches!(tag, 503 | 504 | 505 | 506 | 507 | 508 | 509))
+        .filter(|tag| matches!(tag, 503..=509))
         .collect();
     user_auth.sort_unstable();
     user_auth.dedup();

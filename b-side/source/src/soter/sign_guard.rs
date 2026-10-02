@@ -52,7 +52,7 @@ impl SignGuard {
     pub(super) fn finish_allowed(&mut self, session: i64, now: Instant) -> bool {
         self.expire(now);
         // No local lease may mean a session established before this process started.
-        self.active.map_or(true, |(active, _)| active == session)
+        self.active.is_none_or(|(active, _)| active == session)
     }
 
     pub(super) fn probe_allowed(&mut self, now: Instant) -> bool {

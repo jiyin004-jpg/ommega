@@ -232,7 +232,7 @@ impl Parcel {
     /// `Parcel::writeInplace` 每次写完都会 `pad_size(len)` 补零，就是为这个。
     fn write(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
-        while self.data.len() % 4 != 0 {
+        while !self.data.len().is_multiple_of(4) {
             self.data.push(0);
         }
     }
@@ -529,7 +529,7 @@ impl HwBinder {
     pub fn is_mapped(&self, addr: usize, len: usize) -> bool {
         let start = self.map as usize;
         let end = start + self.map_len;
-        addr >= start && addr.checked_add(len).map_or(false, |e| e <= end)
+        addr >= start && addr.checked_add(len).is_some_and(|e| e <= end)
     }
 
     /// 把 mmap 区里一段拷出来。调用方先用 [`Self::is_mapped`] 验过。
@@ -563,7 +563,7 @@ impl HwBinder {
         if self
             .acquired
             .lock()
-            .map_or(false, |held| held.contains(&handle))
+            .is_ok_and(|held| held.contains(&handle))
         {
             return Ok(());
         }
@@ -595,8 +595,7 @@ impl HwBinder {
             sender_euid: 0,
             data_size: parcel.data().len() as BinderSize,
             // 内核这里是字节数，不是元素个数。
-            offsets_size: (parcel.offsets().len() * std::mem::size_of::<BinderSize>())
-                as BinderSize,
+            offsets_size: std::mem::size_of_val(parcel.offsets()) as BinderSize,
             data_buffer: parcel.data().as_ptr() as u64,
             data_offsets: if parcel.offsets().is_empty() {
                 0

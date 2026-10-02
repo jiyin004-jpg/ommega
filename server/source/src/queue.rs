@@ -669,7 +669,7 @@ impl TaskStore {
                     continue;
                 };
                 let p = task_priority(&t.task_type);
-                if best.map_or(true, |(bp, _)| p < bp) {
+                if best.is_none_or(|(bp, _)| p < bp) {
                     best = Some((p, idx));
                 }
             }
@@ -2749,12 +2749,12 @@ mod priority_tests {
         let t = Duration::from_millis(50);
         let caps = DeviceCaps::default();
         let first = store
-            .pop_for_b(dev, "M-1", caps.clone(), t)
+            .pop_for_b(dev, "M-1", caps, t)
             .await
             .expect("应该能领到活");
         assert_eq!(first.task_id, attest, "attest 要先被领走（RKP 那条腿）");
         let second = store
-            .pop_for_b(dev, "M-1", caps.clone(), t)
+            .pop_for_b(dev, "M-1", caps, t)
             .await
             .expect("应该能领到活");
         assert_eq!(second.task_id, sign, "sign 次之");
@@ -2776,11 +2776,7 @@ mod priority_tests {
         let t = Duration::from_millis(50);
         let caps = DeviceCaps::default();
         assert_eq!(
-            store
-                .pop_for_b(dev, "M-1", caps.clone(), t)
-                .await
-                .unwrap()
-                .task_id,
+            store.pop_for_b(dev, "M-1", caps, t).await.unwrap().task_id,
             a
         );
         assert_eq!(

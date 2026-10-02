@@ -1210,37 +1210,6 @@ fn derive_remote_serial(alias: &str, challenge: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-#[cfg(test)]
-mod remote_alias_tests {
-    use super::*;
-
-    struct CountingRng(u8);
-
-    impl crypto::Rng for CountingRng {
-        fn add_entropy(&mut self, _data: &[u8]) {}
-
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
-            self.0 += 1;
-            dest.fill(self.0);
-        }
-    }
-
-    #[test]
-    fn each_key_creation_allocates_one_random_alias() {
-        let mut rng = CountingRng(0);
-        let first = new_remote_alias(&mut rng);
-        let second = new_remote_alias(&mut rng);
-        assert_ne!(first, second);
-        assert_eq!(first, "ommega-remote-01010101010101010101010101010101");
-        assert_eq!(second, "ommega-remote-02020202020202020202020202020202");
-        assert_eq!(rng.0, 2);
-        // Reusing the allocated identity also preserves the derived serial.
-        let serial = derive_remote_serial(&first, b"same challenge");
-        assert_eq!(serial, derive_remote_serial(&first, b"same challenge"));
-        assert_ne!(serial, derive_remote_serial(&second, b"same challenge"));
-    }
-}
-
 /// SHA-256 digest via the `sha2` crate.
 fn self_hash_sha256(data: &[u8]) -> Vec<u8> {
     use sha2::{Digest as _, Sha256};
@@ -1300,4 +1269,35 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
         }
     }
     out
+}
+
+#[cfg(test)]
+mod remote_alias_tests {
+    use super::*;
+
+    struct CountingRng(u8);
+
+    impl crypto::Rng for CountingRng {
+        fn add_entropy(&mut self, _data: &[u8]) {}
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.0 += 1;
+            dest.fill(self.0);
+        }
+    }
+
+    #[test]
+    fn each_key_creation_allocates_one_random_alias() {
+        let mut rng = CountingRng(0);
+        let first = new_remote_alias(&mut rng);
+        let second = new_remote_alias(&mut rng);
+        assert_ne!(first, second);
+        assert_eq!(first, "ommega-remote-01010101010101010101010101010101");
+        assert_eq!(second, "ommega-remote-02020202020202020202020202020202");
+        assert_eq!(rng.0, 2);
+        // Reusing the allocated identity also preserves the derived serial.
+        let serial = derive_remote_serial(&first, b"same challenge");
+        assert_eq!(serial, derive_remote_serial(&first, b"same challenge"));
+        assert_ne!(serial, derive_remote_serial(&second, b"same challenge"));
+    }
 }

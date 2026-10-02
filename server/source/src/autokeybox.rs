@@ -190,8 +190,8 @@ pub fn configured_sources() -> Vec<KeyboxSource> {
     ]
 }
 
-/// Fetch a URL over http/https, returning the body text.
-///
+// Fetch a URL over http/https, returning the body text.
+//
 // 取网页文本统一走 `crate::http::get_text`（那边记了为什么不用 reqwest）。
 
 /// Fetch the source body.
