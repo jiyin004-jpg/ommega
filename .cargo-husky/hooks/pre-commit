@@ -1,8 +1,8 @@
 #!/bin/sh
 # 提交前跑 Rust 格式检查。
-# a-side 和 server 是两个独立工作区，谁有改动的 .rs 就查谁。
+# 三个工作区（a-side / b-side / server）都是独立的，谁有改动的 .rs 就查谁。
 # AGENTS.md 里那份完整门禁（clippy + Android 目标编译 + 真机跑测试）太慢，
-# 留给发版流程，这里只挡格式漂移。
+# 留给发版流程和 CI，这里只挡格式漂移。
 root=$(git rev-parse --show-toplevel)
 staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
 if [ -z "$staged" ]; then
@@ -10,7 +10,7 @@ if [ -z "$staged" ]; then
 fi
 
 failed=""
-for ws in a-side/source server/source; do
+for ws in a-side/source b-side/source server/source; do
     case "$staged" in
         *"$ws/"*) ;;
         *) continue ;;

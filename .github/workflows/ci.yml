@@ -1,0 +1,126 @@
+# 三端的代码门禁：格式、clippy、编译/跑测试。
+#
+# 为什么分两个 job、为什么 A/B 端只编不跑：
+#   A/B 端只能编到 aarch64 目标（b-side 依赖的 rsproperties 只对 Linux/Android 生效，
+#   裸 cargo check 必挂，看着像代码坏了），测试二进制也只能编、不能在 CI 里执行 ——
+#   真机那一层留给人，见 a-side/source/AGENTS.md 的「Validation and Deployment」。
+#   server 是 host 目标，测试能真跑，所以它跑 cargo test。
+#
+# clippy 带 -D warnings：三端的警告已经清干净了，带上才拦得住回潮。
+# 本地那道 pre-commit 钩子只查格式（钩子脚本在仓库根的 .cargo-husky/hooks/），
+# 完整门禁在这里。
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --component rustfmt
+          rustup default stable
+
+      - name: cargo fmt --check
+        run: |
+          set -euo pipefail
+          for ws in a-side/source b-side/source server/source; do
+            echo "== $ws =="
+            cargo fmt --manifest-path "$ws/Cargo.toml" --all -- --check
+          done
+
+  gate:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: a-side
+            ws: a-side/source
+            target: aarch64-linux-android
+          - name: b-side
+            ws: b-side/source
+            target: aarch64-linux-android
+          - name: server
+            ws: server/source
+            target: ""
+    env:
+      ANDROID_NDK_ROOT: /home/runner/android-ndk-r27d
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup default stable
+
+      - name: 取 NDK 缓存
+        if: matrix.target != ''
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/android-ndk-r27d
+          key: android-ndk-r27d-linux
+
+      - name: 下 NDK r27d
+        if: matrix.target != '' && steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 --max-time 900 -o /tmp/ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q /tmp/ndk.zip -d /home/runner
+          rm -f /tmp/ndk.zip
+          test -x "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+
+      - name: 生成 .cargo/config.toml
+        if: matrix.target != ''
+        working-directory: ${{ matrix.ws }}
+        run: python3 scripts/setup_cargo_config.py
+
+      - name: 取 cargo 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ matrix.ws }}/target
+          key: cargo-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.ws)) }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.name }}-
+
+      - name: clippy
+        working-directory: ${{ matrix.ws }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo clippy --target "${{ matrix.target }}" --workspace --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --all-targets -- -D warnings
+          fi
+
+      - name: 测试
+        working-directory: ${{ matrix.ws }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.target }}" ]; then
+            # 只编不跑：这些测试二进制要在真机 aarch64 上执行，CI 里没有设备。
+            cargo test --target "${{ matrix.target }}" --workspace --no-run
+          else
+            cargo test --workspace
+          fi

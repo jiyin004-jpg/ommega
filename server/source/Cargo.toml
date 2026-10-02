@@ -58,6 +58,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# 本地提交前钩子（钩子脚本在仓库根的 .cargo-husky/hooks/）。三端都声明一份，
+# 这样在哪个工作区跑 cargo test 都能把钩子装上——钩子不进版本库，只装到 .git/hooks/。
+cargo-husky = { version = "1.5.0", default-features = false, features = ["user-hooks"] }
 
 [profile.release]
 opt-level = 2
