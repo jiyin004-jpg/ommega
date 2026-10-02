@@ -191,6 +191,9 @@ pub struct TaskCounts {
 #[derive(Default)]
 struct Inner {
     tasks: HashMap<String, Task>,
+    /// Only open tasks own senders. Receivers retain published results even
+    /// if the terminal task is pruned before the waiter gets scheduled.
+    result_senders: HashMap<String, watch::Sender<Option<Value>>>,
     /// Per-device pending queues: device_id -> FIFO of task_ids targeting it.
     pending_by_device: HashMap<String, VecDeque<String>>,
     /// Pending tasks with no target device (any device can claim them).
@@ -226,7 +229,7 @@ struct Inner {
 pub struct TaskStore {
     inner: Mutex<Inner>,
     /// Woken whenever a new pending task appears (long-poll support).
-    /// 有新任务、或有结果落地时递增的版本号。等的人订阅它，见 [`Self::bump_tick`]。
+    /// 有新任务、或有结果落地时递增的版本号，仅 B 端订阅。
     tick: watch::Sender<u64>,
     /// Sync snapshot of recently-polling device ids (seen within the online
     /// window) so blocking threads (e.g. the auto-keybox loop) can read "who is
@@ -359,6 +362,9 @@ impl TaskStore {
                 status: TaskStatus::Pending,
             },
         );
+        inner
+            .result_senders
+            .insert(task_id.clone(), watch::channel(None).0);
         // Enqueue into the per-device bucket or the wildcard queue.
         if target_device_id.is_empty() {
             inner.pending_any.push_back(task_id.clone());
@@ -374,7 +380,7 @@ impl TaskStore {
         task_id
     }
 
-    /// 叫醒所有挂着等的请求（B 端等活、A 端等结果，两处都用它）。
+    /// 叫醒 B 端等活的请求；A 端用独立的任务结果 watch。
     ///
     /// 用 `watch` 的版本号，而不是 `Notify::notify_waiters()`：后者只唤醒「此刻已经
     /// 注册上」的等待者，入队与注册之间那一瞬的通知会丢，等的人只能靠兜底轮询醒过来
@@ -410,7 +416,10 @@ impl TaskStore {
     /// 时得自己按窗口筛一遍，不能信队列里的残留 —— 否则“曾经忙、现在闲着”的
     /// 机器负载一直挂在高位，被排在负载 0 的新机器后面，越闲越派不到活。
     fn window_activity_locked(inner: &Inner, device_id: &str) -> u64 {
-        let now = Self::now_ms();
+        Self::window_activity_at(inner, device_id, Self::now_ms())
+    }
+
+    fn window_activity_at(inner: &Inner, device_id: &str, now: u64) -> u64 {
         inner
             .device_events
             .get(device_id)
@@ -517,6 +526,9 @@ impl TaskStore {
                         },
                     );
                     inner
+                        .result_senders
+                        .insert(task_id.clone(), watch::channel(None).0);
+                    inner
                         .pending_by_device
                         .entry(device_id.to_string())
                         .or_default()
@@ -552,7 +564,7 @@ impl TaskStore {
     }
 
     /// Try to dequeue a task matching this device from the FIFO.
-    /// O(1): checks per-device queue first, then the wildcard queue.
+    /// Checks per-device priority queue first, then the wildcard FIFO.
     fn dequeue_locked(&self, inner: &mut Inner, device_id: &str) -> Option<Task> {
         // 说过不支持的设备不该拿到 SOTER 任务：正常路径上 `resolve_soter_target`
         // 已经把它排除了，这里是兜底（比如设备在上报之后能力又变了）。
@@ -571,8 +583,6 @@ impl TaskStore {
             .unwrap_or((true, true));
         // 1) Try device-specific queue first.
         //
-        // 扫描上限设成本轮开始的长度：做不了的 SOTER 任务会被推到队尾，
-        // 不设上限就会在“弹出→推回→再弹出”里转不出去。
         let mut picked: Option<Task> = None;
         let mut deferred: Vec<String> = Vec::new();
         if let Some(q) = inner.pending_by_device.get_mut(device_id) {
@@ -582,44 +592,63 @@ impl TaskStore {
             // 同一条队。RKP / attest 这一路是远端一跳，Duck Detector 拿它跟本地
             // attest 的 13ms 比延迟（delta >= 120ms 就红），排在几十条别的活后面
             // 必然红。soter 那些 op 本来就有短 TTL 合并，晚几毫秒无所谓。
-            let ids: Vec<String> = q.iter().cloned().collect();
+            // 原地清掉失效引用，能力变化后做不了的定向任务收集起来终结，
+            // 不迁移身份。无需克隆整条队列再按 id 查找/删除一次。
+            q.retain(|id| {
+                let Some(t) = inner.tasks.get(id) else {
+                    return false;
+                };
+                if t.status != TaskStatus::Pending {
+                    return false;
+                }
+                let cannot_sign = !soter_sign_ok && task_needs_soter_sign(t);
+                if t.task_type == "soter" && (!soter_ok || cannot_sign) {
+                    deferred.push(id.clone());
+                    return false;
+                }
+                true
+            });
             let mut best: Option<(u8, usize)> = None;
-            for (idx, id) in ids.iter().enumerate() {
+            for (idx, id) in q.iter().enumerate() {
                 let Some(t) = inner.tasks.get(id) else {
                     continue;
                 };
-                let cannot_sign = !soter_sign_ok && task_needs_soter_sign(t);
-                if t.task_type == "soter" && (!soter_ok || cannot_sign) {
-                    // 这台说它做不了 SOTER（或者只做不了签名那两步）。任务本身还等着人做，不能就这么
-                    // 从队列里没了（那就只剩 TTL 扫到才被标失败），先收着。
-                    deferred.push(id.clone());
-                    continue;
-                }
                 let p = task_priority(&t.task_type);
                 if best.map_or(true, |(bp, _)| p < bp) {
                     best = Some((p, idx));
                 }
             }
             if let Some((_, idx)) = best {
-                let candidate_id = ids[idx].clone();
-                if let Some(t) = inner.tasks.get_mut(&candidate_id) {
-                    t.assigned_device_id = Some(device_id.to_string());
-                    t.assigned_at_ms = Self::now_ms();
-                    t.status = TaskStatus::Assigned;
-                    picked = Some(t.clone());
-                }
-                if let Some(pos) = q.iter().position(|x| *x == candidate_id) {
-                    q.remove(pos);
+                if let Some(candidate_id) = q.remove(idx) {
+                    if let Some(t) = inner.tasks.get_mut(&candidate_id) {
+                        if t.status == TaskStatus::Pending {
+                            t.assigned_device_id = Some(device_id.to_string());
+                            t.assigned_at_ms = Self::now_ms();
+                            t.status = TaskStatus::Assigned;
+                            picked = Some(t.clone());
+                        }
+                    }
                 }
             }
             // Queue drained and nothing matched — drop the entry to save memory.
-            if picked.is_none() && q.is_empty() {
+            if q.is_empty() {
                 inner.pending_by_device.remove(device_id);
             }
         }
-        // 做不了的那些交给通配队列：换台做得了的设备领走，别压在原地。
+        // 定向设备仍在线，只是能力在入队后变化：不能换另一台的钥匙。
+        // 快速终结这层失败，让调用者的既有回退策略接手。
         for id in deferred {
-            inner.pending_any.push_back(id);
+            let now = Self::now_ms();
+            if let Some(task) = inner.tasks.get_mut(&id) {
+                task.status = TaskStatus::Failed;
+                task.completed_at_ms = now;
+                task.result = Some(serde_json::json!({
+                    "error": "target device cannot execute this SOTER operation",
+                    "relay_error_kind": if !soter_ok { "soter_unsupported" } else { "soter_nosign" }
+                }));
+                inner.failed_queue.push_back((now, id.clone()));
+            }
+            Self::publish_result_locked(inner, &id);
         }
         if picked.is_some() {
             return picked;
@@ -636,6 +665,10 @@ impl TaskStore {
                 // Stale id (task no longer exists) — drop it.
                 continue;
             };
+            if t.status != TaskStatus::Pending {
+                // 回收后的晚到结果、重复引用都不能再次派发。
+                continue;
+            }
             let cannot_sign = !soter_sign_ok && task_needs_soter_sign(t);
             if t.task_type == "soter" && (!soter_ok || cannot_sign) {
                 // 同上：放回队尾，留给做得了的设备。
@@ -666,6 +699,15 @@ impl TaskStore {
         self.expire_locked(inner);
     }
 
+    /// Publish under the terminal transition's lock, then drop the sender.
+    /// watch retains the final value and cannot lose a wake during subscription.
+    fn publish_result_locked(inner: &mut Inner, task_id: &str) {
+        if let Some(tx) = inner.result_senders.remove(task_id) {
+            let result = inner.tasks.get(task_id).and_then(|t| t.result.clone());
+            tx.send_replace(result);
+        }
+    }
+
     /// Expire stale pending tasks and prune old completed/failed tasks.
     /// Must be called while holding `inner` lock.
     fn expire_locked(&self, inner: &mut Inner) {
@@ -692,6 +734,7 @@ impl TaskStore {
                 t.completed_at_ms = now;
                 inner.failed_queue.push_back((now, id.clone()));
             }
+            Self::publish_result_locked(inner, id);
         }
         // Remove expired tasks from per-device and wildcard queues.
         if !expired_pending.is_empty() {
@@ -766,6 +809,7 @@ impl TaskStore {
                     }));
                     t.completed_at_ms = now;
                     inner.failed_queue.push_back((now, id.clone()));
+                    Self::publish_result_locked(inner, &id);
                     continue;
                 }
                 t.status = TaskStatus::Pending;
@@ -912,8 +956,9 @@ impl TaskStore {
         } else {
             inner.completed_queue.push_back((now, task_id.to_string()));
         }
+        Self::publish_result_locked(&mut inner, task_id);
         // 任务本身（结果 + 状态 + 归属 + 队列）到这里已经全部落定，先把锁放掉：
-        // A 端的 wait_for_result 只认 status，所以 notify 一响它立刻就能取走结果。
+        // A 端已由独立 watch 收到结果，不必再次争抢 inner 锁。
         // 下面那串"状态页的活儿"不该再挡在它前面。
         drop(inner);
         self.bump_tick();
@@ -971,31 +1016,77 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Wait for a task result, polling internally. Returns the result or None on timeout.
+    /// Wait on this task alone. Returns the result or None at the original timeout.
     pub async fn wait_for_result(&self, task_id: &str, timeout: Duration) -> Option<Value> {
         let deadline = Instant::now() + timeout;
-        // 订阅版本号：结果落地那一刻不管我们有没有注册上，`changed()` 都会立刻返回。
-        let mut rx = self.tick.subscribe();
-        loop {
-            {
-                let inner = self.inner.lock().await;
-                if let Some(t) = inner.tasks.get(task_id) {
-                    if t.status == TaskStatus::Completed || t.status == TaskStatus::Failed {
-                        return t.result.clone();
-                    }
+        let rx = {
+            let inner = self.inner.lock().await;
+            if let Some(t) = inner.tasks.get(task_id) {
+                if matches!(t.status, TaskStatus::Completed | TaskStatus::Failed) {
+                    return t.result.clone();
                 }
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            // 版本号变了就是结果落地了；兜底轮询只防「消息真丢了」。
-            let poll_interval = remaining.min(Duration::from_millis(100));
-            tokio::select! {
-                _ = rx.changed() => {},
-                _ = tokio::time::sleep(poll_interval) => {},
+            // Subscribe while holding the transition lock: no check/subscribe gap.
+            inner.result_senders.get(task_id).map(|tx| tx.subscribe())
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Some(mut rx) = rx {
+            let result = tokio::time::timeout(remaining, async {
+                loop {
+                    if let Some(result) = rx.borrow_and_update().clone() {
+                        return Some(result);
+                    }
+                    if rx.changed().await.is_err() {
+                        // cancel closes without a result; preserve timeout semantics.
+                        return None;
+                    }
+                }
+            })
+            .await;
+            if let Ok(Some(result)) = result {
+                return Some(result);
             }
         }
+        // Missing/cancelled tasks used to poll until the deadline, not return early.
+        tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
+        // 尚未派发的请求已无人等待，不能在调用者回退后再去建/删钥匙。
+        // 已派发的 TEE 操作无法撤回，保留既有晚到结果和回收语义。
+        let mut inner = self.inner.lock().await;
+        let target = inner
+            .tasks
+            .get(task_id)
+            .filter(|task| task.status == TaskStatus::Pending && task.attempts == 0)
+            .map(|task| task.target_device_id.clone());
+        if let Some(target) = target {
+            let now = Self::now_ms();
+            if let Some(task) = inner.tasks.get_mut(task_id) {
+                task.status = TaskStatus::Failed;
+                task.completed_at_ms = now;
+                task.result =
+                    Some(serde_json::json!({"error": "request deadline exceeded before dispatch"}));
+            }
+            if target.is_empty() {
+                inner.pending_any.retain(|id| id != task_id);
+            } else if let Some(q) = inner.pending_by_device.get_mut(&target) {
+                q.retain(|id| id != task_id);
+                if q.is_empty() {
+                    inner.pending_by_device.remove(&target);
+                }
+            }
+            inner.failed_queue.push_back((now, task_id.to_string()));
+            Self::publish_result_locked(&mut inner, task_id);
+        }
+        None
+    }
+
+    /// Actual dispatch identity; avoid cloning and sorting the entire task table.
+    pub async fn assigned_device_for_task(&self, task_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .await
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.assigned_device_id.clone())
     }
 
     pub async fn list_tasks(&self, limit: usize) -> Vec<Task> {
@@ -1023,6 +1114,7 @@ impl TaskStore {
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
         if inner.tasks.remove(task_id).is_some() {
+            inner.result_senders.remove(task_id);
             // Remove from all pending queues.
             for queue in inner.pending_by_device.values_mut() {
                 queue.retain(|id| id != task_id);
@@ -1096,6 +1188,16 @@ impl TaskStore {
         let mut inner = self.inner.lock().await;
         let now = Self::now_ms();
 
+        // 点名在线设备直接命中，不必为每笔定向请求扫描设备/任务表。
+        if !requested_did.is_empty()
+            && inner
+                .devices
+                .get(requested_did)
+                .is_some_and(|d| now.saturating_sub(d.last_seen_ms) < 120_000)
+        {
+            return requested_did.to_string();
+        }
+
         // Collect online device IDs (seen within the last 120 s).
         let online_ids: Vec<String> = inner
             .devices
@@ -1105,10 +1207,6 @@ impl TaskStore {
             .collect();
 
         if online_ids.is_empty() {
-            return requested_did.to_string();
-        }
-
-        if !requested_did.is_empty() && online_ids.iter().any(|id| id == requested_did) {
             return requested_did.to_string();
         }
 
@@ -1133,18 +1231,12 @@ impl TaskStore {
         // `get_device_load`. Secondary = currently active (pending/assigned)
         // tasks targeting or claimed by the device. Exact ties are broken
         // round-robin so one device isn't always picked when several are idle.
+        let active_counts = Self::active_counts_locked(&inner);
         let mut candidates: Vec<(String, u64, usize)> = online_ids
             .iter()
             .map(|id| {
                 let events = Self::window_activity_locked(&inner, id);
-                let active = inner
-                    .tasks
-                    .values()
-                    .filter(|t| {
-                        t.assigned_device_id.as_deref() == Some(id) || t.target_device_id == *id
-                    })
-                    .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Assigned))
-                    .count();
+                let active = active_counts.get(id.as_str()).copied().unwrap_or(0);
                 (id.clone(), events, active)
             })
             .collect();
@@ -1169,13 +1261,34 @@ impl TaskStore {
         chosen
     }
 
+    /// 一次扫描算出各设备的活动任务数，避免每个候选设备各扫一次 tasks。
+    /// target 和 assigned 相同时只计一次，保持原来的 OR 计数口径。
+    fn active_counts_locked(inner: &Inner) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        for task in inner.tasks.values() {
+            if !matches!(task.status, TaskStatus::Pending | TaskStatus::Assigned) {
+                continue;
+            }
+            *counts.entry(task.target_device_id.as_str()).or_default() += 1;
+            if let Some(assigned) = task.assigned_device_id.as_deref() {
+                if assigned != task.target_device_id {
+                    *counts.entry(assigned).or_default() += 1;
+                }
+            }
+        }
+        counts
+            .into_iter()
+            .map(|(id, count)| (id.to_string(), count))
+            .collect()
+    }
+
     /// Resolve the target for a SOTER task.
     ///
     /// SOTER 的答案是在目标设备的 TEE 里签的，换台设备就换了身份，所以它跟认证
     /// 不一样，没有 keybox / self_signed 兜底，只能挑一台真能做的设备：
     ///
-    /// 1. 指定的设备在线、且上报了支持 SOTER → 就用它；
-    /// 2. 否则在"上报了支持"的在线设备里按负载挑一台；
+    /// 1. 指定的设备在线 → 能力允许就用它，否则 None，不换设备身份；
+    /// 2. 未指定或指定设备离线 → 在"上报了支持"的在线设备里按负载挑一台；
     /// 3. 再否则（没有设备上报过能力，比如老版本 relay）在"没上报"的设备里按负载挑；
     /// 4. 都没有 → `None`，调用方自己降级。
     ///
@@ -1187,6 +1300,16 @@ impl TaskStore {
     ) -> Option<String> {
         let mut inner = self.inner.lock().await;
         let now = Self::now_ms();
+        // 在线点名不能因能力不足/未知而改派，只有离线才回退。
+        if !requested_did.is_empty() {
+            if let Some(d) = inner.devices.get(requested_did) {
+                if now.saturating_sub(d.last_seen_ms) < 120_000 {
+                    return (d.supports_soter != Some(false)
+                        && !(needs_sign && d.soter_nosign == Some(true)))
+                    .then(|| requested_did.to_string());
+                }
+            }
+        }
         // 先把手上的设备快照出来（只取判路由要的字段），免得后面算负载时
         // 和 `load_balance_index` 的写操作撞借用。
         let online: Vec<(String, Option<bool>)> = inner
@@ -1201,32 +1324,16 @@ impl TaskStore {
             return None;
         }
 
-        // 1) 指定的设备只要能做就直接用它 —— 这是调用方点名要的设备。
-        if !requested_did.is_empty()
-            && online
-                .iter()
-                .any(|(id, cap)| id == requested_did && *cap == Some(true))
-        {
-            return Some(requested_did.to_string());
-        }
-
         // 2/3) 负载均衡。先只有"上报支持"的一档，再退到"没上报"的一档。
         // 负载口径跟认证那条路一致（近 60 s 的活动量 + 在跑的任务数）。
+        let active_counts = Self::active_counts_locked(&inner);
         for tier in [Some(true), None] {
             let mut candidates: Vec<(String, u64, usize)> = online
                 .iter()
                 .filter(|(_, cap)| *cap == tier)
                 .map(|(id, _)| {
                     let events = Self::window_activity_locked(&inner, id);
-                    let active = inner
-                        .tasks
-                        .values()
-                        .filter(|t| {
-                            t.assigned_device_id.as_deref() == Some(id.as_str())
-                                || t.target_device_id == *id
-                        })
-                        .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Assigned))
-                        .count();
+                    let active = active_counts.get(id.as_str()).copied().unwrap_or(0);
                     (id.clone(), events, active)
                 })
                 .collect();
@@ -1522,7 +1629,7 @@ mod selfcheck_tests {
         );
     }
 
-    /// SOTER 路由：点名的设备支持就用它；不支持/没上报/不认识就落到支持的设备上。
+    /// SOTER 点名在线设备不换身份，只有离线/未指定才按能力回退。
     #[tokio::test]
     async fn soter_target_prefers_a_device_that_reported_support() {
         let store = TaskStore::new(30, 60, 100, 60, false);
@@ -1558,7 +1665,15 @@ mod selfcheck_tests {
             Some("dev-yes"),
             "点名的设备支持就应该用它"
         );
-        for requested in ["dev-none", "dev-unknown", "dev-absent", ""] {
+        assert_eq!(store.resolve_soter_target("dev-none", false).await, None);
+        assert_eq!(
+            store
+                .resolve_soter_target("dev-unknown", false)
+                .await
+                .as_deref(),
+            Some("dev-unknown")
+        );
+        for requested in ["dev-absent", ""] {
             assert_eq!(
                 store
                     .resolve_soter_target(requested, false)
@@ -1650,14 +1765,19 @@ mod selfcheck_tests {
             .expect("认证任务应该领得到");
         assert_eq!(popped.task_id, attest_task);
 
-        // SOTER 任务还在待办里，没被谁吃掉。
-        let still_pending = store
+        // 定向任务终结失败，不转移到另一台设备。
+        let failed = store
             .list_tasks(10)
             .await
             .into_iter()
             .find(|t| t.task_id == soter_task)
             .expect("任务应该还在");
-        assert_eq!(still_pending.status, TaskStatus::Pending);
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(
+            failed.result.unwrap()["relay_error_kind"],
+            "soter_unsupported"
+        );
+        assert!(store.inner.lock().await.pending_any.is_empty());
     }
 }
 
@@ -1707,7 +1827,9 @@ mod device_load_window_tests {
                 .collect(),
             );
         }
-        assert_eq!(store.get_device_load("dev").await, 4);
+        // 固定测试时钟，避免锁调度跨越毫秒边界导致偶发失败。
+        let inner = store.inner.lock().await;
+        assert_eq!(TaskStore::window_activity_at(&inner, "dev", now), 4);
     }
 
     /// 派活的口径得跟 `get_device_load` 一样：很久没动静的机器不能因为历史
@@ -1745,6 +1867,380 @@ mod device_load_window_tests {
             "dev-busy",
             "过期负载不该再压着它"
         );
+    }
+}
+
+#[cfg(test)]
+mod dequeue_regression_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capability_change_fails_named_task_without_dispatching_elsewhere() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let id = store
+            .create_task("soter", serde_json::json!({"op": "finish_sign"}), "dev")
+            .await;
+        let attest = store
+            .create_task("attest", serde_json::json!({}), "dev")
+            .await;
+        let no_sign = DeviceCaps {
+            soter: Some(true),
+            soter_nosign: Some(true),
+            ..Default::default()
+        };
+        let picked = store
+            .pop_for_b("dev", "M", no_sign, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(picked.task_id, attest);
+        for _ in 0..3 {
+            assert!(store
+                .pop_for_b("dev", "M", no_sign, Duration::ZERO)
+                .await
+                .is_none());
+        }
+        {
+            let inner = store.inner.lock().await;
+            assert!(!inner.pending_by_device.contains_key("dev"));
+            assert!(inner.pending_any.is_empty());
+            assert_eq!(inner.tasks[&id].status, TaskStatus::Failed);
+            assert!(!inner.result_senders.contains_key(&id));
+        }
+        assert!(store
+            .wait_for_result(&id, Duration::ZERO)
+            .await
+            .unwrap()
+            .get("error")
+            .is_some());
+        assert!(store
+            .pop_for_b("other", "M", DeviceCaps::default(), Duration::ZERO)
+            .await
+            .is_none());
+        let can_sign = DeviceCaps {
+            soter_nosign: Some(false),
+            ..Default::default()
+        };
+        assert!(store
+            .pop_for_b("dev", "M", can_sign, Duration::ZERO)
+            .await
+            .is_none());
+        assert!(store
+            .pop_for_b("other", "M", can_sign, Duration::ZERO)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn all_dequeue_paths_drop_non_pending_and_missing_references() {
+        for target in ["dev", ""] {
+            for status in [
+                TaskStatus::Assigned,
+                TaskStatus::Completed,
+                TaskStatus::Failed,
+            ] {
+                let store = TaskStore::new(30, 60, 100, 60, false);
+                let stale = store
+                    .create_task("attest", serde_json::json!({}), target)
+                    .await;
+                let fresh = store
+                    .create_task("sign", serde_json::json!({}), target)
+                    .await;
+                let mut inner = store.inner.lock().await;
+                inner.tasks.get_mut(&stale).unwrap().status = status.clone();
+                let q = if target.is_empty() {
+                    &mut inner.pending_any
+                } else {
+                    inner.pending_by_device.get_mut(target).unwrap()
+                };
+                q.push_front("missing".into());
+                q.push_back(stale.clone());
+                assert_eq!(
+                    store.dequeue_locked(&mut inner, "dev").unwrap().task_id,
+                    fresh
+                );
+                assert!(store.dequeue_locked(&mut inner, "dev").is_none());
+                assert_eq!(inner.tasks[&stale].status, status);
+                assert!(inner.pending_any.is_empty());
+                assert!(!inner.pending_by_device.contains_key("dev"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_result_after_reclaim_is_not_dispatched_again() {
+        for target in ["dev", ""] {
+            let store = TaskStore::new(30, 60, 100, 60, false);
+            let id = store
+                .create_task("sign", serde_json::json!({}), target)
+                .await;
+            assert!(store
+                .pop_for_b("dev", "M", DeviceCaps::default(), Duration::ZERO)
+                .await
+                .is_some());
+            {
+                let mut inner = store.inner.lock().await;
+                inner.tasks.get_mut(&id).unwrap().assigned_at_ms =
+                    TaskStore::now_ms().saturating_sub(31_000);
+                store.reclaim_locked(&mut inner);
+                assert_eq!(inner.tasks[&id].status, TaskStatus::Pending);
+            }
+            store
+                .complete_task(&id, serde_json::json!({"ok": true}), "dev")
+                .await
+                .unwrap();
+            assert!(store
+                .pop_for_b("dev", "M", DeviceCaps::default(), Duration::ZERO)
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn online_named_soter_device_does_not_fall_back_on_capability() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let no_sign = DeviceCaps {
+            soter: Some(true),
+            soter_nosign: Some(true),
+            ..Default::default()
+        };
+        store.pop_for_b("named", "M", no_sign, Duration::ZERO).await;
+        store
+            .pop_for_b(
+                "other",
+                "M",
+                DeviceCaps {
+                    soter: Some(true),
+                    ..Default::default()
+                },
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(store.resolve_soter_target("named", true).await, None);
+        assert_eq!(
+            store.resolve_soter_target("named", false).await.as_deref(),
+            Some("named")
+        );
+        {
+            let mut inner = store.inner.lock().await;
+            inner.devices.get_mut("named").unwrap().last_seen_ms =
+                TaskStore::now_ms().saturating_sub(120_001);
+        }
+        assert_eq!(
+            store.resolve_soter_target("named", true).await.as_deref(),
+            Some("other")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_counts_preserve_or_semantics_and_ignore_terminal_tasks() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let same = store.create_task("sign", serde_json::json!({}), "a").await;
+        let different = store.create_task("sign", serde_json::json!({}), "a").await;
+        let done = store.create_task("sign", serde_json::json!({}), "b").await;
+        let mut inner = store.inner.lock().await;
+        inner.tasks.get_mut(&same).unwrap().assigned_device_id = Some("a".into());
+        inner.tasks.get_mut(&different).unwrap().assigned_device_id = Some("b".into());
+        inner.tasks.get_mut(&done).unwrap().status = TaskStatus::Completed;
+        let counts = TaskStore::active_counts_locked(&inner);
+        assert_eq!(counts.get("a"), Some(&2));
+        assert_eq!(counts.get("b"), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod result_watch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_timeout_stops_pending_but_not_inflight_operations() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let pending = store
+            .create_task(
+                "soter",
+                serde_json::json!({"op":"generate_auth_key_pair"}),
+                "dev",
+            )
+            .await;
+        assert_eq!(store.wait_for_result(&pending, Duration::ZERO).await, None);
+        assert!(store
+            .pop_for_b("dev", "M", DeviceCaps::default(), Duration::ZERO)
+            .await
+            .is_none());
+        {
+            let inner = store.inner.lock().await;
+            assert_eq!(inner.tasks[&pending].status, TaskStatus::Failed);
+            assert!(!inner.result_senders.contains_key(&pending));
+        }
+        let inflight = store.create_task("sign", Value::Null, "dev").await;
+        assert_eq!(
+            store
+                .pop_for_b("dev", "M", DeviceCaps::default(), Duration::ZERO)
+                .await
+                .unwrap()
+                .task_id,
+            inflight
+        );
+        assert_eq!(store.wait_for_result(&inflight, Duration::ZERO).await, None);
+        assert_eq!(
+            store.inner.lock().await.tasks[&inflight].status,
+            TaskStatus::Assigned
+        );
+        let result = serde_json::json!({"signature":"late"});
+        store
+            .complete_task(&inflight, result.clone(), "dev")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.wait_for_result(&inflight, Duration::ZERO).await,
+            Some(result)
+        );
+    }
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn early_results_and_selfcheck_have_no_subscription_gap() {
+        let store = TaskStore::new(30, 60, 100, 60, true);
+        let task = store
+            .pop_for_b("dev", "M", DeviceCaps::default(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(store
+            .inner
+            .lock()
+            .await
+            .result_senders
+            .contains_key(&task.task_id));
+        let result = serde_json::json!({"error": "selfcheck failure"});
+        store
+            .complete_task(&task.task_id, result.clone(), "dev")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.wait_for_result(&task.task_id, Duration::ZERO).await,
+            Some(result)
+        );
+        assert!(store.inner.lock().await.result_senders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn independent_tasks_do_not_wake_or_poll_each_other() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let a = store.create_task("sign", Value::Null, "").await;
+        let b = store.create_task("sign", Value::Null, "").await;
+        let count = Arc::new(WakeCount::default());
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = Box::pin(store.wait_for_result(&a, Duration::from_secs(5)));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        store
+            .complete_task(&b, serde_json::json!({"ok": "b"}), "")
+            .await
+            .unwrap();
+        store.create_task("sign", Value::Null, "").await;
+        store.bump_tick();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            0,
+            "no shared tick or 100ms polling"
+        );
+        let result = serde_json::json!({"ok": "a"});
+        store.complete_task(&a, result.clone(), "").await.unwrap();
+        // Result delivery must not need the global lock again.
+        let _guard = store.inner.lock().await;
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(Some(result)));
+    }
+
+    #[tokio::test]
+    async fn cancel_and_missing_preserve_deadline_without_senders() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let id = store.create_task("sign", Value::Null, "").await;
+        let mut wait = Box::pin(store.wait_for_result(&id, Duration::from_millis(80)));
+        let waker = Waker::from(Arc::new(WakeCount::default()));
+        let mut cx = Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        store.cancel_task(&id).await.unwrap();
+        assert!(store.inner.lock().await.result_senders.is_empty());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wait.await, None);
+        let start = Instant::now();
+        assert_eq!(
+            store
+                .wait_for_result("missing", Duration::from_millis(30))
+                .await,
+            None
+        );
+        assert!(start.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn completed_result_survives_ttl_prune_for_subscribed_waiter() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let id = store.create_task("sign", Value::Null, "").await;
+        let mut wait = Box::pin(store.wait_for_result(&id, Duration::from_secs(5)));
+        let waker = Waker::from(Arc::new(WakeCount::default()));
+        let mut cx = Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        let result = serde_json::json!({"ok": true});
+        store.complete_task(&id, result.clone(), "").await.unwrap();
+        {
+            let mut inner = store.inner.lock().await;
+            inner.completed_queue.front_mut().unwrap().0 =
+                TaskStore::now_ms().saturating_sub(61_000);
+            store.expire_locked(&mut inner);
+            assert!(!inner.tasks.contains_key(&id));
+            assert!(inner.result_senders.is_empty());
+        }
+        assert_eq!(wait.await, Some(result));
+    }
+
+    #[tokio::test]
+    async fn expiry_and_reclaim_limit_publish_before_immediate_prune() {
+        for reclaim in [false, true] {
+            let store = TaskStore::new(30, 60, 0, 60, false);
+            let id = store.create_task("sign", Value::Null, "").await;
+            let mut wait = Box::pin(store.wait_for_result(&id, Duration::from_secs(5)));
+            let waker = Waker::from(Arc::new(WakeCount::default()));
+            let mut cx = Context::from_waker(&waker);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            {
+                let mut inner = store.inner.lock().await;
+                let task = inner.tasks.get_mut(&id).unwrap();
+                if reclaim {
+                    task.status = TaskStatus::Assigned;
+                    task.assigned_at_ms = TaskStore::now_ms().saturating_sub(31_000);
+                    task.attempts = MAX_ASSIGN_ATTEMPTS - 1;
+                    store.reclaim_locked(&mut inner);
+                } else {
+                    task.created_at_ms = TaskStore::now_ms().saturating_sub(61_000);
+                }
+                store.expire_locked(&mut inner);
+                assert!(!inner.tasks.contains_key(&id));
+                assert!(inner.result_senders.is_empty());
+            }
+            let result = wait.await.unwrap();
+            assert_eq!(
+                result["error"],
+                if reclaim {
+                    "task expired: too many delivery attempts"
+                } else {
+                    "task expired: pending TTL exceeded"
+                }
+            );
+        }
     }
 }
 

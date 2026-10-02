@@ -320,12 +320,12 @@ impl crate::KeyMintTa {
                 crypto_op: match purpose {
                     KeyPurpose::Sign => CryptoOperation::RemoteSign {
                         alias: remote.alias.clone(),
-                        algorithm: remote_sign_algorithm(&params)?,
+                        algorithm: remote_sign_algorithm(key_chars, &params)?,
                         data: Vec::new(),
                     },
                     KeyPurpose::Decrypt => CryptoOperation::RemoteDecrypt {
                         alias: remote.alias.clone(),
-                        algorithm: remote_decrypt_algorithm(&params)?,
+                        algorithm: remote_decrypt_algorithm(key_chars, &params)?,
                         data: Vec::new(),
                     },
                     _ => {
@@ -540,14 +540,14 @@ fn check_begin_params(
     Ok(())
 }
 
-/// Determine the remote signing algorithm (JCA name) from the begin params.
+/// Determine the remote signing algorithm from key characteristics and begin modes.
 ///
 /// The digest and padding must be encoded into the algorithm string so the
 /// B-side real-TEE proxy mints the signature the app actually verifies: a PSS
 /// signature must not be produced as PKCS#1 v1.5 (which fails PSS verify), so
 /// RSA-PSS carries its digest plus the `/PSS` marker.
-fn remote_sign_algorithm(params: &[KeyParam]) -> Result<String, Error> {
-    let algo = get_algorithm(params)?;
+fn remote_sign_algorithm(chars: &[KeyParam], params: &[KeyParam]) -> Result<String, Error> {
+    let algo = get_algorithm(chars)?;
     match algo {
         Algorithm::Rsa => {
             let padding = get_padding_mode(params)?;
@@ -606,12 +606,16 @@ fn remote_sign_algorithm(params: &[KeyParam]) -> Result<String, Error> {
     }
 }
 
-/// Determine the remote decryption algorithm (JCA name) from the begin params.
+/// Determine the remote decryption algorithm from key characteristics and begin modes.
 ///
 /// RSA-OAEP carries its digest so the B-side real-TEE proxy can supply the
 /// required DIGEST/MGF_DIGEST at begin(DECRYPT) — without them the TEE fails,
 /// which surfaced on the A-side as UNKNOWN_ERROR (-1000) / empty plaintext.
-fn remote_decrypt_algorithm(params: &[KeyParam]) -> Result<String, Error> {
+fn remote_decrypt_algorithm(chars: &[KeyParam], params: &[KeyParam]) -> Result<String, Error> {
+    let algo = get_algorithm(chars)?;
+    if algo != Algorithm::Rsa {
+        return Err(km_err!(UnsupportedAlgorithm, "remote decrypt for {algo:?}"));
+    }
     let padding = get_padding_mode(params)?;
     match padding {
         PaddingMode::RsaOaep => {
@@ -1127,6 +1131,77 @@ mod tests {
     use kmr_common::expect_err;
     use kmr_wire::{keymint::KeyParam, KeySizeInBits};
     use std::vec;
+
+    #[test]
+    fn remote_algorithms_use_key_characteristics() {
+        let rsa_chars = vec![
+            KeyParam::Algorithm(Algorithm::Rsa),
+            KeyParam::KeySize(KeySizeInBits(2048)),
+            KeyParam::Purpose(KeyPurpose::Sign),
+            KeyParam::Purpose(KeyPurpose::Decrypt),
+            KeyParam::Padding(PaddingMode::RsaPss),
+            KeyParam::Padding(PaddingMode::RsaOaep),
+            KeyParam::Digest(Digest::Sha256),
+            KeyParam::RsaOaepMgfDigest(Digest::Sha1),
+        ];
+        let sign = vec![
+            KeyParam::Padding(PaddingMode::RsaPss),
+            KeyParam::Digest(Digest::Sha256),
+        ];
+        check_begin_params(&rsa_chars, KeyPurpose::Sign, &sign).unwrap();
+        assert_eq!(
+            remote_sign_algorithm(&rsa_chars, &sign).unwrap(),
+            "SHA256withRSA/PSS"
+        );
+        let decrypt = vec![
+            KeyParam::Padding(PaddingMode::RsaOaep),
+            KeyParam::Digest(Digest::Sha256),
+        ];
+        check_begin_params(&rsa_chars, KeyPurpose::Decrypt, &decrypt).unwrap();
+        assert_eq!(
+            remote_decrypt_algorithm(&rsa_chars, &decrypt).unwrap(),
+            "RSA/OAEP/SHA-256/MGF1-SHA1"
+        );
+        let ec_chars = vec![
+            KeyParam::Algorithm(Algorithm::Ec),
+            KeyParam::EcCurve(EcCurve::P256),
+            KeyParam::Purpose(KeyPurpose::Sign),
+            KeyParam::Digest(Digest::Sha384),
+        ];
+        let ec_sign = vec![KeyParam::Digest(Digest::Sha384)];
+        check_begin_params(&ec_chars, KeyPurpose::Sign, &ec_sign).unwrap();
+        assert_eq!(
+            remote_sign_algorithm(&ec_chars, &ec_sign).unwrap(),
+            "SHA384withECDSA"
+        );
+        // A caller-supplied algorithm must not choose the remote operation type.
+        let mut misleading = sign.clone();
+        misleading.push(KeyParam::Algorithm(Algorithm::Ec));
+        assert_eq!(
+            remote_sign_algorithm(&rsa_chars, &misleading).unwrap(),
+            "SHA256withRSA/PSS"
+        );
+        expect_err!(
+            remote_decrypt_algorithm(&ec_chars, &decrypt),
+            "UnsupportedAlgorithm"
+        );
+        expect_err!(
+            check_begin_params(&ec_chars, KeyPurpose::Decrypt, &decrypt),
+            "UnsupportedPurpose"
+        );
+        expect_err!(
+            check_begin_params(&rsa_chars, KeyPurpose::Sign, &ec_sign),
+            "UnsupportedPaddingMode"
+        );
+        let unauthorized_digest = vec![
+            KeyParam::Padding(PaddingMode::RsaPss),
+            KeyParam::Digest(Digest::Sha512),
+        ];
+        expect_err!(
+            check_begin_params(&rsa_chars, KeyPurpose::Sign, &unauthorized_digest),
+            "IncompatibleDigest"
+        );
+    }
 
     #[test]
     fn test_check_begin_params_fail() {

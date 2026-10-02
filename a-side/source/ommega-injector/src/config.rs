@@ -210,7 +210,42 @@ impl LoadContext {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CONFIG: std::cell::RefCell<Option<Arc<InjectorConfig>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scoped, thread-local configuration for routing unit tests. Never reads or
+/// seeds a device's live configuration, and restores a nested override on drop.
+#[cfg(test)]
+pub(crate) struct TestConfigGuard {
+    previous: Option<Arc<InjectorConfig>>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_config_guard(config: InjectorConfig) -> TestConfigGuard {
+    let previous = TEST_CONFIG.with(|slot| slot.replace(Some(Arc::new(config))));
+    TestConfigGuard {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestConfigGuard {
+    fn drop(&mut self) {
+        TEST_CONFIG.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
 pub fn get() -> Arc<InjectorConfig> {
+    #[cfg(test)]
+    if let Some(config) = TEST_CONFIG.with(|slot| slot.borrow().clone()) {
+        return config;
+    }
     if CONFIG.get().is_none() || WATCHER_STARTED.get().is_none() {
         ensure_initialized();
     }

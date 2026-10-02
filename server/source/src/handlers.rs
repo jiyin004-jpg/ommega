@@ -78,7 +78,7 @@ fn auth_fail() -> Response {
 ///
 /// `role`: `Some("a")` for A-side endpoints, `Some("b")` for B-side, `None` for
 /// role-agnostic endpoints (ping/health/admin status).
-fn check_auth(
+async fn check_auth(
     state: &AppState,
     headers: &HeaderMap,
     role: Option<&str>,
@@ -96,7 +96,18 @@ fn check_auth(
 
     // Authenticate first. Failed auth counts against the (much tighter)
     // invalid-request limit, keyed by client IP.
-    if !state.auth.check_token(Some(&token), role, &ip) {
+    let authorized = if state.auth.check_static_token(Some(&token)) {
+        true
+    } else {
+        let auth = state.auth.clone();
+        let token = token.clone();
+        let ip = ip.clone();
+        let role = role.map(str::to_string);
+        tokio::task::spawn_blocking(move || auth.check_token(Some(&token), role.as_deref(), &ip))
+            .await
+            .unwrap_or(false)
+    };
+    if !authorized {
         if !state.auth.allow_invalid(&ip) {
             return Err(Box::new(json_err(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -807,7 +818,7 @@ pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) 
     // Diagnostic: dump stored server identity chain (admin diagnostic). Requires
     // a valid A/B token so the keybox identity is not exposed to unauthenticated
     // callers.
-    if let Err(r) = check_auth(&state, &headers, None) {
+    if let Err(r) = check_auth(&state, &headers, None).await {
         return *r;
     }
     let Some(db) = state.db.clone() else {
@@ -843,7 +854,7 @@ pub async fn attest(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")) {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
     run_a_side_task(&state, "attest", &body).await
@@ -854,7 +865,7 @@ pub async fn sign(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")) {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
     run_a_side_task(&state, "sign", &body).await
@@ -865,7 +876,7 @@ pub async fn decrypt(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")) {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
     run_a_side_task(&state, "decrypt", &body).await
@@ -877,23 +888,16 @@ pub async fn soter(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")) {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
     run_soter_task(&state, &body).await
 }
 
-/// SOTER 转发的收尾：一笔 `finish_sign` 回来就把它的会话登记撤掉。
-///
-/// 必须放 inner 之后：补签（见 `repair_clobbered_finish`）就在 inner 里查这份登记。
+/// SOTER 入口；设备会话在 inner 的设备层补签之后按实际设备清理。
+/// 服务端回退层不消费其他设备的同号会话。
 async fn run_soter_task(state: &AppState, body: &Value) -> Response {
-    let resp = run_soter_task_inner(state, body).await;
-    if body.get("op").and_then(Value::as_str) == Some("finish_sign") {
-        if let Some(session) = body.get("session").and_then(Value::as_i64) {
-            state.sign_sessions.forget(session);
-        }
-    }
-    resp
+    run_soter_task_inner(state, body).await
 }
 
 /// 补签最多试几次。第二次是给「设备层那一瞬没答出来」准备的 —— 那种是瞬时的。
@@ -924,7 +928,8 @@ async fn repair_clobbered_finish(
     target: Option<&str>,
 ) -> Option<Value> {
     let session = body.get("session").and_then(Value::as_i64)?;
-    let spec = match state.sign_sessions.lookup(session) {
+    let device = target?;
+    let spec = match state.sign_sessions.lookup_for(device, requested, session) {
         Some(spec) => spec,
         None => {
             // 这张会话没登记（init 不是设备层答的）或者登记已经过期 —— 补不了，只能把
@@ -933,7 +938,7 @@ async fn repair_clobbered_finish(
             return None;
         }
     };
-    let (Some(alias), Some(challenge)) = (spec.alias.as_deref(), spec.challenge.as_deref()) else {
+    let Some(alias) = spec.alias.as_deref() else {
         return None;
     };
     tracing::info!(
@@ -967,6 +972,9 @@ async fn repair_once(
     let init_body = repair_init_body(body, spec.uid, alias, challenge);
     let init = try_b_soter_layer(state, &init_body, requested, target).await?;
     let init_code = init.value.get("error_code").and_then(Value::as_i64);
+    if init_code != Some(0) || init.device.as_deref() != target {
+        return None;
+    }
     let Some(new_session) = init
         .value
         .get("session")
@@ -980,9 +988,10 @@ async fn repair_once(
     if let Some(obj) = fin_body.as_object_mut() {
         obj.insert("session".to_string(), json!(new_session));
     }
-    let done = try_b_soter_layer(state, &fin_body, requested, target).await?;
+    // The new handle belongs to the device that actually answered init, not the request.
+    let done = try_b_soter_layer(state, &fin_body, requested, init.device.as_deref()).await?;
     let code = done.value.get("error_code").and_then(Value::as_i64);
-    if code != Some(0) {
+    if code != Some(0) || done.device != init.device {
         tracing::warn!("soter: 补签的 finish 也失败了（error_code={code:?}）");
         return None;
     }
@@ -1014,10 +1023,9 @@ fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Val
 /// 哪一层没做成（没物料、没能力、请求失败）就回退下一层，三层都不行才把错误回
 /// 给 A 端；A 端据此用本地密钥，本地也不行就透原生。
 ///
-/// B 端层的路由规则跟认证一样（见 `queue::resolve_soter_target`）：点名的设备
-/// 支持 SOTER 就用它，否则按负载在报过支持的设备里挑一台；一台都没有就是这层
-/// 没做成。SOTER 的答案本来是目标设备 TEE 里签的，换台设备就换了身份，所以这
-/// 一层没有"拿别的设备的密钥顶一下"这回事，只能换设备。
+/// B 端层在线点名时不换设备；离线点名且没有已登记的签名会话路由时才按能力
+/// 和负载选设备。finish 保留 init 的实际设备，无法使用原设备时走原来的回退层，
+/// 不在另一台设备上拿同号句柄补签。
 ///
 /// 服务端两层（见 `soter_mint`）用服务端自己的 RSA 物料现造一份自洽的 ASK，让
 /// A 端本地流程先闭环；腾讯那边的根谁也拿不到，这两层不假装自己是腾讯认得的东西。
@@ -1072,10 +1080,56 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     // B 端这一层有没有能接活的设备，先问一次：没有就是「这层结构性地做不了」，
     // 顺带让下面不用再解析一遍。
     let needs_sign = matches!(op, "init_sign" | "finish_sign");
-    let b_target = state
-        .store
-        .resolve_soter_target(requested, needs_sign)
-        .await;
+    let connected = state.store.get_connected_devices().await;
+    let requested_online = connected.iter().any(|d| d.device_id == requested);
+    let remembered = if op == "finish_sign" {
+        body.get("session")
+            .and_then(Value::as_i64)
+            .and_then(|s| state.sign_sessions.route(requested, s))
+    } else {
+        None
+    };
+    let session_present =
+        op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
+    // A recorded (requested device, integer session) route is authoritative.
+    // Do not let a newly-online requested device override it: the same numeric
+    // handle can refer to a different TA session on another B device.
+    let route_request = remembered.as_deref().unwrap_or(requested);
+    let resolved = if session_present {
+        // If the route is unknown or ambiguous, do not guess: sending finish to
+        // another B could operate an unrelated session with the same integer
+        // handle. If the original B is offline, let the normal non-B fallback
+        // layers decide rather than changing the requested session's route.
+        remembered.as_deref().and_then(|actual| {
+            connected
+                .iter()
+                .find(|d| d.device_id == actual)
+                .filter(|d| {
+                    d.supports_soter != Some(false) && !(needs_sign && d.soter_nosign == Some(true))
+                })
+                .map(|d| d.device_id.clone())
+        })
+    } else if requested_online {
+        // Unknown capabilities may be tried on the original device, but explicit
+        // negative capabilities must still go through the unchanged fallback layers.
+        connected
+            .iter()
+            .find(|d| d.device_id == route_request)
+            .filter(|d| {
+                d.supports_soter != Some(false) && !(needs_sign && d.soter_nosign == Some(true))
+            })
+            .map(|d| d.device_id.clone())
+    } else {
+        state
+            .store
+            .resolve_soter_target(route_request, needs_sign)
+            .await
+    };
+    let b_target = if session_present {
+        resolved
+    } else {
+        consistent_soter_target(requested_online, requested, None, resolved)
+    };
 
     // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：不拦、不排队，
     // 只拿 `init_sign` 时缓存的参数重开一张会话再签一次。B 端自己的能力探针也会在这台
@@ -1125,12 +1179,14 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     // 设备层那个失败答复（结构性失败也带着真错误码）。服务端两层都接不了这个槽位的时候
     // 把它原样还回去 —— 比递一个「钥匙不在这层」的 -5 准得多。
     let mut b_error_reply: Option<Value> = None;
+    let mut served_device: Option<String> = None;
 
     for &layer in &layers {
         let result = match layer {
             "b" => match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
                 Some(mut b) => {
                     b_structural = b.unavailable;
+                    served_device = b.device.clone();
                     if let Some(reply) = b.hardware_reply.clone() {
                         b_error_reply = Some(reply);
                     }
@@ -1141,10 +1197,18 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                         && b.value.get("error_code").and_then(Value::as_i64) == Some(-204)
                     {
                         if let Some(fixed) =
-                            repair_clobbered_finish(state, body, requested, b_target.as_deref())
+                            repair_clobbered_finish(state, body, requested, b.device.as_deref())
                                 .await
                         {
                             b.value = fixed;
+                        }
+                    }
+                    if op == "finish_sign" {
+                        if let (Some(device), Some(session)) = (
+                            b.device.as_deref(),
+                            body.get("session").and_then(Value::as_i64),
+                        ) {
+                            state.sign_sessions.forget_for(device, requested, session);
                         }
                     }
                     Some(b.value)
@@ -1182,13 +1246,15 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                 }
                 // 设备层的会话记下来：被顶掉的时候还能用同样的参数补一次（见
                 // `repair_clobbered_finish`）。
-                if layer == "b" && op == "init_sign" && code == 0 {
+                if layer == "b" && op == "init_sign" && code == 0 && served_device.is_some() {
                     if let Some(session) =
                         v.get("session").and_then(Value::as_i64).filter(|s| *s != 0)
                     {
                         state.sign_sessions.record(
+                            served_device.as_deref().unwrap(),
+                            requested,
                             session,
-                            uid.map(i64::from),
+                            body.get("uid").and_then(Value::as_i64),
                             alias_arg,
                             body.get("challenge").and_then(Value::as_str),
                         );
@@ -1237,7 +1303,25 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     )
 }
 
-/// B 端设备层：优先点名的设备，它做不了就按负载换一台报过支持的。
+/// 保留在线点名设备以及已知会话的原设备；不能接活时由原回退层处理，不能换身份。
+fn consistent_soter_target(
+    requested_online: bool,
+    requested: &str,
+    remembered: Option<&str>,
+    resolved: Option<String>,
+) -> Option<String> {
+    let required = if requested_online {
+        Some(requested)
+    } else {
+        remembered
+    };
+    match required {
+        Some(device) => resolved.filter(|target| target == device),
+        None => resolved,
+    }
+}
+
+/// B 端设备层：只派给调用方已解析并校验过的设备。
 ///
 /// 一台都没有不算"这层不管这个 op"，而是这层没做成，所以返回带 `error` 的对象，
 /// 让上层接着试服务端那两层。
@@ -1254,6 +1338,7 @@ async fn try_b_soter_layer(
                 "error": "no B-side device reporting SOTER support is online",
             }),
             unavailable: true,
+            device: None,
             hardware_reply: None,
         });
     };
@@ -1270,6 +1355,14 @@ async fn try_b_soter_layer(
         state.cfg.soter_wait_result_timeout_secs,
     )
     .await;
+    // Result device_id can be the TA's get_device_id output; use the dispatch
+    // metadata instead. Query only this task: never scan the full task table on
+    // the hot SOTER completion path.
+    let device = (match reply.get("task_id").and_then(Value::as_str) {
+        Some(task_id) => state.store.assigned_device_for_task(task_id).await,
+        None => None,
+    })
+    .filter(|d| !d.is_empty());
     if let Some(code) = soter_device_hard_failure(op, &reply) {
         return Some(BSoterLayer {
             value: json!({
@@ -1279,14 +1372,18 @@ async fn try_b_soter_layer(
                 ),
             }),
             unavailable: true,
+            device,
             hardware_reply: Some(reply),
         });
     }
     // 这里返回的是设备自己的答复，包括 `-26`「这会儿没人按指纹」和超时 —— 那是
-    // 这笔没答好，不是这层做不了，得原样递给 App 让它重试。
+    // 这笔没答好，不是这层做不了，得原样递给 App 让它重试。队列定向拒绝则是
+    // 明确的能力结论，和 resolve_soter_target 的在线能力拒绝保持同一回退策略。
+    let unavailable = soter_relay_marks_unavailable(&reply);
     Some(BSoterLayer {
         value: reply,
-        unavailable: false,
+        device,
+        unavailable,
         hardware_reply: None,
     })
 }
@@ -1298,6 +1395,8 @@ async fn try_b_soter_layer(
 /// 一次 `-26` 都不算。
 struct BSoterLayer {
     value: Value,
+    /// Relay device that actually completed the queued task (not the TA device_id).
+    device: Option<String>,
     unavailable: bool,
     /// 结构性失败时设备层那个原始答复（带着真错误码）。服务端那两层接不了同一个
     /// 槽位的时候要把它还给 App —— 该让人看见的是「这台设备真实出了什么毛病」，
@@ -1331,6 +1430,15 @@ fn layer_to_pin(served_layer: &str, b_structural: bool) -> Option<&str> {
 /// 把这些当成「这层没做成」，`run_soter_task` 就会把 `(device, uid)` 槽位挪到
 /// 服务端自签那两层：App 手里换成假料，真机再也轮不到（PLC110 的 uid 10490
 /// 就这么被钉到 self_signed 上，之后一轮流程都回不到真机）。
+/// Queue-directed relay verdicts that mean the B device cannot serve SOTER at all.
+/// Timeouts and ordinary SOTER operation errors deliberately do not match.
+fn soter_relay_marks_unavailable(reply: &Value) -> bool {
+    matches!(
+        reply.get("relay_error_kind").and_then(Value::as_str),
+        Some("soter_unsupported" | "soter_nosign")
+    )
+}
+
 fn soter_device_hard_failure(op: &str, reply: &Value) -> Option<i64> {
     let code = reply.get("error_code").and_then(Value::as_i64)?;
     if !matches!(
@@ -1455,7 +1563,7 @@ pub async fn client_report(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")) {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
     let Some(db) = state.db.clone() else {
@@ -1524,7 +1632,7 @@ pub async fn b_poll(
     headers: HeaderMap,
     Query(q): Query<PollQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("b")) {
+    if let Err(r) = check_auth(&state, &headers, Some("b")).await {
         return *r;
     }
     if q.device_id.is_empty() {
@@ -1592,7 +1700,7 @@ pub async fn b_result(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("b")) {
+    if let Err(r) = check_auth(&state, &headers, Some("b")).await {
         return *r;
     }
     let task_id = body
@@ -1624,7 +1732,7 @@ pub async fn b_upload_keybox_identity(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("b")) {
+    if let Err(r) = check_auth(&state, &headers, Some("b")).await {
         return *r;
     }
     let fulfill = state.fulfill.clone();
@@ -1664,7 +1772,7 @@ pub async fn b_revoke_server_identity(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("b")) {
+    if let Err(r) = check_auth(&state, &headers, Some("b")).await {
         return *r;
     }
     let Some(db) = state.db.clone() else {
@@ -1822,8 +1930,27 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod soter_device_layer_tests {
-    use super::{soter_device_hard_failure, soter_error_name};
+    use super::{soter_device_hard_failure, soter_error_name, soter_relay_marks_unavailable};
     use serde_json::json;
+
+    #[test]
+    fn queue_relay_capability_markers_are_unavailable_but_timeout_is_not() {
+        assert!(soter_relay_marks_unavailable(&json!({
+            "error": "SOTER unsupported",
+            "relay_error_kind": "soter_unsupported",
+        })));
+        assert!(soter_relay_marks_unavailable(&json!({
+            "error": "SOTER signing disabled",
+            "relay_error_kind": "soter_nosign",
+        })));
+        assert!(!soter_relay_marks_unavailable(&json!({
+            "error": "task timeout",
+            "relay_error_kind": "timeout",
+        })));
+        assert!(!soter_relay_marks_unavailable(&json!({
+            "error": "task timeout",
+        })));
+    }
 
     #[test]
     fn only_structural_device_errors_are_a_layer_failure() {
@@ -1904,6 +2031,31 @@ mod soter_device_layer_tests {
         assert_eq!(layer_to_pin("self_signed", true), Some("self_signed"));
         assert_eq!(layer_to_pin("keybox", true), Some("keybox"));
         assert_eq!(layer_to_pin("b", true), Some("b"));
+    }
+
+    #[test]
+    fn finish_route_does_not_follow_a_new_balancer_choice() {
+        use super::consistent_soter_target;
+        assert_eq!(
+            consistent_soter_target(false, "offline", Some("a"), Some("a".into())),
+            Some("a".into())
+        );
+        assert_eq!(
+            consistent_soter_target(false, "offline", Some("a"), Some("b".into())),
+            None
+        );
+        assert_eq!(
+            consistent_soter_target(true, "b", Some("a"), Some("b".into())),
+            Some("b".into())
+        );
+        assert_eq!(
+            consistent_soter_target(true, "b", None, Some("a".into())),
+            None
+        );
+        assert_eq!(
+            consistent_soter_target(false, "offline", None, Some("a".into())),
+            Some("a".into())
+        );
     }
 
     #[test]

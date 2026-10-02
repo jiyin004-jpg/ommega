@@ -840,7 +840,7 @@ fn decrypt_begin_params(
             return Err(anyhow!("EC keys cannot be used for decrypt"));
         }
         KeyAlgorithm::Rsa2048 => {
-            if algorithm.contains("OAEP") {
+            if algorithm.to_ascii_uppercase().contains("OAEP") {
                 let digest = digest_for_algorithm(algorithm)?;
                 let mgf = mgf_digest_for_algorithm(algorithm);
                 // OAEP requires both the digest and the MGF digest at
@@ -867,7 +867,7 @@ fn decrypt_begin_params(
 fn mgf_digest_for_algorithm(algorithm: &str) -> KmDigest {
     let up = algorithm.to_uppercase();
     if let Some(pos) = up.find("/MGF1-") {
-        let rest = &up[pos + 6..];
+        let rest = up[pos + 6..].replace('-', "");
         if rest.starts_with("SHA256") {
             return KmDigest::Sha256;
         }
@@ -885,6 +885,8 @@ fn mgf_digest_for_algorithm(algorithm: &str) -> KmDigest {
 
 fn digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
     let up = algorithm.to_uppercase();
+    // MGF1 has its own digest. Never let its suffix select the message digest.
+    let up = up.split("/MGF1-").next().unwrap_or(&up);
     if up.contains("SHA256") || up.contains("SHA-256") {
         Ok(KmDigest::Sha256)
     } else if up.contains("SHA1") || up.contains("SHA-1") {
@@ -899,6 +901,54 @@ fn digest_for_algorithm(algorithm: &str) -> Result<KmDigest> {
         // Unknown algorithm: fail loudly instead of silently producing a
         // signature over the wrong digest (which the verifier would reject).
         Err(anyhow!("unsupported digest algorithm: {algorithm}"))
+    }
+}
+
+#[cfg(test)]
+mod algorithm_digest_tests {
+    use super::*;
+
+    #[test]
+    fn oaep_message_and_mgf_digests_are_independent() {
+        for (algorithm, message, mgf) in [
+            (
+                "RSA/OAEP/SHA-384/MGF1-SHA1",
+                KmDigest::Sha384,
+                KmDigest::Sha1,
+            ),
+            (
+                "RSA/OAEP/SHA-512/MGF1-SHA1",
+                KmDigest::Sha512,
+                KmDigest::Sha1,
+            ),
+            (
+                "RSA/OAEP/SHA-1/MGF1-SHA256",
+                KmDigest::Sha1,
+                KmDigest::Sha256,
+            ),
+            (
+                "rsa/oaep/sha-384/mgf1-sha-512",
+                KmDigest::Sha384,
+                KmDigest::Sha512,
+            ),
+            ("RSA/OAEP/SHA256", KmDigest::Sha256, KmDigest::Sha1),
+        ] {
+            assert_eq!(digest_for_algorithm(algorithm).unwrap(), message);
+            assert_eq!(mgf_digest_for_algorithm(algorithm), mgf);
+        }
+        assert!(digest_for_algorithm("RSA/OAEP/UNKNOWN/MGF1-SHA256").is_err());
+    }
+
+    #[test]
+    fn signing_digest_names_keep_existing_behavior() {
+        for (algorithm, expected) in [
+            ("SHA256withRSA/PSS", KmDigest::Sha256),
+            ("SHA384withECDSA", KmDigest::Sha384),
+            ("SHA512withRSA", KmDigest::Sha512),
+            ("NONEwithECDSA", KmDigest::None),
+        ] {
+            assert_eq!(digest_for_algorithm(algorithm).unwrap(), expected);
+        }
     }
 }
 

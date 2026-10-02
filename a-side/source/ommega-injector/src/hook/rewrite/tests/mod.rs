@@ -173,14 +173,16 @@ static ROUTE_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(in crate::hook) fn route_state_test_guard() -> (
     std::sync::MutexGuard<'static, ()>,
     std::sync::MutexGuard<'static, ()>,
+    crate::config::TestConfigGuard,
 ) {
+    let config_guard = crate::config::test_config_guard(crate::config::InjectorConfig::default());
     let tracker_guard = tracker::state_test_guard();
     let route_guard = ROUTE_STATE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     super::mirror::reset_mirror_state_for_tests();
     reset_route_state_for_tests();
-    (tracker_guard, route_guard)
+    (tracker_guard, route_guard, config_guard)
 }
 
 pub(super) fn reset_route_state_for_tests() {

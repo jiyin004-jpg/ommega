@@ -8,7 +8,7 @@
 //!        - `expires_at = activated_at + duration_seconds`
 //!   3. if neither env token nor any DB token is configured, allow (back-compat)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,9 +22,9 @@ pub struct AuthState {
     pub admin_password: String,
     pub admin_extra: String,
     db: Option<Arc<Db>>,
-    rate: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
-    invalid_rate: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
-    login_rate: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    invalid_rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    login_rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
     pub rate_limit_requests: u64,
     pub invalid_rate_limit_requests: u64,
@@ -320,43 +320,55 @@ impl AuthState {
     /// Returns true if the attempt is allowed. Limits to 5 attempts per minute
     /// (independent of the general request rate limit).
     pub fn allow_login_attempt(&self, key: &str) -> bool {
-        let now = Instant::now();
         let window = Duration::from_secs(60);
         let mut map = crate::util::mu(&self.login_rate);
+        let now = Instant::now();
         let bucket = map.entry(key.to_string()).or_default();
-        bucket.retain(|t| now.duration_since(*t) < window);
+        prune_rate_bucket(bucket, now, window);
         if bucket.len() as u64 >= 5 {
             false
         } else {
-            bucket.push(now);
+            bucket.push_back(now);
             true
         }
     }
 
     fn allow_with_limit(
         &self,
-        rate: &Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+        rate: &Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
         key: &str,
         limit: u64,
     ) -> bool {
-        let now = Instant::now();
         let mut map = crate::util::mu(rate);
+        // 在锁内取时间，保证桶内时间递增，才能只弹出过期前缀。
+        let now = Instant::now();
         // key 以前是 token（就那几把），现在是 IP，来源杂得多，扫一遍全表的 IP 都
         // 会各留一个桶。桶空了不删，表只涨不消；攒到一定规模就把过期的清一遭。
-        if map.len() > RATE_MAP_MAX {
+        if map.len() > RATE_MAP_MAX && !map.contains_key(key) {
             map.retain(|_, v| {
-                v.retain(|t| now.duration_since(*t) < self.rate_limit_window);
+                prune_rate_bucket(v, now, self.rate_limit_window);
                 !v.is_empty()
             });
         }
         let bucket = map.entry(key.to_string()).or_default();
-        bucket.retain(|t| now.duration_since(*t) < self.rate_limit_window);
+        prune_rate_bucket(bucket, now, self.rate_limit_window);
         if bucket.len() as u64 >= limit {
             false
         } else {
-            bucket.push(now);
+            bucket.push_back(now);
             true
         }
+    }
+}
+
+/// 每个时间戳只入队/出队一次，热 IP 不再每次请求扫描整个窗口。
+/// 保留精确滑动窗口语义：恰好位于窗口边界的请求已经过期。
+fn prune_rate_bucket(bucket: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while bucket
+        .front()
+        .is_some_and(|t| now.duration_since(*t) >= window)
+    {
+        bucket.pop_front();
     }
 }
 
@@ -409,4 +421,74 @@ fn parse_beijing_datetime(s: &str) -> Option<i64> {
     let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
     let dt = offset.with_ymd_and_hms(y, mo, d, h, mi, sec).single()?;
     Some(dt.timestamp())
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_keeps_live_entries_and_expires_window_boundary() {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let live = now - Duration::from_secs(59);
+        let mut bucket = VecDeque::from([now - Duration::from_secs(61), now - window, live, now]);
+        prune_rate_bucket(&mut bucket, now, window);
+        assert_eq!(bucket, VecDeque::from([live, now]));
+        prune_rate_bucket(&mut bucket, now + window, window);
+        assert!(bucket.is_empty());
+    }
+
+    #[test]
+    fn limits_remain_exact_and_independent_per_ip() {
+        let auth = AuthState::new(String::new(), 2, 60, true);
+        assert!(auth.allow("one"));
+        assert!(auth.allow("one"));
+        assert!(!auth.allow("one"));
+        assert!(auth.allow("two"));
+        assert!(auth.allow_invalid("one"));
+        for _ in 0..5 {
+            assert!(auth.allow_login_attempt("one:admin"));
+        }
+        assert!(!auth.allow_login_attempt("one:admin"));
+    }
+
+    #[test]
+    fn hot_large_map_does_not_rescan_other_buckets() {
+        let auth = AuthState::new(String::new(), 2, 60, true);
+        let old = Instant::now() - Duration::from_secs(61);
+        {
+            let mut map = crate::util::mu(&auth.rate);
+            for i in 0..=RATE_MAP_MAX {
+                map.insert(format!("cold-{i}"), VecDeque::from([old]));
+            }
+            map.insert("hot".into(), VecDeque::new());
+        }
+        assert!(auth.allow("hot"));
+        assert!(crate::util::mu(&auth.rate).contains_key("cold-0"));
+        assert!(auth.allow("new-ip"));
+        assert!(!crate::util::mu(&auth.rate).contains_key("cold-0"));
+    }
+
+    #[test]
+    #[ignore = "manual hot-window performance comparison"]
+    fn bench_hot_window_pruning() {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let rounds = 2000;
+        let mut old = vec![now; 60000];
+        let start = Instant::now();
+        for _ in 0..rounds {
+            old.retain(|t| now.duration_since(*t) < window);
+        }
+        let scan = start.elapsed();
+        let mut new = VecDeque::from(vec![now; 60000]);
+        let start = Instant::now();
+        for _ in 0..rounds {
+            prune_rate_bucket(&mut new, now, window);
+        }
+        let prefix = start.elapsed();
+        assert_eq!(old.len(), new.len());
+        eprintln!("{rounds} prunes, 60000 live entries: scan={scan:?}, prefix={prefix:?}");
+    }
 }

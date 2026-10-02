@@ -612,7 +612,12 @@ pub(crate) fn interceptable(call: &SoterCall) -> bool {
 /// parcel 一直留到宿主把 `BC_FREE_BUFFER` 交回来为止** —— 这两个返回值是一个整体。
 /// `OwnedReply` 里装的是堆上的 `Parcel`，移交给调用方不会挪动数据本身，指针依旧有效。
 pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> {
-    let reply = match crate::hook::soter_relay::answer(call)? {
+    frame_br_reply(call, crate::hook::soter_relay::answer(call)?)
+}
+
+/// Frame an already resolved answer without contacting the daemon or local key state.
+fn frame_br_reply(call: &SoterCall, answer: Answer) -> Option<(Vec<u8>, OwnedReply)> {
+    let reply = match answer {
         Answer::Code(code) => build_plain_reply(&code).ok()?,
         Answer::Buffer { code, data } => {
             if call.hidl {
@@ -1055,7 +1060,14 @@ mod tests {
         let call = parse(&data, 8).expect("code 8 is getDeviceId");
         assert!(interceptable(&call));
 
-        let (bytes, reply) = build_br_reply(&call).expect("the local backend answers getDeviceId");
+        let (bytes, reply) = frame_br_reply(
+            &call,
+            Answer::Buffer {
+                code: 0,
+                data: Some(b"090000001234567890abcdef12345678".to_vec()),
+            },
+        )
+        .expect("the device id answer must frame");
         assert_eq!(&bytes[..4], &BR_TRANSACTION_COMPLETE_CMD.to_ne_bytes());
         assert_eq!(&bytes[4..8], &BR_REPLY_CMD.to_ne_bytes());
         assert_eq!(bytes.len(), 8 + size_of::<binder_transaction_data>());
@@ -1101,9 +1113,9 @@ mod tests {
 
     #[test]
     fn every_answer_shape_frames_a_reply_the_host_can_read() {
-        // 三种形状各来一笔：Buffer 带数据（ASK / 设备号）、Buffer 空 out（钥匙不在
-        // 本机）、Init（会话）。形状错了宿主解出来的是垃圾，所以这里按帧解一遍。
-        let cases: [(u32, Vec<u8>); 4] = [
+        // Explicit answers keep framing independent of live daemon RPC, RSA signing,
+        // and process-global key/session state. Test both AIDL buffer layouts.
+        let cases: [(u32, Vec<u8>); 5] = [
             (1, request(&|out| push_i32(out, 10373))),
             (
                 3,
@@ -1113,6 +1125,7 @@ mod tests {
                 }),
             ),
             (8, request(&|_out| {})),
+            (9, request(&|out| push_i32(out, 10373))),
             (
                 11,
                 request(&|out| {
@@ -1122,19 +1135,72 @@ mod tests {
                 }),
             ),
         ];
-        for (code, data) in cases {
-            let call = parse(&data, code).expect("a known hal code");
-            let (bytes, reply) = build_br_reply(&call)
-                .unwrap_or_else(|| panic!("the local backend must answer code {code}"));
-            assert_eq!(&bytes[..4], &BR_TRANSACTION_COMPLETE_CMD.to_ne_bytes());
-            assert_eq!(&bytes[4..8], &BR_REPLY_CMD.to_ne_bytes());
-            let tr = unsafe {
-                std::ptr::read_unaligned(bytes.as_ptr().add(8) as *const binder_transaction_data)
-            };
-            assert_eq!(tr.data_size, reply.data_size());
-            assert_ne!(tr.data_size, 0, "code {code} answers with a payload");
-            assert_eq!(tr.flags & TF_STATUS_CODE, 0);
-            assert_eq!(tr.offsets_size, 0);
+        for has_return_code in [true, false] {
+            for (code, data) in &cases {
+                let mut call = parse(data, *code).expect("a known hal code");
+                call.has_return_code = has_return_code;
+                let answer = match code {
+                    1 | 8 => Answer::Buffer {
+                        code: 0,
+                        data: Some(b"test".to_vec()),
+                    },
+                    3 => Answer::Buffer {
+                        code: -5,
+                        data: None,
+                    },
+                    9 => Answer::Code(-5),
+                    11 => Answer::Init {
+                        status: 0,
+                        session: 0x1234_5678,
+                    },
+                    _ => unreachable!(),
+                };
+                let (bytes, reply) = frame_br_reply(&call, answer)
+                    .unwrap_or_else(|| panic!("the answer must frame for code {code}"));
+                assert_eq!(&bytes[..4], &BR_TRANSACTION_COMPLETE_CMD.to_ne_bytes());
+                assert_eq!(&bytes[4..8], &BR_REPLY_CMD.to_ne_bytes());
+                assert_eq!(bytes.len(), 8 + size_of::<binder_transaction_data>());
+                let tr = unsafe {
+                    std::ptr::read_unaligned(bytes.as_ptr().add(8) as *const binder_transaction_data)
+                };
+                assert_eq!(tr.data_size, reply.data_size());
+                assert_eq!(tr.flags & TF_STATUS_CODE, 0);
+                assert_eq!(tr.offsets_size, 0);
+                // SAFETY: the reply owns the live parcel referenced by this frame.
+                assert_eq!(
+                    unsafe { tr.data.ptr.buffer } as usize,
+                    reply.data_ptr() as usize
+                );
+                let payload =
+                    unsafe { std::slice::from_raw_parts(reply.data_ptr(), reply.data_size()) };
+                let mut expected = vec![0i32]; // Binder Status::Ok
+                match code {
+                    9 => expected.push(-5),
+                    11 => expected.extend([1, 16, 0, 0x1234_5678, 0]),
+                    1 | 3 | 8 => {
+                        let status = if *code == 3 { -5 } else { 0 };
+                        let len = if *code == 3 { 0 } else { 4 };
+                        if has_return_code {
+                            expected.push(status);
+                        }
+                        expected.extend([1, if has_return_code { 12 + len } else { 16 + len }]);
+                        if !has_return_code {
+                            expected.push(status);
+                        }
+                        expected.push(len);
+                        if len != 0 {
+                            expected.push(i32::from_le_bytes(*b"test"));
+                        }
+                        expected.push(len);
+                    }
+                    _ => unreachable!(),
+                }
+                let expected: Vec<u8> = expected.into_iter().flat_map(i32::to_le_bytes).collect();
+                assert_eq!(
+                    payload, expected,
+                    "code {code}, return code {has_return_code}"
+                );
+            }
         }
     }
 
@@ -1269,7 +1335,14 @@ mod tests {
         assert_eq!((call.code, call.op), (8, "getDeviceId"));
         assert!(interceptable(&call), "HIDL 那条路现在也拦");
 
-        let (bytes, reply) = build_br_reply(&call).expect("the local backend answers it");
+        let (bytes, reply) = frame_br_reply(
+            &call,
+            Answer::Buffer {
+                code: 0,
+                data: Some(b"090000001234567890abcdef12345678".to_vec()),
+            },
+        )
+        .expect("the HIDL device id answer must frame");
         assert_eq!(&bytes[..4], &BR_TRANSACTION_COMPLETE_CMD.to_ne_bytes());
         assert_eq!(&bytes[4..8], &BR_REPLY_CMD.to_ne_bytes());
         let tr = unsafe {

@@ -36,6 +36,27 @@ fn temp_config_path(name: &str) -> TempConfigPath {
 }
 
 #[test]
+fn scoped_test_config_is_nested_and_thread_local() {
+    assert!(TEST_CONFIG.with(|slot| slot.borrow().is_none()));
+    let mut disabled = InjectorConfig::default();
+    disabled.main.enabled = false;
+    let outer = test_config_guard(disabled);
+    assert!(!get().main.enabled);
+    {
+        let _inner = test_config_guard(InjectorConfig::default());
+        assert!(get().main.enabled);
+        assert!(
+            std::thread::spawn(|| TEST_CONFIG.with(|slot| slot.borrow().is_none()))
+                .join()
+                .unwrap()
+        );
+    }
+    assert!(!get().main.enabled);
+    drop(outer);
+    assert!(TEST_CONFIG.with(|slot| slot.borrow().is_none()));
+}
+
+#[test]
 fn config_defaults_and_log_levels_match_contract() {
     let config = InjectorConfig::default();
     assert!(config.main.enabled);

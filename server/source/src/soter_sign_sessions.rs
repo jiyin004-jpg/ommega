@@ -43,13 +43,14 @@ impl SlotSpec {
 }
 
 struct Entry {
+    requested: Option<String>,
     spec: SlotSpec,
     at: Instant,
 }
 
 pub struct SignSessions {
     ttl: Duration,
-    inner: Mutex<HashMap<i64, Entry>>,
+    inner: Mutex<HashMap<(String, i64), Entry>>,
 }
 
 impl SignSessions {
@@ -68,11 +69,16 @@ impl SignSessions {
     /// 记下来也补不了，白占内存。
     pub fn record(
         &self,
+        device: &str,
+        requested: &str,
         session: i64,
         uid: Option<i64>,
         alias: Option<&str>,
         challenge: Option<&str>,
     ) {
+        if device.is_empty() {
+            return;
+        }
         let Some(uid) = uid else { return };
         let spec = SlotSpec {
             uid,
@@ -87,29 +93,105 @@ impl SignSessions {
         g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
         if g.len() >= MAX_ENTRIES {
             // 满了先扔一半最老的，别让它无限涨。
-            let mut ages: Vec<(i64, Instant)> = g.iter().map(|(s, e)| (*s, e.at)).collect();
+            let mut ages: Vec<((String, i64), Instant)> =
+                g.iter().map(|(s, e)| (s.clone(), e.at)).collect();
             ages.sort_by_key(|(_, at)| *at);
             for (s, _) in ages.into_iter().take(g.len() / 2) {
                 g.remove(&s);
             }
         }
-        g.insert(session, Entry { spec, at: now });
+        let key = (device.to_string(), session);
+        // The wire handle cannot distinguish two callers reusing a handle on
+        // one device. Keep it unrepairable rather than signing the wrong challenge.
+        let requested = match g.get(&key) {
+            Some(e) if e.requested.as_deref() != Some(requested) || e.spec != spec => None,
+            _ => Some(requested.to_string()),
+        };
+        g.insert(
+            key,
+            Entry {
+                requested,
+                spec,
+                at: now,
+            },
+        );
     }
 
     /// 查这张会话是哪个槽位开的（顺手清掉过期的）。
-    pub fn lookup(&self, session: i64) -> Option<SlotSpec> {
+    pub fn lookup(&self, device: &str, session: i64) -> Option<SlotSpec> {
         let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
-        g.get(&session).map(|e| e.spec.clone())
+        g.get(&(device.to_string(), session))
+            .map(|e| e.spec.clone())
+    }
+
+    /// 在同一把锁内确认唯一路由并取出槽位信息。
+    ///
+    /// 不要把这个检查拆成 `belongs_to` + `lookup`：两次加锁之间登记可能被
+    /// 同号句柄的新请求覆盖，随后就会拿错 challenge。若同一请求+句柄落在
+    /// 多台设备上，也一律拒绝猜测。
+    pub fn lookup_for(&self, device: &str, requested: &str, session: i64) -> Option<SlotSpec> {
+        let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
+        let mut matches = g.iter().filter(|((_, handle), e)| {
+            *handle == session && e.requested.as_deref() == Some(requested)
+        });
+        let ((matched_device, _), entry) = matches.next()?;
+        if matched_device != device || matches.next().is_some() {
+            return None;
+        }
+        Some(entry.spec.clone())
+    }
+
+    /// 在同一把锁内确认唯一路由后删除登记。
+    pub fn forget_for(&self, device: &str, requested: &str, session: i64) -> bool {
+        let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
+        let mut matches = g.iter().filter(|((_, handle), e)| {
+            *handle == session && e.requested.as_deref() == Some(requested)
+        });
+        let Some(((matched_device, _), _)) = matches.next() else {
+            return false;
+        };
+        if matched_device != device || matches.next().is_some() {
+            return false;
+        }
+        g.remove(&(device.to_string(), session)).is_some()
+    }
+
+    /// 防止本次路由碰巧落到另一请求的同号会话上。
+    pub fn belongs_to(&self, device: &str, requested: &str, session: i64) -> bool {
+        self.lookup_for(device, requested, session).is_some()
+    }
+
+    /// 原请求路由的会话归属；同请求+句柄有多个设备时不猜测。
+    pub fn route(&self, requested: &str, session: i64) -> Option<String> {
+        let mut g = self.hold().lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        g.retain(|_, e| now.saturating_duration_since(e.at) <= self.ttl);
+        let mut devices = g
+            .iter()
+            .filter(|((_, handle), e)| {
+                *handle == session && e.requested.as_deref() == Some(requested)
+            })
+            .map(|((device, _), _)| device.clone());
+        let first = devices.next()?;
+        if devices.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
     }
 
     /// 这一笔自己收尾了（或者补签完了），登记撤掉。
-    pub fn forget(&self, session: i64) {
+    pub fn forget(&self, device: &str, session: i64) {
         self.hold()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&session);
+            .remove(&(device.to_string(), session));
     }
 
     #[cfg(test)]
@@ -117,7 +199,7 @@ impl SignSessions {
         self.hold().lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
-    fn hold(&self) -> &Mutex<HashMap<i64, Entry>> {
+    fn hold(&self) -> &Mutex<HashMap<(String, i64), Entry>> {
         &self.inner
     }
 }
@@ -139,8 +221,8 @@ mod tests {
     #[test]
     fn a_recorded_session_can_be_looked_up() {
         let s = sessions();
-        s.record(42, Some(10043), Some("slot_a"), Some("aabb"));
-        let spec = s.lookup(42).expect("刚记下的会话应该查得到");
+        s.record("a", "a", 42, Some(10043), Some("slot_a"), Some("aabb"));
+        let spec = s.lookup("a", 42).expect("刚记下的会话应该查得到");
         assert_eq!(spec.uid, 10043);
         assert_eq!(spec.alias.as_deref(), Some("slot_a"));
         assert_eq!(spec.challenge.as_deref(), Some("aabb"));
@@ -151,27 +233,93 @@ mod tests {
     fn a_record_without_alias_or_challenge_is_not_kept() {
         // 补救得重开一张会话，缺别名或挑战就补不了，记下来也没用。
         let s = sessions();
-        s.record(1, Some(10043), None, Some("aabb"));
-        s.record(2, Some(10043), Some("slot_a"), None);
-        s.record(3, Some(10043), Some(""), Some("aabb"));
-        s.record(4, None, Some("slot_a"), Some("aabb"));
+        s.record("a", "a", 1, Some(10043), None, Some("aabb"));
+        s.record("a", "a", 2, Some(10043), Some("slot_a"), None);
+        s.record("a", "a", 3, Some(10043), Some(""), Some("aabb"));
+        s.record("a", "a", 4, None, Some("slot_a"), Some("aabb"));
         assert_eq!(s.len(), 0);
-        assert!(s.lookup(1).is_none());
+        assert!(s.lookup("a", 1).is_none());
     }
 
     #[test]
     fn a_finished_session_is_dropped() {
         let s = sessions();
-        s.record(7, Some(10043), Some("slot_a"), Some("aabb"));
-        s.forget(7);
-        assert!(s.lookup(7).is_none());
+        s.record("a", "a", 7, Some(10043), Some("slot_a"), Some("aabb"));
+        s.forget("a", 7);
+        assert!(s.lookup("a", 7).is_none());
+    }
+
+    #[test]
+    fn identical_handles_on_different_devices_are_independent() {
+        let s = sessions();
+        s.record(
+            "a",
+            "offline-a",
+            42,
+            Some(10043),
+            Some("slot_a"),
+            Some("aa"),
+        );
+        s.record(
+            "b",
+            "offline-b",
+            42,
+            Some(10373),
+            Some("slot_b"),
+            Some("bb"),
+        );
+        assert_eq!(s.lookup("a", 42).unwrap().challenge.as_deref(), Some("aa"));
+        assert_eq!(s.lookup("b", 42).unwrap().uid, 10373);
+        assert!(s.lookup("c", 42).is_none());
+        assert_eq!(s.route("offline-a", 42).as_deref(), Some("a"));
+        assert_eq!(s.route("offline-b", 42).as_deref(), Some("b"));
+        assert!(s.route("unknown", 42).is_none());
+        assert_eq!(
+            s.lookup_for("a", "offline-a", 42)
+                .unwrap()
+                .challenge
+                .as_deref(),
+            Some("aa")
+        );
+        assert!(!s.forget_for("b", "offline-a", 42));
+        assert!(s.lookup_for("a", "offline-a", 42).is_some());
+        assert!(s.belongs_to("a", "offline-a", 42));
+        assert!(!s.belongs_to("b", "offline-a", 42));
+        assert!(s.forget_for("a", "offline-a", 42));
+        assert!(s.lookup("a", 42).is_none());
+        assert_eq!(s.lookup("b", 42).unwrap().challenge.as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn multiple_callers_reusing_one_device_handle_cannot_be_repaired() {
+        let s = sessions();
+        s.record("a", "caller-1", 42, Some(1), Some("x"), Some("aa"));
+        s.record("a", "caller-2", 42, Some(2), Some("y"), Some("bb"));
+        assert!(s.route("caller-1", 42).is_none());
+        assert!(s.route("caller-2", 42).is_none());
+        assert!(!s.belongs_to("a", "caller-1", 42));
+        assert!(!s.belongs_to("a", "caller-2", 42));
+        assert!(s.lookup_for("a", "caller-1", 42).is_none());
+        assert!(!s.forget_for("a", "caller-1", 42));
+    }
+
+    #[test]
+    fn one_request_with_two_device_handles_is_ambiguous() {
+        let s = sessions();
+        s.record("a", "offline", 42, Some(1), Some("x"), Some("aa"));
+        s.record("b", "offline", 42, Some(2), Some("y"), Some("bb"));
+        assert!(s.route("offline", 42).is_none());
+        assert!(s.lookup_for("a", "offline", 42).is_none());
+        assert!(!s.forget_for("a", "offline", 42));
+        assert!(!s.belongs_to("a", "offline", 42));
+        assert!(!s.belongs_to("b", "offline", 42));
     }
 
     #[test]
     fn an_old_session_is_not_used_for_repair() {
         let s = sessions();
-        s.record(9, Some(10043), Some("slot_a"), Some("aabb"));
+        s.record("a", "a", 9, Some(10043), Some("slot_a"), Some("aabb"));
         std::thread::sleep(Duration::from_millis(200));
-        assert!(s.lookup(9).is_none(), "过期的登记不该再拿去补签");
+        assert!(s.lookup("a", 9).is_none(), "过期的登记不该再拿去补签");
     }
 }

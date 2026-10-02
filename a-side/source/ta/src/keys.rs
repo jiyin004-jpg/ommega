@@ -466,40 +466,9 @@ impl crate::KeyMintTa {
         let app_id = get_opt_tag_value!(params, AttestationApplicationId)?
             .ok_or_else(|| km_err!(AttestationApplicationIdMissing, "remote attest needs appid"))?;
         let serial = get_opt_tag_value!(params, CertificateSerial)?;
-        // Derive a stable alias for the remote key from the FULL challenge plus
-        // the caller's certificate serial. The relay session is keyed by
-        // (device_id, alias), so distinct keys must map to distinct aliases.
-        // Hashing only the first 8 challenge bytes made every
-        // KeyAttestation-style date-string challenge ("Thu Aug 14 ...") — which
-        // share the same 8-byte prefix — collide on one alias; each subsequent
-        // attestation then overwrote the server session, so a later TBS signing
-        // used a different leaf key than the one the A-side holds ("签名错误").
-        let mut seed_input = challenge.clone();
-        if let Some(s) = &serial {
-            seed_input.extend_from_slice(s);
-        }
-        // Mix in the creation datetime so repeated attestations carrying the
-        // same date-string challenge (and serial=1) within a day still derive
-        // distinct aliases, preventing relay session cross-talk between
-        // different keys that would otherwise collide on one alias.
-        if let Some(creation) = get_opt_tag_value!(params, CreationDatetime)? {
-            seed_input.extend_from_slice(&creation.ms_since_epoch.to_be_bytes());
-        }
-        // Mix in the requesting security level so a TEE attestation and a
-        // StrongBox attestation of the same challenge/serial/creation-time map
-        // to distinct relay sessions. Without this the second attestation
-        // overwrites the first session and the first key's later sign/decrypt
-        // fails with INVALID_KEY_BLOB (the blob was minted by the other HAL).
-        seed_input.extend_from_slice(&(self.hw_info.security_level as i32).to_be_bytes());
-        let digest = self_hash_sha256(&seed_input);
-        // Use 8 digest bytes (64 bits) for the alias seed so distinct keys with
-        // the same challenge+serial+creation-time still map to distinct aliases
-        // with negligible collision probability. 32 bits was enough to collide
-        // when a caller minted two keys within the same millisecond.
-        let alias_seed = u64::from_be_bytes([
-            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
-        ]);
-        let alias = format!("ommega-remote-{:016x}", alias_seed);
+        // Allocate once per logical key creation, even for identical params.
+        // Remote transport retries reuse this alias in the same request body.
+        let alias = new_remote_alias(&mut *self.imp.rng);
         // Mirror client-a's `effectiveCertificateSerial`: forward the caller's
         // CERTIFICATE_SERIAL if present, otherwise derive a deterministic
         // positive integer from (alias, challenge) so the B-side mints a leaf
@@ -1199,6 +1168,13 @@ fn needs_attestation_ids(params: &[KeyParam]) -> bool {
     })
 }
 
+/// Allocate an independent 128-bit random identity for a remote key.
+fn new_remote_alias(rng: &mut dyn crypto::Rng) -> String {
+    let mut bytes = [0u8; 16];
+    rng.fill_bytes(&mut bytes);
+    format!("ommega-remote-{:032x}", u128::from_be_bytes(bytes))
+}
+
 /// Derives a deterministic positive certificate serial from `(alias, challenge)`,
 /// mirroring client-a's `effectiveCertificateSerial`.  The first 8 bytes of
 /// SHA-256(alias || base64(challenge)) are treated as a positive big-endian
@@ -1231,6 +1207,37 @@ fn derive_remote_serial(alias: &str, challenge: &[u8]) -> Option<Vec<u8>> {
         // Trim leading zeros, keep at least one byte.
         let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
         Some(bytes[start..].to_vec())
+    }
+}
+
+#[cfg(test)]
+mod remote_alias_tests {
+    use super::*;
+
+    struct CountingRng(u8);
+
+    impl crypto::Rng for CountingRng {
+        fn add_entropy(&mut self, _data: &[u8]) {}
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.0 += 1;
+            dest.fill(self.0);
+        }
+    }
+
+    #[test]
+    fn each_key_creation_allocates_one_random_alias() {
+        let mut rng = CountingRng(0);
+        let first = new_remote_alias(&mut rng);
+        let second = new_remote_alias(&mut rng);
+        assert_ne!(first, second);
+        assert_eq!(first, "ommega-remote-01010101010101010101010101010101");
+        assert_eq!(second, "ommega-remote-02020202020202020202020202020202");
+        assert_eq!(rng.0, 2);
+        // Reusing the allocated identity also preserves the derived serial.
+        let serial = derive_remote_serial(&first, b"same challenge");
+        assert_eq!(serial, derive_remote_serial(&first, b"same challenge"));
+        assert_ne!(serial, derive_remote_serial(&second, b"same challenge"));
     }
 }
 
