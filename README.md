@@ -1,18 +1,17 @@
 # Ommega
 
-Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真实硬件 TEE 能力通过网络提供给另一台设备（A 端）使用。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经过 server 中转调度，由 B 端设备的真实硬件 TEE（KeyMint / StrongBox）执行并返回结果，从而为 A 端应用提供真实可信的硬件级安全认证。
+Ommega 是一个三端远程 TEE 认证系统：A 端是服务请求端，B 端提供真实硬件 TEE 能力，server 在中转调度。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经 server 转发到 B 端，由本机真实硬件 TEE（KeyMint / StrongBox）执行后原样回传。B 端另有一套配套的管理 App（b-app）。
 
-版本号唯一来源是仓库根的 `VERSION`（A 端模块 / B 端模块 / b-app / 服务端 四端同号），正文里不写具体版本：
-当前版本和下载都以 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 页面为准。
+当前版本与下载见 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 页面。
 
 ## 系统组成
 
 | 端 | 角色 | 形态 | 安装方式 |
 |----|------|------|----------|
-| **A 端（a-side）** | 服务请求端。keymint 守护进程 + inject 注入器拦截本机 keystore 调用，将认证/签名/解密请求转发到远程 B 端真实 TEE | Magisk 模块（arm64-v8a / armeabi-v7a / x86 / x86_64） | Magisk / KernelSU 刷入 zip |
-| **B 端（b-side）** | 服务提供端。relay 守护进程长轮询 server 领取任务，调用本机真实硬件 TEE 执行认证/签名/解密并回传结果 | Magisk 模块（arm64-v8a / x86_64） | Magisk / KernelSU 刷入 zip |
-| **B 端 App（b-app）** | B 端管理界面，用于查看设备状态、配置连接参数 | Android APK | 直接安装 APK |
-| **Server（server）** | 中转与调度中心。任务队列、设备管理、卡片计费、密钥盒（keybox）管理、在线设备状态展示 | 独立二进制 | Linux x86_64 / Windows x86_64 部署 |
+| **A 端（a-side）** | 服务请求端。keymint 守护进程 + inject 注入器拦截本机 keystore 调用，转发到远程 B 端 | Magisk 模块（arm64-v8a / armeabi-v7a / x86 / x86_64） | Magisk / KernelSU 刷入 zip |
+| **B 端（b-side）** | 服务提供端。relay 守护进程长轮询 server 领任务，交给本机硬件 TEE 执行后回传 | Magisk 模块（arm64-v8a / x86_64） | Magisk / KernelSU 刷入 zip |
+| **服务端（server）** | 中转与调度中心。任务队列、设备管理、卡片计费、密钥盒管理、在线状态页 | 独立二进制 | Linux x86_64 / Windows x86_64 部署 |
+| **B 端 App（b-app）** | B 端的配套管理界面，看设备状态、配连接参数 | Android APK | 直接安装 APK |
 
 ## 主要功能
 
@@ -23,7 +22,6 @@ Ommega 是一个三端远程 TEE 认证系统：让一台设备（B 端）的真
 - **在线设备状态页**：server 提供公开的设备在线状态展示界面
 - **卡片计费体系**：server 内置卡片购买、激活与用量管理
 - **管理后台**：设备管理、任务查看、密钥盒上传与自动刷新
-- **路径遮罩**：A 端按内核版本装载 PathMask 内核模块，遮住指定路径的检测面（默认 `/system/priv-app/SoterService`）
 
 ## 快速使用（官方在线服务）
 
@@ -63,7 +61,7 @@ tls_insecure: true
 remote: on
 ```
 
-> ⚠️ 路径注意：`ommegadata` 是指向 `/data/misc/keystore/ommega` 的软链，守护进程真正读的就是
+> 路径注意：`ommegadata` 是指向 `/data/misc/keystore/ommega` 的软链，守护进程真正读的就是
 > `/data/misc/keystore/ommega/config`。**没有 `ommegadata` 那一层**的
 > `/data/adb/ommega/config` 是另一个文件，写了不生效（改完不用重启，配置有 watch）。
 
@@ -85,12 +83,12 @@ ommega/
 ├── b-side/source/           # B 端（Magisk 模块）Rust 源码：relay 守护进程
 ├── b-app/source/            # B 端 Android App（Kotlin + Gradle）
 ├── server/source/           # 服务端 Rust 源码 + 运维脚本
-└── VERSION                  # 四端共用的版本号
+└── VERSION                  # 三端共用的版本号
 ```
 
 仓库只保存源码与文档，构建产物（模块 zip、APK、服务端二进制）一律以 Release 附件形式发布。
 
-### Server 部署
+### 服务端部署
 
 1. 从 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 下载对应二进制：
    - Linux x86_64：`relay_rs-linux-x86_64-musl`（musl 静态编译，无 libc 依赖，`chmod +x` 后直接运行）
@@ -114,14 +112,14 @@ ommega/
 > 加上目标平台就行：`cargo check --target aarch64-linux-android`（需先设好 NDK 环境变量
 > `ANDROID_NDK_ROOT` / `ANDROID_NDK_HOME`）。A 端与 server 没有这个限制。
 
-### 开发门禁
+## 开发门禁
 
 三个工作区各自独立，CI（`.github/workflows/ci.yml`）对每个都跑同一套：`cargo clippy` 带
 `-D warnings`、`cargo fmt --all -- --check`、以及测试。server 是 host 目标，测试真跑；
-A / B 端只能编到 `aarch64-linux-android`，CI 里只编测试二进制（`--no-run`），真机那一层留给人。
+A / B 端只能编到 `aarch64-linux-android`，CI 里只编测试二进制（`--no-run`），真机上跑那步由人工完成。
 本地提交前另有一道轻量钩子，只查被改工作区的格式，脚本在仓库根的 `.cargo-husky/hooks/`。
 
-A 端本地开发还得自备两样东西，缺了编不过：
+A 端本地开发需要自备两项，缺了编译不过：
 
 - `protoc`：`build.rs` 用 prost 把 `proto/storage.proto` 生成到 `src/proto/`（生成物不入库）
 - `a-side/source/ommega-injector/assets/soter_ask.pem`：本地兜底 ASK 私钥，被 `.gitignore` 的
