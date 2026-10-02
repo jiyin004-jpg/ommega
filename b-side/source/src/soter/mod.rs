@@ -312,8 +312,13 @@ fn is_hard_slot_failure(op: &str, result: &Value) -> bool {
 
 /// `-5` / `-6`：TA 说这个槽位上的 ASK / AuthKey 没就绪 —— 这两码才值得原地重建。
 /// 别的非零码（-18 安全通道、-8、-26 没指纹）都是另一回事，动设备状态只会更糟。
+///
+/// `-65528`（`TEE_ERROR_ITEM_NOT_FOUND`）2026-10-02 补进来：在 PLC110 上拿一个
+/// 全新 alias 打 `init_sign` 就是这个码，意思是「这台机器上没有这号材料」，
+/// 和 -5/-6 同一种缺料，一样该就地补齐再试。
 const SOTER_ASK_NOT_READY_CODE: i32 = -5;
 const SOTER_AUTH_KEY_NOT_READY_CODE: i32 = -6;
+const SOTER_ITEM_NOT_FOUND_CODE: i32 = -65528;
 
 /// 「B 端手上没这批材料」就地补齐再重试签名。
 ///
@@ -473,11 +478,13 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
             // App 一验不过，整个 SOTER 支付流程就炸。
             // 用户规矩：指定的那台 B 说没有，就在原地重建，不换机器、也不退回自签。
             //
-            // 只认 -5 / -6 这两个「没料」的码：-18（安全通道不通）、-8 这些是 TA
+            // 只认「没料」这三个码（-5 / -6 / -65528）：-18（安全通道不通）、-8 这些是 TA
             // 自己的结构性毛病，材料没问题，重建既没用、还会把人家真钥匙重铸掉。
             if matches!(
                 session.error_code,
-                SOTER_ASK_NOT_READY_CODE | SOTER_AUTH_KEY_NOT_READY_CODE
+                SOTER_ASK_NOT_READY_CODE
+                    | SOTER_AUTH_KEY_NOT_READY_CODE
+                    | SOTER_ITEM_NOT_FOUND_CODE
             ) && allow_mutation
             {
                 session = rebuild_material_then_sign(&soter, uid, &alias, &challenge, session);

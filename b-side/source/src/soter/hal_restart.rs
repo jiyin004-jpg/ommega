@@ -6,19 +6,29 @@
 //! （`SOTER_ERROR_SECURE_HW_COMMUNICATION_FAILED`）。进程还活着、也不是 D 状态，
 //! 重启这个服务就好（实测 `setprop ctl.restart soter_hal`，旧 pid 退掉、init 拉新的）。
 //!
+//! 但要分清两种坏法（2026-10-02 补）：
+//!
+//! - **HAL 进程半死**：`init_sign` 恒回 -18 —— 重启这个服务有效。
+//! - **TA 状态卡死在 TEE 里**：`init_sign` 回 0、`finish_sign` 恒回 258（0x102）。
+//!   用户态怎么重启服务都没用（2026-10-02 现场试了 3 次，pid 18055→27813→31557
+//!   全无效），**只有重启整台设备**才修得好。这一档自愈治不了，但至少不该去白杀
+//!   进程 —— 判据别被 `init_sign` 的成功糊弄。
+//!
 //! 不收拾的后果是实打实的：服务端会按「这台结构性做不了」把这个槽位换到自签那两层，
 //! App 手里变成假料，拿到的还是个误导性的 -5（「这把钥匙不在」）—— Duck Detector
 //! 就是这么报 soter damaged 的，微信那边整轮开启都拿不到真材料。
 //!
-//! 计数规则（2026-10-01 改）：
+//! 计数规则（2026-10-02 改）：
 //!
 //! - **阈值 2**：一次失败可能只是偶然撞上，连着两次就动手，先把 HAL 拉回来再说。
 //! - **凡非 0 都算**，只有几个「正常业务答复」不算：-5 / -6 / -8（这个槽位还没建料，
-//!   新装的 App 天天问）、-26（这会儿没人按指纹）。剩下的 -12/-13/-18/-20、-204
+//!   新装的 App 天天问）、-26（这会儿没人按指纹）、-204（会话句柄已被顶掉）、
+//!   -65528（这台机器上这个 uid 本来就没料）。剩下的 -12/-13/-18/-20、258
 //!   以及一切没见过的码，都是「这台现在真做不了」，一律计入。
-//! - **清零只认 TEE 会话 op 的成功**（`init_sign` / `finish_sign`）。半死状态下
-//!   建料类 op 照样成功，以前用它们清零，导致计数永远攒不满、HAL 一直坏着 ——
-//!   那台 PLC110 从开机到被我手动顶穿就是这么过来的。
+//! - **清零只认 `finish_sign` 的成功**。半死状态下不仅建料类 op 照样成功，
+//!   **`init_sign` 也照样回 0** —— 只有 `finish_sign` 会回 258。以前把 init_sign
+//!   也算「通道好」，结果探针每轮 init_sign(0) 都把计数清掉，PLC110 从 06:44
+//!   坏到 09:28，自愈一次都没触发过。
 //! - 冷却照旧：刚重启过就先不动，免得 HAL 真坏的时候每一笔都去 kill 一遍。
 //!
 //! 冷却用 `Instant`（单调钟，不含 suspend）就够 —— 它是防抖，不是精确调度。
@@ -33,19 +43,28 @@ const FAILURE_LIMIT: u32 = 2;
 const RESTART_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
 /// 正常的业务答复，不参与计数：这个槽位还没建料（-5 ASK / -6 AuthKey / -8）、
-/// 以及这会儿没人按指纹（-26）。
+/// 这会儿没人按指纹（-26）、会话句柄已经被顶掉了（-204）、
+/// 这台机器上这个 uid 本来就没料（-65528）。
 ///
 /// -8 是 2026-10-01 从生产日志里量出来的：40k 行里有 657 次，全是建料类 op
 /// （`has_auth_key` / `export_auth_key_public_key`），是 `-5` 同一种「还没准备」的意思。
 /// 不排掉它的话，App 每查几回就把阈值顶满。
 ///
-/// -204 只在 `finish_sign` 上出现过 6 次（倾向是用户取消指纹），少见，先照算 ——
-/// 连着两次的代价只是冷却期内多重启一次 HAL。
-const BENIGN_CODES: &[i64] = &[-5, -6, -8, -26];
+/// -204（`OPERATEID_NULL`，会话句柄无效）是 2026-10-02 在 PLC110 上翻的案：
+/// 它是 TA 侧会话被别人顶掉的意思，**重启 SOTER HAL 根本修不了**，只会白丢材料
+/// —— 那天自愈正是被它连触两次，把好端端的 18055 kill 掉又毫无用处。
+///
+/// -65528（`TEE_ERROR_ITEM_NOT_FOUND`）同日对照量出来的：在**健康**设备上一样
+/// 大量出现（重启后的正常态里 `TEE_GenerateASKPair` 就回了 40 次），和 -5 是
+/// 同一种「这个 uid 没建过料」。所以别按 `0xFFFFxxxx` 段一刀切，会误伤。
+const BENIGN_CODES: &[i64] = &[-5, -6, -8, -26, -204, -65528];
 
-/// 只有走 TEE 会话的 op 成功了才说明通道是好的。建料类 op 在半死状态下照样成功。
-fn is_session_op(op: &str) -> bool {
-    matches!(op, "init_sign" | "finish_sign")
+/// 只有真签出东西来才说明通道是好的。
+///
+/// 2026-10-02 定案：TA 状态卡死时不仅建料类 op 正常，**`init_sign` 也照样回 0**，
+/// 只有 `finish_sign` 恒回 258。所以「init_sign 成功 = 通道好」是错的。
+fn proves_channel_works(op: &str) -> bool {
+    matches!(op, "finish_sign")
 }
 
 /// 候选服务名：各家 HAL 在 init 里注册的名字不一样，`getprop init.svc.<名字>` 有值的
@@ -119,8 +138,8 @@ fn step(
     since_restart: Option<Duration>,
 ) -> (u32, Verdict) {
     if error_code == 0 {
-        // 只有真走通了 TEE 会话才说明通道好了；建料类 op 成功不算数。
-        return if is_session_op(op) {
+        // 只有真签出来才算通道好了；`init_sign` 成功不算（TA 卡死时它照样回 0）。
+        return if proves_channel_works(op) {
             (0, Verdict::Reset)
         } else {
             (count_before, Verdict::Nothing)
@@ -229,19 +248,21 @@ mod tests {
 
     #[test]
     fn benign_codes_are_left_alone() {
-        // -5 / -6 / -8 是「这个槽位还没建料」，-26 是「这会儿没人按指纹」：正常答复，不计数。
-        for code in [-5i64, -6, -8, -26] {
+        // -5/-6/-8 是「这个槽位还没建料」，-26 是「这会儿没人按指纹」，
+        // -204 是「会话被顶掉了」，-65528 是「这台机器上这个 uid 没料」：都不计数。
+        for code in [-5i64, -6, -8, -26, -204, -65528] {
             assert_eq!(step("has_auth_key", code, 1, None), (1, Verdict::Nothing));
             assert_eq!(step("init_sign", code, 1, None), (1, Verdict::Nothing));
         }
     }
 
     #[test]
-    fn only_a_session_op_success_clears_the_count() {
-        // init_sign / finish_sign 成功 = 通道确实好了。
-        assert_eq!(step("init_sign", 0, 2, None), (0, Verdict::Reset));
+    fn only_a_real_signature_clears_the_count() {
+        // 真签出东西来 = 通道确实好了。
         assert_eq!(step("finish_sign", 0, 2, None), (0, Verdict::Reset));
-        // 建料类 op 在半死状态下也会成功，不能让它把计数清掉。
+        // init_sign 成功**不算**：TA 卡死时它照样回 0（PLC110 就是这么坏的）。
+        assert_eq!(step("init_sign", 0, 2, None), (2, Verdict::Nothing));
+        // 建料类 op 在半死状态下也会成功，更不能让它把计数清掉。
         assert_eq!(step("has_auth_key", 0, 2, None), (2, Verdict::Nothing));
         assert_eq!(
             step("generate_auth_key_pair", 0, 2, None),
@@ -251,6 +272,35 @@ mod tests {
             step("export_ask_public_key", 0, 2, None),
             (2, Verdict::Nothing)
         );
+    }
+
+    #[test]
+    fn the_258_killer_still_reaches_the_threshold() {
+        // PLC110 2026-10-02 的真实形态：init_sign 回 0、finish_sign 恒回 258。
+        // 以前 init_sign 的成功会把计数清掉，这个序列永远攒不到 2。
+        let (count, verdict) = step("init_sign", 0, 0, None);
+        assert_eq!((count, verdict), (0, Verdict::Nothing));
+        let (count, verdict) = step("finish_sign", 258, count, None);
+        assert_eq!((count, verdict), (1, Verdict::Nothing));
+        // 下一轮又会来一笔成功的 init_sign，它不能把上面那笔记账抹掉。
+        let (count, verdict) = step("init_sign", 0, count, None);
+        assert_eq!((count, verdict), (1, Verdict::Nothing));
+        let (count, verdict) = step("finish_sign", 258, count, None);
+        assert_eq!((count, verdict), (2, Verdict::Restart));
+    }
+
+    #[test]
+    fn a_stale_session_never_kills_the_hal() {
+        // -204（会话被顶掉）重启 HAL 修不了，只会白丢材料：连多少笔都不该动手。
+        let mut count = 0;
+        let mut verdict = Verdict::Nothing;
+        for _ in 0..5 {
+            let (c, v) = step("finish_sign", -204, count, None);
+            count = c;
+            verdict = v;
+        }
+        assert_eq!(verdict, Verdict::Nothing);
+        assert_eq!(count, 0);
     }
 
     #[test]
