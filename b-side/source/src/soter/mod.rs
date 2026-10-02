@@ -33,12 +33,13 @@ pub mod hal;
 pub mod hal_restart;
 pub mod hidl;
 pub mod hwbinder;
+mod sign_guard;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use hal::{Soter, SoterData, SoterSession};
 
@@ -162,29 +163,10 @@ impl std::fmt::Display for SignVerdict {
 /// 服务端照样会派活。
 static LEARNED_PROBE_TARGET: Mutex<Option<(i32, String)>> = Mutex::new(None);
 
-/// 最近一次真签名活动（服务端派下来的 `init_sign` / `finish_sign`）发生在什么时候。
-///
-/// 能力探针（`caps::probe_sign_capability`）要拿一个现成槽位跑一遍 `init_sign` +
-/// `finish_sign`，而同一个槽位上 TA 只留一个会话 —— 别人流程跑到一半被探针插一脚，
-/// 对方手上的会话就废了，`finish_sign` 回去就是 -204（`OPERATEID_NULL`）。
-/// 2026-10-01 对着 B 的 logcat 逐条对过：一笔 A 端流程的两次 `initSign` 中间夹着
-/// 探针的 `initSign`，紧接着那笔 `finishSign` 就回了 -204。所以探针得先看这里。
-static LAST_SIGN_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// 记一笔「刚从设备上走了签名流程」。
-pub fn note_sign_activity() {
-    *LAST_SIGN_ACTIVITY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
-}
-
-/// 最近 `window` 内有过签名活动吗（探针用它避让）。
-pub fn sign_active_within(window: Duration) -> bool {
-    LAST_SIGN_ACTIVITY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_some_and(|at| at.elapsed() < window)
-}
+/// Serializes real signing HAL calls with the entire probe. The same mutex
+/// atomically checks/reserves probe access and protects the in-memory lease.
+/// Never held while waiting for a caller's finish or during HAL restart.
+static SIGN_GUARD: Mutex<sign_guard::SignGuard> = Mutex::new(sign_guard::SignGuard::new());
 
 /// 探针要试的那个槽位；没配 OMMEGA_RELAY_SOTER_PROBE_* 的时候就用这里学到的。
 pub fn learned_probe_target() -> Option<(i32, String)> {
@@ -453,9 +435,17 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
         }
         "finish_sign" => {
             let session = session_of(payload)?;
-            // 给能力探针留个“刚有人在这台机器上签名”的记号，免得它插进别人流程中间。
-            note_sign_activity();
-            let data = open_soter(op)?.finish_sign(session)?;
+            let mut guard = SIGN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if !guard.finish_allowed(session, now) {
+                return Ok(code_result(op, -204));
+            }
+            guard.activity(now);
+            // End the matching lease even on transport/open failure. A stale
+            // finish must never clear a newer session's lease.
+            let data = open_soter(op).and_then(|soter| soter.finish_sign(session));
+            guard.finish_ended(session, Instant::now());
+            let data = data?;
             // 真替上层签出来就是一整条链路的成功证据；回 -26 就是「没人按指纹」的
             // 一次实测，都交给同一个判定函数累。
             note_sign_result(data.error_code as i64);
@@ -467,7 +457,12 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
                 alias_of(payload)?,
                 string_arg(payload, "challenge")?,
             );
-            note_sign_activity();
+            let mut guard = SIGN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if !guard.init_allowed(now) {
+                return Ok(code_result(op, -9));
+            }
+            guard.activity(now);
             let soter = open_soter(op)?;
             let mut session = soter.init_sign(uid, &alias, &challenge)?;
             // 这台机器上没有这批材料：就地在原地补齐再签一次。
@@ -490,6 +485,7 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
                 session = rebuild_material_then_sign(&soter, uid, &alias, &challenge, session);
             }
             if session.error_code == 0 {
+                guard.init_succeeded(session.session, Instant::now());
                 // 只是建了会话，还没签出东西来：能签的证据不在这；不过槽位记住了，
                 // 探针以后可以拿它去试签。
                 remember_probe_target(uid, &alias);
@@ -601,6 +597,17 @@ const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
 /// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
 pub fn sign_probe(uid: i32, alias: &str) -> Value {
     let mut out = json!({ "op": "sign_probe", "uid": uid, "alias": alias });
+    // Check and reserve under the real signing lock; callers cannot init
+    // between this check and the probe's finish. Do not call handle() here:
+    // it takes the same non-reentrant mutex.
+    let mut guard = SIGN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.probe_allowed(Instant::now()) {
+        out["skipped"] = json!(true);
+        out["reason"] = json!("active signing session or recent signing activity");
+        out["verdict"] = json!(SignVerdict::Unknown.as_str());
+        out["signed"] = json!(false);
+        return out;
+    }
     let soter = match Soter::open() {
         Ok(Some(soter)) => soter,
         Ok(None) => {

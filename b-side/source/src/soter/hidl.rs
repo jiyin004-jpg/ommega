@@ -41,8 +41,18 @@ pub const HIDL_TRUSTONIC_FQNAME: &str = "vendor.trustonic.hardware.soter@1.0::IT
 /// （天玑机型上常见），接口名还是 `ISoter`，方法声明顺序跟另外两家一致。
 pub const HIDL_XIAOMI_FQNAME: &str = "vendor.xiaomi.hardware.soterservice@1.0::ISoter";
 
-/// 三家 HIDL 后端，按解析顺序（跟 AIDL 那份 [`super::hal::Backend::ALL`] 同序）。
-pub const BACKENDS: [&str; 3] = [HIDL_TRUSTONIC_FQNAME, HIDL_QTI_FQNAME, HIDL_XIAOMI_FQNAME];
+/// Registered by rubyx's manifest_microtrust_wechat.xml on hwbinder/default.
+/// The vendor stub has the same 14 HIDL signatures (initSign=13, finishSign=14).
+/// This is an artifact contract check, not on-device validation.
+pub const HIDL_MICROTRUST_FQNAME: &str = "vendor.microtrust.hardware.soter@1.0::ISoter";
+
+/// HIDL backends in the same order as [`super::hal::Backend::ALL`].
+pub const BACKENDS: [&str; 4] = [
+    HIDL_TRUSTONIC_FQNAME,
+    HIDL_QTI_FQNAME,
+    HIDL_XIAOMI_FQNAME,
+    HIDL_MICROTRUST_FQNAME,
+];
 
 /// 默认实例名。设备上只注册这一个。
 pub const HIDL_DEFAULT_INSTANCE: &str = "default";
@@ -83,9 +93,9 @@ pub struct HidlSoter {
 }
 
 impl HidlSoter {
-    /// 顺着 `hwservicemanager` 把服务找出来，三家vendor依次试。
+    /// 顺着 `hwservicemanager` 把服务找出来，各家 vendor 依次试。
     ///
-    /// `Ok(None)` 是「这台机器上两家都没注册」；「有 /dev/hwbinder 但没这家服务」
+    /// `Ok(None)` 是「这台机器上都没注册」；「有 /dev/hwbinder 但没这家服务」
     /// 也归到 `Ok(None)`（跟 AIDL 那边的语义对齐）。
     pub fn open() -> Result<Option<Self>> {
         for fq_name in BACKENDS {

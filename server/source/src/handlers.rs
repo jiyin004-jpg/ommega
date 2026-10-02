@@ -156,9 +156,19 @@ async fn enqueue_and_wait(
         .store
         .create_task(task_type, body.clone(), target)
         .await;
+    // Dropping an HTTP future must also remove its queued SOTER work so it
+    // cannot be reclaimed/dispatched after the device lease was released.
+    let mut cancel = (task_type == "soter").then(|| CancelSoterTask {
+        store: state.store.clone(),
+        task_id: task_id.clone(),
+        armed: true,
+    });
     let timeout = Duration::from_secs(timeout_secs);
     match state.store.wait_for_result(&task_id, timeout).await {
         Some(mut result) => {
+            if let Some(cancel) = cancel.as_mut() {
+                cancel.armed = false;
+            }
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("task_id".to_string(), json!(task_id));
             }
@@ -168,6 +178,25 @@ async fn enqueue_and_wait(
             "error": "task timeout: no B-side result",
             "task_id": task_id,
         }),
+    }
+}
+
+struct CancelSoterTask {
+    store: Arc<TaskStore>,
+    task_id: String,
+    armed: bool,
+}
+
+impl Drop for CancelSoterTask {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let store = self.store.clone();
+        let task_id = self.task_id.clone();
+        tokio::spawn(async move {
+            let _ = store.cancel_task(&task_id).await;
+        });
     }
 }
 
@@ -926,20 +955,24 @@ async fn repair_clobbered_finish(
     body: &Value,
     requested: &str,
     target: Option<&str>,
-) -> Option<Value> {
-    let session = body.get("session").and_then(Value::as_i64)?;
-    let device = target?;
+) -> Result<Option<Value>, ()> {
+    let Some(session) = body.get("session").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let Some(device) = target else {
+        return Ok(None);
+    };
     let spec = match state.sign_sessions.lookup_for(device, requested, session) {
         Some(spec) => spec,
         None => {
             // 这张会话没登记（init 不是设备层答的）或者登记已经过期 —— 补不了，只能把
             // 原来的 -204 还回去。留一行日志，好知道到底哪种情况多。
             tracing::warn!("soter: 会话 {session} 没在登记表里（没记上或已过期），补不了");
-            return None;
+            return Ok(None);
         }
     };
     let Some(alias) = spec.alias.as_deref() else {
-        return None;
+        return Ok(None);
     };
     tracing::info!(
         "soter: 会话 {session} 被顶掉了，拿缓存的参数重开一张再签（uid={} alias={alias}）",
@@ -950,11 +983,11 @@ async fn repair_clobbered_finish(
             tracing::info!("soter: 补签第 {attempt} 次重试（会话 {session}）");
             tokio::time::sleep(REPAIR_RETRY_GAP).await;
         }
-        if let Some(done) = repair_once(state, body, requested, target, session, &spec).await {
-            return Some(done);
+        if let Some(done) = repair_once(state, body, requested, target, session, &spec).await? {
+            return Ok(Some(done));
         }
     }
-    None
+    Ok(None)
 }
 
 /// 补签的实际动作：重开一张会话、把同一个 challenge 签出来。
@@ -965,15 +998,18 @@ async fn repair_once(
     target: Option<&str>,
     session: i64,
     spec: &crate::soter_sign_sessions::SlotSpec,
-) -> Option<Value> {
+) -> Result<Option<Value>, ()> {
     let (Some(alias), Some(challenge)) = (spec.alias.as_deref(), spec.challenge.as_deref()) else {
-        return None;
+        return Ok(None);
     };
     let init_body = repair_init_body(body, spec.uid, alias, challenge);
-    let init = try_b_soter_layer(state, &init_body, requested, target).await?;
+    let init = try_b_soter_layer(state, &init_body, requested, target)
+        .await
+        .ok_or(())?;
+    repair_reply_known(&init.value, init.device.as_deref(), target)?;
     let init_code = init.value.get("error_code").and_then(Value::as_i64);
-    if init_code != Some(0) || init.device.as_deref() != target {
-        return None;
+    if init_code != Some(0) {
+        return Ok(None);
     }
     let Some(new_session) = init
         .value
@@ -982,23 +1018,98 @@ async fn repair_once(
         .filter(|s| *s != 0)
     else {
         tracing::info!("soter: 补签没拿到新会话（init error_code={init_code:?}）");
-        return None;
+        return Err(());
     };
     let mut fin_body = body.clone();
     if let Some(obj) = fin_body.as_object_mut() {
         obj.insert("session".to_string(), json!(new_session));
     }
     // The new handle belongs to the device that actually answered init, not the request.
-    let done = try_b_soter_layer(state, &fin_body, requested, init.device.as_deref()).await?;
+    let done = try_b_soter_layer(state, &fin_body, requested, init.device.as_deref())
+        .await
+        .ok_or(())?;
+    repair_reply_known(&done.value, done.device.as_deref(), init.device.as_deref())?;
     let code = done.value.get("error_code").and_then(Value::as_i64);
     if code != Some(0) || done.device != init.device {
         tracing::warn!("soter: 补签的 finish 也失败了（error_code={code:?}）");
-        return None;
+        return Ok(None);
     }
     tracing::info!(
         "soter: 补签成功，会话 {session} 的那个 challenge 由新会话 {new_session} 签出来了"
     );
-    Some(done.value)
+    Ok(Some(done.value))
+}
+
+fn finish_owner_layer<'a>(
+    remembered: Option<&str>,
+    server_owner: Option<&'a str>,
+) -> Option<&'a str> {
+    if remembered.is_some() {
+        Some("b")
+    } else {
+        server_owner
+    }
+}
+
+// A dispatched repair without a definite reply must stop the retry loop and
+// leave the outer dispatched guard incomplete (quarantined on drop).
+#[cfg(test)]
+mod repair_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn finish_routes_only_to_its_owner_in_either_mode() {
+        assert_eq!(
+            finish_owner_layer(None, Some("self_signed")),
+            Some("self_signed")
+        );
+        assert_eq!(finish_owner_layer(None, Some("keybox")), Some("keybox"));
+        assert_eq!(finish_owner_layer(None, None), None);
+        assert_eq!(
+            finish_owner_layer(Some("actual-b"), Some("keybox")),
+            Some("b")
+        );
+        assert_eq!(finish_owner_layer(Some("offline-b"), None), Some("b"));
+    }
+
+    #[test]
+    fn uncertain_repair_stops_instead_of_releasing_as_original_failure() {
+        assert_eq!(
+            repair_reply_known(&json!({"error": "timeout"}), Some("b"), Some("b")),
+            Err(())
+        );
+        assert_eq!(
+            repair_reply_known(&json!({"error_code": 0}), Some("other"), Some("b")),
+            Err(())
+        );
+        assert_eq!(
+            repair_reply_known(&json!({}), Some("b"), Some("b")),
+            Err(())
+        );
+        assert_eq!(
+            repair_reply_known(&json!({"error_code": -204}), Some("b"), Some("b")),
+            Ok(())
+        );
+        assert_eq!(
+            repair_reply_known(&json!({"error_code": -9}), Some("b"), Some("b")),
+            Ok(())
+        );
+        assert_eq!(
+            repair_reply_known(&json!({"error_code": 0}), Some("b"), Some("b")),
+            Ok(())
+        );
+    }
+}
+
+fn repair_reply_known(reply: &Value, actual: Option<&str>, target: Option<&str>) -> Result<(), ()> {
+    if reply.get("error").is_some()
+        || actual != target
+        || reply.get("error_code").and_then(Value::as_i64).is_none()
+    {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 /// 把一笔 `finish_sign` 请求改写成「重开同一张槽位」的 `init_sign`：补签要的三个参数
@@ -1075,6 +1186,8 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         &["b", "keybox", "self_signed"]
     };
 
+    let request_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(state.cfg.soter_wait_result_timeout_secs);
     let mut last_error: Option<String> = None;
 
     // B 端这一层有没有能接活的设备，先问一次：没有就是「这层结构性地做不了」，
@@ -1098,8 +1211,8 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     let resolved = if session_present {
         // If the route is unknown or ambiguous, do not guess: sending finish to
         // another B could operate an unrelated session with the same integer
-        // handle. If the original B is offline, let the normal non-B fallback
-        // layers decide rather than changing the requested session's route.
+        // handle. If the original B is offline, finish is terminal; neither
+        // another B nor a server mint layer owns that session.
         remembered.as_deref().and_then(|actual| {
             connected
                 .iter()
@@ -1131,7 +1244,21 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         consistent_soter_target(requested_online, requested, None, resolved)
     };
 
-    // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：不拦、不排队，
+    // Physical finish must never fall through to a fabricated session or repair
+    // without a live lease. Unknown/expired handles are terminal business errors.
+    let server_owner = if op == "finish_sign" && remembered.is_none() {
+        body.get("session")
+            .and_then(Value::as_i64)
+            .and_then(|s| crate::soter_mint::session_layer(requested, s))
+    } else {
+        None
+    };
+    if op == "finish_sign" && remembered.is_none() && server_owner.is_none() {
+        return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"}))
+            .into_response();
+    }
+
+    // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：
     // 只拿 `init_sign` 时缓存的参数重开一张会话再签一次。B 端自己的能力探针也会在这台
     // 设备上跑 `init_sign`，那是另一条顶人的路子，已在 B 端给它加了空闲门
     // （`b-side/source/src/caps.rs` 的 `SIGN_PROBE_QUIET`）。
@@ -1172,6 +1299,12 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     if layers.is_empty() {
         layers.extend(order.iter().copied());
     }
+    if op == "finish_sign" {
+        layers.clear();
+        if let Some(owner) = finish_owner_layer(remembered.as_deref(), server_owner.as_deref()) {
+            layers.push(owner);
+        }
+    }
 
     // B 端这层到底是不是结构性地做不了（没有设备、设备没报 SOTER、TA 结构性报错）。
     // 只有它成立，服务端那两层接上之后才允许把槽位挪过去。
@@ -1183,42 +1316,139 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
 
     for &layer in &layers {
         let result = match layer {
-            "b" => match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
-                Some(mut b) => {
-                    b_structural = b.unavailable;
-                    served_device = b.device.clone();
-                    if let Some(reply) = b.hardware_reply.clone() {
-                        b_error_reply = Some(reply);
+            "b" => {
+                let mut lease = if needs_sign {
+                    match b_target.as_deref() {
+                        Some(device) if op == "init_sign" => {
+                            match state.sign_sessions.acquire(device, requested, request_deadline).await {
+                                Some(lease) => Some(lease),
+                                None => return Json(json!({"error_code": -9, "relay_error_kind": "soter_busy", "retryable": true})).into_response(),
+                            }
+                        }
+                        Some(device) => {
+                            match body.get("session").and_then(Value::as_i64).and_then(|s| state.sign_sessions.finish(device, requested, s)) {
+                                Some(lease) => Some(lease),
+                                None => return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response(),
+                            }
+                        }
+                        None if op == "finish_sign" => return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response(),
+                        None => None,
                     }
-                    // -204（`SOTER_ERROR_OPERATEID_NULL`）在这台设备上就一个意思：这张
-                    // 会话被后来的一笔 `init_sign` 顶掉了（TA 一台设备只留一个会话）。
-                    // 拿 init 时缓存的参数重开一张、用同一个 challenge 再签一次。
-                    if op == "finish_sign"
-                        && b.value.get("error_code").and_then(Value::as_i64) == Some(-204)
-                    {
-                        if let Some(fixed) =
-                            repair_clobbered_finish(state, body, requested, b.device.as_deref())
+                } else {
+                    None
+                };
+                let deadline = lease
+                    .as_ref()
+                    .map(|l| l.deadline.min(request_deadline))
+                    .unwrap_or(request_deadline);
+                let work = async {
+                    if let Some(guard) = lease.as_mut() {
+                        guard.dispatch();
+                    }
+                    match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
+                        Some(mut b) => {
+                            if needs_sign
+                                && b.device.as_deref() == b_target.as_deref()
+                                && b.value.get("error_code").and_then(Value::as_i64) == Some(-9)
+                            {
+                                // B's local active lease rejected init without touching HAL.
+                                // This is a definite result, not unknown dispatch; release
+                                // only our server reservation, never the B active session.
+                                if let Some(guard) = lease.as_mut() {
+                                    guard.completed();
+                                }
+                                return Some(b.value);
+                            }
+                            if needs_sign
+                                && b.value.get("error").is_none()
+                                && b.device.as_deref() != b_target.as_deref()
+                            {
+                                return Some(
+                                    json!({"error_code": -204, "relay_error_kind": "soter_device_mismatch"}),
+                                );
+                            }
+                            b_structural = b.unavailable;
+                            served_device = b.device.clone();
+                            if let Some(reply) = b.hardware_reply.clone() {
+                                b_error_reply = Some(reply);
+                            }
+                            // -204（`SOTER_ERROR_OPERATEID_NULL`）在这台设备上就一个意思：这张
+                            // 会话被后来的一笔 `init_sign` 顶掉了（TA 一台设备只留一个会话）。
+                            // 拿 init 时缓存的参数重开一张、用同一个 challenge 再签一次。
+                            if op == "finish_sign"
+                                && b.value.get("error_code").and_then(Value::as_i64) == Some(-204)
+                            {
+                                match repair_clobbered_finish(
+                                    state,
+                                    body,
+                                    requested,
+                                    b.device.as_deref(),
+                                )
                                 .await
-                        {
-                            b.value = fixed;
+                                {
+                                    Ok(Some(fixed)) => b.value = fixed,
+                                    Ok(None) => {}
+                                    Err(()) => {
+                                        return Some(
+                                            json!({"error_code": -204, "relay_error_kind": "soter_dispatch_unknown", "retryable": true}),
+                                        )
+                                    }
+                                }
+                            }
+                            if op == "finish_sign" {
+                                if let (Some(device), Some(session)) = (
+                                    b.device.as_deref(),
+                                    body.get("session").and_then(Value::as_i64),
+                                ) {
+                                    state.sign_sessions.forget_for(device, requested, session);
+                                }
+                            }
+                            if b.value.get("error").is_none() {
+                                if let Some(guard) = lease.as_mut() {
+                                    guard.completed();
+                                }
+                            } else if needs_sign {
+                                return Some(
+                                    json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_dispatch_unknown", "retryable": true}),
+                                );
+                            }
+                            if op == "init_sign"
+                                && b.value.get("error_code").and_then(Value::as_i64) == Some(0)
+                            {
+                                if let Some(guard) = lease.as_mut() {
+                                    let kept = b
+                                        .value
+                                        .get("session")
+                                        .and_then(Value::as_i64)
+                                        .filter(|s| *s != 0)
+                                        .is_some_and(|s| guard.retain_session(s));
+                                    if !kept {
+                                        return Some(json!({"error_code": -204}));
+                                    }
+                                }
+                            }
+                            Some(b.value)
                         }
+                        None => None,
                     }
-                    if op == "finish_sign" {
-                        if let (Some(device), Some(session)) = (
-                            b.device.as_deref(),
-                            body.get("session").and_then(Value::as_i64),
-                        ) {
-                            state.sign_sessions.forget_for(device, requested, session);
-                        }
-                    }
-                    Some(b.value)
+                };
+                match tokio::time::timeout_at(deadline, work).await {
+                    Ok(result) => result,
+                    Err(_) => return Json(json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_deadline"})).into_response(),
                 }
-                None => None,
-            },
+            }
             "keybox" | "self_signed" => run_layer_soter(state, layer, body, requested).await,
             _ => None,
         };
         match result {
+            Some(mut v)
+                if layer == "b" && v.get("error_code").and_then(Value::as_i64) == Some(-9) =>
+            {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("retryable".to_owned(), json!(true));
+                }
+                return Json(v).into_response();
+            }
             Some(v) if v.get("error").is_none() => {
                 // 服务端这两层的钥匙各是各的（`soter_mint` 的 `Store::auth` 按
                 // `{device}|{uid}|{alias}` 存），槽位建在 B 上的钥匙它们手里没有，于是
@@ -1363,6 +1593,14 @@ async fn try_b_soter_layer(
         None => None,
     })
     .filter(|d| !d.is_empty());
+    if reply.get("error").is_none() && device.as_deref() != Some(target) {
+        return Some(BSoterLayer {
+            value: json!({"error": "SOTER completion device mismatch", "error_code": -204}),
+            unavailable: false,
+            device: None,
+            hardware_reply: None,
+        });
+    }
     if let Some(code) = soter_device_hard_failure(op, &reply) {
         return Some(BSoterLayer {
             value: json!({

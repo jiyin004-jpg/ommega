@@ -627,21 +627,46 @@ impl HwBinder {
         // 接收侧用一块普通堆内存，不用那张 mmap —— AOSP 的 `talkWithDriver` 也是把
         // `bwr.read_buffer` 指到 `Parcel` 的堆内存上，内核拿 `put_user` 往里写命令流。
         // mmap 区只用来放应答里 buffer 对象指向的数据体。
-        let mut inbox = vec![0u8; 4096];
-        let mut wwr = BinderWriteRead {
-            write_size: out.len() as BinderSize,
-            write_consumed: 0,
-            write_buffer: out.as_ptr() as BinderSize,
-            read_size: inbox.len() as BinderSize,
-            read_consumed: 0,
-            read_buffer: inbox.as_mut_ptr() as BinderSize,
-        };
-        // SAFETY: fd 有效，wwr 的 write_buffer 指向本次调用期间有效的 out，read_buffer
-        // 指向我们自己的 mmap 区。
-        let rc = unsafe { libc_ioctl_wwr(self.fd.as_raw_fd(), &mut wwr) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            return Err(err).with_context(|| format!("BINDER_WRITE_READ for code {code} failed"));
+        wait_for_reply(
+            &out,
+            code,
+            |wwr| {
+                // SAFETY: out and the heap inbox remain valid throughout this ioctl.
+                let rc = unsafe { libc_ioctl_wwr(self.fd.as_raw_fd(), wwr) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            },
+            |tr| self.collect_reply(tr),
+        )
+    }
+}
+
+/// Send once, then use blocking read-only ioctls until a reply or driver error.
+/// Partial writes remain an error: retrying the transaction could duplicate it.
+fn wait_for_reply(
+    out: &[u8],
+    code: u32,
+    mut talk: impl FnMut(&mut BinderWriteRead) -> io::Result<()>,
+    mut collect: impl FnMut(&BinderTransactionData) -> Result<Reply>,
+) -> Result<Reply> {
+    let mut inbox = vec![0u8; 4096];
+    let mut wwr = BinderWriteRead {
+        write_size: out.len() as BinderSize,
+        write_consumed: 0,
+        write_buffer: out.as_ptr() as BinderSize,
+        read_size: inbox.len() as BinderSize,
+        read_consumed: 0,
+        read_buffer: inbox.as_mut_ptr() as BinderSize,
+    };
+    loop {
+        // Keep the same consumption counters on EINTR; never replay consumed bytes.
+        match talk(&mut wwr) {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            result => {
+                result.with_context(|| format!("BINDER_WRITE_READ for code {code} failed"))?
+            }
         }
         if wwr.write_consumed != wwr.write_size {
             // 内核没把命令流吃完，说明这笔事务没能完整交出去。此时读侧通常只有一条
@@ -653,85 +678,102 @@ impl HwBinder {
             );
         }
 
-        // read_buffer 是内核写进来的命令流，长度是 read_consumed。
-        // SAFETY: 内核保证 read_consumed <= read_size，也就是 <= inbox.len()。
-        let reply_bytes =
-            unsafe { std::slice::from_raw_parts(inbox.as_ptr(), wwr.read_consumed as usize) };
-        self.parse_commands(reply_bytes, code)
+        if wwr.read_consumed == 0 {
+            bail!("no binder commands while waiting for BR_REPLY for code {code}");
+        }
+        if wwr.read_consumed > inbox.len() as BinderSize {
+            bail!("binder read_consumed exceeds inbox for code {code}");
+        }
+        if let Some(reply) =
+            parse_commands(&inbox[..wwr.read_consumed as usize], code, &mut collect)?
+        {
+            return Ok(reply);
+        }
+        // BR_TRANSACTION_COMPLETE acknowledges delivery, not the synchronous reply.
+        // Like libhwbinder waitForResponse, continue reading without resending.
+        wwr.write_size = 0;
+        wwr.write_consumed = 0;
+        wwr.write_buffer = 0;
+        wwr.read_consumed = 0;
     }
+}
 
-    /// 走一遍应答里的命令流，挑出 `BR_REPLY`；应答 buffer 交给 `pending_free` 推迟释放。
-    fn parse_commands(&self, bytes: &[u8], code: u32) -> Result<Reply> {
-        let mut at = 0usize;
-        let mut reply: Option<Reply> = None;
-        while at + 4 <= bytes.len() {
-            let cmd = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-            at += 4;
-            if cmd_type(cmd) != b'r' as u32 {
-                bail!("expected a BR_ command in the reply stream, got {cmd:#x}");
+/// Parse one complete driver batch; None means the synchronous reply is pending.
+fn parse_commands(
+    bytes: &[u8],
+    code: u32,
+    collect: &mut impl FnMut(&BinderTransactionData) -> Result<Reply>,
+) -> Result<Option<Reply>> {
+    let mut at = 0usize;
+    let mut reply: Option<Reply> = None;
+    while at + 4 <= bytes.len() {
+        let cmd = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        at += 4;
+        if cmd_type(cmd) != b'r' as u32 {
+            bail!("expected a BR_ command in the reply stream, got {cmd:#x}");
+        }
+        let nr = cmd_nr(cmd);
+        match cmd {
+            BR_NOOP
+            | BR_OK
+            | BR_TRANSACTION_COMPLETE
+            | BR_SPAWN_LOOPER
+            | BR_FINISHED
+            | BR_ONEWAY_SPAM_SUSPECT => {}
+            BR_DEAD_REPLY => bail!("binder target died while handling code {code}"),
+            BR_FAILED_REPLY => bail!("binder failed to deliver code {code} (bad handle?)"),
+            BR_FROZEN_REPLY => bail!("binder target is frozen, code {code}"),
+            BR_ERROR => {
+                if at + 4 > bytes.len() {
+                    bail!("truncated BR_ERROR");
+                }
+                let err =
+                    i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+                bail!("binder reported error {err} for code {code}");
             }
-            let nr = cmd_nr(cmd);
-            match cmd {
-                BR_NOOP
-                | BR_OK
-                | BR_TRANSACTION_COMPLETE
-                | BR_SPAWN_LOOPER
-                | BR_FINISHED
-                | BR_ONEWAY_SPAM_SUSPECT => {}
-                BR_DEAD_REPLY => bail!("binder target died while handling code {code}"),
-                BR_FAILED_REPLY => bail!("binder failed to deliver code {code} (bad handle?)"),
-                BR_FROZEN_REPLY => bail!("binder target is frozen, code {code}"),
-                BR_ERROR => {
-                    if at + 4 > bytes.len() {
-                        bail!("truncated BR_ERROR");
-                    }
-                    let err = i32::from_le_bytes([
-                        bytes[at],
-                        bytes[at + 1],
-                        bytes[at + 2],
-                        bytes[at + 3],
-                    ]);
-                    bail!("binder reported error {err} for code {code}");
+            BR_ACQUIRE_RESULT => {
+                at = at.checked_add(4).context("truncated BR_ACQUIRE_RESULT")?;
+            }
+            BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS | BR_ATTEMPT_ACQUIRE => {
+                at = at.checked_add(16).context("truncated ref-count command")?;
+            }
+            BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE => {
+                at = at.checked_add(8).context("truncated death command")?;
+            }
+            BR_TRANSACTION | BR_REPLY | BR_TRANSACTION_SEC_CTX => {
+                let size = if cmd == BR_TRANSACTION_SEC_CTX {
+                    72 // binder_transaction_data + secctx 指针
+                } else {
+                    64
+                };
+                if at + size > bytes.len() {
+                    bail!("truncated transaction data");
                 }
-                BR_ACQUIRE_RESULT => {
-                    at = at.checked_add(4).context("truncated BR_ACQUIRE_RESULT")?;
-                }
-                BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS | BR_ATTEMPT_ACQUIRE => {
-                    at = at.checked_add(16).context("truncated ref-count command")?;
-                }
-                BR_DEAD_BINDER | BR_CLEAR_DEATH_NOTIFICATION_DONE => {
-                    at = at.checked_add(8).context("truncated death command")?;
-                }
-                BR_TRANSACTION | BR_REPLY | BR_TRANSACTION_SEC_CTX => {
-                    let size = if cmd == BR_TRANSACTION_SEC_CTX {
-                        72 // binder_transaction_data + secctx 指针
-                    } else {
-                        64
+                // 只有 BR_REPLY 才是给我们的应答；服务端才收 BR_TRANSACTION。
+                if cmd == BR_REPLY {
+                    let mut raw = [0u8; 64];
+                    raw.copy_from_slice(&bytes[at..at + 64]);
+                    // SAFETY: 64 字节正好是 BinderTransactionData 的大小，POD。
+                    let tr: BinderTransactionData = unsafe {
+                        std::ptr::read_unaligned(raw.as_ptr().cast::<BinderTransactionData>())
                     };
-                    if at + size > bytes.len() {
-                        bail!("truncated transaction data");
-                    }
-                    // 只有 BR_REPLY 才是给我们的应答；服务端才收 BR_TRANSACTION。
-                    if cmd == BR_REPLY {
-                        let mut raw = [0u8; 64];
-                        raw.copy_from_slice(&bytes[at..at + 64]);
-                        // SAFETY: 64 字节正好是 BinderTransactionData 的大小，POD。
-                        let tr: BinderTransactionData = unsafe {
-                            std::ptr::read_unaligned(raw.as_ptr().cast::<BinderTransactionData>())
-                        };
-                        reply = Some(self.collect_reply(&tr)?);
-                    }
-                    at += size;
+                    reply = Some(collect(&tr)?);
                 }
-                other => {
-                    // 不认识的命令不能瞎猜它带多少参数，再往下走必然错位，直接停。
-                    bail!("unknown BR_ command {other:#x} (nr={nr}) in the reply stream");
-                }
+                at += size;
+            }
+            other => {
+                // 不认识的命令不能瞎猜它带多少参数，再往下走必然错位，直接停。
+                bail!("unknown BR_ command {other:#x} (nr={nr}) in the reply stream");
             }
         }
-        reply.ok_or_else(|| anyhow::anyhow!("no BR_REPLY for code {code} in the binder stream"))
     }
+    if at != bytes.len() {
+        bail!("truncated binder command stream for code {code}");
+    }
+    Ok(reply)
+}
 
+impl HwBinder {
     /// 把上一轮攒下的应答 buffer 一次性交回内核（多条 `BC_FREE_BUFFER` 串在一个写流里）。
     fn flush_pending_free(&self) {
         let ptrs: Vec<BinderSize> = match self.pending_free.lock() {
@@ -943,6 +985,142 @@ fn _keep_alive() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_batches(batches: &[Vec<u8>]) -> (Result<Reply>, usize) {
+        let out = BC_TRANSACTION_SG.to_le_bytes();
+        let mut calls = 0;
+        let result = wait_for_reply(
+            &out,
+            42,
+            |wwr| {
+                if calls == 0 {
+                    assert_eq!(wwr.write_size, out.len() as u64);
+                    assert_eq!(wwr.write_buffer, out.as_ptr() as u64);
+                } else {
+                    assert_eq!(wwr.write_size, 0, "must not resend transaction");
+                    assert_eq!(wwr.write_buffer, 0);
+                }
+                let batch = &batches[calls];
+                calls += 1;
+                wwr.write_consumed = wwr.write_size;
+                wwr.read_consumed = batch.len() as u64;
+                // SAFETY: wait_for_reply supplies a live 4096-byte inbox.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        batch.as_ptr(),
+                        wwr.read_buffer as *mut u8,
+                        batch.len(),
+                    );
+                }
+                Ok(())
+            },
+            |_| {
+                Ok(Reply {
+                    data: vec![7],
+                    offsets: Vec::new(),
+                })
+            },
+        );
+        (result, calls)
+    }
+
+    #[test]
+    fn complete_then_reply_reads_without_resending() {
+        let mut reply = BR_REPLY.to_le_bytes().to_vec();
+        reply.extend_from_slice(&[0; 64]);
+        let (result, calls) = run_batches(&[BR_TRANSACTION_COMPLETE.to_le_bytes().to_vec(), reply]);
+        assert_eq!(result.unwrap().data, vec![7]);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn complete_and_reply_in_one_batch() {
+        let mut batch = BR_TRANSACTION_COMPLETE.to_le_bytes().to_vec();
+        batch.extend_from_slice(&BR_REPLY.to_le_bytes());
+        batch.extend_from_slice(&[0; 64]);
+        let (result, calls) = run_batches(&[batch]);
+        assert_eq!(result.unwrap().data, vec![7]);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn truncated_batch_does_not_wait_for_more() {
+        let mut batch = BR_TRANSACTION_COMPLETE.to_le_bytes().to_vec();
+        batch.push(0);
+        let (result, calls) = run_batches(&[batch]);
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn complete_then_terminal_error() {
+        for cmd in [BR_DEAD_REPLY, BR_FAILED_REPLY, BR_FROZEN_REPLY, BR_ERROR] {
+            let mut error = cmd.to_le_bytes().to_vec();
+            if cmd == BR_ERROR {
+                error.extend_from_slice(&(-22i32).to_le_bytes());
+            }
+            let (result, calls) =
+                run_batches(&[BR_TRANSACTION_COMPLETE.to_le_bytes().to_vec(), error]);
+            assert!(result.is_err());
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn complete_then_no_data_is_bounded() {
+        let (result, calls) =
+            run_batches(&[BR_TRANSACTION_COMPLETE.to_le_bytes().to_vec(), Vec::new()]);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no binder commands"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn partial_write_fails_without_retry() {
+        let mut calls = 0;
+        let result = wait_for_reply(
+            &[0; 76],
+            42,
+            |wwr| {
+                calls += 1;
+                wwr.write_consumed = 4;
+                Ok(())
+            },
+            |_| unreachable!("partial writes cannot produce a reply"),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("consumed only 4 of 76"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn interrupted_ioctl_preserves_write_consumption() {
+        let mut calls = 0;
+        let result = wait_for_reply(
+            &[0; 76],
+            42,
+            |wwr| {
+                calls += 1;
+                if calls == 1 {
+                    wwr.write_consumed = wwr.write_size;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                assert_eq!(wwr.write_consumed, wwr.write_size);
+                wwr.read_consumed = 0;
+                Ok(())
+            },
+            |_| unreachable!(),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no binder commands"));
+        assert_eq!(calls, 2);
+    }
 
     #[test]
     fn ioctl_command_numbers_match_the_kernel_macros() {

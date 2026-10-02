@@ -34,10 +34,11 @@ const SOTER_HOST_PROCESS: &str = "com.tencent.soter.soterserver";
 /// `vendor.xiaomi.hardware.soterservice@1.0-service`。一个都没匹配上也不当事 ——
 /// 宿主那条路（app → 宿主 → HAL）本来就在宿主进程里，这条只为了 `service call` 那种
 /// 绕开宿主直接打 HAL 的流量。
-const SOTER_HAL_PROCESSES: [&str; 3] = [
+const SOTER_HAL_PROCESSES: [&str; 4] = [
     "vendor.qti.hardware.soter-service",
     "vendor.trustonic.soter@1.0-service",
     "vendor.xiaomi.hardware.soterservice@1.0-service",
+    "vendor.microtrust.hardware.soter@1.0-service",
 ];
 
 /// 已经注过的目标不要再注第二遍：payload 是同一个可执行文件，dlopen 第二次就是第二份
@@ -320,6 +321,15 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soter_hal_targets_include_the_exact_microtrust_process() {
+        assert!(SOTER_HAL_PROCESSES.contains(&"vendor.microtrust.hardware.soter@1.0-service"));
+        assert!(!SOTER_HAL_PROCESSES.contains(&"soter-1-0"));
+        assert!(
+            !SOTER_HAL_PROCESSES.contains(&"vendor.microtrust.hardware.soter@1.0-service-helper")
+        );
+    }
 
     #[test]
     fn payload_thread_names_recognize_our_own_threads() {

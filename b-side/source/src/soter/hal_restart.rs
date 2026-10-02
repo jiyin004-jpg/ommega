@@ -77,6 +77,18 @@ const SERVICE_CANDIDATES: &[&str] = &[
     "vendor.trustonic.soter@1.0-service",
     "vendor.trustonic.soter-1-0",
     "vendor.xiaomi.hardware.soterservice@1.0-service",
+    "soter-1-0",
+];
+
+/// Exact executable basenames only; init service names are a separate list.
+const HAL_PROCESS_CANDIDATES: &[&str] = &[
+    "soter_hal",
+    "android.hardware.soter@1.0-service",
+    "vendor.qti.hardware.soter-service",
+    "vendor.qti.hardware.soter@1.0-service",
+    "vendor.trustonic.soter@1.0-service",
+    "vendor.xiaomi.hardware.soterservice@1.0-service",
+    "vendor.microtrust.hardware.soter@1.0-service",
 ];
 
 static FAILURES: Mutex<u32> = Mutex::new(0);
@@ -202,8 +214,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// 进程名里带 soter 的那个 HAL（`com.tencent.soter.soterserver` 是 App 那侧的服务，
-/// 不算）；返回它的 pid。
+/// Only restart an exact known HAL process, never an app or a substring match.
 fn kill_hal_process() -> Result<String, String> {
     let listing = run("ps", &["-A", "-o", "PID,NAME"]).map_err(|e| format!("ps 用不了：{e}"))?;
     let pid = listing
@@ -212,11 +223,8 @@ fn kill_hal_process() -> Result<String, String> {
             let mut parts = line.split_whitespace();
             let pid = parts.next()?;
             let name = parts.next()?;
-            let lower = name.to_ascii_lowercase();
-            let looks_like_hal = lower.contains("soter")
-                && !lower.contains("soterserver")
-                && (lower.contains("service") || lower.contains("hal"));
-            (looks_like_hal && pid.chars().all(|c| c.is_ascii_digit())).then(|| pid.to_string())
+            (HAL_PROCESS_CANDIDATES.contains(&name) && pid.chars().all(|c| c.is_ascii_digit()))
+                .then(|| pid.to_string())
         })
         .next()
         .ok_or_else(|| "ps 里没找到 SOTER HAL 进程".to_string())?;
@@ -317,6 +325,22 @@ mod tests {
         assert_eq!(verdict, Verdict::Restart);
         // 从没重启过（None）也算过了冷却。
         assert_eq!(step("init_sign", -18, 1, None).1, Verdict::Restart);
+    }
+
+    #[test]
+    fn microtrust_restart_names_are_exact_and_keep_rc_separate_from_process() {
+        assert!(SERVICE_CANDIDATES.contains(&"soter-1-0"));
+        assert!(!SERVICE_CANDIDATES.contains(&"vendor.microtrust.hardware.soter@1.0-service"));
+        assert!(HAL_PROCESS_CANDIDATES.contains(&"vendor.microtrust.hardware.soter@1.0-service"));
+        for name in [
+            "soter-1-0",
+            "com.tencent.soter.soterserver",
+            "com.example.soter.service",
+            "vendor.microtrust.hardware.soter@1.0-service-helper",
+            "Vendor.microtrust.hardware.soter@1.0-service",
+        ] {
+            assert!(!HAL_PROCESS_CANDIDATES.contains(&name), "{name}");
+        }
     }
 
     #[test]

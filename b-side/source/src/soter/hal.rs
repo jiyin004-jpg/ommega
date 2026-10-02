@@ -8,6 +8,7 @@
 //! trustonic : vendor.trustonic.hardware.soter.ITrustonicSoter/default   (MTK / Kinibi)
 //! qti       : vendor.qti.hardware.soter.ISoter/default                  (Qualcomm)
 //! xiaomi    : vendor.xiaomi.hardware.soterservice@1.0::ISoter           (MTK, HIDL only)
+//! microtrust: vendor.microtrust.hardware.soter@1.0::ISoter              (HIDL only)
 //! ```
 //!
 //! What differs is the outer reply framing:
@@ -75,17 +76,19 @@ pub enum Backend {
     TrustonicHidl,
     QtiHidl,
     XiaomiHidl,
+    MicrotrustHidl,
 }
 
 impl Backend {
     /// 解析顺序。AIDL 在前：Android 13 以后厂商都搬过去了，HIDL 是过渡期的兜底。
     /// 同一家 vendor 只会注册其中一种形态。
-    pub const ALL: [Backend; 5] = [
+    pub const ALL: [Backend; 6] = [
         Backend::Trustonic,
         Backend::Qti,
         Backend::TrustonicHidl,
         Backend::QtiHidl,
         Backend::XiaomiHidl,
+        Backend::MicrotrustHidl,
     ];
 
     /// 服务名。HIDL 那边是 fqName（`@1.0::` 那个），instance 统一是 `default`。
@@ -96,6 +99,7 @@ impl Backend {
             Backend::TrustonicHidl => hidl::HIDL_TRUSTONIC_FQNAME,
             Backend::QtiHidl => hidl::HIDL_QTI_FQNAME,
             Backend::XiaomiHidl => hidl::HIDL_XIAOMI_FQNAME,
+            Backend::MicrotrustHidl => hidl::HIDL_MICROTRUST_FQNAME,
         }
     }
 
@@ -107,6 +111,7 @@ impl Backend {
             Backend::TrustonicHidl => hidl::HIDL_TRUSTONIC_FQNAME,
             Backend::QtiHidl => hidl::HIDL_QTI_FQNAME,
             Backend::XiaomiHidl => hidl::HIDL_XIAOMI_FQNAME,
+            Backend::MicrotrustHidl => hidl::HIDL_MICROTRUST_FQNAME,
         }
     }
 
@@ -118,6 +123,7 @@ impl Backend {
             Backend::TrustonicHidl => "trustonic-hidl",
             Backend::QtiHidl => "qti-hidl",
             Backend::XiaomiHidl => "xiaomi-hidl",
+            Backend::MicrotrustHidl => "microtrust-hidl",
         }
     }
 
@@ -125,7 +131,10 @@ impl Backend {
     pub fn is_hidl(self) -> bool {
         matches!(
             self,
-            Backend::TrustonicHidl | Backend::QtiHidl | Backend::XiaomiHidl
+            Backend::TrustonicHidl
+                | Backend::QtiHidl
+                | Backend::XiaomiHidl
+                | Backend::MicrotrustHidl
         )
     }
 
@@ -139,14 +148,20 @@ impl Backend {
 
     /// Whether the ATTK family (codes 2/6/14) can be addressed.
     ///
-    /// 这是 vendor 的差别而不是 AIDL/HIDL 的差别：联发科那套（Trustonic）上是真
-    /// 实现，高通那边是空号。所以两个 Trustonic 后端都算支持。
+    /// Trustonic exposes the AIDL slots and their HIDL equivalents. Microtrust's
+    /// vendor stub also declares the ATTK HIDL methods (codes 1/2/3).
+    /// Addressable methods do not imply successful device provisioning.
     ///
     /// The host never sends those three, so the vendor's declarations for them
     /// were never observable on Qualcomm, and guessing is not an option: on the
     /// Trustonic HAL code 6 is `generateAttkKeyPair`, i.e. a TEE state change.
     fn supports_attk_extras(self) -> bool {
-        matches!(self, Backend::Trustonic | Backend::TrustonicHidl)
+        // Microtrust's vendor stub declares all 14 HIDL methods, including ATTK.
+        // This addresses the interface only; provisioning remains device-dependent.
+        matches!(
+            self,
+            Backend::Trustonic | Backend::TrustonicHidl | Backend::MicrotrustHidl
+        )
     }
 }
 
@@ -286,7 +301,10 @@ impl Soter {
                 let _typed: rsbinder::Strong<dyn ISoter> =
                     FromIBinder::try_from(binder.clone()).map_err(descriptor_error)?;
             }
-            Backend::TrustonicHidl | Backend::QtiHidl | Backend::XiaomiHidl => {
+            Backend::TrustonicHidl
+            | Backend::QtiHidl
+            | Backend::XiaomiHidl
+            | Backend::MicrotrustHidl => {
                 unreachable!("handled above")
             }
         }
@@ -683,6 +701,24 @@ mod tests {
                 assert_eq!(backend.interface(), backend.service());
             }
         }
+        assert_eq!(
+            Backend::MicrotrustHidl.service(),
+            hidl::HIDL_MICROTRUST_FQNAME
+        );
+        assert_eq!(
+            Backend::MicrotrustHidl.interface(),
+            hidl::HIDL_MICROTRUST_FQNAME
+        );
+        assert_eq!(Backend::MicrotrustHidl.label(), "microtrust-hidl");
+        assert!(Backend::MicrotrustHidl.is_hidl());
+        assert!(Backend::MicrotrustHidl.supports_attk_extras());
+        assert!(!Backend::MicrotrustHidl.has_return_code());
+        let hidl_services: Vec<_> = Backend::ALL
+            .into_iter()
+            .filter(|backend| backend.is_hidl())
+            .map(Backend::service)
+            .collect();
+        assert_eq!(hidl_services, hidl::BACKENDS);
         assert_eq!(Backend::XiaomiHidl.service(), hidl::HIDL_XIAOMI_FQNAME);
         assert_eq!(Backend::XiaomiHidl.interface(), hidl::HIDL_XIAOMI_FQNAME);
         assert_eq!(Backend::XiaomiHidl.label(), "xiaomi-hidl");

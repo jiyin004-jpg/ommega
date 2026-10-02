@@ -56,5 +56,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # no C zlib (libz-sys) is linked in the musl cross-build.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = 2

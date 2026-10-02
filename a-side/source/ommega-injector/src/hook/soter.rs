@@ -75,7 +75,7 @@ pub(crate) const TRUSTONIC_DESCRIPTOR: &str = "vendor.trustonic.hardware.soter.I
 /// HIDL 那一版的描述符。名字里带版本号（`@1.0::`），跟 AIDL 那两条完全不是一回事：
 /// 宿主 dex 里两种代理类都在（`...@1.0::ISoter@Proxy` / `...@1.0::ITrustonicSoter@Proxy`），
 /// 哪条路通得看系统里装的是哪种实现；小米又是另一个包名（`vendor.xiaomi.hardware.soterservice`）。
-/// 三条都得认 —— 号码、参数、回复形状是同一套（`.hal` 的声明顺序）。
+/// 这些 HIDL 描述符的号码、参数、回复形状是同一套（`.hal` 的声明顺序）。
 pub(crate) const QTI_HIDL_DESCRIPTOR: &str = "vendor.qti.hardware.soter@1.0::ISoter";
 pub(crate) const TRUSTONIC_HIDL_DESCRIPTOR: &str =
     "vendor.trustonic.hardware.soter@1.0::ITrustonicSoter";
@@ -83,6 +83,9 @@ pub(crate) const TRUSTONIC_HIDL_DESCRIPTOR: &str =
 /// 接口名、方法声明顺序跟上面两条 HIDL 一模一样，只是包名不同。
 /// 不认这条的话，小米机上宿主发往 HAL 的那条路就归到「不认识的流量」里，转不出去。
 pub(crate) const XIAOMI_HIDL_DESCRIPTOR: &str = "vendor.xiaomi.hardware.soterservice@1.0::ISoter";
+/// Microtrust's rubyx manifest and vendor stub confirm the HIDL contract,
+/// including initSign=13 and finishSign=14; not validated on-device.
+pub(crate) const MICROTRUST_HIDL_DESCRIPTOR: &str = "vendor.microtrust.hardware.soter@1.0::ISoter";
 /// App 面向的接口描述符（App 发给 SoterService 的那条，走的是入站 transaction）。
 pub(crate) const APP_DESCRIPTOR: &str = "com.tencent.soter.soterserver.ISoterService";
 
@@ -362,7 +365,8 @@ impl<'a> Cursor<'a> {
 /// interface token 在真实流量里见过这几种前缀（里面都是 i32）：
 ///
 /// ```text
-///  0 字节：[String16]                                  hwbinder / HIDL —— 没有 strict-mode
+///  0 字节：[CString + 4-byte padding]                  libhwbinder / HIDL
+///  0 字节：[String16]                                  legacy fixtures / AIDL
 ///  4 字节：[strict-mode policy][String16]              老一点的 libbinder
 ///  8 字节：[strict-mode policy]['SYST'][String16]       （没见过实例，但形状上说得通）
 /// 12 字节：[strict-mode policy][work source]['SYST'][String16]
@@ -378,6 +382,11 @@ impl<'a> Cursor<'a> {
 /// 高通那两条（AIDL 与 HIDL）都是 `int`，联发科那两条都是 `void`。
 /// `initSign` 两家都不带（高通直接返回 `SoterInitReturn`），所以那个号的回复不走这一格。
 fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
+    // libhwbinder writeInterfaceToken -> writeCString writes strlen + 1 bytes,
+    // padded to four bytes, without any libbinder policy/work-source prefix.
+    if let Some((has_return_code, next)) = read_hidl_token(data) {
+        return Some((Side::HalHidl, has_return_code, next));
+    }
     for prefix in [0usize, 4, 8, 12] {
         let variants: &[bool] = if prefix == 12 {
             &[true, false]
@@ -407,7 +416,7 @@ fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
             if text == TRUSTONIC_HIDL_DESCRIPTOR {
                 return Some((Side::HalHidl, false, next));
             }
-            if text == XIAOMI_HIDL_DESCRIPTOR {
+            if text == XIAOMI_HIDL_DESCRIPTOR || text == MICROTRUST_HIDL_DESCRIPTOR {
                 // 第二个值在 HIDL 这条路上用不上（回复按 [`Side::HalHidl`] 另拼，
                 // 不读这一格），统一填 false。
                 return Some((Side::HalHidl, false, next));
@@ -415,6 +424,29 @@ fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
             if text == APP_DESCRIPTOR {
                 return Some((Side::App, false, next));
             }
+        }
+    }
+    None
+}
+
+/// Recognise only an exact, unprefixed HIDL CString token. Do not search arbitrary
+/// payload bytes or accept AIDL descriptors in the CString encoding.
+fn read_hidl_token(data: &[u8]) -> Option<(bool, usize)> {
+    for (descriptor, has_return_code) in [
+        (QTI_HIDL_DESCRIPTOR, true),
+        (TRUSTONIC_HIDL_DESCRIPTOR, false),
+        (XIAOMI_HIDL_DESCRIPTOR, false),
+        (MICROTRUST_HIDL_DESCRIPTOR, false),
+    ] {
+        let bytes = descriptor.as_bytes();
+        let next = (bytes.len() + 1).next_multiple_of(4);
+        if data.starts_with(bytes)
+            && data.get(bytes.len()) == Some(&0)
+            && data
+                .get(bytes.len() + 1..next)
+                .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
+        {
+            return Some((has_return_code, next));
         }
     }
     None
@@ -929,6 +961,7 @@ mod tests {
             QTI_HIDL_DESCRIPTOR,
             TRUSTONIC_HIDL_DESCRIPTOR,
             XIAOMI_HIDL_DESCRIPTOR,
+            MICROTRUST_HIDL_DESCRIPTOR,
         ] {
             let mut keep: Vec<Box<[u8]>> = Vec::new();
             let mut data = hidl_token(descriptor);
@@ -941,6 +974,30 @@ mod tests {
             assert!(interceptable(&call), "HIDL 现在也拦");
             drop(keep);
         }
+    }
+
+    #[test]
+    fn microtrust_hidl_sign_codes_use_the_existing_mapping() {
+        let mut keep: Vec<Box<[u8]>> = Vec::new();
+        let mut data = hidl_token(MICROTRUST_HIDL_DESCRIPTOR);
+        push_i32(&mut data, 10373);
+        push_hidl_string(&mut data, &mut keep, "SoterAuthKey");
+        push_hidl_string(&mut data, &mut keep, "abcd");
+        let call = parse(&data, 13).expect("Microtrust initSign");
+        assert!(call.hal && call.hidl);
+        assert_eq!(call.code, 11);
+        assert_eq!(call.op, "initSign");
+        assert_eq!(call.uid, Some(10373));
+        assert_eq!(call.alias.as_deref(), Some("SoterAuthKey"));
+        assert_eq!(call.challenge.as_deref(), Some("abcd"));
+
+        let mut data = hidl_token(MICROTRUST_HIDL_DESCRIPTOR);
+        push_i64(&mut data, 42);
+        let call = parse(&data, 14).expect("Microtrust finishSign");
+        assert!(call.hal && call.hidl);
+        assert_eq!(call.code, 4);
+        assert_eq!(call.op, "finishSign");
+        assert_eq!(call.session, Some(42));
     }
 
     #[test]
@@ -1261,11 +1318,165 @@ mod tests {
         );
     }
 
-    /// hwbinder 的接口 token：没有 strict-mode 那几个 i32 头，开头就是一个 String16。
+    /// Legacy String16 HIDL fixture, retained independently of real CString tokens.
     fn hidl_token(descriptor: &str) -> Vec<u8> {
         let mut out = Vec::new();
         push_string(&mut out, descriptor);
         out
+    }
+
+    /// libhwbinder Parcel::writeCString: strlen + 1, then zero padding to four.
+    fn hidl_cstring_token(descriptor: &str) -> Vec<u8> {
+        let mut out = descriptor.as_bytes().to_vec();
+        out.push(0);
+        out.resize(out.len().next_multiple_of(4), 0);
+        out
+    }
+
+    #[test]
+    fn real_hidl_cstring_tokens_align_uid_and_session() {
+        for descriptor in [
+            QTI_HIDL_DESCRIPTOR,
+            TRUSTONIC_HIDL_DESCRIPTOR,
+            XIAOMI_HIDL_DESCRIPTOR,
+            MICROTRUST_HIDL_DESCRIPTOR,
+        ] {
+            let mut data = hidl_cstring_token(descriptor);
+            let args_at = data.len();
+            assert_eq!(args_at, (descriptor.len() + 1).next_multiple_of(4));
+            assert_eq!(match_descriptor(&data).unwrap().2, args_at);
+            push_i32(&mut data, 10490);
+            let call = parse(&data, 8).expect("CString hasAskAlready");
+            assert!(call.hal && call.hidl);
+            assert_eq!(
+                (call.code, call.wire_code, call.op),
+                (9, 8, "hasAskAlready")
+            );
+            assert_eq!(call.uid, Some(10490));
+            assert!(parse(&data[..data.len() - 1], 8).is_none());
+
+            let mut data = hidl_cstring_token(descriptor);
+            push_i64(&mut data, 0x1234_5678_9abc_def0);
+            let call = parse(&data, 14).expect("CString finishSign");
+            assert!(call.hal && call.hidl);
+            assert_eq!((call.code, call.wire_code, call.op), (4, 14, "finishSign"));
+            assert_eq!(call.session, Some(0x1234_5678_9abc_def0));
+            assert!(parse(&data[..data.len() - 1], 14).is_none());
+        }
+    }
+
+    #[test]
+    fn real_hidl_cstring_init_preserves_embedded_string_boundaries() {
+        let alias = "SoterAuthKeyV2_salt11d8ba34_scene1";
+        let challenge = "0102030405060708";
+        let object_size = 8 + 4 * size_of::<usize>();
+        for descriptor in [QTI_HIDL_DESCRIPTOR, TRUSTONIC_HIDL_DESCRIPTOR] {
+            let mut keep = Vec::new();
+            let mut data = hidl_cstring_token(descriptor);
+            push_i32(&mut data, 10490);
+            let objects_at = data.len();
+            push_hidl_string(&mut data, &mut keep, alias);
+            push_hidl_string(&mut data, &mut keep, challenge);
+            // The second string's child points to object index 2, not index 0.
+            let parent_at = objects_at + 3 * object_size + 8 + 2 * size_of::<usize>();
+            let mut parent = Vec::new();
+            push_abi_usize(&mut parent, 2);
+            data[parent_at..parent_at + parent.len()].copy_from_slice(&parent);
+            assert_eq!(data.len(), objects_at + 4 * object_size);
+            let mut cursor = Cursor::new(&data, objects_at, true);
+            for (index, text) in [(0, alias), (2, challenge)] {
+                let head = cursor.hidl_buffer_object().unwrap();
+                let child = cursor.hidl_buffer_object().unwrap();
+                assert_eq!(head.length, HIDL_STRUCT_SIZE);
+                assert_eq!(child.length, text.len() + 1);
+                assert_eq!(child.flags, BINDER_BUFFER_FLAG_HAS_PARENT);
+                assert_eq!(child.parent, index);
+                assert_eq!(child.parent_offset, 0);
+            }
+            assert_eq!(cursor.remaining(), 0);
+            let call = parse(&data, 13).expect("CString initSign");
+            assert!(call.hal && call.hidl);
+            assert_eq!((call.code, call.wire_code, call.op), (11, 13, "initSign"));
+            assert_eq!(call.uid, Some(10490));
+            assert_eq!(call.alias.as_deref(), Some(alias));
+            assert_eq!(call.challenge.as_deref(), Some(challenge));
+            for cut in 0..data.len() {
+                assert!(parse(&data[..cut], 13).is_none(), "truncated at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn real_hidl_cstring_finish_reply_has_embedded_vector_boundaries() {
+        let mut data = hidl_cstring_token(QTI_HIDL_DESCRIPTOR);
+        push_i64(&mut data, 42);
+        let call = parse(&data, 14).expect("CString finishSign");
+        let vector = b"signed-json";
+        let (_, reply) = frame_br_reply(
+            &call,
+            Answer::Buffer {
+                code: 0,
+                data: Some(vector.to_vec()),
+            },
+        )
+        .expect("HIDL vector reply");
+        let payload = unsafe { std::slice::from_raw_parts(reply.data_ptr(), reply.data_size()) };
+        assert_eq!(&payload[..8], &[0; 8]);
+        let object_size = 8 + 4 * size_of::<usize>();
+        assert_eq!(payload.len(), 8 + 2 * object_size + 4);
+        assert_eq!(reply.offsets.as_ref(), &[8, 8 + object_size]);
+        let mut cursor = Cursor::new(payload, 8, true);
+        let head = cursor.hidl_buffer_object().unwrap();
+        let child = cursor.hidl_buffer_object().unwrap();
+        assert_eq!(head.type_, BINDER_TYPE_PTR);
+        assert_eq!(head.length, HIDL_STRUCT_SIZE);
+        assert_eq!(child.type_, BINDER_TYPE_PTR);
+        assert_eq!(child.flags, BINDER_BUFFER_FLAG_HAS_PARENT);
+        assert_eq!(child.length, vector.len());
+        assert_eq!((child.parent, child.parent_offset), (0, 0));
+        assert_eq!(cursor.i32().unwrap() as usize, vector.len());
+        assert_eq!(cursor.remaining(), 0);
+        let mut header = [0; HIDL_STRUCT_SIZE];
+        read_self(head.buffer, &mut header).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(header[..8].try_into().unwrap()),
+            child.buffer as u64
+        );
+        assert_eq!(
+            u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize,
+            vector.len()
+        );
+        let mut actual = vec![0; vector.len()];
+        read_self(child.buffer, &mut actual).unwrap();
+        assert_eq!(actual, vector);
+    }
+
+    #[test]
+    fn cstring_tokens_reject_non_hidl_and_non_exact_payloads() {
+        for descriptor in [
+            HAL_DESCRIPTOR,
+            TRUSTONIC_DESCRIPTOR,
+            APP_DESCRIPTOR,
+            "vendor.qti.hardware.soter@1.0::ISoterExtra",
+            "android.hardware.security.keymint@1.0::IKeyMintDevice",
+        ] {
+            assert!(parse(&hidl_cstring_token(descriptor), 4).is_none());
+        }
+        let token = hidl_cstring_token(QTI_HIDL_DESCRIPTOR);
+        for cut in 0..token.len() {
+            assert!(parse(&token[..cut], 4).is_none());
+        }
+        for prefix in [vec![0; 4], vec![0; 8], vec![0; 12], vec![0xff; 1]] {
+            let mut data = prefix;
+            data.extend_from_slice(&token);
+            assert!(parse(&data, 4).is_none());
+        }
+        let mut no_nul = token.clone();
+        no_nul[QTI_HIDL_DESCRIPTOR.len()] = b'x';
+        assert!(parse(&no_nul, 4).is_none());
+        let mut bad_padding = token;
+        *bad_padding.last_mut().unwrap() = 0xff;
+        assert!(parse(&bad_padding, 4).is_none());
     }
 
     #[test]

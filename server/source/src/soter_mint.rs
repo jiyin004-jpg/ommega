@@ -138,10 +138,20 @@ struct SlotPin {
 const SLOT_PIN_TTL_MILLIS: i64 = 30 * 60 * 1000;
 
 struct SignSession {
+    requested: String,
+    device: String,
+    layer: String,
     uid: i32,
     alias: String,
     /// 挑战原文。真机把这段原文写进签名 JSON 的 `raw` 里，不是解出来的字节。
     raw: String,
+}
+
+/// Only an exact requested-device/session owner may route a server finish.
+pub fn session_layer(requested: &str, session: i64) -> Option<String> {
+    let sessions = store().sessions.lock().ok()?;
+    let owner = sessions.get(&session)?;
+    (owner.requested == requested).then(|| owner.layer.clone())
 }
 
 fn store() -> &'static Store {
@@ -423,7 +433,21 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                         .sessions
                         .lock()
                         .map_err(|_| anyhow!("session lock poisoned"))?;
-                    sessions.insert(session, SignSession { uid, alias, raw });
+                    sessions.insert(
+                        session,
+                        SignSession {
+                            requested: body
+                                .get("device_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(device_id)
+                                .to_string(),
+                            device: device_id.to_string(),
+                            layer: layer.to_string(),
+                            uid,
+                            alias,
+                            raw,
+                        },
+                    );
                     session
                 };
                 Ok(json!({
@@ -434,12 +458,20 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             }
             "finish_sign" => {
                 let session = body.get("session").and_then(Value::as_i64).unwrap_or(0);
-                let sign_session = match store()
-                    .sessions
-                    .lock()
-                    .ok()
-                    .and_then(|mut m| m.remove(&session))
-                {
+                let sign_session = match store().sessions.lock().ok().and_then(|mut m| {
+                    let requested = body
+                        .get("device_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(device_id);
+                    let owner = m.get(&session)?;
+                    if owner.requested != requested
+                        || owner.device != device_id
+                        || owner.layer != layer
+                    {
+                        return None;
+                    }
+                    m.remove(&session)
+                }) {
                     Some(s) => s,
                     None => return Ok(code_result(op, NOT_FOUND)),
                 };
@@ -1043,6 +1075,44 @@ mod tests {
         assert!(pin_is_fresh(now, now));
         assert!(pin_is_fresh(now, now + SLOT_PIN_TTL_MILLIS));
         assert!(!pin_is_fresh(now, now + SLOT_PIN_TTL_MILLIS + 1));
+    }
+
+    #[test]
+    fn fallback_session_owner_is_exact_and_finish_cannot_steal_it() {
+        let device = "fallback-session-owner-test";
+        run(
+            "self_signed",
+            device,
+            &json!({"op": "generate_auth_key_pair", "uid": 8, "alias": "pay"}),
+            None,
+        )
+        .unwrap();
+        let init = run("self_signed", device, &json!({"device_id": device, "op": "init_sign", "uid": 8, "alias": "pay", "challenge": "raw"}), None).unwrap();
+        let session = init["session"].as_i64().unwrap();
+        assert_eq!(
+            session_layer(device, session).as_deref(),
+            Some("self_signed")
+        );
+        assert_eq!(session_layer("other", session), None);
+        assert_eq!(session_layer(device, -987654321), None);
+        let finish = json!({"device_id": device, "op": "finish_sign", "session": session});
+        assert_eq!(
+            run("self_signed", "other", &finish, None).unwrap()["error_code"],
+            json!(NOT_FOUND)
+        );
+        assert_eq!(
+            session_layer(device, session).as_deref(),
+            Some("self_signed")
+        );
+        assert_eq!(
+            run("self_signed", device, &finish, None).unwrap()["error_code"],
+            json!(0)
+        );
+        assert_eq!(session_layer(device, session), None);
+        assert_eq!(
+            run("self_signed", device, &finish, None).unwrap()["error_code"],
+            json!(NOT_FOUND)
+        );
     }
 
     #[test]

@@ -81,15 +81,6 @@ fn learned_target() -> Option<SignProbeTarget> {
 /// How long a probed verdict is trusted before probing again.
 const SOTER_PROBE_TTL: Duration = Duration::from_secs(300);
 
-/// 探针要动手之前，这台设备得安静多久。
-///
-/// 探针自己就是一次 `init_sign` + `finish_sign`，而 TA 一个槽位只留一个会话 ——
-/// 插进别人流程中间就会把对方顶成 -204（2026-10-01 对着 B 的 logcat 逐条对过）。
-/// 活跃的机器上探针几乎永远轮不到，那也行：服务端派签名活只要求「没明说签不了」
-/// （`queue.rs::resolve_soter_target`），而真正派下来的 `finish_sign` 成功本身就是
-/// 能力证据（见 `soter::note_sign_result`）。
-const SIGN_PROBE_QUIET: Duration = Duration::from_secs(60);
-
 /// Last verdict as `(when, usable)`; `None` means never probed.
 static SOTER_VERDICT: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
@@ -131,12 +122,7 @@ fn soter_usable() -> bool {
 /// 明明能签的机器从签名链路上踢掉 —— 比不报还糟。「签不了」只认别的证据：连续
 /// 几次真派下来的签名 op 都被 -26 顶回来（见 `soter::sign_state`）。
 fn probe_sign_capability(target: Option<&SignProbeTarget>) {
-    // 别人正在走签名流程的时候不许探：探针也会 `init_sign`，一插就把对方手上的
-    // 会话顶掉，对方 `finish_sign` 回去就是 -204。
-    if soter::sign_active_within(SIGN_PROBE_QUIET) {
-        log::debug!("soter sign capability probe: skipped, the device is signing right now");
-        return;
-    }
+    // sign_probe atomically checks the session lease and reserves HAL access.
     let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, cached)) = cache.as_ref() {
         // 已经挣到结论就不用再探了；另外同一个目标 5 分钟内也不重复探。
@@ -149,6 +135,12 @@ fn probe_sign_capability(target: Option<&SignProbeTarget>) {
     match target {
         Some(target) => {
             let probe = soter::sign_probe(target.uid, &target.alias);
+            if probe["skipped"].as_bool() == Some(true) {
+                log::debug!(
+                    "soter sign capability probe: skipped, the device is signing right now"
+                );
+                return; // No HAL measurement: do not consume the probe TTL.
+            }
             let verdict = soter::SignVerdict::from_probe(&probe);
             if verdict != soter::SignVerdict::Signed {
                 // 探不出能签就把原因写进日志：光看 caps 里没有 `soter_sign`，谁也
@@ -188,16 +180,6 @@ mod tests {
         ] {
             assert_ne!(verdict, SignVerdict::Signed, "{verdict:?} 不该当成签出来过");
         }
-    }
-
-    /// 探针目标带 uid + alias，比的是整体（uid 或 alias 换一个都得重新探）。
-    #[test]
-    fn a_quiet_gate_keeps_the_probe_off_a_busy_device() {
-        // 刚记过活动：探针不能动手。
-        soter::note_sign_activity();
-        assert!(soter::sign_active_within(Duration::from_secs(60)));
-        // 窗口比 0 还小就不算活跃 —— 说明比较的是“距今多久”，不是永远为真。
-        assert!(!soter::sign_active_within(Duration::from_secs(0)));
     }
 
     #[test]

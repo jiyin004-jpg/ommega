@@ -6,21 +6,23 @@
 //! （`SOTER_ERROR_OPERATEID_NULL`），4 轮 4 次都是如此。B 端的 relay 只是把句柄透传给
 //! HAL / TA，自己根本没有会话表，这个「一个」改不动。
 //!
-//! 生产日志里 `finish_sign -204` 一直占收尾的一成上下。拦是拦不住的（谁先谁后全看 App
-//! 的时序），所以这一层不拦、只留证据：`init_sign` 拿到会话的时候把 (uid, 别名,
-//! challenge) 记下来，等这笔 `finish_sign` 真回 -204 了，`handlers` 拿它重开一张会话、
-//! 把同一个 challenge 再签一遍 —— 同一把钥匙、同一个挑战，签名值是等价的，App 那边看到
-//! 的就是一次正常成功。
+//! `init_sign` 拿到会话时保存 (uid, 别名, challenge)，finish 回 -204 时可在同一次
+//! 设备占用内重开会话，签同一个 challenge。租约外的过期 finish 不再补签，以免顶掉
+//! 新流程；成功补签与原流程使用同一把钥匙、同一个挑战。
 //!
-//! 这里没有任何阻塞，所以也不会再回 -9（`IS_AUTHING`）去让 App 重试。
+//! 实际设备现在由租约串行化：init 前占位，成功后 session TTL 60 秒；
+//! finish 原子消费 requested+session，并在同一 guard 下补签。争用异步等待最多
+//! 3 秒（计入原网络 deadline），busy 回 -9。未知已派发结果隔离 60 秒；
+//! 活跃 await 的 guard 不因 TTL 被替换。HTTP 取消不能撤回已经进入 HAL 的操作。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 一笔会话记多久。App 的 init->finish 正常是秒级，慢的时候是在等用户按指纹（几十秒
 /// 量级）。生产里能看到隔几分钟才收尾的（App 自己缓着 session 不急着签），所以给到
-/// 15 分钟；过期只是不再补救，没别的副作用，内存也被 [`MAX_ENTRIES`] 卡着。
+/// 15 分钟；它保留路由/补救材料，不延长下面独立的 60 秒签名租约。
+/// 内存被 [`MAX_ENTRIES`] 卡着。
 const STASH_TTL: Duration = Duration::from_secs(900);
 
 /// 最多记多少条，挡住异常增长（正常随 `finish_sign` 清掉）。
@@ -51,6 +53,71 @@ struct Entry {
 pub struct SignSessions {
     ttl: Duration,
     inner: Mutex<HashMap<(String, i64), Entry>>,
+    leases: Mutex<HashMap<String, Lease>>,
+}
+
+struct Lease {
+    id: uuid::Uuid,
+    deadline: tokio::time::Instant,
+    requested: String,
+    session: Option<i64>,
+    finishing: bool,
+    inflight: bool,
+}
+
+/// HTTP future owns this guard until successful init transfers ownership to TTL.
+/// Drop only removes its own generation, never a replacement lease.
+pub struct SignLease {
+    owner: Arc<SignSessions>,
+    device: String,
+    id: uuid::Uuid,
+    pub deadline: tokio::time::Instant,
+    retained: bool,
+    dispatched: bool,
+}
+
+impl SignLease {
+    pub fn dispatch(&mut self) {
+        self.dispatched = true;
+    }
+    pub fn completed(&mut self) {
+        self.dispatched = false;
+    }
+    pub fn retain_session(&mut self, session: i64) -> bool {
+        let mut leases = self.owner.leases.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(lease) = leases.get_mut(&self.device) else {
+            return false;
+        };
+        if lease.id != self.id || tokio::time::Instant::now() >= lease.deadline {
+            return false;
+        }
+        lease.session = Some(session);
+        lease.inflight = false;
+        lease.deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        self.retained = true;
+        true
+    }
+}
+
+impl Drop for SignLease {
+    fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
+        let mut leases = self.owner.leases.lock().unwrap_or_else(|p| p.into_inner());
+        if leases.get(&self.device).is_some_and(|l| l.id == self.id) {
+            if self.dispatched {
+                // Unknown dispatched HAL result: quarantine rather than pretend
+                // HTTP cancellation recalled the operation. No session can finish it.
+                let lease = leases.get_mut(&self.device).unwrap();
+                lease.inflight = false;
+                lease.session = None;
+                lease.deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            } else {
+                leases.remove(&self.device);
+            }
+        }
+    }
 }
 
 impl SignSessions {
@@ -62,7 +129,84 @@ impl SignSessions {
         Self {
             ttl,
             inner: Mutex::new(HashMap::new()),
+            leases: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Reserve only the already-resolved physical device. Polling is async and
+    /// bounded by both three seconds and the caller's original network deadline.
+    pub async fn acquire(
+        self: &Arc<Self>,
+        device: &str,
+        requested: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<SignLease> {
+        let wait_until = deadline.min(tokio::time::Instant::now() + Duration::from_secs(3));
+        loop {
+            {
+                let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+                let now = tokio::time::Instant::now();
+                leases.retain(|_, l| l.inflight || l.deadline > now);
+                if !leases.contains_key(device) && now < deadline {
+                    let id = uuid::Uuid::new_v4();
+                    let expires = now + Duration::from_secs(60);
+                    leases.insert(
+                        device.to_owned(),
+                        Lease {
+                            id,
+                            deadline: expires,
+                            requested: requested.to_owned(),
+                            session: None,
+                            finishing: false,
+                            inflight: true,
+                        },
+                    );
+                    return Some(SignLease {
+                        owner: self.clone(),
+                        device: device.to_owned(),
+                        id,
+                        deadline: expires,
+                        retained: false,
+                        dispatched: false,
+                    });
+                }
+            }
+            if tokio::time::Instant::now() >= wait_until {
+                return None;
+            }
+            tokio::time::sleep_until(
+                wait_until.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+            )
+            .await;
+        }
+    }
+
+    /// Atomically consume this flow; duplicate or expired finishes never send HAL work.
+    pub fn finish(
+        self: &Arc<Self>,
+        device: &str,
+        requested: &str,
+        session: i64,
+    ) -> Option<SignLease> {
+        let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+        let lease = leases.get_mut(device)?;
+        if lease.deadline <= tokio::time::Instant::now()
+            || lease.requested != requested
+            || lease.session != Some(session)
+            || lease.finishing
+        {
+            return None;
+        }
+        lease.finishing = true;
+        lease.inflight = true;
+        Some(SignLease {
+            owner: self.clone(),
+            device: device.to_owned(),
+            id: lease.id,
+            deadline: lease.deadline,
+            retained: false,
+            dispatched: false,
+        })
     }
 
     /// `init_sign` 拿到会话时登记。uid / 别名 / 挑战缺一不可，缺了就不记 ——
@@ -178,7 +322,23 @@ impl SignSessions {
                 *handle == session && e.requested.as_deref() == Some(requested)
             })
             .map(|((device, _), _)| device.clone());
-        let first = devices.next()?;
+        let first = match devices.next() {
+            Some(device) => device,
+            None => {
+                let leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+                let mut matches = leases.iter().filter(|(_, l)| {
+                    l.requested == requested
+                        && l.session == Some(session)
+                        && l.deadline > tokio::time::Instant::now()
+                });
+                let (device, _) = matches.next()?;
+                return if matches.next().is_none() {
+                    Some(device.clone())
+                } else {
+                    None
+                };
+            }
+        };
         if devices.next().is_some() {
             None
         } else {
@@ -213,6 +373,108 @@ impl Default for SignSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn leases_interleave_finish_repair_and_devices() {
+        let s = Arc::new(SignSessions::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut first = s.acquire("a", "caller", deadline).await.unwrap();
+        first.dispatch();
+        first.completed();
+        assert!(first.retain_session(42));
+        drop(first);
+        let other = s.acquire("b", "caller", deadline).await.unwrap();
+        let waiting = {
+            let s = s.clone();
+            tokio::spawn(async move { s.acquire("a", "second", deadline).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert!(s.finish("a", "wrong", 42).is_none());
+        let mut finish = s.finish("a", "caller", 42).unwrap();
+        finish.dispatch(); // original finish + repair init/finish share this guard
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(waiting.await.unwrap().is_none());
+        assert!(s.finish("a", "caller", 42).is_none());
+        finish.completed();
+        drop(finish);
+        let next = s
+            .acquire(
+                "a",
+                "second",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(s.finish("a", "caller", 42).is_none());
+        drop(next);
+        drop(other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ttl_drop_and_unknown_dispatch_quarantine() {
+        let s = Arc::new(SignSessions::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(200);
+        let guard = s.acquire("a", "one", deadline).await.unwrap();
+        drop(guard); // before dispatch frees immediately
+        let mut guard = s.acquire("a", "one", deadline).await.unwrap();
+        guard.dispatch();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(s.acquire("a", "two", deadline).await.is_none()); // inflight cannot expire
+        drop(guard); // unknown remote operation, quarantine
+        assert!(s.acquire("a", "two", deadline).await.is_none());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let mut guard = s.acquire("a", "two", deadline).await.unwrap();
+        assert!(guard.retain_session(43));
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(s.finish("a", "two", 43).is_none());
+        assert!(s.acquire("a", "three", deadline).await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_init_starts_only_after_finish_releases_device() {
+        let s = Arc::new(SignSessions::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut init = s.acquire("a", "first", deadline).await.unwrap();
+        assert!(init.retain_session(7));
+        drop(init);
+        let waiter = {
+            let s = s.clone();
+            tokio::spawn(async move { s.acquire("a", "second", deadline).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        let finish = s.finish("a", "first", 7).unwrap();
+        tokio::time::advance(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        drop(finish);
+        tokio::time::advance(Duration::from_millis(20)).await;
+        let next = waiter.await.unwrap().unwrap();
+        assert!(s.finish("a", "first", 7).is_none());
+        drop(next);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inflight_finish_cannot_be_evicted_at_session_deadline() {
+        let s = Arc::new(SignSessions::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(200);
+        let mut init = s.acquire("a", "first", deadline).await.unwrap();
+        assert!(init.retain_session(7));
+        drop(init);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        let mut finish = s.finish("a", "first", 7).unwrap();
+        finish.dispatch();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(s.acquire("a", "second", deadline).await.is_none());
+        finish.completed();
+        drop(finish);
+        assert!(s.acquire("a", "second", deadline).await.is_some());
+        assert!(s
+            .acquire("b", "expired", tokio::time::Instant::now())
+            .await
+            .is_none());
+    }
 
     fn sessions() -> SignSessions {
         SignSessions::with_ttl(Duration::from_millis(150))
