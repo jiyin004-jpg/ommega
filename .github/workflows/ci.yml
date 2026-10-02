@@ -66,6 +66,21 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
 
+      # injector 用 include_bytes! 把本地兜底 ASK 私钥编进二进制，而 `*.pem` 被仓库根的
+      # .gitignore 排除（私钥不能进公开仓库），所以干净 checkout 里根本没有这个文件，
+      # 编译直接断在 `couldn't read .../assets/soter_ask.pem`。这里现生成一把**编译占位**，
+      # 只为让 clippy/fmt 过得去：CI 不打包，它不会出现在任何发布产物里，
+      # 更不是服务端认的那把 ASK。
+      - name: 生成编译用的占位 ASK
+        if: matrix.name == 'a-side'
+        working-directory: ${{ matrix.ws }}
+        run: |
+          set -euo pipefail
+          mkdir -p ommega-injector/assets
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out ommega-injector/assets/soter_ask.pem
+          openssl pkey -in ommega-injector/assets/soter_ask.pem -noout -check
+
       - name: 取 NDK 缓存
         if: matrix.target != ''
         id: ndk
