@@ -135,8 +135,14 @@ def get_version() -> str:
     return version
 
 
+# 同版本号重发（热修）的时候 versionCode 必须继续往上走，模块管理器才认得出更新。
+# 1.6.1 / 1.6.2 / 1.6.3 各重发过一次，把数一路抬到了 1006014，而公式值只有 1006004，
+# 中间差的这个 10 固定在这儿；真要再同号重发，就把这个数往上加（10 -> 11 -> 12）。
+VERSION_CODE_OFFSET = 10
+
+
 def version_code(version: str) -> str:
-    """versionCode 由版本号推出（major*1000000 + minor*1000 + patch）。
+    """versionCode 由版本号推出（major*1000000 + minor*1000 + patch + VERSION_CODE_OFFSET）。
 
     以前用 git 提交数：随便一次无关提交都会让它跳，没有 .git 的源码包还会退化成 0。
     """
@@ -146,7 +152,7 @@ def version_code(version: str) -> str:
     major, minor, patch = (int(p) for p in parts)
     if minor > 999 or patch > 999:
         raise ValueError(f"VERSION minor/patch must be <= 999: {version}")
-    return str(major * 1_000_000 + minor * 1_000 + patch)
+    return str(major * 1_000_000 + minor * 1_000 + patch + VERSION_CODE_OFFSET)
 
 
 def get_git_commit_hash() -> str:
