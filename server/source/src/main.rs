@@ -10,27 +10,10 @@
 //!
 //! Auth: `X-Relay-Token` header must match RELAY_TOKEN.
 
-mod admin;
-mod attstatus;
-mod auth;
-mod autokeybox;
-mod card;
-mod cert;
-mod config;
-mod crypto;
-mod db;
-mod fulfill;
-mod geo;
-mod handlers;
-mod http;
-mod keybox;
-mod pay;
-mod queue;
-mod soter_gate;
-mod soter_mint;
-mod soter_sign_sessions;
-mod strongbox;
-mod util;
+// 模块只在 lib 侧声明（见 `lib.rs`），这里一律复用，别再用 `mod xxx;` 重编一遍。
+// 同一份源码被 lib 和 bin 各编一次，不只是编译量翻倍：`dead_code` 是按各自目标算的，
+// lib 里 `pub` 算对外 API 不报，bin 里同一份 `pub` 就成了「never used」，
+// 于是每次 clippy 都多出一批只跟目标有关的假警告，把真问题盖住。
 
 use std::sync::Arc;
 
@@ -41,10 +24,13 @@ use axum::Router;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::db::Db;
-use crate::fulfill::Fulfill;
-use crate::queue::TaskStore;
+use relay_rs::admin;
+use relay_rs::card;
+use relay_rs::config::Config;
+use relay_rs::db::Db;
+use relay_rs::fulfill::Fulfill;
+use relay_rs::handlers;
+use relay_rs::queue::TaskStore;
 
 /// Serve the embedded background image (compiled into the binary).
 async fn serve_bg() -> impl axum::response::IntoResponse {
@@ -86,7 +72,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         cfg.b_selfcheck,
     );
     // Initialize the Fernet cipher used to encrypt stored private keys.
-    crate::crypto::init_fernet(&cfg.secret_key);
+    relay_rs::crypto::init_fernet(&cfg.secret_key);
     let db = if cfg.mysql_url.is_empty() {
         None
     } else {
@@ -99,7 +85,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         }
     };
     let auth = Arc::new(
-        crate::auth::AuthState::new(
+        relay_rs::auth::AuthState::new(
             cfg.relay_token.clone(),
             cfg.rate_limit_requests,
             cfg.rate_limit_window_secs,
@@ -112,7 +98,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
     let fulfill = Fulfill::new(cfg.server_keybox_enabled(), db.clone());
 
     // Load the offline IP-to-region database (non-fatal if missing).
-    let geo = crate::geo::Ip2Region::load(&cfg.geo_db_path).map(Arc::new);
+    let geo = relay_rs::geo::Ip2Region::load(&cfg.geo_db_path).map(Arc::new);
     if geo.is_none() {
         tracing::warn!(
             "ip2region database not found at '{}'; IP region lookup disabled",
@@ -124,8 +110,8 @@ fn build_router(cfg: &Arc<Config>) -> Router {
     // `store` is passed so the auto-cover step can snapshot online B device ids.
     if cfg.keybox_refresh_enabled {
         if let Some(db_ref) = db.clone() {
-            crate::autokeybox::set_enabled(true);
-            crate::autokeybox::start_background(
+            relay_rs::autokeybox::set_enabled(true);
+            relay_rs::autokeybox::start_background(
                 db_ref,
                 store.clone(),
                 std::time::Duration::from_secs(cfg.keybox_refresh_interval_secs),
@@ -138,7 +124,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
     std::thread::Builder::new()
         .name("attstatus".to_string())
         .spawn(|| loop {
-            crate::attstatus::ensure(false);
+            relay_rs::attstatus::ensure(false);
             std::thread::sleep(std::time::Duration::from_secs(3600));
         })
         .ok();
@@ -150,8 +136,8 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         fulfill,
         db,
         geo,
-        soter_gate: Arc::new(crate::soter_gate::SoterGate::new()),
-        sign_sessions: Arc::new(crate::soter_sign_sessions::SignSessions::new()),
+        soter_gate: Arc::new(relay_rs::soter_gate::SoterGate::new()),
+        sign_sessions: Arc::new(relay_rs::soter_sign_sessions::SignSessions::new()),
     };
 
     Router::new()
@@ -281,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::load());
     tracing::info!(
         "relay_rs starting: version={} mode={} bind={} http={} https={} tls={}",
-        crate::config::VERSION,
+        relay_rs::config::VERSION,
         if cfg.server_keybox_enabled() {
             "server_keybox"
         } else {
