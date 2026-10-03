@@ -79,6 +79,63 @@ pub fn answers_with_session(op: &str) -> bool {
     op == "init_sign"
 }
 
+// ── 真机 cpu_id 的副本文件 ──────────────────────────────────────────────
+//
+// SOTER 的身份是 `(cpu_id, uid)` 绑在一起的，而这个号只有真机（B 端 TEE）有。A 端
+// daemon 跟服务端要一次 `get_device_id`（服务端只会让真机答这个 op）学到真值，写到
+// 下面这两份；payload 读它，本地自签那套就报跟真机一模一样的号。不这么做的话，
+// 本地答一个号、服务端造一个号、真机又是另一个，检测器两次一对比就报「不一致」。
+//
+// 两个位置对应两个域：
+// - `/data/misc/ommega/`：启动器（root）从 keystore 域镜像过来的那份，SOTER 宿主是
+//   uid 1000、进不去 0770 的 keystore 目录，本地兜底那套只能读这一份；
+// - `/data/misc/keystore/ommega/`：daemon 自己写的那份（它跑在 keystore uid 里，
+//   只有这个目录写得动），keystore 域里的 payload 读得到。
+
+/// 副本文件按顺序找，先读到的算。
+pub const CPU_ID_PATHS: [&str; 2] = [
+    "/data/misc/ommega/soter_cpu_id",
+    "/data/misc/keystore/ommega/soter_cpu_id",
+];
+
+/// daemon 写的那一份（它自己那个域；app 域那份由启动器镜像过去）。
+pub const CPU_ID_WRITE_PATH: &str = "/data/misc/keystore/ommega/soter_cpu_id";
+
+/// 环境变量覆盖（测试、临时探针用）。
+pub const CPU_ID_ENV: &str = "OMMEGA_SOTER_CPU_ID";
+
+/// 真机 cpu_id 的形状：32 个十六进制字符。
+///
+/// 不卡 `09000000` 前缀：换个代次或者换个 TEE 实现的号头不一样，那时这个判断会
+/// 把真值当成废值丢掉，比放宽它坑。
+pub fn is_cpu_id(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// 从副本文件的内容里抠出 cpu_id。
+///
+/// 认 `soter_cpu_id: <值>` 这种扁平写法（跟 `log_flag` 一个格式），也认整个文件
+/// 就一行光秃秃的值；别的键、注释、空行都跳过。抠不出合法值就返回 `None`，调用方
+/// 自己决定用什么兜底 —— 这里绝不猜。
+pub fn parse_cpu_id(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let value = match line.split_once(':') {
+            Some((key, value)) if key.trim() == "soter_cpu_id" => value.trim(),
+            // 有冒号但不是这个键：别把别的配置项的值当成设备号。
+            Some(_) => continue,
+            None => line,
+        };
+        if is_cpu_id(value) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 /// 一笔调用的去处，以及远程给的答案本体。
 ///
 /// 形状跟 payload 本地那套 `Answer` 是一一对应的，转换放在 payload 里做 —— 这个模块
@@ -178,6 +235,36 @@ impl Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_32_hex_digits_count_as_a_cpu_id() {
+        assert!(is_cpu_id("090000005171734c42866bea148b21f5"));
+        assert!(is_cpu_id("090000005171734C42866BEA148B21F5"));
+        assert!(!is_cpu_id(""));
+        assert!(!is_cpu_id("09000000"));
+        assert!(!is_cpu_id("090000005171734c42866bea148b21f50"));
+        assert!(!is_cpu_id("090000005171734c42866bea148b21fz"));
+        assert!(!is_cpu_id("090000005171734c42866bea148b21f \n"));
+    }
+
+    #[test]
+    fn the_flat_form_and_the_bare_form_both_parse() {
+        let expected = Some("090000005171734c42866bea148b21f5".to_string());
+        assert_eq!(
+            parse_cpu_id("soter_cpu_id: 090000005171734c42866bea148b21f5\n"),
+            expected
+        );
+        assert_eq!(parse_cpu_id("090000005171734c42866bea148b21f5"), expected);
+        // 注释、空行、别的键都不该干扰。
+        assert_eq!(
+            parse_cpu_id("# SOTER\nlog_flag: 0\nsoter_cpu_id: 090000005171734c42866bea148b21f5\n"),
+            expected
+        );
+        // 值形状不对就不认（宁可用兜底，也不能把别的东西当设备号）。
+        assert_eq!(parse_cpu_id("soter_cpu_id: 09000000\n"), None);
+        assert_eq!(parse_cpu_id("log_flag: 1\n"), None);
+        assert_eq!(parse_cpu_id(""), None);
+    }
 
     fn round_trip(outcome: Outcome) {
         let blob = outcome.encode();

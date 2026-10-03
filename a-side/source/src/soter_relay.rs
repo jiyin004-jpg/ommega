@@ -216,7 +216,8 @@ pub(crate) fn parse_uid_map(raw: &str) -> Vec<(i64, i64)> {
     pairs
 }
 
-/// 转发前的最后一步：按配置里的映射表把请求的 uid 换成 B 端对应的那个。
+/// 转发前的最后一步：按配置里的映射表把请求的 uid 换成 B 端对应的那个，再把学到的
+/// 真机 cpu_id 带上。
 ///
 /// 换成功了记一行 info —— 拿 A 的 uid 去问 B 得到的是「没有」，换完才拿得到真材料，
 /// 这条日志是区分这两种情况的唯一依据。
@@ -225,7 +226,7 @@ fn request_value(value: &Value, op: &str) -> Value {
         Ok(cfg) => cfg.remote.soter_uid_map.clone(),
         Err(_) => String::new(),
     };
-    match apply_uid_map(value, &raw) {
+    let mapped = match apply_uid_map(value, &raw) {
         Some(mapped) => {
             log::info!(
                 "event=soter relay op={op} uid {} -> {} (B 端那个同名应用)",
@@ -235,7 +236,25 @@ fn request_value(value: &Value, op: &str) -> Value {
             mapped
         }
         None => value.clone(),
+    };
+    with_cpu_id(mapped, crate::soter_cpu_id::current())
+}
+
+/// 把真机 cpu_id 塞进要转发的请求（`None` = 还没学到，就不带这个字段）。
+///
+/// 服务端拿它给那两层铸料，本地兜底那条路读的是同一份文件（`soter_local::cpu_id`）——
+/// 三处报同一个号，`(cpu_id, uid)` 这个身份才不打架。调用方自己带了这个字段就不动。
+fn with_cpu_id(mut value: Value, cpu_id: Option<String>) -> Value {
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    if map.contains_key("cpu_id") {
+        return value;
     }
+    if let Some(cpu_id) = cpu_id {
+        map.insert("cpu_id".to_string(), Value::from(cpu_id));
+    }
+    value
 }
 
 /// 把服务端那份 JSON 答案翻成 payload 认的形状。形状对不上返回 `None`（上层转透传）。
@@ -396,6 +415,23 @@ mod tests {
         assert_eq!(parse_uid_map("10490=abc"), Vec::new());
         // 坏了一条，好的那一条还得留着。
         assert_eq!(parse_uid_map("乱写,10490=10373"), vec![(10490, 10373)]);
+    }
+
+    #[test]
+    fn a_forwarded_request_carries_the_learned_cpu_id() {
+        let value = json!({"op": "export_ask_public_key", "uid": 10490});
+        let some = "090000005171734c42866bea148b21f5".to_string();
+        assert_eq!(
+            with_cpu_id(value.clone(), Some(some.clone()))["cpu_id"],
+            json!(some)
+        );
+        // 还没学到就一个字不加（服务端照旧用它自己派生的那个）。
+        assert_eq!(with_cpu_id(value.clone(), None), value);
+        // 调用方自己带着就不动（`get_device_id` 这类探针时手动指定的场合）。
+        let explicit = json!({"op": "get_device_id", "cpu_id": "09000000aabbccddeeff001122334455"});
+        assert_eq!(with_cpu_id(explicit.clone(), Some(some)), explicit);
+        // 不是对象的请求照原样递过去，不能因为它把整条链路弄崩。
+        assert_eq!(with_cpu_id(json!("nope"), None), json!("nope"));
     }
 
     #[test]

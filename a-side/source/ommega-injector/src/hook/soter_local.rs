@@ -23,7 +23,8 @@
 //! 键序全照真机现场抓到的来，字段名一个都别改，`uid` 是字符串不是数字。
 //!
 //! 设备信息（`cpu_id` / `fp_n` / `fp_v` / `tee_n` / `tee_v` / `fid`）按本机属性推：
-//! `cpu_id` 由 `ro.boot.serialno` 派生，指纹和 TEE 也从属性读，读不到才退回兜底值。
+//! `cpu_id` 先看 daemon 学来的那份真机值（[`kmr_common::soter_relay::CPU_ID_PATHS`]），
+//! 没有才按 `ro.boot.serialno` 派生一个；指纹和 TEE 也从属性读，读不到才退回兜底值。
 //! 不要把它写成编死的常量 —— 那样装过这套的机器全是同一个设备，业务侧一眼假。
 //!
 //! 心里得有数的边界：自签的链**骗得过 App 本地**（它拿我们给的公钥验我们签的
@@ -195,10 +196,85 @@ fn now_millis() -> i64 {
 
 /// 一台"看起来像真机"的设备号：`09000000` + 12 字节十六进制。
 ///
-/// 按本机序列号派生，同一台机器每次都一样（换号 App 会当成换了设备，得重走一遍
-/// 建 key 流程），不同机器不一样 —— 这才叫设备身份。
+/// daemon 跟服务端要来的那个真机 cpu_id 优先（见 [`cpu_id`]）；没学到才按本机
+/// 序列号派生，同一台机器每次都一样（换号 App 会当成换了设备，得重走一遍建 key
+/// 流程），不同机器不一样 —— 这才叫设备身份。
 pub(crate) fn device_id() -> String {
-    device_info().cpu_id.clone()
+    cpu_id()
+}
+
+/// 这个值多久重新看一眼文件。真机 cpu_id 一辈子不换，这个时限只是为了「daemon 刚
+/// 学到新的、payload 不用重启就跟着改」，跟 `log_flag` 一样 30 秒。
+const CPU_ID_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 当前该报的 cpu_id 加上它是什么时候看来的（来路只在换值那行日志里出现，不留）。
+struct CpuIdCache {
+    value: String,
+    read_at: std::time::Instant,
+}
+
+static CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
+
+/// 这台机器该报的 cpu_id：daemon 学来的真机值 > 按本机序列号派生的。
+///
+/// 为什么要用真机那个：SOTER 的身份是 `(cpu_id, uid)`，本地自签答一个号、服务端
+/// 造一个号、真机又是第三个，同一个 App 在不同层上就成了不同设备 —— 微信会重走一
+/// 遍开通，检测器直接报「两次 cpuid 不一致」。
+fn cpu_id() -> String {
+    let Ok(mut slot) = CPU_ID.lock() else {
+        return device_info().derived_cpu_id.clone();
+    };
+    if let Some(cached) = slot.as_ref() {
+        if cached.read_at.elapsed() < CPU_ID_TTL {
+            return cached.value.clone();
+        }
+    }
+    let previous = slot.as_ref().map(|cached| cached.value.clone());
+    let (learned, origin) = load_cpu_id();
+    let value = learned.unwrap_or_else(|| device_info().derived_cpu_id.clone());
+    if previous.as_deref() != Some(value.as_str()) {
+        log::info!(
+            "soter local cpu_id {} -> {value} ({origin})",
+            previous.as_deref().unwrap_or("<unset>")
+        );
+    }
+    *slot = Some(CpuIdCache {
+        value: value.clone(),
+        read_at: std::time::Instant::now(),
+    });
+    value
+}
+
+/// 找一份学来的 cpu_id：环境变量 > 两个候选文件。找不到返回 `(None, "derived")`，
+/// 调用方再用本机派生值兜底。
+fn load_cpu_id() -> (Option<String>, String) {
+    let env = std::env::var_os(kmr_common::soter_relay::CPU_ID_ENV)
+        .map(|raw| raw.to_string_lossy().into_owned());
+    load_cpu_id_from(&kmr_common::soter_relay::CPU_ID_PATHS, env)
+}
+
+/// `load_cpu_id` 里跟「从哪读」无关的那半（测试要拿临时文件跑，不进进程环境）。
+fn load_cpu_id_from(paths: &[&str], env: Option<String>) -> (Option<String>, String) {
+    if let Some(raw) = env {
+        match kmr_common::soter_relay::parse_cpu_id(raw.trim()) {
+            Some(id) => return (Some(id), "env".to_string()),
+            None => log::warn!(
+                "soter local {} is not a usable cpu_id; ignoring it",
+                kmr_common::soter_relay::CPU_ID_ENV
+            ),
+        }
+    }
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match kmr_common::soter_relay::parse_cpu_id(&text) {
+            Some(id) => return (Some(id), format!("file {path}")),
+            // 文件在那儿但里面没有合形状的值：别当没事，也别拿它顶，继续往下找。
+            None => log::warn!("soter local cpu_id at {path} has no usable value; ignoring it"),
+        }
+    }
+    (None, "derived".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -236,8 +312,9 @@ fn prop(_name: &str) -> Option<String> {
 
 /// 这台机器的 SOTER 设备信息。属性只读一次，之后复用。
 struct DeviceInfo {
-    /// `09000000` + 12 字节十六进制。
-    cpu_id: String,
+    /// 按本机序列号派生的那个号，`09000000` + 12 字节十六进制。只当兜底：没从
+    /// daemon 那边学到真机 cpu_id 时才用它（见 [`cpu_id`]）。
+    derived_cpu_id: String,
     fp_n: String,
     fp_v: String,
     tee_n: String,
@@ -251,7 +328,7 @@ fn device_info() -> &'static DeviceInfo {
     INFO.get_or_init(|| {
         let serial = prop("ro.boot.serialno").or_else(|| prop("ro.serialno"));
         DeviceInfo {
-            cpu_id: cpu_id_from(serial.as_deref()),
+            derived_cpu_id: cpu_id_from(serial.as_deref()),
             fp_n: fingerprint_name(),
             fp_v: fingerprint_version(),
             tee_n: tee_name(),
@@ -542,11 +619,10 @@ fn envelope(document: &[u8], signature: &[u8]) -> Vec<u8> {
 
 /// AuthKey 那份 JSON，`pub_key` 是 AuthKey 自己的公钥 —— **拿 ASK 私钥签**。
 fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
-    let info = device_info();
     format!(
         "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
         json_string(&key.pem),
-        info.cpu_id,
+        cpu_id(),
         counter,
         uid,
         SALT_LEN
@@ -567,7 +643,7 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
         json_string(&info.tee_v),
         json_string(&info.fp_n),
         json_string(&info.fp_v),
-        json_string(&info.cpu_id),
+        json_string(&cpu_id()),
         json_string(&uid.to_string()),
         SALT_LEN
     )
@@ -576,11 +652,10 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
 
 /// ASK 那份 JSON。键序照现场抓到的来，`uid` 是字符串别写成数字。
 fn ask_json(key: &Key, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
-    let device = device_id();
     let document = format!(
         "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
         json_string(&key.pem),
-        device,
+        cpu_id(),
         counter,
         uid,
         SALT_LEN
@@ -951,11 +1026,16 @@ mod tests {
     #[test]
     fn the_device_info_is_derived_from_this_machine() {
         let info = device_info();
-        assert_eq!(info.cpu_id.len(), 32, "SOTER device ids are 32 hex chars");
-        assert!(info.cpu_id.starts_with("09000000"));
-        assert!(info.cpu_id.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(info.cpu_id, device_id(), "device_id() 就是那个 cpu_id");
-        assert_eq!(device_info().cpu_id, info.cpu_id, "属性只读一次，值要稳定");
+        assert_eq!(
+            info.derived_cpu_id.len(),
+            32,
+            "SOTER device ids are 32 hex chars"
+        );
+        assert!(info.derived_cpu_id.starts_with("09000000"));
+        assert!(info.derived_cpu_id.chars().all(|c| c.is_ascii_hexdigit()));
+        // `device_id()` 报的是「当前该报的那个」（学到真值就用真值，没有才用它）。
+        assert_eq!(device_id(), cpu_id(), "device_id() 就是那个 cpu_id");
+        assert_eq!(device_id(), device_id(), "同一个进程里报的号要稳");
 
         assert!(!info.fp_n.is_empty());
         assert!(!info.fp_v.is_empty());
@@ -963,6 +1043,49 @@ mod tests {
         assert!(!info.tee_v.is_empty());
         assert!(info.fid.len() >= 10, "fid 像真机那样是十位数字");
         assert!(info.fid.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    /// daemon 学来的真机号一旦落到文件里，本地这一套就得报它，不能自己再派生一个。
+    #[test]
+    fn a_learned_cpu_id_wins_over_the_derived_one() {
+        let learned = "090000005171734c42866bea148b21f5";
+        let path = temp_pem("soter_cpu_id", &format!("soter_cpu_id: {learned}\n"));
+        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], None);
+        assert_eq!(value.as_deref(), Some(learned));
+        assert!(origin.starts_with("file "), "origin = {origin}");
+        assert_ne!(learned, device_info().derived_cpu_id, "两份号必须不是一个");
+
+        // 环境变量优先于文件。
+        let other = "09000000aabbccddeeff001122334455";
+        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], Some(other.to_string()));
+        assert_eq!(value.as_deref(), Some(other));
+        assert_eq!(origin, "env");
+    }
+
+    /// 文件缺了、内容废了、环境变量写错了，一律当作没学到，回落本机派生值 ——
+    /// 绝不拿半截东西去当设备身份。
+    #[test]
+    fn a_broken_cpu_id_source_falls_back_to_nothing() {
+        let broken = temp_pem("soter_cpu_id_broken", "soter_cpu_id: 09000000\n");
+        let missing = std::env::temp_dir().join("ommega-soter-cpu-id-does-not-exist");
+        let _ = std::fs::remove_file(&missing);
+        for paths in [
+            vec![missing.to_str().unwrap()],
+            vec![broken.to_str().unwrap()],
+            vec![missing.to_str().unwrap(), broken.to_str().unwrap()],
+        ] {
+            let (value, origin) = load_cpu_id_from(&paths, None);
+            assert_eq!(value, None, "{paths:?} 里没有合形状的值");
+            assert_eq!(origin, "derived");
+        }
+        // 坏的环境变量不牵连后面的文件。
+        let good = temp_pem(
+            "soter_cpu_id_good",
+            "soter_cpu_id: 09000000aabbccddeeff001122334455\n",
+        );
+        let (value, _) =
+            load_cpu_id_from(&[good.to_str().unwrap()], Some("not-a-cpu-id".to_string()));
+        assert_eq!(value.as_deref(), Some("09000000aabbccddeeff001122334455"));
     }
 
     #[test]

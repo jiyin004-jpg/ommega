@@ -641,7 +641,18 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
     // 账号指纹的 TTL 清理：节流在里面，不会拖慢请求。
     purge_owners_if_due();
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
-    let product = virtual_device_id(device_id);
+    // A 端把真机的 cpu_id 一起转过来了就用它的：同一台设备上，本地兜底那条路、这里这
+    // 两层、还有 B 端 TEE，必须报同一个号，否则「两次 cpuid 不一致」的检测项就亮红。
+    // 没给（老 A 端）或者给得不成样子才回落到按设备名派生的虚拟号。
+    let product = docs_cpu_id(body).unwrap_or_else(|| {
+        if body.get(CPU_ID_FIELD).is_some() {
+            tracing::warn!(
+                "soter: {layer} 层收到形状不对的 cpu_id {:?}，照旧用虚拟设备号",
+                body.get(CPU_ID_FIELD)
+            );
+        }
+        virtual_device_id(device_id)
+    });
 
     if !KNOWN_OPS.contains(&op) {
         return None;
@@ -667,7 +678,13 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                 "version": 1,
                 "device_id": product,
             })),
-            "get_device_id" => Ok(data_result(op, OK, product.as_bytes())),
+            "get_device_id" => {
+                // 带上层名：A 端要靠它分辨这个号是真机报的还是服务端自己造的（只有
+                // 真机那个值能当设备身份转出去，见 `docs_cpu_id`）。
+                let mut out = data_result(op, OK, product.as_bytes());
+                out["layer"] = json!(layer);
+                Ok(out)
+            }
             "export_attk_public_key" => Ok(data_result(op, OK, key.attk_pem.as_bytes())),
             "export_ask_public_key" => ask_result(op, layer, &key, &product, uid_of(body)?),
             "has_ask_already" => Ok(code_result(op, OK)),
@@ -864,8 +881,28 @@ fn auth_key(device_id: &str, body: &Value) -> Option<Arc<MintKey>> {
     store().auth.lock().ok()?.get(&id).cloned()
 }
 
+/// 请求里那个「真机 cpu_id」的字段名。A 端转发时带上，B 端不带（B 自己也改不了它）。
+pub(crate) const CPU_ID_FIELD: &str = "cpu_id";
+
+/// A 端转过来的真机 `cpu_id`，形状对（32 个十六进制字符）就用它。
+///
+/// 为什么要认它：SOTER 的身份就是 `(cpu_id, uid)`。同一次开通流程里，`get_device_id`、
+/// ASK 文档、AuthKey 文档、签名现场四处的 `cpu_id` 只要有一处跟真机报的不一样，微信和
+/// 检测器就会判成「设备换了」/「两次 cpuid 不一致」，然后拿新身份重走一遍（检测器直接
+/// 记一条红）。真机那个号只有 B 端 TEE 有，所以 A 端学会了转过来，这里照抄。
+fn docs_cpu_id(body: &Value) -> Option<String> {
+    let text = body.get(CPU_ID_FIELD)?.as_str()?.trim();
+    is_soter_cpu_id(text).then(|| text.to_string())
+}
+
+/// 真机 cpu_id 的形状：32 个十六进制字符（真机的都是 `09000000` 打头，但不拿前缀卡死，
+/// 以后换代次也不用改）。
+fn is_soter_cpu_id(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// 虚拟 SOTER 设备号。真机上是 `09000000` + 12 字节随机，这里用请求里的设备 id
-/// 派生，好处是同一台 A 端设备每次拿到的都一样。
+/// 派生，好处是同一台 A 端设备每次拿到的都一样。只有 A 端没转来真值时才用它。
 fn virtual_device_id(device_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ommega-server-soter:");
@@ -1097,6 +1134,76 @@ mod tests {
             order.windows(2).all(|w| w[0] < w[1]),
             "key order changed: {text}"
         );
+    }
+
+    /// A 端把真机 cpu_id 转过来了就得原样落进文档，不能自己再派生一个 —— 同一台设备上
+    /// 本地兜底、服务端两层、真机三处报同一个号，检测器才不报「两次 cpuid 不一致」。
+    #[test]
+    fn a_forwarded_cpu_id_is_used_verbatim() {
+        let forwarded = "090000005171734c42866bea148b21f5";
+        let device = "device-a-cpuid";
+
+        let id = run(
+            "self_signed",
+            device,
+            &json!({ "op": "get_device_id", "cpu_id": forwarded }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(id["text"], json!(forwarded));
+        // 层名是给 A 端分辨「这个号是真机报的还是服务端造的」用的。
+        assert_eq!(id["layer"], json!("self_signed"));
+
+        let ask = run(
+            "self_signed",
+            device,
+            &json!({ "op": "export_ask_public_key", "uid": 1, "cpu_id": forwarded }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(ask["payload"]["cpu_id"], json!(forwarded));
+        assert_ne!(
+            ask["payload"]["cpu_id"],
+            json!(virtual_device_id(device)),
+            "有真值就不能回落到虚拟号"
+        );
+
+        // 没转真值（老 A 端、或者它自己还没学到）照旧走虚拟号，层名一样要有。
+        let plain = run(
+            "self_signed",
+            device,
+            &json!({ "op": "get_device_id" }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(plain["text"], json!(virtual_device_id(device)));
+        assert_eq!(plain["layer"], json!("self_signed"));
+    }
+
+    #[test]
+    fn a_malformed_cpu_id_falls_back_to_the_virtual_one() {
+        let device = "device-a-badcpuid";
+        let cases = [
+            json!(""),
+            json!("09000000"),
+            json!("zz0000005171734c42866bea148b21f5"),
+            json!("090000005171734c42866bea148b21f50"),
+            json!(1234),
+        ];
+        for bad in cases {
+            let id = run(
+                "self_signed",
+                device,
+                &json!({ "op": "get_device_id", "cpu_id": bad }),
+                None,
+            )
+            .expect("handled");
+            assert_eq!(
+                id["text"],
+                json!(virtual_device_id(device)),
+                "{bad:?} 不该被当身份证用"
+            );
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub mod plat;
 pub mod proto;
 pub mod remote;
 pub mod selinux;
+pub mod soter_cpu_id;
 pub mod soter_relay;
 pub mod utils;
 pub mod watchdog;
@@ -364,6 +365,8 @@ fn run() -> Result<()> {
     prepare_android_storage();
     config::install_runtime_config(config_file, resolved_trust)
         .context("failed to install runtime config")?;
+    // 真机 cpu_id 是 SOTER 身份的一半，趁早去学 —— 后台线程，不挡启动。
+    crate::soter_cpu_id::start();
 
     install_module_info_bundle_if_available().context("failed to initialize moduleHash input")?;
 

@@ -645,7 +645,7 @@ impl RemoteRelay {
         Ok(r.token)
     }
 
-    fn device_id() -> Result<String> {
+    pub(crate) fn device_id() -> Result<String> {
         let r = Self::remote()?;
         if r.device_id.is_empty() {
             return Err(anyhow!("remote device_id not configured"));

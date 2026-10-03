@@ -1773,6 +1773,23 @@ fn consistent_soter_target(
 
 /// B 端设备层：只派给调用方已解析并校验过的设备。
 ///
+/// 递给 B 端的那份 SOTER 请求体：把只给服务端看的字段摘掉，`None` = 原样发。
+///
+/// 目前只有 `cpu_id` 一个。它是 A 端学来的**真机** cpu_id，用来让服务端那两层和 A 端
+/// 本地兜底跟真机报同一个号（见 `soter_mint::docs_cpu_id`）。B 端那个号是它自己 TA 报的，
+/// 我们既改不了也不用改，递过去只会多出一种说法。
+fn device_soter_body(body: &Value) -> Option<Value> {
+    let object = body.as_object()?;
+    if !object.contains_key(crate::soter_mint::CPU_ID_FIELD) {
+        return None;
+    }
+    let mut copy = body.clone();
+    if let Some(map) = copy.as_object_mut() {
+        map.remove(crate::soter_mint::CPU_ID_FIELD);
+    }
+    Some(copy)
+}
+
 /// 一台都没有不算"这层不管这个 op"，而是这层没做成，所以返回带 `error` 的对象，
 /// 让上层接着试服务端那两层。
 async fn try_b_soter_layer(
@@ -1797,10 +1814,11 @@ async fn try_b_soter_layer(
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
         );
     }
+    let device_body = device_soter_body(body);
     let mut reply = enqueue_and_wait(
         state,
         "soter",
-        body,
+        device_body.as_ref().unwrap_or(body),
         target,
         state.cfg.soter_wait_result_timeout_secs,
     )
