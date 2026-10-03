@@ -1516,16 +1516,28 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                             if op == "init_sign"
                                 && b.value.get("error_code").and_then(Value::as_i64) == Some(0)
                             {
-                                if let Some(guard) = lease.as_mut() {
-                                    let kept = b
-                                        .value
-                                        .get("session")
-                                        .and_then(Value::as_i64)
-                                        .filter(|s| *s != 0)
-                                        .is_some_and(|s| guard.retain_session(s));
-                                    if !kept {
-                                        return Some(json!({"error_code": -204}));
+                                let session = b
+                                    .value
+                                    .get("session")
+                                    .and_then(Value::as_i64)
+                                    .filter(|s| *s != 0);
+                                match (session, lease.as_mut()) {
+                                    (Some(session), Some(guard)) => {
+                                        // 记账不是我们就只记一行警告 —— 会话是真的，
+                                        // 以前这里会把它改口成 -204，App 收到就自删重来一轮
+                                        // （一台设备上多路客户端抢同一张 TA 会话是常态，
+                                        // 2026-10-03 实测）。
+                                        if !guard.retain_session(session) {
+                                            tracing::warn!(
+                                                "soter: init_sign uid={probe_uid} alias={probe_alias} \
+                                                 拿到的会话 {session} 记账时租约已经换人了，照旧回给 App"
+                                            );
+                                        }
                                     }
+                                    // 答了成功却没有会话号：这张会话在 TA 里根本没建起来，
+                                    // 递上去 App 只会拿到 session=0（微信那边直接判 -204）。
+                                    (None, _) => return Some(json!({"error_code": -204})),
+                                    (Some(_), None) => {}
                                 }
                             }
                             Some(b.value)
@@ -1546,11 +1558,21 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         };
         match result {
             Some(v) if v.get("soter_outcome_unknown").and_then(Value::as_bool) == Some(true) => {
+                // 这条以前不打日志，线上只看得到「请求进来了、什么结果都没有」。
+                tracing::warn!(
+                    "soter: op={op} uid={probe_uid} layer={layer} 结果未知（mutation outcome unknown），不落兜底层，原样回给 App"
+                );
                 return Json(v).into_response();
             }
             Some(mut v)
                 if layer == "b" && v.get("error_code").and_then(Value::as_i64) == Some(-9) =>
             {
+                // 这条也一样是静默的：`-9` = IS_AUTHING，设备说它那儿还有一张签名没收尾。
+                // `init_sign` 上吃到它就等于这一轮 App 弹不出指纹圈（2026-10-03 线上）。
+                tracing::warn!(
+                    "soter: op={op} uid={probe_uid} layer=b 设备回了 -9（IS_AUTHING）原样递回；\
+                     init_sign 上出这个 A 端就弹不出指纹圈"
+                );
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("retryable".to_owned(), json!(true));
                 }

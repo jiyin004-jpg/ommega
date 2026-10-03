@@ -643,9 +643,18 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
             );
             let mut guard = SIGN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            if !guard.init_allowed(now) {
-                return Ok(code_result(op, -9));
-            }
+            // 这里以前会拿「别人还有一张会话没收尾」把这一笔拒掉，回 -9。
+            //
+            // 2026-10-03 在 PLC110 上实测到后果：A 端微信开通指纹支付时，设备上还挂着
+            // 一笔 chunqiu/duckdetector 探针的 init（探针不发 finish），租约要 60 秒才
+            // 过期，期间 App 每一笔 init 都吃 -9，soterserver 给微信的 SoterSessionResult
+            // 里 session=0，App 连指纹圈都弹不出来就自删重来 —— 下一轮又撞在同一个窗里。
+            // 那天 09 时全部 13 笔成功 init 的别名都是探针，一笔真 App 都没有。
+            //
+            // 服务端 2026-10-02 踩过同一个坑（见 `handlers.rs` 里 init 那段注释：
+            // 「抢不到租约不再直接回 -9：那会让 A 端连指纹圈都弹不出来」）。这边照同一个
+            // 口径改：不拒，让它去顶掉旧会话；被顶掉的那笔在 finish 上吃 -204，由服务端
+            // 的补签路径收尾。租约本身留着挡探针（`probe_allowed`）。
             guard.activity(now);
             let soter = open_soter(op)?;
             let mut session = soter.init_sign(uid, &alias, &challenge)?;

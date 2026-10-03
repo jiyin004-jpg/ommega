@@ -1,8 +1,14 @@
 //! In-memory signing lease and probe exclusion. Hold the mutex only across HAL
 //! calls, never across the init -> finish wait. A lost finish (or HAL restart) expires.
+//!
+//! 租约**不再拒掉 App 派下来的 init**：一台设备上多路客户端抢同一张 TA 会话是常态
+//! （2026-10-03 在 PLC110 上实测，光探针就每分钟吃掉一次），拒掉等于让真活儿一直
+//! 抢不到。这里只剩两件事：挡住我们自己的能力探针（`probe_allowed`），以及记住
+//! 「哪个会话还没收尾」好让 finish 认人。
 
 use std::time::{Duration, Instant};
 
+/// 一张会话在没人 finish 的情况下占多久。过了就当丢了（HAL 重启、调用方走了）。
 pub(super) const LEASE: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
@@ -44,11 +50,6 @@ impl SignGuard {
         }
     }
 
-    pub(super) fn init_allowed(&mut self, now: Instant) -> bool {
-        self.expire(now);
-        self.active.is_none()
-    }
-
     pub(super) fn finish_allowed(&mut self, session: i64, now: Instant) -> bool {
         self.expire(now);
         // No local lease may mean a session established before this process started.
@@ -69,28 +70,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_is_busy_until_the_active_lease_expires() {
+    fn a_hanging_lease_no_longer_refuses_the_next_init() {
+        // 2026-10-03 PLC110：这条「还占着就不许再 init」曾经把 A 端的微信开通挡死
+        // （回 -9，App 连指纹圈都弹不出来），现在它只用来挡住我们自己的探针。
         let now = Instant::now();
         let mut guard = SignGuard::new();
-        assert!(guard.init_allowed(now));
         guard.init_succeeded(1, now);
-        let before_expiry = now + LEASE - Duration::from_nanos(1);
-        assert!(!guard.init_allowed(before_expiry));
         assert_eq!(guard.active, Some((1, now)));
-        assert!(guard.init_allowed(now + LEASE));
+        assert!(!guard.probe_allowed(now + LEASE - Duration::from_nanos(1)));
+        assert!(guard.probe_allowed(now + LEASE));
         assert!(guard.active.is_none());
     }
 
     #[test]
-    fn init_after_finish_ignores_recent_activity() {
+    fn a_new_init_takes_over_the_hanging_session() {
+        let now = Instant::now();
+        let mut guard = SignGuard::new();
+        guard.init_succeeded(1, now);
+        // 旧的那笔没收尾也照签：被顶掉的那笔只能在 finish 上吃 -204，走补签。
+        guard.activity(now);
+        guard.init_succeeded(2, now);
+        assert_eq!(guard.active.map(|(session, _)| session), Some(2));
+        assert!(!guard.finish_allowed(1, now));
+        assert!(guard.finish_allowed(2, now));
+    }
+
+    #[test]
+    fn a_finish_clears_the_lease_but_the_probe_still_waits() {
         let now = Instant::now();
         let mut guard = SignGuard::new();
         guard.activity(now);
-        assert!(guard.init_allowed(now));
         guard.init_succeeded(1, now);
         guard.finish_ended(1, now);
-        assert!(guard.init_allowed(now));
-        assert!(!guard.probe_allowed(now));
+        assert!(guard.active.is_none());
+        assert!(!guard.probe_allowed(now), "刚有人签过，探针还得等");
     }
 
     #[test]
@@ -98,13 +111,13 @@ mod tests {
         let now = Instant::now();
         let mut guard = SignGuard::new();
         guard.init_succeeded(1, now);
-        assert!(guard.init_allowed(now + LEASE));
+        assert!(guard.probe_allowed(now + LEASE));
         guard.init_succeeded(2, now + LEASE);
         assert!(!guard.finish_allowed(1, now + LEASE));
         assert_eq!(guard.active, Some((2, now + LEASE)));
         assert_eq!(guard.last_activity, Some(now + LEASE));
         assert!(guard.finish_allowed(2, now + LEASE));
-        assert!(!guard.init_allowed(now + LEASE));
+        assert!(!guard.probe_allowed(now + LEASE));
     }
 
     #[test]
@@ -164,6 +177,16 @@ mod tests {
         assert!(guard.probe_allowed(now + LEASE));
         assert!(guard.active.is_none());
         assert!(SignGuard::new().probe_allowed(now));
+    }
+
+    /// 探针那条路（`probe_allowed`）仍旧受租约管，别把它一起放开。
+    #[test]
+    fn the_probe_still_yields_to_a_hanging_lease() {
+        let now = Instant::now();
+        let mut guard = SignGuard::new();
+        guard.init_succeeded(7, now);
+        assert!(!guard.probe_allowed(now + Duration::from_secs(59)));
+        assert!(guard.probe_allowed(now + Duration::from_secs(60)));
     }
 
     #[test]
