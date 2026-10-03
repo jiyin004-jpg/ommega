@@ -66,8 +66,8 @@ const ASK_FILE_PATHS: [&str; 2] = [
 ];
 /// 环境变量覆盖，写测试和临时探针用。
 const ASK_FILE_ENV: &str = "OMMEGA_SOTER_ASK_PEM";
-/// 读不到序列号时的兜底种子。正常情况 `cpu_id` 是按本机 `ro.boot.serialno` 派生的
-/// （每台机器一个号，同一台机器每次都一样），只有序列号都读不到才用得上它。
+/// `fid` 在序列号读不到时的兜底种子。`cpu_id` **不用**它 —— 那个号只从真实属性来，
+/// 读不到就不报，绝不编一个（见 [`cpu_id`]）。
 const FALLBACK_SEED: &str = "ommega-a-side-local";
 
 /// 一对 RSA，加它的公钥 PEM（SOTER 里的"证书"就是拿这个验的）。
@@ -196,9 +196,8 @@ fn now_millis() -> i64 {
 
 /// 一台"看起来像真机"的设备号：`09000000` + 12 字节十六进制。
 ///
-/// daemon 跟服务端要来的那个真机 cpu_id 优先（见 [`cpu_id`]）；没学到才按本机
-/// 序列号派生，同一台机器每次都一样（换号 App 会当成换了设备，得重走一遍建 key
-/// 流程），不同机器不一样 —— 这才叫设备身份。
+/// 两个真实来源：daemon 写下的那份文件，或按本机真实序列号现派生；一个都拿不到就
+/// 是空串（不编号，本地这条路也就不答，见 [`answer`]）。
 pub(crate) fn device_id() -> String {
     cpu_id()
 }
@@ -215,14 +214,13 @@ struct CpuIdCache {
 
 static CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
 
-/// 这台机器该报的 cpu_id：daemon 学来的真机值 > 按本机序列号派生的。
+/// 这台机器该报的 cpu_id：daemon 写下的那份 > 按本机真实序列号现派生。
 ///
-/// 为什么要用真机那个：SOTER 的身份是 `(cpu_id, uid)`，本地自签答一个号、服务端
-/// 造一个号、真机又是第三个，同一个 App 在不同层上就成了不同设备 —— 微信会重走一
-/// 遍开通，检测器直接报「两次 cpuid 不一致」。
+/// 两处都是真实来源。一个都拿不到就返回空串 —— 那种机器我们没有任何真身份可报，
+/// 不许编（编出来的号在业务侧一眼假），本地这条路也就不报身份（见 [`answer`]）。
 fn cpu_id() -> String {
     let Ok(mut slot) = CPU_ID.lock() else {
-        return device_info().derived_cpu_id.clone();
+        return device_info().derived_cpu_id.clone().unwrap_or_default();
     };
     if let Some(cached) = slot.as_ref() {
         if cached.read_at.elapsed() < CPU_ID_TTL {
@@ -231,12 +229,18 @@ fn cpu_id() -> String {
     }
     let previous = slot.as_ref().map(|cached| cached.value.clone());
     let (learned, origin) = load_cpu_id();
-    let value = learned.unwrap_or_else(|| device_info().derived_cpu_id.clone());
+    let value = learned
+        .or_else(|| device_info().derived_cpu_id.clone())
+        .unwrap_or_default();
     if previous.as_deref() != Some(value.as_str()) {
-        log::info!(
-            "soter local cpu_id {} -> {value} ({origin})",
-            previous.as_deref().unwrap_or("<unset>")
-        );
+        if value.is_empty() {
+            log::warn!("soter local cpu_id -> <none> (no learned value, no real serialno)");
+        } else {
+            log::info!(
+                "soter local cpu_id {} -> {value} ({origin})",
+                previous.as_deref().unwrap_or("<unset>")
+            );
+        }
     }
     *slot = Some(CpuIdCache {
         value: value.clone(),
@@ -246,7 +250,7 @@ fn cpu_id() -> String {
 }
 
 /// 找一份学来的 cpu_id：环境变量 > 两个候选文件。找不到返回 `(None, "derived")`，
-/// 调用方再用本机派生值兜底。
+/// 调用方再用本机真实序列号现派生那份兜底（两处都没有才空着）。
 fn load_cpu_id() -> (Option<String>, String) {
     let env = std::env::var_os(kmr_common::soter_relay::CPU_ID_ENV)
         .map(|raw| raw.to_string_lossy().into_owned());
@@ -312,9 +316,9 @@ fn prop(_name: &str) -> Option<String> {
 
 /// 这台机器的 SOTER 设备信息。属性只读一次，之后复用。
 struct DeviceInfo {
-    /// 按本机序列号派生的那个号，`09000000` + 12 字节十六进制。只当兜底：没从
-    /// daemon 那边学到真机 cpu_id 时才用它（见 [`cpu_id`]）。
-    derived_cpu_id: String,
+    /// 按本机真实序列号现派生的那个号，`09000000` + 12 字节十六进制。只当兜底：
+    /// daemon 那份文件没读到、又没有环境变量时才用它；序列号都读不到就是 `None`。
+    derived_cpu_id: Option<String>,
     fp_n: String,
     fp_v: String,
     tee_n: String,
@@ -328,7 +332,7 @@ fn device_info() -> &'static DeviceInfo {
     INFO.get_or_init(|| {
         let serial = prop("ro.boot.serialno").or_else(|| prop("ro.serialno"));
         DeviceInfo {
-            derived_cpu_id: cpu_id_from(serial.as_deref()),
+            derived_cpu_id: serial.as_deref().map(cpu_id_from),
             fp_n: fingerprint_name(),
             fp_v: fingerprint_version(),
             tee_n: tee_name(),
@@ -338,12 +342,12 @@ fn device_info() -> &'static DeviceInfo {
     })
 }
 
-/// 一台像真机的设备号：`09000000` + 12 字节十六进制。
-fn cpu_id_from(serial: Option<&str>) -> String {
+/// 一台像真机的设备号：`09000000` + 12 字节十六进制。只拿真实序列号算，没有就不算。
+fn cpu_id_from(serial: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"ommega-a-side-soter:");
-    hasher.update(serial.unwrap_or(FALLBACK_SEED).as_bytes());
+    hasher.update(serial.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::from("09000000");
     for byte in &digest[..12] {
@@ -449,6 +453,12 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
         return None;
     }
     let state = state()?;
+    // 没有任何真实来源（daemon 那份没读到、本机序列号也读不到）时，这台机器没有可报的
+    // 身份。不许编一个（编出来的号在业务侧一眼假），这一笔干脆不答，让上层去透传。
+    if cpu_id().is_empty() {
+        log::warn!("event=soter local has no real cpu_id; not answering this call locally");
+        return None;
+    }
     match call.code {
         // exportAskPublicKey(uid) —— ASK 的自描述，拿 ASK 自己签（本地 ASK 兼 ATTK）
         1 => {
@@ -700,6 +710,7 @@ mod tests {
             challenge: None,
             session: None,
             key: None,
+            caller_uid: None,
             data_size: 0,
         }
     }
@@ -1026,14 +1037,14 @@ mod tests {
     #[test]
     fn the_device_info_is_derived_from_this_machine() {
         let info = device_info();
-        assert_eq!(
-            info.derived_cpu_id.len(),
-            32,
-            "SOTER device ids are 32 hex chars"
-        );
-        assert!(info.derived_cpu_id.starts_with("09000000"));
-        assert!(info.derived_cpu_id.chars().all(|c| c.is_ascii_hexdigit()));
-        // `device_id()` 报的是「当前该报的那个」（学到真值就用真值，没有才用它）。
+        let derived = info
+            .derived_cpu_id
+            .as_deref()
+            .expect("真机/真设备上序列号读得到；读不到这儿就该是 None");
+        assert_eq!(derived.len(), 32, "SOTER device ids are 32 hex chars");
+        assert!(derived.starts_with("09000000"));
+        assert!(derived.chars().all(|c| c.is_ascii_hexdigit()));
+        // `device_id()` 报的是「当前该报的那个」（文件里有就用文件里的，没有才用它）。
         assert_eq!(device_id(), cpu_id(), "device_id() 就是那个 cpu_id");
         assert_eq!(device_id(), device_id(), "同一个进程里报的号要稳");
 
@@ -1053,7 +1064,11 @@ mod tests {
         let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], None);
         assert_eq!(value.as_deref(), Some(learned));
         assert!(origin.starts_with("file "), "origin = {origin}");
-        assert_ne!(learned, device_info().derived_cpu_id, "两份号必须不是一个");
+        assert_ne!(
+            Some(learned),
+            device_info().derived_cpu_id.as_deref(),
+            "两份号必须不是一个"
+        );
 
         // 环境变量优先于文件。
         let other = "09000000aabbccddeeff001122334455";

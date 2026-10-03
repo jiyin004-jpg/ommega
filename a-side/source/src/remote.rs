@@ -537,6 +537,16 @@ fn candidates() -> (Vec<String>, Vec<String>) {
     split_candidates(live, physical_like)
 }
 
+/// 这台机器现在有没有任何持 IPv4 路由的接口。
+///
+/// 跟 `pick_uplink` 里“一个都没有就留空”那个判断同一件事，但这里要的是个是非题：
+/// 飞行模式、数据与 WiFi 都关的时候，把请求发出去只会白撞一轮连接超时（还要重试
+/// 一次），App 那边早就不等了 —— 看起来就是「远程不通也不回退本地」。
+fn uplink_absent() -> bool {
+    let (preferred, rest) = candidates();
+    preferred.is_empty() && rest.is_empty()
+}
+
 /// Splits candidates by "does it look physical", best first inside each group.
 ///
 /// Separate from `candidates` so a test can inject its own verdict: a dev box has
@@ -657,6 +667,14 @@ impl RemoteRelay {
     /// with a JSON body, `Ok(None)` if the remote is unreachable/non-2xx.
     fn post_json(path: &str, body: &Value) -> Result<Option<Value>> {
         let url = format!("{}{}", Self::base_url()?, path);
+        // 根本没有上行就先别发：一轮 3 秒连接超时再加一次重试，App 那边早就超时
+        // 放弃了，看到的就成了「远程不通也不回退」。这里直接报错，上层（attest /
+        // sign / soter 那几条）立刻落到本地兜底，这也就是“快速失败”。
+        if uplink_absent() {
+            anyhow::bail!(
+                "no interface holds an IPv4 route; skipping the remote attempt and going local"
+            );
+        }
         let body_str = serde_json::to_string(body)?;
         let headers = vec![
             ("Content-Type".to_string(), "application/json".to_string()),

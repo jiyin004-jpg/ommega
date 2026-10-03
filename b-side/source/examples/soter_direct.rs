@@ -51,6 +51,16 @@ fn main() -> Result<()> {
         if mode.is_empty() { "probe" } else { &mode }
     );
 
+    // 真机自己报的设备号：鸭子那条「known relay cpu_id」看的就是它。
+    // 先把这一条打出来，才好跟文档里的 `cpu_id` 对齐。
+    let device_id = soter.get_device_id()?;
+    println!(
+        "[direct] get_device_id        -> {} text={:?} bytes={}",
+        device_id.error_code,
+        device_id.text(),
+        device_id.data.len()
+    );
+
     if mode == "gen" {
         let ask = soter.generate_ask_key_pair(uid)?;
         println!("[direct] generate_ask_key_pair -> {ask}");

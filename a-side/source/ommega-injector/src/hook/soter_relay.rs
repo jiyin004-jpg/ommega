@@ -72,6 +72,12 @@ fn request(call: &SoterCall) -> Option<String> {
         out.push_str(",\"session\":");
         out.push_str(&session.to_string());
     }
+    // 真调用者是谁（App 侧事务头里内核填的 sender_euid）。取不到就不带：daemon 翻不出
+    // 包名、服务端就退回别名/槽位那套老判据，跟旧 payload 一个样。
+    if let Some(uid) = call.caller_uid {
+        out.push_str(",\"caller_uid\":");
+        out.push_str(&uid.to_string());
+    }
     out.push('}');
     Some(out)
 }
@@ -119,6 +125,7 @@ mod tests {
             challenge: challenge.map(str::to_string),
             session: None,
             key: None,
+            caller_uid: None,
             data_size: 0,
         }
     }
@@ -162,6 +169,28 @@ mod tests {
         assert_eq!(
             request(&call).as_deref(),
             Some("{\"op\":\"finish_sign\",\"session\":81985529216486895}")
+        );
+    }
+
+    /// 解析出真调用者 uid 之后，转发 JSON 里得带上它（包名由 daemon 翻）。
+    #[test]
+    fn a_resolved_caller_uid_rides_along_in_the_request() {
+        let mut call = call(11, Some(10490), Some("SoterAuthKey"), Some("0a1b"));
+        call.caller_uid = Some(10490);
+        assert_eq!(
+            request(&call).as_deref(),
+            Some(
+                "{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKey\",\"challenge\":\"0a1b\",\"caller_uid\":10490}"
+            )
+        );
+    }
+
+    /// 没解出调用者就一个字都不多带（旧 payload / 没有 App 侧事务时就是这个形状）。
+    #[test]
+    fn an_unresolved_caller_adds_no_field() {
+        assert_eq!(
+            request(&call(9, Some(10490), None, None)).as_deref(),
+            Some("{\"op\":\"has_ask_already\",\"uid\":10490}")
         );
     }
 

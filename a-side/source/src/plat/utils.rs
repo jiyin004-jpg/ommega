@@ -159,6 +159,27 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
     encode_application_id(application_id)
 }
 
+/// 这个 uid 挂着哪些包（AAID 里那几个 `packageInfos` 的包名）。
+///
+/// SOTER 分流要按「真调用者是谁」判：调用方自己填的 uid / 别名都不可信（实测探测机
+/// 填过 Gmail 的 uid），只有内核填的 `sender_euid` 可信；而 uid→包名这个映射得问系统。
+/// 那个服务只认 Keystore/Credstore 的 uid，所以只能在这儿翻（daemon 跑在 keystore uid），
+/// payload 那边（SOTER 宿主，uid 1000）一问就被拒：
+/// `This service can only be used by Keystore or Credstore`。
+pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
+    // 系统自己那两份没有对应的安装包，`get_aaid` 里也是这么特判的。
+    if uid == 0 || uid == 1000 {
+        return Ok(Vec::new());
+    }
+    let application_id = get_application_id_from_provider(uid)?;
+    Ok(application_id
+        .packageInfos
+        .into_iter()
+        .map(|info| info.packageName)
+        .filter(|name| !name.is_empty())
+        .collect())
+}
+
 fn get_application_id_from_provider(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
     let _wd = crate::watchdog::watch("get_aaid: Retrieving AAID by calling service");
     let use_legacy = super::legacy::should_use_aaid_provider();

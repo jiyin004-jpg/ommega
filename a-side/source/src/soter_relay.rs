@@ -14,14 +14,53 @@ use crate::remote::{fallback_local, remote_enabled, RemoteRelay};
 /// 「这些调用只在本地兜底回答、一次都不往 B 端转」的缺省别名前缀。
 ///
 /// 两个名字都是探针自己起的（别名尾部带毫秒时间戳，每跑一轮新铸一个），所以认前缀
-/// 比认 uid 稳：uid 每台机器一套，这个名字是探针里写死的。配置里写 `none` 就是关掉。
+/// 比认 uid 稳。**uid 完全不能信**：SOTER 的接口把 uid 当参数传，宿主不拿
+/// `Binder.getCallingUid()` 覆盖它，所以探测机可以随便填 —— 实测鸭子的 AuthKey 那几笔
+/// 用的是 Gmail 的 uid，ASK 用的是 `com.android.pacprocessor` 这类系统包。按 uid 或按
+/// 包名认探测机都是南辕北辙。配置里写 `none` 就是关掉。
 pub const DEFAULT_LOCAL_ONLY_PREFIXES: &str = "chunqiu_soter_probe_,duckdetector_soter_probe_";
+
+/// 刚看见探测别名之后多久内，这台设备上不带别名的那几笔（ASK 那套）也按探测机处理。
+///
+/// 为什么要这个窗：探测机的 ASK 接口本身没有别名，uid 又是假的，本来无从辨认；但它
+/// 那一轮总是先带别名铸 AuthKey / 签名，紧接着（实测同一个秒到两秒的窗口）才发那几笔
+/// 不带别名的 ASK。取 4 秒：窗口只是给「同一轮」盖个戳，太长反而会把真应用的 ASK 也
+/// 带进本地兜底（那样它的身份会跟真机那份对不上）。
+const PROBE_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// 这台设备最后一次看到探测别名是什么时候。
+fn note_probe_sighting() {
+    if let Ok(mut guard) = LAST_PROBE.lock() {
+        *guard = Some(std::time::Instant::now());
+    }
+}
+
+fn probe_recently_seen() -> bool {
+    let Ok(guard) = LAST_PROBE.lock() else {
+        return false;
+    };
+    guard.map(|at| at.elapsed() < PROBE_WINDOW).unwrap_or(false)
+}
+
+static LAST_PROBE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// 一笔 SOTER 调用的去处，`request` 是 payload 拼好的 JSON（`{"op":..,"uid":..}`）。
 ///
 /// 认不出来的请求、远程没开、远程没答案，都会回退到「本地兜底」——那是接线之前的行为，
 /// 也是唯一不会把宿主坑住的退路。
 pub fn forward(request: &str) -> Vec<u8> {
+    let started = std::time::Instant::now();
+    let out = forward_inner(request);
+    // 一笔 SOTER 调用在 daemon 这边待了多久：App 那边挂着的就是这个时间。
+    // 远程不通时靠它一眼看出「是等远程等掉的，还是本地磨掉的」。
+    log::info!(
+        "event=soter relay took {} ms",
+        started.elapsed().as_millis()
+    );
+    out
+}
+
+fn forward_inner(request: &str) -> Vec<u8> {
     let value: Value = match serde_json::from_str(request) {
         Ok(value) => value,
         Err(error) => {
@@ -39,6 +78,11 @@ pub fn forward(request: &str) -> Vec<u8> {
         log::warn!("event=soter relay unknown op {op:?}; using the local backend");
         return Outcome::Local.encode();
     }
+
+    // 真调用者：payload 只带内核填的 uid（`caller_uid`），包名在这边翻 —— SOTER 宿主里
+    // 问不动那个服务（它只认 Keystore/Credstore 的 uid）。翻出来的 `caller_pkg` 既当下面
+    // 那条「刚见过探测别名」时间窗的否决，也跟着请求转给服务端按白名单判。
+    let value = with_caller_pkg(value);
 
     // 探测机（春秋 / 鸭子这类检测器）的这笔直接本地兜底，一次都不往 B 端转。
     //
@@ -90,7 +134,105 @@ fn local_only(value: &Value) -> Option<String> {
         ),
         Err(_) => return None,
     };
-    local_only_match(value, &prefixes, &uids)
+    if let Some(why) = local_only_match(value, &prefixes, &uids) {
+        // 看见探测别名就把「这台设备刚跑过探测机」记一笔：它那一轮不带别名的 ASK
+        // 就在几秒内，只能靠这个窗口接住。
+        note_probe_sighting();
+        return Some(why);
+    }
+    // 带了真调用者包名（新 payload）的那几笔不吃这个时间窗：这笔到底是不是探测机由
+    // 服务端按包名判（名单之外一律内置）。靠窗猜会把真应用紧跟着探测机跑的那笔不带
+    // 别名的 ASK 也拽到本地来 —— 它跟同一轮真机那把钥匙就对不上了（微信栽过）。
+    if !has_caller_pkg(value) && probe_recently_seen() && alias_is_blank(value) {
+        return Some("这台设备刚跑过探测机的流程（名字前几秒刚出现过）".to_string());
+    }
+    None
+}
+
+/// 这笔请求带没带「真调用者包名」（A 端带来的，或 daemon 刚翻出来的）。
+fn has_caller_pkg(value: &Value) -> bool {
+    value
+        .get(CALLER_PKG_FIELD)
+        .and_then(Value::as_str)
+        .is_some_and(|pkg| !pkg.trim().is_empty())
+}
+
+/// payload 带来的「内核填的真调用者 uid」字段名（新 payload 才有）。
+pub const CALLER_UID_FIELD: &str = "caller_uid";
+/// uid 翻出来的包名（共享 uid 会有好几个，逗号连起来）。转发给服务端时用这个字段名。
+pub const CALLER_PKG_FIELD: &str = "caller_pkg";
+
+/// uid → 翻出来的包名 + 什么时候翻的。只有装/卸应用才会变，所以缓存一分钟。
+type CallerNames = std::sync::Mutex<Vec<(u32, std::time::Instant, Option<String>)>>;
+static CALLER_NAMES: CallerNames = std::sync::Mutex::new(Vec::new());
+
+/// uid → 包名（逗号连起来），带一层短缓存。
+///
+/// 为什么要缓存：它每笔 SOTER 调用都要问一次系统，而那个映射只有装/卸应用才会变。
+fn caller_package_for_uid(uid: i64) -> Option<String> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let uid = u32::try_from(uid).ok()?;
+    if let Ok(entries) = CALLER_NAMES.lock() {
+        if let Some((_, at, hit)) = entries.iter().find(|(cached, _, _)| *cached == uid) {
+            if at.elapsed() < TTL {
+                return hit.clone();
+            }
+        }
+    }
+
+    let hit = match crate::plat::utils::package_names_for_uid(uid) {
+        Ok(names) => {
+            let joined = names.join(",");
+            let hit = (!joined.is_empty()).then_some(joined);
+            log::info!("event=soter caller uid {uid} -> {hit:?}");
+            hit
+        }
+        Err(error) => {
+            // 翻不出来就不带这个字段：服务端会退回别名/槽位那套老判据。
+            log::warn!("event=soter caller uid {uid} 翻包名失败（{error:#}）；照旧按别名/槽位判");
+            None
+        }
+    };
+
+    if let Ok(mut entries) = CALLER_NAMES.lock() {
+        if entries.len() > 256 {
+            entries.clear();
+        }
+        entries.retain(|(cached, _, _)| *cached != uid);
+        entries.push((uid, std::time::Instant::now(), hit.clone()));
+    }
+    hit
+}
+
+/// 把 payload 带来的真调用者 uid 翻成包名塞进请求，给服务端白名单用。
+///
+/// 请求里已经有 `caller_pkg`（或压根没带 `caller_uid`）就原样不动 —— 后者是旧 payload
+/// 或者没有 App 侧事务的调用，服务端会自动退回别名/槽位那套。
+fn with_caller_pkg(mut value: Value) -> Value {
+    if has_caller_pkg(&value) {
+        return value;
+    }
+    let Some(uid) = value.get(CALLER_UID_FIELD).and_then(Value::as_i64) else {
+        return value;
+    };
+    let Some(pkg) = caller_package_for_uid(uid) else {
+        return value;
+    };
+    if let Some(map) = value.as_object_mut() {
+        map.insert(CALLER_PKG_FIELD.to_string(), Value::from(pkg));
+    }
+    value
+}
+
+/// 这笔调用有没有「能分辨的别名」。空别名和 `-` 都算没有（探测机那几个 ASK 就是这种）。
+fn alias_is_blank(value: &Value) -> bool {
+    let alias = value
+        .get("alias")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    alias.is_empty() || alias == "-"
 }
 
 /// `local_only` 里跟配置来源无关的那半：名单匹配。
@@ -498,6 +640,57 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// 探测别名出现过之后，紧跟着不带别名的 ASK 也按探测机处理（靠的是设备级的时间窗）。
+    #[test]
+    fn a_blank_alias_right_after_a_probe_alias_counts_as_a_probe() {
+        assert!(alias_is_blank(
+            &json!({"op": "has_ask_already", "uid": 10490})
+        ));
+        assert!(alias_is_blank(
+            &json!({"op": "has_ask_already", "uid": 10490, "alias": "-"})
+        ));
+        assert!(alias_is_blank(
+            &json!({"op": "has_ask_already", "uid": 10490, "alias": "  "})
+        ));
+        assert!(!alias_is_blank(
+            &json!({"op": "init_sign", "alias": "SoterAuthKeyV2_salt1_scene1"})
+        ));
+        // 窗口本身是设备级的静态变量，测试之间共享，所以只断言「记一笔之后就是热的」
+        // 这个方向，不去断言「没记过就是冷的」（别的测试可能刚记过）。
+        note_probe_sighting();
+        assert!(probe_recently_seen());
+        assert!(!PROBE_WINDOW.is_zero());
+    }
+
+    /// 带没带真调用者包名，决定这几笔吃不吃上面那个时间窗。
+    #[test]
+    fn only_a_request_without_a_caller_package_uses_the_probe_window() {
+        assert!(has_caller_pkg(&json!({"caller_pkg": "com.tencent.mm"})));
+        assert!(has_caller_pkg(&json!({
+            "op": "has_ask_already",
+            "caller_pkg": "com.tencent.mm,com.tencent.mm:tools"
+        })));
+        // 空 / 全空格 / 类型不对都算没带。
+        assert!(!has_caller_pkg(&json!({"caller_pkg": ""})));
+        assert!(!has_caller_pkg(&json!({"caller_pkg": "   "})));
+        assert!(!has_caller_pkg(&json!({"caller_pkg": 7})));
+        assert!(!has_caller_pkg(&json!({"op": "has_ask_already"})));
+    }
+
+    /// 已经带了包名（或压根没带 uid）时，`with_caller_pkg` 不该去问系统 —— 这两条
+    /// 路径不碰 AAID 服务，所以在宿主机上也能跑。
+    #[test]
+    fn an_existing_or_missing_caller_is_left_alone() {
+        let already = json!({"op": "has_ask_already", "caller_pkg": "com.tencent.mm"});
+        assert_eq!(with_caller_pkg(already.clone()), already);
+        let no_uid = json!({"op": "has_ask_already", "uid": 10490});
+        assert_eq!(with_caller_pkg(no_uid.clone()), no_uid);
+        // uid 形状不对（负号、字符串）同样不动。
+        for bad in [json!({"caller_uid": -5}), json!({"caller_uid": "x"})] {
+            assert_eq!(with_caller_pkg(bad.clone()), bad);
+        }
     }
 
     #[test]

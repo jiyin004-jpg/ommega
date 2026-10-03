@@ -70,6 +70,16 @@ pub struct Config {
     /// 探测机那几个不带别名的 op 靠它和「槽位学过」两条判据兜（uid 号跨设备复用，
     /// 手写一条就等于拍板把那个槽位当探测机，所以要人自己决定）。
     pub soter_local_only_uids: String,
+    /// 「这些 SOTER 调用交给真机（B）答」的别名前缀名单
+    /// （`RELAY_SOTER_REAL_APP_PREFIXES`，缺省就是 SOTER SDK 那套真应用名字）。
+    ///
+    /// 规则是反向白名单：命中这里的给真机，其余（探测机自起的名字、其它自定义名、
+    /// 不带别名的 ASK）一律用内置料就地作答。写空字符串就用缺省那套。
+    pub soter_real_app_prefixes: String,
+    /// 「这些包名的应用算真应用、交给真机答」的白名单
+    /// （`RELAY_SOTER_REAL_APP_PACKAGES`）。A 端转发时带的 `caller_pkg` 按它判；
+    /// 没带包名（老 A 端）就退回上面那套别名/槽位逻辑。写空字符串就用缺省那套。
+    pub soter_real_app_packages: String,
     /// Long-poll default timeout, seconds.
     pub poll_timeout_secs: u64,
     /// MySQL connection URL: `mysql://user:pass@host:port/dbname`
@@ -130,8 +140,11 @@ impl Default for Config {
             assignment_timeout_secs: 3,
             wait_result_timeout_secs: 3,
             soter_wait_result_timeout_secs: 15,
-            soter_local_only_prefixes: crate::soter_probe::DEFAULT_PREFIXES.to_string(),
+            // 反向白名单：不需要人工名单，留空就行（见 `soter_probe::reason`）。
+            soter_local_only_prefixes: String::new(),
             soter_local_only_uids: String::new(),
+            soter_real_app_prefixes: crate::soter_probe::DEFAULT_REAL_APP_PREFIXES.to_string(),
+            soter_real_app_packages: crate::soter_probe::DEFAULT_REAL_APP_PACKAGES.to_string(),
             poll_timeout_secs: 30,
             mysql_url: String::new(),
             mysql_time_zone: "+08:00".to_string(),
@@ -272,6 +285,12 @@ impl Config {
         }
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_SOTER_LOCAL_ONLY_UIDS") {
             cfg.soter_local_only_uids = v;
+        }
+        if let Some(v) = env_or_dotenv(&dotenv, "RELAY_SOTER_REAL_APP_PREFIXES") {
+            cfg.soter_real_app_prefixes = v.trim().to_string();
+        }
+        if let Some(v) = env_or_dotenv(&dotenv, "RELAY_SOTER_REAL_APP_PACKAGES") {
+            cfg.soter_real_app_packages = v.trim().to_string();
         }
         cfg.poll_timeout_secs = env_u64("RELAY_POLL_TIMEOUT", 30);
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_MYSQL_URL") {

@@ -49,8 +49,10 @@
 //! uid 是 App 自己的（SoterService 用 `Binder.getCallingUid()`），不是 binder 的
 //! 调用者 uid；所以作用域判定要看这个参数。
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use log::{debug, info};
 
@@ -137,6 +139,16 @@ pub(crate) struct SoterCall {
     pub(crate) session: Option<i64>,
     /// App 面向 13 号 `getExtraParam` 那个 key。
     pub(crate) key: Option<String>,
+    /// 真调用者是谁：App 侧那笔事务头里内核填的 `sender_euid`。
+    ///
+    /// 只有 HAL 侧（宿主发往 HAL 的那笔）才有。请求参数里那个 uid 是调用方自己填的
+    /// （实测探测机填过 Gmail 的号），只有这个内核值信得过。
+    ///
+    /// 这里**不翻包名**：uid→包名得问 `sec_key_att_app_id_provider`，而那个服务
+    /// 只认 Keystore/Credstore 的 uid，SOTER 宿主（uid 1000）一问就回
+    /// `This service can only be used by Keystore or Credstore`。翻包名放进 daemon
+    /// （它跑在 keystore uid）做 —— 反正它本来就在那儿把 AAID 解析出来。
+    pub(crate) caller_uid: Option<i32>,
     /// 请求体总字节数，写日志时对一眼就知道有没有漏掉参数。
     pub(crate) data_size: usize,
 }
@@ -553,11 +565,48 @@ pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
         challenge,
         session,
         key,
+        caller_uid: None,
         data_size: data.len(),
     })
 }
 
-/// 观察一条写出去的 transaction。不是 SOTER 的就一声不吭地回去。
+/// App 面向那笔请求带来的调用者 uid 只在这段时间内算数。
+///
+/// 一笔 App 调用和它引发的 HAL 调用是同一个线程上前后脚，实测毫秒级；2 秒足够，
+/// 又短到不会把上一笔 App 的 uid 借给下一笔无关的 HAL 调用，串了台。
+const APP_CALLER_WINDOW: Duration = Duration::from_millis(2000);
+
+thread_local! {
+    /// 本线程上「刚进来的那笔 App 面向 SOTER 请求」的真调用者（内核填的 `sender_euid`）
+    /// 和它到来的时刻。
+    ///
+    /// 为什么按线程记：宿主进程收到 App 发来的 SOTER 请求（读侧那条 BR_TRANSACTION）
+    /// 之后，就在同一个 binder 线程上同步去调 HAL（写侧那条 BC_TRANSACTION）。所以出站
+    /// 那笔紧接着入站那笔、落在同一个线程，这就是把「调用者到底是谁」接到 HAL 调用上的
+    /// 唯一凭据 —— 请求参数里那个 uid 是调用方自己填的，信不得。
+    static APP_CALLER: RefCell<Option<(i32, Instant)>> = const { RefCell::new(None) };
+}
+
+/// 记一笔：本线程刚收到 App 面向的 SOTER 请求，调用者是 `uid`（内核填的 `sender_euid`）。
+fn note_app_caller(uid: i32) {
+    APP_CALLER.with(|slot| {
+        *slot.borrow_mut() = if uid < 0 {
+            // 内核没填（异常事务）：宁可不记，也别把 -1 当调用者去翻包名。
+            None
+        } else {
+            Some((uid, Instant::now()))
+        };
+    });
+}
+
+/// 取走本线程记下的调用者 uid。取走即清：一笔 App 调用只借给紧跟着的那笔 HAL 调用。
+/// 没记过、或者已经出了窗口，都返回 `None`。
+fn take_app_caller_uid() -> Option<i32> {
+    let (uid, at) = APP_CALLER.with(|slot| slot.borrow_mut().take())?;
+    (at.elapsed() <= APP_CALLER_WINDOW).then_some(uid)
+}
+
+/// 观察一条 transaction。不是 SOTER 的就一声不吭地回去。
 ///
 /// # Safety
 ///
@@ -574,7 +623,15 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
     }
     // SAFETY: 见上面那条 —— 调用点保证这段字节可读。
     let data = unsafe { std::slice::from_raw_parts(buffer as *const u8, size) };
-    let call = parse(data, tr.code)?;
+    let mut call = parse(data, tr.code)?;
+    if call.hal {
+        // 宿主发往 HAL 的那笔：把上一笔 App 面向请求的真调用者 uid 接到这笔上，
+        // 转发时带给 daemon（由它翻包名、由服务端按包名白名单判）。
+        call.caller_uid = take_app_caller_uid();
+    } else {
+        // App 面向那笔：`tr.sender_euid` 是内核填的，调用方改不了，记下来给出站那笔用。
+        note_app_caller(tr.sender_euid);
+    }
     log_call(&call);
     Some(call)
 }
@@ -608,7 +665,11 @@ fn log_call(call: &SoterCall) {
     } else {
         String::new()
     };
-    let line = format!("{line}{wire_code}");
+    let caller_uid = call
+        .caller_uid
+        .map(|uid| format!(" caller_uid={uid}"))
+        .unwrap_or_default();
+    let line = format!("{line}{caller_uid}{wire_code}");
     // 本地那一路（logcat / 日志文件）在 app 域的进程里是哑的，所以同一条还顺 RPC 送一份给
     // daemon 记：宿主的观测只有这一条路能看见。
     info!("{line}");
@@ -903,6 +964,30 @@ mod tests {
         let call = parse(&data, 8).expect("code 8 is ours");
         assert_eq!(call.op, "getDeviceId");
         assert_eq!(call.uid, None);
+    }
+
+    /// App 面向那笔记下的调用者 uid 借给紧跟着的那笔 HAL 调用，取走即清。
+    #[test]
+    fn an_app_side_caller_is_borrowed_by_the_next_hal_call() {
+        // 同线程里别的测试可能记过，先清干净再验。
+        let _ = take_app_caller_uid();
+        note_app_caller(10490);
+        assert_eq!(take_app_caller_uid(), Some(10490));
+        // 取走即清：同一笔 App 调用不能借给第二笔 HAL 调用。
+        assert_eq!(take_app_caller_uid(), None);
+        // 内核没填 uid（负数）不算调用者。
+        note_app_caller(-1);
+        assert_eq!(take_app_caller_uid(), None);
+        // 窗口要是个正数：太小会把同一笔流程拆开，太大就会串台。
+        assert!(APP_CALLER_WINDOW >= Duration::from_millis(500));
+    }
+
+    /// 解析出来的请求本来不带 caller_uid（那是 observe 在真机上填的），别在 parse 里瞎猜。
+    #[test]
+    fn parse_never_invents_a_caller_uid() {
+        let data = request(&|out| push_i32(out, 10373));
+        let call = parse(&data, 1).expect("code 1 is ours");
+        assert_eq!(call.caller_uid, None);
     }
 
     #[test]

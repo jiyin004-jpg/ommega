@@ -1194,9 +1194,33 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     // 兜底，这些流量只有服务端看得见）。attest 走的是另一条路，这里一个字都不动。
     let uid_arg = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     let probe_alias_arg = body.get("alias").and_then(Value::as_str);
-    if let Some(why) = crate::soter_probe::reason(&state.cfg, requested, uid_arg, probe_alias_arg) {
+    let session_arg = body.get("session").and_then(Value::as_i64);
+    // `finish_sign` 只有会话号：它必须回到开会话的那一侧，不能拿“没别名”就判成内置。
+    let forced_local = if op == "finish_sign" {
+        session_arg
+            .and_then(|session| crate::soter_probe::session_side(requested, session))
+            .map(|real| !real)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if let Some(why) = crate::soter_probe::reason_with_caller(
+        &state.cfg,
+        requested,
+        uid_arg,
+        probe_alias_arg,
+        body.get(crate::soter_probe::CALLER_PKG_FIELD)
+            .and_then(Value::as_str),
+    )
+    .or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
+    {
         let reply = run_layer_soter(state, "builtin", body, requested).await;
         if let Some(v) = reply.filter(|v| v.get("error").is_none()) {
+            if op == "init_sign" {
+                if let Some(session) = v.get("session").and_then(Value::as_i64) {
+                    crate::soter_probe::note_session_side(requested, session, false);
+                }
+            }
             tracing::info!(
                 "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
                  用服务端内置物料作答，不落 B"

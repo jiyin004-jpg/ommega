@@ -647,11 +647,14 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
     let product = docs_cpu_id(body).unwrap_or_else(|| {
         if body.get(CPU_ID_FIELD).is_some() {
             tracing::warn!(
-                "soter: {layer} 层收到形状不对的 cpu_id {:?}，照旧用虚拟设备号",
+                "soter: {layer} 层收到形状不对的 cpu_id {:?}，按当前时间现造一个",
                 body.get(CPU_ID_FIELD)
             );
         }
-        virtual_device_id(device_id)
+        // 老 A 端不带 cpu_id：按当时的年月日时分现造一个。同一分钟内稳定，
+        // 一轮 ASK/AuthKey 流程跑在同一分钟里就能对上；不再用按设备名派生的那个，
+        // 免得到处都是同一个号、探测器一对比就认出来。
+        time_device_id()
     });
 
     if !KNOWN_OPS.contains(&op) {
@@ -901,8 +904,27 @@ fn is_soter_cpu_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// 虚拟 SOTER 设备号。真机上是 `09000000` + 12 字节随机，这里用请求里的设备 id
-/// 派生，好处是同一台 A 端设备每次拿到的都一样。只有 A 端没转来真值时才用它。
+/// 请求里没带 cpu_id 时现造一个设备号：`09000000` +
+/// `sha256("ommega-server-soter-time:" + YYYYMMDDHHMM)` 前 12 字节。
+///
+/// 按分钟：同一分钟的 ASK / AuthKey / 签名现场报同一个号，不会一轮流程中途换身份；
+/// 又不会跟别的设备、别的时间撞成同一串值。
+fn time_device_id() -> String {
+    let stamp = chrono::Utc::now().format("%Y%m%d%H%M").to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(b"ommega-server-soter-time:");
+    hasher.update(stamp.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::from("09000000");
+    for byte in &digest[..12] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// 早先用过的「按设备名派生」的虚拟 SOTER 设备号。现在不再当兜底用（兜底那个是
+/// [`time_device_id`]），留在这里只给测试当「跟按时间造的绝不是同一个」的对照组。
+#[cfg(test)]
 fn virtual_device_id(device_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ommega-server-soter:");
@@ -1168,7 +1190,7 @@ mod tests {
             "有真值就不能回落到虚拟号"
         );
 
-        // 没转真值（老 A 端、或者它自己还没学到）照旧走虚拟号，层名一样要有。
+        // 没转真值（老 A 端、或者它自己还没学到）就按当时的年月日时分现造一个，层名一样要有。
         let plain = run(
             "self_signed",
             device,
@@ -1176,12 +1198,18 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(plain["text"], json!(virtual_device_id(device)));
+        assert_eq!(plain["text"], json!(time_device_id()));
         assert_eq!(plain["layer"], json!("self_signed"));
+        assert_ne!(
+            plain["text"],
+            json!(virtual_device_id(device)),
+            "不再用按设备名派生的虚拟号"
+        );
     }
 
+    /// 没带 cpu_id / 带得不成样子时，按当前时间现造一个（同一分钟内稳定）。
     #[test]
-    fn a_malformed_cpu_id_falls_back_to_the_virtual_one() {
+    fn a_malformed_cpu_id_falls_back_to_the_time_based_one() {
         let device = "device-a-badcpuid";
         let cases = [
             json!(""),
@@ -1198,12 +1226,17 @@ mod tests {
                 None,
             )
             .expect("handled");
-            assert_eq!(
-                id["text"],
-                json!(virtual_device_id(device)),
-                "{bad:?} 不该被当身份证用"
+            let text = id["text"].as_str().expect("text");
+            assert_eq!(text.len(), 32, "{bad:?}");
+            assert!(text.starts_with("09000000"), "{bad:?}: {text}");
+            assert!(
+                text.chars().all(|c| c.is_ascii_hexdigit()),
+                "{bad:?}: {text}"
             );
+            assert_ne!(text, virtual_device_id(device), "{bad:?}");
         }
+        // 同一分钟里两次调用应当一样（一轮 ASK / AuthKey 不会中途换号）。
+        assert_eq!(time_device_id(), time_device_id());
     }
 
     #[test]
