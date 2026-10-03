@@ -515,6 +515,87 @@ mod tests {
         );
     }
 
+    /// 真机上手工跑的验证：把设备上那份真配置装进运行时配置，再拿真的探测别名走
+    /// `local_only`（`forward()` 里就是这一步），确认它判成「本地兜底」、而微信那类真
+    /// 应用的别名一个都判不出来。只读设备文件，不发请求、不改任何东西。
+    ///
+    /// ```text
+    /// adb push <test-bin> /data/local/tmp/a-keymint-tests
+    /// adb shell su -c '/data/local/tmp/a-keymint-tests --ignored --nocapture the_device_config'
+    /// ```
+    #[test]
+    #[ignore = "读设备上的真配置（/data/misc/keystore/ommega/config），只在真机上手工跑"]
+    fn the_device_config_diverts_detector_probes() {
+        use crate::config::{self, ResolvedTrust, TrustValueSource};
+
+        let config_file = config::bootstrap_config_file().expect("读设备配置");
+        let trust = ResolvedTrust {
+            os_version: 0,
+            security_patch: String::new(),
+            os_patchlevel: String::new(),
+            vendor_patchlevel: String::new(),
+            boot_patchlevel: String::new(),
+            vb_key: [0u8; 32],
+            vb_hash: [0u8; 32],
+            vb_key_source: TrustValueSource::Original,
+            vb_hash_source: TrustValueSource::Original,
+            verified_boot_state: true,
+            device_locked: true,
+        };
+        config::install_runtime_config(config_file, trust).expect("装上运行时配置");
+
+        let (prefixes, uids, url, device_id) = {
+            let cfg = config::config().read().expect("读运行时配置");
+            (
+                cfg.remote.soter_local_only_prefixes.clone(),
+                cfg.remote.soter_local_only_uids.clone(),
+                cfg.remote.url.clone(),
+                cfg.remote.device_id.clone(),
+            )
+        };
+        println!("设备配置 soter_local_only_prefixes = {prefixes:?}");
+        println!("设备配置 soter_local_only_uids     = {uids:?}");
+        println!("设备配置 url/device_id             = {url:?} / {device_id:?}");
+        // url 和 device_id 只可能来自那份扁平配置，它们非空就说明文件真的被读进来了。
+        assert!(!url.is_empty() && !device_id.is_empty(), "扁平配置没被读到");
+        assert!(!list_disabled(&prefixes), "真配置把本地兜底名单关掉了");
+
+        // 两台探测机的别名（名字是从生产服务端日志里抄回来的真的）。
+        for alias in [
+            "chunqiu_soter_probe_1791022575713",
+            "duckdetector_soter_probe_1791022480012",
+        ] {
+            let value = json!({"op": "init_sign", "uid": 10388, "alias": alias});
+            assert!(local_only(&value).is_some(), "{alias} 应当判成本地兜底");
+        }
+
+        // 真应用一个都不能碰。
+        for alias in [
+            "SoterAuthKeyV2_salt11d8ba34_scene1",
+            "WechatAuthKeyPay&dx20079023",
+            "SoterAuthKey_salt4add9b38_scene2",
+        ] {
+            let value = json!({"op": "init_sign", "uid": 10490, "alias": alias});
+            assert_eq!(local_only(&value), None, "{alias} 不该被判成本地兜底");
+        }
+
+        // 没用别名、也没有 uid 名单的时候，光靠缺省前缀也得拦住（探测机的 op 里
+        // `has_ask_already` 这类根本不给别名）。
+        let no_uid = json!({"op": "init_sign", "alias": "duckdetector_soter_probe_1"});
+        assert!(local_only(&no_uid).is_some(), "没有 uid 也要认前缀");
+
+        // uid 名单是每台机器手写的（默认空），写了就必须一个不落地都拦住 —— 哪怕别名
+        // 看着像微信的真钥匙（uid 命中就是命中，不必再看别名）。
+        for uid in parse_number_list(&uids) {
+            let value = json!({
+                "op": "init_sign",
+                "uid": uid,
+                "alias": "SoterAuthKeyV2_salt11d8ba34_scene1",
+            });
+            assert!(local_only(&value).is_some(), "uid {uid} 在名单里却没拦住");
+        }
+    }
+
     #[test]
     fn a_broken_base64_out_parameter_is_not_guessed() {
         assert_eq!(
