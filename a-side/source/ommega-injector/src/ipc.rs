@@ -391,12 +391,17 @@ where
     F: FnMut(&Strong<B>) -> Result<T>,
 {
     let client = get()?;
+    // 影子可能刚换了一代（重启 / 被替换），它内存里的解锁材料跟着没了；先把我们手上
+    // 存着的那份补喂回去，免得这笔请求撞在「设备已锁定」上。没有材料时这行不做事。
+    crate::hook::rewrite::sync_ommega_state_after_reconnect();
     match f(&client) {
         Ok(value) => Ok(value),
         Err(error) if retryable(&error) => {
             warn!("{tag} transaction hit a stale Binder; refreshing client and retrying once");
             clear(&client);
             let client = get()?;
+            // 重连之后的影子是新的，同样先补料再重试。
+            crate::hook::rewrite::sync_ommega_state_after_reconnect();
             let result = f(&client);
             if result.as_ref().err().is_some_and(retryable) {
                 clear(&client);
@@ -421,6 +426,8 @@ where
     F: FnOnce(&Strong<B>) -> Result<T>,
 {
     let client = get()?;
+    // 同 with_binder_retry：新影子先补解锁材料再发这一笔。
+    crate::hook::rewrite::sync_ommega_state_after_reconnect();
     let result = f(&client);
     if result.as_ref().err().is_some_and(stale) {
         clear(&client);
@@ -430,6 +437,12 @@ where
 
 pub fn get_ommega() -> Result<Strong<dyn IKeymintService>> {
     get_rpc_binder(rpc::SERVICE, "failed to connect to ommega service", false)
+}
+
+/// 到影子那条 RPC 连接的代数。每次重连、每次因为调用失败把缓存会话丢掉，都会 +1。
+/// 所以代数变了就等于「影子进程换了一代」，它内存里的东西（CE 超密钥之类）也都没了。
+pub fn rpc_generation() -> u64 {
+    RPC_CACHE.lock().expect("RPC cache poisoned").generation
 }
 
 pub fn with_ommega_retry<T, F>(mut f: F) -> Result<T>

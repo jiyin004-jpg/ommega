@@ -547,9 +547,15 @@ fn execute_authorization_mirror(
             })
         }
         ParsedAuthorizationRequest::OnDeviceUnlocked { user_id, password } => {
-            ipc::with_ommega_authorization_once(|auth| {
+            let result = ipc::with_ommega_authorization_once(|auth| {
                 Ok(auth.r#onDeviceUnlocked(Some(caller), *user_id, password.as_deref())?)
-            })
+            });
+            if result.is_ok() {
+                // 只有影子自己答了「收下了」才算数：这份材料是它以后重启还能恢复的唯一
+                // 依据，所以先确认它拿到手，再落一份到盘上。
+                remember_device_unlock(*user_id, password.as_deref(), caller);
+            }
+            result
         }
         ParsedAuthorizationRequest::OnDeviceLocked {
             user_id,

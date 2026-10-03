@@ -36,6 +36,7 @@ use rsbinder::{ExceptionCode, Status, StatusCode, Strong};
 
 mod mirror;
 mod pending;
+mod replay;
 mod reply;
 mod request;
 mod synthetic;
@@ -46,6 +47,11 @@ use pending::*;
 use reply::*;
 use request::*;
 use synthetic::*;
+
+// 影子（daemon）只把解锁材料放在内存里，进程一换就没了。ipc 层每拿到一条新的影子
+// 连接就调一次这个，把之前记下的材料补喂回去；没有材料时它自己什么都不做。
+pub(crate) use replay::sync_ommega_state_after_reconnect;
+use replay::*;
 
 pub(super) use reply::handle_synthetic_br_transaction;
 pub(super) use synthetic::{
