@@ -150,6 +150,26 @@ systemctl start relay_rs
 `owners`，各槽位的钉子（`layer` / `at_millis`）原样保留。库已经在跑之后就不用它了 —— 登记
 是写穿到 `soter_slot_owners` 的。
 
+## B 端的会话也进了一个库（`/data/adb/ommega/sessions.db`）
+
+2026-10-03 起，B 端（`b-side/source/src/keymaster/session_db.rs`）不再「一个别名一个
+JSON 文件」，改成 SQLite 一个文件，规则跟服务端那套对齐：
+
+- 过期按**最后一次使用**算（7 天），条数上限 20000，超了 LRU 淘汰最久没用的
+  （`used_ms` 上建索引，清理是两条 DELETE）。取用会顺手把 `used_ms` 顶到当下，
+  但节流 5 分钟一次 —— 不刷新就是 2026-10-03 那个 bug 的翻版：正在用的 alias 被当成
+  闲置的清掉，紧接着签名报 `no key for alias ... (call attest first)`
+- 内存里只留最近用过的 2000 条（原来那份 map 是全量常驻，实测到过 19967 条 ≈ 160 MB），
+  其余按 alias 单查库；库才是权威，重启不丢会话
+- 旧目录 `/data/adb/ommega/sessions/` **原样留着**：只在库空的时候导一次
+  （别名从 JSON 里取，文件名是哈希反推不出来；「最后使用时间」用文件 mtime，跟老版本的
+  LRU 依据是同一个），导完不再动它，等于现成的回滚源。确认没问题之后手工
+  `rm -rf /data/adb/ommega/sessions` 就收回那一百多 MB
+- 刷回旧版本（只认 JSON 目录的那版）之前，先把 `sessions.db*` 挪走，否则旧版会从
+  旧目录读到一份落后的会话表；反过来再升上来时，库非空就不再导旧 JSON
+- 跟服务端一样，**挪库要连 `-wal`、`-shm` 一起**（WAL 模式）。relay 每次重启都是
+  `pkill -9`，这正是 WAL 该处理的场景，不用特地关库
+
 ## Release 规范
 
 - 标题一律 `vX.Y.Z`，跟 tag 一字不差。不带项目名（`Ommega 1.6.0` 那种）、不带端侧名和

@@ -23,6 +23,7 @@ rsbinder = { version = "0.10.0", features = ["android_12_plus", "rpc"] }
 anyhow = "1.0.104"
 async-trait = "0.1.91"
 serde_json = "1.0.151"
+rusqlite = { version = "0.37", features = ["bundled"] }
 x509-cert = "0.3.0"
 der = "0.8.1"
 base64 = "0.23.0"

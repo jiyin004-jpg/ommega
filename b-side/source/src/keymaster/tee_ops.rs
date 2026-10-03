@@ -14,20 +14,16 @@
 //! through `get_system_keymint` + `begin`/`update`/`finish`, so the produced
 //! signatures, decryptions and certificate chains are genuine TEE outputs.
 //!
-//! Key blobs and certificate chains are held in a process-local session table
-//! keyed by alias (mirroring the behaviour of the legacy client-b agent, which
-//! also keeps sessions in memory).
+//! Key blobs and certificate chains are held in a process-local hot cache keyed by
+//! alias and persisted in a SQLite file (`/data/adb/ommega/sessions.db`, see
+//! [`session_db`]) so aliases survive a relay restart; the cache only keeps the
+//! recently used ones and the rest are read back from the database by alias.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
 use kmr_wire::{
     keymint::{
         Algorithm as KmAlgorithm, DateTime, Digest as KmDigest, EcCurve as KmEcCurve, KeyParam,
@@ -66,6 +62,7 @@ use crate::keymaster::relay_tee::{
 };
 
 use super::attest_proxy::{SYSTEM_KEYMINT_DEFAULT, SYSTEM_KEYMINT_STRONGBOX};
+use super::session_db;
 
 /// How a generated key is meant to be used.  Mirrors the `KeyPurpose`s the
 /// legacy agent used. Only distinguishes EC vs RSA (used for begin()-parameter
@@ -148,300 +145,232 @@ pub struct TeeSession {
     pub hal_service: &'static str,
 }
 
-/// Session persistence directory.  Key blobs minted by the real TEE are
-/// self-contained and remain usable after a relay restart (begin/finish works
-/// on the persisted blob), so we persist every generated session here to keep
-/// the A-side `isRemote` keys usable across relay restarts.
-fn sessions_dir() -> PathBuf {
-    PathBuf::from("/data/adb/ommega/sessions")
-}
-
-/// Session files 原本只进不出：A 端每要一个新 key（新 alias）就落一个文件，
-/// 长期在线的设备会一直堆 —— 真机上到过 19967 个 / 162 MB，启动全量加载要
-/// 12 秒。两个上限把它压住：超过 TTL 的删，超过数量上限的从最旧的开始删。
+/// 会话的落盘库（SQLite）与内存热缓存。
 ///
-/// 2026-10-03 修：清理按 mtime 排，但**取用时从不刷新 mtime**，于是「刚用过」和
-/// 「几小时没用」在它眼里一样旧。实测 2000 个上限配 6.7 个/分钟的新增速率，有效
-/// 保留窗只有 **4 小时 46 分**，正在用的 alias 照样被清，紧接着签名就报
-/// `no key for alias ... (call attest first)`（relay.log 里 6c9e18291df990e9、
-/// dc70e82803071c96 等就是这么死的）。现在按最后使用时间算：每次取用顺手碰一下
-/// mtime（有节流，见 `touch_session`），清的才是真正没人用的。
-const SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
-/// 上限抬到 20000。按实测 6.7 个/分钟的铸造速率，2000 只够 4 小时 46 分，而现役
-/// 别名是要长期活着的。20000 个约 162 MB（实测 8 KB/个），磁盘吃得下；启动也不再
-/// 全量加载（见 `load_all_sessions`），所以放大它没有启动代价。
-const SESSION_MAX_FILES: usize = 20000;
-/// 每这么多次保存做一轮清理（启动时另有一轮，见 `load_all_sessions`）。
-/// 运行时清理的节流间隔。清一遍是 read_dir + 对每个文件 stat，几百次系统
-/// 调用；丢在 keygen 的结果路径上会直接拖住正在等答复的 A 端，所以改成按时间
-/// 节流 —— 不管来多少任务，最多每 10 分钟清一次就够（磁盘上限本来就还有个
-/// 文件数封顶兜着）。
-const SESSION_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+/// Key blob 是自包含的，重启之后照样能 begin/finish，所以每个铸出来的会话都落一份
+/// 到 `/data/adb/ommega/sessions.db`（见 [`super::session_db`]），A 端的 `isRemote`
+/// 钥匙跨重启仍然有效。
+///
+/// 2026-10-03 那条教训还在：淘汰按「最后使用时间」算。之前按文件 mtime 排，可取用时
+/// 从不刷新 mtime，于是「刚用过」和「几小时没用」在它眼里一样旧 —— 2000 个上限配
+/// 6.7 个/分钟的新增速率，有效保留窗只有 4 小时 46 分，正在用的 alias 照样被清，
+/// 紧接着签名就报 `no key for alias ... (call attest first)`（relay.log 里
+/// 6c9e18291df990e9、dc70e82803071c96 就是这么死的）。现在每次取用顺手写一下
+/// `used_ms`（有节流），清的才是真正没人用的。
+///
+/// 内存里只留最近用过的这么多条，其余的在库里按 alias 单查：原来那份 map 是全量常驻
+/// 的（实测到过 19967 条 × 8 KB ≈ 160 MB），一台手机的常驻进程不该背这个。
+const SESSION_MEMORY_HOT: usize = 2_000;
 
-/// 该不该删这个会话文件。`rank_from_oldest` 是它在「按 mtime 从旧到新排好」的
-/// 序列里的位置，所以 `total - rank` 就是「含自己在内还剩多少个更新的」。
-/// 抽成函数是为了能测：`prune_sessions` 自己写死了设备上的路径，测不到。
-fn session_is_evictable(age_secs: u64, rank_from_oldest: usize, total: usize, cap: usize) -> bool {
-    age_secs > SESSION_TTL_SECS || total.saturating_sub(rank_from_oldest) > cap
+/// 距上次写 `used_ms` 多久才值得再写一次。取得比这更勤的会话不必每次都写：淘汰判的
+/// 是小时级的窗口，差几分钟无所谓，而一次 UPDATE 也顶不上白做。
+const SESSION_TOUCH_MIN_AGE_MS: i64 = 5 * 60 * 1000;
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|age| age.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// 距上次碰过多久才值得再碰一次。取得比这更勤的会话不必每次都写时间戳：淘汰判的
-/// 是小时级的窗口，mtime 差几分钟无所谓，而一次 utimensat 也顶不上白做。
-const SESSION_TOUCH_MIN_AGE: Duration = Duration::from_secs(300);
-
-/// 把会话的最后使用时间顶到当下 —— 这才是 LRU 淘汰的依据。
-/// 只动 mtime，不重写内容；时间戳比现在还晚（时钟被改过）也当旧的碰一下。
-fn touch_session(path: &Path) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    let fresh = meta
-        .modified()
-        .ok()
-        .and_then(|m| SystemTime::now().duration_since(m).ok())
-        .map(|age| age < SESSION_TOUCH_MIN_AGE)
-        .unwrap_or(false);
-    if fresh {
-        return;
-    }
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
-        let _ = file.set_modified(SystemTime::now());
-    }
+/// 内存热缓存：alias -> (最后一次使用的时间戳, 会话)。时间戳既给 LRU 用（满了丢最旧
+/// 的），也给「要不要写库」的节流用。
+fn sessions() -> &'static Mutex<HashMap<String, (i64, TeeSession)>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, (i64, TeeSession)>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 清理会话文件：先按 mtime（最后一次使用）从旧到新排序，超 TTL 的或超出数量上限
-/// 的都删掉，于是留下来的总是最近还在用的那一批。全程 best-effort —— 删不掉就当
-/// 没发生过，最坏结果只是这一轮没清成，不影响任何正在用的会话（它们在内存里）。
-fn prune_sessions() {
-    let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
-        return;
-    };
-    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(UNIX_EPOCH);
-        files.push((path, mtime));
-    }
-    let total = files.len();
-    if total == 0 {
-        return;
-    }
-    files.sort_by_key(|(_, t)| *t);
-    let now = SystemTime::now();
-    let mut removed = 0usize;
-    for (i, (path, mtime)) in files.iter().enumerate() {
-        // mtime 在未来（时钟被改过）就当刚用过，不删。
-        let age_secs = now.duration_since(*mtime).map(|d| d.as_secs()).unwrap_or(0);
-        if session_is_evictable(age_secs, i, total, SESSION_MAX_FILES)
-            && std::fs::remove_file(path).is_ok()
-        {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        log::info!(
-            "pruned {removed} session file(s), kept {} of {total}",
-            total - removed
-        );
-    }
-}
-
-/// Alias -> safe file stem.  Aliases can contain arbitrary UTF-8, so we keep
-/// the printable prefix and append a short hash to guarantee uniqueness.
-fn session_stem(alias: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    alias.hash(&mut hasher);
-    let digest = hasher.finish();
-    let safe: String = alias
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(48)
-        .collect();
-    format!("{safe}_{digest:016x}")
-}
-
-fn session_path(alias: &str) -> PathBuf {
-    sessions_dir().join(format!("{}.json", session_stem(alias)))
-}
-
-fn load_session_from_disk(alias: &str) -> Option<TeeSession> {
-    let path = session_path(alias);
-    let data = std::fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
-    let key_blob_b64 = value.get("key_blob")?.as_str()?;
-    let key_blob = B64.decode(key_blob_b64).ok()?;
-    let cert_chain = value
-        .get("cert_chain")?
-        .as_array()?
-        .iter()
-        .map(|c| B64.decode(c.as_str()?).ok())
-        .collect::<Option<Vec<Vec<u8>>>>()?;
-    let algorithm = match value.get("algorithm")?.as_str()? {
+fn session_from_stored(stored: session_db::Stored) -> Option<TeeSession> {
+    let algorithm = match stored.algorithm.as_str() {
         "EcP256" => KeyAlgorithm::EcP256,
         "Rsa2048" => KeyAlgorithm::Rsa2048,
-        _ => return None,
+        other => {
+            log::warn!("persisted session has unknown algorithm '{other}'; ignoring it");
+            return None;
+        }
     };
-    // `hal_service` was added later; old sessions without this field default
-    // to the TEE HAL (the only service that existed at the time).
-    let hal_service = match value.get("hal_service").and_then(|v| v.as_str()) {
-        Some("strongbox") => SYSTEM_KEYMINT_STRONGBOX,
-        _ => SYSTEM_KEYMINT_DEFAULT,
+    // `hal_service` 是后加的字段，缺值按 TEE 算：签名/解密必须落在铸它的那个 HAL 上，
+    // 猜错只会拿到 INVALID_KEY_BLOB。
+    let hal_service = if stored.hal_service == "strongbox" {
+        SYSTEM_KEYMINT_STRONGBOX
+    } else {
+        SYSTEM_KEYMINT_DEFAULT
     };
     Some(TeeSession {
-        key_blob,
-        cert_chain,
+        key_blob: stored.key_blob,
+        cert_chain: stored.cert_chain,
         algorithm,
         hal_service,
     })
 }
 
-fn save_session_to_disk(alias: &str, session: &TeeSession) {
-    let path = session_path(alias);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let algorithm = match session.algorithm {
-        KeyAlgorithm::EcP256 => "EcP256",
-        KeyAlgorithm::Rsa2048 => "Rsa2048",
-    };
-    let hal_service_label = if session.hal_service == SYSTEM_KEYMINT_STRONGBOX {
-        "strongbox"
-    } else {
-        "tee"
-    };
-    let value = serde_json::json!({
-        "alias": alias,
-        "key_blob": B64.encode(&session.key_blob),
-        "cert_chain": session.cert_chain.iter().map(|c| B64.encode(c)).collect::<Vec<_>>(),
-        "algorithm": algorithm,
-        "hal_service": hal_service_label,
-    });
-    let _ = std::fs::write(&path, serde_json::to_string(&value).unwrap_or_default());
-    {
-        static LAST_PRUNE: Mutex<Option<Instant>> = Mutex::new(None);
-        let mut guard = LAST_PRUNE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let due = match guard.as_ref() {
-            Some(last) => last.elapsed() >= SESSION_PRUNE_INTERVAL,
-            None => true,
-        };
-        if due {
-            *guard = Some(Instant::now());
+fn session_to_stored(session: &TeeSession) -> session_db::Stored {
+    session_db::Stored {
+        key_blob: session.key_blob.clone(),
+        cert_chain: session.cert_chain.clone(),
+        algorithm: match session.algorithm {
+            KeyAlgorithm::EcP256 => "EcP256",
+            KeyAlgorithm::Rsa2048 => "Rsa2048",
         }
-        drop(guard);
-        if due {
-            prune_sessions();
+        .to_string(),
+        hal_service: if session.hal_service == SYSTEM_KEYMINT_STRONGBOX {
+            "strongbox"
+        } else {
+            "tee"
         }
+        .to_string(),
     }
 }
 
-fn sessions() -> &'static Mutex<HashMap<String, TeeSession>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<String, TeeSession>>> = OnceLock::new();
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+/// 往内存里放一份；满了按「最后使用」丢掉最旧的那些。丢的只是内存副本，库里那条还
+/// 在，下次取用会从库里读回来。
+fn cache_put(alias: &str, session: TeeSession, used_ms: i64) {
+    let mut sessions = sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sessions.insert(alias.to_string(), (used_ms, session));
+    while sessions.len() > SESSION_MEMORY_HOT {
+        let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, (used_ms, _))| *used_ms)
+            .map(|(alias, _)| alias.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+}
+
+/// 命中内存就返回会话，并说明这次要不要把 `used_ms` 写回库里（距上次够久了才写）。
+/// 内存里的位置每次都刷新，写库那步才节流。
+fn cache_get(alias: &str) -> Option<(TeeSession, bool)> {
+    let now = now_ms();
+    let mut sessions = sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (used_ms, session) = sessions.get_mut(alias)?;
+    let should_touch = now.saturating_sub(*used_ms) >= SESSION_TOUCH_MIN_AGE_MS;
+    *used_ms = now;
+    Some((session.clone(), should_touch))
 }
 
 fn session_put(alias: &str, session: TeeSession) {
-    save_session_to_disk(alias, &session);
-    sessions()
-        .lock()
-        .unwrap()
-        .insert(alias.to_string(), session);
+    session_db::put(alias, &session_to_stored(&session));
+    cache_put(alias, session, now_ms());
+    session_db::prune_if_due();
 }
 
 fn session_get(alias: &str) -> Result<TeeSession> {
-    {
-        let sessions = sessions().lock().unwrap();
-        if let Some(session) = sessions.get(alias) {
-            let session = session.clone();
-            drop(sessions);
-            // 命中内存也得碰一下盘：淘汰看的是文件 mtime，不刷新的话它记的还是铸造
-            // 时间，长期在用的别名会跟闲置的一样被判成旧的。
-            touch_session(&session_path(alias));
-            return Ok(session);
+    if let Some((session, should_touch)) = cache_get(alias) {
+        if should_touch {
+            session_db::touch(alias);
         }
+        return Ok(session);
     }
-    // Miss: try to recover from disk (e.g. after a relay restart).  The TEE key
-    // blob is persisted, so the recovered session can still sign/decrypt.
-    if let Some(session) = load_session_from_disk(alias) {
-        touch_session(&session_path(alias));
-        sessions()
-            .lock()
-            .unwrap()
-            .insert(alias.to_string(), session.clone());
+    // Miss: 从库里捞（比如 relay 刚重启）。key blob 是持久化的，捞回来照样能
+    // 签名/解密。
+    if let Some(stored) = session_db::get(alias) {
+        let session = session_from_stored(stored)
+            .ok_or_else(|| anyhow!("persisted session for alias '{alias}' is unusable"))?;
+        session_db::touch(alias);
+        cache_put(alias, session.clone(), now_ms());
         log::info!("recovered persisted session for alias '{alias}'");
         return Ok(session);
     }
     Err(anyhow!("no key for alias '{alias}' (call attest first)"))
 }
 
-/// 启动时只清一轮盘，不再把所有会话读进内存。
+/// 启动时开库（库里空就先把旧目录导进来）并清一轮，不做全量加载。
 ///
-/// 原来这里是「清一遍 + 全量加载」：别名被哈希进文件名、反推不出来，所以只能逐个
-/// 读 JSON 才能把 alias 填进 map —— 实测 19967 个文件要 12 秒。但 `session_get`
-/// 本来就按别名直接算出路径去读盘（会打一条 `recovered persisted session for
-/// alias ...`），全量加载纯粹是热身，去掉之后一样能用、启动还快，上限也才敢放大
-/// （见 `SESSION_MAX_FILES`）。
+/// 原来这里是「清一遍 + 全量加载」：别名被哈希进文件名、反推不出来，所以只能逐个读
+/// JSON 才能把 alias 填进 map —— 实测 19967 个文件要 12 秒。现在按 alias 主键单查，
+/// 那份热身既没用又白占 160 MB 内存，一并去掉了。
 pub fn load_all_sessions() {
-    prune_sessions();
+    session_db::init();
 }
 
 #[cfg(test)]
-mod session_prune_tests {
+mod session_cache_tests {
     use super::*;
 
-    /// 最近碰过的会话必须活过数量上限 —— 这就是「按最后使用时间淘汰」这条规矩本身。
-    /// 修之前 mtime 记的是铸造时间，长期在用的别名跟翼置的一样旧。
-    #[test]
-    fn recently_touched_sessions_survive_the_cap() {
-        // 3 个文件、上限 2：只有最旧的那个出去。
-        assert!(session_is_evictable(60, 0, 3, 2), "最旧的那个该被清");
-        assert!(!session_is_evictable(60, 1, 3, 2));
-        assert!(!session_is_evictable(60, 2, 3, 2));
+    /// 这几个用例都动那个全局热缓存，串着跑。
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 超 TTL 的不管排第几都清，哪怕总数没到上限。
-    #[test]
-    fn sessions_past_the_ttl_go_even_under_the_cap() {
-        assert!(session_is_evictable(
-            SESSION_TTL_SECS + 1,
-            0,
-            1,
-            SESSION_MAX_FILES
-        ));
-        assert!(!session_is_evictable(
-            SESSION_TTL_SECS,
-            0,
-            1,
-            SESSION_MAX_FILES
-        ));
+    fn session(id: u8) -> TeeSession {
+        TeeSession {
+            key_blob: vec![id],
+            cert_chain: vec![vec![id, id]],
+            algorithm: KeyAlgorithm::EcP256,
+            hal_service: SYSTEM_KEYMINT_DEFAULT,
+        }
     }
 
-    /// 上限从 2000 抬到 20000 到底救回多少：拿「三万个别名、其中最后用过的五千个」
-    /// 当场景，老上限会把这五千个活着的清掉三千，新上限一个不动。
+    /// 内存只留最近用过的那些：塞爆之后最旧的被换出去，最新的还在，条数不多不少。
     #[test]
-    fn a_larger_cap_stops_evicting_live_sessions() {
-        let total = 30_000usize;
-        let live_from = 25_000; // 排在最新那一头的 5000 个
-        let live_evicted = |cap: usize| {
-            (live_from..total)
-                .filter(|rank| session_is_evictable(30, *rank, total, cap))
-                .count()
+    fn hot_cache_keeps_the_most_recently_used() {
+        let _guard = exclusive();
+        let cache = sessions();
+        cache.lock().unwrap().clear();
+        for id in 0..SESSION_MEMORY_HOT {
+            cache_put(&format!("k{id}"), session(id as u8), id as i64);
+        }
+        assert_eq!(cache.lock().unwrap().len(), SESSION_MEMORY_HOT);
+        cache_put("newest", session(200), 10_000_000);
+        let sessions = cache.lock().unwrap();
+        assert_eq!(sessions.len(), SESSION_MEMORY_HOT, "多出来的只能是换出去的");
+        assert!(sessions.contains_key("newest"));
+        assert!(!sessions.contains_key("k0"), "最久没用过的那个被换出去");
+    }
+
+    /// 命中内存时位置刷新、写库节流：刚用过的不用再写，隔够久了才写一次。
+    #[test]
+    fn cache_hits_refresh_recency_but_throttle_the_db_write() {
+        let _guard = exclusive();
+        let cache = sessions();
+        cache.lock().unwrap().clear();
+        cache_put("alias", session(1), now_ms());
+        let (hit, should_touch) = cache_get("alias").expect("刚放进去的必须在");
+        assert_eq!(hit.key_blob, vec![1]);
+        assert!(!should_touch, "刚写过就不用再写一遍");
+        assert!(cache_get("does-not-exist").is_none());
+        cache_put("alias", session(1), now_ms() - SESSION_TOUCH_MIN_AGE_MS - 1);
+        assert!(cache_get("alias").unwrap().1, "隔够久了就该写一次");
+    }
+
+    /// 存进库再取回来，字段一个不差（含枚举 <-> 字符串的来回）。
+    #[test]
+    fn stored_round_trip_keeps_every_field() {
+        let _guard = exclusive();
+        let original = TeeSession {
+            key_blob: vec![9; 128],
+            cert_chain: vec![vec![1; 700], vec![2; 4]],
+            algorithm: KeyAlgorithm::Rsa2048,
+            hal_service: SYSTEM_KEYMINT_STRONGBOX,
         };
-        assert_eq!(live_evicted(2_000), 3_000, "老上限会把活着的清掉三千");
-        assert_eq!(live_evicted(SESSION_MAX_FILES), 0, "新上限一个都不清");
+        let stored = session_to_stored(&original);
+        assert_eq!(stored.algorithm, "Rsa2048");
+        assert_eq!(stored.hal_service, "strongbox");
+        let back = session_from_stored(stored).expect("自己写进去的算法必须认得");
+        assert_eq!(back.key_blob, original.key_blob);
+        assert_eq!(back.cert_chain, original.cert_chain);
+        assert_eq!(back.algorithm, KeyAlgorithm::Rsa2048);
+        assert_eq!(back.hal_service, SYSTEM_KEYMINT_STRONGBOX);
+    }
+
+    /// 库里存了个不认识的算法就别当会话用 —— 拿它去签名只会错得更远。
+    #[test]
+    fn unknown_algorithm_is_rejected() {
+        let _guard = exclusive();
+        let stored = session_db::Stored {
+            key_blob: vec![1],
+            cert_chain: vec![vec![1]],
+            algorithm: "DsA1024".to_string(),
+            hal_service: "tee".to_string(),
+        };
+        assert!(session_from_stored(stored).is_none());
     }
 }
 
@@ -566,7 +495,7 @@ fn mint_attest_key_on(
     // certificate chain must not be forwarded as a successful attestation:
     // sending `cert_chain: []` means the operator cannot tell which side dropped
     // the chain, and the empty session would also be persisted to
-    // /data/adb/ommega/sessions. Fail loudly instead: the relay server treats an
+    // /data/adb/ommega/sessions.db. Fail loudly instead: the relay server treats an
     // error exactly like an empty chain (next layer / StrongBox demotion), so
     // behaviour is unchanged.
     if cert_chain.is_empty() {
@@ -1032,6 +961,7 @@ mod alias_flight_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct Store {
