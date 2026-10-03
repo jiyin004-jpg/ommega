@@ -196,9 +196,9 @@ fn now_millis() -> i64 {
 
 /// 一台"看起来像真机"的设备号：`09000000` + 12 字节十六进制。
 ///
-/// daemon 跟服务端要来的那个真机 cpu_id 优先（见 [`cpu_id`]）；没学到才按本机
-/// 序列号派生，同一台机器每次都一样（换号 App 会当成换了设备，得重走一遍建 key
-/// 流程），不同机器不一样 —— 这才叫设备身份。
+/// 只在测试里用（对照「当前该报的真机 cpu_id」）；生产代码走 [`cpu_id_for`]，因为那还
+/// 得分探测机 / 真实应用两份。
+#[cfg(test)]
 pub(crate) fn device_id() -> String {
     cpu_id()
 }
@@ -214,6 +214,12 @@ struct CpuIdCache {
 }
 
 static CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
+static PROBE_CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
+
+/// 探测别名进过的 uid。真实应用的 uid 是每台机器安装时分下来的，硬编码不得，只能
+/// 「看见过就记住」—— 跟服务端 `soter_probe` 里那个槽位记忆一个口径。
+const PROBE_UID_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+static PROBE_UIDS: Mutex<Vec<(i32, std::time::Instant)>> = Mutex::new(Vec::new());
 
 /// 这台机器该报的 cpu_id：daemon 学来的真机值 > 按本机序列号派生的。
 ///
@@ -221,42 +227,122 @@ static CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
 /// 造一个号、真机又是第三个，同一个 App 在不同层上就成了不同设备 —— 微信会重走一
 /// 遍开通，检测器直接报「两次 cpuid 不一致」。
 fn cpu_id() -> String {
-    let Ok(mut slot) = CPU_ID.lock() else {
+    cached_id(
+        &CPU_ID,
+        kmr_common::soter_relay::parse_cpu_id,
+        &kmr_common::soter_relay::CPU_ID_PATHS,
+        "cpu_id",
+    )
+}
+
+/// 探测机（春秋 / 鸭子）那套该报的 cpu_id：daemon 按设备名算出来的那份（跟服务端
+/// `builtin` 层同一个值）> 按本机序列号派生的。
+///
+/// 跟真机那份分着用：探测流量本来就不该看到被中继那台机器的身份（那串号是公开的
+/// 采样值，检测器直接认得出来）。而同一轮探测的 ASK / AuthKey、以及「远程不通退回本地
+/// 自签」那条路用的是**同一个**值，不会自己跟自己打架。
+fn probe_cpu_id() -> String {
+    cached_id(
+        &PROBE_CPU_ID,
+        kmr_common::soter_relay::parse_probe_cpu_id,
+        &kmr_common::soter_relay::PROBE_CPU_ID_PATHS,
+        "probe cpu_id",
+    )
+}
+
+/// 这笔调用（uid + 别名）该报哪个号。
+fn cpu_id_for(uid: Option<i32>, alias: Option<&str>) -> String {
+    if is_probe_caller(uid, alias) {
+        probe_cpu_id()
+    } else {
+        cpu_id()
+    }
+}
+
+/// 每笔拦到的 HAL 调用都过一下这里：带探测别名的记下 uid，好让后面不带别名的 op
+/// （ASK 那几个）也跟上；反过来，见过真应用别名的 uid 就不再当探测机。
+pub(crate) fn note_caller(uid: Option<i32>, alias: Option<&str>) {
+    let Some(uid) = uid else {
+        return;
+    };
+    let Ok(mut guard) = PROBE_UIDS.lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    guard.retain(|(_, seen)| now.duration_since(*seen) < PROBE_UID_TTL);
+    if kmr_common::soter_relay::is_probe_alias(alias) {
+        match guard.iter_mut().find(|(known, _)| *known == uid) {
+            Some(entry) => entry.1 = now,
+            None => guard.push((uid, now)),
+        }
+    } else if alias.is_some() {
+        guard.retain(|(known, _)| *known != uid);
+    }
+}
+
+/// 这个调用是不是探测机的。别名前缀（探测机自己起的名字）优先，其次是记住的 uid。
+fn is_probe_caller(uid: Option<i32>, alias: Option<&str>) -> bool {
+    if kmr_common::soter_relay::is_probe_alias(alias) {
+        return true;
+    }
+    let Some(uid) = uid else {
+        return false;
+    };
+    let Ok(guard) = PROBE_UIDS.lock() else {
+        return false;
+    };
+    guard
+        .iter()
+        .any(|(known, seen)| *known == uid && seen.elapsed() < PROBE_UID_TTL)
+}
+
+/// 两份号走同一段缓存：新鲜就用缓存，过期或者空就重新看一眼文件，读不到退回本机派生值。
+fn cached_id(
+    slot: &Mutex<Option<CpuIdCache>>,
+    parse: fn(&str) -> Option<String>,
+    paths: &[&str],
+    label: &str,
+) -> String {
+    let Ok(mut guard) = slot.lock() else {
         return device_info().derived_cpu_id.clone();
     };
-    if let Some(cached) = slot.as_ref() {
+    if let Some(cached) = guard.as_ref() {
         if cached.read_at.elapsed() < CPU_ID_TTL {
             return cached.value.clone();
         }
     }
-    let previous = slot.as_ref().map(|cached| cached.value.clone());
-    let (learned, origin) = load_cpu_id();
+    let previous = guard.as_ref().map(|cached| cached.value.clone());
+    let (learned, origin) = load_cpu_id(paths, parse);
     let value = learned.unwrap_or_else(|| device_info().derived_cpu_id.clone());
     if previous.as_deref() != Some(value.as_str()) {
         log::info!(
-            "soter local cpu_id {} -> {value} ({origin})",
+            "soter local {label} {} -> {value} ({origin})",
             previous.as_deref().unwrap_or("<unset>")
         );
     }
-    *slot = Some(CpuIdCache {
+    *guard = Some(CpuIdCache {
         value: value.clone(),
         read_at: std::time::Instant::now(),
     });
     value
 }
 
-/// 找一份学来的 cpu_id：环境变量 > 两个候选文件。找不到返回 `(None, "derived")`，
+/// 找一份 daemon 摆好的号：环境变量 > 两个候选文件。找不到返回 `(None, "derived")`，
 /// 调用方再用本机派生值兜底。
-fn load_cpu_id() -> (Option<String>, String) {
+fn load_cpu_id(paths: &[&str], parse: fn(&str) -> Option<String>) -> (Option<String>, String) {
     let env = std::env::var_os(kmr_common::soter_relay::CPU_ID_ENV)
         .map(|raw| raw.to_string_lossy().into_owned());
-    load_cpu_id_from(&kmr_common::soter_relay::CPU_ID_PATHS, env)
+    load_cpu_id_from(paths, env, parse)
 }
 
 /// `load_cpu_id` 里跟「从哪读」无关的那半（测试要拿临时文件跑，不进进程环境）。
-fn load_cpu_id_from(paths: &[&str], env: Option<String>) -> (Option<String>, String) {
+fn load_cpu_id_from(
+    paths: &[&str],
+    env: Option<String>,
+    parse: fn(&str) -> Option<String>,
+) -> (Option<String>, String) {
     if let Some(raw) = env {
-        match kmr_common::soter_relay::parse_cpu_id(raw.trim()) {
+        match parse(raw.trim()) {
             Some(id) => return (Some(id), "env".to_string()),
             None => log::warn!(
                 "soter local {} is not a usable cpu_id; ignoring it",
@@ -268,7 +354,7 @@ fn load_cpu_id_from(paths: &[&str], env: Option<String>) -> (Option<String>, Str
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
-        match kmr_common::soter_relay::parse_cpu_id(&text) {
+        match parse(&text) {
             Some(id) => return (Some(id), format!("file {path}")),
             // 文件在那儿但里面没有合形状的值：别当没事，也别拿它顶，继续往下找。
             None => log::warn!("soter local cpu_id at {path} has no usable value; ignoring it"),
@@ -449,12 +535,14 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
         return None;
     }
     let state = state()?;
+    // 这笔该报哪个号：探测机用探测那份，真实应用用真机那份（走 B 的那条路不在我们手里）。
+    let reported_id = cpu_id_for(call.uid, call.alias.as_deref());
     match call.code {
         // exportAskPublicKey(uid) —— ASK 的自描述，拿 ASK 自己签（本地 ASK 兼 ATTK）
         1 => {
             let uid = call.uid?;
             let counter = bump_counter(state, uid);
-            let document = ask_json(&state.ask, uid, counter).ok()?;
+            let document = ask_json(&state.ask, uid, counter, &reported_id).ok()?;
             let signature = state.ask.sign(&document)?;
             Some(Answer::Buffer {
                 code: OK,
@@ -468,7 +556,7 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
             match auth_key(state, uid, alias) {
                 Some(key) => {
                     let counter = bump_counter(state, uid);
-                    let document = auth_json(&key, uid, counter);
+                    let document = auth_json(&key, uid, counter, &reported_id);
                     let signature = state.ask.sign(&document)?;
                     Some(Answer::Buffer {
                         code: OK,
@@ -490,7 +578,7 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
             match found {
                 Some((s, key)) => {
                     let counter = bump_counter(state, s.uid);
-                    let document = sign_json(s.uid, &s.raw, counter);
+                    let document = sign_json(s.uid, &s.raw, counter, &reported_id);
                     let signature = key.sign(&document)?;
                     Some(Answer::Buffer {
                         code: OK,
@@ -523,7 +611,7 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
         // getDeviceId()
         8 => Some(Answer::Buffer {
             code: OK,
-            data: Some(device_id().into_bytes()),
+            data: Some(reported_id.clone().into_bytes()),
         }),
         // hasAskAlready(uid) —— 我们这把一直"有"。
         9 => Some(Answer::Code(if call.uid.is_some() {
@@ -618,11 +706,11 @@ fn envelope(document: &[u8], signature: &[u8]) -> Vec<u8> {
 }
 
 /// AuthKey 那份 JSON，`pub_key` 是 AuthKey 自己的公钥 —— **拿 ASK 私钥签**。
-fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
+fn auth_json(key: &Key, uid: i32, counter: u64, cpu_id: &str) -> Vec<u8> {
     format!(
         "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
         json_string(&key.pem),
-        cpu_id(),
+        cpu_id,
         counter,
         uid,
         SALT_LEN
@@ -632,7 +720,7 @@ fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
 
 /// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
 /// 都不能少 —— App 会把它们存下来当设备指纹。
-fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
+fn sign_json(uid: i32, raw: &str, counter: u64, cpu_id: &str) -> Vec<u8> {
     let info = device_info();
     format!(
         "{{\"raw\":{},\"fid\":{},\"counter\":{},\"tee_n\":{},\"tee_v\":{},\"fp_n\":{},\"fp_v\":{},\"cpu_id\":{},\"uid\":{},\"rsa_pss_saltlen\":{}}}",
@@ -643,7 +731,7 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
         json_string(&info.tee_v),
         json_string(&info.fp_n),
         json_string(&info.fp_v),
-        json_string(&cpu_id()),
+        json_string(cpu_id),
         json_string(&uid.to_string()),
         SALT_LEN
     )
@@ -651,11 +739,11 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
 }
 
 /// ASK 那份 JSON。键序照现场抓到的来，`uid` 是字符串别写成数字。
-fn ask_json(key: &Key, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
+fn ask_json(key: &Key, uid: i32, counter: u64, cpu_id: &str) -> Result<Vec<u8>, ()> {
     let document = format!(
         "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
         json_string(&key.pem),
-        cpu_id(),
+        cpu_id,
         counter,
         uid,
         SALT_LEN
@@ -1050,16 +1138,83 @@ mod tests {
     fn a_learned_cpu_id_wins_over_the_derived_one() {
         let learned = "090000005171734c42866bea148b21f5";
         let path = temp_pem("soter_cpu_id", &format!("soter_cpu_id: {learned}\n"));
-        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], None);
+        let parse = kmr_common::soter_relay::parse_cpu_id;
+        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], None, parse);
         assert_eq!(value.as_deref(), Some(learned));
         assert!(origin.starts_with("file "), "origin = {origin}");
         assert_ne!(learned, device_info().derived_cpu_id, "两份号必须不是一个");
 
         // 环境变量优先于文件。
         let other = "09000000aabbccddeeff001122334455";
-        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], Some(other.to_string()));
+        let (value, origin) =
+            load_cpu_id_from(&[path.to_str().unwrap()], Some(other.to_string()), parse);
         assert_eq!(value.as_deref(), Some(other));
         assert_eq!(origin, "env");
+    }
+
+    /// 探测机读的是探测那份（`soter_probe_cpu_id`），不会把真机那份当探测号。
+    #[test]
+    fn the_probe_copy_has_its_own_key() {
+        let real = temp_pem(
+            "soter_cpu_id",
+            "soter_cpu_id: 090000005171734c42866bea148b21f5\n",
+        );
+        let probe = temp_pem(
+            "soter_probe_cpu_id",
+            "soter_probe_cpu_id: 09000000ceeb5dc3c8e0216a5f74cfeb\n",
+        );
+        let parse_probe = kmr_common::soter_relay::parse_probe_cpu_id;
+        let (value, origin) = load_cpu_id_from(&[probe.to_str().unwrap()], None, parse_probe);
+        assert_eq!(value.as_deref(), Some("09000000ceeb5dc3c8e0216a5f74cfeb"));
+        assert!(origin.starts_with("file "), "origin = {origin}");
+        assert_eq!(
+            load_cpu_id_from(&[real.to_str().unwrap()], None, parse_probe).0,
+            None,
+            "真机那份里没有探测那个键"
+        );
+    }
+
+    /// 探测机判据：别名前缀直接算；不带别名的 op（ASK 类）靠记住的 uid 跟上；
+    /// 见过真应用别名之后就不再当探测机。
+    #[test]
+    fn the_probe_caller_is_recognised_by_alias_then_by_uid() {
+        // 别名前缀这一层是纯函数，不碰全局状态。
+        assert!(is_probe_caller(
+            None,
+            Some("duckdetector_soter_probe_1791039597073")
+        ));
+        assert!(is_probe_caller(
+            None,
+            Some("chunqiu_soter_probe_1791039390267")
+        ));
+        assert!(!is_probe_caller(
+            Some(10373),
+            Some("SoterAuthKeyV2_salt11d8ba34_scene1")
+        ));
+
+        // uid 记忆那一层拿一个别的测试不会碰的号来验。
+        let uid = 900_421;
+        assert!(
+            !is_probe_caller(Some(uid), None),
+            "还没见过，不该当成探测机"
+        );
+        note_caller(Some(uid), Some("duckdetector_soter_probe_1"));
+        assert!(is_probe_caller(Some(uid), None), "不带别名的 op 要跟上");
+        note_caller(Some(uid), Some("SoterAuthKeyV2_salt11d8ba34_scene1"));
+        assert!(!is_probe_caller(Some(uid), None), "见过真应用别名就撤销");
+    }
+
+    /// 文档里那个 `cpu_id` 用的是调用方给的那个（不是从全局现拿的）。
+    #[test]
+    fn the_document_builders_report_the_id_they_are_given() {
+        let key = Key::from_pem(&fresh_pem()).unwrap();
+        let probe = "09000000ceeb5dc3c8e0216a5f74cfeb";
+        let ask = String::from_utf8(ask_json(&key, 10323, 7, probe).unwrap()).unwrap();
+        assert!(ask.contains(&format!("\"cpu_id\":\"{probe}\"")), "{ask}");
+        let auth = String::from_utf8(auth_json(&key, 10323, 7, probe)).unwrap();
+        assert!(auth.contains(&format!("\"cpu_id\":\"{probe}\"")), "{auth}");
+        let sign = String::from_utf8(sign_json(10323, "0102", 7, probe)).unwrap();
+        assert!(sign.contains(&format!("\"cpu_id\":\"{probe}\"")), "{sign}");
     }
 
     /// 文件缺了、内容废了、环境变量写错了，一律当作没学到，回落本机派生值 ——
@@ -1074,7 +1229,8 @@ mod tests {
             vec![broken.to_str().unwrap()],
             vec![missing.to_str().unwrap(), broken.to_str().unwrap()],
         ] {
-            let (value, origin) = load_cpu_id_from(&paths, None);
+            let (value, origin) =
+                load_cpu_id_from(&paths, None, kmr_common::soter_relay::parse_cpu_id);
             assert_eq!(value, None, "{paths:?} 里没有合形状的值");
             assert_eq!(origin, "derived");
         }
@@ -1083,8 +1239,11 @@ mod tests {
             "soter_cpu_id_good",
             "soter_cpu_id: 09000000aabbccddeeff001122334455\n",
         );
-        let (value, _) =
-            load_cpu_id_from(&[good.to_str().unwrap()], Some("not-a-cpu-id".to_string()));
+        let (value, _) = load_cpu_id_from(
+            &[good.to_str().unwrap()],
+            Some("not-a-cpu-id".to_string()),
+            kmr_common::soter_relay::parse_cpu_id,
+        );
         assert_eq!(value.as_deref(), Some("09000000aabbccddeeff001122334455"));
     }
 

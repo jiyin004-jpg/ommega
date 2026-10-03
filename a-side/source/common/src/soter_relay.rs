@@ -104,6 +104,31 @@ pub const CPU_ID_WRITE_PATH: &str = "/data/misc/keystore/ommega/soter_cpu_id";
 /// 环境变量覆盖（测试、临时探针用）。
 pub const CPU_ID_ENV: &str = "OMMEGA_SOTER_CPU_ID";
 
+/// 探测机（春秋 / 鸭子）那套用的号：跟服务端 `builtin` 层同一个口径（按设备名派生）。
+///
+/// 跟真实应用那份分开是为了：探测流量本来就不该看到被中继那台机器的身份。两边都用
+/// 同一个号，同一轮探测的 ASK / AuthKey 和「远程不通时退回本地自签」那条路不会打架。
+pub const PROBE_CPU_ID_PATHS: [&str; 2] = [
+    "/data/misc/ommega/soter_probe_cpu_id",
+    "/data/misc/keystore/ommega/soter_probe_cpu_id",
+];
+
+/// daemon 写的那一份（app 域那份由启动器镜像过去）。
+pub const PROBE_CPU_ID_WRITE_PATH: &str = "/data/misc/keystore/ommega/soter_probe_cpu_id";
+
+/// 探测机的别名前缀，跟服务端 `soter_probe` 和 daemon 那份一个口径。
+pub const PROBE_ALIAS_PREFIXES: [&str; 2] = ["chunqiu_soter_probe_", "duckdetector_soter_probe_"];
+
+/// 这个别名是不是探测机的。
+pub fn is_probe_alias(alias: Option<&str>) -> bool {
+    let Some(alias) = alias else {
+        return false;
+    };
+    PROBE_ALIAS_PREFIXES
+        .iter()
+        .any(|prefix| alias.starts_with(prefix))
+}
+
 /// 真机 cpu_id 的形状：32 个十六进制字符。
 ///
 /// 不卡 `09000000` 前缀：换个代次或者换个 TEE 实现的号头不一样，那时这个判断会
@@ -113,18 +138,26 @@ pub fn is_cpu_id(text: &str) -> bool {
 }
 
 /// 从副本文件的内容里抠出 cpu_id。
-///
-/// 认 `soter_cpu_id: <值>` 这种扁平写法（跟 `log_flag` 一个格式），也认整个文件
-/// 就一行光秃秃的值；别的键、注释、空行都跳过。抠不出合法值就返回 `None`，调用方
-/// 自己决定用什么兜底 —— 这里绝不猜。
 pub fn parse_cpu_id(text: &str) -> Option<String> {
+    parse_keyed_cpu_id(text, "soter_cpu_id")
+}
+
+/// 从副本文件的内容里抠出探测机那份 cpu_id。
+pub fn parse_probe_cpu_id(text: &str) -> Option<String> {
+    parse_keyed_cpu_id(text, "soter_probe_cpu_id")
+}
+
+/// 认 `<键>: <值>` 这种扁平写法（跟 `log_flag` 一个格式），也认整个文件就一行光秃秃
+/// 的值；别的键、注释、空行都跳过。抠不出合法值就返回 `None`，调用方自己决定用什么
+/// 兜底 —— 这里绝不猜。
+fn parse_keyed_cpu_id(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let value = match line.split_once(':') {
-            Some((key, value)) if key.trim() == "soter_cpu_id" => value.trim(),
+            Some((found, value)) if found.trim() == key => value.trim(),
             // 有冒号但不是这个键：别把别的配置项的值当成设备号。
             Some(_) => continue,
             None => line,
@@ -264,6 +297,37 @@ mod tests {
         assert_eq!(parse_cpu_id("soter_cpu_id: 09000000\n"), None);
         assert_eq!(parse_cpu_id("log_flag: 1\n"), None);
         assert_eq!(parse_cpu_id(""), None);
+    }
+
+    /// 两份副本各认自己的键：探测那份不能把真机那份读进来，反之亦然。
+    #[test]
+    fn the_two_copies_keep_their_own_keys_apart() {
+        let real = "soter_cpu_id: 090000005171734c42866bea148b21f5\n";
+        let probe = "soter_probe_cpu_id: 09000000ceeb5dc3c8e0216a5f74cfeb\n";
+        assert_eq!(
+            parse_cpu_id(probe),
+            None,
+            "键不一样（`soter_probe_cpu_id`），真机那份不能把它认进来"
+        );
+        assert_eq!(
+            parse_probe_cpu_id(probe).as_deref(),
+            Some("09000000ceeb5dc3c8e0216a5f74cfeb")
+        );
+        assert_eq!(parse_probe_cpu_id(real), None);
+    }
+
+    /// 探测机判据只看别名前缀（服务端 / daemon / payload 三处同一个口径）。
+    #[test]
+    fn only_the_probe_prefixes_count_as_a_probe() {
+        assert!(is_probe_alias(Some(
+            "duckdetector_soter_probe_1791039597073"
+        )));
+        assert!(is_probe_alias(Some("chunqiu_soter_probe_1791039390267")));
+        assert!(!is_probe_alias(Some("SoterAuthKeyV2_salt11d8ba34_scene1")));
+        assert!(!is_probe_alias(Some("")));
+        assert!(!is_probe_alias(None));
+        // 前缀得在开头：名字中间出现不算。
+        assert!(!is_probe_alias(Some("x_duckdetector_soter_probe_1")));
     }
 
     fn round_trip(outcome: Outcome) {

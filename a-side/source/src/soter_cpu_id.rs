@@ -49,6 +49,10 @@ pub fn start() {
         return;
     }
     std::thread::spawn(|| loop {
+        // 探测机那份是按设备名算出来的，不用等 B 端，开机就先摆好。
+        if let Err(error) = write_probe_mirror() {
+            log::debug!("soter probe cpu_id not written yet: {error:#}");
+        }
         let stale = match LEARNED.lock() {
             Ok(guard) => guard
                 .as_ref()
@@ -138,6 +142,22 @@ fn learn() -> Result<()> {
     Ok(())
 }
 
+/// 探测机（春秋 / 鸭子）那套该报的号：按设备名派生，跟服务端 `builtin` 层
+/// （`soter_mint::virtual_device_id`）同一个值。
+///
+/// 为什么要有一份单独的：探测流量不该看到被中继那台机器的身份（那串号是采样值，
+/// 探测器认得出来）；但同一轮探测的 ASK / AuthKey、以及「远程不通退回本地自签」那条路
+/// 又必须报同一个号，所以两边都用这个算得出来的号。
+fn write_probe_mirror() -> Result<()> {
+    let device_id = RemoteRelay::device_id()?;
+    let value = virtual_id_for(&device_id);
+    write_mirror_to(
+        kmr_common::soter_relay::PROBE_CPU_ID_WRITE_PATH,
+        "soter_probe_cpu_id",
+        &value,
+    )
+}
+
 fn fetch_device_id() -> Result<String> {
     if !remote_enabled() {
         return Err(anyhow!("远程没开，先不学"));
@@ -205,14 +225,24 @@ fn device_id_from_reply(reply: &Value) -> Option<String> {
 }
 
 /// 写 daemon 自己那份副本：先写临时文件再 rename，读的一方（payload 每 30 秒看一眼，
-/// 启动器每 5 秒镜像一次）永远读不到半截。
+/// 启动器每 5 秒镜像一次）永远读不到半截。内容没变就不动文件。
 fn write_mirror(value: &str) -> Result<()> {
+    write_mirror_to(
+        kmr_common::soter_relay::CPU_ID_WRITE_PATH,
+        "soter_cpu_id",
+        value,
+    )
+}
+
+fn write_mirror_to(path: &str, key: &str, value: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    let path = kmr_common::soter_relay::CPU_ID_WRITE_PATH;
+    let body = format!("{key}: {value}\n");
+    if std::fs::read_to_string(path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
     let tmp = format!("{path}.tmp");
-    let body = format!("soter_cpu_id: {value}\n");
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(body.as_bytes())?;
     file.sync_all()?;
@@ -300,6 +330,41 @@ mod tests {
             "09000000ceeb5dc3c8e0216a5f74cfeb",
             None
         ));
+    }
+
+    /// 写副本：内容没变不重写，两个键各写各的。
+    #[test]
+    fn writing_a_mirror_is_idempotent_and_keyed() {
+        let dir = std::env::temp_dir().join(format!("ommega-mirror-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("soter_probe_cpu_id");
+        let path = path.to_str().unwrap();
+        let value = "09000000ceeb5dc3c8e0216a5f74cfeb";
+        write_mirror_to(path, "soter_probe_cpu_id", value).unwrap();
+        let body = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            body,
+            "soter_probe_cpu_id: 09000000ceeb5dc3c8e0216a5f74cfeb\n"
+        );
+        assert_eq!(
+            kmr_common::soter_relay::parse_probe_cpu_id(&body).as_deref(),
+            Some(value)
+        );
+        // 第二次写同样内容：文件不该被重写（不然启动器每轮都会镜像一遍）。
+        let first = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_mirror_to(path, "soter_probe_cpu_id", value).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), first);
+        // 换值就重写。
+        write_mirror_to(
+            path,
+            "soter_probe_cpu_id",
+            "090000005171734c42866bea148b21f5",
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("5171734c42866bea148b21f5"));
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
 
 /// 问 daemon 这笔该怎么答。问不到一律按本地兜底处理。
 fn resolve(call: &SoterCall) -> Outcome {
+    // 顺手记一下「这个 uid 是探测机」：探测机不带别名的那几个 op（ASK 类）靠它认出来。
+    soter_local::note_caller(call.uid, call.alias.as_deref());
     let Some(request) = request(call) else {
         // 号码不在转发表里（空号、app 侧那套号码）：老规矩，本地能答就本地答。
         return Outcome::Local;

@@ -29,6 +29,8 @@ SOTER_ASK_DST=/data/misc/ommega/soter_ask.pem
 # daemon 学到的真机 cpu_id：它自己那份写在 keystore 域（它跑在 keystore uid 里，别处
 # 写不动），这里抄到 app 域给宿主里那份 payload 读。内容就一行 `soter_cpu_id: <32 hex>`。
 SOTER_CPU_ID_DST=/data/misc/ommega/soter_cpu_id
+# 探测机（春秋 / 鸭子）那套用的号：daemon 按设备名算出来的，跟服务端内置层同一个值。
+SOTER_PROBE_CPU_ID_DST=/data/misc/ommega/soter_probe_cpu_id
 SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
 
@@ -237,22 +239,31 @@ sync_soter_ask() {
 #
 # 不需要踢 SOTER 宿主：payload 每 30 秒看一眼这个文件，换了号下一次调用就跟上。
 sync_soter_cpu_id() {
-  src=$(dirname "$CONF_PATH")/soter_cpu_id
+  sync_cpu_id_file "$(dirname "$CONF_PATH")/soter_cpu_id" "$SOTER_CPU_ID_DST" "device cpu_id"
+
+  # 探测机那份可能还没算出来（没配 device_id 之类），没有就什么也不做。
+  sync_cpu_id_file "$(dirname "$CONF_PATH")/soter_probe_cpu_id" "$SOTER_PROBE_CPU_ID_DST" "probe cpu_id"
+}
+
+# 把 keystore 域里的一个 cpu_id 副本抄到 app 域。两份（真机 / 探测机）走同一段逻辑。
+sync_cpu_id_file() {
+  src=$1
+  dst=$2
+  label=$3
   [ -f "$src" ] || return 0
 
-  if [ -f "$SOTER_CPU_ID_DST" ] \
-    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_CPU_ID_DST" 2>/dev/null)" ]; then
+  if [ -f "$dst" ] && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$dst" 2>/dev/null)" ]; then
     return 0
   fi
 
-  if cp -f "$src" "$SOTER_CPU_ID_DST" 2>/dev/null; then
+  if cp -f "$src" "$dst" 2>/dev/null; then
     # 644：这个号不是秘密（App 走 SOTER 本来就看得到），而宿主在红魔上是 uid 1000、
     # 一加上是 u0_a292(10292) —— 属主给 0、组给不到它头上，只有 other 那一档人人读得到。
-    chown 0:0 "$SOTER_CPU_ID_DST" 2>/dev/null
-    chmod 0644 "$SOTER_CPU_ID_DST" 2>/dev/null
-    log "[injector-daemon] device cpu_id mirrored from $src"
+    chown 0:0 "$dst" 2>/dev/null
+    chmod 0644 "$dst" 2>/dev/null
+    log "[injector-daemon] $label mirrored from $src"
   else
-    log "[injector-daemon] failed to mirror $src to $SOTER_CPU_ID_DST"
+    log "[injector-daemon] failed to mirror $src to $dst"
   fi
 }
 
