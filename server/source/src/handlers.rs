@@ -1195,16 +1195,7 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     let uid_arg = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     let probe_alias_arg = body.get("alias").and_then(Value::as_str);
     if let Some(why) = crate::soter_probe::reason(&state.cfg, requested, uid_arg, probe_alias_arg) {
-        // 探测机这套用我们自己造的号作答，不把转发过来的 `cpu_id`（被中继那台真机的号）
-        // 带进文档：探测流量不该碰到真机身份，那个号探测器认得出来。
-        let probe_body = body_without_cpu_id(body);
-        let reply = run_layer_soter(
-            state,
-            "builtin",
-            probe_body.as_ref().unwrap_or(body),
-            requested,
-        )
-        .await;
+        let reply = run_layer_soter(state, "builtin", body, requested).await;
         if let Some(v) = reply.filter(|v| v.get("error").is_none()) {
             tracing::info!(
                 "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
@@ -1782,17 +1773,12 @@ fn consistent_soter_target(
 
 /// B 端设备层：只派给调用方已解析并校验过的设备。
 ///
-/// 递给后端（B 端 / `builtin` 层）的那份 SOTER 请求体：把只给服务端铸料看的字段摘掉，
-/// `None` = 原样发。
+/// 递给 B 端的那份 SOTER 请求体：把只给服务端看的字段摘掉，`None` = 原样发。
 ///
 /// 目前只有 `cpu_id` 一个。它是 A 端学来的**真机** cpu_id，用来让服务端那两层和 A 端
-/// 本地兜底跟真机报同一个号（见 `soter_mint::docs_cpu_id`）。两处要摘：
-///
-/// * 递给 B 端：B 那个号是它自己 TA 报的，我们既改不了也不用改，递过去只会多出一种说法；
-/// * 递给 `builtin` 层（探测机就地作答）：探测流量本来就不该碰到真机身份 —— 那个号
-///   是被中继那台机器的号，探测器一看到就能认出「背后是谁」。让 `builtin` 按设备名
-///   派生稳定号，同一轮的 ASK / AuthKey 也天然一致。
-fn body_without_cpu_id(body: &Value) -> Option<Value> {
+/// 本地兜底跟真机报同一个号（见 `soter_mint::docs_cpu_id`）。B 端那个号是它自己 TA 报的，
+/// 我们既改不了也不用改，递过去只会多出一种说法。
+fn device_soter_body(body: &Value) -> Option<Value> {
     let object = body.as_object()?;
     if !object.contains_key(crate::soter_mint::CPU_ID_FIELD) {
         return None;
@@ -1828,7 +1814,7 @@ async fn try_b_soter_layer(
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
         );
     }
-    let device_body = body_without_cpu_id(body);
+    let device_body = device_soter_body(body);
     let mut reply = enqueue_and_wait(
         state,
         "soter",
@@ -3110,25 +3096,5 @@ mod soter_slot_miss_tests {
             server_layer_missed_the_slot("keybox", "init_sign", &json!({ "op": "init_sign" })),
             None
         );
-    }
-
-    /// 递给后端时 `cpu_id` 要拿掉（B 端用不上；`builtin` 那边不能露出真机身份），
-    /// 其余字段一个别动。
-    #[test]
-    fn the_cpu_id_is_stripped_before_a_backend_gets_the_body() {
-        let with_id = json!({
-            "op": "export_ask_public_key",
-            "uid": 10490,
-            "cpu_id": "090000005171734c42866bea148b21f5"
-        });
-        let stripped = body_without_cpu_id(&with_id).expect("带 cpu_id 就得复制一份");
-        assert_eq!(stripped.get("cpu_id"), None);
-        assert_eq!(stripped["op"], json!("export_ask_public_key"));
-        assert_eq!(stripped["uid"], json!(10490));
-        // 原件不改（调用方还要拿它去 service 层铸料）。
-        assert_eq!(with_id["cpu_id"], json!("090000005171734c42866bea148b21f5"));
-        // 本来就没这个字段：返回 `None`，调用方原样发。
-        assert_eq!(body_without_cpu_id(&json!({"op": "probe"})), None);
-        assert_eq!(body_without_cpu_id(&json!("nope")), None);
     }
 }
