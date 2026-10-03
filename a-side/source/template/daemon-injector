@@ -259,6 +259,9 @@ sync_soter_cpu_id() {
 # 换 key 之后把 SOTER 宿主停掉：key 是进程启动时加载的，它下一次被 bind 起来
 # 的时候会重新加载。
 restart_soter_host() {
+  # pid 必须是局部的：它跟主循环那个 keystore2 的 pid 同名，不声明 local 就会把循环里的
+  # 目标冲成 SOTER 宿主的 pid（日志打错 pid，重试冷却也失效）。
+  local pid
   pid=$(soter_pid)
   [ -n "$pid" ] || return 0
   log "[injector-daemon] stopping $SOTER_PKG pid=$pid so the new soter ask takes effect"
@@ -282,6 +285,8 @@ start_soter_service() {
 }
 
 is_injected() {
+  # 同上：调用方会用 keystore2 的 pid / SOTER 的 pid 各叫一次，局部化才不会互相覆盖。
+  local pid maps
   pid=$1
   maps=/proc/$pid/maps
   [ -r "$maps" ] || return 1
@@ -311,6 +316,7 @@ is_injected() {
 }
 
 restart_keystore() {
+  local pid
   pid=$1
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     log "[injector-daemon] restart requested; stopping keystore2 pid=$pid"
