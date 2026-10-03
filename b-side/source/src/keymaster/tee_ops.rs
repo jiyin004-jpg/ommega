@@ -372,6 +372,89 @@ mod session_cache_tests {
         };
         assert!(session_from_stored(stored).is_none());
     }
+
+    /// 演练：拿「真的那份库」的副本，按别名把老钥匙取回来，再让真 TEE 用它签一次。
+    /// 走的正是重启后那条路：内存空 → 查库 → key blob → HAL。
+    ///
+    /// 在设备上跑（库指副本，旧目录指原地）：
+    ///   OMMEGA_SESSIONS_DB=/data/local/tmp/drill-copy.db \
+    ///   OMMEGA_SESSIONS_DIR=/data/adb/ommega/sessions \
+    ///   ./ommegaclient-b-<hash> --ignored --nocapture \
+    ///     'keymaster::tee_ops::session_cache_tests::drill_recover_keys_from_a_db_copy'
+    #[test]
+    #[ignore]
+    fn drill_recover_keys_from_a_db_copy() {
+        let _guard = exclusive();
+        sessions().lock().unwrap().clear();
+        session_db::init();
+        // 后面要真让 HAL 签一次，得先把 binder 的 ProcessState 起来
+        crate::init_binder();
+
+        // 文件名只是别名的变体（带 .json 后缀），真正的别名在 JSON 里，样本就随便抽 40 个
+        let dir = session_db::legacy_dir();
+        let mut aliases: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|it| it.is_file()).unwrap_or(false))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .take(40)
+            .collect();
+        aliases.sort();
+        assert!(!aliases.is_empty(), "{} 里没有样本", dir.display());
+
+        let digest = [7u8; 32];
+        let mut back = 0;
+        let mut signed = 0;
+        let mut missing = 0;
+        for entry in &aliases {
+            let text = std::fs::read_to_string(dir.join(entry)).expect("旧目录里那份读不到");
+            let (alias, legacy) =
+                session_db::parse_legacy_json(&text).expect("旧目录里那份解析不了");
+            // 内存刚清过，所以这一次必然是查库
+            let session = match session_get(&alias) {
+                Ok(session) => session,
+                Err(err) => {
+                    eprintln!("  {alias}: 取不回来：{err:#}");
+                    missing += 1;
+                    continue;
+                }
+            };
+            // 和旧目录里那份 JSON 对齐：迁移前后必须是同一把钥匙
+            assert_eq!(
+                session.key_blob, legacy.key_blob,
+                "{alias} 的 key blob 对不上"
+            );
+            assert_eq!(
+                session.cert_chain, legacy.cert_chain,
+                "{alias} 的证书链对不上"
+            );
+            back += 1;
+
+            let algorithm = match session.algorithm {
+                KeyAlgorithm::EcP256 => "SHA256withECDSA",
+                KeyAlgorithm::Rsa2048 => "SHA256withRSA",
+            };
+            match sign(&alias, &digest, algorithm) {
+                Ok(signature) => {
+                    signed += 1;
+                    eprintln!(
+                        "  {alias}: 库里捞回来 + 真 TEE 签名 {} 字节",
+                        signature.len()
+                    );
+                }
+                Err(err) => eprintln!("  {alias}: 捞回来了但签不了（多半是钥匙用途）：{err:#}"),
+            }
+        }
+        eprintln!(
+            "演练：样本 {} 个，从库里取回来且和旧文件逐字节一致 {} 个，取不回来 {} 个，真 TEE 签名成功 {} 个",
+            aliases.len(),
+            back,
+            missing,
+            signed
+        );
+        assert!(back > 0, "一把都没从库里取回来");
+        assert!(signed > 0, "取回来了但一把都没签成，这条链路不算验完");
+    }
 }
 
 // ---------------------------------------------------------------------------

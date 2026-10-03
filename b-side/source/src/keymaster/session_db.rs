@@ -348,7 +348,7 @@ fn import_legacy_dir(conn: &Connection, dir: &Path, now: i64) -> Result<usize> {
 /// 老版本那条 JSON：`{"alias":..., "key_blob":b64, "cert_chain":[b64...],
 /// "algorithm":"EcP256|Rsa2048", "hal_service":"tee|strongbox"}`。
 /// `hal_service` 是后加的，老记录没有，按 tee 算（当时的唯一取值）。
-fn parse_legacy_json(data: &str) -> Option<(String, Stored)> {
+pub(crate) fn parse_legacy_json(data: &str) -> Option<(String, Stored)> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
     let alias = value.get("alias")?.as_str()?.to_string();
     let key_blob = B64.decode(value.get("key_blob")?.as_str()?).ok()?;
