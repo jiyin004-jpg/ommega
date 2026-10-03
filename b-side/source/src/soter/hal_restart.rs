@@ -33,9 +33,10 @@
 //!
 //! 冷却用 `Instant`（单调钟，不含 suspend）就够 —— 它是防抖，不是精确调度。
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 连着几次算结构性故障。
 const FAILURE_LIMIT: u32 = 2;
@@ -94,19 +95,72 @@ const HAL_PROCESS_CANDIDATES: &[&str] = &[
 static FAILURES: Mutex<u32> = Mutex::new(0);
 static LAST_RESTART: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// TA 卡在 TEE 里的证据码：`258`（读 anti-rollback 计数器失败）。
+///
+/// 2026-10-03 在 PLC110 上挖到底了：Trustonic 的 `tlTeeSOTER`（TA 镜像
+/// `/odm/vendor/app/mcRegistry/070f0000000000000000000000000a0a.tlbin`）把 RPMB
+/// session 3 打开之后不放手 —— dmesg 里 `rpmb session 3 is already opened by
+/// 070f0000-...-a0a0` 449/449 全是它自己，`Open session failed crSession =
+/// 0xffffffff` 452 次，`EXPORT_PUB_KEY read counter failed (258)` 451 次。TA 从此
+/// 读不到自己的持久存储，对外就是一大片 `-5`（说存在却导不出来、也建不了）加上
+/// `258`。
+///
+/// 这一档上面所有手段都是无效的，两轮实测都验过：2026-10-02 重启 HAL 进程
+/// （pid 18055→27813→31557），2026-10-03 直接 kill SOTER HAL 服务（持有者在 TEE
+/// 里，叫它松手根本不听）。**只有重启整机能松开。**
+const TEE_WEDGE_CODE: i64 = 258;
+/// 攒到这么多才认「卡住了」。卡住时 15 分钟里就有 138 条 258，两次很容易到；
+/// 而健康设备上这个码不该出现。
+const WEDGE_LIMIT: u32 = 2;
+/// 两次自动重启之间至少隔这么久。
+const REBOOT_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
+/// 24 小时内最多自动重启几次。到顶就只上报（caps 里的 `soter_stuck`），不再动手
+/// —— 那是「重启也修不好」的最终态，不能变成无限重启循环。
+const REBOOT_MAX_PER_DAY: usize = 3;
+/// 开机后多久才允许自动重启。刚起来又卡的话，这就是防重启循环的第一道闸。
+const REBOOT_BOOT_GRACE: Duration = Duration::from_secs(15 * 60);
+
+static WEDGE_SIGNALS: Mutex<u32> = Mutex::new(0);
+static LAST_SELF_REBOOT: Mutex<Option<Instant>> = Mutex::new(None);
+/// 现在是「卡住了、而且我们没能把它重启掉」：对外报 `soter_stuck` 就是用这个。
+static WEDGE_UNRESOLVED: Mutex<bool> = Mutex::new(false);
+
+/// 自动重启的记账文件。**必须落盘**：重启会把内存清空，只有文件能跨重启记住
+/// 「今天已经重启过几次」，否则 24 小时上限形同虚设。
+fn reboot_log_path() -> PathBuf {
+    PathBuf::from("/data/adb/ommega/self-reboot.log")
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 一笔真活的结果。非 0 且不属于 `BENIGN_CODES` 的累加，够了就重启一次 HAL；
 /// TEE 会话 op 成功清零；其余一概不碰。
+///
+/// `258` 单独走一条路：它说明卡住的是 TEE 里那个 TA，重启用户态服务治不了，
+/// 得往上抬一级（重启整机，见 `try_self_reboot`）。
 pub fn note(op: &str, error_code: i64) {
+    if error_code == TEE_WEDGE_CODE {
+        let signals = {
+            let mut guard = lock(&WEDGE_SIGNALS);
+            *guard += 1;
+            *guard
+        };
+        if signals >= WEDGE_LIMIT {
+            *lock(&WEDGE_SIGNALS) = 0;
+            try_self_reboot(op, signals);
+        }
+        return;
+    }
     let count_before = *lock(&FAILURES);
     let since_restart = lock(&LAST_RESTART).map(|at| at.elapsed());
     let (count, verdict) = step(op, error_code, count_before, since_restart);
     *lock(&FAILURES) = count;
     match verdict {
-        Verdict::Reset | Verdict::Nothing => {}
+        // 真签出东西来 = 连存储一起好了：把「卡住」的牌子摘掉。
+        Verdict::Reset => *lock(&WEDGE_UNRESOLVED) = false,
+        Verdict::Nothing => {}
         Verdict::Cooling => log::warn!(
             "soter: 连续 {count} 次失败（op={op} code={error_code}），但距上次重启才 {:.0}s，先不动 HAL",
             since_restart.map(|d| d.as_secs_f64()).unwrap_or_default()
@@ -137,6 +191,158 @@ enum Verdict {
     Restart,
     /// 攒够了，但在冷却期里。
     Cooling,
+}
+
+/// 对外上报：这台现在是不是「TA 卡在 TEE 里、而且没能重启掉」。
+///
+/// 只有「卡住 + 现在动不了手」（次数到顶、开机宽限期里、或者重启命令失败）才为真
+/// —— 那正是操作员需要看见、需要手动接管的那个状态。
+pub fn tee_wedged() -> bool {
+    *lock(&WEDGE_UNRESOLVED)
+}
+
+/// 自动重启的最终判定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebootVerdict {
+    /// 该重启了。
+    Reboot,
+    /// 距上次重启还太近（`Instant` 只活在内存里，所以这条只管「没重启过」的会话）。
+    TooSoon,
+    /// 24 小时的上限用完了：只上报，不再动手。
+    DailyCap,
+    /// 开机还没多久：先不动手，免得变成重启循环。
+    Booting,
+}
+
+/// 纯判定，拆出来是为了能直接测（不碰设备、不抢 static）。
+fn reboot_verdict(already: usize, uptime: Duration, since_last: Option<Duration>) -> RebootVerdict {
+    if already >= REBOOT_MAX_PER_DAY {
+        return RebootVerdict::DailyCap;
+    }
+    if uptime < REBOOT_BOOT_GRACE {
+        return RebootVerdict::Booting;
+    }
+    match since_last {
+        Some(age) if age < REBOOT_COOLDOWN => RebootVerdict::TooSoon,
+        _ => RebootVerdict::Reboot,
+    }
+}
+
+/// TA 卡在 TEE 里时的最后一招：重启整机。
+///
+/// 刹车三道：开机宽限期（刚起来又卡就先不动）、6 小时间隔、24 小时最多 3 次。
+/// 任何一道拦住、或者重启命令没跑成，都把 `WEDGE_UNRESOLVED` 立起来对外上报
+/// —— 不吭声就 reboot 完了，操作员只会看到设备反复掉线却不知道为什么。
+fn try_self_reboot(op: &str, signals: u32) {
+    let uptime_secs = uptime().as_secs();
+    let already = reboots_last_day();
+    let since_last = lock(&LAST_SELF_REBOOT).map(|at| at.elapsed());
+    let verdict = reboot_verdict(already, Duration::from_secs(uptime_secs), since_last);
+    if verdict != RebootVerdict::Reboot {
+        *lock(&WEDGE_UNRESOLVED) = true;
+    }
+    match verdict {
+        RebootVerdict::Reboot => {
+            // 先记账再动手：`reboot` 一执行这台机器就下去了，`run()` 不一定回来得及。
+            // 反过来说，万一没重启成，也只是把一次假的算进今天的额度（宁可少重启，
+            // 不要多。）
+            record_self_reboot();
+            match reboot_device() {
+                Ok(what) => {
+                    *lock(&LAST_SELF_REBOOT) = Some(Instant::now());
+                    log::error!(
+                        "soter: TA 卡在 TEE 里（{signals} 笔 {TEE_WEDGE_CODE}，最后一笔 op={op}），\
+                         用户态救不回来，重启整机：{what}（今天第 {} 次）",
+                        already + 1
+                    );
+                }
+                Err(error) => {
+                    *lock(&WEDGE_UNRESOLVED) = true;
+                    log::error!(
+                        "soter: TA 卡在 TEE 里（{signals} 笔 {TEE_WEDGE_CODE}），\
+                         想重启整机但没成功：{error}"
+                    );
+                }
+            }
+        }
+        RebootVerdict::TooSoon => log::error!(
+            "soter: TA 又卡在 TEE 里了（{signals} 笔 {TEE_WEDGE_CODE}），\
+             但距上次自动重启才 {:.0}s，先不动手（已上报 soter_stuck）",
+            since_last.map(|d| d.as_secs_f64()).unwrap_or_default()
+        ),
+        RebootVerdict::DailyCap => log::error!(
+            "soter: TA 卡在 TEE 里（{signals} 笔 {TEE_WEDGE_CODE}），今天已经自动重启过 {already} 次，\
+             不再重启 —— 重启也修不好的话需要人工介入（已上报 soter_stuck）"
+        ),
+        RebootVerdict::Booting => log::error!(
+            "soter: 开机才 {uptime_secs}s 就见到 {TEE_WEDGE_CODE}（{signals} 笔，op={op}），\
+             不动手重启，免得进重启循环（已上报 soter_stuck）"
+        ),
+    }
+}
+
+/// 开机时长。读不到就回 0 —— 那样判定落在 `Booting`，宁可不重启。
+fn uptime() -> Duration {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .filter(|secs| secs.is_finite() && *secs >= 0.0)
+        .map(Duration::from_secs_f64)
+        .unwrap_or_default()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// 24 小时内记了几次自动重启。文件读不出来（第一次跑）就是 0。
+fn reboots_last_day() -> usize {
+    let now = unix_now();
+    std::fs::read_to_string(reboot_log_path())
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.trim().parse::<u64>().ok())
+                .filter(|at| now.saturating_sub(*at) <= 24 * 3600)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// 把这次自动重启写进记账文件（追加一行时间戳）。写不进去就罢了 —— 最坏只是上限
+/// 少拦一次。
+fn record_self_reboot() {
+    let path = reboot_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{}", unix_now());
+    }
+}
+
+/// 重启整机。Android 上 `reboot` 在 `/system/bin`，relay 是 init 拉起来的、PATH 不
+/// 一定全，所以两条都试。
+fn reboot_device() -> Result<String, String> {
+    let mut last_error = String::from("没有可用的 reboot 命令");
+    for cmd in ["/system/bin/reboot", "reboot"] {
+        match run(cmd, &[]) {
+            Ok(_) => return Ok(cmd.to_string()),
+            Err(error) => last_error = format!("{cmd}: {error}"),
+        }
+    }
+    Err(last_error)
 }
 
 /// 纯判定：给定「这次是哪个 op / 什么结果 / 已有计数 / 距上次重启多久」，
@@ -347,5 +553,54 @@ mod tests {
     fn the_service_name_list_starts_with_the_one_plc110_uses() {
         // PLC110 实测就是这个；顺序有意义（先试它，省一轮 getprop）。
         assert_eq!(SERVICE_CANDIDATES[0], "soter_hal");
+    }
+
+    /// `258` 是 TA 卡在 TEE 里的证据：`note()` 会在进 `step()` 之前把它拦下来
+    /// （去见 `try_self_reboot`）—— 那一档重启用户态 HAL 是无效的，两轮实测都验过。
+    /// 这里钉住两件事：码就是实测的那个，而且它绝不属于「正常业务答复」。
+    #[test]
+    fn the_tee_wedge_code_is_the_measured_one_and_never_benign() {
+        assert_eq!(
+            TEE_WEDGE_CODE, 258,
+            "0x102 read counter failed，PLC110 实测"
+        );
+        assert!(!BENIGN_CODES.contains(&TEE_WEDGE_CODE));
+        // 万一哪天拦截被删了，它至少会落到 HAL 重启那条路上，不会被当正常答复放过。
+        assert_eq!(
+            step("finish_sign", TEE_WEDGE_CODE, 1, None),
+            (2, Verdict::Restart)
+        );
+    }
+
+    /// 重启整机那三道刹车。
+    #[test]
+    fn the_self_reboot_ladder_guards_the_device() {
+        let warm = REBOOT_BOOT_GRACE + Duration::from_secs(1);
+        // 正常情况：开机够久、今天还没重启过、也没刚重启过 → 该动手。
+        assert_eq!(reboot_verdict(0, warm, None), RebootVerdict::Reboot);
+        // 刚开机就卡：不动手，免得进重启循环。
+        assert_eq!(
+            reboot_verdict(0, Duration::from_secs(60), None),
+            RebootVerdict::Booting
+        );
+        // 6 小时内重启过：不动手。
+        assert_eq!(
+            reboot_verdict(1, warm, Some(REBOOT_COOLDOWN - Duration::from_secs(1))),
+            RebootVerdict::TooSoon
+        );
+        assert_eq!(
+            reboot_verdict(1, warm, Some(REBOOT_COOLDOWN + Duration::from_secs(1))),
+            RebootVerdict::Reboot
+        );
+        // 到顶了：停手，只上报。上限优先于其它条件。
+        assert_eq!(
+            reboot_verdict(REBOOT_MAX_PER_DAY, warm, None),
+            RebootVerdict::DailyCap
+        );
+        assert_eq!(
+            reboot_verdict(99, Duration::from_secs(1), None),
+            RebootVerdict::DailyCap,
+            "上限该盖过开机宽限期"
+        );
     }
 }

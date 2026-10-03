@@ -113,6 +113,13 @@ pub struct DeviceEntry {
     /// （`soter_nosign`），签名类 op 不再派给它；`None` 是没上报（老版本 relay），
     /// 还能试。
     pub soter_nosign: Option<bool>,
+    /// 心跳里上报“TA 卡在 TEE 里了”（`soter_stuck`）：RPMB 会话被 TA 自己占死，
+    /// 它读不到自己的持久存储，导出/建料全回 `-5`，还会报 `258`。这是暂态，
+    /// 重启整机就能恢复（设备侧自己会先试）。跟 `soter_nosign` 那种「结构性做不到」
+    /// 分开记：它**不是**「这台不会做 SOTER」，只是「现在做不了」。
+    ///
+    /// 路由上只用来降优先级，不用来踢人（见 `resolve_soter_target`）。
+    pub soter_stuck: Option<bool>,
     /// 心跳里上报的 StrongBox 能力（有没有那个 HAL 实例）。只看展示，
     /// StrongBox 出证走的是 strongbox 模式那套逻辑。
     pub supports_strongbox: Option<bool>,
@@ -133,6 +140,14 @@ pub struct DeviceCaps {
     ///
     /// 老版本 relay 不会报这个名字 —— 那是“没说”，不是“做不到”，签名还能试。
     pub soter_nosign: Option<bool>,
+    /// 设备明说“TA 现在卡在 TEE 里”（`soter_stuck`）：RPMB 会话被 TA 自己占着，
+    /// 导出/建料一概回 `-5`。
+    ///
+    /// 跟 `soter = Some(false)`（压根没 HAL）、`soter_nosign`（结构上不签）都不同：
+    /// 这是**暂态**。所以它不进 `soter_relay_marks_unavailable` —— 那个名单的语义是
+    /// 「这层做不了」，会把槽位挪到服务端自签那两层，把 App 手里的真料换成假料。
+    /// 卡住只降优先级、并上报给操作员。
+    pub soter_stuck: Option<bool>,
     pub strongbox: Option<bool>,
 }
 
@@ -194,6 +209,7 @@ impl DeviceCaps {
                     // 出来），那是“还能试”，不是“不行”。
                     soter_sign: Some(has("soter_sign")),
                     soter_nosign: Some(has("soter_nosign")),
+                    soter_stuck: Some(has("soter_stuck")),
                     strongbox: Some(has("strongbox")),
                 }
             }
@@ -505,6 +521,7 @@ impl TaskStore {
                     known_supports_soter,
                     known_soter_sign,
                     known_soter_nosign,
+                    known_soter_stuck,
                     known_supports_strongbox,
                 ) = match inner.devices.get(device_id) {
                     Some(d) => (
@@ -515,9 +532,10 @@ impl TaskStore {
                         d.supports_soter,
                         d.soter_sign,
                         d.soter_nosign,
+                        d.soter_stuck,
                         d.supports_strongbox,
                     ),
-                    None => (None, None, None, 0, None, None, None, None),
+                    None => (None, None, None, 0, None, None, None, None, None),
                 };
                 let has_tee_verdict = known_boot.is_some() || known_tee_error.is_some();
                 inner.devices.insert(
@@ -535,6 +553,7 @@ impl TaskStore {
                         supports_soter: caps.soter.or(known_supports_soter),
                         soter_sign: caps.soter_sign.or(known_soter_sign),
                         soter_nosign: caps.soter_nosign.or(known_soter_nosign),
+                        soter_stuck: caps.soter_stuck.or(known_soter_stuck),
                         supports_strongbox: caps.strongbox.or(known_supports_strongbox),
                     },
                 );
@@ -1480,13 +1499,21 @@ impl TaskStore {
         }
         // 先把手上的设备快照出来（只取判路由要的字段），免得后面算负载时
         // 和 `load_balance_index` 的写操作撞借用。
-        let online: Vec<(String, Option<bool>)> = inner
+        let online: Vec<(String, Option<bool>, bool)> = inner
             .devices
             .values()
             .filter(|d| now.saturating_sub(d.last_seen_ms) < 120_000)
             // 签名 op 不能落到“明说签不了”的设备上：它接下去只会白跑一趟 -26。
             .filter(|d| !(needs_sign && d.soter_nosign == Some(true)))
-            .map(|d| (d.device_id.clone(), d.supports_soter))
+            .map(|d| {
+                (
+                    d.device_id.clone(),
+                    d.supports_soter,
+                    // 第三项：TA 卡在 TEE 里。只在负载均衡那段拿它降优先级，
+                    // 不在这里直接剔掉 —— 全卡住的时候它还得是候选。
+                    d.soter_stuck == Some(true),
+                )
+            })
             .collect();
         if online.is_empty() {
             return None;
@@ -1496,22 +1523,31 @@ impl TaskStore {
         // 负载口径跟认证那条路一致（近 60 s 的活动量 + 在跑的任务数）。
         let active_counts = Self::active_counts_locked(&inner);
         for tier in [Some(true), None] {
-            let mut candidates: Vec<(String, u64, usize)> = online
+            let mut candidates: Vec<(String, u64, usize, bool)> = online
                 .iter()
-                .filter(|(_, cap)| *cap == tier)
-                .map(|(id, _)| {
+                .filter(|(_, cap, _)| *cap == tier)
+                .map(|(id, _, stuck)| {
                     let events = Self::window_activity_locked(&inner, id);
                     let active = active_counts.get(id.as_str()).copied().unwrap_or(0);
-                    (id.clone(), events, active)
+                    (id.clone(), events, active, *stuck)
                 })
                 .collect();
             if candidates.is_empty() {
                 continue;
             }
-            candidates.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+            // 卡住的那台排到最后：只要这一档里还有一台是好的，就别把活交给它。
+            // 整档都卡住时它仍是候选 —— 宁可让真机自己回 `-5`，也不要因为「避卡」
+            // 就回退到服务端自签那两层（那会把 App 手里的真料换成假料，见
+            // `run_soter_task` 的层回退注释）。这一档的意义不是「不给活」，
+            // 只是「挑一台更合适的」。
+            candidates.sort_by(|a, b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
             let min = (candidates[0].1, candidates[0].2);
-            let tied: Vec<&(String, u64, usize)> =
-                candidates.iter().filter(|c| (c.1, c.2) == min).collect();
+            // 打平时只在同一个「卡没卡」档里打平，不能让一台卡住的挤进并列池。
+            let best_stuck = candidates[0].3;
+            let tied: Vec<&(String, u64, usize, bool)> = candidates
+                .iter()
+                .filter(|c| (c.1, c.2) == min && c.3 == best_stuck)
+                .collect();
             let chosen = if tied.len() > 1 {
                 let i = inner.load_balance_index % tied.len();
                 inner.load_balance_index = inner.load_balance_index.wrapping_add(1);
@@ -1548,6 +1584,70 @@ mod soter_substitute_tests {
             .get_mut(id)
             .unwrap()
             .last_seen_ms = TaskStore::now_ms().saturating_sub(120_001);
+    }
+
+    fn healthy_caps() -> DeviceCaps {
+        DeviceCaps {
+            soter: Some(true),
+            ..DeviceCaps::default()
+        }
+    }
+
+    fn stuck_caps() -> DeviceCaps {
+        DeviceCaps {
+            soter: Some(true),
+            soter_stuck: Some(true),
+            ..DeviceCaps::default()
+        }
+    }
+
+    /// 卡住的设备（TA 卡在 TEE 里，导出/建料全回 -5）：在「没点名」的负载均衡里
+    /// 排到最后，还有好设备就别把活给它。
+    ///
+    /// 但点名要它的时候照旧给它 —— 点名不换身份，让真机自己回 -5，别把请求支到
+    /// 别的 TEE（也就别支到自签那两层）。
+    #[tokio::test]
+    async fn a_stuck_device_is_a_last_resort_but_still_honours_a_direct_request() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        online(&store, "healthy", healthy_caps()).await;
+        online(&store, "stuck", stuck_caps()).await;
+
+        assert_eq!(
+            store.resolve_soter_target("stuck", false).await.as_deref(),
+            Some("stuck"),
+            "点名的那台就该是它"
+        );
+        // 两台都是刚上线、负载打平；没点名时必须落到好的那台（不是轮询到卡的那台）。
+        for _ in 0..3 {
+            assert_eq!(
+                store.resolve_soter_target("", false).await.as_deref(),
+                Some("healthy")
+            );
+        }
+        // 签名 op 同理。
+        assert_eq!(
+            store.resolve_soter_target("", true).await.as_deref(),
+            Some("healthy")
+        );
+    }
+
+    /// 只剩卡住的那台时还是得给它：返回 `None` 会让上层回退到服务端自签那两层，
+    /// 把 App 手里的真料换成假料 —— 那比「让真机自己回 -5」坏得多。
+    /// 清掉卡住标记（重启后 B 端心跳不再带这个名字）它当然也回到正常候选里。
+    #[tokio::test]
+    async fn a_stuck_device_still_serves_when_it_is_the_only_candidate() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        online(&store, "stuck", stuck_caps()).await;
+        assert_eq!(
+            store.resolve_soter_target("", false).await.as_deref(),
+            Some("stuck")
+        );
+        // 心跳改口（重启回来了）：标记得跟着下来，不能留着。
+        online(&store, "stuck", healthy_caps()).await;
+        assert_eq!(
+            store.resolve_soter_target("", false).await.as_deref(),
+            Some("stuck")
+        );
     }
 
     #[tokio::test]
@@ -1871,7 +1971,18 @@ mod selfcheck_tests {
         let mixed = DeviceCaps::parse(Some(" SOTER , fingerprint "));
         assert_eq!(mixed.soter, Some(true));
         assert_eq!(mixed.soter_nosign, Some(false));
+        assert_eq!(mixed.soter_stuck, Some(false));
         assert_eq!(mixed.strongbox, Some(false));
+
+        // `soter_stuck`（TA 卡在 TEE 里）单独一位：它是暂态（重启就能好），
+        // 不是「这台不会做 SOTER」，也不是「结构上签不了」。
+        let stuck = DeviceCaps::parse(Some("soter,soter_stuck"));
+        assert_eq!(stuck.soter, Some(true));
+        assert_eq!(stuck.soter_stuck, Some(true));
+        assert_eq!(stuck.soter_nosign, Some(false));
+        // 没上报这个名字的设备（包括卡住之前的老 relay）：不是卡住。
+        assert_eq!(DeviceCaps::default().soter_stuck, None);
+        assert_eq!(DeviceCaps::parse(Some("soter")).soter_stuck, Some(false));
 
         // `soter_nosign`（HAL 在、签名不行）跟 `soter` 各记各的。
         let nosign = DeviceCaps::parse(Some("soter,soter_nosign"));
@@ -1898,6 +2009,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(true),
             soter_nosign: Some(true),
+            soter_stuck: None,
             strongbox: None,
         };
         assert!(store
@@ -1927,6 +2039,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
+            soter_stuck: None,
             strongbox: None,
         };
         assert!(store
@@ -1965,6 +2078,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
+            soter_stuck: None,
             strongbox: Some(false),
         };
         let unknown = DeviceCaps::default();
@@ -1972,6 +2086,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(true),
             soter_nosign: None,
+            soter_stuck: None,
             strongbox: Some(true),
         };
         for (id, caps) in [
@@ -2021,6 +2136,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
+            soter_stuck: None,
             strongbox: None,
         };
         assert!(store
@@ -2058,6 +2174,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(true),
             soter_nosign: None,
+            soter_stuck: None,
             strongbox: None,
         };
         assert!(store
@@ -2073,6 +2190,7 @@ mod selfcheck_tests {
             soter_sign: None,
             soter: Some(false),
             soter_nosign: None,
+            soter_stuck: None,
             strongbox: None,
         };
         assert!(

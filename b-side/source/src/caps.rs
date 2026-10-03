@@ -20,6 +20,12 @@
 //!   extra — claiming `soter_nosign` there would make the server route sign ops
 //!   away from a device that can sign perfectly well (a phone whose owner is
 //!   simply not touching it right now).
+//! - `soter_stuck` — the TA is wedged inside the TEE: it holds the RPMB session
+//!   open and never lets go, so it can no longer read its own persistent store.
+//!   Export/build then answer `-5`/`258` while `has_*` still says the material is
+//!   there.  Before reporting this the relay already tried to escalate (reboot
+//!   the phone, see `soter::hal_restart`); this name means that escalation
+//!   either could not run or did not help, so a human has to look.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -65,6 +71,13 @@ pub fn report(sign_target: Option<&SignProbeTarget>) -> String {
             soter::SignState::Proven => caps.push("soter_sign"),
             soter::SignState::Refused => caps.push("soter_nosign"),
             soter::SignState::Unknown => {}
+        }
+        // TA 卡在 TEE 里：HAL 照样答话、身份/导出 op 也照样回，但回的是错的
+        // （「说存在、却导不出来」，`-5` + `258`）。这台现在不该再被派 SOTER 活；
+        // 自愈自己会先试重启整机，试不动（次数到顶/开机宽限期/重启失败）才会报
+        // 这个名字，意思就是「得人工看一眼了」。
+        if soter::hal_restart::tee_wedged() {
+            caps.push("soter_stuck");
         }
     }
     if strongbox_present() {
@@ -215,6 +228,7 @@ mod tests {
                 name == "soter"
                     || name == "soter_sign"
                     || name == "soter_nosign"
+                    || name == "soter_stuck"
                     || name == "strongbox",
                 "unexpected capability {name:?} in {caps:?}"
             );

@@ -239,6 +239,10 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
                 // 设备自己说“签名做不了”（要本机指纹）：身份/导出还能用，
                 // 签名类 op 不会再派给它。
                 "soter_nosign": d.soter_nosign,
+                // TA 卡在 TEE 里（RPMB 会话被它自己占死）：导出/建料会一直回 -5。
+                // 这是暂态，设备侧会自己试着重启整机；这个名字亮着就是「重启也没
+                // 搞定，得人工看一眼」。
+                "soter_stuck": d.soter_stuck,
                 "strongbox": d.supports_strongbox,
             }),
             load,
@@ -1221,6 +1225,9 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 "soter_sign": d.soter_sign,
                 // 另一条：设备明说“签名要本机指纹、远程做不了”（`soter_nosign`）。
                 "soter_nosign": d.soter_nosign,
+                // 再一条：TA 卡在 TEE 里（`soter_stuck`），导出/建料会一直回 -5。
+                // 跟上面两条不同，它是暂态，重启整机就能恢复。
+                "soter_stuck": d.soter_stuck,
                 "strongbox": d.supports_strongbox,
             }),
             load,

@@ -21,7 +21,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -159,8 +159,18 @@ fn sessions_dir() -> PathBuf {
 /// Session files 原本只进不出：A 端每要一个新 key（新 alias）就落一个文件，
 /// 长期在线的设备会一直堆 —— 真机上到过 19967 个 / 162 MB，启动全量加载要
 /// 12 秒。两个上限把它压住：超过 TTL 的删，超过数量上限的从最旧的开始删。
+///
+/// 2026-10-03 修：清理按 mtime 排，但**取用时从不刷新 mtime**，于是「刚用过」和
+/// 「几小时没用」在它眼里一样旧。实测 2000 个上限配 6.7 个/分钟的新增速率，有效
+/// 保留窗只有 **4 小时 46 分**，正在用的 alias 照样被清，紧接着签名就报
+/// `no key for alias ... (call attest first)`（relay.log 里 6c9e18291df990e9、
+/// dc70e82803071c96 等就是这么死的）。现在按最后使用时间算：每次取用顺手碰一下
+/// mtime（有节流，见 `touch_session`），清的才是真正没人用的。
 const SESSION_TTL_SECS: u64 = 7 * 24 * 3600;
-const SESSION_MAX_FILES: usize = 2000;
+/// 上限抬到 20000。按实测 6.7 个/分钟的铸造速率，2000 只够 4 小时 46 分，而现役
+/// 别名是要长期活着的。20000 个约 162 MB（实测 8 KB/个），磁盘吃得下；启动也不再
+/// 全量加载（见 `load_all_sessions`），所以放大它没有启动代价。
+const SESSION_MAX_FILES: usize = 20000;
 /// 每这么多次保存做一轮清理（启动时另有一轮，见 `load_all_sessions`）。
 /// 运行时清理的节流间隔。清一遍是 read_dir + 对每个文件 stat，几百次系统
 /// 调用；丢在 keygen 的结果路径上会直接拖住正在等答复的 A 端，所以改成按时间
@@ -168,9 +178,40 @@ const SESSION_MAX_FILES: usize = 2000;
 /// 文件数封顶兜着）。
 const SESSION_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
-/// 清理会话文件：先按 mtime 从旧到新排序，超 TTL 的或超出数量上限的都删掉，
-/// 于是留下来的总是最新的那一批。全程 best-effort —— 删不掉就当没发生过，
-/// 最坏结果只是这一轮没清成，不影响任何正在用的会话（它们在内存里）。
+/// 该不该删这个会话文件。`rank_from_oldest` 是它在「按 mtime 从旧到新排好」的
+/// 序列里的位置，所以 `total - rank` 就是「含自己在内还剩多少个更新的」。
+/// 抽成函数是为了能测：`prune_sessions` 自己写死了设备上的路径，测不到。
+fn session_is_evictable(age_secs: u64, rank_from_oldest: usize, total: usize, cap: usize) -> bool {
+    age_secs > SESSION_TTL_SECS || total.saturating_sub(rank_from_oldest) > cap
+}
+
+/// 距上次碰过多久才值得再碰一次。取得比这更勤的会话不必每次都写时间戳：淘汰判的
+/// 是小时级的窗口，mtime 差几分钟无所谓，而一次 utimensat 也顶不上白做。
+const SESSION_TOUCH_MIN_AGE: Duration = Duration::from_secs(300);
+
+/// 把会话的最后使用时间顶到当下 —— 这才是 LRU 淘汰的依据。
+/// 只动 mtime，不重写内容；时间戳比现在还晚（时钟被改过）也当旧的碰一下。
+fn touch_session(path: &Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .map(|age| age < SESSION_TOUCH_MIN_AGE)
+        .unwrap_or(false);
+    if fresh {
+        return;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+/// 清理会话文件：先按 mtime（最后一次使用）从旧到新排序，超 TTL 的或超出数量上限
+/// 的都删掉，于是留下来的总是最近还在用的那一批。全程 best-effort —— 删不掉就当
+/// 没发生过，最坏结果只是这一轮没清成，不影响任何正在用的会话（它们在内存里）。
 fn prune_sessions() {
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
         return;
@@ -195,13 +236,11 @@ fn prune_sessions() {
     let now = SystemTime::now();
     let mut removed = 0usize;
     for (i, (path, mtime)) in files.iter().enumerate() {
-        let expired = now
-            .duration_since(*mtime)
-            .map(|d| d.as_secs() > SESSION_TTL_SECS)
-            .unwrap_or(false);
-        // 排序后下标 i 之前都是更旧的，剩下 total - i 个（含自己）。
-        let over_cap = total - i > SESSION_MAX_FILES;
-        if (expired || over_cap) && std::fs::remove_file(path).is_ok() {
+        // mtime 在未来（时钟被改过）就当刚用过，不删。
+        let age_secs = now.duration_since(*mtime).map(|d| d.as_secs()).unwrap_or(0);
+        if session_is_evictable(age_secs, i, total, SESSION_MAX_FILES)
+            && std::fs::remove_file(path).is_ok()
+        {
             removed += 1;
         }
     }
@@ -326,12 +365,18 @@ fn session_get(alias: &str) -> Result<TeeSession> {
     {
         let sessions = sessions().lock().unwrap();
         if let Some(session) = sessions.get(alias) {
-            return Ok(session.clone());
+            let session = session.clone();
+            drop(sessions);
+            // 命中内存也得碰一下盘：淘汰看的是文件 mtime，不刷新的话它记的还是铸造
+            // 时间，长期在用的别名会跟闲置的一样被判成旧的。
+            touch_session(&session_path(alias));
+            return Ok(session);
         }
     }
     // Miss: try to recover from disk (e.g. after a relay restart).  The TEE key
     // blob is persisted, so the recovered session can still sign/decrypt.
     if let Some(session) = load_session_from_disk(alias) {
+        touch_session(&session_path(alias));
         sessions()
             .lock()
             .unwrap()
@@ -342,65 +387,61 @@ fn session_get(alias: &str) -> Result<TeeSession> {
     Err(anyhow!("no key for alias '{alias}' (call attest first)"))
 }
 
-/// Loads every persisted session into memory.  Called once at startup so that
-/// an alias generated before a relay restart is immediately usable.
+/// 启动时只清一轮盘，不再把所有会话读进内存。
+///
+/// 原来这里是「清一遍 + 全量加载」：别名被哈希进文件名、反推不出来，所以只能逐个
+/// 读 JSON 才能把 alias 填进 map —— 实测 19967 个文件要 12 秒。但 `session_get`
+/// 本来就按别名直接算出路径去读盘（会打一条 `recovered persisted session for
+/// alias ...`），全量加载纯粹是热身，去掉之后一样能用、启动还快，上限也才敢放大
+/// （见 `SESSION_MAX_FILES`）。
 pub fn load_all_sessions() {
-    // 先清一轮再加载：“只增不减”就是在这一步收住的，顺带把启动耗时压下来。
     prune_sessions();
-    let Some(entries) = std::fs::read_dir(sessions_dir()).ok() else {
-        return;
-    };
-    let mut loaded = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".json") {
-            continue;
-        }
-        // Recover the alias by scanning the file's JSON (we cannot reverse the
-        // filename hash); read each file and store by its alias key.
-        let Ok(data) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
-            continue;
-        };
-        let Some(alias) = value.get("alias").and_then(|a| a.as_str()) else {
-            continue;
-        };
-        let key_blob_b64 = value.get("key_blob").and_then(|v| v.as_str());
-        let Some(key_blob) = key_blob_b64.and_then(|s| B64.decode(s).ok()) else {
-            continue;
-        };
-        let cert_chain = value
-            .get("cert_chain")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| c.as_str().and_then(|s| B64.decode(s).ok()))
-                    .collect::<Vec<Vec<u8>>>()
-            })
-            .unwrap_or_default();
-        let algorithm = match value.get("algorithm").and_then(|v| v.as_str()) {
-            Some("Rsa2048") => KeyAlgorithm::Rsa2048,
-            _ => KeyAlgorithm::EcP256,
-        };
-        let hal_service = match value.get("hal_service").and_then(|v| v.as_str()) {
-            Some("strongbox") => SYSTEM_KEYMINT_STRONGBOX,
-            _ => SYSTEM_KEYMINT_DEFAULT,
-        };
-        sessions().lock().unwrap().insert(
-            alias.to_string(),
-            TeeSession {
-                key_blob,
-                cert_chain,
-                algorithm,
-                hal_service,
-            },
-        );
-        loaded += 1;
+}
+
+#[cfg(test)]
+mod session_prune_tests {
+    use super::*;
+
+    /// 最近碰过的会话必须活过数量上限 —— 这就是「按最后使用时间淘汰」这条规矩本身。
+    /// 修之前 mtime 记的是铸造时间，长期在用的别名跟翼置的一样旧。
+    #[test]
+    fn recently_touched_sessions_survive_the_cap() {
+        // 3 个文件、上限 2：只有最旧的那个出去。
+        assert!(session_is_evictable(60, 0, 3, 2), "最旧的那个该被清");
+        assert!(!session_is_evictable(60, 1, 3, 2));
+        assert!(!session_is_evictable(60, 2, 3, 2));
     }
-    if loaded > 0 {
-        log::info!("loaded {loaded} persisted TEE sessions");
+
+    /// 超 TTL 的不管排第几都清，哪怕总数没到上限。
+    #[test]
+    fn sessions_past_the_ttl_go_even_under_the_cap() {
+        assert!(session_is_evictable(
+            SESSION_TTL_SECS + 1,
+            0,
+            1,
+            SESSION_MAX_FILES
+        ));
+        assert!(!session_is_evictable(
+            SESSION_TTL_SECS,
+            0,
+            1,
+            SESSION_MAX_FILES
+        ));
+    }
+
+    /// 上限从 2000 抬到 20000 到底救回多少：拿「三万个别名、其中最后用过的五千个」
+    /// 当场景，老上限会把这五千个活着的清掉三千，新上限一个不动。
+    #[test]
+    fn a_larger_cap_stops_evicting_live_sessions() {
+        let total = 30_000usize;
+        let live_from = 25_000; // 排在最新那一头的 5000 个
+        let live_evicted = |cap: usize| {
+            (live_from..total)
+                .filter(|rank| session_is_evictable(30, *rank, total, cap))
+                .count()
+        };
+        assert_eq!(live_evicted(2_000), 3_000, "老上限会把活着的清掉三千");
+        assert_eq!(live_evicted(SESSION_MAX_FILES), 0, "新上限一个都不清");
     }
 }
 

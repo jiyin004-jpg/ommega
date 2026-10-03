@@ -38,7 +38,8 @@ mod sign_guard;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
-use std::sync::Mutex;
+use std::cell::Cell;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use hal::{Soter, SoterData, SoterSession};
@@ -167,6 +168,64 @@ static LEARNED_PROBE_TARGET: Mutex<Option<(i32, String)>> = Mutex::new(None);
 /// atomically checks/reserves probe access and protects the in-memory lease.
 /// Never held while waiting for a caller's finish or during HAL restart.
 static SIGN_GUARD: Mutex<sign_guard::SignGuard> = Mutex::new(sign_guard::SignGuard::new());
+
+/// SOTER TA 里的 RPMB 会话是独占资源：同一时刻只许一笔操作进去。
+///
+/// 2026-10-03 在 PLC110 上实测：Trustonic 的 `tlTeeSOTER`（TA 镜像
+/// `/odm/vendor/app/mcRegistry/070f0000000000000000000000000a0a.tlbin`）把 RPMB
+/// session 3 打开之后不释放，之后每一次 `EXPORT_PUB_KEY` 都开不了会话 —— 驱动
+/// 日志 `rpmb session 3 is already opened by 070f0000-...-a0a0` 449/449 全是它
+/// 自己，`Open session failed crSession = 0xffffffff` 452 次，
+/// `read counter failed (258)` 451 次。TA 从此读不到自己的持久存储，于是
+/// `export_*` / `generate_*` 一律回 -5，而 `has_*` 照旧回 0（它不走 RPMB）——
+/// 对外就是「说存在、却导不出来、也建不了」。踢 Android 侧的 HAL 服务没用
+/// （持有者在 TEE 里），只有重启整机能松开。
+///
+/// relay 默认开两路 worker（`OMMEGA_RELAY_WORKERS`，见 `bin/relay.rs`），两笔
+/// SOTER 请求可以同时压进同一个 TA，而 TA 那条 RPMB 读路径是否可重入厂商没给
+/// 保证。这把门把 SOTER 的操作串起来（KeyMint / attest 那条路不受影响，照旧并发），
+/// 代价是 SOTER 吞吐降到单笔，换不走这个坑。
+static SOTER_HAL_MUTEX: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// 本线程已经进过这道门几次。`handle()` 里会调到 `probe()`，所以必须能重入
+    /// —— std 的 Mutex 不可重入，直接套会自锁死。
+    static SOTER_HAL_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// 进 SOTER HAL 的串行门；可重入，出作用域自动放。
+struct SoterHalGate {
+    /// 只有最外层那一次真握着锁，内层重入的不握。
+    _guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl SoterHalGate {
+    fn enter() -> Self {
+        let depth = SOTER_HAL_DEPTH.with(|d| d.get());
+        if depth > 0 {
+            SOTER_HAL_DEPTH.with(|d| d.set(depth + 1));
+            return Self { _guard: None };
+        }
+        let guard = SOTER_HAL_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SOTER_HAL_DEPTH.with(|d| d.set(1));
+        Self {
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for SoterHalGate {
+    fn drop(&mut self) {
+        let depth = SOTER_HAL_DEPTH.with(|d| d.get());
+        if depth > 1 {
+            SOTER_HAL_DEPTH.with(|d| d.set(depth - 1));
+        } else {
+            SOTER_HAL_DEPTH.with(|d| d.set(0));
+        }
+    }
+}
 
 /// 探针要试的那个槽位；没配 OMMEGA_RELAY_SOTER_PROBE_* 的时候就用这里学到的。
 pub fn learned_probe_target() -> Option<(i32, String)> {
@@ -388,6 +447,8 @@ fn rebuild_material_then_sign(
 /// `allow_mutation` comes from the relay config; it gates the ops that create
 /// or delete keys.
 pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
+    // 一笔一笔进 HAL：TA 那条 RPMB 会话不可重入，见 `SOTER_HAL_MUTEX`。
+    let _gate = SoterHalGate::enter();
     let op = payload
         .get("op")
         .and_then(Value::as_str)
@@ -596,6 +657,8 @@ const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
 /// 结论写在 `verdict` 里（见 [`SignVerdict`]），`signed` 只为看日志方便。
 /// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
 pub fn sign_probe(uid: i32, alias: &str) -> Value {
+    // 探针也是真的去 init/finish，跟派下来的活一样得排队。
+    let _gate = SoterHalGate::enter();
     let mut out = json!({ "op": "sign_probe", "uid": uid, "alias": alias });
     // Check and reserve under the real signing lock; callers cannot init
     // between this check and the probe's finish. Do not call handle() here:
@@ -672,6 +735,7 @@ pub fn service_present() -> bool {
 /// Unlike the other ops this never fails: `supported` is `false` when the HAL
 /// is missing or cannot answer, with the reason attached.
 pub fn probe() -> Value {
+    let _gate = SoterHalGate::enter();
     match Soter::open() {
         Ok(Some(soter)) => {
             let mut out = json!({
