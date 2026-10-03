@@ -718,6 +718,19 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         .unwrap_or_default()
         .to_string();
 
+    // 「这些调用只在本地兜底回答」的名单：别名前缀 + uid。缺省前缀就是两台探测机
+    // （春秋/鸭子），不写这个键也拦；写 `none` 关掉。uid 缺省空（每台设备一套，手写）。
+    let soter_local_only_prefixes = get(&[
+        "soter_local_only_prefixes",
+        "soter_local_only_alias_prefixes",
+        "soter_local_only_aliases",
+    ])
+    .unwrap_or(crate::soter_relay::DEFAULT_LOCAL_ONLY_PREFIXES)
+    .to_string();
+    let soter_local_only_uids = get(&["soter_local_only_uids", "soter_local_uids"])
+        .unwrap_or_default()
+        .to_string();
+
     Some(RemoteConfig {
         enabled: prefer_remote,
         url,
@@ -730,6 +743,8 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         soter_hide,
         soter_inject,
         soter_uid_map,
+        soter_local_only_prefixes,
+        soter_local_only_uids,
         bind_iface,
     })
 }
@@ -817,6 +832,21 @@ pub struct RemoteConfig {
     /// 没配就原样转发（不做任何推断：uid 猜错了答出来的东西更坑）。
     #[serde(default)]
     pub soter_uid_map: String,
+    /// 「这些调用只在本地兜底回答、一次都不往 B 端转」的别名前缀（逗号/分号/空格分隔）。
+    /// 缺省就是两台探测机（`chunqiu_soter_probe_` / `duckdetector_soter_probe_`），
+    /// 写成 `none` / `off` 就是关掉这条（那两家的探针就又去打真机 TEE 了）。
+    ///
+    /// 为什么要有它：探针每跑一轮都新铸一把别名、签完也不收尾，在 B 端吃的是真 TEE
+    /// 的会话（实测一天 900+ 次 init_sign，占全部 init 的一半以上），而它们的结论
+    /// 只看「这条路通不通」，本地兜底那份自洽的答复就够。判定在 `soter_relay`。
+    #[serde(default = "default_soter_local_only_prefixes")]
+    pub soter_local_only_prefixes: String,
+    /// 同上，按 uid 点名（逗号/分号/空格分隔，缺省空 = 不按 uid 拦）。
+    ///
+    /// `has_ask_already` 这类调用根本没有别名，只能按 uid 认；而 uid 每台设备一套，
+    /// 所以这个键是设备本地手写的。
+    #[serde(default)]
+    pub soter_local_only_uids: String,
     /// 连 relay server 时把 socket 绑到哪块网卡（`/data/adb/ommega/config` 的
     /// `bind_iface`）。空（或缺省）＝ `auto`：先看系统默认那条路通不通，通了就不绑；
     /// 不通才去挑一块真能打到服务端的网卡（优先物理链路）。`none` / `off` 表示
@@ -843,9 +873,16 @@ impl Default for RemoteConfig {
             soter_hide: false,
             soter_inject: false,
             soter_uid_map: String::new(),
+            soter_local_only_prefixes: default_soter_local_only_prefixes(),
+            soter_local_only_uids: String::new(),
             bind_iface: String::new(),
         }
     }
+}
+
+/// 「只在本地兜底回答」名单的缺省值：还是拿 `soter_relay` 那份常量，免得两处跑偏。
+fn default_soter_local_only_prefixes() -> String {
+    crate::soter_relay::DEFAULT_LOCAL_ONLY_PREFIXES.to_string()
 }
 
 /// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`),

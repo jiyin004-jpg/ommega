@@ -11,6 +11,12 @@ use serde_json::Value;
 
 use crate::remote::{fallback_local, remote_enabled, RemoteRelay};
 
+/// 「这些调用只在本地兜底回答、一次都不往 B 端转」的缺省别名前缀。
+///
+/// 两个名字都是探针自己起的（别名尾部带毫秒时间戳，每跑一轮新铸一个），所以认前缀
+/// 比认 uid 稳：uid 每台机器一套，这个名字是探针里写死的。配置里写 `none` 就是关掉。
+pub const DEFAULT_LOCAL_ONLY_PREFIXES: &str = "chunqiu_soter_probe_,duckdetector_soter_probe_";
+
 /// 一笔 SOTER 调用的去处，`request` 是 payload 拼好的 JSON（`{"op":..,"uid":..}`）。
 ///
 /// 认不出来的请求、远程没开、远程没答案，都会回退到「本地兜底」——那是接线之前的行为，
@@ -31,6 +37,16 @@ pub fn forward(request: &str) -> Vec<u8> {
 
     if soter_relay::code_for_op(&op).is_none() {
         log::warn!("event=soter relay unknown op {op:?}; using the local backend");
+        return Outcome::Local.encode();
+    }
+
+    // 探测机（春秋 / 鸭子这类检测器）的这笔直接本地兜底，一次都不往 B 端转。
+    //
+    // 它们每跑一轮都新铸一把别名、签完也不收尾，在 B 端吃的是真 TEE 的空会话
+    // （实测一天 900+ 次 init_sign，顶掉全部 init 的一半以上），而它们只看「这条路
+    // 通不通」——本地兜底那份自洽的答复就够，真机会话留给真应用。
+    if let Some(why) = local_only(&value) {
+        log::info!("event=soter relay op={op} {why}；本地兜底作答，不往 B 端转");
         return Outcome::Local.encode();
     }
 
@@ -59,6 +75,74 @@ pub fn forward(request: &str) -> Vec<u8> {
         Ok(None) => no_remote_answer(&op, "no B-side answer"),
         Err(error) => no_remote_answer(&op, &format!("{error:#}")),
     }
+}
+
+/// 一笔调用该不该只在本地兜底回答（连远程都不问）。命中时回一句「凭什么」给日志。
+///
+/// 名单从配置里现读（`/data/misc/keystore/ommega/config` 的 `soter_local_only_prefixes` /
+/// `soter_local_only_uids`）：宿主是 uid 1000、读不到那个 0770 的 keystore 目录，
+/// 所以这个判断只能留在 daemon 这边，跟这个文件里其它开关同理。
+fn local_only(value: &Value) -> Option<String> {
+    let (prefixes, uids) = match crate::config::config().read() {
+        Ok(cfg) => (
+            cfg.remote.soter_local_only_prefixes.clone(),
+            cfg.remote.soter_local_only_uids.clone(),
+        ),
+        Err(_) => return None,
+    };
+    local_only_match(value, &prefixes, &uids)
+}
+
+/// `local_only` 里跟配置来源无关的那半：名单匹配。
+///
+/// 两个名单都是逗号/分号/空格/换行分隔；`none` / `off` / `-` 表示整条名单关掉。
+fn local_only_match(value: &Value, prefixes: &str, uids: &str) -> Option<String> {
+    if let Some(uid) = value.get("uid").and_then(Value::as_i64) {
+        if parse_number_list(uids).contains(&uid) {
+            return Some(format!("uid {uid} 在本地兜底名单里"));
+        }
+    }
+    let alias = value
+        .get("alias")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    // 没有别名（`get_device_id` 这类）、或者调用方给的空别名（`-`）就只认 uid。
+    if alias.is_empty() || alias == "-" {
+        return None;
+    }
+    let prefix = parse_text_list(prefixes)
+        .into_iter()
+        .find(|prefix| alias.starts_with(prefix.as_str()))?;
+    Some(format!("别名 {alias} 命中本地兜底前缀 {prefix}"))
+}
+
+/// 名单是不是「关掉」的写法。空也算关：缺省值不写就是这个意思。
+fn list_disabled(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.is_empty() || matches!(raw.to_ascii_lowercase().as_str(), "none" | "off" | "-")
+}
+
+/// 逗号/分号/空格/换行分隔的字符串名单。
+fn parse_text_list(raw: &str) -> Vec<String> {
+    if list_disabled(raw) {
+        return Vec::new();
+    }
+    raw.split([',', ';', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 同上，元素是数字（uid）；认不出来的那一项直接丢掉，不牵连别的项。
+fn parse_number_list(raw: &str) -> Vec<i64> {
+    if list_disabled(raw) {
+        return Vec::new();
+    }
+    raw.split([',', ';', ' ', '\t', '\n'])
+        .filter_map(|item| item.trim().parse::<i64>().ok())
+        .collect()
 }
 
 /// 远程没给出答案时的分岔：配置允许退回本地就退回，否则把这笔调用放给真 HAL。
@@ -339,6 +423,95 @@ mod tests {
                 session: 1
             }),
             8
+        );
+    }
+
+    #[test]
+    fn the_two_probe_names_default_to_the_local_backend() {
+        for alias in [
+            "chunqiu_soter_probe_1759500000000",
+            "duckdetector_soter_probe_1759500000001",
+        ] {
+            let value = json!({"op": "init_sign", "uid": 10396, "alias": alias});
+            assert!(
+                local_only_match(&value, DEFAULT_LOCAL_ONLY_PREFIXES, "").is_some(),
+                "{alias} 应当被本地兜底接住"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_app_is_not_diverted() {
+        // 微信自己那套别名一个字都不能碰（这台机器上是 uid 10490 的
+        // `SoterAuthKeyV2_<salt>_scene1`）。
+        let value = json!({
+            "op": "init_sign",
+            "uid": 10490,
+            "alias": "SoterAuthKeyV2_salt11d8ba34_scene1",
+        });
+        assert_eq!(
+            local_only_match(&value, DEFAULT_LOCAL_ONLY_PREFIXES, ""),
+            None
+        );
+        // 没有别名的调用（`get_device_id` 这类）uid 没点名就不动。
+        assert_eq!(
+            local_only_match(
+                &json!({"op": "get_device_id", "uid": 10490}),
+                DEFAULT_LOCAL_ONLY_PREFIXES,
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_listed_uid_is_enough_without_an_alias() {
+        // `has_ask_already` 这种调用没有别名，只能按 uid 认（uid 每台设备一套，
+        // 所以这份名单是设备本地的）。
+        let value = json!({"op": "has_ask_already", "uid": 10396, "alias": "-"});
+        assert!(local_only_match(&value, "", "10396,10400").is_some());
+        assert_eq!(local_only_match(&value, "", "10397"), None);
+    }
+
+    #[test]
+    fn an_empty_or_none_list_diverts_nothing() {
+        let value = json!({
+            "op": "init_sign",
+            "uid": 10396,
+            "alias": "chunqiu_soter_probe_1",
+        });
+        for off in ["", "none", "off", "-", "  ", "NONE"] {
+            assert_eq!(local_only_match(&value, off, ""), None, "{off:?}");
+            assert_eq!(
+                local_only_match(&json!({"op": "init_sign", "uid": 10396}), "", off),
+                None,
+                "{off:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn odd_spellings_of_the_lists_are_tolerated() {
+        let value = json!({
+            "op": "init_sign",
+            "uid": 10396,
+            "alias": "chunqiu_soter_probe_1",
+        });
+        // 逗号/分号/空格混着写、末尾多一个分隔符，都不该让整条名单失效。
+        assert!(
+            local_only_match(&value, "chunqiu_soter_probe_ ; duck_soter_probe_,", "").is_some()
+        );
+        assert!(local_only_match(&value, "  chunqiu_soter_probe_  ", "").is_some());
+        // uid 名单里坏的那一项丢掉，好的还得留着。
+        assert!(local_only_match(&value, "", "乱写, 10396").is_some());
+        // 认的是前缀不是「包含」：别的前缀里夹着这个名字不算命中。
+        assert_eq!(
+            local_only_match(
+                &json!({"op": "init_sign", "uid": 1, "alias": "SoterAuthKeyV2_chunqiu_soter_probe_x"}),
+                DEFAULT_LOCAL_ONLY_PREFIXES,
+                ""
+            ),
+            None
         );
     }
 
