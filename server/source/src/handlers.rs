@@ -18,7 +18,7 @@ use crate::auth::AuthState;
 use crate::config::Config;
 use crate::db::Db;
 use crate::fulfill::Fulfill;
-use crate::queue::TaskStore;
+use crate::queue::{soter_op_is_mutation, TaskStore};
 use crate::soter_sign_sessions::LeaseMiss;
 
 #[derive(Clone)]
@@ -1281,6 +1281,24 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
             .into_response();
     }
 
+    // SOTER 的写操作只在 A 端点名的那台设备上做；点名那台接不了就明说，不换设备。
+    //
+    // 换台做的后果我们已经在线上看过一遍了：钥匙状态改在别的设备上，然后因为「不是
+    // 点名那台」被判成「结果未知」，App 收到 -1000 —— 两头不落（2026-10-03，几十条/分钟）。
+    // 连「一台能接的设备都没有」（点名那台离线、或者服务端刚重启还没学到谁在线）
+    // 也算接不了：那种情况下照样判「结果未知」，App 拿到的 -1000 比确定的答复难处理。
+    //
+    // 回什么见 `soter_off_target_reply`：写操作回 -5（这把钥匙不在这台，去原地重建），
+    // 要签名的回 -204（会话不在这台，就是 App 自己也会算出来的那个 `OPERATEID_NULL`）。
+    if soter_mutation_cross_served(op, requested, b_target.as_deref(), session_present) {
+        tracing::warn!(
+            "soter: op={op} uid={probe_uid} 点名设备 {requested} 这会儿接不了这笔写操作\
+             （b_target={:?} requested_online={requested_online}），不换设备、不落兜底层",
+            b_target
+        );
+        return Json(soter_off_target_reply(op)).into_response();
+    }
+
     // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：
     // 只拿 `init_sign` 时缓存的参数重开一张会话再签一次。B 端自己的能力探针也会在这台
     // 设备上跑 `init_sign`，那是另一条顶人的路子，已在 B 端给它加了空闲门
@@ -1443,7 +1461,22 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                     match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
                         Some(mut b) => {
                             if b.mutation_outcome_unknown(op, b_target.as_deref()) {
-                                return Some(soter_unknown_reply());
+                                if crate::queue::soter_op_needs_sign(op) {
+                                    // init/finish：真说不清（超时、会话被顶、队列没派出去）
+                                    // 时保持原样，不让 App 以为这把钥匙没了。
+                                    return Some(soter_unknown_reply());
+                                }
+                                // generate_*/remove_*：没落在点名那台上就是确定的结论，
+                                // 不管是因为换台做完了、还是压根没派出去 / 被队列直接拒了。
+                                // 换台做过的那些更得说清楚 —— 那把钥匙其实没动，也不存在
+                                // A 端这台机器上。
+                                tracing::warn!(
+                                    "soter: op={op} uid={probe_uid} 点名设备 {} 上没做成\
+                                     （device={:?}），回确定码不换层",
+                                    requested,
+                                    b.device
+                                );
+                                return Some(soter_off_target_reply(op));
                             }
                             if needs_sign
                                 && b.device.as_deref() == b_target.as_deref()
@@ -1660,6 +1693,44 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("no layer could serve SOTER op '{op}' ({detail})"),
     )
+}
+
+/// 「这笔写操作没落在 A 端点名的那台设备上」该回什么。
+///
+/// 两种写操作要分开说，因为 App 两边认得的东西不一样：
+///
+/// * 要签名的（`init_sign` / `finish_sign`）回 **-204**（`SOTER_ERROR_OPERATEID_NULL`）。
+///   这是 App 自己也会算出来的「这张会话不在了」，会走它自己的重试/补签那条路；
+///   回 -5（钥匙不在）反而可能让它以为要重新生成密钥。
+/// * 其余的（`generate_*` / `remove_*`）回 **-5**（`NOT_FOUND`）：跟 A 端本地兜底那个
+///   码一个意思 —— 这台设备上就是没有这把钥匙（或者这把钥匙没被改过），
+///   让 A 端在原地重建，别在别的设备上重做、也别让服务端两层替它造。
+fn soter_off_target_reply(op: &str) -> Value {
+    if crate::queue::soter_op_needs_sign(op) {
+        json!({"error_code": -204, "relay_error_kind": "soter_device_mismatch"})
+    } else {
+        json!({"error_code": -5, "relay_error_kind": "soter_device_unavailable"})
+    }
+}
+
+/// 这笔 SOTER 调用是不是「没落在 A 端点名的那台设备上」。
+///
+/// 写操作（`generate_*` / `remove_*` / 要签名的 `init`、`finish`）落到别的设备上（或
+/// 者一台都没派出去）就等于没在点名那台上做：材料对不上，判据（`mutation_outcome_unknown`
+/// 看的就是点名设备）也判不到，只能回 -1000。所以只认点名那台。
+///
+/// `session_routed` 是 `finish_sign` 带会话时的例外：那张会话本来就记在另一台设备上
+/// （`sign_sessions.route` 的结论），按它走是正常的，不算顶替。
+fn soter_mutation_cross_served(
+    op: &str,
+    requested: &str,
+    b_target: Option<&str>,
+    session_routed: bool,
+) -> bool {
+    !requested.is_empty()
+        && !session_routed
+        && soter_op_is_mutation(op)
+        && b_target != Some(requested)
 }
 
 /// 保留在线点名设备以及已知会话的原设备；不能接活时由原回退层处理，不能换身份。
@@ -2565,6 +2636,90 @@ mod soter_device_layer_tests {
         assert_eq!(
             consistent_soter_target(false, "offline", None, Some("a".into())),
             Some("a".into())
+        );
+    }
+
+    #[test]
+    fn a_mutation_never_lands_on_another_device() {
+        use super::soter_mutation_cross_served;
+        // 点 PLC110，却要派给别的 B：拿别人的密钥库替它作答，不许。
+        assert!(soter_mutation_cross_served(
+            "generate_auth_key_pair",
+            "device-b-a",
+            Some("device-b-b"),
+            false
+        ));
+        assert!(soter_mutation_cross_served(
+            "init_sign",
+            "device-b-a",
+            Some("device-b-b"),
+            false
+        ));
+        // 派给点名那台才算数：别的设备、乃至一台都没派出去（点名那台离线 / 服务端
+        // 刚重启还没学到谁在线），都不算「在这台上做过」。
+        assert!(!soter_mutation_cross_served(
+            "generate_auth_key_pair",
+            "device-b-a",
+            Some("device-b-a"),
+            false
+        ));
+        assert!(soter_mutation_cross_served(
+            "remove_auth_key",
+            "device-b-a",
+            None,
+            false
+        ));
+        // 读操作照旧可以换设备（ASK 身份类另有 `soter_identity_op` 那条）。
+        assert!(!soter_mutation_cross_served(
+            "has_auth_key",
+            "device-b-a",
+            Some("device-b-b"),
+            false
+        ));
+        // `finish_sign` 带会话时按会话记的设备走，那不算顶替。
+        assert!(!soter_mutation_cross_served(
+            "finish_sign",
+            "device-b-a",
+            Some("device-b-b"),
+            true
+        ));
+        // 配置里根本没写设备 id 的老客户端：没法点名，按原样放行。
+        assert!(!soter_mutation_cross_served(
+            "generate_ask_key_pair",
+            "",
+            Some("device-b-b"),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_off_target_mutation_says_what_the_app_understands() {
+        use super::soter_off_target_reply;
+        // 写操作：钥匙不在这台 —— 去原地重建。
+        assert_eq!(
+            soter_off_target_reply("generate_auth_key_pair")["error_code"],
+            json!(-5)
+        );
+        assert_eq!(
+            soter_off_target_reply("remove_auth_key")["error_code"],
+            json!(-5)
+        );
+        assert_eq!(
+            soter_off_target_reply("generate_ask_key_pair")["relay_error_kind"],
+            json!("soter_device_unavailable")
+        );
+        // 要签名的：回 App 自己认的那个「会话没了」，不是「钥匙没了」。
+        assert_eq!(
+            soter_off_target_reply("init_sign")["error_code"],
+            json!(-204)
+        );
+        assert_eq!(
+            soter_off_target_reply("finish_sign")["error_code"],
+            json!(-204)
+        );
+        assert_eq!(
+            soter_off_target_reply("init_sign")["relay_error_kind"],
+            json!("soter_device_mismatch")
         );
     }
 

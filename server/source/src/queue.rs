@@ -153,7 +153,7 @@ pub struct DeviceCaps {
 
 /// 这一步得由 TEE 现场签（要新鲜指纹）：`init_sign` 开会话、`finish_sign` 出签名。
 /// 其余的 op（身份、公钥导出、建/删）设备自己就能答。
-fn soter_op_needs_sign(op: &str) -> bool {
+pub(crate) fn soter_op_needs_sign(op: &str) -> bool {
     matches!(op, "init_sign" | "finish_sign")
 }
 
