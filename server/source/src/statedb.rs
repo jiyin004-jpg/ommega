@@ -180,6 +180,21 @@ impl StateDb {
             "CREATE INDEX IF NOT EXISTS idx_sessions_used ON sessions(used_epoch_ms);",
         )
         .context("state db index idx_sessions_used")?;
+        // 账号指纹的「最后见到」：从旧 JSON 导进来的那批当时写的是 0（那份 JSON 里
+        // 压根没有时间），0 一律按「未知」算。这行回填不能省 —— 直接挂上 TTL，0 会被
+        // 当成「过期了几辈子」，第一次启动就把整张表的账号记录清光（2026-10-03 真发生
+        // 过一次，5298 条剩 386 条）。拿当下顶上：我们至少知道它到这一刻还在库里。
+        // 只补 0 的行，正常记录动不着；补过之后这里每次都返回 0。
+        let fixed = conn
+            .execute(
+                "UPDATE soter_slot_owners SET first_seen_ms = ?1, last_seen_ms = ?1
+                  WHERE last_seen_ms = 0",
+                params![chrono::Utc::now().timestamp_millis()],
+            )
+            .context("state db 回填 soter_slot_owners 的时间戳")?;
+        if fixed > 0 {
+            tracing::info!("state db: {fixed} 条账号指纹的时间戳是 0，按现在回填");
+        }
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -382,10 +397,13 @@ impl StateDb {
     }
 
     /// 丢掉太久没见到的账号记录（TTL）。每条缓存都有过期时间，不留永生的行。
+    ///
+    /// 时间戳 0 的不碰：那是「不知道什么时候见的」（老数据/导入的），不是「很久没见」。
+    /// 把它们当过期删掉，丢的是「这个槽位上原本有几个号」的判据。
     pub fn purge_owners_expired_before(&self, cutoff_ms: i64) -> Result<usize> {
         let conn = self.plain();
         Ok(conn.execute(
-            "DELETE FROM soter_slot_owners WHERE last_seen_ms < ?1",
+            "DELETE FROM soter_slot_owners WHERE last_seen_ms < ?1 AND last_seen_ms > 0",
             params![cutoff_ms],
         )?)
     }
@@ -494,6 +512,7 @@ impl StateDb {
         if sessions_json.is_none() && slots_json.is_none() {
             return Ok(report);
         }
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let conn = self.plain();
         let tx = conn
             .unchecked_transaction()
@@ -529,7 +548,7 @@ impl StateDb {
                     if value.is_empty() {
                         continue;
                     }
-                    if Self::insert_owner_if_absent(&tx, &slot_id, family, value)? {
+                    if Self::insert_owner_if_absent(&tx, &slot_id, family, value, now_ms)? {
                         report.owners += 1;
                     }
                 }
@@ -587,11 +606,14 @@ impl StateDb {
         slot_id: &str,
         family: &str,
         token: &str,
+        now_ms: i64,
     ) -> Result<bool> {
+        // 旧 JSON 里没有时间，所以时间戳写「导入这一刻」而不是 0 —— 0 是「未知」，
+        // 挂上 TTL 之后会被当成早就过期，一启动就把这批记录全清了。
         let n = conn.execute(
             "INSERT OR IGNORE INTO soter_slot_owners(slot_id, family, token, first_seen_ms, last_seen_ms)
-             VALUES(?1, ?2, ?3, 0, 0)",
-            params![slot_id, family, token],
+             VALUES(?1, ?2, ?3, ?4, ?4)",
+            params![slot_id, family, token, now_ms],
         )?;
         Ok(n > 0)
     }
@@ -911,6 +933,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 从旧 JSON 导进来的账号记录不能一挂上 TTL 就被清光。
+    ///
+    /// 那份 JSON 里根本没有时间，早先导的时候写的是 0 —— 而 0 在「按最后见到算过期」
+    /// 下等于「过期了几辈子」，2026-10-03 上线时真把线上 5298 条清成了 386 条。
+    #[test]
+    fn imported_owner_records_survive_the_ttl() {
+        let (db, dir) = tmp_db("import-owner-ttl");
+        let slots_json = dir.join("soter_slots.json");
+        std::fs::write(
+            &slots_json,
+            r#"{"dev|9":{"layer":"b","at_millis":333,
+                 "owners":["wx:hubssh","v2:salt1"]}}"#,
+        )
+        .unwrap();
+        let report = db.import_legacy_json(None, Some(&slots_json)).unwrap();
+        assert_eq!(report.owners, 2);
+
+        let owners = db.slots_snapshot().unwrap().owners;
+        assert_eq!(owners.len(), 2);
+        assert!(
+            owners.iter().all(|(_, _, _, ms)| *ms > 0),
+            "导入得写上「导入这一刻」，不能留 0"
+        );
+        // 30 天这条线上：刚导进来的，一条都不该被清
+        let now = chrono::Utc::now().timestamp_millis();
+        let cutoff = now - 30 * 24 * 60 * 60 * 1000;
+        assert_eq!(db.purge_owners_expired_before(cutoff).unwrap(), 0);
+        assert_eq!(db.slots_snapshot().unwrap().owners.len(), 2);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 时间戳是 0（「不知道什么时候见的」）的记录，再狠的 cutoff 也不清；
+    /// 而且库里一旦出现 0，下一次开库得把它回填成当下（否则 TTL 永远管不了它）。
+    #[test]
+    fn unknown_timestamp_owner_records_are_backfilled_then_spared() {
+        let (db, dir) = tmp_db("owner-zero");
+        {
+            let conn = db.plain();
+            StateDb::insert_owner_if_absent(&conn, "d|1", "v2", "old", 0).unwrap();
+        }
+        assert_eq!(db.slots_snapshot().unwrap().owners[0].3, 0);
+        assert_eq!(
+            db.purge_owners_expired_before(i64::MAX).unwrap(),
+            0,
+            "0 是「不知道」，不是「早就过期」"
+        );
+        drop(db);
+
+        let path = dir.join("state.db");
+        let db = StateDb::open(path.to_str().unwrap()).unwrap();
+        let owners = db.slots_snapshot().unwrap().owners;
+        assert!(owners[0].3 > 0, "开库时该把 0 回填成当下");
+        // 回填之后 TTL 才真的能管它：30 天内还在，放到永生就该过期
+        let now = chrono::Utc::now().timestamp_millis();
+        assert_eq!(
+            db.purge_owners_expired_before(now - 30 * 24 * 60 * 60 * 1000)
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.purge_owners_expired_before(i64::MAX).unwrap(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn legacy_json_import_is_byte_faithful_and_idempotent() {
         let (db, dir) = tmp_db("import");
@@ -1187,6 +1274,21 @@ mod tests {
             snap.slots.len(),
             snap.owners.len()
         );
+
+        // 导完马上跑一遍 TTL 清理：一条都不该掉（导入写的是「导入这一刻」，不是 0）。
+        // 这条正是 2026-10-03 上线时踩的坑，拿真数据再验一次。
+        let cutoff = chrono::Utc::now().timestamp_millis() - 30 * 24 * 60 * 60 * 1000;
+        assert_eq!(
+            db.purge_owners_expired_before(cutoff).unwrap(),
+            0,
+            "刚导入的账号记录不能被 TTL 清掉"
+        );
+        assert_eq!(
+            db.slots_snapshot().unwrap().owners.len(),
+            owners_in_json,
+            "清理之后账号指纹数不该变"
+        );
+        println!("导入后跑一遍 30 天 TTL：一条没掉");
         drop(db);
         let _ = std::fs::remove_dir_all(&scratch);
     }

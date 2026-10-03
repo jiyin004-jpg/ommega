@@ -355,7 +355,9 @@ fn purge_owners_if_due() {
         let mut swept = 0usize;
         for pin in map.values_mut() {
             let before = pin.owners.len();
-            pin.owners.retain(|o| o.last_seen_ms >= cutoff);
+            // 时间戳 0 的不清：那是「不知道什么时候见的」，不是「很久没见」。
+            pin.owners
+                .retain(|o| o.last_seen_ms == 0 || o.last_seen_ms >= cutoff);
             swept += before - pin.owners.len();
         }
         // layer 空的槽位本来就只是「账号登记」，账号清完了整条就可以扔掉。
@@ -367,6 +369,9 @@ fn purge_owners_if_due() {
         swept
     };
     match statedb::shared().purge_owners_expired_before(cutoff) {
+        Ok(n) if n > 500 => tracing::warn!(
+            "soter: 账号指纹过期一次清掉 {n} 条（内存 {swept} 条）—— 量偏大，留意时间戳是不是有问题"
+        ),
         Ok(n) if n > 0 || swept > 0 => {
             tracing::info!("soter: 账号指纹过期清掉 {n} 条（内存 {swept} 条）")
         }
@@ -444,7 +449,8 @@ pub fn owners_of(device_id: &str, uid: i32) -> Vec<String> {
             map.get(&slot_id(device_id, uid)).map(|p| {
                 p.owners
                     .iter()
-                    .filter(|o| now - o.last_seen_ms <= OWNER_TTL_MILLIS)
+                    // 0 = 不知道什么时候见的，按「还有效」算（`purge` 那边也不清它）。
+                    .filter(|o| o.last_seen_ms == 0 || now - o.last_seen_ms <= OWNER_TTL_MILLIS)
                     .map(|o| o.token.clone())
                     .collect()
             })
