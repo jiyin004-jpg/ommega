@@ -59,6 +59,14 @@ versionCode 由版本号推出：`major * 1000000 + minor * 1000 + patch`，模�
 - 包内 `module.prop`：`version` 带的 hash 跟 tag 对得上，`versionCode` 比上一版大
 - `update.json` / `b-update.json` 的 `versionCode` 跟包内一致
 - 附件能下：HEAD 返回 200，`Content-Length` 跟本地文件一致
+- 刷到真机后确认跑的就是模块里那份二进制：
+  `readlink /proc/$(pgrep -f ommega/relay)/exe` 要落在
+  `/data/adb/modules/ommega-b/libs/<abi>/relay`。`/data/adb/ommega/relay` 是「热更新」放
+  二进制的口子（`uninstall.sh` 里就叫 hot-update relay binary），而 `service.sh` 的
+  `find_module_relay()` 让它优先于模块目录 —— 实测（一加 PLC110 / KernelSU 3.3.0，
+  2026-10-03 12:46）：模块已经刷成 `1.6.4-5c41c1a`，`/proc/<pid>/exe` 还指着上一次热更新
+  塞进去的旧二进制，光刷模块只换了 `module.prop`。刷完要么把那份副本删掉（让模块里的
+  生效），要么手工换掉它。
 
 ## Release 规范
 
