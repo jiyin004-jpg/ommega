@@ -333,6 +333,20 @@ soter_start_attempted=0
 last_soter_pid=
 last_soter_attempt_at=0
 
+# 开机头 90 秒里紧凑轮询（1 秒一次）：keystore2 一出现就注上，别等 5 秒的节拍。
+# 因为框架的 onDeviceUnlocked 只有你解锁那一刻一次、从不补发 —— 那一瞬间我们不在
+# keystore2 里，这份解锁材料就永久丢了（影子 keystore 会一直 LOCKED 到下次解锁）。
+EARLY_POLL_SECONDS=90
+started_at=$(date +%s 2>/dev/null || echo 0)
+tick_sleep() {
+  now=$(date +%s 2>/dev/null)
+  if [ -n "$now" ] && [ "$started_at" -gt 0 ] && [ $((now - started_at)) -lt $EARLY_POLL_SECONDS ]; then
+    sleep 1
+  else
+    sleep 5
+  fi
+}
+
 while true; do
   # Config and target list live in the single data location
   # (/data/misc/keystore/ommega/); the webroot UI writes them through the
@@ -348,7 +362,7 @@ while true; do
   fi
 
   if ! prepare_injector; then
-    sleep 5
+    tick_sleep
     continue
   fi
 
@@ -356,7 +370,7 @@ while true; do
     pending_restart=1
     restart_keystore "$(get_keystore_pid)"
     if ! prepare_injector; then
-      sleep 5
+      tick_sleep
       continue
     fi
   fi
@@ -390,7 +404,7 @@ while true; do
     pending_restart=0
     last_attempt_pid=
     last_soter_pid=
-    sleep 5
+    tick_sleep
     continue
   fi
 
@@ -399,12 +413,12 @@ while true; do
   if [ -n "$now" ] && [ "$pending_restart" -eq 0 ]; then
     if [ "$keystore_pending" -eq 1 ] && [ "$last_attempt_pid" = "$pid" ] \
       && [ "$now" -lt $((last_attempt_at + retry_cooldown)) ]; then
-      sleep 5
+      tick_sleep
       continue
     fi
     if [ "$soter_pending" -eq 1 ] && [ "$last_soter_pid" = "$spid" ] \
       && [ "$now" -lt $((last_soter_attempt_at + retry_cooldown)) ]; then
-      sleep 5
+      tick_sleep
       continue
     fi
   fi

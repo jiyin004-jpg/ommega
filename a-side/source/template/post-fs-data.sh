@@ -203,3 +203,57 @@ for rel in $WL_RELS; do
   fi
 done
 unset WL_NAME WL_RELS hide_strongbox
+
+# ── 尽早把两个守护拉起来 ─────────────────────────────────────────────────
+# 为什么抢在 post-fs-data（最早那个阶段）而不是 service.sh（late_start）：注入 keystore2
+# 越早越好 —— 框架的 `onDeviceUnlocked` 只在解锁那一刻发一次、从不补发；那会儿我们还没
+# 进 keystore2 的话，这份解锁材料就永久丢了，影子 keystore 会一直 LOCKED 到下一次解锁。
+# service.sh 里还有一份同样的启动（这里失败/被杀就靠它兑底），它会先看这两个 pid 文件，
+# 活着就不重复启。
+pid_matches_script() {
+  p=$1
+  s=$2
+  [ -r "/proc/$p/cmdline" ] || return 1
+  tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -F "$s" >/dev/null 2>&1
+}
+
+start_daemon_early() {
+  script=$1
+  pidfile=$2
+  if [ -f "$pidfile" ]; then
+    pid=$(cat "$pidfile" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$script"; then
+      return 0
+    fi
+    rm -f "$pidfile"
+  fi
+  # 离开 post-fs-data 阶段后子进程可能被收走，所以用 setsid 脱开（没有就退回普通后台）。
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh "$script" >/dev/null 2>&1 &
+  else
+    sh "$script" >/dev/null 2>&1 &
+  fi
+  pid=$!
+  echo $pid > "$pidfile"
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$script"; then
+    rm -f "$pidfile"
+    return 1
+  fi
+  return 0
+}
+
+if [ -f "$MODDIR/daemon" ]; then
+  if start_daemon_early "$MODDIR/daemon" "$STATE_DIR/keymint-daemon.pid"; then
+    log_line "ommega: keymint daemon started early in post-fs-data"
+  else
+    log_line "ommega: keymint daemon early start failed; service.sh will retry"
+  fi
+fi
+if [ -f "$MODDIR/daemon-injector" ]; then
+  if start_daemon_early "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"; then
+    log_line "ommega: injector daemon started early in post-fs-data"
+  else
+    log_line "ommega: injector daemon early start failed; service.sh will retry"
+  fi
+fi

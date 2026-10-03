@@ -59,12 +59,27 @@ kill_all() {
   sleep 1
 }
 
-kill_all
+# post-fs-data 阶段可能已经把两个守护拉起来了（为了抢在 keystore2 之前守着，好接住开机
+# 解锁那份材料）。那两个还活着就别 kill 重来 —— 那会把刚抢到的时间窗白白丢掉。
+daemons_alive() {
+  for spec in "$STATE_DIR/keymint-daemon.pid:$MODDIR/daemon" "$STATE_DIR/injector-daemon.pid:$MODDIR/daemon-injector"; do
+    pf=${spec%%:*}
+    sp=${spec#*:}
+    [ -f "$pf" ] || return 1
+    p=$(cat "$pf" 2>/dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && pid_matches_script "$p" "$sp" || return 1
+  done
+  return 0
+}
 
-update_status "Ommega ⏳ 启动中"
-
-start_daemon "$MODDIR/daemon" "$STATE_DIR/keymint-daemon.pid"
-start_daemon "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"
+if daemons_alive; then
+  update_status "Ommega ✅ 运行中"
+else
+  kill_all
+  update_status "Ommega ⏳ 启动中"
+  start_daemon "$MODDIR/daemon" "$STATE_DIR/keymint-daemon.pid"
+  start_daemon "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"
+fi
 
 # Bundled PathMask kernel module: pick the .ko matching this kernel and hide
 # /system/priv-app/SoterService only when its binder service cannot be reached
