@@ -202,3 +202,7 @@
  display: flex;
  align-items: center;
 }
+
+/* ommega: 应用条目里那个复选框不再自己接点击 —— 点它只走卡片的 onclick，
+   否则两边各 toggle 一次，checked 和 selected 会对不上（看着就是点了亮着不灭）。 */
+.card .checkbox{pointer-events:none}

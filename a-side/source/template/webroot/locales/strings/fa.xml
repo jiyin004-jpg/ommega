@@ -16,15 +16,15 @@
 
     <string name="help_select_denylist">انتخاب از DenyList</string>
 
-    <string name="help_select_denylist_description">فقط در Magisk موجود است، برنامه‌های�?که در DenyList هستند را انتخاب کنید. توصیه شده.</string>
+    <string name="help_select_denylist_description">فقط در Magisk موجود است، برنامه‌های</string>
 
     <string name="help_deselect_unnecessary">لغو انتخاب غیرضروری</string>
 
-    <string name="help_deselect_unnecessary_description">دسته غیرضروری: ماژول Xposed، مدیر root، برنامه‌ها�?مرتبط با root، و برنامه‌ها�?عمومی که هرگز وضعیت bootloader را بررسی نمی‌کنن�? این گزینه نیاز به اتصال اینترنت دارد.</string>
+    <string name="help_deselect_unnecessary_description">دسته غیرضروری: ماژول Xposed، مدیر root، برنامه‌ها</string>
 
     <string name="help_add_system_app">افزودن برنامه سیستمی</string>
 
-    <string name="help_add_system_app_description">برنامه سیستمی خاص را به لیست برنامه‌ه�?اضافه کنید.</string>
+    <string name="help_add_system_app_description">برنامه سیستمی خاص را به لیست برنامه‌ه</string>
 
     <string name="help_set_keybox">تنظیم AOSP و Valid Keybox</string>
 
@@ -32,7 +32,7 @@
 
     <string name="help_set_custom_keybox">تنظیم Custom Keybox</string>
 
-    <string name="help_set_custom_keybox_description">keybox را از ذخیره‌ساز�?دستگاه خود وارد کنید. فقط فایل xml پشتیبانی می‌شو�?</string>
+    <string name="help_set_custom_keybox_description">keybox را از ذخیره‌ساز</string>
 
     <string name="help_set_security_patch">تنظیم Security Patch</string>
 
@@ -52,7 +52,7 @@
 
     <string name="update_install">نصب</string>
 
-    <string name="update_reboot">راه‌انداز�?مجدد</string>
+    <string name="update_reboot">راه‌اندازی مجدد</string>
 
     <!-- Search -->
 
@@ -102,7 +102,7 @@
 
     <string name="about_telegram_channel">کانال تلگرام</string>
 
-    <string name="about_canary_update">به‌روزرسان�?به آخرین نسخه canary</string>
+    <string name="about_canary_update">به‌روزرسان</string>
 
     <string name="about_disclaimer">ماژول رله اتصال Ommega</string>
 
@@ -114,7 +114,7 @@
 
     <string name="prompt_aosp_key_set">AOSP keybox با موفقیت تنظیم شد</string>
 
-    <string name="prompt_key_set_error">به‌روزرسان�?keybox ناموفق بود</string>
+    <string name="prompt_key_set_error">به‌روزرسان</string>
 
     <string name="prompt_unknown_key_set">Unknown keybox با موفقیت تنظیم شد</string>
 
@@ -129,43 +129,43 @@
     <string name="prompt_boot_key_set">Verified Boot Key با موفقیت ذخیره شد</string>
     <string name="prompt_boot_key_cleared">Verified Boot Key cleared</string>
 
-    <string name="prompt_boot_hash_set_error">به‌روزرسان�?Verified Boot Hash ناموفق بود</string>
+    <string name="prompt_boot_hash_set_error">به‌روزرسان</string>
 
     <string name="prompt_saved_target">پیکربندی در target.txt ذخیره شد</string>
 
     <string name="prompt_save_error">ذخیره پیکربندی ناموفق بود</string>
 
-    <string name="prompt_uninstall_prompt">WebUI پس از راه‌انداز�?مجدد حذف خواهد شد</string>
+    <string name="prompt_uninstall_prompt">WebUI پس از راه‌انداز</string>
 
     <string name="prompt_uninstall_failed">حذف WebUI ناموفق بود</string>
 
     <string name="prompt_checking_update">بررسی به روز رسانی...</string>
 
-    <string name="prompt_new_update">یک بروزرسانی جدید دردسترس می‌باش�?</string>
+    <string name="prompt_new_update">یک بروزرسانی جدید دردسترس می‌باشد!</string>
 
-    <string name="prompt_no_update">در حال حاضر هیچ به‌روزرسان�?موجود نیست</string>
+    <string name="prompt_no_update">در حال حاضر هیچ به‌روزرسان</string>
 
-    <string name="prompt_downloading">دانلود به‌روزرسان�?جدید...</string>
+    <string name="prompt_downloading">دانلود به‌روزرسان</string>
 
     <string name="prompt_downloaded">بارگیری کامل شد</string>
 
     <string name="prompt_download_fail">به روزرسانی بارگیری نشد</string>
 
-    <string name="prompt_installing">در حال نصب به‌روزرسان�?..</string>
+    <string name="prompt_installing">در حال نصب به‌روزرسان</string>
 
-    <string name="prompt_installed">با موفقیت نصب شد، اکنون راه‌انداز�?مجدد کنید.</string>
+    <string name="prompt_installed">با موفقیت نصب شد، اکنون راه‌انداز</string>
 
-    <string name="prompt_install_fail">نصب ناموفق بود، لطفاً به صورت دستی به‌روزرسان�?کنید</string>
+    <string name="prompt_install_fail">نصب ناموفق بود، لطفاً به صورت دستی به‌روزرسانی کنید</string>
 
-    <string name="prompt_rebooting">در حال راه اندازی مجدد�?/string>
+    <string name="prompt_rebooting">در حال راه اندازی مجدد…</string>
 
-    <string name="prompt_reboot_fail">راه‌انداز�?مجدد ناموفق بود، لطفاً به صورت دستی راه‌انداز�?مجدد کنید</string>
+    <string name="prompt_reboot_fail">راه‌انداز</string>
 
     <string name="prompt_custom_key_set">Custom keybox با موفقیت تنظیم شد</string>
 
     <string name="prompt_custom_key_set_error">تنظیم Custom keybox ناموفق بود</string>
 
-    <string name="prompt_no_file_selected">هیچ پرونده‌ا�?گزیده نشده</string>
+    <string name="prompt_no_file_selected">هیچ پرونده‌ا</string>
 
     <string name="prompt_system_app_not_found">برنامه سیستمی یافت نشد</string>
 
@@ -189,7 +189,7 @@
 
     <string name="security_patch_auto_success">Auto config با موفقیت فعال شد</string>
 
-    <string name="security_patch_auto_failed">فعال‌ساز�?Auto config ناموفق بود</string>
+    <string name="security_patch_auto_failed">فعال‌ساز</string>
 
     <string name="security_patch_save_success">Security patch با موفقیت ذخیره شد</string>
 
@@ -211,13 +211,13 @@
 
     <string name="add_system_app_add">افزودن</string>
 
-    <string name="add_system_app_current_list">لیست فعلی برنامه‌ها�?سیستمی</string>
+    <string name="add_system_app_current_list">لیست فعلی برنامه‌ها</string>
 
     <!-- Uninstall confirmation -->
 
     <string name="confirmation_uninstall_title">تأیید حذف؟</string>
 
-    <string name="confirmation_uninstall_message">آیا مطمئن هستید که می‌خواهی�?Tricky Addon را حذف کنید</string>
+    <string name="confirmation_uninstall_message">آیا مطمئن هستید که می‌خواهی</string>
 
     <!-- Mode dialog -->
 

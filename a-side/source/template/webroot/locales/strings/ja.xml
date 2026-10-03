@@ -12,49 +12,49 @@
 
     <!-- Help Menu-->
 
-    <string name="help_help_instructions">使い�?/string>
+    <string name="help_help_instructions">使い方</string>
 
-    <string name="help_save_and_update_description">現在の設定を target.txt に保存します�?/string>
+    <string name="help_save_and_update_description">現在の設定を target.txt に保存します</string>
 
     <string name="help_select_denylist">DenyList から選択</string>
 
-    <string name="help_select_denylist_description">Magisk の環境でのみ使用可能です。DenyList 内のアプリを選択しま�?推奨)�?/string>
+    <string name="help_select_denylist_description">Magisk の環境でのみ使用可能です。DenyList 内のアプリを選択します(推奨)。</string>
 
     <string name="help_deselect_unnecessary">不要な選択を解除</string>
 
-    <string name="help_deselect_unnecessary_description">不要なカテゴリー: Xposed モジュール、root マネージャー、root 関連アプリ、Bootloader の状態を確認しない一般的なアプリです。このオプションはインターネット接続が必要です�?/string>
+    <string name="help_deselect_unnecessary_description">不要なカテゴリー: Xposed モジュール、root マネージャー、root 関連アプリ、Bootloader の状態を確認しない一般的なアプリです。このオプションはインターネット接続が必要です</string>
 
     <string name="help_add_system_app">システムアプリを追加</string>
 
-    <string name="help_add_system_app_description">特定のシステムアプリをアプリリストに追加します�?/string>
+    <string name="help_add_system_app_description">特定のシステムアプリをアプリリストに追加します。</string>
 
     <string name="help_set_keybox">AOSP と有効な Keybox</string>
 
-    <string name="help_set_keybox_description">keybox.xml を置き換えます。インターネット接続が必要です�?/string>
+    <string name="help_set_keybox_description">keybox.xml を置き換えます。インターネット接続が必要です</string>
 
-    <string name="help_set_custom_keybox">カスタム Keybox を設�?/string>
+    <string name="help_set_custom_keybox">カスタム Keybox を設</string>
 
-    <string name="help_set_custom_keybox_description">デバイスのストレージからカスタム Keybox ファイルをインポートします。インポート�?xml ファイルのみ対応しています�?/string>
+    <string name="help_set_custom_keybox_description">デバイスのストレージからカスタム Keybox ファイルをインポートします。インポート</string>
 
     <string name="help_set_security_patch">セキュリティパッチを設定</string>
 
-    <string name="help_set_security_patch_description">カスタムセキュリティパッチの設定です。自動設定は PIF モジュールのセキュリティパッチを使用します。空白のまま保存すると自動設定を無効にします�?/string>
+    <string name="help_set_security_patch_description">カスタムセキュリティパッチの設定です。自動設定は PIF モジュールのセキュリティパッチを使用します。空白のまま保存すると自動設定を無効にします</string>
 
     <string name="help_set_verified_boot_hash">確認付きブートハッシュを設定</string>
 
-    <string name="help_set_verified_boot_hash_description">Key Attestation Demo から確認付きブートハッシュの値を取得します。ro.boot.vbmeta.digest をリセットして異常なブート状態を修正します�?/string>
+    <string name="help_set_verified_boot_hash_description">Key Attestation Demo から確認付きブートハッシュの値を取得します。ro.boot.vbmeta.digest をリセットして異常なブート状態を修正します</string>
 
     <!-- Update -->
 
-    <string name="update_update_available">新しいバージョンの準備完�?/string>
+    <string name="update_update_available">新しいバージョンの準備完了</string>
 
-    <string name="update_redirect_to_release">タップで最新のバージョンをダウンロー�?/string>
+    <string name="update_redirect_to_release">タップで最新のバージョンをダウンロード</string>
 
     <string name="update_changelog">変更履歴</string>
 
     <string name="update_install">インストール</string>
 
-    <string name="update_reboot">再起�?/string>
+    <string name="update_reboot">再起動</string>
 
     <!-- Search -->
 
@@ -64,23 +64,23 @@
 
     <string name="functional_button_save">保存</string>
 
-    <string name="functional_button_uninstall_webui">WebUI をアンインストー�?/string>
+    <string name="functional_button_uninstall_webui">WebUI をアンインストール</string>
 
-    <string name="functional_button_cancel">キャンセ�?/string>
+    <string name="functional_button_cancel">キャンセル</string>
 
     <string name="functional_button_confirm">確認</string>
 
     <!-- Loading -->
 
-    <string name="loading_loading">読み込み�?..</string>
+    <string name="loading_loading">読み込み</string>
 
     <!-- Menu -->
 
     <string name="menu_refresh">更新</string>
 
-    <string name="menu_select_all">すべて選�?/string>
+    <string name="menu_select_all">すべて選</string>
 
-    <string name="menu_deselect_all">すべての選択を解�?/string>
+    <string name="menu_deselect_all">すべての選択を解</string>
 
     <string name="menu_select_denylist">DenyList から選択</string>
 
@@ -97,63 +97,63 @@
 
     <string name="menu_set_security_patch">セキュリティパッチを設定</string>
 
-    <string name="menu_set_devconfig">DevConfig を設�?/string>
+    <string name="menu_set_devconfig">DevConfig を設</string>
 
     <string name="menu_about">このアドオンについて</string>
 
     <!-- Boot Hash -->
 
-    <string name="boot_hash_title">ブートハッシ�?/string>
+    <string name="boot_hash_title">ブートハッシュ</string>
 
-    <string name="boot_hash_input_placeholder">確認付きブートハッシュをここに貼り付�?/string>
+    <string name="boot_hash_input_placeholder">確認付きブートハッシュをここに貼り付</string>
 
     <!-- About -->
 
     <string name="about_module_name_line1">Tricky Addon</string>
 
-    <string name="about_module_name_line2">ターゲットリストを更�?/string>
+    <string name="about_module_name_line2">ターゲットリストを更新</string>
 
-    <string name="about_by">開発�? </string>
+    <string name="about_by">開発者: </string>
 
-    <string name="about_telegram_channel">Telegram チャンネ�?/string>
+    <string name="about_telegram_channel">Telegram チャンネル</string>
 
     <string name="about_canary_update">最新の Canary バージョンに更新</string>
 
-    <string name="about_disclaimer">Ommega アテステーション リレ�?モジュー�?/string>
+    <string name="about_disclaimer">Ommega アテステーション リレ</string>
 
     <string name="about_acknowledgment">謝辞</string>
 
     <!-- Prompt -->
 
-    <string name="prompt_no_internet">インターネット接続を確認してください�?/string>
+    <string name="prompt_no_internet">インターネット接続を確認してください</string>
 
-    <string name="prompt_aosp_key_set">AOSP Keybox の設定に成功しました�?/string>
+    <string name="prompt_aosp_key_set">AOSP Keybox の設定に成功しました。</string>
 
-    <string name="prompt_key_set_error">Keybox の更新に失敗しました�?/string>
+    <string name="prompt_key_set_error">Keybox の更新に失敗しました。</string>
 
-    <string name="prompt_unknown_key_set">不明�?Keybox の設定に成功しました�?/string>
+    <string name="prompt_unknown_key_set">不明</string>
 
-    <string name="prompt_valid_key_set">有効�?Keybox の設定に成功しました�?/string>
+    <string name="prompt_valid_key_set">有効</string>
 
-    <string name="prompt_no_valid">有効�?Keybox がありません�?/string>
+    <string name="prompt_no_valid">有効</string>
 
-    <string name="prompt_boot_hash_set">確認付きブートハッシュの更新に成功しました�?/string>
+    <string name="prompt_boot_hash_set">確認付きブートハッシュの更新に成功しました。</string>
 
-    <string name="prompt_boot_hash_set_error">確認付きブートハッシュの更新に失敗しました�?/string>
+    <string name="prompt_boot_hash_set_error">確認付きブートハッシュの更新に失敗しました。</string>
 
-    <string name="prompt_saved_target">設定�?target.txt に保存しました�?/string>
+    <string name="prompt_saved_target">設定</string>
 
-    <string name="prompt_save_error">設定の保存に失敗しました�?/string>
+    <string name="prompt_save_error">設定の保存に失敗しました。</string>
 
-    <string name="prompt_uninstall_prompt">WebUI を再起動後に削除されます�?/string>
+    <string name="prompt_uninstall_prompt">WebUI を再起動後に削除されます。</string>
 
-    <string name="prompt_uninstall_failed">WebUI のアンインストールに失敗しました�?/string>
+    <string name="prompt_uninstall_failed">WebUI のアンインストールに失敗しました。</string>
 
     <string name="prompt_checking_update">更新を確認しています...</string>
 
     <string name="prompt_new_update">新しいバージョンがあります！</string>
 
-    <string name="prompt_no_update">利用可能な更新はありません�?/string>
+    <string name="prompt_no_update">利用可能な更新はありません。</string>
 
     <string name="prompt_downloading">新しい更新をダウンロード中...</string>
 
@@ -163,13 +163,13 @@
 
     <string name="prompt_installing">更新をインストール中...</string>
 
-    <string name="prompt_installed">正常にインストールされました。再起動してください�?/string>
+    <string name="prompt_installed">正常にインストールされました。再起動してください。</string>
 
-    <string name="prompt_install_fail">インストールに失敗しました。手動で更新してください�?/string>
+    <string name="prompt_install_fail">インストールに失敗しました。手動で更新してください。</string>
 
     <string name="prompt_rebooting">再起動中...</string>
 
-    <string name="prompt_reboot_fail">再起動に失敗しました。手動で再起動してください�?/string>
+    <string name="prompt_reboot_fail">再起動に失敗しました。手動で再起動してください。</string>
 
     <string name="prompt_custom_key_set">カスタム Keybox の設定に成功しました</string>
 
@@ -177,45 +177,45 @@
 
     <string name="prompt_no_file_selected">ファイルが選択されていません</string>
 
-    <string name="prompt_system_app_not_found">システムアプリが見つかりませ�?/string>
+    <string name="prompt_system_app_not_found">システムアプリが見つかりませ</string>
 
-    <string name="prompt_system_app_error">システムアプリの追加に失敗しまし�?/string>
+    <string name="prompt_system_app_error">システムアプリの追加に失敗しまし</string>
 
     <!-- Security Patch -->
 
-    <string name="security_patch_title">セキュリティパッ�?/string>
+    <string name="security_patch_title">セキュリティパッ</string>
 
     <string name="security_patch_advanced_mode">高度</string>
 
-    <string name="security_patch_get_date">セキュリティパッチの日付を取�?/string>
+    <string name="security_patch_get_date">セキュリティパッチの日付を取</string>
 
     <string name="security_patch_auto">自動</string>
 
-    <string name="security_patch_fetching">取得�?..</string>
+    <string name="security_patch_fetching">取得</string>
 
     <string name="security_patch_fetched">完了</string>
 
-    <string name="security_patch_get_failed">セキュリティパッチの日付を取得できませんでし�?/string>
+    <string name="security_patch_get_failed">セキュリティパッチの日付を取得できませんでし</string>
 
     <string name="security_patch_unable_to_connect">source.android.com に接続できません</string>
 
-    <string name="security_patch_auto_success">自動設定が有効化されまし�?/string>
+    <string name="security_patch_auto_success">自動設定が有効化されまし</string>
 
     <string name="security_patch_auto_failed">自動設定が有効化できませんでした</string>
 
     <string name="security_patch_save_success">セキュリティパッチが正常に保存されました</string>
 
-    <string name="security_patch_save_failed">セキュリティパッチの保存に失敗しまし�?/string>
+    <string name="security_patch_save_failed">セキュリティパッチの保存に失敗しまし</string>
 
-    <string name="security_patch_value_empty">セキュリティパッチの設定は無効で�?/string>
+    <string name="security_patch_value_empty">セキュリティパッチの設定は無効で</string>
 
-    <string name="security_patch_invalid_all">無効な形式で�?/string>
+    <string name="security_patch_invalid_all">無効な形式です</string>
 
-    <string name="security_patch_invalid_boot">無効�?boot 形式です</string>
+    <string name="security_patch_invalid_boot">無効</string>
 
-    <string name="security_patch_invalid_system">無効�?system 形式です</string>
+    <string name="security_patch_invalid_system">無効</string>
 
-    <string name="security_patch_invalid_vendor">無効�?vendor 形式です</string>
+    <string name="security_patch_invalid_vendor">無効</string>
 
     <!-- Add System App -->
 
@@ -223,13 +223,13 @@
 
     <string name="add_system_app_add">追加</string>
 
-    <string name="add_system_app_current_list">現在のシステムアプリリス�?/string>
+    <string name="add_system_app_current_list">現在のシステムアプリリス</string>
 
     <!-- Uninstall confirmation -->
 
-    <string name="confirmation_uninstall_title">アンインストールしますか�?/string>
+    <string name="confirmation_uninstall_title">アンインストールしますか？</string>
 
-    <string name="confirmation_uninstall_message">Tricky Addon をアンインストールしてもよろしいです�?/string>
+    <string name="confirmation_uninstall_message">Tricky Addon をアンインストールしてもよろしいですか</string>
 
     <!-- Mode dialog -->
 

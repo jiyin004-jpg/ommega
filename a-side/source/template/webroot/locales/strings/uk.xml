@@ -30,9 +30,7 @@
 
     <string name="help_set_keybox">Встановити AOSP та валідний ключ</string>
 
-    <string name="help_set_keybox_description">Замінити keybox.xml. Для використання валідного ключа потрібне з&apos;єднання з інтернетом.
-
-    <string name="help_set_custom_keybox">Встановити власний ключ</string>
+    <string name="help_set_keybox_description">Replace Ommega keybox.xml. Valid keybox option requires Internet connection and not always available.</string><string name="help_set_custom_keybox">Встановити власний ключ</string>
 
     <string name="help_set_custom_keybox_description">Імпортувати ключі зі сховища вашого пристрою. Підтримуються лише xml файли.</string>
 

@@ -14,41 +14,41 @@
 
     <string name="help_help_instructions">使用指南</string>
 
-    <string name="help_save_and_update_description">保存當前配置到目標列表（target.txt）�?/string>
+    <string name="help_save_and_update_description">保存當前配置到目標列表（target.txt）</string>
 
     <string name="help_select_denylist">從排除列表中選擇</string>
 
-    <string name="help_select_denylist_description">僅適用於 Magisk，選擇在排除列表中的應用。推薦使用�?/string>
+    <string name="help_select_denylist_description">僅適用於 Magisk，選擇在排除列表中的應用。推薦使用。</string>
 
-    <string name="help_deselect_unnecessary">取消選擇非必要應�?/string>
+    <string name="help_deselect_unnecessary">取消選擇非必要應用</string>
 
-    <string name="help_deselect_unnecessary_description">非必要分類：Xposed 模組、root 管理器、與 root 相關的應用，以及從不檢查 bootloader 狀態的通用應用。此功能需連網使用�?/string>
+    <string name="help_deselect_unnecessary_description">非必要分類：Xposed 模組、root 管理器、與 root 相關的應用，以及從不檢查 bootloader 狀態的通用應用。此功能需連網使用</string>
 
     <string name="help_add_system_app">添加系統應用</string>
 
-    <string name="help_add_system_app_description">添加特定系統應用到應用列表�?/string>
+    <string name="help_add_system_app_description">添加特定系統應用到應用列表。</string>
 
     <string name="help_set_keybox">設置 AOSP &amp; 有效密鑰</string>
 
-    <string name="help_set_keybox_description">替換密鑰（keybox.xml）。有效密鑰選項需連網使用，不保證能一直提供�?/string>
+    <string name="help_set_keybox_description">替換密鑰（keybox.xml）。有效密鑰選項需連網使用，不保證能一直提供</string>
 
-    <string name="help_set_custom_keybox">設置自定義密�?/string>
+    <string name="help_set_custom_keybox">設置自定義密</string>
 
-    <string name="help_set_custom_keybox_description">從設備存儲導入自定義密鑰。僅支持 xml 文件�?/string>
+    <string name="help_set_custom_keybox_description">從設備存儲導入自定義密鑰。僅支持 xml 文件</string>
 
     <string name="help_set_security_patch">設置安全補丁</string>
 
-    <string name="help_set_security_patch_description">設置自定義安全補丁。自動配置將使用 PIF 模組的安全補丁。留空保存則禁用自動配置�?/string>
+    <string name="help_set_security_patch_description">設置自定義安全補丁。自動配置將使用 PIF 模組的安全補丁。留空保存則禁用自動配置</string>
 
-    <string name="help_set_verified_boot_hash">設置哈希�?/string>
+    <string name="help_set_verified_boot_hash">設置哈希</string>
 
-    <string name="help_set_verified_boot_hash_description">�?Key Attestation Demo 獲取 verifiedBootHash（哈希值）。通過重置 ro.boot.vbmeta.digest 修復異常 boot 狀態�?/string>
+    <string name="help_set_verified_boot_hash_description"></string>
 
     <!-- Update -->
 
-    <string name="update_update_available">發現新版�?/string>
+    <string name="update_update_available">發現新版本</string>
 
-    <string name="update_redirect_to_release">點擊下載最新版�?/string>
+    <string name="update_redirect_to_release">點擊下載最新版本</string>
 
     <string name="update_changelog">更新日誌</string>
 
@@ -74,7 +74,7 @@
 
     <!-- Loading -->
 
-    <string name="loading_loading">加載�?..</string>
+    <string name="loading_loading">加載</string>
 
     <!-- Menu -->
 
@@ -86,7 +86,7 @@
 
     <string name="menu_select_denylist">從排除列表中選擇</string>
 
-    <string name="menu_deselect_unnecessary">取消選擇非必要應�?/string>
+    <string name="menu_deselect_unnecessary">取消選擇非必要應用</string>
 
     <string name="menu_add_system_app">添加系統應用</string>
 
@@ -103,9 +103,9 @@
 
     <string name="menu_keybox_valid">有效</string>
 
-    <string name="menu_keybox_custom">自定�?/string>
+    <string name="menu_keybox_custom">自定</string>
 
-    <string name="menu_set_verified_boot_hash">設置哈希�?/string>
+    <string name="menu_set_verified_boot_hash">設置哈希</string>
 
     <string name="menu_set_security_patch">設置安全補丁</string>
 
@@ -119,9 +119,9 @@
 
     <!-- Boot Hash -->
 
-    <string name="boot_hash_title">哈希�?/string>
+    <string name="boot_hash_title">哈希值</string>
 
-    <string name="boot_hash_input_placeholder">在此貼上您的哈希�?/string>
+    <string name="boot_hash_input_placeholder">在此貼上您的哈希</string>
 
     <!-- About -->
 
@@ -135,7 +135,7 @@
 
     <string name="about_canary_update">下載最新測試版</string>
 
-    <string name="about_translation_update">更新翻譯�?/string>
+    <string name="about_translation_update">更新翻譯包</string>
 
     <string name="about_disclaimer">Ommega 認證中繼模組</string>
 
@@ -153,11 +153,11 @@
 
     <string name="prompt_valid_key_set">成功設置有效密鑰</string>
 
-    <string name="prompt_no_valid">未找到有效密鑰�?/string>
+    <string name="prompt_no_valid">未找到有效密鑰</string>
 
-    <string name="prompt_boot_hash_set">哈希值重置成�?/string>
+    <string name="prompt_boot_hash_set">哈希值重置成功</string>
 
-    <string name="prompt_boot_hash_set_error">哈希值重置失�?/string>
+    <string name="prompt_boot_hash_set_error">哈希值重置失敗</string>
 
     <string name="prompt_saved_target">成功保存配置</string>
 
@@ -171,7 +171,7 @@
 
     <string name="prompt_new_update">發現新版本！</string>
 
-    <string name="prompt_no_update">當前已是最新版�?/string>
+    <string name="prompt_no_update">當前已是最新版本</string>
 
     <string name="prompt_downloading">正在下載...</string>
 
@@ -181,7 +181,7 @@
 
     <string name="prompt_installing">正在安裝...</string>
 
-    <string name="prompt_installed">安裝完成，重啟生�?/string>
+    <string name="prompt_installed">安裝完成，重啟生效</string>
 
     <string name="prompt_install_fail">安裝失敗，請手動更新</string>
 
@@ -189,15 +189,15 @@
 
     <string name="prompt_reboot_fail">重啟失敗，請手動重啟</string>
 
-    <string name="prompt_translation_updated">翻譯包更新成�?/string>
+    <string name="prompt_translation_updated">翻譯包更新成功</string>
 
-    <string name="prompt_translation_update_failed">翻譯包更新失�?/string>
+    <string name="prompt_translation_update_failed">翻譯包更新失敗</string>
 
-    <string name="prompt_custom_key_set">成功設置自定義密�?/string>
+    <string name="prompt_custom_key_set">成功設置自定義密鑰</string>
 
-    <string name="prompt_custom_key_set_error">設置自定義密鑰失�?/string>
+    <string name="prompt_custom_key_set_error">設置自定義密鑰失</string>
 
-    <string name="prompt_no_file_selected">未選擇文�?/string>
+    <string name="prompt_no_file_selected">未選擇文</string>
 
     <string name="prompt_system_app_not_found">未找到該系統應用</string>
 
@@ -213,13 +213,13 @@
 
     <string name="security_patch_auto">自動</string>
 
-    <string name="security_patch_fetching">獲取�?..</string>
+    <string name="security_patch_fetching">獲取</string>
 
     <string name="security_patch_fetched">完成</string>
 
     <string name="security_patch_get_failed">獲取安全補丁日期失敗</string>
 
-    <string name="security_patch_unable_to_connect">無法連線�?source.android.com</string>
+    <string name="security_patch_unable_to_connect">無法連線</string>
 
     <string name="security_patch_auto_success">自動配置成功啟用</string>
 
@@ -229,7 +229,7 @@
 
     <string name="security_patch_save_failed">保存安全補丁失敗</string>
 
-    <string name="security_patch_value_empty">安全補丁配置已禁�?/string>
+    <string name="security_patch_value_empty">安全補丁配置已禁</string>
 
     <string name="security_patch_invalid_all">無效格式</string>
 
@@ -249,9 +249,9 @@
 
     <!-- Uninstall confirmation -->
 
-    <string name="confirmation_uninstall_title">確認卸載�?/string>
+    <string name="confirmation_uninstall_title">確認卸載？</string>
 
-    <string name="confirmation_uninstall_message">您確定要卸載 TS 插件�?/string>
+    <string name="confirmation_uninstall_message">您確定要卸載 TS 插件嗎</string>
 
     <!-- Mode dialog -->
 

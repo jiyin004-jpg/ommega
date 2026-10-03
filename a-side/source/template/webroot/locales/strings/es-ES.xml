@@ -30,9 +30,7 @@
 
     <string name="help_set_keybox">Configurar AOSP y Keybox Válido</string>
 
-    <string name="help_set_keybox_description">Reemplazar el archivo keybox.xml. Esta opción requiere conexión a Internet.
-
-    <string name="help_set_custom_keybox">Establecer Keybox Personalizado</string>
+    <string name="help_set_keybox_description">Replace Ommega keybox.xml. Valid keybox option requires Internet connection and not always available.</string><string name="help_set_custom_keybox">Establecer Keybox Personalizado</string>
 
     <string name="help_set_custom_keybox_description">Importar keybox desde el almacenamiento de tu dispositivo. Solo soporta archivos xml.</string>
 

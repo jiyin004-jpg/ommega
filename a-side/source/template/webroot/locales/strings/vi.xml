@@ -2,7 +2,7 @@
 
 <resources>
 
-    <string name="system_default">Mặc định h�?thống</string>
+    <string name="system_default">Mặc định hệ thống</string>
 
     <string name="more_language">Thêm</string>
 
@@ -16,39 +16,37 @@
 
     <string name="help_save_and_update_description">Lưu cấu hình hiện tại vào target.txt.</string>
 
-    <string name="help_select_denylist">Chọn t�?DenyList</string>
+    <string name="help_select_denylist">Chọn t</string>
 
-    <string name="help_select_denylist_description">Ch�?kh�?dụng trong Magisk, chọn ứng dụng nằm trong DenyList. Khuyến ngh�?s�?dụng.</string>
+    <string name="help_select_denylist_description">Ch</string>
 
-    <string name="help_deselect_unnecessary">B�?chọn không cần thiết</string>
+    <string name="help_deselect_unnecessary">B</string>
 
-    <string name="help_deselect_unnecessary_description">Danh mục không cần thiết: Trình quản lý root, module Xposed, ứng dụng liên quan đến root và các ứng dụng thông thường không bao gi�?kiểm tra trạng thái bootloader. Tùy chọn này yêu cầu kết nối Internet.</string>
+    <string name="help_deselect_unnecessary_description">Danh mục không cần thiết: Trình quản lý root, module Xposed, ứng dụng liên quan đến root và các ứng dụng thông thường không bao gi</string>
 
-    <string name="help_add_system_app">Thêm ứng dụng h�?thống</string>
+    <string name="help_add_system_app">Thêm ứng dụng hệ thống</string>
 
-    <string name="help_add_system_app_description">Thêm ứng dụng h�?thống c�?th�?vào danh sách ứng dụng.</string>
+    <string name="help_add_system_app_description">Thêm ứng dụng h</string>
 
-    <string name="help_set_keybox">Đặt AOSP &amp; Keybox hợp l�?/string>
+    <string name="help_set_keybox">Đặt AOSP &amp; Keybox hợp l</string>
 
-    <string name="help_set_keybox_description">Thay th�?keybox.xml. Tùy chọn Keybox hợp l�?yêu cầu kết nối Internet và không phải lúc nào cũng kh�?dụng.
+    <string name="help_set_keybox_description">Thay thế Keybox của TrickyStore bằng:</string><string name="help_set_custom_keybox">Đặt Keybox tùy chỉnh</string>
 
-    <string name="help_set_custom_keybox">Đặt Keybox tùy chỉnh</string>
-
-    <string name="help_set_custom_keybox_description">Nhập Keybox t�?b�?nh�?thiết b�?của bạn. Ch�?h�?tr�?tệp xml.</string>
+    <string name="help_set_custom_keybox_description">Nhập Keybox t</string>
 
     <string name="help_set_security_patch">Đặt bản vá bảo mật</string>
 
-    <string name="help_set_security_patch_description">Đặt spoof bản vá bảo mật tùy chỉnh. Cấu hình t�?động s�?s�?dụng bản vá bảo mật t�?module PIF. Đ�?trống và lưu đ�?tắt cấu hình t�?động.</string>
+    <string name="help_set_security_patch_description">Đặt spoof bản vá bảo mật tùy chỉnh. Cấu hình t</string>
 
     <string name="help_set_verified_boot_hash">Đặt Verified Boot Hash</string>
 
-    <string name="help_set_verified_boot_hash_description">Lấy giá tr�?verifiedBootHash t�?Key Attestation Demo. Sửa trạng thái boot bất thường bằng cách đặt lại ro.boot.vbmeta.digest.</string>
+    <string name="help_set_verified_boot_hash_description">Lấy giá tr</string>
 
     <!-- Update -->
 
     <string name="update_update_available">Đã có phiên bản mới</string>
 
-    <string name="update_redirect_to_release">Nhấn đ�?tải phiên bản mới nhất</string>
+    <string name="update_redirect_to_release">Nhấn đ</string>
 
     <string name="update_changelog">Nhật ký thay đổi</string>
 
@@ -64,11 +62,11 @@
 
     <string name="functional_button_save">Lưu</string>
 
-    <string name="functional_button_uninstall_webui">G�?cài đặt WebUI</string>
+    <string name="functional_button_uninstall_webui">G</string>
 
     <string name="functional_button_close">Đóng</string>
 
-    <string name="functional_button_cancel">Hu�?/string>
+    <string name="functional_button_cancel">Huỷ</string>
 
     <string name="functional_button_confirm">Xác nhận</string>
 
@@ -80,15 +78,15 @@
 
     <string name="menu_refresh">Làm mới</string>
 
-    <string name="menu_select_all">Chọn tất c�?/string>
+    <string name="menu_select_all">Chọn tất c</string>
 
-    <string name="menu_deselect_all">B�?chọn tất c�?/string>
+    <string name="menu_deselect_all">B</string>
 
-    <string name="menu_select_denylist">Chọn t�?DenyList</string>
+    <string name="menu_select_denylist">Chọn t</string>
 
-    <string name="menu_deselect_unnecessary">B�?chọn không cần thiết</string>
+    <string name="menu_deselect_unnecessary">B</string>
 
-    <string name="menu_add_system_app">Thêm ứng dụng h�?thống</string>
+    <string name="menu_add_system_app">Thêm ứng dụng hệ thống</string>
 
     <string name="menu_keybox">Keybox</string>
 
@@ -96,9 +94,9 @@
 
     <string name="menu_keybox_unknown">Không xác định</string>
 
-    <string name="menu_keybox_valid">Hợp l�?/string>
+    <string name="menu_keybox_valid">Hợp l</string>
 
-    <string name="menu_keybox_custom">Tu�?chỉnh</string>
+    <string name="menu_keybox_custom">Tu</string>
 
     <string name="menu_set_verified_boot_hash">Đặt Verified Boot Hash</string>
 
@@ -106,9 +104,9 @@
 
     <string name="menu_set_devconfig">Đặt DevConfig</string>
 
-    <string name="menu_help">H�?tr�?/string>
+    <string name="menu_help">Hỗ trợ</string>
 
-    <string name="menu_language">Ngôn ng�?/string>
+    <string name="menu_language">Ngôn ngữ</string>
 
     <string name="menu_about">Giới thiệu</string>
 
@@ -142,13 +140,13 @@
 
     <string name="prompt_aosp_key_set">Đã đặt AOSP Keybox thành công</string>
 
-    <string name="prompt_key_set_error">Không th�?cập nhật Keybox</string>
+    <string name="prompt_key_set_error">Không th</string>
 
     <string name="prompt_unknown_key_set">Đã đặt Keybox không xác định thành công</string>
 
-    <string name="prompt_valid_key_set">Đã đặt Keybox hợp l�?thành công</string>
+    <string name="prompt_valid_key_set">Đã đặt Keybox hợp l</string>
 
-    <string name="prompt_no_valid">Không tìm thấy Keybox hợp l�?/string>
+    <string name="prompt_no_valid">Không tìm thấy Keybox hợp l</string>
 
     <string name="prompt_boot_hash_set">Đã lưu Verified Boot Hash thành công</string>
     <string name="menu_set_verified_boot_key">Đặt Verified Boot Key</string>
@@ -157,15 +155,15 @@
     <string name="prompt_boot_key_set">Đã lưu Verified Boot Key thành công</string>
     <string name="prompt_boot_key_cleared">Verified Boot Key cleared</string>
 
-    <string name="prompt_boot_hash_set_error">Không th�?cập nhật Verified Boot Hash</string>
+    <string name="prompt_boot_hash_set_error">Không th</string>
 
     <string name="prompt_saved_target">Đã lưu cấu hình vào target.txt</string>
 
-    <string name="prompt_save_error">Không th�?lưu cấu hình</string>
+    <string name="prompt_save_error">Không th</string>
 
-    <string name="prompt_uninstall_prompt">WebUI s�?b�?G�?cài đặt sau khi khởi động lại</string>
+    <string name="prompt_uninstall_prompt">WebUI s</string>
 
-    <string name="prompt_uninstall_failed">Không th�?G�?cài đặt WebUI</string>
+    <string name="prompt_uninstall_failed">Không th</string>
 
     <string name="prompt_checking_update">Đang kiểm tra cập nhật...</string>
 
@@ -177,17 +175,17 @@
 
     <string name="prompt_downloaded">Tải xuống hoàn tất</string>
 
-    <string name="prompt_download_fail">Không th�?tải bản cập nhật</string>
+    <string name="prompt_download_fail">Không th</string>
 
     <string name="prompt_installing">Đang cài đặt bản cập nhật...</string>
 
     <string name="prompt_installed">Cài đặt thành công, khởi động lại ngay.</string>
 
-    <string name="prompt_install_fail">Không th�?cài đặt, vui lòng cập nhật th�?công</string>
+    <string name="prompt_install_fail">Không th</string>
 
     <string name="prompt_rebooting">Đang khởi động lại...</string>
 
-    <string name="prompt_reboot_fail">Không th�?khởi động lại, vui lòng khởi động lại th�?công</string>
+    <string name="prompt_reboot_fail">Không th</string>
 
     <string name="prompt_translation_updated">Gói dịch thuật đã được cập nhật thành công</string>
 
@@ -195,13 +193,13 @@
 
     <string name="prompt_custom_key_set">Đã đặt Keybox tùy chỉnh thành công</string>
 
-    <string name="prompt_custom_key_set_error">Không th�?đặt Keybox tùy chỉnh</string>
+    <string name="prompt_custom_key_set_error">Không th</string>
 
     <string name="prompt_no_file_selected">Chưa chọn tệp nào</string>
 
-    <string name="prompt_system_app_not_found">Không tìm thấy ứng dụng h�?thống</string>
+    <string name="prompt_system_app_not_found">Không tìm thấy ứng dụng h</string>
 
-    <string name="prompt_system_app_error">Không th�?thêm ứng dụng h�?thống</string>
+    <string name="prompt_system_app_error">Không th</string>
 
     <!-- Security Patch -->
 
@@ -211,53 +209,53 @@
 
     <string name="security_patch_get_date">Lấy ngày bản vá bảo mật</string>
 
-    <string name="security_patch_auto">T�?động</string>
+    <string name="security_patch_auto">T</string>
 
     <string name="security_patch_fetching">Đang lấy...</string>
 
     <string name="security_patch_fetched">Hoàn tất</string>
 
-    <string name="security_patch_get_failed">Không th�?lấy ngày bản vá bảo mật</string>
+    <string name="security_patch_get_failed">Không th</string>
 
-    <string name="security_patch_unable_to_connect">Không th�?kết nối tới source.android.com</string>
+    <string name="security_patch_unable_to_connect">Không th</string>
 
-    <string name="security_patch_auto_success">Bật cấu hình t�?động thành công</string>
+    <string name="security_patch_auto_success">Bật cấu hình t</string>
 
-    <string name="security_patch_auto_failed">Không th�?bật cấu hình t�?động</string>
+    <string name="security_patch_auto_failed">Không th</string>
 
     <string name="security_patch_save_success">Đã lưu bản vá bảo mật thành công</string>
 
-    <string name="security_patch_save_failed">Không th�?lưu bản vá bảo mật</string>
+    <string name="security_patch_save_failed">Không th</string>
 
     <string name="security_patch_value_empty">Đã tắt cấu hình bản vá bảo mật</string>
 
-    <string name="security_patch_invalid_all">Định dạng không hợp l�?/string>
+    <string name="security_patch_invalid_all">Định dạng không hợp lệ</string>
 
-    <string name="security_patch_invalid_boot">Định dạng boot không hợp l�?/string>
+    <string name="security_patch_invalid_boot">Định dạng boot không hợp l</string>
 
-    <string name="security_patch_invalid_system">Định dạng system không hợp l�?/string>
+    <string name="security_patch_invalid_system">Định dạng system không hợp l</string>
 
-    <string name="security_patch_invalid_vendor">Định dạng vendor không hợp l�?/string>
+    <string name="security_patch_invalid_vendor">Định dạng vendor không hợp l</string>
 
     <!-- Add System App -->
 
-    <string name="add_system_app_title">Thêm ứng dụng h�?thống</string>
+    <string name="add_system_app_title">Thêm ứng dụng hệ thống</string>
 
     <string name="add_system_app_add">Thêm</string>
 
-    <string name="add_system_app_current_list">Danh sách ứng dụng h�?thống hiện tại</string>
+    <string name="add_system_app_current_list">Danh sách ứng dụng h</string>
 
     <!-- Uninstall confirmation -->
 
-    <string name="confirmation_uninstall_title">Xác nhận G�?cài đặt?</string>
+    <string name="confirmation_uninstall_title">Xác nhận G</string>
 
-    <string name="confirmation_uninstall_message">Bạn có chắc muốn G�?cài đặt Tricky Addon không?</string>
+    <string name="confirmation_uninstall_message">Bạn có chắc muốn G</string>
 
     <!-- Mode dialog -->
 
-    <string name="mode_dialog_title">Ch�?đ�?/string>
+    <string name="mode_dialog_title">Chế độ</string>
 
-    <string name="mode_auto">T�?động</string>
+    <string name="mode_auto">Tự động</string>
 
     <string name="mode_certificate_generating">Cert Generating (!)</string>
 

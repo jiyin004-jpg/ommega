@@ -30,9 +30,7 @@
 
     <string name="help_set_keybox">Imposta AOSP &amp; Keybox Valida</string>
 
-    <string name="help_set_keybox_description">Sostituisci keybox.xml. L&apos;opzione valida per la keybox richiede una connessione Internet.
-
-    <string name="help_set_custom_keybox">Imposta Keybox Personalizzata</string>
+    <string name="help_set_keybox_description">Sostituire keybox TrickyStore con:</string><string name="help_set_custom_keybox">Imposta Keybox Personalizzata</string>
 
     <string name="help_set_custom_keybox_description">Importa keybox dalla memoria del tuo dispositivo. Supporta solo file xml.</string>
 

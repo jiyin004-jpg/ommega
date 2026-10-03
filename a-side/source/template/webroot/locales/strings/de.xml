@@ -40,7 +40,7 @@
 
     <string name="help_set_verified_boot_hash">Verifizierten Boot-Hash setzen</string>
 
-    <string name="help_set_verified_boot_hash_description">Wert „verifiedBootHash�?aus der Key Attestation Demo abrufen. Behebt einen abnormalen Bootzustand durch Zurücksetzen von ro.boot.vbmeta.digest.</string>
+    <string name="help_set_verified_boot_hash_description">Wert „verifiedBootHash</string>
 
     <!-- Update -->
 

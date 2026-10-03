@@ -2,57 +2,57 @@
 
 <resources>
 
-    <string name="system_default">সিস্টে�?পূর্�?নির্ধারি�?/string>
+    <string name="system_default">সিস্টে</string>
 
-    <string name="more_language">আর�?/string>
+    <string name="more_language">আরো</string>
 
     <!-- Header -->
 
     <!-- Help Menu-->
 
-    <string name="help_help_instructions">নির্দেশন�?/string>
+    <string name="help_help_instructions">নির্দেশনা</string>
 
-    <string name="help_save_and_update_description">বর্তমা�?কনফিগারেশন target.txt �?সে�?করুন�?/string>
+    <string name="help_save_and_update_description">বর্তমা</string>
 
     <string name="help_select_denylist">DenyList থেকে নির্বাচন করুন</string>
 
-    <string name="help_select_denylist_description">শুধুমাত্�?Magisk �?উপলব্ধ, DenyList �?থাকা অ্যাপগুল�?নির্বাচন করুন�?সুপারিশকৃত�?/string>
+    <string name="help_select_denylist_description">শুধুমাত্</string>
 
     <string name="help_deselect_unnecessary">অপ্রয়োজনীয় নির্বাচন প্রত্যাহার করুন</string>
 
-    <string name="help_deselect_unnecessary_description">অপ্রয়োজনীয় বিভা�? Xposed মডিউ�? root ম্যানেজা�? root-সম্পর্কি�?অ্যা�? এব�?সাধারণ অ্যা�?যা কখনও bootloader স্ট্যাটা�?চে�?কর�?না�?এই অপশন ইন্টারনে�?সংযো�?প্রয়োজন�?/string>
+    <string name="help_deselect_unnecessary_description">অপ্রয়োজনীয় বিভা</string>
 
-    <string name="help_add_system_app">সিস্টে�?অ্যা�?যো�?করুন</string>
+    <string name="help_add_system_app">সিস্টে</string>
 
-    <string name="help_add_system_app_description">অ্যা�?তালিকায় নির্দিষ্�?সিস্টে�?অ্যা�?যো�?করুন�?/string>
+    <string name="help_add_system_app_description">অ্যা</string>
 
-    <string name="help_set_keybox">AOSP এব�?Valid Keybox সে�?করুন</string>
+    <string name="help_set_keybox">AOSP এব</string>
 
-    <string name="help_set_keybox_description">keybox.xml প্রতিস্থাপ�?করুন�?Valid keybox অপশন ইন্টারনে�?সংযো�?প্রয়োজন এব�?সবসময় উপলব্ধ নয়।</string>
+    <string name="help_set_keybox_description">keybox.xml প্রতিস্থাপ</string>
 
-    <string name="help_set_custom_keybox">Custom Keybox সে�?করুন</string>
+    <string name="help_set_custom_keybox">Custom Keybox সে</string>
 
-    <string name="help_set_custom_keybox_description">আপনা�?ডিভাইস স্টোরে�?থেকে keybox ইমপোর্�?করুন�?শুধুমাত্�?xml ফাইল সমর্থন করে।</string>
+    <string name="help_set_custom_keybox_description">আপনা</string>
 
-    <string name="help_set_security_patch">Security Patch সে�?করুন</string>
+    <string name="help_set_security_patch">Security Patch সে</string>
 
-    <string name="help_set_security_patch_description">Custom security patch spoof সে�?করুন�?Auto config PIF মডিউ�?থেকে security patch ব্যবহা�?করবে�?খালি রাখু�?এব�?সে�?করুন auto config নিষ্ক্রিয় করতে�?/string>
+    <string name="help_set_security_patch_description">Custom security patch spoof সে</string>
 
-    <string name="help_set_verified_boot_hash">Verified Boot Hash সে�?করুন</string>
+    <string name="help_set_verified_boot_hash">Verified Boot Hash সে</string>
 
-    <string name="help_set_verified_boot_hash_description">Key Attestation Demo থেকে verifiedBootHash মা�?পান। ro.boot.vbmeta.digest রিসে�?কর�?অস্বাভাবিক boot state ঠি�?করুন�?/string>
+    <string name="help_set_verified_boot_hash_description">Key Attestation Demo থেকে verifiedBootHash মা</string>
 
     <!-- Update -->
 
-    <string name="update_update_available">একটি নতুন সংস্কর�?প্রস্তুত</string>
+    <string name="update_update_available">একটি নতুন সংস্কর</string>
 
-    <string name="update_redirect_to_release">সর্বশে�?সংস্কর�?ডাউনলো�?করতে ট্যা�?করুন</string>
+    <string name="update_redirect_to_release">সর্বশে</string>
 
     <string name="update_changelog">পরিবর্তন তালিকা</string>
 
     <string name="update_install">ইনস্টল করুন</string>
 
-    <string name="update_reboot">রিবু�?/string>
+    <string name="update_reboot">রিবুট</string>
 
     <!-- Search -->
 
@@ -60,140 +60,140 @@
 
     <!-- Functional Button -->
 
-    <string name="functional_button_save">সে�?করুন</string>
+    <string name="functional_button_save">সেভ করুন</string>
 
     <string name="functional_button_uninstall_webui">WebUI আনইনস্টল করুন</string>
 
     <string name="functional_button_cancel">ক্যানসেল করুন</string>
 
-    <string name="functional_button_confirm">নিশ্চি�?করুন</string>
+    <string name="functional_button_confirm">নিশ্চিত করুন</string>
 
     <!-- Loading -->
 
-    <string name="loading_loading">লো�?হচ্ছ�?..</string>
+    <string name="loading_loading">লো</string>
 
     <!-- Menu -->
 
-    <string name="menu_refresh">রিফ্রে�?/string>
+    <string name="menu_refresh">রিফ্রে</string>
 
     <string name="menu_select_all">সব নির্বাচন করুন</string>
 
-    <string name="menu_deselect_all">সমস্�?নির্বাচন প্রত্যাহার করুন</string>
+    <string name="menu_deselect_all">সমস্</string>
 
     <string name="menu_select_denylist">DenyList থেকে নির্বাচন করুন</string>
 
     <string name="menu_deselect_unnecessary">অপ্রয়োজনীয় নির্বাচন প্রত্যাহার করুন</string>
 
-    <string name="menu_add_system_app">সিস্টে�?অ্যা�?যো�?করুন</string>
+    <string name="menu_add_system_app">সিস্টে</string>
 
-    <string name="menu_set_verified_boot_hash">Verified Boot Hash সে�?করুন</string>
+    <string name="menu_set_verified_boot_hash">Verified Boot Hash সে</string>
 
-    <string name="menu_set_security_patch">Security Patch সে�?করুন</string>
+    <string name="menu_set_security_patch">Security Patch সে</string>
 
     <string name="menu_about">সম্পর্কে</string>
 
     <!-- Boot Hash -->
 
-    <string name="boot_hash_input_placeholder">আপনা�?verified Boot Hash এখান�?পেস্�?করুন</string>
+    <string name="boot_hash_input_placeholder">আপনা</string>
 
     <!-- About -->
 
     <string name="about_by">দ্বারা</string>
 
-    <string name="about_telegram_channel">টেলিগ্রা�?চ্যানে�?/string>
+    <string name="about_telegram_channel">টেলিগ্রা</string>
 
-    <string name="about_canary_update">সর্বশে�?canary সংস্করণে আপডে�?করুন</string>
+    <string name="about_canary_update">সর্বশে</string>
 
-    <string name="about_disclaimer">Ommega অ্যাটেস্টেশন রিলে মডিউ�?/string>
+    <string name="about_disclaimer">Ommega অ্যাটেস্টেশন রিলে মডিউ</string>
 
-    <string name="about_acknowledgment">কৃতজ্ঞতা স্বীকা�?/string>
+    <string name="about_acknowledgment">কৃতজ্ঞতা স্বীকার</string>
 
     <!-- Prompt -->
 
-    <string name="prompt_no_internet">অনুগ্র�?কর�?আপনা�?ইন্টারনে�?সংযো�?চে�?করুন�?/string>
+    <string name="prompt_no_internet">অনুগ্র</string>
 
-    <string name="prompt_aosp_key_set">AOSP keybox সফলভাব�?সে�?হয়েছে</string>
+    <string name="prompt_aosp_key_set">AOSP keybox সফলভাব</string>
 
-    <string name="prompt_key_set_error">Keybox আপডে�?করতে ব্যর্থ</string>
+    <string name="prompt_key_set_error">Keybox আপডে</string>
 
-    <string name="prompt_unknown_key_set">Unknown keybox সফলভাব�?সে�?হয়েছে</string>
+    <string name="prompt_unknown_key_set">Unknown keybox সফলভাব</string>
 
-    <string name="prompt_valid_key_set">Valid keybox সফলভাব�?সে�?হয়েছে</string>
+    <string name="prompt_valid_key_set">Valid keybox সফলভাব</string>
 
-    <string name="prompt_no_valid">কো�?valid keybox পাওয়া যায়নি�?/string>
+    <string name="prompt_no_valid">কো</string>
 
-    <string name="prompt_boot_hash_set">Verified Boot Hash সফলভাব�?সে�?হয়েছে</string>
-    <string name="menu_set_verified_boot_key">Verified Boot Key সে�?করুন</string>
+    <string name="prompt_boot_hash_set">Verified Boot Hash সফলভাব</string>
+    <string name="menu_set_verified_boot_key">Verified Boot Key সে</string>
     <string name="boot_key_title">Boot Key</string>
-    <string name="boot_key_input_placeholder">আপনা�?verified Boot Key এখান�?পেস্�?করুন</string>
-    <string name="prompt_boot_key_set">Verified Boot Key সফলভাব�?সে�?হয়েছে</string>
+    <string name="boot_key_input_placeholder">আপনা</string>
+    <string name="prompt_boot_key_set">Verified Boot Key সফলভাব</string>
     <string name="prompt_boot_key_cleared">Verified Boot Key cleared</string>
 
-    <string name="prompt_boot_hash_set_error">Verified Boot Hash আপডে�?করতে ব্যর্থ</string>
+    <string name="prompt_boot_hash_set_error">Verified Boot Hash আপডে</string>
 
-    <string name="prompt_saved_target">কনফি�?target.txt �?সে�?হয়েছে</string>
+    <string name="prompt_saved_target">কনফি</string>
 
-    <string name="prompt_save_error">কনফি�?সে�?করতে ব্যর্থ</string>
+    <string name="prompt_save_error">কনফি</string>
 
-    <string name="prompt_uninstall_prompt">রিবুটে�?পর WebUI সরান�?হব�?/string>
+    <string name="prompt_uninstall_prompt">রিবুটে</string>
 
     <string name="prompt_uninstall_failed">WebUI আনইনস্টল করতে ব্যর্থ</string>
 
-    <string name="prompt_checking_update">হালনাগাদের জন্য পরীক্ষা কর�?হচ্ছ�?..</string>
+    <string name="prompt_checking_update">হালনাগাদের জন্য পরীক্ষা কর</string>
 
-    <string name="prompt_new_update">একটি নতুন আপডে�?উপলব্ধ</string>
+    <string name="prompt_new_update">একটি নতুন আপডেট উপলব্ধ</string>
 
-    <string name="prompt_no_update">বর্তমানে কো�?আপডে�?উপলব্ধ নে�?/string>
+    <string name="prompt_no_update">বর্তমানে কো</string>
 
-    <string name="prompt_downloading">নতুন আপডে�?ডাউনলো�?হচ্ছ�?..</string>
+    <string name="prompt_downloading">নতুন আপডে</string>
 
-    <string name="prompt_downloaded">ডাউনলো�?সম্পন্�?হয়েছে</string>
+    <string name="prompt_downloaded">ডাউনলো</string>
 
-    <string name="prompt_download_fail">আপডে�?ডাউনলো�?করতে ব্যর্থ</string>
+    <string name="prompt_download_fail">আপডে</string>
 
-    <string name="prompt_installing">আপডে�?ইন্সটল হচ্ছ�?..</string>
+    <string name="prompt_installing">আপডে</string>
 
-    <string name="prompt_installed">সফলভাব�?ইন্সটল হয়েছে, এখ�?রিবু�?করুন�?/string>
+    <string name="prompt_installed">সফলভাব</string>
 
-    <string name="prompt_install_fail">ইন্সটল করতে ব্যর্থ, অনুগ্র�?কর�?ম্যানুয়াল�?আপডে�?করুন</string>
+    <string name="prompt_install_fail">ইন্সটল করতে ব্যর্থ, অনুগ্র</string>
 
-    <string name="prompt_rebooting">রিবু�?হচ্ছ�?..</string>
+    <string name="prompt_rebooting">রিবু</string>
 
-    <string name="prompt_reboot_fail">রিবু�?করতে ব্যর্থ, অনুগ্র�?কর�?ম্যানুয়াল�?রিবু�?করুন</string>
+    <string name="prompt_reboot_fail">রিবু</string>
 
-    <string name="prompt_custom_key_set">Custom keybox সফলভাব�?সে�?হয়েছে</string>
+    <string name="prompt_custom_key_set">Custom keybox সফলভাব</string>
 
-    <string name="prompt_custom_key_set_error">Custom keybox সে�?করতে ব্যর্থ</string>
+    <string name="prompt_custom_key_set_error">Custom keybox সে</string>
 
-    <string name="prompt_no_file_selected">কোনো ফাইল সিলেক্�?কর�?হয় নি</string>
+    <string name="prompt_no_file_selected">কোনো ফাইল সিলেক্</string>
 
-    <string name="prompt_system_app_not_found">সিস্টে�?অ্যা�?পাওয়া যায়নি</string>
+    <string name="prompt_system_app_not_found">সিস্টে</string>
 
-    <string name="prompt_system_app_error">সিস্টে�?অ্যা�?যো�?করতে ব্যর্থ</string>
+    <string name="prompt_system_app_error">সিস্টে</string>
 
     <!-- Security Patch -->
 
     <string name="security_patch_advanced_mode">অগ্রসর</string>
 
-    <string name="security_patch_get_date">Security Patch Date পা�?/string>
+    <string name="security_patch_get_date">Security Patch Date পা</string>
 
-    <string name="security_patch_auto">অট�?/string>
+    <string name="security_patch_auto">অট</string>
 
-    <string name="security_patch_fetching">আনয়�?হচ্ছ�?..</string>
+    <string name="security_patch_fetching">আনয়</string>
 
-    <string name="security_patch_fetched">সম্পন্�?/string>
+    <string name="security_patch_fetched">সম্পন্</string>
 
-    <string name="security_patch_get_failed">Security patch date আনয়�?করতে ব্যর্থ</string>
+    <string name="security_patch_get_failed">Security patch date আনয়</string>
 
-    <string name="security_patch_unable_to_connect">source.android.com এর সাথে সংযো�?করতে অক্ষ�?/string>
+    <string name="security_patch_unable_to_connect">source.android.com এর সাথে সংযো</string>
 
-    <string name="security_patch_auto_success">Auto config সফলভাব�?সক্রিয�?হয়েছে</string>
+    <string name="security_patch_auto_success">Auto config সফলভাব</string>
 
-    <string name="security_patch_auto_failed">Auto config সক্রিয�?করতে ব্যর্থ</string>
+    <string name="security_patch_auto_failed">Auto config সক্রিয</string>
 
-    <string name="security_patch_save_success">Security patch সফলভাব�?সে�?হয়েছে</string>
+    <string name="security_patch_save_success">Security patch সফলভাব</string>
 
-    <string name="security_patch_save_failed">Security patch সে�?করতে ব্যর্থ</string>
+    <string name="security_patch_save_failed">Security patch সে</string>
 
     <string name="security_patch_value_empty">Security patch কনফিগারেশন নিষ্ক্রিয়</string>
 
@@ -207,17 +207,17 @@
 
     <!-- Add System App -->
 
-    <string name="add_system_app_title">সিস্টে�?অ্যা�?যো�?করুন</string>
+    <string name="add_system_app_title">সিস্টে</string>
 
-    <string name="add_system_app_add">যো�?করুন</string>
+    <string name="add_system_app_add">যো</string>
 
-    <string name="add_system_app_current_list">বর্তমা�?সিস্টে�?অ্যা�?তালিকা</string>
+    <string name="add_system_app_current_list">বর্তমা</string>
 
     <!-- Uninstall confirmation -->
 
-    <string name="confirmation_uninstall_title">আনইনস্টল নিশ্চি�?করুন?</string>
+    <string name="confirmation_uninstall_title">আনইনস্টল নিশ্চিত করুন?</string>
 
-    <string name="confirmation_uninstall_message">আপনি কি নিশ্চি�?যে আপনি Tricky Addon আনইনস্টল করতে চা�?/string>
+    <string name="confirmation_uninstall_message">আপনি কি নিশ্চি</string>
 
     <!-- Mode dialog -->
 

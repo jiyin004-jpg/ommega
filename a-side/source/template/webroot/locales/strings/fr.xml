@@ -30,9 +30,7 @@
 
     <string name="help_set_keybox">Définir une Keybox AOSP &amp; Valide</string>
 
-    <string name="help_set_keybox_description">Remplacer le fichier keybox.xml. L&apos;option keybox valide nécessite une connexion Internet.
-
-    <string name="help_set_custom_keybox">Définir une Keybox personnalisée</string>
+    <string name="help_set_keybox_description">Replace Ommega keybox.xml. Valid keybox option requires Internet connection and not always available.</string><string name="help_set_custom_keybox">Définir une Keybox personnalisée</string>
 
     <string name="help_set_custom_keybox_description">Importer une keybox depuis le stockage de votre appareil. Seuls les fichiers XML sont pris en charge.</string>
 
@@ -74,7 +72,7 @@
 
     <!-- Loading -->
 
-    <string name="loading_loading">Chargement�?/string>
+    <string name="loading_loading">Chargement</string>
 
     <!-- Menu -->
 
@@ -173,19 +171,19 @@
 
     <string name="prompt_no_update">Il aucune mise à jour disponible pour le moment</string>
 
-    <string name="prompt_downloading">Téléchargement de la mise à jour�?/string>
+    <string name="prompt_downloading">Téléchargement de la mise à jour…</string>
 
     <string name="prompt_downloaded">Téléchargement terminé</string>
 
     <string name="prompt_download_fail">Échec du téléchargement de la mise à jour</string>
 
-    <string name="prompt_installing">Installation de la mise à jour�?/string>
+    <string name="prompt_installing">Installation de la mise à jour</string>
 
     <string name="prompt_installed">Installation réussie, redémarrez maintenant.</string>
 
     <string name="prompt_install_fail">Échec de l&apos;installation, veuillez mettre à jour manuellement</string>
 
-    <string name="prompt_rebooting">Redémarrage�?/string>
+    <string name="prompt_rebooting">Redémarrage…</string>
 
     <string name="prompt_reboot_fail">Échec du redémarrage, veuillez redémarrer manuellement</string>
 
@@ -213,7 +211,7 @@
 
     <string name="security_patch_auto">Automatique</string>
 
-    <string name="security_patch_fetching">Récupération�?/string>
+    <string name="security_patch_fetching">Récupération</string>
 
     <string name="security_patch_fetched">Terminé</string>
 

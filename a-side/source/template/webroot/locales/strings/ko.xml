@@ -2,9 +2,9 @@
 
 <resources>
 
-    <string name="system_default">시스�?기본</string>
+    <string name="system_default">시스템 기본</string>
 
-    <string name="more_language">�?보기</string>
+    <string name="more_language"></string>
 
     <!-- Header -->
 
@@ -12,57 +12,57 @@
 
     <!-- Help Menu-->
 
-    <string name="help_help_instructions">설명�?/string>
+    <string name="help_help_instructions">설명서</string>
 
-    <string name="help_save_and_update_description">현재 설정�?target.txt�?저장합니다.</string>
+    <string name="help_save_and_update_description">현재 설정</string>
 
     <string name="help_select_denylist">DenyList에서 선택</string>
 
-    <string name="help_select_denylist_description">(권장�? Magisk 사용자만 사용�?�?있으�? DenyList�?포함�?앱을 선택합니�?</string>
+    <string name="help_select_denylist_description">(권장</string>
 
-    <string name="help_deselect_unnecessary">필요 없는 �?선택 해제</string>
+    <string name="help_deselect_unnecessary">필요 없는 앱 선택 해제</string>
 
-    <string name="help_deselect_unnecessary_description">불필요한 카테고리: Xposed 모듈, 루트 관리자, 루트 관�?�? �?부트로�?상태�?절대 확인하지 않는 일반 앱을 선택 해제합니�? �?옵션은 인터�?연결�?필요합니�?</string>
+    <string name="help_deselect_unnecessary_description">불필요한 카테고리: Xposed 모듈, 루트 관리자, 루트 관</string>
 
-    <string name="help_add_system_app">시스�?�?추가</string>
+    <string name="help_add_system_app">시스템 앱 추가</string>
 
-    <string name="help_add_system_app_description">특정 시스�?앱을 �?리스트에 추가합니�?</string>
+    <string name="help_add_system_app_description">특정 시스</string>
 
-    <string name="help_set_keybox">AOSP �?유효�?키박�?설정</string>
+    <string name="help_set_keybox">AOSP</string>
 
-    <string name="help_set_keybox_description">keybox.xml�?교체합니�? 유효 키박�?옵션은 인터�?연결�?필요하며 항상 사용�?�?있는 것은 아닙니다.</string>
+    <string name="help_set_keybox_description">keybox.xml</string>
 
-    <string name="help_set_custom_keybox">유저 정의 키박�?설정</string>
+    <string name="help_set_custom_keybox">유저 정의 키박</string>
 
-    <string name="help_set_custom_keybox_description">기기 저장소에서 키박스를 가져옵니다. XML 파일�?지원됩니다.</string>
+    <string name="help_set_custom_keybox_description">기기 저장소에서 키박스를 가져옵니다. XML 파일</string>
 
     <string name="help_set_security_patch">보안 패치 설정</string>
 
-    <string name="help_set_security_patch_description">유저 정의 보안 패치 스푸핑을 설정합니�? 자동 구성은 PIF 모듈에서 보안 패치�?사용합니�? �?상태�?두고 저장하�?자동 구성�?비활성화합니�?</string>
+    <string name="help_set_security_patch_description">유저 정의 보안 패치 스푸핑을 설정합니</string>
 
     <string name="help_set_verified_boot_hash">Verified Boot 해시 설정</string>
 
-    <string name="help_set_verified_boot_hash_description">Key Attestation Demo에서 검증된 verifiedBootHash 값을 가져옵니다. ro.boot.vbmeta.digest�?재설정하�?비정상적�?부�?상태�?수정합니�?</string>
+    <string name="help_set_verified_boot_hash_description">Key Attestation Demo에서 검증된 verifiedBootHash 값을 가져옵니다. ro.boot.vbmeta.digest</string>
 
     <!-- Update -->
 
-    <string name="update_update_available">�?버전�?준비되었습니다.</string>
+    <string name="update_update_available"></string>
 
-    <string name="update_redirect_to_release">탭해�?최신 버전�?다운로드합니�?</string>
+    <string name="update_redirect_to_release">탭해</string>
 
-    <string name="update_changelog">변�?로그</string>
+    <string name="update_changelog">변경 로그</string>
 
     <string name="update_install">설치</string>
 
-    <string name="update_reboot">재부�?/string>
+    <string name="update_reboot">재부팅</string>
 
     <!-- Search -->
 
-    <string name="search_bar_search_placeholder">검�?/string>
+    <string name="search_bar_search_placeholder">검색</string>
 
     <!-- Functional Button -->
 
-    <string name="functional_button_save">저�?/string>
+    <string name="functional_button_save">저장</string>
 
     <string name="functional_button_uninstall_webui">WebUI 제거</string>
 
@@ -72,7 +72,7 @@
 
     <!-- Loading -->
 
-    <string name="loading_loading">로드 �?..</string>
+    <string name="loading_loading">로드</string>
 
     <!-- Menu -->
 
@@ -84,9 +84,9 @@
 
     <string name="menu_select_denylist">DenyList에서 선택</string>
 
-    <string name="menu_deselect_unnecessary">필요 없는 �?선택 해제</string>
+    <string name="menu_deselect_unnecessary">필요 없는 앱 선택 해제</string>
 
-    <string name="menu_add_system_app">시스�?�?추가</string>
+    <string name="menu_add_system_app">시스템 앱 추가</string>
 
     <string name="menu_set_verified_boot_hash">Verified Boot 해시 설정</string>
 
@@ -98,9 +98,9 @@
 
     <!-- Boot Hash -->
 
-    <string name="boot_hash_title">부�?해시</string>
+    <string name="boot_hash_title">부트 해시</string>
 
-    <string name="boot_hash_input_placeholder">여기�?Verified Boot Hash 값을 입력하세�?</string>
+    <string name="boot_hash_input_placeholder">여기</string>
 
     <!-- About -->
 
@@ -114,72 +114,72 @@
 
     <string name="about_canary_update">최신 canary 버전으로 업데이트하기</string>
 
-    <string name="about_disclaimer">Ommega 인증 릴레�?모듈</string>
+    <string name="about_disclaimer">Ommega 인증 릴레</string>
 
-    <string name="about_acknowledgment">크레�?/string>
+    <string name="about_acknowledgment">크레딧</string>
 
     <!-- Prompt -->
 
-    <string name="prompt_no_internet">인터�?연결�?확인해주세요.</string>
+    <string name="prompt_no_internet">인터</string>
 
-    <string name="prompt_aosp_key_set">AOSP 키박스가 성공적으�?설정되었습니�?</string>
+    <string name="prompt_aosp_key_set">AOSP 키박스가 성공적으</string>
 
-    <string name="prompt_key_set_error">키박�?갱신�?실패했습니다.</string>
+    <string name="prompt_key_set_error">키박</string>
 
-    <string name="prompt_unknown_key_set">�?�?없는 키박스가 성공적으�?설정되었습니�?</string>
+    <string name="prompt_unknown_key_set"></string>
 
-    <string name="prompt_valid_key_set">유효 키박스가 성공적으�?설정되었습니�?</string>
+    <string name="prompt_valid_key_set">유효 키박스가 성공적으</string>
 
-    <string name="prompt_no_valid">유효 키박스를 찾을�?없습니다.</string>
+    <string name="prompt_no_valid">유효 키박스를 찾을</string>
 
-    <string name="prompt_boot_hash_set">Verified Boot 해시가 성공적으�?설정되었습니�?</string>
+    <string name="prompt_boot_hash_set">Verified Boot 해시가 성공적으</string>
     <string name="menu_set_verified_boot_key">Verified Boot 키 설정</string>
-    <string name="boot_key_title">부�?키</string>
-    <string name="boot_key_input_placeholder">여기�?Verified Boot Key 값을 입력하세�?</string>
-    <string name="prompt_boot_key_set">Verified Boot 키가 성공적으�?설정되었습니�?</string>
+    <string name="boot_key_title">부</string>
+    <string name="boot_key_input_placeholder">여기</string>
+    <string name="prompt_boot_key_set">Verified Boot 키가 성공적으</string>
     <string name="prompt_boot_key_cleared">Verified Boot Key cleared</string>
 
-    <string name="prompt_boot_hash_set_error">Verified Boot 설정�?실패했습니다.</string>
+    <string name="prompt_boot_hash_set_error">Verified Boot 설정</string>
 
-    <string name="prompt_saved_target">target.txt�?설정�?저장했습니�?</string>
+    <string name="prompt_saved_target">target.txt</string>
 
     <string name="prompt_save_error">설정 저장에 실패했습니다.</string>
 
-    <string name="prompt_uninstall_prompt">재부�?�?WebUI가 제거됩니�?</string>
+    <string name="prompt_uninstall_prompt">재부</string>
 
-    <string name="prompt_uninstall_failed">WebUI 제거�?실패했습니다.</string>
+    <string name="prompt_uninstall_failed">WebUI 제거</string>
 
-    <string name="prompt_checking_update">업데이트 확인 �?..</string>
+    <string name="prompt_checking_update">업데이트 확인 중...</string>
 
-    <string name="prompt_new_update">�?업데이트가 있습니다!</string>
+    <string name="prompt_new_update"></string>
 
     <string name="prompt_no_update">현재 업데이트가 없습니다.</string>
 
-    <string name="prompt_downloading">�?업데이트 다운로드 �?..</string>
+    <string name="prompt_downloading"></string>
 
     <string name="prompt_downloaded">다운로드 완료</string>
 
-    <string name="prompt_download_fail">업데이트 다운로드�?실패했습니다.</string>
+    <string name="prompt_download_fail">업데이트 다운로드</string>
 
-    <string name="prompt_installing">업데이트 설치 �?..</string>
+    <string name="prompt_installing">업데이트 설치</string>
 
-    <string name="prompt_installed">설치가 성공적으�?완료되었습니�? 지�?재부팅해 주세�?</string>
+    <string name="prompt_installed">설치가 성공적으</string>
 
-    <string name="prompt_install_fail">설치�?실패했습니다. 수동으로 업데이트�?주세�?</string>
+    <string name="prompt_install_fail">설치</string>
 
-    <string name="prompt_rebooting">재부�?�?..</string>
+    <string name="prompt_rebooting">재부팅 중...</string>
 
-    <string name="prompt_reboot_fail">재부팅에 실패했습니다. 수동으로 재부팅해 주세�?</string>
+    <string name="prompt_reboot_fail">재부팅에 실패했습니다. 수동으로 재부팅해 주세요.</string>
 
-    <string name="prompt_custom_key_set">유저 정의 키박스가 성공적으�?설정되었습니�?</string>
+    <string name="prompt_custom_key_set">유저 정의 키박스가 성공적으</string>
 
-    <string name="prompt_custom_key_set_error">유저 정의 키박�?설정�?실패했습니다.</string>
+    <string name="prompt_custom_key_set_error">유저 정의 키박</string>
 
-    <string name="prompt_no_file_selected">선택�?파일�?없습니다.</string>
+    <string name="prompt_no_file_selected">선택</string>
 
-    <string name="prompt_system_app_not_found">시스�?앱을 찾을�?없습니다.</string>
+    <string name="prompt_system_app_not_found">시스</string>
 
-    <string name="prompt_system_app_error">시스�?�?추가�?실패했습니다.</string>
+    <string name="prompt_system_app_error">시스</string>
 
     <!-- Security Patch -->
 
@@ -187,49 +187,49 @@
 
     <string name="security_patch_advanced_mode">고급</string>
 
-    <string name="security_patch_get_date">보안 패치 날짜 가져오�?/string>
+    <string name="security_patch_get_date">보안 패치 날짜 가져오</string>
 
     <string name="security_patch_auto">자동</string>
 
-    <string name="security_patch_fetching">가져오�?�?..</string>
+    <string name="security_patch_fetching">가져오</string>
 
     <string name="security_patch_fetched">완료</string>
 
-    <string name="security_patch_get_failed">보안 패치 날짜 취득�?실패했습니다.</string>
+    <string name="security_patch_get_failed">보안 패치 날짜 취득</string>
 
-    <string name="security_patch_unable_to_connect">source.android.com�?연결�?�?없습니다.</string>
+    <string name="security_patch_unable_to_connect">source.android.com</string>
 
-    <string name="security_patch_auto_success">자동 설정�?켜졌습니�?</string>
+    <string name="security_patch_auto_success">자동 설정</string>
 
     <string name="security_patch_auto_failed">자동 설정 활성화에 실패했습니다.</string>
 
-    <string name="security_patch_save_success">보안 패치�?성공적으�?저장했습니�?</string>
+    <string name="security_patch_save_success">보안 패치</string>
 
     <string name="security_patch_save_failed">보안 패치 저장에 실패했습니다.</string>
 
-    <string name="security_patch_value_empty">보안 패치 구성�?비활성화 되어 있습니다.</string>
+    <string name="security_patch_value_empty">보안 패치 구성</string>
 
-    <string name="security_patch_invalid_all">잘못�?형식</string>
+    <string name="security_patch_invalid_all">잘못된 형식</string>
 
-    <string name="security_patch_invalid_boot">잘못�?boot 형식</string>
+    <string name="security_patch_invalid_boot">잘못</string>
 
-    <string name="security_patch_invalid_system">잘못�?system 형식</string>
+    <string name="security_patch_invalid_system">잘못</string>
 
-    <string name="security_patch_invalid_vendor">잘못�?vendor 형식</string>
+    <string name="security_patch_invalid_vendor">잘못</string>
 
     <!-- Add System App -->
 
-    <string name="add_system_app_title">시스�?�?추가</string>
+    <string name="add_system_app_title">시스템 앱 추가</string>
 
     <string name="add_system_app_add">추가</string>
 
-    <string name="add_system_app_current_list">현재 시스�?�?리스�?/string>
+    <string name="add_system_app_current_list">현재 시스</string>
 
     <!-- Uninstall confirmation -->
 
     <string name="confirmation_uninstall_title">삭제 확인</string>
 
-    <string name="confirmation_uninstall_message">정말 Tricky Addon�?삭제할까�?</string>
+    <string name="confirmation_uninstall_message">정말 Tricky Addon을 삭제할까요?</string>
 
     <!-- Mode dialog -->
 

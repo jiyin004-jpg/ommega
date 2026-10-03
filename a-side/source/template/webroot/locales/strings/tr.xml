@@ -30,9 +30,7 @@
 
     <string name="help_set_keybox">AOSP &amp; Geçerli Keybox Ayarla</string>
 
-    <string name="help_set_keybox_description">keybox.xml dosyasını değiştirir. Geçerli keybox seçeneği internet bağlantısı gerektirir.
-
-    <string name="help_set_custom_keybox">Özel Keybox Ayarla</string>
+    <string name="help_set_keybox_description">Replace Ommega keybox.xml. Valid keybox option requires Internet connection and not always available.</string><string name="help_set_custom_keybox">Özel Keybox Ayarla</string>
 
     <string name="help_set_custom_keybox_description">Cihaz depolamasından bir keybox dosyasını içe aktarın. Sadece xml dosyaları desteklenir.</string>
 
