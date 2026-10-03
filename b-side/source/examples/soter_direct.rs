@@ -15,6 +15,17 @@ use ommegaclient_b::soter::hal::Soter;
 const DEFAULT_ALIAS: &str = "SoterAuthKeyV2_saltc2e99f57_scene1";
 const CHALLENGE: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
+/// 一段数据的短指纹（FNV-1a 64）。用来比「两次铸造是不是同一把钥匙」：
+/// 只看头几个字节会被 JSON/PEM 包装骗到，看签名又带随机数。
+fn fingerprint(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 fn main() -> Result<()> {
     // 跟 relay 的 main 一样先起 binder 的 ProcessState：`Soter::open()` 会先试 AIDL
     // 那条后端，rsbinder 没初始化就直接 panic（HIDL 那家不需要）。
@@ -45,6 +56,13 @@ fn main() -> Result<()> {
         println!("[direct] generate_ask_key_pair -> {ask}");
         let auth = soter.generate_auth_key_pair(uid, &alias)?;
         println!("[direct] generate_auth_key_pair-> {auth}");
+        let ask_pub = soter.export_ask_public_key(uid)?;
+        println!(
+            "[direct] export_ask_public_key   -> {} ({} bytes) fp={}",
+            ask_pub.error_code,
+            ask_pub.data.len(),
+            fingerprint(&ask_pub.data)
+        );
     }
 
     let ask = soter.has_ask_already(uid)?;
@@ -59,6 +77,11 @@ fn main() -> Result<()> {
         pub_key.error_code,
         pub_key.data.len()
     );
+    // 公钥的指纹：同一个 (uid, alias) 重铸之后是不是同一把钥匙，只能靠它判定
+    // （前几十字节是 JSON/PEM 包装，谁铸都一样；签名还带随机数，也比不了）。
+    if !pub_key.data.is_empty() {
+        println!("[direct]   pub_key fp: {}", fingerprint(&pub_key.data));
+    }
 
     let session = soter.init_sign(uid, &alias, CHALLENGE)?;
     println!(
