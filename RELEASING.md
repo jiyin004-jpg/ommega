@@ -70,6 +70,50 @@ versionCode 由版本号推出：`major * 1000000 + minor * 1000 + patch`，模�
   塞进去的旧二进制，光刷模块只换了 `module.prop`。刷完要么把那份副本删掉（让模块里的
   生效），要么手工换掉它。
 
+## 服务端上线
+
+服务端不走 OTA，是手工换二进制：`scp` 到 `/tmp`，校验 sha，停服再换（跑着的时候 `cp`
+会 `Text file busy`），换完留备份：
+
+```sh
+cp -a /opt/relay/relay_rs /opt/relay/relay_rs.pre<改动名>-$(date +%Y%m%d-%H%M%S)
+systemctl stop relay_rs
+install -m 755 /tmp/relay_rs.new /opt/relay/relay_rs
+systemctl start relay_rs
+systemctl is-active relay_rs; sha256sum /opt/relay/relay_rs
+```
+
+验活看两个口子（2026-10-03 实测）：`curl -s http://127.0.0.1:10886/api/status/` 是明文 200，
+TLS 在 `https://127.0.0.1:8443/api/status/`。别再拿 https 打 10886，那个口子不答 TLS，
+会拿到空内容、看着像没起来。业务日志全在 `/opt/relay/relay.out.log`（带 ANSI 颜色，
+先 `sed -r 's/\x1b\[[0-9;]*m//g'` 去掉），systemd 那边只有起停记录。
+
+换完记得把 Release 里的 `relay_rs-*` 附件一起换掉（`gh release upload <tag> <文件> --clobber`），
+不然「master == Release == 线上」这条对不上。
+
+### 账号指纹登记表（`soter_slots.json` 的 `owners`）
+
+`soter_mint` 会把一个槽位上认到的微信账号记进 `data/soter_slots.json`，靠它决定收到 uid 级
+全清（`remove_all_uid_key`）时要不要转发：槽位上有两个以上账号时只答成功、不往下转发，
+免得一发全清把同 uid 其它号的开通记录一起废掉。
+
+这份登记表是运行时慢慢认出来的，换机 / 清库 / 新数据目录时是空的，头几个小时等于没保护。
+日志里已经有全部「别名 ↔ (设备, uid)」的历史，种一次就生效：
+
+```sh
+python3 server/deploy/seed_soter_owners.py            # 先看统计
+cp -a /opt/relay/data/soter_slots.json /opt/relay/data/soter_slots.json.bak-$(date +%Y%m%d-%H%M%S)
+systemctl stop relay_rs
+python3 server/deploy/seed_soter_owners.py --apply    # 写 /tmp/soter_slots.merged.json
+install -m 644 /tmp/soter_slots.merged.json /opt/relay/data/soter_slots.json
+systemctl start relay_rs
+```
+
+必须停服再换：进程里那份 map 是权威，跑着的时候它下一次写盘会盖掉手工改的内容。脚本只动
+`owners`，各槽位的钉子（`layer` / `at_millis`）原样保留。认到账号时日志会打
+`槽位 <设备>|<uid> 上认到第 N 个账号指纹`，拦下清空打 `uid 级全清会连坐`（2026-10-03 实测：
+种表后 2536 个 op 里有 71 次清空请求，30 次被拦下，全是 2~11 个账号的槽位）。
+
 ## Release 规范
 
 - 标题一律 `vX.Y.Z`，跟 tag 一字不差。不带项目名（`Ommega 1.6.0` 那种）、不带端侧名和
