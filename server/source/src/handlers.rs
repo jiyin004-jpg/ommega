@@ -1188,6 +1188,26 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         }
     );
 
+    // 探测机（春秋 / 鸭子）的 SOTER 请求不落 B 端：用服务端内置物料就地作答。这两台探测器
+    // 把整套流程反复地跑，每一笔都要真机 TEE 陪着走一遍（实测当前每分钟十几到二十几笔），
+    // 而它们要的只是「SOTER 能不能用」。判据在 `soter_probe` 里（别人自己写的 A 端没有本地
+    // 兜底，这些流量只有服务端看得见）。attest 走的是另一条路，这里一个字都不动。
+    let uid_arg = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+    let probe_alias_arg = body.get("alias").and_then(Value::as_str);
+    if let Some(why) = crate::soter_probe::reason(&state.cfg, requested, uid_arg, probe_alias_arg) {
+        let reply = run_layer_soter(state, "builtin", body, requested).await;
+        if let Some(v) = reply.filter(|v| v.get("error").is_none()) {
+            tracing::info!(
+                "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
+                 用服务端内置物料作答，不落 B"
+            );
+            return Json(v).into_response();
+        }
+        // 内置层不认这个 op（`generate_app_secure_key` 之类）：照原来的路走，别把探测机
+        // 变成 503。
+        tracing::warn!("soter: op={op} uid={probe_uid} 探测机（{why}）内置层不认这笔，照原路走");
+    }
+
     let gate_uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     let alias_arg = body.get("alias").and_then(Value::as_str);
     // 削峰：同一台设备上同一份只读 op（`has_auth_key` / `has_ask_already` / `export_*`）

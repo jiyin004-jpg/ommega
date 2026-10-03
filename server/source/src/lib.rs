@@ -18,6 +18,7 @@ pub mod pay;
 pub mod queue;
 pub mod soter_gate;
 pub mod soter_mint;
+pub mod soter_probe;
 pub mod soter_sign_sessions;
 pub mod statedb;
 pub mod strongbox;

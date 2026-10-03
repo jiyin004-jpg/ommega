@@ -235,7 +235,7 @@ impl StateDb {
     pub fn load_sessions(&self) -> Result<Vec<(String, SessionRow)>> {
         let conn = self.plain();
         let mut stmt = conn.prepare(&format!("SELECT {} FROM sessions", Self::SESSION_COLS))?;
-        let rows = stmt.query_map([], |r| Self::session_row(r))?;
+        let rows = stmt.query_map([], Self::session_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -250,7 +250,7 @@ impl StateDb {
             "SELECT {} FROM sessions ORDER BY used_epoch_ms DESC, created_epoch_ms DESC LIMIT ?1",
             Self::SESSION_COLS
         ))?;
-        let rows = stmt.query_map(params![limit as i64], |r| Self::session_row(r))?;
+        let rows = stmt.query_map(params![limit as i64], Self::session_row)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -268,7 +268,7 @@ impl StateDb {
                     Self::SESSION_COLS
                 ),
                 params![alias],
-                |r| Self::session_row(r),
+                Self::session_row,
             )
             .optional()?;
         Ok(row.map(|(_, s)| s))

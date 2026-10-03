@@ -59,6 +59,17 @@ pub struct Config {
     /// 不一样：同一个槽位的 ASK / AuthKey / 签名必须出自同一层，早一步换层就是
     /// 给 App 递了另一把钥匙。所以 SOTER 多等一会儿，宁可慢也别换错身份。
     pub soter_wait_result_timeout_secs: u64,
+    /// 「这些 SOTER 调用只在服务端内置物料上作答、不落 B 端」的别名前缀名单
+    /// （`RELAY_SOTER_LOCAL_ONLY_PREFIXES`，缺省就是两台探测机春秋/鸭子）。
+    ///
+    /// 写 `none`/`off`/`-` 关掉。见 `soter_probe`：attest 那条路不受影响。
+    pub soter_local_only_prefixes: String,
+    /// 再给一份手写的 uid 名单（`RELAY_SOTER_LOCAL_ONLY_UIDS`，缺省空）。
+    ///
+    /// 写法两种：`10401`（哪台点名设备都算）和 `device-b-c3f204aa:10401`（只认这台）。
+    /// 探测机那几个不带别名的 op 靠它和「槽位学过」两条判据兜（uid 号跨设备复用，
+    /// 手写一条就等于拍板把那个槽位当探测机，所以要人自己决定）。
+    pub soter_local_only_uids: String,
     /// Long-poll default timeout, seconds.
     pub poll_timeout_secs: u64,
     /// MySQL connection URL: `mysql://user:pass@host:port/dbname`
@@ -119,6 +130,8 @@ impl Default for Config {
             assignment_timeout_secs: 3,
             wait_result_timeout_secs: 3,
             soter_wait_result_timeout_secs: 15,
+            soter_local_only_prefixes: crate::soter_probe::DEFAULT_PREFIXES.to_string(),
+            soter_local_only_uids: String::new(),
             poll_timeout_secs: 30,
             mysql_url: String::new(),
             mysql_time_zone: "+08:00".to_string(),
@@ -254,6 +267,12 @@ impl Config {
         cfg.wait_result_timeout_secs = env_u64("RELAY_WAIT_RESULT_TIMEOUT", 3);
         cfg.soter_wait_result_timeout_secs =
             env_u64("RELAY_SOTER_WAIT_RESULT_TIMEOUT", 15).max(cfg.wait_result_timeout_secs);
+        if let Some(v) = env_or_dotenv(&dotenv, "RELAY_SOTER_LOCAL_ONLY_PREFIXES") {
+            cfg.soter_local_only_prefixes = v;
+        }
+        if let Some(v) = env_or_dotenv(&dotenv, "RELAY_SOTER_LOCAL_ONLY_UIDS") {
+            cfg.soter_local_only_uids = v;
+        }
         cfg.poll_timeout_secs = env_u64("RELAY_POLL_TIMEOUT", 30);
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_MYSQL_URL") {
             cfg.mysql_url = v;

@@ -111,6 +111,8 @@ fn parse_rsa_private(pem: &str) -> Result<RsaPrivateKey> {
 /// 进程内的 SOTER 物料库。
 struct Store {
     self_signed: Mutex<Option<Arc<MintKey>>>,
+    /// 专给探测机作答的那一把（见 `crate::soter_probe`），自己一份、永不轮换。
+    builtin: Mutex<Option<Arc<MintKey>>>,
     /// `{device}|{uid}|{alias}` -> AuthKey
     auth: Mutex<HashMap<String, Arc<MintKey>>>,
     /// `{device}|{uid}` -> 签名计数器
@@ -185,6 +187,7 @@ fn store() -> &'static Store {
     static STORE: OnceLock<Store> = OnceLock::new();
     STORE.get_or_init(|| Store {
         self_signed: Mutex::new(None),
+        builtin: Mutex::new(None),
         auth: Mutex::new(HashMap::new()),
         counters: Mutex::new(HashMap::new()),
         next_session: Mutex::new(chrono::Utc::now().timestamp_millis()),
@@ -200,7 +203,25 @@ fn material(layer: &str, key_pem: Option<&str>) -> Result<Arc<MintKey>> {
         let pem = key_pem.ok_or_else(|| anyhow!("服务端在这台设备名下没有 RSA 身份的私钥"))?;
         return Ok(Arc::new(MintKey::from_pem(pem)?));
     }
+    if layer == "builtin" {
+        return builtin_key();
+    }
     self_signed_key()
+}
+
+/// 探测机专用的那把 ASK。跟自签层分开，是因为探测流量会一直让 `generate_ask_key_pair`
+/// 换钥匙 —— 换的是全局那一把，会把钉在那一层上、正跑着一轮的槽位劈成两半。
+fn builtin_key() -> Result<Arc<MintKey>> {
+    let mut guard = store()
+        .builtin
+        .lock()
+        .map_err(|_| anyhow!("builtin material lock poisoned"))?;
+    if guard.is_none() {
+        *guard = Some(Arc::new(MintKey::generate()?));
+    }
+    guard
+        .clone()
+        .ok_or_else(|| anyhow!("builtin material disappeared"))
 }
 
 fn self_signed_key() -> Result<Arc<MintKey>> {
@@ -593,6 +614,10 @@ pub fn scope_wipe_enabled() -> bool {
 ///
 /// 返回 `None` 表示"这一层不认识这个 op"，`Some` 里带 `error` 表示这层试过但没
 /// 成 —— 两种情况调用方都该继续回退下一层。成功就是一份跟 B 端形状一致的应答。
+///
+/// 层名三选一：`keybox`（服务端存的设备身份）、`self_signed`（极端兜底）、`builtin`
+/// （探测机就地作答专用，见 `crate::soter_probe`）。`builtin` 的料是自己一把、永不
+/// 轮换，就是不想让探测流量一直换全局 ASK、把别人正跑着的槽位劈成两半。
 /// 这两层认得的 op；不认得的直接让下一层试，连物料都不用取。
 const KNOWN_OPS: &[&str] = &[
     "probe",
@@ -700,11 +725,13 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                 // 劈成两半。它的 ASK 本来就在，回成功，让流程留在这层里。
                 if layer == "self_signed" {
                     rotate_self_signed_key()?;
-                } else {
+                } else if layer == "keybox" {
                     tracing::info!(
                         "soter: layer={layer} 拿着服务端存的身份，{op} 不轮换、直接回成功"
                     );
                 }
+                // `builtin`（探测机）也不轮换：那一把 ASK 换了只会把正在跑的一轮劈成
+                // 两半，而探测机根本不看「换没换」。
                 // 重建 ASK = 全新一轮流程（App 正在把旧的扔掉），槽位的钉子也该摘掉：
                 // 后面哪一层服务这一轮，它就重新钉到哪一层。
                 unpin_layer(device_id, uid_of(body)?);
@@ -1521,6 +1548,75 @@ mod tests {
         for off in ["0", "false", "no", "off"] {
             assert!(!scope_wipe_from(Some(off)), "{off} 应该关掉降级");
         }
+    }
+
+    #[test]
+    fn the_builtin_layer_answers_a_probe_flow_and_never_rotates() {
+        // 探测机（春秋/鸭子）的那一套：ASK 在、AuthKey 现建、签名会话能用。
+        // 见 `crate::soter_probe`：这套回答只给探测机，不落 B 端。
+        let device = "device-a-probe-builtin";
+        let uid = 24601i64;
+        let alias = "chunqiu_soter_probe_1791022575713";
+        let call = |body: Value| run("builtin", device, &body, None).expect("handled");
+
+        let builtin_before = builtin_key().expect("builtin material");
+
+        assert_eq!(
+            call(json!({"op": "has_ask_already", "uid": uid}))["error_code"],
+            json!(0)
+        );
+        // 没建过的钥匙就是没建过，跟真机同一个码。
+        assert_eq!(
+            call(json!({"op": "has_auth_key", "uid": uid, "alias": alias}))["error_code"],
+            json!(NOT_FOUND)
+        );
+        assert_eq!(
+            call(json!({"op": "init_sign", "uid": uid, "alias": alias, "challenge": "0a1b"}))
+                ["error_code"],
+            json!(NOT_FOUND)
+        );
+
+        assert_eq!(
+            call(json!({"op": "generate_auth_key_pair", "uid": uid, "alias": alias}))["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            call(json!({"op": "has_auth_key", "uid": uid, "alias": alias}))["error_code"],
+            json!(0)
+        );
+        let init =
+            call(json!({"op": "init_sign", "uid": uid, "alias": alias, "challenge": "0a1b"}));
+        assert_eq!(init["error_code"], json!(0));
+        let session = init["session"]
+            .as_i64()
+            .filter(|s| *s != 0)
+            .expect("session");
+        assert_eq!(
+            call(json!({"op": "finish_sign", "uid": uid, "alias": alias, "session": session}))
+                ["error_code"],
+            json!(0)
+        );
+
+        // 重建 ASK：探测机不会看「换没换」，而换的又是全局那一把 —— 只会把正跑着的一轮
+        // 劈成两半，还可能把别人的钉层换掉。所以内置层不轮换。
+        assert_eq!(
+            call(json!({"op": "generate_ask_key_pair", "uid": uid}))["error_code"],
+            json!(0)
+        );
+        assert!(
+            Arc::ptr_eq(&builtin_before, &builtin_key().expect("builtin material")),
+            "内置层的 ASK 被探测流量换掉了"
+        );
+
+        // 清账：别把这一局的 AuthKey 留给同一个 uid 的别的用例（uid 号是复用的）。
+        assert_eq!(
+            call(json!({"op": "remove_all_uid_key", "uid": uid}))["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            call(json!({"op": "has_auth_key", "uid": uid, "alias": alias}))["error_code"],
+            json!(NOT_FOUND)
+        );
     }
 
     #[test]
