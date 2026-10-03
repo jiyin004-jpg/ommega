@@ -265,6 +265,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Arc::new(Config::load());
+    // 长期状态库（会话表 + 槽位登记表）先开出来：开不了就直接退出，别带着空会话表跑
+    // —— 那等于 A 端所有远程钥匙当场判死（见 statedb::open_checked 里的理由）。
+    relay_rs::statedb::open_checked()?;
     tracing::info!(
         "relay_rs starting: version={} mode={} bind={} http={} https={} tls={}",
         relay_rs::config::VERSION,

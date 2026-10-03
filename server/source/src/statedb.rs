@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 
 /// 默认落盘位置（systemd 的 WorkingDirectory 是 /opt/relay）。`OMMEGA_STATE_DB` 可覆盖。
@@ -372,24 +372,32 @@ impl StateDb {
     }
 
     /// 导入本身（测试和演练都走这里）。两个路径都可以是 None。
+    ///
+    /// 整个导入包在一个事务里：线上那份会话表一万多条，逐条 autocommit 又慢、中途断了
+    /// 还会导一半（库里一半、旧 JSON 一半，而下一次启动因为「库非空」就不导了）。
     pub fn import_legacy_json(
         &self,
         sessions_json: Option<&Path>,
         slots_json: Option<&Path>,
     ) -> Result<ImportReport> {
         let mut report = ImportReport::default();
+        if sessions_json.is_none() && slots_json.is_none() {
+            return Ok(report);
+        }
+        let conn = self.plain();
+        let tx = conn
+            .unchecked_transaction()
+            .context("state db import transaction")?;
         if let Some(path) = sessions_json {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("read {}", path.display()))?;
-            let mut rows = legacy_sessions(&text)?;
             // 同一条会话可能被两台设备拥有（老布局按设备嵌套），后来的同别名忽略。
-            rows.dedup_by(|a, b| a.0 == b.0);
             let mut seen = std::collections::HashSet::new();
-            for (alias, row) in rows {
+            for (alias, row) in legacy_sessions(&text)? {
                 if !seen.insert(alias.clone()) {
                     continue;
                 }
-                if self.insert_session_if_absent(&alias, &row)? {
+                if Self::insert_session_if_absent(&tx, &alias, &row)? {
                     report.sessions += 1;
                 }
             }
@@ -398,11 +406,10 @@ impl StateDb {
         if let Some(path) = slots_json {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("read {}", path.display()))?;
-            let map = legacy_slots(&text)?;
-            for (slot_id, pin) in map {
+            for (slot_id, pin) in legacy_slots(&text)? {
                 if pin.layer.is_empty() && pin.at_millis == 0 {
                     // 只有账号记录、没钉过层的记录：不写空钉子行（读回来一样）。
-                } else if self.insert_slot_if_absent(&slot_id, &pin.layer, pin.at_millis)? {
+                } else if Self::insert_slot_if_absent(&tx, &slot_id, &pin.layer, pin.at_millis)? {
                     report.slots += 1;
                 }
                 for token in pin.owners {
@@ -412,18 +419,18 @@ impl StateDb {
                     if value.is_empty() {
                         continue;
                     }
-                    if self.insert_owner_if_absent(&slot_id, family, value)? {
+                    if Self::insert_owner_if_absent(&tx, &slot_id, family, value)? {
                         report.owners += 1;
                     }
                 }
             }
             report.files.push(path.display().to_string());
         }
+        tx.commit().context("state db import commit")?;
         Ok(report)
     }
 
-    fn insert_session_if_absent(&self, alias: &str, row: &SessionRow) -> Result<bool> {
-        let conn = self.plain();
+    fn insert_session_if_absent(conn: &Connection, alias: &str, row: &SessionRow) -> Result<bool> {
         let n = conn.execute(
             "INSERT OR IGNORE INTO sessions(alias, chain_pem, leaf_key_pem, created_epoch_ms)
              VALUES(?1, ?2, ?3, ?4)",
@@ -437,8 +444,12 @@ impl StateDb {
         Ok(n > 0)
     }
 
-    fn insert_slot_if_absent(&self, slot_id: &str, layer: &str, at_millis: i64) -> Result<bool> {
-        let conn = self.plain();
+    fn insert_slot_if_absent(
+        conn: &Connection,
+        slot_id: &str,
+        layer: &str,
+        at_millis: i64,
+    ) -> Result<bool> {
         let n = conn.execute(
             "INSERT OR IGNORE INTO soter_slots(slot_id, layer, at_millis) VALUES(?1, ?2, ?3)",
             params![slot_id, layer, at_millis],
@@ -446,8 +457,12 @@ impl StateDb {
         Ok(n > 0)
     }
 
-    fn insert_owner_if_absent(&self, slot_id: &str, family: &str, token: &str) -> Result<bool> {
-        let conn = self.plain();
+    fn insert_owner_if_absent(
+        conn: &Connection,
+        slot_id: &str,
+        family: &str,
+        token: &str,
+    ) -> Result<bool> {
         let n = conn.execute(
             "INSERT OR IGNORE INTO soter_slot_owners(slot_id, family, token, first_seen_ms, last_seen_ms)
              VALUES(?1, ?2, ?3, 0, 0)",
@@ -522,33 +537,56 @@ fn legacy_slots(text: &str) -> Result<HashMap<String, LegacyPin>> {
 // ---------------------------------------------------------------------------
 
 /// 进程里共用的那一个库（`fulfill` 和 `soter_mint` 用的是同一份）。
+///
+/// 开不起来的时候**不**退化成内存库：会话表就是 A 端那批 `KeyMaterial::Remote`
+/// 的钥匙，静默丢掉等于让所有远程钥匙当场签不动（1.6.4 之前丢 `sessions.json`
+/// 就是这么坏的），所以宁可起不来，让日志和 systemd 直接说。
+static SHARED: OnceLock<Result<Arc<StateDb>, String>> = OnceLock::new();
+
+fn init() -> &'static Result<Arc<StateDb>, String> {
+    SHARED.get_or_init(open_for_process)
+}
+
+/// 启动时先调一次：这里拿到 Err，进程带原因退出。
+pub fn open_checked() -> Result<Arc<StateDb>> {
+    match init() {
+        Ok(db) => Ok(db.clone()),
+        Err(e) => bail!("{e}"),
+    }
+}
+
+/// 读路径用（启动时已经 `open_checked` 过了）。
 pub fn shared() -> Arc<StateDb> {
-    static SHARED: OnceLock<Arc<StateDb>> = OnceLock::new();
-    SHARED.get_or_init(open_for_process).clone()
+    match init() {
+        Ok(db) => db.clone(),
+        Err(e) => panic!("state db 没开起来：{e}"),
+    }
 }
 
 #[cfg(test)]
-fn open_for_process() -> Arc<StateDb> {
+fn open_for_process() -> Result<Arc<StateDb>, String> {
     // 测试里不碰仓库里的 data/：每个测试进程一份内存库。
-    Arc::new(StateDb::open_in_memory().expect("in-memory state db"))
+    StateDb::open_in_memory()
+        .map(Arc::new)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(not(test))]
-fn open_for_process() -> Arc<StateDb> {
+fn open_for_process() -> Result<Arc<StateDb>, String> {
     let path = std::env::var("OMMEGA_STATE_DB").unwrap_or_else(|_| DEFAULT_PATH.to_string());
-    let opened = StateDb::open(&path).and_then(|db| {
-        db.import_legacy_if_empty()?;
-        Ok(db)
-    });
-    match opened {
-        Ok(db) => Arc::new(db),
-        Err(e) => {
-            // 落盘不了就得喊出来：会话表不落盘 = 进程重启后 A 端那些
-            // `KeyMaterial::Remote` 的钥匙全签不动。宁可吵，不可静默降级。
-            tracing::error!("state db 打不开（{path}）：{e:#} —— 这次不落盘，重启后会话会丢");
-            Arc::new(StateDb::open_in_memory().expect("in-memory state db"))
-        }
-    }
+    StateDb::open(&path)
+        .and_then(|db| {
+            db.import_legacy_if_empty()?;
+            Ok(db)
+        })
+        .map(Arc::new)
+        .map_err(|e| {
+            format!(
+                "state db 打不开（{path}）：{e:#} —— 会话表和槽位登记表都在这儿，\
+                 起不来比静默丢会话强。查路径/权限/磁盘，或者回滚上一版二进制\
+                 （回滚前把库挪走：mv {path} {path}.bak）"
+            )
+        })
 }
 
 #[cfg(test)]
