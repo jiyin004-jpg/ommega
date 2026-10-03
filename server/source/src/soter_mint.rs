@@ -131,6 +131,10 @@ struct Store {
 struct SlotPin {
     layer: String,
     at_millis: i64,
+    /// 这个槽位上认出来的账号指纹（`owner_token` 给出来的）。`layer` 为空、只有
+    /// 这个字段的记录表示「还没服务过这个槽位，只知道上面有谁」。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    owners: Vec<String>,
 }
 
 /// 钉子活多久。取 30 分钟：比一轮开启流程长得多，又短到不至于把一次抖动变成
@@ -247,7 +251,8 @@ pub fn pinned_layer(device_id: &str, uid: i32) -> Option<String> {
     let now = chrono::Utc::now().timestamp_millis();
     let guard = store().slots.lock().ok()?;
     let pin = guard.get(&slot_id(device_id, uid))?;
-    pin_is_fresh(pin.at_millis, now).then(|| pin.layer.clone())
+    // `layer` 空的记录只记了账号（`note_owner` 建的），不算服务过这个槽位。
+    (!pin.layer.is_empty() && pin_is_fresh(pin.at_millis, now)).then(|| pin.layer.clone())
 }
 
 /// 把槽位钉在某一层上。第一次服务这个槽位、或者换层之后都要调。
@@ -266,11 +271,14 @@ pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
             return;
         }
     }
+    // 换层时这个槽位上认出来的账号得留着：那是连坐判断的判据（`note_owner`）。
+    let owners = map.get(&id).map(|p| p.owners.clone()).unwrap_or_default();
     map.insert(
         id,
         SlotPin {
             layer: layer.to_string(),
             at_millis: now,
+            owners,
         },
     );
     save_slots(&map);
@@ -285,6 +293,129 @@ pub fn unpin_layer(device_id: &str, uid: i32) {
     if map.remove(&id).is_some() {
         save_slots(&map);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 这个槽位上一个账号还是好几个
+// ---------------------------------------------------------------------------
+//
+// 为什么要数：SOTER 的钥匙在 TA 里按 uid 存一包，`remove_all_uid_key`（HAL 12 /
+// AIDL 7 `removeAppGlobalSecureKey`）清的是整包 —— ASK 加上这个 uid 上**每一个**
+// 账号的 AuthKey。而微信自己就会打这一枪，逆向 classes13.dex 看得很清楚：
+//
+//   - `d36/p0.a(false)`：ASK 公钥上传腾讯校验失败 → `q26.a.r()` 当场清；
+//   - `d36/m0`（Soter.TaskInit）：`WechatASK` 状态非 0（含「从没写过」的默认 -1）
+//     并且 ASK 存在 → 清；
+//   - `d36/q0.f()`：ASK 生成被取消 → 清。
+//
+// 真机上微信一个 uid 只有一个号，清的是自己；我们这里十几个号挤一个 uid（实测一台
+// B 端最多 28 个 `WechatAuthKeyPay&<微信号>`）。一枪下去，同 uid 上别人的开通记录
+// 一起没了 —— 私钥只在 TA 里，重建出来是新的，腾讯那边存着的公钥对不上，之后
+// 指纹支付就一直失败。所以要数清楚，好把这一枪拦下来（见 `handlers::soter`）。
+
+/// 一个槽位最多记几个账号指纹。够用就行，别让 slots 文件长成几十兆。
+const OWNER_CAP: usize = 64;
+
+/// 从别名里抠出「这是谁的钥匙」。
+///
+/// 微信一个账号会留下三族别名，而且盐各不相同 —— 同一个账号的旧盐是 `md5(微信号)`、
+/// 新盐是 `md5(uin)`，所以本来就得按族分开数：
+///
+///   - `WechatAuthKeyPay&<微信号>`（scene1 的旧名字）
+///   - `SoterAuthKeyV2_salt<md5(uin)[0:8]>_sceneN`（现在的名字）
+///   - `SoterAuthKey_salt<md5(微信号)[0:8]>_sceneN`（旧名字，迁移时被删）
+///
+/// 别的别名（工具自己造的）不算，免得一份探针流量把槽位看成「共用」。
+fn owner_token(alias: &str) -> Option<String> {
+    if let Some(pos) = alias.find("WechatAuthKeyPay&") {
+        let account = alias[pos + "WechatAuthKeyPay&".len()..].trim();
+        return (!account.is_empty() && account != "null").then(|| format!("wx:{account}"));
+    }
+    if let Some(pos) = alias.find("SoterAuthKeyV2_salt") {
+        return salt_after(&alias[pos + "SoterAuthKeyV2_salt".len()..]).map(|s| format!("v2:{s}"));
+    }
+    if let Some(pos) = alias.find("SoterAuthKey_salt") {
+        return salt_after(&alias[pos + "SoterAuthKey_salt".len()..]).map(|s| format!("v1:{s}"));
+    }
+    None
+}
+
+/// `SoterAuthKey*_salt<盐>_sceneN` 里那个盐。
+fn salt_after(rest: &str) -> Option<String> {
+    let salt = rest.split('_').next().unwrap_or("");
+    (!salt.is_empty()).then(|| salt.to_string())
+}
+
+/// 这个槽位上记着的账号指纹。
+pub fn owners_of(device_id: &str, uid: i32) -> Vec<String> {
+    store()
+        .slots
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&slot_id(device_id, uid)).map(|p| p.owners.clone()))
+        .unwrap_or_default()
+}
+
+/// 这个槽位上有几个账号。同一个族里出现两个指纹才算两个：一个账号在每一族里最多
+/// 只有一个指纹，所以「同族两个」是「两个账号」的充分条件，也不会把同一个账号的
+/// 旧盐新盐算成两个人。
+pub fn owner_count(device_id: &str, uid: i32) -> usize {
+    let mut wx = std::collections::HashSet::new();
+    let mut v1 = std::collections::HashSet::new();
+    let mut v2 = std::collections::HashSet::new();
+    for token in owners_of(device_id, uid) {
+        match token.split_once(':') {
+            Some(("wx", id)) => {
+                wx.insert(id.to_string());
+            }
+            Some(("v1", id)) => {
+                v1.insert(id.to_string());
+            }
+            Some(("v2", id)) => {
+                v2.insert(id.to_string());
+            }
+            _ => {}
+        }
+    }
+    wx.len().max(v1.len()).max(v2.len())
+}
+
+/// 记下这个槽位上一个账号的指纹。请求里没点名设备（route 到哪台都行）时不记。
+pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
+    if device_id.is_empty() {
+        return;
+    }
+    let Some(token) = owner_token(alias) else {
+        return;
+    };
+    let Ok(mut map) = store().slots.lock() else {
+        return;
+    };
+    let id = slot_id(device_id, uid);
+    let entry = map.entry(id).or_insert_with(|| SlotPin {
+        layer: String::new(),
+        at_millis: 0,
+        owners: Vec::new(),
+    });
+    if entry.owners.contains(&token) || entry.owners.len() >= OWNER_CAP {
+        return;
+    }
+    entry.owners.push(token);
+    let known = entry.owners.len();
+    save_slots(&map);
+    // 这行日志就是线上「一个 uid 挤了几个号」的读数。
+    tracing::info!("soter: 槽位 {device_id}|{uid} 上认到第 {known} 个账号指纹");
+}
+
+/// uid 级全清要不要降级成「只答成功、不真清」。
+///
+/// 默认开。`RELAY_SOTER_SCOPE_WIPE=0` 关掉（回滚用，不用重新编译）。
+fn scope_wipe_from(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("false") | Some("no") | Some("off"))
+}
+
+pub fn scope_wipe_enabled() -> bool {
+    scope_wipe_from(std::env::var("RELAY_SOTER_SCOPE_WIPE").ok().as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1244,76 @@ mod tests {
             run("self_signed", device, &finish, None).unwrap()["error_code"],
             json!(NOT_FOUND)
         );
+    }
+
+    #[test]
+    fn owner_tokens_are_per_family_and_ignore_foreign_aliases() {
+        assert_eq!(
+            owner_token("WechatAuthKeyPay&hubssh").as_deref(),
+            Some("wx:hubssh")
+        );
+        assert_eq!(
+            owner_token("SoterAuthKeyV2_salt612a30de_scene1").as_deref(),
+            Some("v2:612a30de")
+        );
+        assert_eq!(
+            owner_token("SoterAuthKey_salt9f8e7d6c_scene2").as_deref(),
+            Some("v1:9f8e7d6c")
+        );
+        // 微信那条「名字存成 WechatAuthKeyPay&null 就判定 init error」的兼容路径
+        // （`dm4/g0.java`）留给它的别名不算一个账号。
+        assert_eq!(owner_token("WechatAuthKeyPay&null"), None);
+        assert_eq!(owner_token("other:probe"), None);
+        assert_eq!(owner_token(""), None);
+    }
+
+    #[test]
+    fn a_slot_with_two_accounts_of_one_family_is_shared() {
+        let device = "device-a-owner-shared";
+        let uid = 6101;
+        // slots 文件是跨进程落盘的（`target/soter_slots-test.json`），上一次跑留下的
+        // 记录会把这个槽位弄脏 —— 先把它清了再数。
+        unpin_layer(device, uid);
+        assert_eq!(owner_count(device, uid), 0);
+
+        note_owner(device, uid, "WechatAuthKeyPay&hubssh");
+        note_owner(device, uid, "SoterAuthKeyV2_saltaaaaaaaa_scene1");
+        assert_eq!(
+            owner_count(device, uid),
+            1,
+            "一个账号的三族别名只能算一个账号"
+        );
+
+        note_owner(device, uid, "SoterAuthKeyV2_saltbbbbbbbb_scene1");
+        assert_eq!(owner_count(device, uid), 2, "同族两个指纹就是两个账号");
+
+        note_owner(device, uid, "WechatAuthKeyPay&hubssh");
+        assert_eq!(owner_count(device, uid), 2, "同一个指纹重复报不长数");
+
+        // 只记了账号、没服务过这个槽位，不算钉过层
+        assert!(pinned_layer(device, uid).is_none());
+        // 钉层不能把这个槽位上的账号记录冲掉
+        pin_layer(device, uid, "b");
+        assert_eq!(owner_count(device, uid), 2);
+        assert_eq!(pinned_layer(device, uid).as_deref(), Some("b"));
+
+        // 没点名设备就不记（route 到哪台都行的请求）
+        note_owner("", uid, "SoterAuthKeyV2_saltcccccccc_scene1");
+        assert_eq!(owner_count("", uid), 0);
+
+        // 清完就走，别给下一次跑留脏数据（`unpin_layer` 连账号记录一起删）
+        unpin_layer(device, uid);
+        assert_eq!(owner_count(device, uid), 0);
+    }
+
+    #[test]
+    fn the_wipe_downgrade_switch_defaults_on() {
+        assert!(scope_wipe_from(None));
+        assert!(scope_wipe_from(Some("1")));
+        assert!(scope_wipe_from(Some("true")));
+        for off in ["0", "false", "no", "off"] {
+            assert!(!scope_wipe_from(Some(off)), "{off} 应该关掉降级");
+        }
     }
 
     #[test]

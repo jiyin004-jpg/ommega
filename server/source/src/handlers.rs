@@ -1295,6 +1295,11 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     // PLC110 的 uid 10490 就是这么被钉到 self_signed 上，之后每轮第一个 op 又把
     // 钉子续上，一轮流程都回不到真机。
     let uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+    // 顺手记下这个槽位上是哪个微信号在用（`soter_mint::owner_token` 从别名里认）：
+    // uid 级全清要不要拦下来，就看这里认出来几个账号。
+    if let (Some(uid), Some(alias)) = (uid, alias_arg) {
+        crate::soter_mint::note_owner(requested, uid, alias);
+    }
     let mut layers: Vec<&str> = Vec::with_capacity(order.len());
     if let (false, Some(uid)) = (requested.is_empty(), uid) {
         if let Some(pinned) = crate::soter_mint::pinned_layer(requested, uid) {
@@ -1322,6 +1327,22 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     if layers.is_empty() {
         layers.extend(order.iter().copied());
     }
+    // ASK 身份类的 op 只走真机。
+    //
+    // 微信把 ASK 的 (cpu_id, uid) 永久缓存在自己 prefs 里（`dm4/u.java`：两个都非空
+    // 就「directly return」，再也不读真 ASK），而且开启流程会把 ASK 公钥上传给腾讯
+    // 校验。服务端两层造的是**假 cpu_id** 的自洽产物，腾讯那边过不了；微信的
+    // `d36/p0.a(false)` 拿到这个结果就直接 `q26.a.r()` —— uid 级全清。所以这几个
+    // op 只要 B 端能接就一层都不往下换，宁可这一笔失败。B 端整层做不了（没有设备）
+    // 时照旧让下面两层兜底，那是极端情况。
+    if soter_identity_op(op) && b_target.is_some() {
+        if layers.first() != Some(&"b") {
+            tracing::info!(
+                "soter: op={op} uid={probe_uid} 是 ASK 身份类（谁给的 ASK 决定腾讯那边的校验），B 端能接就只走 B"
+            );
+        }
+        layers = vec!["b"];
+    }
     if op == "finish_sign" {
         layers.clear();
         if let Some(owner) = finish_owner_layer(remembered.as_deref(), server_owner.as_deref()) {
@@ -1340,6 +1361,29 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     for &layer in &layers {
         let result = match layer {
             "b" => {
+                // uid 级全清是微信自己会打的枪（见 `soter_mint::owner_token` 上的注释：
+                // `d36/p0.a(false)` 腾讯校验失败、`d36/m0` 的 `WechatASK` 状态脏、
+                // `d36/q0.f()` 生成被取消，三条都调 `q26.a.r()`）。真机上这个 uid 只有
+                // 一个号，清的是自己；我们这里十几个号挤一个 uid（实测一台 B 端最多 28
+                // 个 `WechatAuthKeyPay&<微信号>`），一枪下去同 uid 别人的开通记录全废，
+                // 而私钥只在 TA 里、重建出来是新的，腾讯存着的公钥对不上 —— 之后指纹
+                // 支付就一直失败。所以槽位上不止一个账号时，这一笔只答成功、不真清。
+                //
+                // 跟在它后面的 `remove_auth_key`（微信会逐个删自己的 scene 别名）照常
+                // 转发，所以调用方自己想删的东西还是一样删掉。
+                if op == "remove_all_uid_key" {
+                    if let Some(uid) = uid {
+                        let owners = crate::soter_mint::owner_count(requested, uid);
+                        if crate::soter_mint::scope_wipe_enabled() && owners >= 2 {
+                            tracing::warn!(
+                                "soter: op=remove_all_uid_key uid={probe_uid} requested={requested} \
+                                 这个槽位上有 {owners} 个账号，uid 级全清会连坐，只答成功不真清 \
+                                 （RELAY_SOTER_SCOPE_WIPE=0 可关掉这条）"
+                            );
+                            return Json(json!({"op": op, "error_code": 0})).into_response();
+                        }
+                    }
+                }
                 let mut lease = if needs_sign {
                     match b_target.as_deref() {
                         Some(device) if op == "init_sign" => {
@@ -1757,6 +1801,21 @@ impl BSoterLayer {
 /// 钉子。真机接了却答个错（参数不齐、超时）时，钉子必须留在 `b` 上 —— 兜底层
 /// 抢走钉子等于以后每轮都拿服务端自签的假料，App 手里的身份跟着换（PLC110 的
 /// uid 10490 就是这么被钉到 self_signed 上的）。
+/// ASK 身份类的 op：它们给出的东西就是腾讯拿来认这台设备（ASK 公钥 + `cpu_id` +
+/// `uid`）的凭据，所以只能由真机给。
+fn soter_identity_op(op: &str) -> bool {
+    matches!(
+        op,
+        "get_device_id"
+            | "export_attk_public_key"
+            | "export_ask_public_key"
+            | "has_ask_already"
+            | "verify_attk_key_pair"
+            | "generate_ask_key_pair"
+            | "generate_attk_key_pair"
+    )
+}
+
 fn layer_to_pin(served_layer: &str, b_structural: bool) -> Option<&str> {
     if served_layer == "b" || b_structural {
         Some(served_layer)
@@ -2278,7 +2337,8 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
 #[cfg(test)]
 mod soter_device_layer_tests {
     use super::{
-        soter_device_hard_failure, soter_error_name, soter_relay_marks_unavailable, BSoterLayer,
+        soter_device_hard_failure, soter_error_name, soter_identity_op,
+        soter_relay_marks_unavailable, BSoterLayer,
     };
 
     #[test]
@@ -2491,6 +2551,34 @@ mod soter_device_layer_tests {
         assert_eq!(soter_error_name(-26), "SOTER_ERROR_VERIFICATION_FAILED");
         assert_eq!(soter_error_name(-8), "SOTER_ERROR_NO_AUTH_KEY_MATCHED");
         assert_eq!(soter_error_name(-3), "unknown SOTER error");
+    }
+
+    /// ASK 身份类 op 一网打尽，别的 op 不能被顺带钉在真机上。
+    #[test]
+    fn only_identity_ops_are_pinned_to_the_device() {
+        for op in [
+            "get_device_id",
+            "export_attk_public_key",
+            "export_ask_public_key",
+            "has_ask_already",
+            "verify_attk_key_pair",
+            "generate_ask_key_pair",
+            "generate_attk_key_pair",
+        ] {
+            assert!(soter_identity_op(op), "{op} 得只走真机");
+        }
+        for op in [
+            "has_auth_key",
+            "export_auth_key_public_key",
+            "generate_auth_key_pair",
+            "remove_auth_key",
+            "remove_all_uid_key",
+            "init_sign",
+            "finish_sign",
+            "probe",
+        ] {
+            assert!(!soter_identity_op(op), "{op} 不该被这条规则顺带管");
+        }
     }
 }
 
