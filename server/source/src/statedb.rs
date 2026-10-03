@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// 默认落盘位置（systemd 的 WorkingDirectory 是 /opt/relay）。`OMMEGA_STATE_DB` 可覆盖。
 pub const DEFAULT_PATH: &str = "data/relay_state.db";
@@ -37,17 +37,28 @@ const LEGACY_SESSIONS: &str = "data/sessions.json";
 const LEGACY_SLOTS: &str = "data/soter_slots.json";
 
 /// 一个槽位里每一族最多记几个指纹。三族分开算：一个账号在每一族最多留一个指纹，
-/// 所以「同族 512 个」是上限而不是 512/3。
+/// 所以「同族 512 个」是上限而不是 512/3。满了不是「不收新的」，而是把这一族里
+/// 最久没见到的那一条换出去（LRU，见 `add_owner`）。
 pub const OWNER_FAMILY_CAP: usize = 512;
 
-const SCHEMA_VERSION: i64 = 1;
+/// 会话表条数上限，跟 B 端 `SESSION_MAX_FILES` 一个口径。超了按「最久没用」淘汰。
+pub const SESSION_MAX: usize = 20_000;
 
-/// 会话表里一行（字段跟旧的 `SessionFile` 对齐）。
+/// 启动时只把最近用过的这么多条会话装进内存。一条（链 + 私钥密文）实测 6~8 KB，
+/// 8000 条 ≈ 50 MB；没装进来的留在库里，取用时按 alias 单查一条（有索引）。
+pub const SESSION_MEMORY_HOT: usize = 8_000;
+
+/// v2：会话表加了 `used_epoch_ms`（最后一次使用）。TTL 和 LRU 都按它算，不再看创建时间。
+const SCHEMA_VERSION: i64 = 2;
+
+/// 会话表里一行（字段跟旧的 `SessionFile` 对齐，多一个最后使用时间）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub chain_pem: String,
     pub leaf_key_pem: String,
     pub created_epoch_ms: u64,
+    /// 最后一次被取用的时间。老库迁上来时先拿 `created_epoch_ms` 顶上。
+    pub used_epoch_ms: u64,
 }
 
 /// 启动时把槽位表整个装进内存用的快照。
@@ -139,7 +150,8 @@ impl StateDb {
                  alias            TEXT PRIMARY KEY,
                  chain_pem        TEXT NOT NULL,
                  leaf_key_pem     TEXT NOT NULL,
-                 created_epoch_ms INTEGER NOT NULL);
+                 created_epoch_ms INTEGER NOT NULL,
+                 used_epoch_ms    INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_epoch_ms);
              CREATE TABLE IF NOT EXISTS soter_slots(
                  slot_id   TEXT PRIMARY KEY,
@@ -155,6 +167,19 @@ impl StateDb {
              CREATE INDEX IF NOT EXISTS idx_owners_slot ON soter_slot_owners(slot_id, family);",
         )
         .context("state db schema")?;
+        // v1 -> v2：老库的会话表没有 `used_epoch_ms`。补上，并拿创建时间顶上
+        // （那时候我们唯一的「最后使用」证据就是它）。
+        if !Self::has_column(&conn, "sessions", "used_epoch_ms")? {
+            conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN used_epoch_ms INTEGER NOT NULL DEFAULT 0;
+                 UPDATE sessions SET used_epoch_ms = created_epoch_ms WHERE used_epoch_ms = 0;",
+            )
+            .context("state db 迁移 sessions.used_epoch_ms")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_used ON sessions(used_epoch_ms);",
+        )
+        .context("state db index idx_sessions_used")?;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -169,26 +194,33 @@ impl StateDb {
     // 会话表（原 data/sessions.json）
     // -----------------------------------------------------------------------
 
+    /// 会话表的列，顺序跟 `session_row` 里读的一一对应。
+    const SESSION_COLS: &'static str =
+        "alias, chain_pem, leaf_key_pem, created_epoch_ms, used_epoch_ms";
+
+    fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, SessionRow)> {
+        Ok((
+            r.get::<_, String>(0)?,
+            SessionRow {
+                chain_pem: r.get(1)?,
+                leaf_key_pem: r.get(2)?,
+                created_epoch_ms: r.get::<_, i64>(3)? as u64,
+                used_epoch_ms: r.get::<_, i64>(4)? as u64,
+            },
+        ))
+    }
+
     pub fn session_count(&self) -> Result<usize> {
         let conn = self.plain();
         let n: i64 = conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?;
         Ok(n as usize)
     }
 
+    /// 全量装载（测试/演练用；进程启动走 `load_hot_sessions`）。
     pub fn load_sessions(&self) -> Result<Vec<(String, SessionRow)>> {
         let conn = self.plain();
-        let mut stmt =
-            conn.prepare("SELECT alias, chain_pem, leaf_key_pem, created_epoch_ms FROM sessions")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                SessionRow {
-                    chain_pem: r.get(1)?,
-                    leaf_key_pem: r.get(2)?,
-                    created_epoch_ms: r.get::<_, i64>(3)? as u64,
-                },
-            ))
-        })?;
+        let mut stmt = conn.prepare(&format!("SELECT {} FROM sessions", Self::SESSION_COLS))?;
+        let rows = stmt.query_map([], |r| Self::session_row(r))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -196,32 +228,88 @@ impl StateDb {
         Ok(out)
     }
 
+    /// 启动时只装「最近用过的」那批：内存当热缓存，冷的留在库里按 alias 单查。
+    pub fn load_hot_sessions(&self, limit: usize) -> Result<Vec<(String, SessionRow)>> {
+        let conn = self.plain();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM sessions ORDER BY used_epoch_ms DESC, created_epoch_ms DESC LIMIT ?1",
+            Self::SESSION_COLS
+        ))?;
+        let rows = stmt.query_map(params![limit as i64], |r| Self::session_row(r))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 按 alias 单查一条（内存热缓存没命中时走这里）。
+    pub fn get_session_row(&self, alias: &str) -> Result<Option<SessionRow>> {
+        let conn = self.plain();
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM sessions WHERE alias = ?1",
+                    Self::SESSION_COLS
+                ),
+                params![alias],
+                |r| Self::session_row(r),
+            )
+            .optional()?;
+        Ok(row.map(|(_, s)| s))
+    }
+
     /// 一条会话一行；原来这里是「整份 74 MB 重写一遍」。
     pub fn upsert_session(&self, alias: &str, row: &SessionRow) -> Result<()> {
         let conn = self.plain();
         conn.execute(
-            "INSERT INTO sessions(alias, chain_pem, leaf_key_pem, created_epoch_ms)
-             VALUES(?1, ?2, ?3, ?4)
+            "INSERT INTO sessions(alias, chain_pem, leaf_key_pem, created_epoch_ms, used_epoch_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(alias) DO UPDATE SET
                  chain_pem = excluded.chain_pem,
                  leaf_key_pem = excluded.leaf_key_pem,
-                 created_epoch_ms = excluded.created_epoch_ms",
+                 created_epoch_ms = excluded.created_epoch_ms,
+                 used_epoch_ms = excluded.used_epoch_ms",
             params![
                 alias,
                 row.chain_pem,
                 row.leaf_key_pem,
-                row.created_epoch_ms as i64
+                row.created_epoch_ms as i64,
+                row.used_epoch_ms as i64
             ],
         )?;
         Ok(())
     }
 
-    /// 过期的会话直接按条件删。返回删了几条。
+    /// 顶一下「最后使用」时间（TTL 和 LRU 都看它）。调用方有节流，别每条请求都来。
+    pub fn touch_session(&self, alias: &str, used_ms: i64) -> Result<()> {
+        let conn = self.plain();
+        conn.execute(
+            "UPDATE sessions SET used_epoch_ms = ?2 WHERE alias = ?1",
+            params![alias, used_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 过期的会话按「最后使用」删。返回删了几条。
     pub fn delete_sessions_expired_before(&self, cutoff_ms: i64) -> Result<usize> {
         let conn = self.plain();
         Ok(conn.execute(
-            "DELETE FROM sessions WHERE created_epoch_ms < ?1",
+            "DELETE FROM sessions WHERE used_epoch_ms < ?1",
             params![cutoff_ms],
+        )?)
+    }
+
+    /// 会话表超过 `cap` 条就从最久没用的开始删（LRU，丢的永远是没人用的那批）。
+    /// 返回删了几条。
+    pub fn trim_sessions_lru(&self, cap: usize) -> Result<usize> {
+        let conn = self.plain();
+        Ok(conn.execute(
+            "DELETE FROM sessions WHERE alias IN (
+                 SELECT alias FROM sessions
+                 ORDER BY used_epoch_ms ASC, created_epoch_ms ASC
+                 LIMIT (SELECT max(0, count(*) - ?1) FROM sessions))",
+            params![cap as i64],
         )?)
     }
 
@@ -280,21 +368,33 @@ impl StateDb {
         Ok(())
     }
 
-    /// 拔钉子：跟内存里的语义一致（连这个槽位的账号记录一起删）。
-    pub fn delete_slot(&self, slot_id: &str) -> Result<()> {
+    /// 拔钉子：**只删「钉层」这一行，账号记录留着**。
+    ///
+    /// 账号记录是「这个槽位上还认得出几个号」的判据（连坐拦截用）。清钥匙的时候
+    /// 连它一起删，等于把「这里原本有好几个号」的证据也抹掉，下一次别人问就没法答。
+    pub fn delete_slot_pin(&self, slot_id: &str) -> Result<()> {
         let conn = self.plain();
         conn.execute(
             "DELETE FROM soter_slots WHERE slot_id = ?1",
             params![slot_id],
         )?;
-        conn.execute(
-            "DELETE FROM soter_slot_owners WHERE slot_id = ?1",
-            params![slot_id],
-        )?;
         Ok(())
     }
 
-    /// 记一个账号指纹。同一族超过 `cap` 就不记了（返回现有条数，`inserted=false`）。
+    /// 丢掉太久没见到的账号记录（TTL）。每条缓存都有过期时间，不留永生的行。
+    pub fn purge_owners_expired_before(&self, cutoff_ms: i64) -> Result<usize> {
+        let conn = self.plain();
+        Ok(conn.execute(
+            "DELETE FROM soter_slot_owners WHERE last_seen_ms < ?1",
+            params![cutoff_ms],
+        )?)
+    }
+
+    /// 记一个账号指纹。
+    ///
+    /// 记过就只刷「最后见到」；没记过才插。这一族满了（`cap` 条）不是拒收新的，
+    /// 而是把这一族里**最久没见到**的那条换出去 —— 丢的永远是最没用的那个，
+    /// 正在用的号不会被新号挤掉。
     pub fn add_owner(
         &self,
         slot_id: &str,
@@ -327,19 +427,29 @@ impl StateDb {
                 inserted: false,
             });
         }
-        if count as usize >= cap {
-            return Ok(OwnerAdd {
-                family_count: count as usize,
-                inserted: false,
-            });
+        if cap > 0 && count as usize >= cap {
+            // LRU：把这一族最久没见到的那条换出去。（token 只是并列时的稳定排序。）
+            conn.execute(
+                "DELETE FROM soter_slot_owners
+                 WHERE slot_id = ?1 AND family = ?2 AND token = (
+                     SELECT token FROM soter_slot_owners
+                     WHERE slot_id = ?1 AND family = ?2
+                     ORDER BY last_seen_ms ASC, token ASC LIMIT 1)",
+                params![slot_id, family],
+            )?;
         }
         conn.execute(
             "INSERT INTO soter_slot_owners(slot_id, family, token, first_seen_ms, last_seen_ms)
              VALUES(?1, ?2, ?3, ?4, ?4)",
             params![slot_id, family, token, now_ms],
         )?;
+        let after = if cap > 0 && count as usize >= cap {
+            cap
+        } else {
+            (count + 1) as usize
+        };
         Ok(OwnerAdd {
-            family_count: (count + 1) as usize,
+            family_count: after,
             inserted: true,
         })
     }
@@ -431,17 +541,32 @@ impl StateDb {
     }
 
     fn insert_session_if_absent(conn: &Connection, alias: &str, row: &SessionRow) -> Result<bool> {
+        // 旧 JSON 里没有「最后使用」，拿创建时间顶上。
         let n = conn.execute(
-            "INSERT OR IGNORE INTO sessions(alias, chain_pem, leaf_key_pem, created_epoch_ms)
-             VALUES(?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO sessions(alias, chain_pem, leaf_key_pem, created_epoch_ms, used_epoch_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 alias,
                 row.chain_pem,
                 row.leaf_key_pem,
-                row.created_epoch_ms as i64
+                row.created_epoch_ms as i64,
+                row.used_epoch_ms as i64
             ],
         )?;
         Ok(n > 0)
+    }
+
+    /// 表里有没有这一列（迁移用，SQLite 没有 `ADD COLUMN IF NOT EXISTS`）。
+    fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn insert_slot_if_absent(
@@ -505,6 +630,7 @@ fn legacy_sessions(text: &str) -> Result<Vec<(String, SessionRow)>> {
                         chain_pem: s.chain_pem,
                         leaf_key_pem: s.leaf_key_pem,
                         created_epoch_ms: s.created_epoch_ms,
+                        used_epoch_ms: s.created_epoch_ms,
                     },
                 )
             })
@@ -521,6 +647,7 @@ fn legacy_sessions(text: &str) -> Result<Vec<(String, SessionRow)>> {
                     chain_pem: s.chain_pem,
                     leaf_key_pem: s.leaf_key_pem,
                     created_epoch_ms: s.created_epoch_ms,
+                    used_epoch_ms: s.created_epoch_ms,
                 },
             ));
         }
@@ -603,22 +730,27 @@ mod tests {
     }
 
     fn row(chain: &str, leaf: &str, ms: u64) -> SessionRow {
+        row_at(chain, leaf, ms, ms)
+    }
+
+    fn row_at(chain: &str, leaf: &str, created: u64, used: u64) -> SessionRow {
         SessionRow {
             chain_pem: chain.to_string(),
             leaf_key_pem: leaf.to_string(),
-            created_epoch_ms: ms,
+            created_epoch_ms: created,
+            used_epoch_ms: used,
         }
     }
 
     #[test]
     fn sessions_survive_a_reopen_and_purge_by_time() {
         let (db, dir) = tmp_db("sessions");
-        db.upsert_session("a", &row("chain-a", "key-a", 1_000))
+        db.upsert_session("a", &row_at("chain-a", "key-a", 1_000, 1_000))
             .unwrap();
         db.upsert_session("b", &row("chain-b", "key-b", 2_000))
             .unwrap();
         // 同名再写就是覆盖，不是再来一行
-        db.upsert_session("a", &row("chain-a2", "key-a2", 3_000))
+        db.upsert_session("a", &row_at("chain-a2", "key-a2", 3_000, 1_000))
             .unwrap();
         assert_eq!(db.session_count().unwrap(), 2);
 
@@ -628,11 +760,89 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].1.chain_pem, "chain-a2");
         assert_eq!(rows[0].1.created_epoch_ms, 3_000);
+        assert_eq!(rows[0].1.used_epoch_ms, 1_000);
 
-        // 过期的按条件删（原来得整份重写一遍才删得掉）
+        // 「最后使用」顶一下；TTL 看它，不看创建时间：
+        // a 的创建时间更新（3000）但最后用在 1000 → 过期；
+        // b 的创建时间更早（2000）但最后用在 9000 → 留着。
+        reopened.touch_session("b", 9_000).unwrap();
+        assert_eq!(
+            reopened
+                .get_session_row("b")
+                .unwrap()
+                .unwrap()
+                .used_epoch_ms,
+            9_000
+        );
         assert_eq!(reopened.delete_sessions_expired_before(2_500).unwrap(), 1);
         assert_eq!(reopened.session_count().unwrap(), 1);
+        assert!(reopened.get_session_row("b").unwrap().is_some());
         drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hot_load_and_lru_trim_keep_the_most_recently_used() {
+        let (db, dir) = tmp_db("lru");
+        for i in 1..=5u64 {
+            db.upsert_session(
+                &format!("al{i}"),
+                &row(&format!("c{i}"), &format!("l{i}"), i * 100),
+            )
+            .unwrap();
+        }
+        // 热缓存只装最近用过的两条
+        let hot: Vec<String> = db
+            .load_hot_sessions(2)
+            .unwrap()
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect();
+        assert_eq!(hot, vec!["al5", "al4"]);
+
+        // 上限 3：把最久没用的 al1 / al2 挤掉，留最近用的
+        assert_eq!(db.trim_sessions_lru(3).unwrap(), 2);
+        let mut left: Vec<String> = db
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["al3", "al4", "al5"]);
+        // 没超上限时一条不动
+        assert_eq!(db.trim_sessions_lru(10).unwrap(), 0);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v1_sessions_table_migrates_to_last_used() {
+        // 手搓一版 v1 的表（没有 used_epoch_ms），打开后得能迁上来：
+        // 老行没有最后使用时间，拿创建时间顶上。
+        let dir = std::env::temp_dir().join(format!("ommega-state-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions(
+                     alias            TEXT PRIMARY KEY,
+                     chain_pem        TEXT NOT NULL,
+                     leaf_key_pem     TEXT NOT NULL,
+                     created_epoch_ms INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO sessions VALUES('old','C','L',1234)", [])
+                .unwrap();
+        }
+        let db = StateDb::open(path.to_str().unwrap()).unwrap();
+        let migrated = db.get_session_row("old").unwrap().unwrap();
+        assert_eq!(migrated.created_epoch_ms, 1_234);
+        assert_eq!(migrated.used_epoch_ms, 1_234);
+        assert_eq!(db.session_count().unwrap(), 1);
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -653,9 +863,9 @@ mod tests {
         assert!(!again.inserted, "同一条指纹不该算新的");
         assert_eq!(again.family_count, 3);
 
-        // cap 生效：同族满了就不再进
+        // cap 生效：这一族满了就把最久没见到的那条换出去（LRU，不是拒收新的）
         let capped = db.add_owner("dev|1", "wx", "x", 901, 1).unwrap();
-        assert!(!capped.inserted);
+        assert!(capped.inserted, "满了也得收新的，换掉最久没用的那条");
         assert_eq!(capped.family_count, 1);
 
         let snap = db.slots_snapshot().unwrap();
@@ -671,11 +881,32 @@ mod tests {
                 && family == "v2"
                 && token == "s1"
                 && *seen == 900));
+        // 被换出去的是 wx 那一族里最久没见的 acct，新进来的 x 在
+        assert!(snap.owners.iter().any(|(_, f, t, _)| f == "wx" && t == "x"));
+        assert!(!snap
+            .owners
+            .iter()
+            .any(|(_, f, t, _)| f == "wx" && t == "acct"));
 
-        // 拔钉子连账号记录一起删（跟内存语义一致）
-        db.delete_slot("dev|1").unwrap();
+        // 拔钉子只删「钉层」那一行，账号记录得留着（那是连坐判断的判据）
+        db.delete_slot_pin("dev|1").unwrap();
         assert_eq!(db.slot_count().unwrap(), 0);
-        assert!(db.slots_snapshot().unwrap().owners.is_empty());
+        assert_eq!(db.slots_snapshot().unwrap().owners.len(), 4);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_records_expire_by_last_seen() {
+        let (db, dir) = tmp_db("owner-ttl");
+        db.add_owner("d|1", "v2", "fresh", 10_000, OWNER_FAMILY_CAP)
+            .unwrap();
+        db.add_owner("d|1", "v2", "stale", 1_000, OWNER_FAMILY_CAP)
+            .unwrap();
+        assert_eq!(db.purge_owners_expired_before(5_000).unwrap(), 1);
+        let owners = db.slots_snapshot().unwrap().owners;
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].2, "fresh");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

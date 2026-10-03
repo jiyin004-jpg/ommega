@@ -34,6 +34,10 @@ const MAX_CHALLENGE_SIZE: usize = 128;
 
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// 距上次顶过「最后使用」多久才值得再顶一次。TTL/LRU 判的是小时级窗口，差几分钟
+/// 无所谓；这条节流把「每签一次就写一次库」压成每个 alias 五分钟最多一次。
+const SESSION_TOUCH_MIN_MS: u64 = 5 * 60 * 1000;
+
 /// 会话表过期清理的节流间隔。清理是 O(会话数) 的，几千条的表在每个 sign /
 /// decrypt 请求上都扫一遍纯属浪费；隔一分钟清一次就够，反正过期会话在查表
 /// 时本来也拿不到东西。
@@ -66,6 +70,9 @@ struct Session {
     /// 持着全局锁。
     leaf_key_cipher: String,
     created_epoch_ms: u64,
+    /// 最后一次被取用的时间。TTL 和 LRU 都按它算：创建早不等于该丢，一直有人用
+    /// 的会话就得一直留着（B 端那把 `no key for alias` 就是这么坏的）。
+    used_epoch_ms: u64,
 }
 
 /// On-disk form of a session: the leaf private key is encrypted with the same
@@ -77,6 +84,9 @@ struct SessionFile {
     chain_pem: String,
     leaf_key_pem: String,
     created_epoch_ms: u64,
+    /// 老落盘格式没有这一列，读回来时缺省 0，由调用方拿创建时间顶上。
+    #[serde(default)]
+    used_epoch_ms: u64,
 }
 
 impl From<&Session> for SessionFile {
@@ -90,6 +100,7 @@ impl From<&Session> for SessionFile {
                 s.leaf_key_cipher.clone()
             },
             created_epoch_ms: s.created_epoch_ms,
+            used_epoch_ms: s.used_epoch_ms,
         }
     }
 }
@@ -97,11 +108,17 @@ impl From<&Session> for SessionFile {
 impl From<SessionFile> for Session {
     fn from(sf: SessionFile) -> Self {
         let cipher = sf.leaf_key_pem.clone();
+        let used = if sf.used_epoch_ms == 0 {
+            sf.created_epoch_ms
+        } else {
+            sf.used_epoch_ms
+        };
         Session {
             chain_pem: sf.chain_pem,
             leaf_key_pem: crate::crypto::decrypt_private_pem(&sf.leaf_key_pem),
             leaf_key_cipher: cipher,
             created_epoch_ms: sf.created_epoch_ms,
+            used_epoch_ms: used,
         }
     }
 }
@@ -153,16 +170,32 @@ impl Fulfill {
     }
 
     fn session_expired(s: &Session) -> bool {
-        let now_ms = Utc::now().timestamp_millis() as u64;
-        now_ms.saturating_sub(s.created_epoch_ms) > SESSION_TTL.as_millis() as u64
+        Self::session_expired_at(s, Utc::now().timestamp_millis() as u64)
     }
 
-    fn purge_locked(map: &mut HashMap<String, Session>) {
-        map.retain(|_, s| !Self::session_expired(s));
+    fn session_expired_at(s: &Session, now_ms: u64) -> bool {
+        now_ms.saturating_sub(s.used_epoch_ms) > SESSION_TTL.as_millis() as u64
     }
 
-    /// 过期会话在库里也按条件删掉（原来得把 74 MB 整份重写一遍才删得掉）。
-    /// 内存 map 还是权威，这里只是别让库比内存胖。
+    /// 内存只留「热」的一批（按最后使用从新到旧）。超出的从 map 里删掉就行 ——
+    /// 库里那条还在，下次真用到再按 alias 单查回来（见 `get_session`）。
+    fn enforce_memory_cap(map: &mut HashMap<String, Session>) {
+        while map.len() > crate::statedb::SESSION_MEMORY_HOT {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, s)| s.used_epoch_ms)
+                .map(|(alias, _)| alias.clone());
+            match oldest {
+                Some(alias) => {
+                    map.remove(&alias);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 过期会话在库里也按条件删掉（原来得把 74 MB 整份重写一遍才删得掉）；
+    /// 顺手把库里的条数也按 LRU 压到上限。
     fn purge_if_due(&self, map: &mut HashMap<String, Session>) {
         let now_ms = Utc::now().timestamp_millis() as u64;
         let last = LAST_PURGE.load(Ordering::Relaxed);
@@ -170,23 +203,37 @@ impl Fulfill {
             return;
         }
         LAST_PURGE.store(now_ms, Ordering::Relaxed);
-        map.retain(|_, s| {
-            now_ms.saturating_sub(s.created_epoch_ms) <= SESSION_TTL.as_millis() as u64
-        });
+        map.retain(|_, s| !Self::session_expired_at(s, now_ms));
         let cutoff_ms = now_ms.saturating_sub(SESSION_TTL.as_millis() as u64) as i64;
         match self.state.delete_sessions_expired_before(cutoff_ms) {
             Ok(0) => {}
             Ok(n) => tracing::info!("sessions: 库里清掉 {n} 条过期会话"),
             Err(e) => tracing::warn!("sessions: 库里清过期会话失败：{e:#}"),
         }
+        let cap = crate::statedb::SESSION_MAX;
+        match self.state.trim_sessions_lru(cap) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("sessions: 库里按 LRU 淘汰 {n} 条（上限 {cap}）"),
+            Err(e) => tracing::warn!("sessions: 库里按 LRU 淘汰失败：{e:#}"),
+        }
     }
 
-    /// 启动时从库里把会话装进内存（过期的不装）。
+    fn touch_persisted(&self, alias: &str, now_ms: u64) {
+        if let Err(e) = self.state.touch_session(alias, now_ms as i64) {
+            tracing::debug!("sessions: {alias} 的最后使用没顶进库：{e:#}");
+        }
+    }
+
+    /// 启动时从库里把「最近用过的」一批会话装进内存（过期的不装）。
     ///
-    /// 原来的两个参数（扁平 / 按设备嵌套的旧布局）现在归 `crate::statedb` 管：
-    /// 旧的 `data/sessions.json` 由它导一次，这里只认库。
+    /// 内存是热缓存、库是权威：只装 `SESSION_MEMORY_HOT` 条，冷的那批留在库里，
+    /// 取用时按 alias 单查（见 `get_session`）。旧的 `data/sessions.json` 由
+    /// `statedb` 导一次，这里只认库。
     fn load_sessions(&self) {
-        let rows = match self.state.load_sessions() {
+        let rows = match self
+            .state
+            .load_hot_sessions(crate::statedb::SESSION_MEMORY_HOT)
+        {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::error!("sessions: state db 读不出来（{e:#}）—— 这次当没有会话");
@@ -201,10 +248,15 @@ impl Fulfill {
                     chain_pem: row.chain_pem,
                     leaf_key_pem: row.leaf_key_pem,
                     created_epoch_ms: row.created_epoch_ms,
+                    used_epoch_ms: row.used_epoch_ms,
                 }),
             );
         }
-        Self::purge_locked(&mut inner.sessions);
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        inner
+            .sessions
+            .retain(|_, s| !Self::session_expired_at(s, now_ms));
+        Self::enforce_memory_cap(&mut inner.sessions);
     }
 
     /// 落一条会话：一条 INSERT。
@@ -217,6 +269,7 @@ impl Fulfill {
             // 密文在 put_session 算过一次，这里直接复用；万一没算过就现加。
             leaf_key_pem: SessionFile::from(session).leaf_key_pem,
             created_epoch_ms: session.created_epoch_ms,
+            used_epoch_ms: session.used_epoch_ms,
         };
         if let Err(e) = self.state.upsert_session(alias, &row) {
             // 写不进去就等于重启后 A 端那些 `KeyMaterial::Remote` 的钥匙全废，
@@ -225,19 +278,75 @@ impl Fulfill {
         }
     }
 
+    /// 取一条会话：先内存热缓存，没命中再回库单查一条。
+    ///
+    /// 库里热的那批在启动时装进内存；别的那批（长期没人用的）不占内存，用到
+    /// 了再查回来 —— 内存就永远顶不爆。取一次就把「最后使用」顶一下（内存每次
+    /// 都顶，库里节流到 `SESSION_TOUCH_MIN_MS`），TTL 与 LRU 都吃这个时间。
     fn get_session(&self, alias: &str) -> Option<Session> {
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        let cached = {
+            let mut inner = crate::util::mu(&self.inner);
+            self.purge_if_due(&mut inner.sessions);
+            if inner
+                .sessions
+                .get(alias)
+                .is_some_and(|s| Self::session_expired_at(s, now_ms))
+            {
+                inner.sessions.remove(alias);
+            }
+            inner.sessions.get_mut(alias).map(|s| {
+                let stale = now_ms.saturating_sub(s.used_epoch_ms) >= SESSION_TOUCH_MIN_MS;
+                if stale {
+                    s.used_epoch_ms = now_ms;
+                }
+                (s.clone(), stale)
+            })
+        };
+        if let Some((session, stale)) = cached {
+            if stale {
+                self.touch_persisted(alias, now_ms);
+            }
+            return Some(session);
+        }
+
+        let row = match self.state.get_session_row(alias) {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!("sessions: 库里查 {alias} 失败：{e:#}");
+                return None;
+            }
+        };
+        let mut session = Session::from(SessionFile {
+            chain_pem: row.chain_pem,
+            leaf_key_pem: row.leaf_key_pem,
+            created_epoch_ms: row.created_epoch_ms,
+            used_epoch_ms: row.used_epoch_ms,
+        });
+        if Self::session_expired_at(&session, now_ms) {
+            return None;
+        }
+        if now_ms.saturating_sub(session.used_epoch_ms) >= SESSION_TOUCH_MIN_MS {
+            session.used_epoch_ms = now_ms;
+            self.touch_persisted(alias, now_ms);
+        }
         let mut inner = crate::util::mu(&self.inner);
-        self.purge_if_due(&mut inner.sessions);
-        inner
-            .sessions
-            .get(alias)
-            .filter(|s| !Self::session_expired(s))
-            .cloned()
+        inner.sessions.insert(alias.to_string(), session.clone());
+        Self::enforce_memory_cap(&mut inner.sessions);
+        Some(session)
     }
 
     fn put_session(&self, alias: &str, mut s: Session) -> Session {
         // 密文在这里算一次，之后每轮落盘都直接复用（见 persist_session）。
         s.leaf_key_cipher = crate::crypto::encrypt_private_pem(&s.leaf_key_pem);
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        if s.created_epoch_ms == 0 {
+            s.created_epoch_ms = now_ms;
+        }
+        if s.used_epoch_ms == 0 {
+            s.used_epoch_ms = now_ms;
+        }
         let mut inner = crate::util::mu(&self.inner);
         self.purge_if_due(&mut inner.sessions);
         // First successful publication wins, even if a caller bypasses the gate.
@@ -249,6 +358,7 @@ impl Fulfill {
             return existing.clone();
         }
         inner.sessions.insert(alias.to_string(), s.clone());
+        Self::enforce_memory_cap(&mut inner.sessions);
         s
     }
 
@@ -609,11 +719,13 @@ impl Fulfill {
         let params = self.parse_ctx(ctx, challenge);
         let (session, generated) = self.session_or_generate(alias, || {
             let (chain_pem, leaf_key_pem) = cert::build_attested_chain(identity, &params)?;
+            let now_ms = Utc::now().timestamp_millis() as u64;
             Ok(Session {
                 chain_pem,
                 leaf_key_pem,
                 leaf_key_cipher: String::new(),
-                created_epoch_ms: Utc::now().timestamp_millis() as u64,
+                created_epoch_ms: now_ms,
+                used_epoch_ms: now_ms,
             })
         })?;
         // Normal requests derive their alias from key parameters. Defend also
@@ -810,10 +922,10 @@ impl Fulfill {
             .to_string();
         let Some(s) = self.get_session(&alias) else {
             // 别把整个 session 表打出来：线上几百条会话，每一条被 warn 一次就是几十 KB，
-            // 日志全被它撑满了（读日志时根本翻不动）。这里只要「总共还活着几条」够定位。
-            let live = self.inner.lock().map(|g| g.sessions.len()).unwrap_or(0);
+            // 日志全被它撑满了（读日志时根本翻不动）。这里只要「内存里现在还热着几条」够定位。
+            let hot = self.inner.lock().map(|g| g.sessions.len()).unwrap_or(0);
             tracing::warn!(
-                "try_handle_sign: no session for device={device_id} alias={alias} live_sessions={live}"
+                "try_handle_sign: no session for device={device_id} alias={alias} hot_sessions={hot}"
             );
             // Fail fast with a clear error instead of falling through to the
             // A/B queue, which would wait up to the queue timeout for a B
@@ -1053,11 +1165,13 @@ mod tests {
     }
 
     fn session(key: &str) -> Session {
+        let now = Utc::now().timestamp_millis() as u64;
         Session {
             chain_pem: format!("chain-{key}"),
             leaf_key_pem: key.to_string(),
             leaf_key_cipher: String::new(),
-            created_epoch_ms: Utc::now().timestamp_millis() as u64,
+            created_epoch_ms: now,
+            used_epoch_ms: now,
         }
     }
 
@@ -1243,12 +1357,63 @@ mod tests {
             .sessions
             .get_mut("alias")
             .unwrap()
-            .created_epoch_ms =
+            .used_epoch_ms =
             Utc::now().timestamp_millis() as u64 - SESSION_TTL.as_millis() as u64 - 1;
         let (fresh, generated) = f
             .session_or_generate("alias", || Ok(session("fresh")))
             .unwrap();
         assert!(generated);
         assert_eq!(fresh.leaf_key_pem, "fresh");
+    }
+
+    /// 热缓存里没有的会话得回库查出来，而且用一次就把「最后使用」顶到当下。
+    #[test]
+    fn cold_session_is_read_back_from_the_db_and_touched() {
+        let f = fulfill();
+        let material = cert::generate_self_signed("ec").unwrap();
+        // 10 分钟前用过：没到 7 天 TTL，但超出「顶时间」的节流窗，能被看出去
+        let old = Utc::now().timestamp_millis() as u64 - 10 * 60 * 1000;
+        let row = crate::statedb::SessionRow {
+            chain_pem: material.certificate_chain_pem.clone(),
+            leaf_key_pem: material.private_key_pem.clone(),
+            created_epoch_ms: old,
+            used_epoch_ms: old,
+        };
+        f.state.upsert_session("cold", &row).unwrap();
+        // 内存里故意不放 —— 模拟「冷的那批没装进热缓存」
+        assert!(crate::util::mu(&f.inner).sessions.is_empty());
+
+        let got = f.get_session("cold").expect("回库查得到");
+        assert_eq!(got.chain_pem, material.certificate_chain_pem);
+        assert!(got.used_epoch_ms > old);
+        // 查回来之后进了热缓存
+        assert!(crate::util::mu(&f.inner).sessions.contains_key("cold"));
+
+        // 库里那条的「最后使用」也被顶了
+        let persisted = f
+            .state
+            .get_session_row("cold")
+            .unwrap()
+            .unwrap()
+            .used_epoch_ms;
+        assert!(persisted > old, "取用一次就得顶最后使用");
+    }
+
+    /// 内存热缓存超出上限时，淘汰的是最久没用的那个；库里那条还在。
+    #[test]
+    fn memory_cache_evicts_the_least_recently_used() {
+        let mut map: HashMap<String, Session> = HashMap::new();
+        for i in 0..(crate::statedb::SESSION_MEMORY_HOT + 5) {
+            let mut s = session(&format!("k{i}"));
+            s.used_epoch_ms = (i + 1) as u64;
+            map.insert(format!("al{i}"), s);
+        }
+        Fulfill::enforce_memory_cap(&mut map);
+        assert_eq!(map.len(), crate::statedb::SESSION_MEMORY_HOT);
+        // 最久没用的前五个被挤掉，最新的那个还在
+        for i in 0..5 {
+            assert!(!map.contains_key(&format!("al{i}")), "al{i} 该被淘汰");
+        }
+        assert!(map.contains_key(&format!("al{}", crate::statedb::SESSION_MEMORY_HOT + 4)));
     }
 }

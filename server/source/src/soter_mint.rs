@@ -34,6 +34,7 @@
 //!     三份信封一个不少，签名的那把钥匙和导出的公钥对得上。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
@@ -138,12 +139,30 @@ struct SlotPin {
     /// 这个槽位上认出来的账号指纹（`owner_token` 给出来的）。`layer` 为空、只有
     /// 这个字段的记录表示「还没服务过这个槽位，只知道上面有谁」。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    owners: Vec<String>,
+    owners: Vec<Owner>,
+}
+
+/// 槽位上记着的一个账号指纹 + 最后一次见到它的时间。
+///
+/// 时间是给两条缓存规矩用的：这一族满了按它做 LRU（换掉最久没见的），以及久了
+/// 没见就按 TTL 丢掉。指纹本身不带时间，所以时间得跟它放一起。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Owner {
+    token: String,
+    last_seen_ms: i64,
 }
 
 /// 钉子活多久。取 30 分钟：比一轮开启流程长得多，又短到不至于把一次抖动变成
 /// 永久失败（微信缓存的 cpu_id 变了会自己重走一轮流程，所以跨层也是能自愈的）。
 const SLOT_PIN_TTL_MILLIS: i64 = 30 * 60 * 1000;
+
+/// 账号指纹活多久（按最后一次见到算）。比会话的 7 天长得多 —— 它只是「这个槽位
+/// 上还有几个号」的判据，攒着不占多少地方；过早忘掉反而会让连坐拦截失手。
+const OWNER_TTL_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// 账号指纹过期清理的节流间隔（扫一遍是 O(槽位数)）。
+const OWNER_PURGE_INTERVAL_MS: i64 = 10 * 60 * 1000;
+static LAST_OWNER_PURGE: AtomicI64 = AtomicI64::new(0);
 
 struct SignSession {
     requested: String,
@@ -237,7 +256,7 @@ fn load_slots() -> HashMap<String, SlotPin> {
         );
     }
     // 只记了账号、没钉过层的槽位：补一条 layer 空的记录，跟旧 JSON 时的形状一致。
-    for (id, family, token, _) in snap.owners {
+    for (id, family, token, last_seen_ms) in snap.owners {
         map.entry(id)
             .or_insert_with(|| SlotPin {
                 layer: String::new(),
@@ -245,7 +264,10 @@ fn load_slots() -> HashMap<String, SlotPin> {
                 owners: Vec::new(),
             })
             .owners
-            .push(format!("{family}:{token}"));
+            .push(Owner {
+                token: format!("{family}:{token}"),
+                last_seen_ms,
+            });
     }
     map
 }
@@ -297,18 +319,59 @@ pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
 }
 
 /// 槽位的钥匙被清掉了（`remove_all_uid_key`），钉子也拔掉：下一次走什么层都行。
+///
+/// **只拔钉子，账号记录留着**。账号记录是「这个槽位上原本有几个号」的判据；清
+/// 钥匙的时候连它一起删，等于把证据也抹了，下一次别人问就答不出来。清的是钥匙，
+/// 不是「这里曾经有过哪些号」这件事。
 pub fn unpin_layer(device_id: &str, uid: i32) {
     let id = slot_id(device_id, uid);
     let Ok(mut map) = store().slots.lock() else {
         return;
     };
-    if map.remove(&id).is_none() {
-        return;
+    if let Some(pin) = map.get_mut(&id) {
+        pin.layer.clear();
+        pin.at_millis = 0;
     }
     drop(map);
-    // 账号记录跟着一起删，跟内存里的语义一致。
-    if let Err(e) = statedb::shared().delete_slot(&id) {
-        tracing::warn!("soter: 槽位（{id}）没从 state db 删掉：{e:#}");
+    if let Err(e) = statedb::shared().delete_slot_pin(&id) {
+        tracing::warn!("soter: 槽位（{id}）的钉子没从 state db 拔掉：{e:#}");
+    }
+}
+
+/// 太久没见到的账号记录按 TTL 丢掉（内存和库一起）。看一眼是 O(槽位数) 的，
+/// 节流到 `OWNER_PURGE_INTERVAL_MS`。
+fn purge_owners_if_due() {
+    let now = chrono::Utc::now().timestamp_millis();
+    let last = LAST_OWNER_PURGE.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < OWNER_PURGE_INTERVAL_MS {
+        return;
+    }
+    LAST_OWNER_PURGE.store(now, Ordering::Relaxed);
+    let cutoff = now - OWNER_TTL_MILLIS;
+    let swept = {
+        let Ok(mut map) = store().slots.lock() else {
+            return;
+        };
+        let mut swept = 0usize;
+        for pin in map.values_mut() {
+            let before = pin.owners.len();
+            pin.owners.retain(|o| o.last_seen_ms >= cutoff);
+            swept += before - pin.owners.len();
+        }
+        // layer 空的槽位本来就只是「账号登记」，账号清完了整条就可以扔掉。
+        map.retain(|_, pin| !pin.layer.is_empty() || !pin.owners.is_empty());
+        // owner_touch 只是节流用的时间戳，槽位没了就跟着丢。
+        if let Ok(mut touch) = store().owner_touch.lock() {
+            touch.retain(|id, _| map.contains_key(id));
+        }
+        swept
+    };
+    match statedb::shared().purge_owners_expired_before(cutoff) {
+        Ok(n) if n > 0 || swept > 0 => {
+            tracing::info!("soter: 账号指纹过期清掉 {n} 条（内存 {swept} 条）")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("soter: 账号指纹过期清理失败：{e:#}"),
     }
 }
 
@@ -370,13 +433,22 @@ fn salt_after(rest: &str) -> Option<String> {
     (!salt.is_empty()).then(|| salt.to_string())
 }
 
-/// 这个槽位上记着的账号指纹。
+/// 这个槽位上记着的账号指纹（太久没见到的按 TTL 不算）。
 pub fn owners_of(device_id: &str, uid: i32) -> Vec<String> {
+    let now = chrono::Utc::now().timestamp_millis();
     store()
         .slots
         .lock()
         .ok()
-        .and_then(|map| map.get(&slot_id(device_id, uid)).map(|p| p.owners.clone()))
+        .and_then(|map| {
+            map.get(&slot_id(device_id, uid)).map(|p| {
+                p.owners
+                    .iter()
+                    .filter(|o| now - o.last_seen_ms <= OWNER_TTL_MILLIS)
+                    .map(|o| o.token.clone())
+                    .collect()
+            })
+        })
         .unwrap_or_default()
 }
 
@@ -418,6 +490,7 @@ pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
         None => return,
     };
     let id = slot_id(device_id, uid);
+    let now = chrono::Utc::now().timestamp_millis();
     let Ok(mut map) = store().slots.lock() else {
         return;
     };
@@ -426,27 +499,40 @@ pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
         at_millis: 0,
         owners: Vec::new(),
     });
-    let known = entry.owners.iter().any(|t| t == &token);
+    // 记过的只把「最近见到」顶到当下（内存里每次都顶；库里节流，见 touch_owner）。
+    if let Some(o) = entry.owners.iter_mut().find(|o| o.token == token) {
+        o.last_seen_ms = now;
+        drop(map);
+        touch_owner(&id, &family, &value);
+        return;
+    }
     // 同一族按条数封顶，不是三族合计：一个账号在每一族最多留一个指纹。
+    // 满了就把这一族最久没见到的那条换出去（LRU）—— 丢的是没人用的那个，
+    // 正在用的号不会被新号挤掉。
     let family_prefix = format!("{family}:");
     let in_family = entry
         .owners
         .iter()
-        .filter(|t| t.starts_with(&family_prefix))
+        .filter(|o| o.token.starts_with(&family_prefix))
         .count();
-    if known {
-        drop(map);
-        // 记过的只刷「最近见到」，而且一个槽位一小时刷一次，别让每条请求都去动库。
-        touch_owner(&id, &family, &value);
-        return;
-    }
     if in_family >= OWNER_CAP {
-        return;
+        if let Some(idx) = entry
+            .owners
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.token.starts_with(&family_prefix))
+            .min_by_key(|(_, o)| o.last_seen_ms)
+            .map(|(i, _)| i)
+        {
+            entry.owners.remove(idx);
+        }
     }
-    entry.owners.push(token);
+    entry.owners.push(Owner {
+        token: token.clone(),
+        last_seen_ms: now,
+    });
     drop(map);
 
-    let now = chrono::Utc::now().timestamp_millis();
     match statedb::shared().add_owner(&id, &family, &value, now, OWNER_CAP) {
         Ok(add) => {
             if add.inserted {
@@ -521,6 +607,8 @@ const KNOWN_OPS: &[&str] = &[
 ];
 
 pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) -> Option<Value> {
+    // 账号指纹的 TTL 清理：节流在里面，不会拖慢请求。
+    purge_owners_if_due();
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
     let product = virtual_device_id(device_id);
 
@@ -1346,9 +1434,6 @@ mod tests {
     fn a_slot_with_two_accounts_of_one_family_is_shared() {
         let device = "device-a-owner-shared";
         let uid = 6101;
-        // slots 文件是跨进程落盘的（`target/soter_slots-test.json`），上一次跑留下的
-        // 记录会把这个槽位弄脏 —— 先把它清了再数。
-        unpin_layer(device, uid);
         assert_eq!(owner_count(device, uid), 0);
 
         note_owner(device, uid, "WechatAuthKeyPay&hubssh");
@@ -1376,9 +1461,50 @@ mod tests {
         note_owner("", uid, "SoterAuthKeyV2_saltcccccccc_scene1");
         assert_eq!(owner_count("", uid), 0);
 
-        // 清完就走，别给下一次跑留脏数据（`unpin_layer` 连账号记录一起删）
+        // 清钥匙只拔钉子：账号记录得留着，否则下次没人答得出这里原本有几个号
         unpin_layer(device, uid);
-        assert_eq!(owner_count(device, uid), 0);
+        assert!(pinned_layer(device, uid).is_none(), "钉子拔了");
+        assert_eq!(owner_count(device, uid), 2, "账号记录不该被清钥匙带走");
+    }
+
+    #[test]
+    fn a_full_family_evicts_the_least_recently_seen_owner() {
+        let device = "device-a-owner-lru";
+        let uid = 6202;
+        let base = chrono::Utc::now().timestamp_millis();
+        // 直接把这一族填满（时间从旧到新）。不走 note_owner，因为它的时间戳总是
+        // 当下，排不出「谁更久没见」。
+        {
+            let mut map = store().slots.lock().unwrap();
+            let mut owners = Vec::new();
+            for i in 0..OWNER_CAP {
+                owners.push(Owner {
+                    token: format!("v2:old{i:04}"),
+                    last_seen_ms: base + i as i64,
+                });
+            }
+            map.insert(
+                slot_id(device, uid),
+                SlotPin {
+                    layer: String::new(),
+                    at_millis: 0,
+                    owners,
+                },
+            );
+        }
+        // 新号进来：这一族满了，换出去的是最久没见到的 old0000
+        note_owner(device, uid, "SoterAuthKeyV2_saltnewaccount_scene1");
+        let owners = owners_of(device, uid);
+        assert_eq!(owners.len(), OWNER_CAP, "满了是等量替换，不是变长");
+        assert!(owners.iter().any(|t| t == "v2:newaccount"), "新号得进来");
+        assert!(
+            !owners.iter().any(|t| t == "v2:old0000"),
+            "最久没见到的被换出去"
+        );
+        assert!(
+            owners.iter().any(|t| t == "v2:old0001"),
+            "只换一个，别的不动"
+        );
     }
 
     #[test]
