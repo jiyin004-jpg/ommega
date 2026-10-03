@@ -1981,7 +1981,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relay_rs"
-version = "1.6.5"
+version = "1.6.6"
 dependencies = [
  "anyhow",
  "axum",
