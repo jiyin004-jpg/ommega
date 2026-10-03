@@ -55,6 +55,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # mysql's compression uses flate2; give it the pure-Rust (miniz_oxide) backend so
 # no C zlib (libz-sys) is linked in the musl cross-build.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# 「要长期保留的状态」不再各写各的 JSON，统一进一个 SQLite 文件（见 src/statedb.rs）。
+# bundled 会把 SQLite 的 C 源码编进来：musl 那条走 cargo-zigbuild 的 zig cc、
+# Android 那条走 NDK 的 clang，两条交叉编译都实测过，所以不破这个文件一直躲着
+# C 依赖的底线（躲的是 aws-lc-sys / libz-sys 那种 zig 也费劲的）。
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

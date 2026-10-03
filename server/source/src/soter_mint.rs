@@ -45,6 +45,8 @@ use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::statedb;
+
 /// SOTER 的成功码。
 const OK: i32 = 0;
 /// "这把钥匙不在这台设备上"。实测 `hasAskAlready(10371)` 就返回它。
@@ -118,6 +120,8 @@ struct Store {
     sessions: Mutex<HashMap<i64, SignSession>>,
     /// `{device}|{uid}` -> 这个槽位归哪一层（带时间戳，见 `SlotPin`）。
     slots: Mutex<HashMap<String, SlotPin>>,
+    /// `{device}|{uid}` -> 上一次把「最近见到」刷进库的时间（节流用）。
+    owner_touch: Mutex<HashMap<String, i64>>,
 }
 
 /// 钉在槽位上的那一层，加个时间。
@@ -167,6 +171,7 @@ fn store() -> &'static Store {
         next_session: Mutex::new(chrono::Utc::now().timestamp_millis()),
         sessions: Mutex::new(HashMap::new()),
         slots: Mutex::new(load_slots()),
+        owner_touch: Mutex::new(HashMap::new()),
     })
 }
 
@@ -206,39 +211,43 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
 // 槽位钉层
 // ---------------------------------------------------------------------------
 
-/// 钉子落盘的地方（systemd 的 WorkingDirectory 就是 /opt/relay，data/ 在那儿）。
-/// 测试里改用 target/，别在仓库里拉一个 data/ 出来。
-#[cfg(not(test))]
-const SLOT_FILE: &str = "data/soter_slots.json";
-#[cfg(test)]
-const SLOT_FILE: &str = "target/soter_slots-test.json";
-
+/// 钉子存哪儿：跟会话表同一个 SQLite 文件（`crate::statedb`），不再各写各的 JSON。
 fn slot_id(device_id: &str, uid: i32) -> String {
     format!("{device_id}|{uid}")
 }
 
+/// 启动时把槽位表整个装进内存；读路径之后一个 DB 查询都不加。
 fn load_slots() -> HashMap<String, SlotPin> {
-    match std::fs::read_to_string(SLOT_FILE) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!("soter: {SLOT_FILE} 读得出来但解不开（{e}），按空的算");
-            HashMap::new()
-        }),
-        Err(_) => HashMap::new(),
-    }
-}
-
-fn save_slots(map: &HashMap<String, SlotPin>) {
-    if let Some(dir) = std::path::Path::new(SLOT_FILE).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    match serde_json::to_string(map) {
-        Ok(text) => {
-            if let Err(e) = std::fs::write(SLOT_FILE, text) {
-                tracing::warn!("soter: 槽位钉子没写进 {SLOT_FILE}: {e:#}");
-            }
+    let snap = match statedb::shared().slots_snapshot() {
+        Ok(snap) => snap,
+        Err(e) => {
+            tracing::warn!("soter: 槽位表从 state db 读不出来（{e:#}），按空的算");
+            return HashMap::new();
         }
-        Err(e) => tracing::warn!("soter: 槽位钉子序列化失败: {e:#}"),
+    };
+    let mut map: HashMap<String, SlotPin> = HashMap::new();
+    for (id, layer, at_millis) in snap.slots {
+        map.insert(
+            id,
+            SlotPin {
+                layer,
+                at_millis,
+                owners: Vec::new(),
+            },
+        );
     }
+    // 只记了账号、没钉过层的槽位：补一条 layer 空的记录，跟旧 JSON 时的形状一致。
+    for (id, family, token, _) in snap.owners {
+        map.entry(id)
+            .or_insert_with(|| SlotPin {
+                layer: String::new(),
+                at_millis: 0,
+                owners: Vec::new(),
+            })
+            .owners
+            .push(format!("{family}:{token}"));
+    }
+    map
 }
 
 /// 钉子是不是还新鲜。
@@ -274,14 +283,17 @@ pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
     // 换层时这个槽位上认出来的账号得留着：那是连坐判断的判据（`note_owner`）。
     let owners = map.get(&id).map(|p| p.owners.clone()).unwrap_or_default();
     map.insert(
-        id,
+        id.clone(),
         SlotPin {
             layer: layer.to_string(),
             at_millis: now,
             owners,
         },
     );
-    save_slots(&map);
+    drop(map);
+    if let Err(e) = statedb::shared().upsert_slot(&id, layer, now) {
+        tracing::warn!("soter: 槽位钉子没写进 state db（{id}）：{e:#}");
+    }
 }
 
 /// 槽位的钥匙被清掉了（`remove_all_uid_key`），钉子也拔掉：下一次走什么层都行。
@@ -290,8 +302,13 @@ pub fn unpin_layer(device_id: &str, uid: i32) {
     let Ok(mut map) = store().slots.lock() else {
         return;
     };
-    if map.remove(&id).is_some() {
-        save_slots(&map);
+    if map.remove(&id).is_none() {
+        return;
+    }
+    drop(map);
+    // 账号记录跟着一起删，跟内存里的语义一致。
+    if let Err(e) = statedb::shared().delete_slot(&id) {
+        tracing::warn!("soter: 槽位（{id}）没从 state db 删掉：{e:#}");
     }
 }
 
@@ -313,8 +330,15 @@ pub fn unpin_layer(device_id: &str, uid: i32) {
 // 一起没了 —— 私钥只在 TA 里，重建出来是新的，腾讯那边存着的公钥对不上，之后
 // 指纹支付就一直失败。所以要数清楚，好把这一枪拦下来（见 `handlers::soter`）。
 
-/// 一个槽位最多记几个账号指纹。够用就行，别让 slots 文件长成几十兆。
-const OWNER_CAP: usize = 64;
+/// 一个槽位里每一族最多记几个账号指纹（跟 `statedb::OWNER_FAMILY_CAP` 同一口径）。
+///
+/// 这里原来是三族合计 64 条。实测单个 uid 上最多已经 33 个账号（三族共 95 条指纹），
+/// 也就是早就在截断了 —— 而线上几百个人一起用，一个 uid 上堆到上百个号完全可能。
+/// 截断只会漏保护（判据取同族条数，多算不了），但没必要省这点空间。
+const OWNER_CAP: usize = statedb::OWNER_FAMILY_CAP;
+
+/// 同一族里已经记过的账号没必要每次请求都刷一遍「最近见到」，一个槽位一小时一次就够。
+const OWNER_TOUCH_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 /// 从别名里抠出「这是谁的钥匙」。
 ///
@@ -388,23 +412,74 @@ pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
     let Some(token) = owner_token(alias) else {
         return;
     };
+    // 拆出来的两段要活到后面，所以拷一份，别把 `token` 借住（push 的时候要 move 它）。
+    let (family, value) = match token.split_once(':') {
+        Some((f, v)) => (f.to_string(), v.to_string()),
+        None => return,
+    };
+    let id = slot_id(device_id, uid);
     let Ok(mut map) = store().slots.lock() else {
         return;
     };
-    let id = slot_id(device_id, uid);
-    let entry = map.entry(id).or_insert_with(|| SlotPin {
+    let entry = map.entry(id.clone()).or_insert_with(|| SlotPin {
         layer: String::new(),
         at_millis: 0,
         owners: Vec::new(),
     });
-    if entry.owners.contains(&token) || entry.owners.len() >= OWNER_CAP {
+    let known = entry.owners.iter().any(|t| t == &token);
+    // 同一族按条数封顶，不是三族合计：一个账号在每一族最多留一个指纹。
+    let family_prefix = format!("{family}:");
+    let in_family = entry
+        .owners
+        .iter()
+        .filter(|t| t.starts_with(&family_prefix))
+        .count();
+    if known {
+        drop(map);
+        // 记过的只刷「最近见到」，而且一个槽位一小时刷一次，别让每条请求都去动库。
+        touch_owner(&id, &family, &value);
+        return;
+    }
+    if in_family >= OWNER_CAP {
         return;
     }
     entry.owners.push(token);
-    let known = entry.owners.len();
-    save_slots(&map);
-    // 这行日志就是线上「一个 uid 挤了几个号」的读数。
-    tracing::info!("soter: 槽位 {device_id}|{uid} 上认到第 {known} 个账号指纹");
+    drop(map);
+
+    let now = chrono::Utc::now().timestamp_millis();
+    match statedb::shared().add_owner(&id, &family, &value, now, OWNER_CAP) {
+        Ok(add) => {
+            if add.inserted {
+                // 这行日志就是线上「一个 uid 挤了几个号」的读数。
+                tracing::info!(
+                    "soter: 槽位 {device_id}|{uid} 上认到第 {} 个账号指纹（{family}）",
+                    add.family_count
+                );
+            }
+            if let Ok(mut touch) = store().owner_touch.lock() {
+                touch.insert(id, now);
+            }
+        }
+        Err(e) => tracing::warn!("soter: 账号指纹没写进 state db（{id}）：{e:#}"),
+    }
+}
+
+/// 记过的账号：需要时把「最近见到」的时间刷进库（节流到 `OWNER_TOUCH_INTERVAL_MS`）。
+fn touch_owner(slot_id: &str, family: &str, value: &str) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let Ok(mut touch) = store().owner_touch.lock() else {
+        return;
+    };
+    if let Some(last) = touch.get(slot_id) {
+        if now - *last < OWNER_TOUCH_INTERVAL_MS {
+            return;
+        }
+    }
+    touch.insert(slot_id.to_string(), now);
+    drop(touch);
+    if let Err(e) = statedb::shared().add_owner(slot_id, family, value, now, OWNER_CAP) {
+        tracing::debug!("soter: 账号指纹的最近见到没刷上（{slot_id}）：{e:#}");
+    }
 }
 
 /// uid 级全清要不要降级成「只答成功、不真清」。

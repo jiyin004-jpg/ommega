@@ -54,8 +54,9 @@ static LAST_PURGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// every previously stored attestation key and forced a manual app reset. With
 /// alias-keying, a sign request for a known alias always resolves to the same
 /// leaf key — across server restarts, device_id changes and identity rotation.
-const SESSION_FILE: &str = "data/sessions.json";
-
+///
+/// 落盘在 `sessions` 表（见 `crate::statedb`）。旧的 `data/sessions.json` 只在库
+/// 里是空的时候导一次，导完原样留着当回滚源，之后不再往里写。
 #[derive(Debug, Clone)]
 struct Session {
     chain_pem: String,
@@ -122,6 +123,9 @@ pub struct Fulfill {
     /// keygen is slow) on every attestation.
     self_signed_cache: Mutex<HashMap<(String, String), DeviceIdentity>>,
     pub db: Option<Arc<Db>>,
+    /// 要长期保留的状态全在这一个 SQLite 文件里（会话语义今天还是内存 map 权威，
+    /// 这里只做写穿 + 启动装载）。
+    state: Arc<crate::statedb::StateDb>,
 }
 
 impl Fulfill {
@@ -132,6 +136,7 @@ impl Fulfill {
             attest_gates: Mutex::new(HashMap::new()),
             self_signed_cache: Mutex::new(HashMap::new()),
             db,
+            state: crate::statedb::shared(),
         });
         f.load_sessions();
         f
@@ -156,7 +161,9 @@ impl Fulfill {
         map.retain(|_, s| !Self::session_expired(s));
     }
 
-    fn purge_if_due(map: &mut HashMap<String, Session>) {
+    /// 过期会话在库里也按条件删掉（原来得把 74 MB 整份重写一遍才删得掉）。
+    /// 内存 map 还是权威，这里只是别让库比内存胖。
+    fn purge_if_due(&self, map: &mut HashMap<String, Session>) {
         let now_ms = Utc::now().timestamp_millis() as u64;
         let last = LAST_PURGE.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) < PURGE_INTERVAL_MS {
@@ -166,82 +173,61 @@ impl Fulfill {
         map.retain(|_, s| {
             now_ms.saturating_sub(s.created_epoch_ms) <= SESSION_TTL.as_millis() as u64
         });
+        let cutoff_ms = now_ms.saturating_sub(SESSION_TTL.as_millis() as u64) as i64;
+        match self.state.delete_sessions_expired_before(cutoff_ms) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("sessions: 库里清掉 {n} 条过期会话"),
+            Err(e) => tracing::warn!("sessions: 库里清过期会话失败：{e:#}"),
+        }
     }
 
-    fn session_file() -> std::path::PathBuf {
-        std::path::Path::new(SESSION_FILE).to_path_buf()
-    }
-
-    /// Restore persisted sessions at startup. Expired entries are purged.
-    /// Accepts both the old `device_id -> alias -> session` layout and the
-    /// current flat `alias -> session` layout (migration). Leaf private keys
-    /// are stored encrypted at rest; `SessionFile -> Session` decrypts and
-    /// falls back to legacy plaintext rows transparently.
+    /// 启动时从库里把会话装进内存（过期的不装）。
+    ///
+    /// 原来的两个参数（扁平 / 按设备嵌套的旧布局）现在归 `crate::statedb` 管：
+    /// 旧的 `data/sessions.json` 由它导一次，这里只认库。
     fn load_sessions(&self) {
-        let path = Self::session_file();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
+        let rows = match self.state.load_sessions() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("sessions: state db 读不出来（{e:#}）—— 这次当没有会话");
+                return;
+            }
         };
         let mut inner = crate::util::mu(&self.inner);
-        if let Ok(flat) = serde_json::from_str::<HashMap<String, SessionFile>>(&text) {
-            for (alias, sf) in flat {
-                inner.sessions.insert(alias, Session::from(sf));
-            }
-        } else if let Ok(nested) =
-            serde_json::from_str::<HashMap<String, HashMap<String, SessionFile>>>(&text)
-        {
-            for (_device, aliases) in nested {
-                for (alias, sf) in aliases {
-                    inner.sessions.insert(alias, Session::from(sf));
-                }
-            }
-        } else {
-            return;
+        for (alias, row) in rows {
+            inner.sessions.insert(
+                alias,
+                Session::from(SessionFile {
+                    chain_pem: row.chain_pem,
+                    leaf_key_pem: row.leaf_key_pem,
+                    created_epoch_ms: row.created_epoch_ms,
+                }),
+            );
         }
         Self::purge_locked(&mut inner.sessions);
     }
 
-    /// Write the current session map to `data/sessions.json` with leaf private
-    /// keys encrypted at rest (same Fernet cipher as the DB identities).
-    fn persist_sessions(&self) {
-        // 锁里只做收集（字段克隆；加密已经在 put_session 做过一次了）；序列化
-        // 和写盘是几十 MB 的活，放到锁外，别让一次出证把并发的 sign/decrypt
-        // 全堵在锁上。
-        let out: HashMap<String, SessionFile> = {
-            let inner = crate::util::mu(&self.inner);
-            inner
-                .sessions
-                .iter()
-                .map(|(a, s)| (a.clone(), SessionFile::from(s)))
-                .collect()
+    /// 落一条会话：一条 INSERT。
+    ///
+    /// 原来是「把所有会话收集一遍、序列化、整份重写」—— 实测 11714 条 / 73.9 MB，
+    /// 而出证约 400 次/天，也就是 25~30 GB/天的写放大，就为了每条多出来的一行。
+    fn persist_session(&self, alias: &str, session: &Session) {
+        let row = crate::statedb::SessionRow {
+            chain_pem: session.chain_pem.clone(),
+            // 密文在 put_session 算过一次，这里直接复用；万一没算过就现加。
+            leaf_key_pem: SessionFile::from(session).leaf_key_pem,
+            created_epoch_ms: session.created_epoch_ms,
         };
-        let Ok(text) = serde_json::to_string(&out) else {
-            return;
-        };
-        let path = Self::session_file();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        // 先写临时文件再改名：覆盖写写到一半崩掉会把整份会话表截断，A 端所有
-        // KeyMaterial::Remote 的钥匙当场变成签不了。
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, text) {
-            tracing::error!("persist_sessions: failed to write {}: {e}", tmp.display());
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            // A lost session file means every A-side `KeyMaterial::Remote` key
-            // becomes unsignable after a restart — surface it, don't swallow it.
-            tracing::error!(
-                "persist_sessions: failed to replace {}: {e}",
-                path.display()
-            );
+        if let Err(e) = self.state.upsert_session(alias, &row) {
+            // 写不进去就等于重启后 A 端那些 `KeyMaterial::Remote` 的钥匙全废，
+            // 跟原来“静默丢文件”一样严重，所以是 error 不是 warn。
+            tracing::error!("sessions: {alias} 没写进 state db：{e:#}");
         }
     }
 
     fn get_session(&self, alias: &str) -> Option<Session> {
         let mut inner = crate::util::mu(&self.inner);
-        Self::purge_if_due(&mut inner.sessions);
+        self.purge_if_due(&mut inner.sessions);
         inner
             .sessions
             .get(alias)
@@ -250,10 +236,10 @@ impl Fulfill {
     }
 
     fn put_session(&self, alias: &str, mut s: Session) -> Session {
-        // 密文在这里算一次，之后每轮落盘都直接复用（见 persist_sessions）。
+        // 密文在这里算一次，之后每轮落盘都直接复用（见 persist_session）。
         s.leaf_key_cipher = crate::crypto::encrypt_private_pem(&s.leaf_key_pem);
         let mut inner = crate::util::mu(&self.inner);
-        Self::purge_if_due(&mut inner.sessions);
+        self.purge_if_due(&mut inner.sessions);
         // First successful publication wins, even if a caller bypasses the gate.
         if let Some(existing) = inner
             .sessions
@@ -650,7 +636,7 @@ impl Fulfill {
             anyhow::bail!("cached session for alias {alias}: invalid leaf key/chain: {error}; existing session preserved");
         }
         if generated {
-            self.persist_sessions();
+            self.persist_session(alias, &session);
         }
         let chain_pem = session.chain_pem;
         let new_leaf_key_pem = session.leaf_key_pem;
@@ -1061,6 +1047,8 @@ mod tests {
             attest_gates: Mutex::new(HashMap::new()),
             self_signed_cache: Mutex::new(HashMap::new()),
             db: None,
+            // 每个测试自己的内存库，并行跑的用例别互相看到对方写的会话。
+            state: Arc::new(crate::statedb::StateDb::open_in_memory().unwrap()),
         }
     }
 
