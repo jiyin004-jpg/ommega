@@ -983,6 +983,104 @@ mod tests {
     /// OMMEGA_DRILL_DIR=/path/to/dir cargo test -- --ignored --nocapture drill
     /// ```
     /// 目录里放 `sessions.json` 和 `soter_slots.json`。
+    /// 拿线上的真库练一遍 v1→v2 迁移（不放进 CI：CI 没有那份数据）。
+    ///
+    /// ```text
+    /// OMMEGA_DRILL_DB=/path/to/relay_state.db cargo test -- --ignored --nocapture drill_migrate
+    /// ```
+    /// 先拿一个副本跑（`sqlite3 真库 ".backup 副本"`），别直接对着生产文件开。
+    #[test]
+    #[ignore]
+    fn drill_migrate_a_real_state_db() {
+        let Ok(path) = std::env::var("OMMEGA_DRILL_DB") else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let (before_sessions, before_has_used) = {
+            let conn = Connection::open(&path).unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(sessions)").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            let mut has_used = false;
+            while let Some(r) = rows.next().unwrap() {
+                if r.get::<_, String>(1).unwrap() == "used_epoch_ms" {
+                    has_used = true;
+                }
+            }
+            let n: i64 = conn
+                .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            (n, has_used)
+        };
+        println!("迁移前：sessions={before_sessions}，已有 used_epoch_ms={before_has_used}");
+
+        let db = StateDb::open(&path).unwrap();
+        let rows = db.load_sessions().unwrap();
+        let zero_used = rows.iter().filter(|(_, s)| s.used_epoch_ms == 0).count();
+        let used_eq_created = rows
+            .iter()
+            .filter(|(_, s)| s.used_epoch_ms == s.created_epoch_ms)
+            .count();
+        println!(
+            "迁移后：sessions={}，used=0 的 {} 条，used==created 的 {} 条，用时 {} ms",
+            rows.len(),
+            zero_used,
+            used_eq_created,
+            started.elapsed().as_millis()
+        );
+        assert_eq!(rows.len() as i64, before_sessions, "条数不该变");
+        assert_eq!(zero_used, 0, "老行必须都回填了最后使用");
+        if !before_has_used {
+            assert_eq!(
+                used_eq_created,
+                rows.len(),
+                "第一次迁移得全部回填成创建时间"
+            );
+        }
+
+        // 热装载只装上限那么多，且每一条都能按 alias 单查回来
+        let hot = db.load_hot_sessions(SESSION_MEMORY_HOT).unwrap();
+        println!("热装载 {} 条（上限 {SESSION_MEMORY_HOT}）", hot.len());
+        assert!(hot.len() <= SESSION_MEMORY_HOT);
+        if let Some((alias, _)) = hot.first() {
+            assert!(db.get_session_row(alias).unwrap().is_some());
+        }
+        let slots = db.slots_snapshot().unwrap();
+        println!(
+            "槽位 {} 个 / 账号指纹 {} 条",
+            slots.slots.len(),
+            slots.owners.len()
+        );
+        // 幂等：再开一次不会又改一遍
+        let reopened = StateDb::open(&path).unwrap();
+        assert_eq!(reopened.session_count().unwrap(), rows.len());
+        println!("迁移是幂等的，重开一次条数不变");
+
+        // 在大表上验一遍 LRU 淘汰 SQL：压到 1000 条，留下的必须都不比删掉的老
+        let before: HashMap<String, u64> = rows
+            .iter()
+            .map(|(a, s)| (a.clone(), s.used_epoch_ms))
+            .collect();
+        let removed = db.trim_sessions_lru(1_000).unwrap();
+        let after = db.load_sessions().unwrap();
+        let kept: HashMap<String, u64> = after
+            .iter()
+            .map(|(a, s)| (a.clone(), s.used_epoch_ms))
+            .collect();
+        assert_eq!(after.len(), 1_000);
+        assert_eq!(before.len() - kept.len(), removed);
+        let min_kept = kept.values().min().copied().unwrap_or(0);
+        let max_gone = before
+            .iter()
+            .filter(|(a, _)| !kept.contains_key(*a))
+            .map(|(_, u)| *u)
+            .max()
+            .unwrap_or(0);
+        println!(
+            "LRU 压到 1000：删了 {removed} 条，留下的最早 used={min_kept}，删掉的最晚 used={max_gone}"
+        );
+        assert!(min_kept >= max_gone, "留下的必须都不比删掉的老");
+    }
+
     #[test]
     #[ignore]
     fn drill_against_real_production_json() {
