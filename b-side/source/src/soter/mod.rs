@@ -39,7 +39,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::cell::Cell;
-use std::sync::{Mutex, MutexGuard};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use hal::{Soter, SoterData, SoterSession};
@@ -169,7 +171,7 @@ static LEARNED_PROBE_TARGET: Mutex<Option<(i32, String)>> = Mutex::new(None);
 /// Never held while waiting for a caller's finish or during HAL restart.
 static SIGN_GUARD: Mutex<sign_guard::SignGuard> = Mutex::new(sign_guard::SignGuard::new());
 
-/// SOTER TA 里的 RPMB 会话是独占资源：同一时刻只许一笔操作进去。
+/// SOTER 进 HAL 的排队：全局有上限 + 同一个 uid 串行。
 ///
 /// 2026-10-03 在 PLC110 上实测：Trustonic 的 `tlTeeSOTER`（TA 镜像
 /// `/odm/vendor/app/mcRegistry/070f0000000000000000000000000a0a.tlbin`）把 RPMB
@@ -181,38 +183,121 @@ static SIGN_GUARD: Mutex<sign_guard::SignGuard> = Mutex::new(sign_guard::SignGua
 /// 对外就是「说存在、却导不出来、也建不了」。踢 Android 侧的 HAL 服务没用
 /// （持有者在 TEE 里），只有重启整机能松开。
 ///
-/// relay 默认开两路 worker（`OMMEGA_RELAY_WORKERS`，见 `bin/relay.rs`），两笔
-/// SOTER 请求可以同时压进同一个 TA，而 TA 那条 RPMB 读路径是否可重入厂商没给
-/// 保证。这把门把 SOTER 的操作串起来（KeyMint / attest 那条路不受影响，照旧并发），
-/// 代价是 SOTER 吞吐降到单笔，换不走这个坑。
-static SOTER_HAL_MUTEX: Mutex<()> = Mutex::new(());
+/// 所以这里不是「放开并发」，是**有上限的并行**，两条规矩：
+///
+///   1. 全局同时在飞不超过 `max`（`relay.conf` 的 `soter_concurrency`，默认 2）。
+///      RPMB 会话是独占资源，我们自己占得越少，机器自己那条路（系统 / 微信在真机上
+///      直接调 TA）就越有空位 —— 留出来的那点空间是给它的，不是给我们堆吞吐的。
+///   2. 同一个 uid 严格串行。一个 uid 上的 export / rebuild / 签名 互相插队，正是把
+///      槽位搅成半成品、再喂给 TA 一堆 -5 的来路；不同 uid 之间才并行。
+///
+/// 真撞上那个楔子也不慌：`hal_restart` 里有「连续 258 → 自动重启」兜底。
+/// KeyMint / attest 那条路不经过这里，照旧并发。
+const SOTER_CONCURRENCY_MIN: u32 = 1;
+const SOTER_CONCURRENCY_MAX: u32 = 4;
+/// 默认上限（`DEFAULT_SOTER_CONCURRENCY` 的库内镜像，见 `bin/relay.rs`）。
+const SOTER_CONCURRENCY_DEFAULT: u32 = 2;
+/// 当前上限。跑着的 relay 改 `relay.conf` 就热更新这个值，不用重刷模块。
+static SOTER_MAX_CONCURRENT: AtomicU32 = AtomicU32::new(SOTER_CONCURRENCY_DEFAULT);
+
+/// 由 relay 的配置层调（配置一读/一改就调一次）。
+pub fn set_max_concurrency(n: u32) {
+    SOTER_MAX_CONCURRENT.store(n, AtomicOrdering::Relaxed);
+}
+
+fn max_concurrency() -> u32 {
+    SOTER_MAX_CONCURRENT
+        .load(AtomicOrdering::Relaxed)
+        .clamp(SOTER_CONCURRENCY_MIN, SOTER_CONCURRENCY_MAX)
+}
+/// 排队超过这么久就记一笔（线上 `wait` 的 p99 就是这么数出来的）。
+const SOTER_WAIT_LOG_MS: u128 = 1000;
+
+struct HalQueue {
+    state: Mutex<HalQueueState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct HalQueueState {
+    /// 这一轮的上限，每次进门前刷新（改 relay.conf 不用重启）。
+    max: u32,
+    /// 所有 uid 加起来在飞几笔。
+    total: u32,
+    /// 每个 uid 在飞几笔。
+    per_uid: HashMap<i32, u32>,
+}
+
+impl HalQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HalQueueState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HalQueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+static SOTER_HAL_QUEUE: OnceLock<HalQueue> = OnceLock::new();
+
+fn hal_queue() -> &'static HalQueue {
+    SOTER_HAL_QUEUE.get_or_init(HalQueue::new)
+}
 
 thread_local! {
     /// 本线程已经进过这道门几次。`handle()` 里会调到 `probe()`，所以必须能重入
-    /// —— std 的 Mutex 不可重入，直接套会自锁死。
+    /// —— 带名额的门直接重入会自己把自己堵死。
     static SOTER_HAL_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// 进 SOTER HAL 的串行门；可重入，出作用域自动放。
+/// 一次 SOTER HAL 准入；出作用域自动还。
 struct SoterHalGate {
-    /// 只有最外层那一次真握着锁，内层重入的不握。
-    _guard: Option<MutexGuard<'static, ()>>,
+    /// 占了名额的那个 uid。重入进来的那次是 None（名额记在最外层那笔上）。
+    uid: Option<i32>,
 }
 
 impl SoterHalGate {
-    fn enter() -> Self {
+    /// `uid` 为 `None` 表示这笔请求没指名 uid（探针那种），只吃全局名额。
+    /// `max` 为 `None` 就读全局那个（探针那条路），传值的是手里有实时配置的那条路。
+    fn enter(uid: Option<i32>, max: Option<u32>) -> Self {
         let depth = SOTER_HAL_DEPTH.with(|d| d.get());
         if depth > 0 {
+            // 同线程重入：名额已经在外层拿着了，这里只记深度。
             SOTER_HAL_DEPTH.with(|d| d.set(depth + 1));
-            return Self { _guard: None };
+            return Self { uid: None };
         }
-        let guard = SOTER_HAL_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let queue = hal_queue();
+        let max = max
+            .unwrap_or_else(max_concurrency)
+            .clamp(SOTER_CONCURRENCY_MIN, SOTER_CONCURRENCY_MAX);
+        let started = Instant::now();
+        {
+            let mut st = queue.lock();
+            st.max = max;
+            while st.total >= max
+                || uid.is_some_and(|u| st.per_uid.get(&u).copied().unwrap_or(0) > 0)
+            {
+                st = queue
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            st.total += 1;
+            if let Some(u) = uid {
+                *st.per_uid.entry(u).or_insert(0) += 1;
+            }
+        }
+        let waited_ms = started.elapsed().as_millis();
+        if waited_ms >= SOTER_WAIT_LOG_MS {
+            log::warn!("soter: 排队等了 {waited_ms}ms 才轮到（上限 {max}，uid {uid:?}）");
+        }
         SOTER_HAL_DEPTH.with(|d| d.set(1));
-        Self {
-            _guard: Some(guard),
-        }
+        Self { uid }
     }
 }
 
@@ -221,9 +306,23 @@ impl Drop for SoterHalGate {
         let depth = SOTER_HAL_DEPTH.with(|d| d.get());
         if depth > 1 {
             SOTER_HAL_DEPTH.with(|d| d.set(depth - 1));
-        } else {
-            SOTER_HAL_DEPTH.with(|d| d.set(0));
+            return;
         }
+        SOTER_HAL_DEPTH.with(|d| d.set(0));
+        let Some(uid) = self.uid else {
+            return;
+        };
+        let queue = hal_queue();
+        let mut st = queue.lock();
+        st.total = st.total.saturating_sub(1);
+        if let Some(n) = st.per_uid.get_mut(&uid) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                st.per_uid.remove(&uid);
+            }
+        }
+        drop(st);
+        queue.cv.notify_all();
     }
 }
 
@@ -445,10 +544,10 @@ fn rebuild_material_then_sign(
 /// Handle one `soter` task payload.
 ///
 /// `allow_mutation` comes from the relay config; it gates the ops that create
-/// or delete keys.
-pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
-    // 一笔一笔进 HAL：TA 那条 RPMB 会话不可重入，见 `SOTER_HAL_MUTEX`。
-    let _gate = SoterHalGate::enter();
+/// or delete keys. `max_concurrent` likewise comes from the live config and is
+/// the ceiling on how many SOTER HAL calls may be in flight at once (see
+/// [`SOTER_HAL_QUEUE`]); the same uid is always serialised.
+pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Result<Value> {
     let op = payload
         .get("op")
         .and_then(Value::as_str)
@@ -464,8 +563,13 @@ pub fn handle(payload: &Value, allow_mutation: bool) -> Result<Value> {
         );
     }
     if op == "selftest" {
+        // 自检不碰 HAL，不占名额。
         return Ok(fixtures::selftest());
     }
+    // 有上限地并行：全局不超过 max，同一个 uid 串行。uid 没给（探针那种）就只吃
+    // 全局名额。注：这个 `uid` 只是拿来排队的，真正要用的那两处 arm 里各自还会
+    // 再解析一次（坏 payload 该报错就报错，不在这里默默当没给）。
+    let _gate = SoterHalGate::enter(uid_of(payload).ok(), Some(max_concurrent));
     if op == "probe" {
         return Ok(probe());
     }
@@ -657,8 +761,8 @@ const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
 /// 结论写在 `verdict` 里（见 [`SignVerdict`]），`signed` 只为看日志方便。
 /// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
 pub fn sign_probe(uid: i32, alias: &str) -> Value {
-    // 探针也是真的去 init/finish，跟派下来的活一样得排队。
-    let _gate = SoterHalGate::enter();
+    // 探针也是真的去 init/finish，跟派下来的活一样得排队（上限走全局那个值）。
+    let _gate = SoterHalGate::enter(Some(uid), None);
     let mut out = json!({ "op": "sign_probe", "uid": uid, "alias": alias });
     // Check and reserve under the real signing lock; callers cannot init
     // between this check and the probe's finish. Do not call handle() here:
@@ -735,7 +839,8 @@ pub fn service_present() -> bool {
 /// Unlike the other ops this never fails: `supported` is `false` when the HAL
 /// is missing or cannot answer, with the reason attached.
 pub fn probe() -> Value {
-    let _gate = SoterHalGate::enter();
+    // 能力探针也走一遍排队（上限走全局那个值）。
+    let _gate = SoterHalGate::enter(None, None);
     match Soter::open() {
         Ok(Some(soter)) => {
             let mut out = json!({
@@ -886,21 +991,22 @@ mod tests {
 
     #[test]
     fn unknown_op_is_rejected() {
-        let err = handle(&json!({ "op": "nope" }), true).expect_err("must reject");
+        let err = handle(&json!({ "op": "nope" }), true, 2).expect_err("must reject");
         assert!(format!("{err:#}").contains("unknown soter op"));
     }
 
     #[test]
     fn mutating_ops_need_the_opt_in() {
         let payload = json!({ "op": "generate_ask_key_pair", "uid": 10373 });
-        let err = handle(&payload, false).expect_err("must be gated");
+        let err = handle(&payload, false, 2).expect_err("must be gated");
         assert!(format!("{err:#}").contains("OMMEGA_RELAY_SOTER_MUTATION"));
     }
 
     #[test]
     fn missing_uid_is_reported_before_any_hal_call() {
         crate::init_binder();
-        let err = handle(&json!({ "op": "export_ask_public_key" }), false).expect_err("must fail");
+        let err =
+            handle(&json!({ "op": "export_ask_public_key" }), false, 2).expect_err("must fail");
         assert!(format!("{err:#}").contains("uid"), "err: {err:#}");
     }
 
@@ -926,7 +1032,7 @@ mod tests {
         // 有 HAL），在一台真有 HAL 的机器上就变成必红，跟代码对错无关。
         let uid = 900001;
         let payload = json!({ "op": "has_auth_key", "uid": uid, "alias": "whatever" });
-        let text = match handle(&payload, true) {
+        let text = match handle(&payload, true, 2) {
             Err(e) => format!("{e:#}"),
             Ok(v) => {
                 assert!(
@@ -1005,7 +1111,84 @@ mod tests {
 
     #[test]
     fn selftest_op_does_not_touch_the_device() {
-        let report = handle(&json!({ "op": "selftest" }), false).expect("selftest must run");
+        let report = handle(&json!({ "op": "selftest" }), false, 2).expect("selftest must run");
         assert_eq!(report["ok"], json!(true), "report: {report}");
+    }
+
+    // ---- SOTER 进 HAL 的排队：全局有上限 + 同 uid 串行（见 `HalQueue`）----
+
+    #[test]
+    fn a_gate_takes_exactly_one_slot_and_gives_it_back() {
+        let uid = 40021;
+        {
+            let _g = SoterHalGate::enter(Some(uid), Some(4));
+            let st = hal_queue().lock();
+            assert_eq!(st.per_uid.get(&uid).copied(), Some(1), "本线程占 1 个名额");
+            assert!(st.total >= 1);
+        }
+        let st = hal_queue().lock();
+        assert_eq!(st.per_uid.get(&uid), None, "出作用域要还回去");
+    }
+
+    #[test]
+    fn nested_enters_are_free_and_only_the_outermost_releases() {
+        let outer = SoterHalGate::enter(Some(40001), Some(4));
+        // `handle()` 里会调 `probe()`：同线程重入时不能再去要一个名额，否则
+        // 一个 uid 一笔就把自己堵死。重入那次连 uid 都不记（算在外层头上）。
+        let inner_a = SoterHalGate::enter(Some(40002), Some(4));
+        let inner_b = SoterHalGate::enter(Some(40002), Some(4));
+        {
+            let st = hal_queue().lock();
+            assert_eq!(st.per_uid.get(&40001).copied(), Some(1));
+            assert_eq!(st.per_uid.get(&40002), None, "重入不该占名额");
+        }
+        drop(inner_a);
+        drop(inner_b);
+        {
+            let st = hal_queue().lock();
+            assert_eq!(
+                st.per_uid.get(&40001).copied(),
+                Some(1),
+                "内层退出不该把外层还掉"
+            );
+        }
+        drop(outer);
+        assert_eq!(hal_queue().lock().per_uid.get(&40001), None);
+    }
+
+    #[test]
+    fn another_thread_on_the_same_uid_waits_for_the_slot() {
+        // 用 recv_timeout 而不是 join：万一以后真的写坏了，这里是失败而不是挂死。
+        let uid = 40011;
+        let held = SoterHalGate::enter(Some(uid), Some(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let _g = SoterHalGate::enter(Some(uid), Some(4));
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "同一个 uid 上第二笔得等第一笔走完"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("名额放掉之后第二笔要能进");
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn a_different_uid_does_not_wait_for_the_one_held() {
+        let held = SoterHalGate::enter(Some(40031), Some(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            // 上限 2：另一个 uid 该直接进（这就是从「全局串行」换来的那点并行）
+            let _g = SoterHalGate::enter(Some(40032), Some(2));
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("另一个 uid 不该被挡住");
+        drop(held);
+        t.join().unwrap();
     }
 }

@@ -81,7 +81,7 @@ fn main() -> Result<()> {
         println!("task {task_id} type={task_type} payload={payload}");
 
         let result = if task_type == "soter" {
-            match ommegaclient_b::soter::handle(&payload, allow_mutation) {
+            match ommegaclient_b::soter::handle(&payload, allow_mutation, 2) {
                 Ok(value) => value,
                 Err(e) => json!({ "error": format!("{e:#}") }),
             }

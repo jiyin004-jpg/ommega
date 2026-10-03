@@ -161,6 +161,15 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// SOTER 默认并行几笔。
+///
+/// 2026-10-03 之前是一把全局串行锁（同一时刻只许 1 笔），线上量到排队 `wait`
+/// p50 0 / p90 198 / p99 857 ms。现在放到 2：不同 uid 可以同时跑，同一个 uid 仍然
+/// 串行；全局上限压得低是因为 TA 里的 RPMB 会话是独占资源 —— 留的那点空位是给
+/// 机器自己（系统 / 微信在真机上直接调 TA）用的。改 relay.conf 里的
+/// `OMMEGA_RELAY_SOTER_CONCURRENCY` 就能调，不用重刷模块。
+const DEFAULT_SOTER_CONCURRENCY: u32 = 2;
+
 #[derive(Clone, Debug)]
 struct RelayConfig {
     server: String,
@@ -170,6 +179,10 @@ struct RelayConfig {
     /// Allow SOTER ops that create or remove keys on the device.  Off by
     /// default: those ops change the real payment-key state.
     soter_allow_mutation: bool,
+    /// SOTER 同时能压进 TA 几笔（`OMMEGA_RELAY_SOTER_CONCURRENCY`，默认 2）。
+    /// 上限留小：RPMB 会话是独占资源，我们自己少占一点，机器自己那条路才有空位。
+    /// 同一个 uid 无论如何都是串行的（见 `soter::handle`）。
+    soter_concurrency: u32,
     /// Slot to try a real signature on when reporting the `soter_sign`
     /// capability.  Optional: without it the relay reports only `soter` until it
     /// has learnt a slot from real traffic, and never claims `soter_nosign` on
@@ -279,6 +292,10 @@ fn load_config_from_file() -> Result<RelayConfig> {
     let soter_allow_mutation = m
         .get("OMMEGA_RELAY_SOTER_MUTATION")
         .is_some_and(|v| parse_bool(v));
+    let soter_concurrency = m
+        .get("OMMEGA_RELAY_SOTER_CONCURRENCY")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SOTER_CONCURRENCY);
     let soter_probe = parse_probe_target(
         m.get("OMMEGA_RELAY_SOTER_PROBE_UID").map(|s| s.as_str()),
         m.get("OMMEGA_RELAY_SOTER_PROBE_ALIAS").map(|s| s.as_str()),
@@ -305,6 +322,7 @@ fn load_config_from_file() -> Result<RelayConfig> {
         machine_id,
         token,
         soter_allow_mutation,
+        soter_concurrency,
         soter_probe,
         bind_iface,
         path_probe,
@@ -399,6 +417,9 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         .context("OMMEGA_RELAY_TOKEN not set and relay.conf unreadable")?;
     let machine_id = env("OMMEGA_RELAY_MACHINE_ID").unwrap_or_default();
     let soter_allow_mutation = env("OMMEGA_RELAY_SOTER_MUTATION").is_some_and(|v| parse_bool(&v));
+    let soter_concurrency = env("OMMEGA_RELAY_SOTER_CONCURRENCY")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SOTER_CONCURRENCY);
     let soter_probe = parse_probe_target(
         env("OMMEGA_RELAY_SOTER_PROBE_UID").as_deref(),
         env("OMMEGA_RELAY_SOTER_PROBE_ALIAS").as_deref(),
@@ -417,6 +438,7 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         machine_id,
         token,
         soter_allow_mutation,
+        soter_concurrency,
         soter_probe,
         bind_iface,
         path_probe,
@@ -1045,7 +1067,9 @@ fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
 /// Read-only ops always run; the ops that create or remove keys are gated by
 /// `OMMEGA_RELAY_SOTER_MUTATION` because they change real device key state.
 fn handle_soter(cfg: &RelayConfig, _task_type: &str, payload: &Value) -> Result<Value> {
-    ommegaclient_b::soter::handle(payload, cfg.soter_allow_mutation)
+    // 实时配置：每轮轮询先把 SOTER 的并行上限推给 soter 模块（探针那条路读这个值）。
+    ommegaclient_b::soter::set_max_concurrency(cfg.soter_concurrency);
+    ommegaclient_b::soter::handle(payload, cfg.soter_allow_mutation, cfg.soter_concurrency)
 }
 
 fn handle_task(cfg: &RelayConfig, task_id: &str, task_type: &str, payload: &Value) -> Result<()> {
@@ -1200,6 +1224,8 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
                 continue;
             }
         };
+        // 配置里改过的 SOTER 并行上限立即生效（改 relay.conf 不用重启/重刷）。
+        ommegaclient_b::soter::set_max_concurrency(cfg.soter_concurrency);
         let started = Instant::now();
         watchdog.arm(POLL_WALL_LIMIT);
         // 先探路再发长轮询：链路死的时候挂 15s 长轮询只会把设备醒着的那点窗口
@@ -1327,6 +1353,7 @@ fn main() {
             machine_id: String::new(),
             token: String::new(),
             soter_allow_mutation: false,
+            soter_concurrency: DEFAULT_SOTER_CONCURRENCY,
             soter_probe: None,
             bind_iface: "auto".to_string(),
             path_probe: true,

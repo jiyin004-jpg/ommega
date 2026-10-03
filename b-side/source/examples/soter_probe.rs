@@ -85,6 +85,7 @@ fn main() {
             "challenge": challenge,
         }),
         false,
+        2,
     ) {
         Ok(value) => {
             println!("OK   init_sign: {}", summarize(&value));
@@ -96,6 +97,7 @@ fn main() {
         Some(session) => match ommegaclient_b::soter::handle(
             &json!({ "op": "finish_sign", "session": session }),
             false,
+            2,
         ) {
             Ok(value) => println!("OK   finish_sign: {}", summarize(&value)),
             Err(e) => println!("ERR  finish_sign: {e:#}"),
@@ -106,7 +108,7 @@ fn main() {
 
 fn report(payload: &Value) {
     let op = payload.get("op").and_then(Value::as_str).unwrap_or("?");
-    match ommegaclient_b::soter::handle(payload, false) {
+    match ommegaclient_b::soter::handle(payload, false, 2) {
         Ok(value) => println!("OK   {op}: {}", summarize(&value)),
         Err(e) => println!("ERR  {op}: {e:#}"),
     }
