@@ -241,6 +241,51 @@ impl HalQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// 拿一个名额。
+    ///
+    /// `uid` 为 `None` 只是「这笔没指名 uid」（探针那种），照旧要占全局名额；
+    /// 同线程重入（`handle()` 里会调到 `probe()`）不占名额。
+    fn enter(&'static self, uid: Option<i32>, max: Option<u32>) -> SoterHalGate {
+        let depth = SOTER_HAL_DEPTH.with(|d| d.get());
+        if depth > 0 {
+            // 名额已经在外层拿着了，这次只记深度、不占名额。
+            SOTER_HAL_DEPTH.with(|d| d.set(depth + 1));
+            return SoterHalGate {
+                queue: None,
+                uid: None,
+            };
+        }
+        let max = max
+            .unwrap_or_else(max_concurrency)
+            .clamp(SOTER_CONCURRENCY_MIN, SOTER_CONCURRENCY_MAX);
+        let started = Instant::now();
+        {
+            let mut st = self.lock();
+            st.max = max;
+            while st.total >= max
+                || uid.is_some_and(|u| st.per_uid.get(&u).copied().unwrap_or(0) > 0)
+            {
+                st = self
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            st.total += 1;
+            if let Some(u) = uid {
+                *st.per_uid.entry(u).or_insert(0) += 1;
+            }
+        }
+        let waited_ms = started.elapsed().as_millis();
+        if waited_ms >= SOTER_WAIT_LOG_MS {
+            log::warn!("soter: 排队等了 {waited_ms}ms 才轮到（上限 {max}，uid {uid:?}）");
+        }
+        SOTER_HAL_DEPTH.with(|d| d.set(1));
+        SoterHalGate {
+            queue: Some(self),
+            uid,
+        }
+    }
 }
 
 static SOTER_HAL_QUEUE: OnceLock<HalQueue> = OnceLock::new();
@@ -257,7 +302,12 @@ thread_local! {
 
 /// 一次 SOTER HAL 准入；出作用域自动还。
 struct SoterHalGate {
-    /// 占了名额的那个 uid。重入进来的那次是 None（名额记在最外层那笔上）。
+    /// 占了名额的是哪张队列；重入那次是 `None`（名额记在最外层那笔上）。
+    ///
+    /// 早先这里用「uid 是不是 None」来判断该不该还名额，于是没指名 uid 的进门
+    /// （`probe()`）就把名额吞了：两笔之后 `total` 一直是满的，谁也别想再进 HAL。
+    /// 现在进门时就记下「我占没占」，Drop 只看这个。
+    queue: Option<&'static HalQueue>,
     uid: Option<i32>,
 }
 
@@ -265,39 +315,7 @@ impl SoterHalGate {
     /// `uid` 为 `None` 表示这笔请求没指名 uid（探针那种），只吃全局名额。
     /// `max` 为 `None` 就读全局那个（探针那条路），传值的是手里有实时配置的那条路。
     fn enter(uid: Option<i32>, max: Option<u32>) -> Self {
-        let depth = SOTER_HAL_DEPTH.with(|d| d.get());
-        if depth > 0 {
-            // 同线程重入：名额已经在外层拿着了，这里只记深度。
-            SOTER_HAL_DEPTH.with(|d| d.set(depth + 1));
-            return Self { uid: None };
-        }
-        let queue = hal_queue();
-        let max = max
-            .unwrap_or_else(max_concurrency)
-            .clamp(SOTER_CONCURRENCY_MIN, SOTER_CONCURRENCY_MAX);
-        let started = Instant::now();
-        {
-            let mut st = queue.lock();
-            st.max = max;
-            while st.total >= max
-                || uid.is_some_and(|u| st.per_uid.get(&u).copied().unwrap_or(0) > 0)
-            {
-                st = queue
-                    .cv
-                    .wait(st)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-            }
-            st.total += 1;
-            if let Some(u) = uid {
-                *st.per_uid.entry(u).or_insert(0) += 1;
-            }
-        }
-        let waited_ms = started.elapsed().as_millis();
-        if waited_ms >= SOTER_WAIT_LOG_MS {
-            log::warn!("soter: 排队等了 {waited_ms}ms 才轮到（上限 {max}，uid {uid:?}）");
-        }
-        SOTER_HAL_DEPTH.with(|d| d.set(1));
-        Self { uid }
+        hal_queue().enter(uid, max)
     }
 }
 
@@ -309,16 +327,17 @@ impl Drop for SoterHalGate {
             return;
         }
         SOTER_HAL_DEPTH.with(|d| d.set(0));
-        let Some(uid) = self.uid else {
-            return;
+        let Some(queue) = self.queue else {
+            return; // 重入进来的那次没占名额
         };
-        let queue = hal_queue();
         let mut st = queue.lock();
         st.total = st.total.saturating_sub(1);
-        if let Some(n) = st.per_uid.get_mut(&uid) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                st.per_uid.remove(&uid);
+        if let Some(uid) = self.uid {
+            if let Some(n) = st.per_uid.get_mut(&uid) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    st.per_uid.remove(&uid);
+                }
             }
         }
         drop(st);
@@ -1030,6 +1049,9 @@ mod tests {
         // 真机（有 SOTER HAL）上跑也成立：那时候 HAL 自己会回一个 `error_code`，
         // 同样不能带我们编的那句。原来这里写死 `expect_err`（默认跑测试的机器没
         // 有 HAL），在一台真有 HAL 的机器上就变成必红，跟代码对错无关。
+        // 这台机器上真有 HAL：先进 binder，不然 rsbinder 直接 panic
+        // `ProcessState is not initialized!`（跟被测逻辑无关，纯测试自己的事）。
+        crate::init_binder();
         let uid = 900001;
         let payload = json!({ "op": "has_auth_key", "uid": uid, "alias": "whatever" });
         let text = match handle(&payload, true, 2) {
@@ -1117,35 +1139,66 @@ mod tests {
 
     // ---- SOTER 进 HAL 的排队：全局有上限 + 同 uid 串行（见 `HalQueue`）----
 
+    /// 一条用例一张自己的队列：测试是并行跑的，共用全局那张的话 `total` 互相打架，
+    /// 断言就变成碰运气了。
+    fn fresh_queue() -> &'static HalQueue {
+        Box::leak(Box::new(HalQueue::new()))
+    }
+
     #[test]
     fn a_gate_takes_exactly_one_slot_and_gives_it_back() {
+        let q = fresh_queue();
         let uid = 40021;
         {
-            let _g = SoterHalGate::enter(Some(uid), Some(4));
-            let st = hal_queue().lock();
+            let _g = q.enter(Some(uid), Some(4));
+            let st = q.lock();
             assert_eq!(st.per_uid.get(&uid).copied(), Some(1), "本线程占 1 个名额");
-            assert!(st.total >= 1);
+            assert_eq!(st.total, 1);
         }
-        let st = hal_queue().lock();
+        let st = q.lock();
         assert_eq!(st.per_uid.get(&uid), None, "出作用域要还回去");
+        assert_eq!(st.total, 0, "全局名额也要还");
+    }
+
+    #[test]
+    fn a_gate_without_a_uid_still_gives_the_slot_back() {
+        // 探针那条路不指名 uid。早先 Drop 里拿「uid 是不是 None」当「该不该还名额」
+        // 使，于是这种门把名额吞了：漏够 max 个之后所有 SOTER 操作全都卡在等名额上，
+        // 真机上的表现就是「卡死」而不是报错。
+        let q = fresh_queue();
+        {
+            let _g = q.enter(None, Some(1));
+            assert_eq!(q.lock().total, 1, "没 uid 也要占全局名额");
+        }
+        assert_eq!(q.lock().total, 0, "没 uid 的名额也得还");
+        // 而且第二笔还得能进去（漏名额的话这里超时失败，不是挂死）
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _g = q.enter(None, Some(1));
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("名额还回来了就该能再进");
     }
 
     #[test]
     fn nested_enters_are_free_and_only_the_outermost_releases() {
-        let outer = SoterHalGate::enter(Some(40001), Some(4));
+        let q = fresh_queue();
+        let outer = q.enter(Some(40001), Some(4));
         // `handle()` 里会调 `probe()`：同线程重入时不能再去要一个名额，否则
-        // 一个 uid 一笔就把自己堵死。重入那次连 uid 都不记（算在外层头上）。
-        let inner_a = SoterHalGate::enter(Some(40002), Some(4));
-        let inner_b = SoterHalGate::enter(Some(40002), Some(4));
+        // 一个 uid 一笔就把自己堵死。重入那次连名额都不记（算在外层头上）。
+        let inner_a = q.enter(Some(40002), Some(4));
+        let inner_b = q.enter(Some(40002), Some(4));
         {
-            let st = hal_queue().lock();
+            let st = q.lock();
             assert_eq!(st.per_uid.get(&40001).copied(), Some(1));
             assert_eq!(st.per_uid.get(&40002), None, "重入不该占名额");
+            assert_eq!(st.total, 1, "重入也不该多占全局名额");
         }
         drop(inner_a);
         drop(inner_b);
         {
-            let st = hal_queue().lock();
+            let st = q.lock();
             assert_eq!(
                 st.per_uid.get(&40001).copied(),
                 Some(1),
@@ -1153,17 +1206,19 @@ mod tests {
             );
         }
         drop(outer);
-        assert_eq!(hal_queue().lock().per_uid.get(&40001), None);
+        assert_eq!(q.lock().per_uid.get(&40001), None);
+        assert_eq!(q.lock().total, 0);
     }
 
     #[test]
     fn another_thread_on_the_same_uid_waits_for_the_slot() {
         // 用 recv_timeout 而不是 join：万一以后真的写坏了，这里是失败而不是挂死。
+        let q = fresh_queue();
         let uid = 40011;
-        let held = SoterHalGate::enter(Some(uid), Some(4));
+        let held = q.enter(Some(uid), Some(4));
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::thread::spawn(move || {
-            let _g = SoterHalGate::enter(Some(uid), Some(4));
+            let _g = q.enter(Some(uid), Some(4));
             let _ = tx.send(());
         });
         assert!(
@@ -1175,15 +1230,17 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("名额放掉之后第二笔要能进");
         t.join().unwrap();
+        assert_eq!(q.lock().total, 0, "两笔都出完要归零");
     }
 
     #[test]
     fn a_different_uid_does_not_wait_for_the_one_held() {
-        let held = SoterHalGate::enter(Some(40031), Some(2));
+        let q = fresh_queue();
+        let held = q.enter(Some(40031), Some(2));
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::thread::spawn(move || {
             // 上限 2：另一个 uid 该直接进（这就是从「全局串行」换来的那点并行）
-            let _g = SoterHalGate::enter(Some(40032), Some(2));
+            let _g = q.enter(Some(40032), Some(2));
             let _ = tx.send(());
         });
         rx.recv_timeout(std::time::Duration::from_secs(5))
