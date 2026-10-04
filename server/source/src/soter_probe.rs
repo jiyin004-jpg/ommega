@@ -209,7 +209,7 @@ pub const DEFAULT_REAL_APP_PACKAGES: &str = concat!(
     "com.sankuai.meituan,com.sankuai.meituan.takeoutnew,com.dianping.v1,",
     "com.sdu.didi.psnger,com.jingdong.app.mall,com.sinovatech.unicom.ui,",
     "com.greenpoint.android.mc10086.activity,com.ct.client,",
-    "com.ss.android.ugc.aweme,com.ss.android.ugc.aweme.lite,com.smile.gifmaker,",
+    "com.smile.gifmaker,",
     "tv.danmaku.bili,com.baidu.tieba,com.baidu.netdisk,com.netease.cloudmusic,",
     "ctrip.android.view,com.achievo.vipshop,",
     // GMS/Play。
@@ -516,7 +516,6 @@ mod tests {
             "com.sankuai.meituan",
             "com.sdu.didi.psnger",
             "com.sinovatech.unicom.ui",
-            "com.ss.android.ugc.aweme",
             // GMS/Play
             "com.google.android.gms",
             "com.android.vending",
@@ -524,6 +523,13 @@ mod tests {
             assert!(
                 known.iter().any(|name| name == pkg),
                 "{pkg} 不在缺省真应用名单里"
+            );
+        }
+        // 抖音（含极速版）2026-10-04 按要求移出，别再手滑加回来。
+        for pulled in ["com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.lite"] {
+            assert!(
+                !known.iter().any(|name| name == pulled),
+                "{pulled} 已按要求移出真应用名单"
             );
         }
         // 探测/测试类一个都不能在里面 —— 放进来就是把真机那个 cpu_id 递出去。
