@@ -171,13 +171,56 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
     if uid == 0 || uid == 1000 {
         return Ok(Vec::new());
     }
-    let application_id = get_application_id_from_provider(uid)?;
-    Ok(application_id
+
+    let mut error = None;
+    match get_application_id_from_provider(uid) {
+        Ok(application_id) => {
+            let names = package_names_of(&application_id);
+            if !names.is_empty() {
+                return Ok(names);
+            }
+        }
+        Err(failed) => error = Some(failed),
+    }
+
+    // 不是 user 0 的 uid（多用户 / 分身 / 空间）：`uid = userId * 100000 + appId`。系统那套
+    // 正常查表认不出这些用户号 —— 实测生产里的槽位表上见过 `999`(288) / `998`(84) / `997`(33) /
+    // `996`(16) / `995`(10) / `994`(4) / `19000`(30)，还有真实的 `10` / `11` / `12`——
+    // AAID 要么回空、要么直接报错，于是这些 uid 永远翻不出包名，服务端只能退回按别名/槽位猜
+    // （生产日志里 `99910365` / `99910617` 那些就是这么被拦下的）。
+    // 同一个 App 的 appId 跟它在 user 0 上那份一致，所以拿 appId 再问一次就能拿到同一个包。
+    if let Some(app_id) = other_user_app_id(uid) {
+        if let Ok(application_id) = get_application_id_from_provider(app_id) {
+            let names = package_names_of(&application_id);
+            if !names.is_empty() {
+                log::info!(
+                    "event=soter caller uid {uid} 不是 user 0（多用户/分身），按 appId {app_id} 翻出 {names:?}"
+                );
+                return Ok(names);
+            }
+        }
+    }
+
+    // 没翻到就是没翻到（空名单）；但系统真的拒绝了（不是「查无此 uid」）时把错报上去，
+    // 调用方那条 warn 日志才有东西可写。
+    match error {
+        Some(failed) => Err(failed),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn package_names_of(application_id: &KeyAttestationApplicationId) -> Vec<String> {
+    application_id
         .packageInfos
-        .into_iter()
-        .map(|info| info.packageName)
+        .iter()
+        .map(|info| info.packageName.clone())
         .filter(|name| !name.is_empty())
-        .collect())
+        .collect()
+}
+
+/// 不是 user 0 的 uid（多用户 / 分身 / 空间）回它的 appId；user 0 的就没什么可回退的（appId 就是 uid）。
+fn other_user_app_id(uid: u32) -> Option<u32> {
+    (multiuser_get_user_id(uid) != 0).then(|| multiuser_get_app_id(uid))
 }
 
 fn get_application_id_from_provider(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
@@ -465,5 +508,22 @@ mod tests {
                 .version,
             u64::MAX
         );
+    }
+
+    /// 不是 user 0 的 uid（分身/空间/多用户）都得能认出、并把 appId 取对。生产槽位表里见过
+    /// `999` / `998` / `997` / `996` / `995` / `994` / `19000` 和真实的 `10` / `11` / `12`。
+    #[test]
+    fn a_non_user_zero_uid_falls_back_to_its_app_id() {
+        assert_eq!(other_user_app_id(99910365), Some(10365));
+        assert_eq!(other_user_app_id(99910617), Some(10617));
+        assert_eq!(other_user_app_id(99610040), Some(10040));
+        assert_eq!(other_user_app_id(1_900_010_040), Some(10040));
+        // 真实的第二用户（user 10 / 12）。
+        assert_eq!(other_user_app_id(1_010_490), Some(10490));
+        assert_eq!(other_user_app_id(1_210_392), Some(10392));
+        // user 0 的没什么可回退的（appId 就是 uid 本身）。
+        assert_eq!(other_user_app_id(10490), None);
+        assert_eq!(other_user_app_id(0), None);
+        assert_eq!(other_user_app_id(1000), None);
     }
 }

@@ -24,7 +24,16 @@ use crate::config::Config;
 /// 规则是反向的：**命中这里的交给真机，其余一律用内置料就地作答**。
 /// 探测机自己起的名字（`*_soter_probe_*`）不在里面，所以连它那几笔不带别名的 ASK
 /// 也一并落到内置料上 —— 同一轮的 ASK / AuthKey 报同一个号，不再一个真机一个本地。
-pub const DEFAULT_REAL_APP_PREFIXES: &str = "SoterAuthKey,WechatAuthKeyPay&";
+///
+/// 别名命中还有一层作用：它会把 `(点名设备, uid)` 这个槽位记成「真应用用过」（见
+/// `REAL_SLOT_TTL_MS`），之后同槽位那些**不带别名**的调用（`has_ask_already` /
+/// `export_ask_public_key` 那套）才会跟着走真机。所以漏一个真应用命名，代价不是「那一笔
+/// 被拦」，而是「那台机器整个流程都留在内置料上」——它的 ASK 与 AuthKey 从此不同源。
+///
+/// `Wechatuid...` 是 2026-10-04 从生产日志里补进来的：两小时半里 99 笔、来自十来台设备
+/// （uid 10333 / 10366 / 10442 …），名字形如 `Wechatuid10248__scene0`，之前一条都没命中，
+/// 全都靠 `sticky` 蹭过去的（蹭过去的那几笔不会标槽位）。
+pub const DEFAULT_REAL_APP_PREFIXES: &str = "SoterAuthKey,WechatAuthKeyPay&,Wechatuid";
 
 /// 槽位上见过真应用别名之后，多久内它「不带别名的调用」（ASK / getDeviceId 那套）也照样
 /// 交给真机。真应用的 uid 是诚实的（SDK 拿自己的 `Binder.getCallingUid()` 填），但窗口要
@@ -360,6 +369,8 @@ mod tests {
             "SoterAuthKeyV2_salt11d8ba34_scene1",
             "SoterAuthKey_salt0d4a5c11_scene2",
             "WechatAuthKeyPay&dx20079023",
+            // 生产日志里实测到的另一种微信命名（2026-10-04 加进来）。
+            "Wechatuid10248__scene0",
         ] {
             assert!(prefix_hit(real, DEFAULT_REAL_APP_PREFIXES), "{real}");
         }

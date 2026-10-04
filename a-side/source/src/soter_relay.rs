@@ -170,12 +170,17 @@ static CALLER_NAMES: CallerNames = std::sync::Mutex::new(Vec::new());
 ///
 /// 为什么要缓存：它每笔 SOTER 调用都要问一次系统，而那个映射只有装/卸应用才会变。
 fn caller_package_for_uid(uid: i64) -> Option<String> {
-    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    // 翻成功记一分钟就够（只有装/卸应用才会变）；翻不出来只记几秒 —— 那多半是系统那一刻
+    // 没答上来（AAID 服务刚起来、那一瞬间查不到这个 uid），拿一分钟的负面缓存把「按包名判」
+    // 这条路挡住不值得。
+    const OK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
     let uid = u32::try_from(uid).ok()?;
     if let Ok(entries) = CALLER_NAMES.lock() {
         if let Some((_, at, hit)) = entries.iter().find(|(cached, _, _)| *cached == uid) {
-            if at.elapsed() < TTL {
+            let ttl = if hit.is_some() { OK_TTL } else { MISS_TTL };
+            if at.elapsed() < ttl {
                 return hit.clone();
             }
         }

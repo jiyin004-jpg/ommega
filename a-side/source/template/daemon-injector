@@ -292,21 +292,22 @@ is_injected() {
   [ -r "$maps" ] || return 1
 
   if [ -r "$PAYLOAD_STATE_FILE" ]; then
-    if toybox awk -v want_pid="$pid" '
-      FNR == NR {
-        if ($1 == want_pid && $2 != "") {
-          ident = $2
-        }
-        next
-      }
-      ident != "" && index($0, ident) {
-        found = 1
-        exit
-      }
-      END {
-        exit found ? 0 : 1
-      }
-    ' "$PAYLOAD_STATE_FILE" "$maps" >/dev/null 2>&1; then
+    # 状态文件里是 `<pid> <memfd 名字>`（载荷走 memfd，名字是每轮随机生成的
+    # `lib<32hex>.so`，磁盘上算不出来，只能从这儿拿）。同一个 pid 可能留了好几行，
+    # 取最后一条。
+    #
+    # 这里**不能**写 `toybox awk`：这台机器（nubia NX721J）的 toybox 没有 awk 这个
+    # applet，整段判据静默失败，于是每轮都判「没注上」、每 16 秒重新 ptrace 注一遍
+    # ——实测这个循环会让 MT 管理器刷根目录卡住十来秒、只显示普通权限那份列表。
+    # 用纯 shell，不依赖 awk。
+    local ident line_pid line_ident
+    ident=""
+    while read -r line_pid line_ident _rest; do
+      [ "$line_pid" = "$pid" ] || continue
+      [ -n "$line_ident" ] && ident=$line_ident
+    done < "$PAYLOAD_STATE_FILE"
+
+    if [ -n "$ident" ] && grep -qF "$ident" "$maps" 2>/dev/null; then
       return 0
     fi
   fi

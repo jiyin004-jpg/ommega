@@ -1179,8 +1179,16 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
         .and_then(Value::as_str)
         .unwrap_or("-")
         .to_string();
+    // 「按包名判」这条路到底盖没盖住这笔：带过来就写包名，没带就写 `-`。生产上就靠这一格
+    // 数覆盖率（A 端那条链：内核 uid → 本机翻包名 → caller_pkg）。
+    let caller_pkg = body
+        .get(crate::soter_probe::CALLER_PKG_FIELD)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|pkg| !pkg.is_empty())
+        .unwrap_or("-");
     tracing::info!(
-        "soter: op={op} uid={probe_uid} alias={probe_alias} requested={}",
+        "soter: op={op} uid={probe_uid} alias={probe_alias} caller_pkg={caller_pkg} requested={}",
         if requested.is_empty() {
             "<any>"
         } else {

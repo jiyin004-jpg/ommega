@@ -52,6 +52,7 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use log::{debug, info};
@@ -606,6 +607,162 @@ fn take_app_caller_uid() -> Option<i32> {
     (at.elapsed() <= APP_CALLER_WINDOW).then_some(uid)
 }
 
+/// 一笔 App 面向调用留下的凭据：谁在调 + 这笔请求长什么样。
+///
+/// 只记 uid 不够。真机上实测（2026-10-04，`keymint.log`）：103 笔 HAL 调用里只有 30 笔
+/// 能从「同线程紧接着那笔」借到 uid（29%），其余全空 —— 宿主换个线程去调 HAL、或者一笔
+/// App 请求引出好几笔 HAL 调用（同线程那个槽取走即清，后面那几笔就没了）都会丢。
+/// 丢了这个 uid，daemon 就翻不出包名，服务端只能退回按别名/槽位猜。
+#[derive(Debug, Clone)]
+struct AppCaller {
+    uid: i32,
+    at: Instant,
+    /// App 面向那笔请求里的别名（有些接口没这一格）。
+    alias: Option<String>,
+    /// 会话号（`finish_sign` 那类只有会话号）。
+    session: Option<i64>,
+}
+
+impl AppCaller {
+    /// 同一把钥匙/同一张会话的旧凭据就不用留了：一轮流程里同一个别名会被问很多遍。
+    fn same_key(&self, call: &SoterCall) -> bool {
+        self.alias.as_deref() == call.alias.as_deref() && self.session == call.session
+    }
+
+    /// 这笔凭据是不是「没别名也没会话」（`has_ask_already` / `export_ask_public_key` 那套）。
+    fn bare(&self) -> bool {
+        self.alias.as_deref().unwrap_or("").is_empty() && self.session.is_none()
+    }
+}
+
+/// 最近几笔 App 面向调用的凭据。按**进程**记，不按线程。
+static RECENT_APP_CALLERS: Mutex<Vec<AppCaller>> = Mutex::new(Vec::new());
+
+/// 凭据在进程级列表里留多久。比同线程那个 2 秒的窗长：宿主把出站那几笔排在后面点也还赶得上，
+/// 又短到串不到下一轮无关的调用上。
+const APP_CALLER_TTL: Duration = Duration::from_secs(10);
+
+/// 列表最长多少笔（满了丢最旧的）。一轮流程本来就只有十来笔，32 够得很。
+const APP_CALLER_CAP: usize = 32;
+
+/// 记一笔 App 面向调用，给出站那几笔回查用。`uid` 是内核填的 `sender_euid`。
+fn remember_app_caller(call: &SoterCall, uid: i32) {
+    let Ok(mut list) = RECENT_APP_CALLERS.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    list.retain(|entry| now.saturating_duration_since(entry.at) <= APP_CALLER_TTL);
+    list.retain(|entry| !entry.same_key(call));
+    list.push(AppCaller {
+        uid,
+        at: now,
+        alias: call.alias.clone(),
+        session: call.session,
+    });
+    while list.len() > APP_CALLER_CAP {
+        list.remove(0);
+    }
+}
+
+/// 从最近几笔凭据里挑一笔给出站的 HAL 调用用。抽成纯函数好测。
+///
+/// 顺序：先按 alias 认（`has_auth_key` / `init_sign` 这类带别名的最多），再按会话号认
+/// （`finish_sign` 只有会话号），最后两边都是「没别名没会话」时拿最近一笔 —— 那些 op
+/// 本来就前后脚，认别的东西反而认不出来。
+fn pick_recent_caller(list: &[AppCaller], call: &SoterCall, now: Instant) -> Option<i32> {
+    let fresh = |entry: &AppCaller| now.saturating_duration_since(entry.at) <= APP_CALLER_TTL;
+    let alias = call.alias.as_deref().filter(|alias| !alias.is_empty());
+    if let Some(alias) = alias {
+        if let Some(hit) = list
+            .iter()
+            .rev()
+            .find(|entry| fresh(entry) && entry.alias.as_deref() == Some(alias))
+        {
+            return Some(hit.uid);
+        }
+    }
+    if let Some(session) = call.session {
+        if let Some(hit) = list
+            .iter()
+            .rev()
+            .find(|entry| fresh(entry) && entry.session == Some(session))
+        {
+            return Some(hit.uid);
+        }
+    }
+    if alias.is_none() && call.session.is_none() {
+        if let Some(hit) = list.iter().rev().find(|entry| fresh(entry) && entry.bare()) {
+            return Some(hit.uid);
+        }
+    }
+    None
+}
+
+/// 出站那笔该带谁：先问本线程刚记下的那笔（最近、最准），再回查进程级那份列表。
+fn borrow_app_caller(call: &SoterCall) -> Option<i32> {
+    if let Some(uid) = take_app_caller_uid() {
+        return Some(uid);
+    }
+    let now = Instant::now();
+    if let Ok(list) = RECENT_APP_CALLERS.lock() {
+        if let Some(uid) = pick_recent_caller(&list, call, now) {
+            return Some(uid);
+        }
+    }
+    // 最后按别名找主人：宿主自己也会发几笔「没有 App 在调」的带别名请求（开机一套、
+    // 后台建/清钥匙那套），这些没人可借；按别名认主人之后，它们跟 App 自己那几笔同源。
+    let alias = call.alias.as_deref().filter(|alias| !alias.is_empty())?;
+    let owners = ALIAS_OWNERS.lock().ok()?;
+    pick_alias_owner(&owners, alias, now)
+}
+
+/// 「这把别名是谁的」：别名 → 内核填的 uid。
+///
+/// 比一轮流程活得久：App 那几笔给出来的主人，后面宿主自己发的同别名请求也用得上。
+#[derive(Debug, Clone)]
+struct AliasOwner {
+    alias: String,
+    uid: i32,
+    at: Instant,
+}
+
+static ALIAS_OWNERS: Mutex<Vec<AliasOwner>> = Mutex::new(Vec::new());
+
+/// 别名主人记多久。SOTER 的钥匙就那几个别名，App 一天里会用很多轮，10 分钟够跨好几轮，
+/// 又短到 App 卸载/清数据后不会一直把新主人认错。
+const ALIAS_OWNER_TTL: Duration = Duration::from_secs(600);
+
+/// 最多记多少把别名。
+const ALIAS_OWNER_CAP: usize = 64;
+
+/// 记下这把别名的主人（App 面向那笔的内核 uid）。
+fn remember_alias_owner(alias: &str, uid: i32) {
+    let Ok(mut list) = ALIAS_OWNERS.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    list.retain(|owner| now.saturating_duration_since(owner.at) <= ALIAS_OWNER_TTL);
+    list.retain(|owner| owner.alias != alias);
+    list.push(AliasOwner {
+        alias: alias.to_string(),
+        uid,
+        at: now,
+    });
+    while list.len() > ALIAS_OWNER_CAP {
+        list.remove(0);
+    }
+}
+
+/// 这把别名的主人是谁（过期的、不是这把的都不算）。抽成纯函数好测。
+fn pick_alias_owner(list: &[AliasOwner], alias: &str, now: Instant) -> Option<i32> {
+    list.iter()
+        .rev()
+        .find(|owner| {
+            owner.alias == alias && now.saturating_duration_since(owner.at) <= ALIAS_OWNER_TTL
+        })
+        .map(|owner| owner.uid)
+}
+
 /// 观察一条 transaction。不是 SOTER 的就一声不吭地回去。
 ///
 /// # Safety
@@ -627,10 +784,18 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
     if call.hal {
         // 宿主发往 HAL 的那笔：把上一笔 App 面向请求的真调用者 uid 接到这笔上，
         // 转发时带给 daemon（由它翻包名、由服务端按包名白名单判）。
-        call.caller_uid = take_app_caller_uid();
+        call.caller_uid = borrow_app_caller(&call);
     } else {
-        // App 面向那笔：`tr.sender_euid` 是内核填的，调用方改不了，记下来给出站那笔用。
+        // App 面向那笔：`tr.sender_euid` 是内核填的，调用方改不了，记下来给出站那几笔用。
+        // 两处都记：本线程那份给出站那一笔用（最近、最准），进程级那份给换了线程、或者
+        // 一笔 App 请求引出好几笔 HAL 调用的那几笔用。
         note_app_caller(tr.sender_euid);
+        if tr.sender_euid >= 0 {
+            remember_app_caller(&call, tr.sender_euid);
+            if let Some(alias) = call.alias.as_deref().filter(|alias| !alias.is_empty()) {
+                remember_alias_owner(alias, tr.sender_euid);
+            }
+        }
     }
     log_call(&call);
     Some(call)
@@ -997,6 +1162,175 @@ mod tests {
         assert!(parse(&data, 6).is_none(), "code 6 is a hole in this HAL");
         assert!(parse(&data, 14).is_none(), "code 14 is a hole in this HAL");
         assert!(parse(&data, 99).is_none());
+    }
+
+    /// 回查调用者：按同名钥先认、再按会话号、最后才是「两边都没别名」那种。
+    #[test]
+    fn an_outbound_call_finds_its_caller_in_the_recent_list() {
+        let now = Instant::now();
+        let entry = |uid: i32, ago: u64, alias: Option<&str>, session: Option<i64>| AppCaller {
+            uid,
+            at: now - Duration::from_secs(ago),
+            alias: alias.map(str::to_string),
+            session,
+        };
+        let aliased = |alias: &str| {
+            let data = request(&|out| {
+                push_i32(out, 10490);
+                push_string(out, alias);
+            });
+            parse(&data, 10).expect("code 10 is ours")
+        };
+
+        // 别名对得上那一笔才认（同一台设备上同时有好几把钥匙）。
+        let list = vec![
+            entry(10373, 1, Some("SoterAuthKeyV2_other_scene1"), None),
+            entry(10490, 1, Some("SoterAuthKeyV2_salt11d8ba34_scene1"), None),
+        ];
+        assert_eq!(
+            pick_recent_caller(&list, &aliased("SoterAuthKeyV2_salt11d8ba34_scene1"), now),
+            Some(10490)
+        );
+        // 同一把钥匙的下一个 op（init_sign）照样认得出。
+        let init = {
+            let data = request(&|out| {
+                push_i32(out, 10490);
+                push_string(out, "SoterAuthKeyV2_salt11d8ba34_scene1");
+                push_string(out, "0a1b");
+            });
+            parse(&data, 11).expect("code 11 is ours")
+        };
+        assert_eq!(
+            pick_recent_caller(&list, &init, now),
+            Some(10490),
+            "同一个别名的另一笔也得认"
+        );
+        // 列表里只有别的钥匙：不能乱认。
+        assert_eq!(
+            pick_recent_caller(
+                &[entry(10373, 1, Some("SoterAuthKeyV2_other_scene1"), None)],
+                &aliased("SoterAuthKeyV2_salt11d8ba34_scene1"),
+                now
+            ),
+            None
+        );
+        // 带别名的出站调用不能被「没别名」的凭据顶上。
+        assert_eq!(
+            pick_recent_caller(
+                &[entry(10490, 1, None, None)],
+                &aliased("SoterAuthKeyV2_salt11d8ba34_scene1"),
+                now
+            ),
+            None
+        );
+
+        // 只有会话号的那笔（finish_sign）：靠会话号对上。
+        let finish = {
+            let data = request(&|out| push_i64(out, -8465536435272201480));
+            parse(&data, 4).expect("code 4 is ours")
+        };
+        assert_eq!(
+            pick_recent_caller(
+                &[entry(10490, 1, None, Some(-8465536435272201480))],
+                &finish,
+                now
+            ),
+            Some(10490)
+        );
+        assert_eq!(
+            pick_recent_caller(&[entry(10490, 1, None, Some(7))], &finish, now),
+            None,
+            "会话号对不上的那笔不该被认下"
+        );
+
+        // 两边都没别名没会话（`has_ask_already` / `export_ask_public_key` 那套）：拿最近一笔。
+        let bare = {
+            let data = request(&|out| push_i32(out, 2000));
+            parse(&data, 1).expect("code 1 is ours")
+        };
+        let bare_list = vec![entry(10490, 5, None, None), entry(10540, 1, None, None)];
+        assert_eq!(
+            pick_recent_caller(&bare_list, &bare, now),
+            Some(10540),
+            "没别名没会话时取最近那一笔"
+        );
+
+        // 过了窗口的那笔不算数。
+        let stale = vec![entry(10490, APP_CALLER_TTL.as_secs() + 1, None, None)];
+        assert_eq!(pick_recent_caller(&stale, &bare, now), None);
+    }
+
+    /// 「没别名也没会话」的判据、以及同一把钥匙的去重，别认错。
+    #[test]
+    fn a_bare_caller_is_only_bare_without_alias_and_session() {
+        let bare = AppCaller {
+            uid: 10490,
+            at: Instant::now(),
+            alias: None,
+            session: None,
+        };
+        assert!(bare.bare());
+        let empty_alias = AppCaller {
+            alias: Some(String::new()),
+            ..bare.clone()
+        };
+        assert!(empty_alias.bare(), "空别名也算没别名");
+        let with_alias = AppCaller {
+            alias: Some("SoterAuthKeyV2_x_scene1".to_string()),
+            ..bare.clone()
+        };
+        assert!(!with_alias.bare());
+        let with_session = AppCaller {
+            session: Some(7),
+            ..bare.clone()
+        };
+        assert!(!with_session.bare(), "有会话号就不算没别名那类");
+
+        let data = request(&|out| {
+            push_i32(out, 10490);
+            push_string(out, "SoterAuthKeyV2_x_scene1");
+        });
+        let call = parse(&data, 10).expect("code 10 is ours");
+        assert!(with_alias.same_key(&call));
+        assert!(!bare.same_key(&call));
+    }
+
+    /// 别名主人：同名那把能认出来，别的名字不认，过期的也不认。
+    #[test]
+    fn an_alias_owner_is_found_by_the_exact_name() {
+        let now = Instant::now();
+        let owner = |alias: &str, uid: i32, ago: u64| AliasOwner {
+            alias: alias.to_string(),
+            uid,
+            at: now - Duration::from_secs(ago),
+        };
+        let list = vec![
+            owner("SoterAuthKeyV2_other_scene1", 10373, 30),
+            owner("SoterAuthKeyV2_salt11d8ba34_scene1", 10490, 30),
+        ];
+        assert_eq!(
+            pick_alias_owner(&list, "SoterAuthKeyV2_salt11d8ba34_scene1", now),
+            Some(10490)
+        );
+        assert_eq!(pick_alias_owner(&list, "Wechatuid10248__scene0", now), None);
+        // 同一把别名又用过一次：以后记的那笔为准。
+        let reused = vec![
+            owner("SoterAuthKey_x", 10490, 300),
+            owner("SoterAuthKey_x", 10500, 1),
+        ];
+        assert_eq!(
+            pick_alias_owner(&reused, "SoterAuthKey_x", now),
+            Some(10500)
+        );
+        // 过了窗口不认。
+        let stale = vec![owner(
+            "SoterAuthKey_x",
+            10490,
+            ALIAS_OWNER_TTL.as_secs() + 1,
+        )];
+        assert_eq!(pick_alias_owner(&stale, "SoterAuthKey_x", now), None);
+        // 空别名本来就不该走到这儿。
+        assert_eq!(pick_alias_owner(&reused, "", now), None);
     }
 
     #[test]
