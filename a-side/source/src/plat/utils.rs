@@ -271,8 +271,9 @@ fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
 /// 新鲜度阀（文件超过这个秒数就不用）和配置开关（root 侧得不写，它就不存在）。
 const FOREGROUND_PATH: &str = "/data/misc/keystore/ommega/foreground";
 
-/// 前台信息算多新鲜才能用。
-const FOREGROUND_TTL_SECS: u64 = 8;
+/// 前台信息算多新鲜才能用。要比写侧的间隔大（写侧 `FOREGROUND_EVERY=2` × 5 秒 ≈ 10 秒），
+/// 否则大部分时候都是“过期的没有”——那就等于这一道不存在。
+const FOREGROUND_TTL_SECS: u64 = 20;
 
 /// 前台应用兜底：把那个文件读出来，太旧/格式不对就回 `None`。
 pub fn foreground_package() -> Option<String> {

@@ -218,19 +218,22 @@ fn with_caller_pkg(mut value: Value) -> Value {
     if has_caller_pkg(&value) {
         return value;
     }
-    let Some(uid) = value.get(CALLER_UID_FIELD).and_then(Value::as_i64) else {
-        return value;
-    };
-    let Some(pkg) = caller_package_for_uid(uid) else {
-        // 最后一道兜底：内核 uid 翻不出包名（分身/多用户那些机器）时，用 root 侧写下的
-        // 「当前前台应用」。它比 uid 弱（前台 != 调 SOTER 的那个），所以只在这一步用。
-        let Some(pkg) = crate::plat::utils::foreground_package() else {
-            return value;
-        };
-        log::info!("event=soter caller uid {uid} 翻不出包名，用前台应用兜底 -> {pkg}");
-        if let Some(map) = value.as_object_mut() {
-            map.insert(CALLER_PKG_FIELD.to_string(), Value::from(pkg));
-        }
+    let pkg = value
+        .get(CALLER_UID_FIELD)
+        .and_then(Value::as_i64)
+        .and_then(caller_package_for_uid)
+        .or_else(|| {
+            // 没有 `caller_uid`（宿主那套 App 面向接口我们认不出来），或者有 uid 但翻不出包名：
+            // 用 root 侧写的“当前前台应用”兜底。
+            //
+            // 这一步为什么必须放在这里：以前它接在 `caller_package_for_uid` 的失败分支里，
+            // 而“没有 caller_uid”是**更早**的 `return`（实测小米那台就是这样）—— 文件压根
+            // 没人看，于是整条包名路全空、只能退回别名/槽位猜，他那台的指纹一直起不来。
+            crate::plat::utils::foreground_package().inspect(|pkg| {
+                log::info!("event=soter caller 用前台应用兜底 -> {pkg}");
+            })
+        });
+    let Some(pkg) = pkg else {
         return value;
     };
     if let Some(map) = value.as_object_mut() {

@@ -424,8 +424,10 @@ EARLY_POLL_SECONDS=90
 started_at=$(date +%s 2>/dev/null || echo 0)
 # 主循环的拍数：前台那个活代价比读文件大，没必要每拍都干（见 sync_foreground）。
 tick=0
-# 前台应用多久采一次（拍数）。5 秒一拍 × 3 = 约 15 秒，daemon 那边只认 8 秒内的。
-FOREGROUND_EVERY=3
+# 前台应用多久采一次（拍数）。5 秒一拍 × 2 = 约 10 秒；daemon 那边认 20 秒内的，所以
+# 任何时候它读到的那份最多 10 秒旧——之前是 3 拍（≈15 秒）写一次、只认 8 秒，大部分时候
+# 都是“过期的没有”，等于这一道不存在。
+FOREGROUND_EVERY=2
 tick_sleep() {
   now=$(date +%s 2>/dev/null)
   if [ -n "$now" ] && [ "$started_at" -gt 0 ] && [ $((now - started_at)) -lt $EARLY_POLL_SECONDS ]; then
