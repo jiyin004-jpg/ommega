@@ -189,6 +189,13 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
     // AAID 要么回空、要么直接报错，于是这些 uid 永远翻不出包名，服务端只能退回按别名/槽位猜
     // （生产日志里 `99910365` / `99910617` 那些就是这么被拦下的）。
     // 同一个 App 的 appId 跟它在 user 0 上那份一致，所以拿 appId 再问一次就能拿到同一个包。
+    // 先问 root 侧那张表（它就是系统自己的 `packages.list`，分身的行也在里面，最准）；
+    // 表里没这一条（root 侧还没写出来、或者那个 ROM 的表里真没有）再拿 appId 猜一次 ——
+    // 同一个 App 的 appId 跟它在 user 0 上那份一致，所以猜也能猜对大多数。
+    if let Some(package) = package_from_uid_table(uid) {
+        log::info!("event=soter caller uid {uid} 从 root 侧 uid→包名表里翻出 {package}");
+        return Ok(vec![package]);
+    }
     if let Some(app_id) = other_user_app_id(uid) {
         if let Ok(application_id) = get_application_id_from_provider(app_id) {
             let names = package_names_of(&application_id);
@@ -207,6 +214,88 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
         Some(failed) => Err(failed),
         None => Ok(Vec::new()),
     }
+}
+
+/// root 侧（`daemon-injector`）周期写出来的「uid → 包名」表。
+///
+/// 为什么要多这条：AAID 服务在分身/空间/多用户那些 uid 上会回空或直接报错，那些机器就永远
+/// 翻不出包名、只能退回按别名/槽位猜。这张表是 root 直接从系统自己的 `packages.list` 抄的，
+/// 不依赖那个服务、也不靠 appId 猜（分身那些 999xxxxx 在 `packages.list` 里本来就有行）。
+const UID_PACKAGES_PATH: &str = "/data/misc/keystore/ommega/uid_packages";
+
+/// 表的内容 + 什么时候读的。文件不大（几百行），一分钟重读一次就够。
+static UID_PACKAGES: std::sync::Mutex<
+    Option<(std::time::Instant, std::collections::HashMap<u32, String>)>,
+> = std::sync::Mutex::new(None);
+
+/// 从那张表里查这个 uid 挂着哪个包（表不在/读不出来/没这一条都回 `None`）。
+fn package_from_uid_table(uid: u32) -> Option<String> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let mut guard = UID_PACKAGES.lock().ok()?;
+    let stale = guard
+        .as_ref()
+        .map(|(at, _)| at.elapsed() >= TTL)
+        .unwrap_or(true);
+    if stale {
+        let text = std::fs::read_to_string(UID_PACKAGES_PATH).unwrap_or_default();
+        *guard = Some((std::time::Instant::now(), parse_uid_packages(&text)));
+    }
+    guard.as_ref()?.1.get(&uid).cloned()
+}
+
+/// 把「`uid 包名` 一行一条」的表解析成映射。空行、`#` 注释、字段不够的都不算，uid 不是
+/// 数字的也跳过。
+fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let (Some(uid), Some(package)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if let Ok(uid) = uid.parse::<u32>() {
+            map.insert(uid, package.to_string());
+        }
+    }
+    map
+}
+
+/// root 侧（`daemon-injector`）周期性写出来的「当前前台应用」：一行 `<epoch 秒> <包名>`。
+///
+/// 它是最后一道兜底：前面三层（内核 uid、root 侧表、appId 回退）都拿不到包名时才用它。
+/// 它比前三层弱 —— 前台是谁不等于谁在调 SOTER（支付流程可能在子进程/后台）—— 所以还带
+/// 新鲜度阀（文件超过这个秒数就不用）和配置开关（root 侧得不写，它就不存在）。
+const FOREGROUND_PATH: &str = "/data/misc/keystore/ommega/foreground";
+
+/// 前台信息算多新鲜才能用。
+const FOREGROUND_TTL_SECS: u64 = 8;
+
+/// 前台应用兜底：把那个文件读出来，太旧/格式不对就回 `None`。
+pub fn foreground_package() -> Option<String> {
+    let text = std::fs::read_to_string(FOREGROUND_PATH).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    parse_foreground(&text, now)
+}
+
+/// 解析「前台应用」那个文件：`<epoch 秒> <包名>`，太旧（`FOREGROUND_TTL_SECS`）就不算。
+fn parse_foreground(text: &str, now_epoch_secs: u64) -> Option<String> {
+    let mut fields = text.split_whitespace();
+    let at = fields.next()?.parse::<u64>().ok()?;
+    let package = fields.next()?;
+    if now_epoch_secs.saturating_sub(at) > FOREGROUND_TTL_SECS {
+        return None;
+    }
+    if package.is_empty() || package == "-" {
+        return None;
+    }
+    Some(package.to_string())
 }
 
 fn package_names_of(application_id: &KeyAttestationApplicationId) -> Vec<String> {
@@ -525,5 +614,58 @@ mod tests {
         assert_eq!(other_user_app_id(10490), None);
         assert_eq!(other_user_app_id(0), None);
         assert_eq!(other_user_app_id(1000), None);
+    }
+
+    /// root 侧那张 uid→包名表：一行一条，注释/空行/坏行都跳过，分身 uid 照样认。
+    #[test]
+    fn the_root_uid_package_table_is_parsed_line_by_line() {
+        let table = parse_uid_packages(
+            "# uid package\n10490 com.tencent.mm\n99910365 com.tencent.mm\n\n乱写一行\n10491\n  10492   com.taobao.taobao  \n",
+        );
+        assert_eq!(
+            table.get(&10490).map(String::as_str),
+            Some("com.tencent.mm")
+        );
+        assert_eq!(
+            table.get(&99910365).map(String::as_str),
+            Some("com.tencent.mm")
+        );
+        assert_eq!(
+            table.get(&10492).map(String::as_str),
+            Some("com.taobao.taobao")
+        );
+        assert_eq!(table.get(&10491), None);
+        assert_eq!(table.len(), 3);
+    }
+
+    /// 前台应用兜底：格式对、且够新鲜才用；旧了/写的是空就回 None。
+    #[test]
+    fn the_foreground_fallback_needs_to_be_fresh() {
+        let now = 1_791_000_000u64;
+        assert_eq!(
+            parse_foreground(&format!("{now} com.tencent.mm\n"), now),
+            Some("com.tencent.mm".to_string())
+        );
+        // 刚过阀（8 秒）还能用，再旧就不算。
+        assert_eq!(
+            parse_foreground(
+                &format!("{} com.tencent.mm", now - FOREGROUND_TTL_SECS),
+                now
+            ),
+            Some("com.tencent.mm".to_string())
+        );
+        assert_eq!(
+            parse_foreground(
+                &format!("{} com.tencent.mm", now - FOREGROUND_TTL_SECS - 1),
+                now
+            ),
+            None,
+            "太旧的前台信息不能用"
+        );
+        // 空包名 / 只有时间 / 根本读不出时间，都不算。
+        assert_eq!(parse_foreground(&format!("{now} -\n"), now), None);
+        assert_eq!(parse_foreground(&format!("{now}\n"), now), None);
+        assert_eq!(parse_foreground("乱写", now), None);
+        assert_eq!(parse_foreground("", now), None);
     }
 }

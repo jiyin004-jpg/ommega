@@ -222,6 +222,15 @@ fn with_caller_pkg(mut value: Value) -> Value {
         return value;
     };
     let Some(pkg) = caller_package_for_uid(uid) else {
+        // 最后一道兜底：内核 uid 翻不出包名（分身/多用户那些机器）时，用 root 侧写下的
+        // 「当前前台应用」。它比 uid 弱（前台 != 调 SOTER 的那个），所以只在这一步用。
+        let Some(pkg) = crate::plat::utils::foreground_package() else {
+            return value;
+        };
+        log::info!("event=soter caller uid {uid} 翻不出包名，用前台应用兜底 -> {pkg}");
+        if let Some(map) = value.as_object_mut() {
+            map.insert(CALLER_PKG_FIELD.to_string(), Value::from(pkg));
+        }
         return value;
     };
     if let Some(map) = value.as_object_mut() {

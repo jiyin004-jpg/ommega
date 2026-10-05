@@ -14,6 +14,14 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/keystore/ommega/injector.toml";
+/// 同一份配置的副本，由 `daemon-injector` 抄过来。
+///
+/// 为什么要有它：SOTER 宿主是 uid 1000 的 system_app，keystore 那个 `0770` 目录在有些 ROM 上
+/// 它压根进不去 —— 实测小米那台就是：`injector.toml ... Permission denied (os error 13)` →
+/// `injector disabled here`，于是每一笔 SOTER 都直接透传真 HAL（微信指纹就是这幺坏的）。
+/// `/data/misc/ommega` 的 context 是 `system_data_file`，system_app 读得动
+/// （`log_flag` 就是这个道理，另外这份配置里只有包名/开关，没有敏感材料）。
+pub const FALLBACK_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
 /// Legacy A-side (client-a) per-app interception list.  Each non-comment line is
 /// a package name (optionally suffixed `!`/`?`, or a `[keybox.xml]` scope
 /// header).  These packages are merged into the effective scoop so apps selected
@@ -423,9 +431,25 @@ fn ensure_initialized() {
 }
 
 fn config_path() -> PathBuf {
-    std::env::var_os("OMMEGA_INJECTOR_CONFIG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    if let Some(path) = std::env::var_os("OMMEGA_INJECTOR_CONFIG_PATH") {
+        return PathBuf::from(path);
+    }
+    // 主路径读得到就用主的（那是 WebUI 在写的那份，最新）；读不到（域被拒 / 文件不在）
+    // 就用 daemon-injector 抄到 app 域那份。
+    let primary = PathBuf::from(DEFAULT_CONFIG_PATH);
+    if fs::File::open(&primary).is_ok() {
+        return primary;
+    }
+    let fallback = PathBuf::from(FALLBACK_CONFIG_PATH);
+    if fallback.is_file() {
+        log::warn!(
+            "{} is unreachable from this domain; using the app-readable copy {}",
+            primary.display(),
+            fallback.display()
+        );
+        return fallback;
+    }
+    primary
 }
 
 fn load_from_path(path: &Path, allow_migration: bool) -> Result<InjectorConfig, LoadError> {

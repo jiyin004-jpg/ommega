@@ -695,7 +695,30 @@ fn pick_recent_caller(list: &[AppCaller], call: &SoterCall, now: Instant) -> Opt
             return Some(hit.uid);
         }
     }
+    // 不再往下猜：“认不出接口名”那种凭据（没有别名/会话）只走上面“空对空”那条 ——
+    // 拿它去顶一笔带别名的调用，就是把别的钥匙的事算到别人头上。
     None
+}
+
+/// 记一笔“认不出接口名、但确实是 App 发进来的”调用者。
+///
+/// 它没有别名/会话可对（我们连这笔请求的形状都不知道），所以只能走时间窗那条路；
+/// 用它是**推断**：只在前面三样（同线程、别名、会话号）都对不上时才拿出来用。
+fn remember_raw_app_caller(uid: i32) {
+    let Ok(mut list) = RECENT_APP_CALLERS.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    list.retain(|entry| now.saturating_duration_since(entry.at) <= APP_CALLER_TTL);
+    list.push(AppCaller {
+        uid,
+        at: now,
+        alias: None,
+        session: None,
+    });
+    while list.len() > APP_CALLER_CAP {
+        list.remove(0);
+    }
 }
 
 /// 出站那笔该带谁：先问本线程刚记下的那笔（最近、最准），再回查进程级那份列表。
@@ -780,7 +803,27 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
     }
     // SAFETY: 见上面那条 —— 调用点保证这段字节可读。
     let data = unsafe { std::slice::from_raw_parts(buffer as *const u8, size) };
-    let mut call = parse(data, tr.code)?;
+    let mut call = match parse(data, tr.code) {
+        Some(call) => call,
+        None => {
+            // 认不出来的接口 token 里，看着像 SOTER 的记一条。
+            //
+            // 为什么要这个：实测有些 ROM（小米那台）我们只看到 side=hal、side=app 一条都没有 ——
+            // 也就是 App 面向那套名字没认出来，于是拿不到内核给的调用者、包名整条链断在起点。
+            // 日志里只有“认不出”这个事实可不够，得知道它叫什么。
+            //
+            // 只在调试日志开着时才写得出来：这行走 debug 级，日志关掉时被丢掉（不会上线上刷屏）。
+            note_unrecognised_soter_token(data, tr.code);
+            // 称呼不出来也得把调用者留下：`sender_euid` 是内核在事务头上填的，跟接口名毫无关系。
+            // 宿主自己发往 HAL 的那笔 sender 是宿主（uid 1000），**只有 App 发进来的那笔**才是
+            // 应用 uid —— 所以这一条就足够分辨方向，不需要认得接口。
+            if is_app_uid(tr.sender_euid) {
+                note_app_caller(tr.sender_euid);
+                remember_raw_app_caller(tr.sender_euid);
+            }
+            return None;
+        }
+    };
     if call.hal {
         // 宿主发往 HAL 的那笔：把上一笔 App 面向请求的真调用者 uid 接到这笔上，
         // 转发时带给 daemon（由它翻包名、由服务端按包名白名单判）。
@@ -799,6 +842,47 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
     }
     log_call(&call);
     Some(call)
+}
+
+/// AID_APP_START：第一个“装在机器上的应用”的 uid。比它小的都是 init / system_server /
+/// root / shell 这些系统身份。
+pub(crate) const AID_APP_START: i32 = 10000;
+
+/// 这个 uid 看着是不是应用（不是系统身份）。
+///
+/// 认不出接口名时要靠它分辨方向：宿主自己发往 HAL 那笔的 sender 是宿主（uid 1000），
+/// 只有 App 发进来的那笔 sender 才是应用 uid。分身（999xxxxx）和多用户（10xxxxx）也 ≥ 这个值。
+fn is_app_uid(uid: i32) -> bool {
+    uid >= AID_APP_START
+}
+
+/// 这份 data 开头那个接口 token（NUL 结尾的串），取不到就回 `None`。
+fn interface_token_of(data: &[u8]) -> Option<&str> {
+    let end = data.iter().position(|byte| *byte == 0)?;
+    let head = data.get(..end.min(192))?;
+    std::str::from_utf8(head)
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+/// 认不出来的接口 token 里，看着像 SOTER/滕讯的都记一条 —— 用来兜住那些换了描述符的 ROM。
+///
+/// 只在调试日志开着时才输出：先问 log 层，关着就直接返回，一个字都不写。
+fn note_unrecognised_soter_token(data: &[u8], code: u32) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let Some(token) = interface_token_of(data) else {
+        return;
+    };
+    let lowered = token.to_ascii_lowercase();
+    if !(lowered.contains("soter") || lowered.contains("tencent")) {
+        return;
+    }
+    debug!(
+        "event=soter unknown-descriptor token={token:?} code={code} bytes={}",
+        data.len()
+    );
 }
 
 fn log_call(call: &SoterCall) {
@@ -1214,7 +1298,7 @@ mod tests {
             ),
             None
         );
-        // 带别名的出站调用不能被「没别名」的凭据顶上。
+        // 带别名的出站调用不能被「没别名」的凭据顶上：拿它去顶就是把别的钥匙的事算到它头上。
         assert_eq!(
             pick_recent_caller(
                 &[entry(10490, 1, None, None)],
@@ -1331,6 +1415,63 @@ mod tests {
         assert_eq!(pick_alias_owner(&stale, "SoterAuthKey_x", now), None);
         // 空别名本来就不该走到这儿。
         assert_eq!(pick_alias_owner(&reused, "", now), None);
+    }
+
+    /// uid 是不是应用的判据：分身（999xxxxx）和多用户（10xxxxx）都算应用，
+    /// init/system_server/root/shell（0 / 1000 / 2000）不算。
+    #[test]
+    fn only_app_uids_count_as_the_caller() {
+        assert!(is_app_uid(10490));
+        assert!(is_app_uid(99910365));
+        assert!(is_app_uid(1_010_392));
+        assert!(is_app_uid(AID_APP_START));
+        assert!(!is_app_uid(0));
+        assert!(!is_app_uid(1000));
+        assert!(!is_app_uid(2000));
+        assert!(!is_app_uid(-1));
+    }
+
+    /// 「认不出接口名」那条推断只能活短窗口：2 秒内拿它，超了就不认（免得把别的应用算错）。
+    #[test]
+    fn an_unparsed_app_caller_only_counts_for_a_short_window() {
+        let now = Instant::now();
+        let entry = |ago: u64| AppCaller {
+            uid: 10339,
+            at: now - Duration::from_secs(ago),
+            alias: None,
+            session: None,
+        };
+        // 带别名的出站调用：不能被“空别名”那种凭据顶上（那就是把别的钥匙的事算到它头上）。
+        let data = request(&|out| {
+            push_i32(out, 10339);
+            push_string(out, "SoterAuthKeyV2_salt11d8ba34_scene1");
+        });
+        let call = parse(&data, 10).expect("code 10 is ours");
+        assert_eq!(pick_recent_caller(&[entry(1)], &call, now), None);
+        assert_eq!(
+            pick_recent_caller(&[entry(3)], &call, now),
+            None,
+            "出了 2 秒窗就不认"
+        );
+        assert_eq!(pick_recent_caller(&[], &call, now), None);
+    }
+
+    /// 诊断用：从 transaction 开头那串 token 里把接口名读出来；读不出来就回 None，不硬猜。
+    #[test]
+    fn the_interface_token_of_a_transaction_is_readable() {
+        assert_eq!(
+            interface_token_of(b"vendor.qti.hardware.soter.ISoter\0junk"),
+            Some("vendor.qti.hardware.soter.ISoter")
+        );
+        assert_eq!(
+            interface_token_of(b"android.system.keystore2.IKeystoreService\0"),
+            Some("android.system.keystore2.IKeystoreService")
+        );
+        // 没 NUL 终结符 / 空 token / 不是 UTF-8，都不猜。
+        assert_eq!(interface_token_of(b"no-nul-here"), None);
+        assert_eq!(interface_token_of(b"\0"), None);
+        assert_eq!(interface_token_of(&[0xff, 0xfe, 0x00]), None);
+        assert_eq!(interface_token_of(b""), None);
     }
 
     #[test]

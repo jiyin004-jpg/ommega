@@ -16,6 +16,16 @@ CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
 # 放 /data/misc 下面是因为宿主（system_app）连 /data/adb（0700 root）都进不去，
 # 而这里的 context 是 system_data_file，它读得到。
 LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/ommega/log_flag}
+# root 侧写给 daemon 的「uid → 包名」表（它就从系统自己的 packages.list 抄）。
+# 放 keystore 那个目录里是因为 daemon 就跑在 keystore uid，那个目录它读得到。
+UID_PACKAGES_OUT=/data/misc/keystore/ommega/uid_packages
+PACKAGES_LIST=/data/system/packages.list
+# daemon 拿去做最后一道兜底的「当前前台应用」（它跑在 keystore uid，只读得到这个目录）。
+FOREGROUND_OUT=/data/misc/keystore/ommega/foreground
+# 载荷（跑在 SOTER 宿主，system_app 域）读不到 keystore 那个 0770 目录，得给它一份
+# 读得到的配置副本 —— 那台小米就是这么在宿主里自我禁用的（injector.toml Permission denied）。
+INJECTOR_TOML=/data/misc/keystore/ommega/injector.toml
+INJECTOR_TOML_COPY=/data/misc/ommega/injector.toml
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
 LOG_DIR=/data/misc/keystore/ommega/logs
@@ -316,6 +326,69 @@ is_injected() {
   return 1
 }
 
+# root 侧把「uid → 包名」抄一份给 daemon。
+#
+# 为什么要它：AAID 服务在分身/空间/多用户那些 uid（实测 994~999 / 19000 / 真实 10、11、12）
+# 上会回空或直接报错，daemon 就永远翻不出包名，服务端只能退回按别名/槽位猜 —— 而那些机器
+# 的槽位往往一直标不上，就卡死了。这张表不依赖那个服务：系统的 packages.list 里分身自己那一行
+# 本来就在（999xxxxx），反着抄一遍就是 uid→包名。
+# 只在源文件变了的时候重写，不然每轮白抄上千行。
+sync_uid_packages() {
+  [ -r "$PACKAGES_LIST" ] || return 0
+  local stamp
+  stamp=$(ls -l "$PACKAGES_LIST" 2>/dev/null | awk '{print $5"-"$6"-"$7"-"$8}')
+  if [ -f "$UID_PACKAGES_OUT" ] && [ -n "$stamp" ] \
+    && [ "$stamp" = "$(cat "$UID_PACKAGES_OUT.stamp" 2>/dev/null)" ]; then
+    return 0
+  fi
+  local tmp="$UID_PACKAGES_OUT.tmp"
+  {
+    echo "# uid package (from $PACKAGES_LIST)"
+    while read -r pkg uid _rest; do
+      [ -n "$pkg" ] && [ -n "$uid" ] && echo "$uid $pkg"
+    done < "$PACKAGES_LIST"
+  } > "$tmp" 2>/dev/null || return 0
+  chmod 0644 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$UID_PACKAGES_OUT" 2>/dev/null || return 0
+  echo "$stamp" > "$UID_PACKAGES_OUT.stamp" 2>/dev/null
+}
+
+# root 侧写下「当前前台应用」（一行 `<epoch 秒> <包名>`）给 daemon 做最后一道兜底：
+# 内核 uid 翻不出包名（分身/空间/多用户那类机器）时，daemon 就用它。
+# 这件事比读文件贵（要跑一次 dumpsys），所以只每 FOREGROUND_EVERY 拍干一次。
+# 采不到就保留上一份 —— daemon 那边带新鲜度阀，旧了它自己不用。
+sync_foreground() {
+  local pkg tmp now
+  # 两条路都试：不同 ROM 用的字段不一样（实测 nubia 是 mCurrentFocus / topResumedActivity，
+  # 老的是 mResumedActivity）。取包名的 sed 是贪心的 —— 一行里可能有 Window{hash u0 pkg/cls}
+  # 这种，要的是最后一个 `pkg/` 前的包名。
+  pkg=$(dumpsys window displays 2>/dev/null | grep -m1 mCurrentFocus \
+    | sed -n 's/.* \([a-zA-Z0-9_][a-zA-Z0-9_.]*\)\/[^ }]*.*/\1/p')
+  if [ -z "$pkg" ]; then
+    pkg=$(dumpsys activity activities 2>/dev/null \
+      | grep -m1 -E "topResumedActivity|mResumedActivity" \
+      | sed -n 's/.* \([a-zA-Z0-9_][a-zA-Z0-9_.]*\)\/[^ }]*.*/\1/p')
+  fi
+  [ -n "$pkg" ] || return 0
+  now=$(date +%s 2>/dev/null) || return 0
+  tmp=$FOREGROUND_OUT.tmp
+  echo "$now $pkg" > "$tmp" 2>/dev/null || return 0
+  chmod 0644 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$FOREGROUND_OUT" 2>/dev/null
+}
+
+# 把 injector.toml 抄一份到 app 域读得到的地方（载荷的 config 优先读主路径，读不到就用这份）。
+# 只在内容变了才写，省得每拍白抄。
+sync_injector_toml() {
+  [ -r "$INJECTOR_TOML" ] || return 0
+  cmp -s "$INJECTOR_TOML" "$INJECTOR_TOML_COPY" 2>/dev/null && return 0
+  local tmp="$INJECTOR_TOML_COPY.tmp"
+  cp -f "$INJECTOR_TOML" "$tmp" 2>/dev/null || return 0
+  chmod 0644 "$tmp" 2>/dev/null
+  chcon u:object_r:system_data_file:s0 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$INJECTOR_TOML_COPY" 2>/dev/null
+}
+
 restart_keystore() {
   local pid
   pid=$1
@@ -345,6 +418,10 @@ last_soter_attempt_at=0
 # keystore2 里，这份解锁材料就永久丢了（影子 keystore 会一直 LOCKED 到下次解锁）。
 EARLY_POLL_SECONDS=90
 started_at=$(date +%s 2>/dev/null || echo 0)
+# 主循环的拍数：前台那个活代价比读文件大，没必要每拍都干（见 sync_foreground）。
+tick=0
+# 前台应用多久采一次（拍数）。5 秒一拍 × 3 = 约 15 秒，daemon 那边只认 8 秒内的。
+FOREGROUND_EVERY=3
 tick_sleep() {
   now=$(date +%s 2>/dev/null)
   if [ -n "$now" ] && [ "$started_at" -gt 0 ] && [ $((now - started_at)) -lt $EARLY_POLL_SECONDS ]; then
@@ -362,6 +439,12 @@ while true; do
   LOG_ON=0
   debug_logging_enabled && LOG_ON=1
   sync_log_flag
+  sync_uid_packages
+  sync_injector_toml
+  if [ $((tick % FOREGROUND_EVERY)) -eq 0 ]; then
+    sync_foreground
+  fi
+  tick=$((tick + 1))
   sync_soter_ask
   sync_soter_cpu_id
   if [ "$soter_ask_changed" = "1" ]; then
