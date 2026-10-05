@@ -410,6 +410,10 @@ last_attempt_pid=
 last_attempt_at=0
 retry_cooldown=15
 soter_start_attempted=0
+# 宿主保活用的节流：宿主不在时最多每 30 秒拉起一次，别每拍都去 am start-service。
+last_soter_start_at=0
+# 第一次看到「宿主在跑但没注上」的时刻（epoch 秒），注完把间隔写进日志。
+soter_seen_at=
 last_soter_pid=
 last_soter_attempt_at=0
 
@@ -470,9 +474,19 @@ while true; do
   inject_targets=keystore2
   if soter_inject_enabled; then
     inject_targets=keystore2,soter
-    if [ "$soter_start_attempted" -eq 0 ]; then
-      soter_start_attempted=1
-      start_soter_service
+    # 宿主保活：不在就再拉一次（不是只在开机那一次）。
+    #
+    # 为什么要这样：App 是 bind 到宿主时才把它拉起来的，而它一被拉起来就**马上**发第一笔
+    # SOTER —— 实测那台小米：请求 08:18:28 发出去、08:18:32 我们才把载荷注进去，那四秒里
+    # 全透传真 HAL。而宿主被系统杀掉后我们原来不会再去拉它，只能等 App 下次把它拉起来，
+    # 于是每次都碰上“刚起来的宿主 + 还没进去的载荷”。常态让它跑着（带节流，免得刷日志），
+    # App 来调的时候宿主里就已经有载荷了。
+    if [ -z "$(soter_pid)" ]; then
+      now_start=$(date +%s 2>/dev/null)
+      if [ -z "$now_start" ] || [ "$now_start" -ge $((last_soter_start_at + 30)) ]; then
+        last_soter_start_at=${now_start:-0}
+        start_soter_service
+      fi
     fi
   fi
 
@@ -488,6 +502,10 @@ while true; do
   soter_pending=0
   if [ "$inject_targets" != "keystore2" ] && [ -n "$spid" ] && ! is_injected "$spid"; then
     soter_pending=1
+    # 第一眼看到“在跑但没注上”的时刻：注完算间隔用。
+    [ -n "$soter_seen_at" ] || soter_seen_at=$(date +%s 2>/dev/null)
+  else
+    soter_seen_at=
   fi
 
   if [ "$keystore_pending" -eq 0 ] && [ "$soter_pending" -eq 0 ]; then
@@ -506,6 +524,7 @@ while true; do
       tick_sleep
       continue
     fi
+    # 宿主换了 pid（刚重启）就不吃冷却：那个空窗就压在这里 —— 立刻注，不等 retry_cooldown。
     if [ "$soter_pending" -eq 1 ] && [ "$last_soter_pid" = "$spid" ] \
       && [ "$now" -lt $((last_soter_attempt_at + retry_cooldown)) ]; then
       tick_sleep
@@ -520,7 +539,11 @@ while true; do
   if [ "$keystore_pending" -eq 1 ]; then
     log "[injector-daemon] injecting into keystore2 pid=$pid via $TARGET_INJECTOR"
   else
-    log "[injector-daemon] injecting into $SOTER_PKG pid=$spid via $TARGET_INJECTOR"
+    gap=""
+    if [ -n "$soter_seen_at" ]; then
+      gap=" gap=$(( $(date +%s 2>/dev/null || echo 0) - soter_seen_at ))s"
+    fi
+    log "[injector-daemon] injecting into $SOTER_PKG pid=$spid via $TARGET_INJECTOR$gap"
   fi
   OMMEGA_INJECT_TARGETS="$inject_targets" "$TARGET_INJECTOR"
   rc=$?

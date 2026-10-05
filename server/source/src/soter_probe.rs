@@ -310,6 +310,14 @@ fn reason_without_caller(
     let has_alias = !alias.is_empty() && alias != "-";
     let (real, why) = if is_real_alias {
         if sticky == Some(false) {
+            // 这一笔仍跟着内置料答（不拆 ASK/AuthKey 的同源性），但**槽位必须记上**：
+            // 它见过真应用的别名了。不记就是死锁 —— 那些流程总是先来一笔不带别名的 ASK
+            // （判内置料）→ 90 秒 sticky → 紧跟着带真别名的 AuthKey 也被钉成内置料 → 槽位
+            // 永远标不上 → 下一轮又从头来（实测小米那台：652 笔请求 / 34 条内置料 / 0 条落真机，
+            // 指纹一直起不来）。记上之后，下一轮那笔不带别名的 ASK 就放行，整条流程回到真机。
+            if let Some(uid) = uid {
+                notes.observe(device, uid, now);
+            }
             (
                 false,
                 "上一笔刚在内置料上答过，这一笔跟着内置（不拆 ASK/AuthKey）".to_string(),
