@@ -142,7 +142,7 @@ def get_version() -> str:
 # 1006020，比线上那颗 1006019 大。
 # 注意这个数跟 b-side 各是一套：2026-10-03 B 端单独重发过 1.6.4（那边是 11），A 端
 # 没那样单独重发过 —— 两边不一是有意的，别顺手对齐。
-VERSION_CODE_OFFSET = 14
+VERSION_CODE_OFFSET = 15
 
 
 def version_code(version: str) -> str:

@@ -695,9 +695,18 @@ fn pick_recent_caller(list: &[AppCaller], call: &SoterCall, now: Instant) -> Opt
             return Some(hit.uid);
         }
     }
-    // 不再往下猜：“认不出接口名”那种凭据（没有别名/会话）只走上面“空对空”那条 ——
-    // 拿它去顶一笔带别名的调用，就是把别的钥匙的事算到别人头上。
-    None
+    // 最后一道：“认不出接口名/号”留下的那笔（无别名无会话）在 2 秒内可以去顶**任意形状**
+    // 的出站调用。这一道是为那些换了一套 App 面向接口的宿主准备的（实测小米那台的宿主是
+    // 2.0，号表跟我们不一样 → 那几笔我们解析不了，但它仍然是 App 发进来的，内核 uid 在
+    // 事务头上、跟接口名毫无关系）。没有这一道，他那台的关键几笔（`hasAuthKey` / `initSign`
+    // 带别名）就永远拿不到 uid，包名整条链断在起点。
+    //
+    // 边界：只收“无别名无会话”的凭据 —— 已经解析出来、属于**别的钥匙**的凭据不许顶
+    //（那才是真错：会把 A 的调用算到 B 的调用上）。窗口 2 秒 + 只收 app uid + 同一宿主进程。
+    list.iter()
+        .rev()
+        .find(|entry| now.saturating_duration_since(entry.at) <= RAW_APP_CALLER_TTL && entry.bare())
+        .map(|entry| entry.uid)
 }
 
 /// 记一笔“认不出接口名、但确实是 App 发进来的”调用者。
@@ -720,6 +729,10 @@ fn remember_raw_app_caller(uid: i32) {
         list.remove(0);
     }
 }
+
+/// 「认不出接口名/号」那种凭据（无别名无会话）能在多短的时间窗内去顶一笔出站调用。
+/// 它是估的，所以窗口要比 `APP_CALLER_TTL` 短得多。
+const RAW_APP_CALLER_TTL: Duration = Duration::from_secs(2);
 
 /// 出站那笔该带谁：先问本线程刚记下的那笔（最近、最准），再回查进程级那份列表。
 fn borrow_app_caller(call: &SoterCall) -> Option<i32> {
@@ -1298,14 +1311,15 @@ mod tests {
             ),
             None
         );
-        // 带别名的出站调用不能被「没别名」的凭据顶上：拿它去顶就是把别的钥匙的事算到它头上。
+        // 带别名的出站调用：窗口内“认不出接口”的凭据（无别名无会话）可以顶它 ——
+        // 那些“App 面向接口换了一套”的宿主就只有这一条路能拿到调用者。
         assert_eq!(
             pick_recent_caller(
                 &[entry(10490, 1, None, None)],
                 &aliased("SoterAuthKeyV2_salt11d8ba34_scene1"),
                 now
             ),
-            None
+            Some(10490)
         );
 
         // 只有会话号的那笔（finish_sign）：靠会话号对上。
@@ -1441,13 +1455,13 @@ mod tests {
             alias: None,
             session: None,
         };
-        // 带别名的出站调用：不能被“空别名”那种凭据顶上（那就是把别的钥匙的事算到它头上）。
+        // 带别名的出站调用：窗口内（2 秒）能顶 —— 宿主换了一套接口时就靠这一条。
         let data = request(&|out| {
             push_i32(out, 10339);
             push_string(out, "SoterAuthKeyV2_salt11d8ba34_scene1");
         });
         let call = parse(&data, 10).expect("code 10 is ours");
-        assert_eq!(pick_recent_caller(&[entry(1)], &call, now), None);
+        assert_eq!(pick_recent_caller(&[entry(1)], &call, now), Some(10339));
         assert_eq!(
             pick_recent_caller(&[entry(3)], &call, now),
             None,
