@@ -139,7 +139,10 @@ impl Default for Config {
             attest_source: "physical".to_string(),
             assignment_timeout_secs: 3,
             wait_result_timeout_secs: 3,
-            soter_wait_result_timeout_secs: 15,
+            // SOTER 这条要的是「快 + 准」：真机那条链路健康时实测 70~190 毫秒就回来了,
+            // 等不到就是真机这会儿接不了 —— 那就快速失败让 App 自己重试（重试那一笔靠槽位
+            // 标记会直接走真机），而不是把 App 拖在这里、更不是拿服务端自己造的料顶上去。
+            soter_wait_result_timeout_secs: 2,
             // 反向白名单：不需要人工名单，留空就行（见 `soter_probe::reason`）。
             soter_local_only_prefixes: String::new(),
             soter_local_only_uids: String::new(),
