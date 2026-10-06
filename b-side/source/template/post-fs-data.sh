@@ -32,6 +32,14 @@ if [ -f "$TARGET_RELAY_CONFIG" ] && [ -f "$MODDIR/relay.conf" ]; then
       OMMEGA_*) ;;
       *) continue ;;
     esac
+    # 环境相关的调优项不自动补：这段的目的是让「新版本新增的键 / 新功能」能到老设备
+    # 上，不是顺手把别人的网络路径改了。BIND_IFACE 尤其：模板推荐 `none`，而代码默认
+    # 是 `auto` —— 现网老设备跑的就是 `auto`。在看不见的机器上开机那一下悄悄换掉路由
+    # 行为，真出事是最难查的一类；想让全网收敛到 `none` 就该是一次明说的迁移
+    # （发版说明里写清楚），而不是「补缺键」的副作用。要再加排除项就往下接一行。
+    case "$key" in
+      OMMEGA_RELAY_BIND_IFACE) continue ;;
+    esac
     case "$value" in
       *'<'*) continue ;;
     esac
