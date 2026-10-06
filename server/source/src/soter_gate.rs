@@ -267,7 +267,8 @@ impl SoterGate {
         let count = entry.0;
         drop(guard);
         let due = count == CHURN_REPORT_AT
-            || (count > CHURN_REPORT_AT && (count - CHURN_REPORT_AT) % CHURN_REPEAT_EVERY == 0);
+            || (count > CHURN_REPORT_AT
+                && (count - CHURN_REPORT_AT).is_multiple_of(CHURN_REPEAT_EVERY));
         if !due {
             return None;
         }
