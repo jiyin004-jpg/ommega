@@ -13,6 +13,35 @@ if [ ! -f "$TARGET_RELAY_CONFIG" ] && [ -f "$MODDIR/relay.conf" ]; then
   chmod 0600 "$TARGET_RELAY_CONFIG"
 fi
 
+# Upgrades must not lose new settings.  The live config is copied only on the
+# very first install, so a key introduced by a later version would silently
+# never reach an existing device — 2026-10-06 that is exactly how
+# OMMEGA_RELAY_SOTER_MUTATION stayed off on PLC110 and made every real app's
+# SOTER setup loop (the app only sees "this key is not on this device").
+# Fill in keys the template has and the live config lacks; a key that is
+# already there (whatever its value) is never overwritten, and placeholder
+# values (`device-b-<random>`, `<device-model>`) are skipped.
+if [ -f "$TARGET_RELAY_CONFIG" ] && [ -f "$MODDIR/relay.conf" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      OMMEGA_*) ;;
+      *) continue ;;
+    esac
+    case "$value" in
+      *'<'*) continue ;;
+    esac
+    if ! grep -q "^${key}=" "$TARGET_RELAY_CONFIG" 2>/dev/null; then
+      printf '\n%s\n' "$line" >> "$TARGET_RELAY_CONFIG"
+      echo "[post-fs-data] relay.conf 补上新配置项: $key"
+    fi
+  done < "$MODDIR/relay.conf"
+fi
+
 # Device id / machine id are filled ONLY when the config has no value yet
 # (blank line or the template placeholder).  An already-set value — e.g. the
 # random id minted by a previous boot, or a fixed id the user entered — is

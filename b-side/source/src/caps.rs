@@ -10,16 +10,17 @@
 //! - `soter` — the HAL answers `getDeviceId`: identity / export ops can be
 //!   served.  Cheap to prove, and it is what the old relays reported.
 //! - `soter_sign` — a signature was really produced once (`init_sign` +
-//!   `finish_sign` both answered 0).  This is the only honest way to claim it:
-//!   the TA signs only inside a fresh fingerprint match, so on a headless
-//!   device the answer is `-26` and there is nothing to advertise.
-//! - `soter_nosign` — the OPPOSITE, stated out loud, and only on evidence:
-//!   several real sign ops in a row came back `-26` (the TA wants a fresh
-//!   fingerprint and nobody is there to press).  Anything we merely could not
-//!   measure (no slot to try, no material, one refused probe) reports nothing
-//!   extra — claiming `soter_nosign` there would make the server route sign ops
-//!   away from a device that can sign perfectly well (a phone whose owner is
-//!   simply not touching it right now).
+//!   `finish_sign` both answered 0).  This is the only honest way to claim it.
+//!   A headless device does not fail this: 2026-10-06 measured on PLC110
+//!   (Trustonic AIDL) that the relay signs with nobody pressing a fingerprint
+//!   (the signature verifies against the AuthKey public key).  "Not measured"
+//!   must therefore stay "not measured" — it never means "cannot".
+//! - `soter_nosign` — the OPPOSITE, stated out loud.  The server still parses
+//!   the name (old relays send it), but this build **never emits it**: every
+//!   code a refused sign produces is a per-attempt one (`-26` this attempt did
+//!   not verify, `-204` the session was clobbered, a timeout), and inferring a
+//!   device capability from those used to route sign ops away from devices
+//!   that can sign perfectly well.
 //! - `soter_stuck` — the TA is wedged inside the TEE: it holds the RPMB session
 //!   open and never lets go, so it can no longer read its own persistent store.
 //!   Export/build then answer `-5`/`258` while `has_*` still says the material is
@@ -58,19 +59,16 @@ pub fn report(sign_target: Option<&SignProbeTarget>) -> String {
     // 探法），`&&` 一短路就把 HIDL-only 的机器漏掉了。
     if soter_usable() {
         caps.push("soter");
-        // HAL 肯答话只够说明身份/导出能用。签名那一步骗不了人：一加 11
-        // （PHB110）、MIX 4 这些机器的 TA 只在「刚匹配过指纹」时才肯签，没人
-        // 按指纹时 `finish_sign` 一律回 -26。所以「能签」得真签出来一次才算。
+        // HAL 肯答话只够说明身份/导出能用，证明不了它肯签。所以「能签」得真签
+        // 出来一次才算（反面则一律不说：失败码推不出设备能力，见模块头）。
         //
         // 探针目标优先听配置的；没配就退到这台机器真跑过一次 `init_sign` 的那个
-        // 槽位 —— 探针只为了挣正面结论（真签出来过），量不出来就什么都不说。
+        // 槽位 —— 探针只为了挣正面结论，量不出来就什么都不说。
         probe_sign_capability(sign_target.cloned().or_else(learned_target).as_ref());
-        // 「行」和「不行」都只认实测：行 = 真签出来过；不行 = 连续几次真派下来
-        // 的签名 op 全被 -26 顶回来（没人按指纹）。没量出来就只报 `soter`。
-        match soter::sign_state() {
-            soter::SignState::Proven => caps.push("soter_sign"),
-            soter::SignState::Refused => caps.push("soter_nosign"),
-            soter::SignState::Unknown => {}
+        // 「行」只认真签出来过一次；「不行」这个版本不报（失败码推不出设备
+        // 能力，误报还会把签名 op 从这台挪走）。没量出来就只报 `soter`。
+        if soter::sign_state() == soter::SignState::Proven {
+            caps.push("soter_sign");
         }
         // TA 卡在 TEE 里：HAL 照样答话、身份/导出 op 也照样回，但回的是错的
         // （「说存在、却导不出来」，`-5` + `258`）。这台现在不该再被派 SOTER 活；
@@ -130,10 +128,10 @@ fn soter_usable() -> bool {
 
 /// 探针只能挣到正面结论（真签出来过），永远不能拿它去下「签不了」的断言。
 ///
-/// 探针撞上「指纹窗口关着」会回 -26，但同一台机器指纹刚按过的时候是签得出来
-/// 的（PLC110 上实测过）。拿一次 -26 当证据报 `soter_nosign`，服务端就会把一台
-/// 明明能签的机器从签名链路上踢掉 —— 比不报还糟。「签不了」只认别的证据：连续
-/// 几次真派下来的签名 op 都被 -26 顶回来（见 `soter::sign_state`）。
+/// 探针撞上的失败码全是「这次没量出来」：`-26` 是这一笔没验过、`-5`/`-6` 是槽位
+/// 上没材料、`-204` 是会话被顶掉。2026-10-06 实测 PLC110 无人值守也签得出来，
+/// 所以更没理由从失败码推「这台签不了」—— 服务端接了这个结论会把一台明明能签的
+/// 机器从签名链路上踢掉，比不报还糟。
 fn probe_sign_capability(target: Option<&SignProbeTarget>) {
     // sign_probe atomically checks the session lease and reserves HAL access.
     let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -180,9 +178,9 @@ mod tests {
     use super::*;
     use crate::soter::SignVerdict;
 
-    /// 探针只用现成槽位试签，量不出结论（没目标 / 没材料 / 要新鲜指纹 / HAL 没
-    /// 答话）时什么都不说。说「签不了」的活不归探针管：那要看连续几次真派下来
-    /// 的签名 op 是不是全被 -26 顶回来（`soter::sign_state`）。
+    /// 探针只用现成槽位试签，量不出结论（没目标 / 没材料 / 这一笔没验过 / HAL 没
+    /// 答话）时什么都不说。反面结论这个版本压根不报：`soter::sign_state` 只有
+    /// 「签出来过」和「还没量出来」两档。
     #[test]
     fn a_probe_never_publishes_a_negative_verdict() {
         for verdict in [

@@ -6,6 +6,12 @@
 //! （`SOTER_ERROR_OPERATEID_NULL`），4 轮 4 次都是如此。B 端的 relay 只是把句柄透传给
 //! HAL / TA，自己根本没有会话表，这个「一个」改不动。
 //!
+//! 2026-10-06 又实测到一条，对「谁该去收尾」很关键：这张会话还认**开它的那个
+//! 调用者**。走 B 端 relay（一个常驻进程）`init_sign` + `finish_sign` 一次就成；
+//! 而拿 shell 拆成两个 `service call` 进程发（同一把 uid/别名/challenge、中间没人
+//! 插队）恒回 `-204`。所以 relay 必须自己开会话、自己收尾，别把这两步拆到不同
+//! 连接/不同调用者上去。
+//!
 //! `init_sign` 拿到会话时保存 (uid, 别名, challenge)，finish 回 -204 时可在同一次
 //! 设备占用内重开会话，签同一个 challenge。租约外的过期 finish 不再补签，以免顶掉
 //! 新流程；成功补签与原流程使用同一把钥匙、同一个挑战。
@@ -25,9 +31,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 一笔会话记多久。App 的 init->finish 正常是秒级，慢的时候是在等用户按指纹（几十秒
-/// 量级）。生产里能看到隔几分钟才收尾的（App 自己缓着 session 不急着签），所以给到
-/// 15 分钟；它保留路由/补救材料，不延长下面独立的 60 秒签名租约。
+/// 一笔会话记多久。App 的 init->finish 正常是秒级，慢的时候是在等用户那一步
+/// （指纹/人脸，几十秒量级）。生产里能看到隔几分钟才收尾的（App 自己缓着 session
+/// 不急着签），所以给到 15 分钟；它保留路由/补救材料，不延长下面独立的 60 秒租约。
 /// 内存被 [`MAX_ENTRIES`] 卡着。
 const STASH_TTL: Duration = Duration::from_secs(900);
 
@@ -37,7 +43,7 @@ const MAX_ENTRIES: usize = 8192;
 /// 抢设备租约最多等多久。还要被调用方自己的网络 deadline 卡着，取小的那个。
 const ACQUIRE_WAIT: Duration = Duration::from_secs(3);
 
-/// `init_sign` 成功之后，租约替这笔流程把会话留多久等 `finish_sign`。等用户按指纹是
+/// `init_sign` 成功之后，租约替这笔流程把会话留多久等 `finish_sign`。等用户那一步是
 /// 几十秒量级，所以留够。它是上限而不是保守期限：停在这儿等 finish 的租约下一笔 init
 /// 可以直接接管（见 [`SignSessions::acquire`]）。
 const LEASE_HOLD: Duration = Duration::from_secs(60);

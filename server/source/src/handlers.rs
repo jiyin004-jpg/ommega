@@ -1360,7 +1360,7 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     // 手里会出现一半 B 的一半 keybox 的状态（导出的公钥和签名的私钥都对不上）。
     //
     // 但钉子只在「B 端这层结构性地做不了」（一台能接的设备都没有）的时候才作数：
-    // 一次超时、一次 `-26`（这会儿没人按指纹）都可能只是这一笔没答好，那种时候
+    // 一次超时、一次 `-26`（这一笔的验证没过）都可能只是这一笔没答好，那种时候
     // 把槽位挪到服务端自签那两层，App 手里就换成假料了，真机再也轮不上 —— 实测
     // PLC110 的 uid 10490 就是这么被钉到 self_signed 上，之后每轮第一个 op 又把
     // 钉子续上，一轮流程都回不到真机。
@@ -1680,9 +1680,14 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                 }
                 let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
                 tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
-                state
-                    .soter_gate
-                    .record(requested, op, gate_uid, alias_arg, layer == "b", &v);
+                if let Some(note) =
+                    state
+                        .soter_gate
+                        .record(requested, op, gate_uid, alias_arg, layer == "b", &v)
+                {
+                    // App 在自删自建：这不是设备故障，得让操作员看见原因和处置。
+                    tracing::warn!("{note}");
+                }
                 if let Some(uid) = uid {
                     if let Some(pin) = layer_to_pin(layer, b_structural) {
                         crate::soter_mint::pin_layer(requested, uid, pin);
@@ -1858,6 +1863,22 @@ async fn try_b_soter_layer(
     // Consume immutable dispatch metadata embedded in the result; the task
     // table may already have been pruned. Never expose relay metadata to apps.
     let device = TaskStore::take_result_assigned_device(&mut reply).filter(|d| !d.is_empty());
+    // 建料闸门关着的时候 B 端会按正常答复递一个带标记的 -5（见 b-side `soter::handle`）：
+    // 那是那台 B 的配置问题，不是「这台没料」—— 必须让操作员一眼看见，不能混进 -5 里。
+    if reply
+        .get("soter_mutation_disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        if let Some(obj) = reply.as_object_mut() {
+            obj.remove("soter_mutation_disabled");
+        }
+        tracing::warn!(
+            "soter: op={op} 被 {target} 的建料闸门拦下（那台上 relay.conf 里没开 \
+             OMMEGA_RELAY_SOTER_MUTATION）：这台接不了建料/删料，A 端只会看到 -5 \
+             在原地重建，永远走不到签名那两步 → 去那台 B 上把闸门打开"
+        );
+    }
     if reply.get("error").is_none() && device.as_deref() != Some(target) {
         return Some(BSoterLayer {
             value: json!({"error": "SOTER completion device mismatch", "error_code": -204}),
@@ -1879,7 +1900,7 @@ async fn try_b_soter_layer(
             hardware_reply: Some(reply),
         });
     }
-    // 这里返回的是设备自己的答复，包括 `-26`「这会儿没人按指纹」和超时 —— 那是
+    // 这里返回的是设备自己的答复，包括 `-26`「这一笔的验证没过」和超时 —— 那是
     // 这笔没答好，不是这层做不了，得原样递给 App 让它重试。队列定向拒绝则是
     // 明确的能力结论，和 resolve_soter_target 的在线能力拒绝保持同一回退策略。
     let unavailable = soter_relay_marks_unavailable(&reply);
@@ -1992,7 +2013,8 @@ fn layer_to_pin(served_layer: &str, b_structural: bool) -> Option<&str> {
 /// 只有结构性毛病才算：SOTER 没开（-12）、ATTK 没配（-13）、安全通道不通（-18）。
 /// 其余负码都是「这笔没成」，得原样递给 App，不然会误判一台好机器：
 ///
-/// - `-26 VERIFICATION_FAILED`：TA 要新鲜指纹，人不在/没按而已，按下就能成；
+/// - `-26 VERIFICATION_FAILED`：这一笔的验证没过（真应用那条路上就是 App 那步
+///   生物认证没成），是这笔的状态，不是设备能力；
 /// - `-5` / `-6`：材料还没建，App 就是靠它决定要不要 generate；
 /// - `-7` / `-8` / `-9`：会话过期、没有匹配的 auth key、正在验证 —— 流程状态。
 ///
@@ -2623,7 +2645,8 @@ mod soter_device_layer_tests {
     #[test]
     fn a_sign_failure_that_is_not_structural_stays_an_answer() {
         // 实测的两种误判，都把一个好好的机器弄瘸过：
-        // - 一加 11 的 `finish_sign` 回 -26：TA 要新鲜指纹，人不在而已，按下就能签；
+        // - 一加 11 的 `finish_sign` 回 -26：这一笔的验证没过（真应用那条路上就是
+        //   App 那步生物认证没成），是这笔的状态，不是设备能力；
         // - PLC110 的 op 被 15s 超时打断，槽位从此挪到 self_signed。
         for op in ["init_sign", "finish_sign", "generate_auth_key_pair"] {
             for code in [-26, -25, -5, -6, -7, -8, -9, -20, -1000] {

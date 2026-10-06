@@ -72,9 +72,11 @@ fn main() {
         report(&payload);
     }
 
-    // 反馈三问的那件事：TA 到底要不要现场指纹。这两步跟上面那些只读的调用不一样，
-    // init_sign 会真的开一个签名会话，finish_sign 会让 TEE 出签名 —— 过不过得去
-    // 就是答案。
+    // 这两步跟上面那些只读的调用不一样：init_sign 会真的开一个签名会话，
+    // finish_sign 会让 TEE 出签名。2026-10-06 在 PLC110（Trustonic AIDL）上实测
+    // 过：不用按指纹也出得来真签名（拿 AuthKey 公钥验签 OK）—— 所以这里量到的
+    // 只是「能签」，量不到**不能**反推「签不了」（失败码都是这一笔的状态：
+    // -26 没验过、-204 会话被顶掉）。
     println!("--- 签名会话（uid={uid} alias={alias} challenge={challenge}）---");
     let mut session = None;
     match ommegaclient_b::soter::handle(

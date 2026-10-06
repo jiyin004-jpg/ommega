@@ -134,9 +134,10 @@ pub struct DeviceCaps {
     pub soter: Option<bool>,
     /// 设备真签出来过一次（`soter_sign`）：签名那两个 op 派过去能做完。
     pub soter_sign: Option<bool>,
-    /// 设备明说“签名这步做不了”（`soter_nosign`）：HAL 能答话，但签名要现场指纹，
-    /// 无人值守的 B 端给不了。跟 `soter = Some(false)`（压根没 HAL）分开记，因为它
-    /// 仍然能做身份/导出那些 op，只是签名不行。
+    /// 设备明说“签名这步做不了”（`soter_nosign`）：老版本 relay 会这么报，现在这版
+    /// 不再产生（失败码推不出设备能力，见 B 端 `soter::SignState`）。名字仍然解析，
+    /// 只是给旧设备留兼容：跟 `soter = Some(false)`（压根没 HAL）分开记，因为它
+    /// 还能做身份/导出那些 op。
     ///
     /// 老版本 relay 不会报这个名字 —— 那是“没说”，不是“做不到”，签名还能试。
     pub soter_nosign: Option<bool>,
@@ -151,7 +152,9 @@ pub struct DeviceCaps {
     pub strongbox: Option<bool>,
 }
 
-/// 这一步得由 TEE 现场签（要新鲜指纹）：`init_sign` 开会话、`finish_sign` 出签名。
+/// 这一步由 TEE 现场签：`init_sign` 开会话、`finish_sign` 出签名。无人值守的 B 端
+/// 也做得了（2026-10-06 在 PLC110 上实测：不按指纹也出真签名），只是这两步必须
+/// 落在同一台设备上，别处不能顶替。
 /// 其余的 op（身份、公钥导出、建/删）设备自己就能答。
 pub(crate) fn soter_op_needs_sign(op: &str) -> bool {
     matches!(op, "init_sign" | "finish_sign")
@@ -2000,8 +2003,9 @@ mod selfcheck_tests {
         assert_eq!(old.soter_sign, Some(false));
     }
 
-    /// 上报 `soter_nosign` 的设备（HAL 能答话、签名要现场指纹）：身份/导出还能领，
-    /// `init_sign`/`finish_sign` 不许派过来 —— 那两步远程一定回 -26，白跑一趟。
+    /// 上报 `soter_nosign` 的设备（老版本 relay 的结论）：身份/导出还能领，
+    /// `init_sign`/`finish_sign` 不派过来。现在的 relay 不会再这么报（失败码推不出
+    /// 设备能力），这条只当兼容旧设备的路由规则。
     #[tokio::test]
     async fn sign_ops_skip_a_device_that_reported_soter_nosign() {
         let store = TaskStore::new(30, 60, 100, 60, false);

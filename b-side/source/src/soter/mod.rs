@@ -100,10 +100,16 @@ const SOTER_TA_UNAVAILABLE: i64 = -20;
 /// 能力探针量出来的结论。
 ///
 /// 只有 [`SignVerdict::Unavailable`] 算「这台现在签不了」的硬证据（SOTER 没开、
-/// ATTK 没配、安全通道不通这类结构性毛病）。`-26` 不算：那是「这一刻没人按指纹」，
-/// 不是「这台签不了」—— 自己人的手机上量到过同一台设备指纹窗口开着时签得出来、
-/// 关着时回 -26。把 -26 当成签不了上报，服务端会把一台明明能签的机器从签名链路
-/// 上踢掉（之前那个假阴性就是这么来的）。
+/// ATTK 没配、安全通道不通这类结构性毛病）。
+///
+/// `-26`（`SOTER_ERROR_VERIFICATION_FAILED`）**谁都不该拿它下结论**：它说的是
+/// 「这一笔的验证没过去」——真应用那条路上就是 App 自己那步生物认证没成，是这一笔
+/// 的状态，不是这台机器的能力。2026-10-06 在 PLC110（Trustonic AIDL，HAL
+/// `vendor.trustonic.hardware.soter.ITrustonicSoter`）上实测：没人按指纹、没人
+/// 值守，走中继 `init_sign` 回 0、`finish_sign` 回真签名，拿 AuthKey 公钥验签
+/// `Verified OK`、拿 ASK 验则失败（反例对照）⇒ 无人值守的 B 端**签得出来**。
+/// 以前这里把 -26 当「TA 要新鲜指纹」，服务端据此报过 `soter_nosign`，会把一台
+/// 能签的机器从签名链路上踢掉（假阴性）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignVerdict {
     /// 真签出来了一次。
@@ -353,26 +359,22 @@ pub fn learned_probe_target() -> Option<(i32, String)> {
         .clone()
 }
 
-/// 连续几次真派下来的签名 op 都被 -26 顶回来（TA 说“没有新鲜指纹”），就认这台
-/// 不接签名。只用**真活**计数，不用探针：探针撞上指纹窗口关着只是「这次没量
-/// 出来」，拿它当证据会把一台明明能签的机器踢出签名链路（PLC110 上真踩过）。
-const SIGN_REFUSAL_LIMIT: u32 = 3;
-
-/// 这台机器签名到底行不行。三个值对应上报给服务端的三件事。
+/// 这台机器签名到底行不行。只有两档：真签出来过，或者还没量出来。
+///
+/// **没有「签不了」这一档。** 失败码全是「这一笔没成」：`-26` 是这一笔的验证没
+/// 过去（真应用那条路上＝App 那步生物认证）、`-204` 是这张会话被别人顶掉了、
+/// 超时是没等到 —— 换一笔就可能成，推不出「设备能力」这个结论。报 `soter_nosign`
+/// 的代价是服务端把签名 op 从这台机器上挪走、甚至把槽位钉到服务端自签那两层
+/// （App 手里的真料换成假料），比不报糟得多。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignState {
     /// 真签出来过（真实 op 或探针）：报 `soter_sign`。
     Proven,
-    /// 连续几次真签名 op 都被 -26 顶回来：报 `soter_nosign`，服务端不再把签名
-    /// op 派过来。材料重建后会清掉，重新学。
-    Refused,
     /// 还没量出来：什么都不报，服务端照旧会试。
     Unknown,
 }
 
 static SIGN_STATE: Mutex<SignState> = Mutex::new(SignState::Unknown);
-/// 连续 -26 次数（碰上一次成功就清零）。
-static SIGN_REFUSALS: Mutex<u32> = Mutex::new(0);
 
 pub fn sign_state() -> SignState {
     *SIGN_STATE
@@ -388,56 +390,26 @@ fn mark_sign_proven() {
         log::info!("soter: signed once, this device can sign (keeping the verdict)");
         *state = SignState::Proven;
     }
-    *SIGN_REFUSALS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
 }
 
-/// 一个真签名 op 的结果。`-26` 累加，够了就改口说签不了；成功就把之前那条
-/// 否定的结论推翻（真签出来过比什么都硬）。
+/// 一个真签名 op 的结果：只有「真签出来」算证据。
+///
+/// 失败码一律不参与结论（`-26` 这一笔没验过、`-204` 会话被顶掉、超时没等到）：
+/// 那都是「这笔没成」，换一笔就可能成。2026-10-06 实测 PLC110 无人值守也签得出来，
+/// 所以更不能拿失败码去推断「这台签不了」—— 那会把能签的机器踢出签名链路。
 fn note_sign_result(error_code: i64) {
     if error_code == 0 {
         mark_sign_proven();
-        return;
-    }
-    if error_code != SOTER_VERIFICATION_FAILED {
-        return;
-    }
-    // 已经签出来过的机器，不会因为「这会儿没人按指纹」被改口 —— 它明明能签，
-    // 服务端该继续把签名 op 派过来，人回来按一下就成。
-    if sign_state() == SignState::Proven {
-        return;
-    }
-    let mut refusals = SIGN_REFUSALS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *refusals += 1;
-    let count = *refusals;
-    drop(refusals);
-    if count < SIGN_REFUSAL_LIMIT {
-        return;
-    }
-    let mut state = SIGN_STATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if *state != SignState::Refused {
-        log::warn!(
-            "soter: {count} sign ops in a row came back -26 (no fresh fingerprint); \
-             reporting this device as unable to sign"
-        );
-        *state = SignState::Refused;
     }
 }
 
-/// 槽位被重建 / 删掉：之前那条结论跟着作废（材料换了，能不能签得重新量）。
+/// 槽位被重建 / 删掉：之前那条结论跟着作废（材料换了，重新量一次更保险；
+/// 量不出来时不会瞎说不支持）。
 pub fn clear_sign_state() {
     let mut state = SIGN_STATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *state = SignState::Unknown;
-    *SIGN_REFUSALS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
 }
 
 /// `init_sign` 回了 0 说明这个槽位真有材料，记下来给探针用（探针只用现成材料，
@@ -457,13 +429,13 @@ fn remember_probe_target(uid: i32, alias: &str) {
     }
 }
 
-/// -26 落在签名步骤上，是「这一笔没签成」——TA 要的是当下那一刻的新鲜指纹。
+/// -26 落在签名步骤上，是「这一笔没签成」（这一笔的验证没过去，真应用那条路上就是
+/// App 自己那步生物认证没成），不是「这份材料签不了」。
 ///
 /// 以前这里把它当「这份材料签不了」，记下 uid、24 小时内不再服务这个槽位。那是个
-/// 误判：指纹随时可以按，材料本身没毛病，而“拒绝服务”只能把 App 推给服务端那两层
-/// 自签的假料（PLC110 上就这么让一轮支付流程拿了一整套假材料）。现在一律把 TA 的
-/// 答复原样递上去（`-26` 也就是 App 自己那套 `SOTER_ERR_NO_FINGERPRINT`），要不要
-/// 换层由服务端按错误码的性质决定，本机不再替它下结论。
+/// 误判：材料本身没毛病，而“拒绝服务”只能把 App 推给服务端那两层自签的假料
+/// （PLC110 上就这么让一轮支付流程拿了一整套假材料）。现在一律把 TA 的答复原样递
+/// 上去，要不要换层由服务端按错误码的性质决定，本机不再替它下结论。
 fn is_hard_slot_failure(op: &str, result: &Value) -> bool {
     let _ = (op, result);
     false
@@ -576,10 +548,21 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
         bail!("unknown soter op: {op}");
     }
     if MUTATING_OPS.contains(&op) && !allow_mutation {
-        bail!(
-            "soter op '{op}' creates or removes keys on the device and is disabled; \
-             set OMMEGA_RELAY_SOTER_MUTATION=1 in relay.conf to allow it"
+        // 别 `bail`：任务失败在链路上会被当成「这台设备没这把钥匙」（外层只看到
+        // -5），线上真踩过 —— 一整天所有 generate_* 都被拒，App 一直在原地重建，
+        // 排查时还以为是 TEE 坏了。这里按正常答复递一个 -5（跟真缺料同一个码，A 端
+        // 行为不变），另加一个只有服务端看得懂的标记，让服务端把它和真缺料区分开、
+        // 写进日志；本机也留一条 WARN。
+        log::warn!(
+            "soter: op '{op}' 被建料闸门拦下（relay.conf 里没开 \
+             OMMEGA_RELAY_SOTER_MUTATION）：这台接不了建料/删料，A 端会一直拿到\
+             「没料」的 -5 在原地重建"
         );
+        return Ok(json!({
+            "op": op,
+            "error_code": SOTER_ASK_NOT_READY_CODE,
+            "soter_mutation_disabled": true,
+        }));
     }
     if op == "selftest" {
         // 自检不碰 HAL，不占名额。
@@ -630,8 +613,8 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
             let data = open_soter(op).and_then(|soter| soter.finish_sign(session));
             guard.finish_ended(session, Instant::now());
             let data = data?;
-            // 真替上层签出来就是一整条链路的成功证据；回 -26 就是「没人按指纹」的
-            // 一次实测，都交给同一个判定函数累。
+            // 真替上层签出来是「这台能签」的唯一硬证据；别的码（-26 这一笔没验过、
+            // -204 会话被顶掉）都是「这笔没成」，不参与能力结论。
             note_sign_result(data.error_code as i64);
             Ok(data_result(op, data))
         }
@@ -683,7 +666,8 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
                 // 探针以后可以拿它去试签。
                 remember_probe_target(uid, &alias);
             } else {
-                // TA 连会话都不给建（-26 = 要新鲜指纹）：也是一次实测。
+                // TA 连会话都不给建（-26 = 这一笔的验证没过去）：记一笔，但不参与
+                // 「这台能不能签」的结论。
                 note_sign_result(session.error_code as i64);
             }
             Ok(json!({
@@ -740,7 +724,7 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
     };
     let result = result?;
 
-    // 设备层不再替服务端下结论：`-26` 是 TA 的答复（这会儿没人按指纹），原样递上去。
+    // 设备层不再替服务端下结论：`-26` 是 TA 对「这一笔」的答复，原样递上去。
     // 换不换层、要不要把某个槽位钉到服务端自签那两层，由服务端看错误码的性质定 ——
     // 在设备这边把它改成「这层做不了」就等于替 App 做了决定，还会把一台好机器从
     // 签名链路上踢掉（见 `is_hard_slot_failure`）。
@@ -777,14 +761,14 @@ const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
 
 /// 真去签一次：拿一个现成的槽位走 `init_sign` + `finish_sign`。
 ///
-/// 这是能力上报用的。`getDeviceId` 只能证明 HAL 活着，证明不了它肯签 —— 一加 11
-/// （PHB110）这类机器的 AuthKey 锁在「刚匹配过指纹」后面，没人按指纹时
-/// `finish_sign` 一律回 -26（TA 给的原话就是「没有新鲜指纹」）。所以「能不能签」
-/// 只能靠真签一次来量，别猜。
+/// 这是能力上报用的。`getDeviceId` 只能证明 HAL 活着，证明不了它肯签，而失败码
+/// 也证明不了「不肯签」（-26 是这一笔没验过）。所以「能不能签」只能靠真签一次
+/// 量出来，而且**只有签出来这一种结论**：没人按指纹也签得出来（2026-10-06 在
+/// PLC110 上实测过），量不出来就是量不出来，不许推断成「签不了」。
 ///
 /// 只用槽位上现成的材料，不建不删（改设备密钥状态得先问操作者）：槽位上没材料
-/// （-5 / -6）时结论是「没量出来」，不是「签不了」。这点很要紧 —— 把量不出来
-/// 当成签不了上报，服务端会把一台其实能签的机器从签名链路上踢掉。
+/// （-5 / -6）时结论是「没量出来」。这点很要紧 —— 把量不出来当成签不了上报，
+/// 服务端会把一台其实能签的机器从签名链路上踢掉。
 ///
 /// 结论写在 `verdict` 里（见 [`SignVerdict`]），`signed` 只为看日志方便。
 /// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
@@ -1023,11 +1007,16 @@ mod tests {
         assert!(format!("{err:#}").contains("unknown soter op"));
     }
 
+    /// 建料闸门关着时不能报错退出（那会被当成「这台没料」的 -5 混进链路），
+    /// 要按正常答复递一个带标记的 -5，让服务端能把这笔和真缺料区分开；
+    /// 而且一个字节的 HAL 都不许碰（uid 故意给个不存在的也无所谓）。
     #[test]
     fn mutating_ops_need_the_opt_in() {
         let payload = json!({ "op": "generate_ask_key_pair", "uid": 10373 });
-        let err = handle(&payload, false, 2).expect_err("must be gated");
-        assert!(format!("{err:#}").contains("OMMEGA_RELAY_SOTER_MUTATION"));
+        let reply = handle(&payload, false, 2).expect("闸门关着也要给答复，不是报错");
+        assert_eq!(reply["error_code"], json!(-5));
+        assert_eq!(reply["soter_mutation_disabled"], json!(true));
+        assert_eq!(reply["op"], json!("generate_ask_key_pair"));
     }
 
     #[test]
@@ -1090,38 +1079,32 @@ mod tests {
         }
     }
 
-    /// 签出来过一次就咬死；之后 -26 再多也不翻。反过来，连续几次真活都回 -26
-    /// 才会改口说签不了，而且再来一次成功就推翻。
+    /// 只有「真签出来」算证据：失败码再多也不许变成「这台签不了」。
+    ///
+    /// 2026-10-06 实测（PLC110 / Trustonic AIDL）：没人按指纹、没人值守，走中继
+    /// `init_sign` + `finish_sign` 照样出真签名（AuthKey 公钥验签 OK）。所以
+    /// `-26`（这一笔没验过）、`-204`（会话被顶掉）、超时都只是「这笔没成」。
     #[test]
-    fn a_signature_is_proof_and_three_refusals_are_the_opposite() {
+    fn only_a_real_signature_is_capability_evidence() {
         clear_sign_state();
         assert_eq!(sign_state(), SignState::Unknown);
 
-        // 两次 -26 还不够：等指纹按下去的时候同台机器是签得出来的。
-        note_sign_result(-26);
-        note_sign_result(-26);
-        assert_eq!(sign_state(), SignState::Unknown);
+        for code in [-26i64, -26, -26, -26, -26] {
+            note_sign_result(code);
+            assert_eq!(sign_state(), SignState::Unknown, "{code} 不该当证据");
+        }
+        for code in [-5i64, -6, -7, -9, -204, -1000] {
+            note_sign_result(code);
+            assert_eq!(sign_state(), SignState::Unknown, "{code} 不该当证据");
+        }
 
-        // 第三次真活又被顶回来：这台就不接签名了。
-        note_sign_result(-26);
-        assert_eq!(sign_state(), SignState::Refused);
-
-        // 真签出来一次比什么都硬，否定结论直接丢。
+        // 真签出来过一次就是结论，之后再怎么失败也不翻。
         note_sign_result(0);
         assert_eq!(sign_state(), SignState::Proven);
-
-        // 已经证明能签了，后面几次 -26（指纹窗口关着）不该把结论抽回去。
         for _ in 0..5 {
             note_sign_result(-26);
         }
         assert_eq!(sign_state(), SignState::Proven);
-
-        // 只有别的错误码（没建好 / 会话过期）不算数。
-        clear_sign_state();
-        for code in [-5, -6, -7, -9, -1000] {
-            note_sign_result(code);
-        }
-        assert_eq!(sign_state(), SignState::Unknown);
         clear_sign_state();
     }
 

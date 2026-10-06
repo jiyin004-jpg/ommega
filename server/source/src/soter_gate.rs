@@ -12,8 +12,8 @@
 //! 两条不越界的规矩：
 //! - 只有 `layer=b`（真设备答的）才进缓存。keybox / self_signed 顶替出来的答案
 //!   不进，免得把「这台设备现在不行」也一起缓存住，下一笔连试都不试了。
-//! - `init_sign` / `finish_sign` 一律不缓存：那里面有会话句柄和「这一刻有没有
-//!   新鲜指纹」的状态，复用会把语义搞坏。
+//! - `init_sign` / `finish_sign` 一律不缓存：那里面有会话句柄和「这一笔的验证
+//!   过没过」的状态，复用会把语义搞坏。
 //!
 //! 重建类 op 走的是「去重窗」：同一个 (设备, uid, 别名, op) 在窗口内重复打进来，
 //! 直接把上一次的结果还回去；同时把该 uid 名下所有只读缓存清掉 —— 设备状态变了，
@@ -61,6 +61,13 @@ const DEFAULT_READ_TTL_MS: u64 = 5_000;
 /// 默认 2 秒：App 的重放间隔就在几百毫秒量级。
 const DEFAULT_WRITE_WINDOW_MS: u64 = 2_000;
 
+/// 「自删自建」的统计窗口与上报节拍。
+const CHURN_WINDOW: Duration = Duration::from_secs(60);
+/// 窗口里第几次删开始报（健康的开通流程最多删一两次）。
+const CHURN_REPORT_AT: u32 = 3;
+/// 报过之后每隔多少次再喊一声，免得变成日志洪水。
+const CHURN_REPEAT_EVERY: u32 = 5;
+
 enum Kind {
     Read,
     Write,
@@ -102,6 +109,8 @@ pub struct SoterGate {
     write_window: Duration,
     reads: Mutex<HashMap<String, (Value, Instant)>>,
     writes: Mutex<HashMap<String, (Value, Instant)>>,
+    /// 槽位「自删自建」计数：`设备|uid|别名` -> (窗口里删了几次, 上次时间)。
+    churn: Mutex<HashMap<String, (u32, Instant)>>,
     hits: AtomicU64,
     stores: AtomicU64,
     writes_invalidated: AtomicU64,
@@ -129,6 +138,7 @@ impl SoterGate {
             write_window,
             reads: Mutex::new(HashMap::new()),
             writes: Mutex::new(HashMap::new()),
+            churn: Mutex::new(HashMap::new()),
             hits: AtomicU64::new(0),
             stores: AtomicU64::new(0),
             writes_invalidated: AtomicU64::new(0),
@@ -179,7 +189,7 @@ impl SoterGate {
         alias: Option<&str>,
         from_device: bool,
         value: &Value,
-    ) {
+    ) -> Option<String> {
         match kind_of(op) {
             Kind::Write => {
                 self.invalidate_reads(device, uid);
@@ -211,6 +221,65 @@ impl SoterGate {
             }
             Kind::None => {}
         }
+        self.note_slot_churn(device, op, uid, alias)
+    }
+
+    /// 同一槽位在窗口里被反复「删 AuthKey」，就给一句给操作员看的说明（不改设备状态）。
+    ///
+    /// 为什么要看这个（2026-10-06 实测）：真应用的 SOTER 开通流程是
+    /// `has_ask_already` → `export_ask_public_key`（上报腾讯）→ `generate_auth_key_pair`
+    /// → `export_auth_key_public_key` → `remove_auth_key` → `init_sign` → `finish_sign`。
+    /// 腾讯那边一旦没认这批材料，App 就在「建 AuthKey → 导出 → 删掉」这一段循环，
+    /// 永远走不到签名那两步。两种最常见的成因：
+    ///
+    /// 1. 那台 B 的建料闸门没开（`OMMEGA_RELAY_SOTER_MUTATION`）：`generate_*` 全被它
+    ///    自己拒了，外层只看到 -5「这把钥匙不在这台」（B 端会带 `soter_mutation_disabled`
+    ///    标记，服务端另有一条 WARN 专门喊这个）；
+    /// 2. 槽位上的 ASK 是**别的时候/别处**铸的：微信这类 App 只在 ASK 不存在时才走
+    ///    「生成 ASK → 上报腾讯」，有一把现成的 ASK 就跳过上报 —— 腾讯那边没有这条设备
+    ///    的记录，之后怎么建 AuthKey 都白搭。这条只能清一次槽位让 App 从零走一遍，而
+    ///    `remove_all_uid_key` 是 uid 级的（会连坐同一个 uid 上别的账号，见
+    ///    `handlers.rs` 里那条「uid 级全清会连坐」的处置），所以这里只报不改设备状态。
+    fn note_slot_churn(
+        &self,
+        device: &str,
+        op: &str,
+        uid: Option<i32>,
+        alias: Option<&str>,
+    ) -> Option<String> {
+        if !matches!(op, "remove_auth_key" | "remove_all_uid_key") {
+            return None;
+        }
+        let uid_text = uid
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let alias_text = alias.unwrap_or("-").to_string();
+        let key = format!("{device}|{uid_text}|{alias_text}");
+        let now = Instant::now();
+        let mut guard = self
+            .churn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|_, (_, at)| now.duration_since(*at) <= CHURN_WINDOW);
+        let entry = guard.entry(key).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+        let count = entry.0;
+        drop(guard);
+        let due = count == CHURN_REPORT_AT
+            || (count > CHURN_REPORT_AT && (count - CHURN_REPORT_AT) % CHURN_REPEAT_EVERY == 0);
+        if !due {
+            return None;
+        }
+        Some(format!(
+            "soter: 槽位 {device}|{uid_text}|{alias_text} 在 {} 秒里第 {count} 次删 AuthKey —— \
+             App 在自删自建（腾讯那边没认这批材料）。先确认那台 B 开了 \
+             OMMEGA_RELAY_SOTER_MUTATION（没开的话 generate_* 全被它自己拒成 -5）；\
+             闸门是开的就说明这个槽位上的 ASK 被别的时候铸过、App 跳过了「生成 ASK → \
+             上报腾讯」那一步，得把该槽位的 ASK 清掉（remove_all_uid_key）让 App 从零走\
+             一遍（uid 级全清会连坐同槽位别的账号，清之前先看清台账）",
+            CHURN_WINDOW.as_secs()
+        ))
     }
 
     /// 记下一笔写操作时，把同一 uid 上**别的**写去重记录丢掉：那些答案是「上一种
@@ -346,7 +415,7 @@ mod tests {
 
     #[test]
     fn sign_sessions_are_never_reused() {
-        // init_sign 里有会话句柄、还牵着「这一刻有没有新鲜指纹」，复用等于把语义搞坏。
+        // init_sign 里有会话句柄、还牵着「这一笔的验证过没过」，复用等于把语义搞坏。
         let gate = gate();
         for op in ["init_sign", "finish_sign", "probe", "selftest"] {
             gate.record(
@@ -536,6 +605,58 @@ mod tests {
         );
         assert!(gate
             .lookup("dev", "remove_all_uid_key", Some(10408), None)
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_auth_key_deletions_are_reported_once_the_slot_looks_stuck() {
+        let gate = SoterGate::with_windows(Duration::from_millis(120), Duration::from_millis(120));
+        for i in 1..=2 {
+            assert!(
+                gate.record(
+                    "dev",
+                    "remove_auth_key",
+                    Some(10490),
+                    Some("SoterAuthKeyV2_salt11d8ba34_scene1"),
+                    true,
+                    &json!({ "error_code": 0 }),
+                )
+                .is_none(),
+                "第 {i} 次不该报"
+            );
+        }
+        let note = gate
+            .record(
+                "dev",
+                "remove_auth_key",
+                Some(10490),
+                Some("SoterAuthKeyV2_salt11d8ba34_scene1"),
+                true,
+                &json!({ "error_code": 0 }),
+            )
+            .expect("第三次该报一声");
+        assert!(note.contains("自删自建"), "{note}");
+        assert!(note.contains("OMMEGA_RELAY_SOTER_MUTATION"), "{note}");
+        // 别的槽位/别的 op 不受影响。
+        assert!(gate
+            .record(
+                "dev",
+                "remove_auth_key",
+                Some(10491),
+                Some("A"),
+                true,
+                &json!({}),
+            )
+            .is_none());
+        assert!(gate
+            .record(
+                "dev",
+                "generate_auth_key_pair",
+                Some(10490),
+                Some("SoterAuthKeyV2_salt11d8ba34_scene1"),
+                true,
+                &json!({}),
+            )
             .is_none());
     }
 

@@ -188,7 +188,7 @@ const capRows = d => [
   // “支持”只认 soter_sign（真拿现成槽位签出来过）：没上报签名能力不等于不行，
   // 没说不支持也不等于行 —— 两种都写“没确认，仍会试”。
   kvRow('SOTER 签名', d.soter === false ? '不支持（没有 SOTER HAL）'
-    : d.soter_nosign === true ? '不支持（签名要本机指纹）'
+    : d.soter_nosign === true ? '不支持（设备自报签不了）'
     : d.soter_sign === true ? '支持'
     : '未确认（没量出来，仍会试）'),
   kvRow('StrongBox', CAP_TEXT(d.strongbox)),
