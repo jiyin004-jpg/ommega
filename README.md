@@ -1,5 +1,7 @@
 # Ommega
 
+[English](README.en.md)
+
 Ommega 是一个三端远程 TEE 认证系统：A 端是服务请求端，B 端提供真实硬件 TEE 能力，server 在中转调度。A 端应用发起的密钥认证（attestation）、签名（sign）、解密（decrypt）请求，经 server 转发到 B 端，由本机真实硬件 TEE（KeyMint / StrongBox）执行后原样回传。B 端另有一套配套的管理 App（b-app）。
 
 当前版本与下载见 [Releases](https://github.com/jiyin004-jpg/ommega/releases) 页面。
