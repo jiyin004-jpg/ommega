@@ -25,6 +25,7 @@
 //! 窗口里 `hal` 一定不为 0；而 `getVersion` / `getExtraParam` 这种根本不碰 HAL 的调用单独
 //! 剔掉 —— App 能把它们轮询一天，拿它们当证据就是把好宿主踢掉。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,8 @@ const MIN_MUTATIONS: u64 = 1;
 /// 两次报「哑了」之间的最短间隔。已经踢过一次还是哑的，说明不是这个原因，
 /// 那就每 10 分钟试一次，别把宿主当开关按。
 const REPEAT_COOLDOWN: Duration = Duration::from_secs(600);
+/// 体检线程的节拍。窗口（[`WINDOW`]）靠它来关，所以它得比窗口密得多。
+const TICK: Duration = Duration::from_secs(5);
 
 /// 判出「哑了」时写的标记文件。启动器读一行、删掉、然后把宿主重启。
 const STUCK_PATH: &str = crate::root_path!("soter_host_stuck");
@@ -141,6 +144,7 @@ fn judge(state: &mut State, now: Instant) -> Option<Verdict> {
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| {
@@ -152,25 +156,53 @@ fn state() -> &'static Mutex<State> {
     })
 }
 
-/// 记一笔观测，顺手看一眼窗口。由 `IMaintenanceService::reportHookEvent` 调用。
+/// 起体检线程（幂等）。
 ///
-/// 这条跑在 binder 线程上（宿主是最常来的那个 peer），所以只做整数累加；攒够一个窗口才碰
-/// 文件，而且拿文件锁之外做。写不动只记日志 —— 判不出来顶多是自愈不生效，不该影响别的。
+/// **结算必须自己按时间跑，不能挂在观测上**：一开始把 `judge` 摆在 [`observe`] 里，实测两个
+/// 问题 —— 空闲时窗口永远不关，健康度文件根本不出现；更要命的是哑窗口会等到**下一笔**观测才
+/// 结算，而下一笔已经是恢复后的健康流量（带着 hal 侧）时，那个哑窗口就被判成不哑，真出事反而
+/// 漏判。现在 `observe` 只记数，结算全交给这个线程。
+pub fn start() {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("ommega-soter-health".to_string())
+        .spawn(|| loop {
+            std::thread::sleep(TICK);
+            let verdict = {
+                let mut state = state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                judge(&mut state, Instant::now())
+            };
+            if let Some(verdict) = verdict {
+                report(verdict);
+            }
+        });
+    if let Err(error) = spawned {
+        STARTED.store(false, Ordering::SeqCst);
+        log::warn!("soter host health thread did not start: {error}");
+    }
+}
+
+/// 记一笔观测。由 `IMaintenanceService::reportHookEvent` 调用，跑在 binder 线程上，
+/// 所以这里只做整数累加，不碰文件、不做判断。
 pub fn observe(message: &str) {
     let Some(sample) = classify(message) else {
         return;
     };
-    let verdict = {
-        let mut state = state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.window.record(sample);
-        judge(&mut state, Instant::now())
-    };
-    let Some(verdict) = verdict else {
-        return;
-    };
+    let mut state = state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.window.record(sample);
+}
 
+/// 结算一个窗口：先把计数写进健康度文件，判出哑了再写标记。
+///
+/// 文件操作全在拿锁之外做：这里是体检线程，不是热路径。写不动只记日志 —— 顶多自愈不生效，
+/// 不该影响别的。
+fn report(verdict: Verdict) {
     if let Err(error) = write_mirror(
         STATUS_PATH,
         &format!(

@@ -368,6 +368,9 @@ fn run() -> Result<()> {
         .context("failed to install runtime config")?;
     // 真机 cpu_id 是 SOTER 身份的一半，趁早去学 —— 后台线程，不挡启动。
     crate::soter_cpu_id::start();
+    // SOTER 宿主「哑了」的体检（见 soter_host_health：判定得有自己的节拍，
+    // 不能挂在观测到来上）。同样是个后台线程。
+    crate::soter_host_health::start();
 
     install_module_info_bundle_if_available().context("failed to initialize moduleHash input")?;
 
