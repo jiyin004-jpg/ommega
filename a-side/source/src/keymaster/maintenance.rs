@@ -516,12 +516,14 @@ impl IMaintenanceService for MaintenanceManager {
 
     /// Record one observation sent by a hook inside an injected process.
     ///
-    /// Deliberately does nothing but log: whatever a hook observes is only interesting as a
-    /// log line for now (the SOTER forwarding decision is made elsewhere). There is no
-    /// caller context to require here, and the peer that got this far already passed the
+    /// The line is logged as-is; SOTER observations are also handed to
+    /// [`crate::soter_host_health`], which is the only place that can tell a host that came up mute
+    /// (it receives App-side calls but never forwards one to the HAL) from a working one. There is
+    /// no caller context to require here, and the peer that got this far already passed the
     /// socket authorizer.
     fn reportHookEvent(&self, message: &str) -> rsbinder::status::Result<()> {
         let _wp = wd::watch("IMaintenanceService::reportHookEvent");
+        crate::soter_host_health::observe(message);
         log::info!("hook event: {message}");
         Ok(())
     }

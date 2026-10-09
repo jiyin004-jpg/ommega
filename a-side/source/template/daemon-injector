@@ -45,6 +45,9 @@ SOTER_ASK_DST=/data/misc/ommega/soter_ask.pem
 SOTER_CPU_ID_DST=/data/misc/ommega/soter_cpu_id
 SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
+# daemon 判出「SOTER 宿主哑了」时写的标记。它跑在 keystore uid，只写得动自己那个目录
+# （`src/soter_host_health.rs`）；写一行原因，这里读走、删掉，再把宿主换成新实例。
+SOTER_STUCK_FILE=/data/misc/keystore/ommega/soter_host_stuck
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
@@ -272,13 +275,17 @@ sync_soter_cpu_id() {
 
 # 换 key 之后把 SOTER 宿主停掉：key 是进程启动时加载的，它下一次被 bind 起来
 # 的时候会重新加载。
+#
+# 自愈也用这个：宿主「哑了」（收得到 App 侧调用、却一笔都不往 HAL 发）只有换实例才救得回来。
+# 第二个参数是日志里那句理由：不说清的话，两种场景在日志里长得一样。
 restart_soter_host() {
   # pid 必须是局部的：它跟主循环那个 keystore2 的 pid 同名，不声明 local 就会把循环里的
   # 目标冲成 SOTER 宿主的 pid（日志打错 pid，重试冷却也失效）。
-  local pid
+  local pid reason
+  reason=${1:-"so the new soter ask takes effect"}
   pid=$(soter_pid)
   [ -n "$pid" ] || return 0
-  log "[injector-daemon] stopping $SOTER_PKG pid=$pid so the new soter ask takes effect"
+  log "[injector-daemon] stopping $SOTER_PKG pid=$pid $reason"
   kill -TERM "$pid" 2>/dev/null
   sleep 2
   kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
@@ -487,6 +494,18 @@ while true; do
   inject_targets=keystore2
   if soter_inject_enabled; then
     inject_targets=keystore2,soter
+    # daemon 判出「宿主哑了」时会把结论写进那个标记文件（见 a 端 src/soter_host_health.rs：
+    # 宿主收得到 App 侧调用、却一笔都不往 HAL 发，我们的接管因此没东西可拦，App 那边一直报
+    # 「系统错误」；2026-10-09 nubia NX721J 上微信指纹支付卡住的就是这个）。
+    # 动手的只能是这里：daemon 在 keystore uid 里，杀不动 system 域的宿主。
+    # 踢完立刻拉一个新的，不走下面保活那 30 秒节流 —— 用户这时候多半正卡在微信里重试。
+    if [ -f "$SOTER_STUCK_FILE" ]; then
+      reason=$(head -n1 "$SOTER_STUCK_FILE" 2>/dev/null)
+      rm -f "$SOTER_STUCK_FILE" 2>/dev/null
+      log "[injector-daemon] ${reason:-$SOTER_PKG looks mute}"
+      restart_soter_host "so a fresh HAL client comes up"
+      start_soter_service
+    fi
     # 宿主保活：不在就再拉一次（不是只在开机那一次）。
     #
     # 为什么要这样：App 是 bind 到宿主时才把它拉起来的，而它一被拉起来就**马上**发第一笔
@@ -501,6 +520,10 @@ while true; do
         start_soter_service
       fi
     fi
+  else
+    # 开关关着：宿主里根本没有载荷，这个标记已经没意义 —— 留着只会在下次
+    # 打开开关时平白重启一次宿主。
+    rm -f "$SOTER_STUCK_FILE" 2>/dev/null
   fi
 
   pid=$(get_keystore_pid)
