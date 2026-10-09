@@ -100,7 +100,7 @@ def get_version() -> str:
 # 中间差的这个 10 固定在这儿；真要再同号重发，就把这个数往上加（10 -> 11 -> 12）。
 # 2026-10-03：B 端 1.6.4 重发（补 SOTER 卡在 TEE 里的自愈），10 -> 11。只重发哪端就抬
 # 哪端，两边各一套偏移（A 端这次没重发，那边还是 10 -> 1006014）。
-VERSION_CODE_OFFSET = 11
+VERSION_CODE_OFFSET = 12
 
 
 def version_code(version: str) -> str:

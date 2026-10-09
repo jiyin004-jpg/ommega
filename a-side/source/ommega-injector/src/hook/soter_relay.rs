@@ -53,6 +53,12 @@ fn resolve(call: &SoterCall) -> Outcome {
 /// 那个十六进制串，服务端/B 端会直接写进 HAL 的 String16，**不要**在这边解码（只有本地
 /// 兜底那条路才需要 hex 解码）。哪些号码带哪些参数由 `soter::parse` 定，这里照抄。
 fn request(call: &SoterCall) -> Option<String> {
+    request_with_table(call, None)
+}
+
+/// 拼 JSON 的本体。`table` 是给测试的假 uid→包名 表；`None` 表示读真表，并允许退回前台
+/// 应用兜底（测试那条路不碰真文件，也不拿前台应用顶替）。
+fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
     let op = soter_relay::op_for_code(call.code)?;
     let mut out = String::from("{\"op\":");
     push_json_string(&mut out, op);
@@ -74,16 +80,22 @@ fn request(call: &SoterCall) -> Option<String> {
     }
     // 真调用者是谁（App 侧事务头里内核填的 sender_euid）。取不到就不带：daemon 翻不出
     // 包名、服务端就退回别名/槽位那套老判据，跟旧 payload 一个样。
+    //
+    // 包名也在这边自己翻一份带上。为什么在这边翻：实测有的机器（小米那台）SOTER 根本不走
+    // daemon 那段转发（daemon 侧的翻名代码一次都没跑到），服务端就一直收到 `caller_pkg=-`、
+    // 认不出这是真应用。表是 root 侧 daemon-injector 写的世界可读副本，宿主域读得到。
+    //
+    // 查表只认 `caller_uid`（内核填的 sender_euid，伪造不了），**不认请求里的 `uid`** ——
+    // 那个是应用自己填的参数，探测机（春秋/鸭子）故意填假 uid 试我们，拿它翻名就会把假 uid
+    // 撞上的那个包当成真调用者，服务端可能因此把探测机当真应用派给真机。取不到 caller_uid
+    // 就不带包名，跟旧 payload 一个样。
     if let Some(uid) = call.caller_uid {
         out.push_str(",\"caller_uid\":");
         out.push_str(&uid.to_string());
-    }
-    // 包名自己翻一份带上。为什么在这边翻：实测有的机器（小米那台）SOTER 根本不走 daemon
-    // 那段转发（daemon 侧的翻名代码一次都没跑到），服务端就一直收到 `caller_pkg=-`、
-    // 认不出这是真应用。这里直接拿 `uid`（= 要钥匙的那个应用，微信就是 10339）自己查表：
-    // 表是 root 侧 daemon-injector 写的世界可读副本，宿主域读得到。
-    if let Some(uid) = call.uid {
-        let pkg = caller_package_for_uid(uid as u32);
+        let pkg = match table {
+            Some(table) => lookup_in_table(table, uid as u32),
+            None => caller_package_for_uid(uid as u32),
+        };
         log::info!(
             "event=soter caller uid={uid} pkg={}",
             pkg.as_deref().unwrap_or("-")
@@ -250,16 +262,39 @@ mod tests {
         );
     }
 
-    /// 解析出真调用者 uid 之后，转发 JSON 里得带上它（包名由 daemon 翻）。
+    /// 解析出真调用者 uid 之后，转发 JSON 里得带上它，包名也从**这个** uid 翻出来。
     #[test]
     fn a_resolved_caller_uid_rides_along_in_the_request() {
         let mut call = call(11, Some(10490), Some("SoterAuthKey"), Some("0a1b"));
         call.caller_uid = Some(10490);
         assert_eq!(
-            request(&call).as_deref(),
+            request_with_table(&call, Some("10490 com.tencent.mm\n")).as_deref(),
+            Some(
+                "{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKey\",\"challenge\":\"0a1b\",\"caller_uid\":10490,\"caller_pkg\":\"com.tencent.mm\"}"
+            )
+        );
+    }
+
+    /// 表里没有这个 caller_uid 就干脆不带包名（服务端退回别名/槽位那套老判据）。
+    #[test]
+    fn a_caller_uid_missing_from_the_table_sends_no_package() {
+        let mut call = call(11, Some(10490), Some("SoterAuthKey"), Some("0a1b"));
+        call.caller_uid = Some(10490);
+        assert_eq!(
+            request_with_table(&call, Some("10339 com.other.app\n")).as_deref(),
             Some(
                 "{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKey\",\"challenge\":\"0a1b\",\"caller_uid\":10490}"
             )
+        );
+    }
+
+    /// **不拿请求里那个 `uid` 翻包名**：那是应用填的，探测机就靠伪造它来试我们。
+    #[test]
+    fn the_request_uid_is_never_used_for_the_package_lookup() {
+        let call = call(11, Some(10490), Some("SoterAuthKey"), Some("0a1b"));
+        assert_eq!(
+            request_with_table(&call, Some("10490 com.tencent.mm\n")).as_deref(),
+            Some("{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKey\",\"challenge\":\"0a1b\"}")
         );
     }
 

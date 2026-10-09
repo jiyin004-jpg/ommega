@@ -10,3 +10,5 @@
 - Added diagnostics along the way: with debug logging on, unrecognised SOTER interface names are recorded, which makes it easier to support renamed interfaces later.
 - Hotfix: on models that renamed the SOTER interface, the app could not learn the real caller identity, which broke flows like WeChat fingerprint / payment on those models (some Xiaomi devices).
 - Hotfix #2: added the "current foreground app" fallback for those models (it used to apply only when the uid lookup failed, which those models never reach), and aligned the write/read cadence of the foreground information so the fallback is available at all times.
+- Hotfix #3: fixed "fingerprint / payment suddenly stops working and only a reboot might bring it back" on some models — the chain can now notice that state on its own and start over, with nothing for the user to do.
+- In the same batch, one more caller-identification source: on models where the system's own path is unusable end to end, the device identifies the caller itself instead of relying on the interface name the system hands out.
