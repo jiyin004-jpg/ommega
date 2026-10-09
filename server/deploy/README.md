@@ -1,5 +1,7 @@
 # 服务器上的出墙代理与资源刷新
 
+[English](README.en.md)
+
 这台机器（腾讯云）直连不到 `android.googleapis.com`，也连不到机场的订阅站，但
 `raw.githubusercontent.com` 是通的。所以做成两段：
 

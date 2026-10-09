@@ -1,5 +1,7 @@
 # 发版流程
 
+[English](RELEASING.en.md)
+
 ## 版本号
 
 三端同号，唯一来源是仓库根的 `VERSION`：

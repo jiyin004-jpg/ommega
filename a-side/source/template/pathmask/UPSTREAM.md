@@ -1,5 +1,7 @@
 # PathMask 内核模块（第三方资产，随 ommega A 端模块分发）
 
+[English](UPSTREAM.en.md)
+
 来源：<https://github.com/Andrea-lyz/LKM-PathMask> — release **v2.8.0**（2026-09-14 发布）
 
 本目录里的 `.ko` 是官方 release 逐个上传的原生资产（不是从 zip 里解出来的），

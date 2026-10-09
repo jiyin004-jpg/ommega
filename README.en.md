@@ -1,6 +1,6 @@
 # Ommega
 
-[中文说明](README.md)
+[中文](README.md)
 
 Ommega is a three-part remote TEE attestation system: the A side issues the requests, the B side provides real hardware TEE capability, and the server relays and schedules between them. Attestation, signing and decryption requests made by apps on the A side are forwarded through the server to the B side, executed by that machine's real hardware TEE (KeyMint / StrongBox), and returned unchanged. The B side also has a companion management app (b-app).
 

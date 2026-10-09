@@ -1,5 +1,7 @@
 # Ommega A-side Relay
 
+[中文](README.zh-CN.md)
+
 Custom keystore implementation for remote TEE attestation relay (A-side).
 
 This is a full keystore implementation that fully implements the AOSP AIDL

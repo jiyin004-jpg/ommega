@@ -1,5 +1,7 @@
 # Ommega B-side Relay (module id `ommega-b`)
 
+[中文](README.zh-CN.md)
+
 B-side relay agent for the ommega remote-TEE attestation setup.
 
 This build has been stripped down to the **new B-side relay agent** only. It no
