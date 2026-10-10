@@ -97,10 +97,12 @@ def get_version() -> str:
 
 # 同版本号重发（热修）的时候 versionCode 必须继续往上走，模块管理器才认得出更新。
 # 1.6.1 / 1.6.2 / 1.6.3 各重发过一次，把数一路抬到了 1006014，而公式值只有 1006004，
-# 中间差的这个 10 固定在这儿；真要再同号重发，就把这个数往上加（10 -> 11 -> 12）。
+# 中间差的这个 10 固定在这儿；真要再同号重发，就把这个数往上加（10 -> 11 -> 12 -> 13）。
 # 2026-10-03：B 端 1.6.4 重发（补 SOTER 卡在 TEE 里的自愈），10 -> 11。只重发哪端就抬
 # 哪端，两边各一套偏移（A 端这次没重发，那边还是 10 -> 1006014）。
-VERSION_CODE_OFFSET = 12
+# 2026-10-11：Android 17 dynamic-linker hotfix (platform libc++ before vendor
+# libc++ in service.sh), 12 -> 13 so module managers accept the replacement zip.
+VERSION_CODE_OFFSET = 13
 
 
 def version_code(version: str) -> str:
