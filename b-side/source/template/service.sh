@@ -12,7 +12,11 @@ LOCK_DIR=$STATE_DIR/relay-service.lock
 RELAY_PID_FILE=$STATE_DIR/relay.pid
 LOG_FILE=$STATE_DIR/logs/service.log
 
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/vendor/lib64/:/system/lib64/:/apex/com.android.runtime/lib64/bionic/"
+# Android 17's system liblog.so references __hash_memory from the system
+# libc++.so.  Some vendor images still ship an older libc++.so; keeping
+# /vendor/lib64 first makes the dynamic linker reject relay before main().
+# Put the platform runtime first and retain vendor libraries as a fallback.
+export LD_LIBRARY_PATH="/system/lib64:/apex/com.android.runtime/lib64/bionic:/vendor/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 mkdir -p "$STATE_DIR" "$STATE_DIR/logs"
 

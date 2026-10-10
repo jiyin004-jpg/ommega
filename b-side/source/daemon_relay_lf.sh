@@ -9,7 +9,9 @@ MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
 CONF_FILE=$STATE_DIR/relay.conf
 
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/vendor/lib64/:/system/lib64/:/apex/com.android.runtime/lib64/bionic/"
+# Android 17's liblog.so needs __hash_memory from the platform libc++.so.
+# Prefer the platform runtime over older vendor libc++ copies.
+export LD_LIBRARY_PATH="/system/lib64:/apex/com.android.runtime/lib64/bionic:/vendor/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Mirror client-a's behaviour: keep the module's status (shown in KernelSU /
 # Magisk) in sync with the relay daemon's real state.

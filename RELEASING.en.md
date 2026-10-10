@@ -33,9 +33,9 @@ That gap of 10 is where `VERSION_CODE_OFFSET` comes from, hence:
 
 - a normal release needs nothing; the formula value plus each side's offset increases on its own
 - if the same version number has to be re-released, raise that side's `VERSION_CODE_OFFSET`
-  (10 -> 11 -> 12); do not pass `--version-code` by hand, that parameter is an emergency hatch only
-- current offsets: A side 10 (1.6.4 -> 1006014), B side 11 (re-released 2026-10-03, 1.6.4 ->
-  1006015)
+  (10 -> 11 -> 12 -> 13); do not pass `--version-code` by hand, that parameter is an emergency hatch only
+- current offsets: A side 10 (1.6.4 -> 1006014), B side 13 (Android 17 compatibility hotfix on
+  2026-10-11, 1.6.8 -> 1006021)
 - b-app has none of this (it was never re-released): it always uses the plain formula value,
   `1006004` for 1.6.4, which is not the same series as the modules — do not use it for checks
 
