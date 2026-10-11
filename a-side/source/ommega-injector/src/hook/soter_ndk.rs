@@ -21,6 +21,8 @@ const SYM_TRANSACT: &[u8] = b"AIBinder_transact\0";
 const SYM_PARCEL_DELETE: &[u8] = b"AParcel_delete\0";
 const SYM_READ_INT32: &[u8] = b"AParcel_readInt32\0";
 const SYM_SET_DATA_POSITION: &[u8] = b"AParcel_setDataPosition\0";
+const SYM_WRITE_INT32: &[u8] = b"AParcel_writeInt32\0";
+const SYM_WRITE_INT64: &[u8] = b"AParcel_writeInt64\0";
 
 /// `AIBinder` / `AParcel` 都是不透明指针，我们只负责传，不碰内容。
 #[repr(C)]
@@ -48,6 +50,9 @@ struct NdkBinder {
     parcel_delete: unsafe extern "C" fn(*mut AParcel),
     read_int32: unsafe extern "C" fn(*const AParcel, *mut i32) -> i32,
     set_data_position: unsafe extern "C" fn(*const AParcel, i32) -> i32,
+    // 这两个可选：老设备/老 ROM 上取不到也不影响原来那条无参路，取不到就带参数那条不能用。
+    write_int32: Option<unsafe extern "C" fn(*mut AParcel, i32) -> i32>,
+    write_int64: Option<unsafe extern "C" fn(*mut AParcel, i64) -> i32>,
 }
 
 // 函数指针指向 .text，跟进程同寿命，跨线程共享没有别名问题。
@@ -82,6 +87,15 @@ fn load() -> Option<NdkBinder> {
         sym!(parcel_delete, SYM_PARCEL_DELETE);
         sym!(read_int32, SYM_READ_INT32);
         sym!(set_data_position, SYM_SET_DATA_POSITION);
+        // 可选符号，缺了不算失败。
+        let write_int32 = {
+            let raw = libc::dlsym(handle, SYM_WRITE_INT32.as_ptr() as *const c_char);
+            (!raw.is_null()).then(|| std::mem::transmute_copy(&raw))
+        };
+        let write_int64 = {
+            let raw = libc::dlsym(handle, SYM_WRITE_INT64.as_ptr() as *const c_char);
+            (!raw.is_null()).then(|| std::mem::transmute_copy(&raw))
+        };
         Some(NdkBinder {
             get_service,
             parcel_create,
@@ -90,6 +104,8 @@ fn load() -> Option<NdkBinder> {
             parcel_delete,
             read_int32,
             set_data_position,
+            write_int32,
+            write_int64,
         })
     }
 }
@@ -182,6 +198,121 @@ fn last_dl_error() -> String {
 // 明确表个态：这个模块只发只读调用，别被以后顺手加进来的写操作带偏。
 #[allow(dead_code)]
 const READ_ONLY_CODES: [u32; 1] = [8];
+
+/// 一次调用的参数（够覆盖 SOTER 那几个号：uid / alias / challenge / session）。
+pub enum Arg<'a> {
+    I32(i32),
+    I64(i64),
+    Str(&'a str),
+}
+
+/// 带参数版的 [`transact`]：参数按声明顺序写进 parcel，再发同一个 code。
+///
+/// 存在的理由：`service call` 那个命令行工具写的 parcel 跟 AIDL 布局对不上，
+/// 只要带字符串参数，HAL 就抛 `0x80000008`；这里走 libbinder_ndk 的真 AIDL 布局。
+pub fn transact_with_args(
+    service: &str,
+    interface: &str,
+    code: u32,
+    args: &[Arg<'_>],
+) -> Result<(i32, Vec<i32>), String> {
+    let ndk = load().ok_or_else(|| {
+        format!(
+            "libbinder_ndk.so or one of its symbols is missing: {}",
+            last_dl_error()
+        )
+    })?;
+    let name = CString::new(service).map_err(|e| format!("bad service name: {e}"))?;
+    unsafe {
+        let binder = (ndk.get_service)(name.as_ptr());
+        if binder.is_null() {
+            return Err(format!(
+                "AServiceManager_getService({service}) returned null"
+            ));
+        }
+        let mut input: *mut AParcel = (ndk.parcel_create)();
+        if input.is_null() {
+            return Err("AParcel_create returned null".to_string());
+        }
+        // 见 `transact` 里那段注释：这个字段得自己补上，否则 AIBinder_transact 返 -22。
+        *(input as *mut *mut AIBinder) = binder;
+        // AIDL 的请求头：严格模式 0 + work source 0 + 接口标记。宿主里那条路是 Java 的
+        // Binder 帮你写的，单独跑得自己写 —— 实测只写 token 的话远端直接拒
+        // （AIBinder_transact 返 -2147483647）。
+        match ndk.write_int32 {
+            Some(write) => {
+                for value in [0i32, 0i32, rsbinder::INTERFACE_HEADER as i32] {
+                    if write(input, value) != 0 {
+                        (ndk.parcel_delete)(input);
+                        return Err("writing the AIDL header failed".to_string());
+                    }
+                }
+            }
+            None => {
+                (ndk.parcel_delete)(input);
+                return Err("AParcel_writeInt32 unavailable".to_string());
+            }
+        }
+        let descriptor = CString::new(interface).map_err(|e| format!("bad interface: {e}"))?;
+        let wrote = (ndk.write_string)(input, descriptor.as_ptr(), interface.len() as i32);
+        if wrote != 0 {
+            (ndk.parcel_delete)(input);
+            return Err(format!("writing the interface token failed: {wrote}"));
+        }
+        for arg in args {
+            let failed = match arg {
+                Arg::I32(value) => match ndk.write_int32 {
+                    Some(write) => write(input, *value) != 0,
+                    None => return Err("AParcel_writeInt32 unavailable".to_string()),
+                },
+                Arg::I64(value) => match ndk.write_int64 {
+                    Some(write) => write(input, *value) != 0,
+                    None => return Err("AParcel_writeInt64 unavailable".to_string()),
+                },
+                Arg::Str(value) => {
+                    let text = CString::new(*value).map_err(|e| format!("bad arg: {e}"))?;
+                    (ndk.write_string)(input, text.as_ptr(), value.len() as i32) != 0
+                }
+            };
+            if failed {
+                (ndk.parcel_delete)(input);
+                return Err("writing an argument failed".to_string());
+            }
+        }
+        let mut output: *mut AParcel = std::ptr::null_mut();
+        let status = (ndk.transact)(binder, code, &mut input, &mut output, 0);
+        if status != 0 {
+            if !output.is_null() {
+                (ndk.parcel_delete)(output);
+            }
+            return Err(format!("AIBinder_transact(code={code}) failed: {status}"));
+        }
+        if output.is_null() {
+            return Err(format!(
+                "AIBinder_transact(code={code}) gave no reply parcel"
+            ));
+        }
+        let skip = (ndk.set_data_position)(output, STATUS_HEADER_LEN);
+        let mut error_code: i32 = i32::MIN;
+        let read = (ndk.read_int32)(output, &mut error_code);
+        // 后面的字全读出来（当 32 位字），答复布局不确定时靠它们认 —— 比猜 i64 靠谱。
+        let mut words: Vec<i32> = Vec::new();
+        for _ in 0..16 {
+            let mut word: i32 = 0;
+            if (ndk.read_int32)(output, &mut word) != 0 {
+                break;
+            }
+            words.push(word);
+        }
+        (ndk.parcel_delete)(output);
+        if skip != 0 || read != 0 {
+            return Err(format!(
+                "reading the reply failed (setDataPosition={skip}, readInt32={read})"
+            ));
+        }
+        Ok((error_code, words))
+    }
+}
 
 #[cfg(test)]
 mod tests {

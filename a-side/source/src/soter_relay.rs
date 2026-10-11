@@ -234,8 +234,18 @@ fn with_caller_pkg(mut value: Value) -> Value {
             })
         });
     let Some(pkg) = pkg else {
+        // 一条都不该静默：他这台（小米）指纹起不来时，这行日志就是判据 —— 是「压根没带
+        // caller_uid」还是「带了但翻不出来」，看 caller_uid= 那一格就分得清。
+        log::info!(
+            "event=soter caller 没翻出来 caller_uid={} 前台={:?}",
+            value
+                .get(CALLER_UID_FIELD)
+                .map_or_else(|| "-".to_string(), |v| v.to_string()),
+            crate::plat::utils::foreground_package()
+        );
         return value;
     };
+    log::info!("event=soter caller -> {pkg}");
     if let Some(map) = value.as_object_mut() {
         map.insert(CALLER_PKG_FIELD.to_string(), Value::from(pkg));
     }

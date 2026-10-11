@@ -26,6 +26,10 @@ FOREGROUND_OUT=/data/misc/keystore/ommega/foreground
 # 读得到的配置副本 —— 那台小米就是这么在宿主里自我禁用的（injector.toml Permission denied）。
 INJECTOR_TOML=/data/misc/keystore/ommega/injector.toml
 INJECTOR_TOML_COPY=/data/misc/ommega/injector.toml
+# 载荷（宿主域）自己翻包名要用的两份副本：表 `uid package` 和前台应用。
+# 原理同 injector.toml —— keystore 那个 0770 目录宿主进不去，得给一份读得到的。
+UID_PACKAGES_COPY=/data/misc/ommega/uid_packages
+FOREGROUND_COPY=/data/misc/ommega/foreground
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
 LOG_DIR=/data/misc/keystore/ommega/logs
@@ -351,6 +355,10 @@ sync_uid_packages() {
   chmod 0644 "$tmp" 2>/dev/null
   mv -f "$tmp" "$UID_PACKAGES_OUT" 2>/dev/null || return 0
   echo "$stamp" > "$UID_PACKAGES_OUT.stamp" 2>/dev/null
+  # 再给载荷（宿主域）留一份读得动的：它就在转发 SOTER 那一步自己翻包名。
+  cp -f "$UID_PACKAGES_OUT" "$UID_PACKAGES_COPY" 2>/dev/null
+  chmod 0644 "$UID_PACKAGES_COPY" 2>/dev/null
+  chcon u:object_r:system_data_file:s0 "$UID_PACKAGES_COPY" 2>/dev/null
 }
 
 # root 侧写下「当前前台应用」（一行 `<epoch 秒> <包名>`）给 daemon 做最后一道兜底：
@@ -375,6 +383,9 @@ sync_foreground() {
   echo "$now $pkg" > "$tmp" 2>/dev/null || return 0
   chmod 0644 "$tmp" 2>/dev/null
   mv -f "$tmp" "$FOREGROUND_OUT" 2>/dev/null
+  cp -f "$FOREGROUND_OUT" "$FOREGROUND_COPY" 2>/dev/null
+  chmod 0644 "$FOREGROUND_COPY" 2>/dev/null
+  chcon u:object_r:system_data_file:s0 "$FOREGROUND_COPY" 2>/dev/null
 }
 
 # 把 injector.toml 抄一份到 app 域读得到的地方（载荷的 config 优先读主路径，读不到就用这份）。

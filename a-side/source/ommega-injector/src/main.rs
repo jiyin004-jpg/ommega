@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod legacy;
 pub mod logging;
 pub mod parcel;
+pub mod soter_ctl;
 pub mod sys;
 pub mod tracker;
 pub mod utils;
@@ -114,6 +115,27 @@ fn spawn_soter_selfcheck() {
     }
 }
 
+/// 装完 hook 之后，在另一个线程里看一眼有没有自签的触发文件（`/data/misc/ommega/`）：
+///
+/// - `soter-sign.host.txt` —— 只给 SOTER 宿主（`com.tencent.soter.soterserver`）跑，
+///   这才是真能过钩子的那条路；
+/// - `soter-sign.hal.txt` —— 只给 HAL 服务自己跑（同进程自调，钩子看不到，用来对照）；
+/// - `soter-sign.txt` —— 谁看到谁跑。
+///
+/// 结果按进程分文件写在 `logs/selfsign.<role>.out`。起独立线程 + 先睡一会儿的理由跟
+/// `spawn_soter_selfcheck` 一样：这条调用自己就会被钩子拦，不能跑在 `entry` 的栈上。
+fn spawn_self_sign() {
+    let thread = std::thread::Builder::new()
+        .name("ommega-soter-selfsign".to_string())
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            soter_ctl::maybe_self_sign();
+        });
+    if let Err(error) = thread {
+        warn!("event=selfsign thread did not start: {error}");
+    }
+}
+
 /// 给 write 侧那套拦截造一次真流量。
 ///
 /// 这里**必须**走 libbinder_ndk，不能图省事用 rsbinder：rsbinder 是纯 Rust 自己
@@ -189,6 +211,12 @@ fn log_runtime_identity(role: &str) {
 }
 
 fn main() {
+    // 排查模式：`ommega-inject soter-ctl <code> …` 时不当载荷跑，去调 SOTER HAL。
+    // 放在最前面：这条路不需要日志/配置初始化，也不碰注入逻辑。
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("soter-ctl") {
+        std::process::exit(soter_ctl::run(&argv[2..]));
+    }
     logging::init_logger_fallback(LevelFilter::Debug);
     let config = config::get();
     if config::parse_level_filter(&config.main.log_level).is_none() {
@@ -315,6 +343,8 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
     if in_soter_host() {
         spawn_soter_selfcheck();
     }
+    // 自签排查得排在装钩子之后：我们的出站事务自己也要过这套钩子，早发了等于白发。
+    spawn_self_sign();
     true
 }
 

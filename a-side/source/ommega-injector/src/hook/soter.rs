@@ -816,6 +816,9 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
     }
     // SAFETY: 见上面那条 —— 调用点保证这段字节可读。
     let data = unsafe { std::slice::from_raw_parts(buffer as *const u8, size) };
+    // 诊断：这条路是**每条入站事务**都会过的，所以先把描述符记一份（去重）——
+    // 2026-10-05 那台小米就是靠它才能把「压根没到我们进程」和「到了但没认出来」分开。
+    note_unrecognised_soter_token(data, tr.code, tr.sender_euid);
     let mut call = match parse(data, tr.code) {
         Some(call) => call,
         None => {
@@ -826,7 +829,7 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
             // 日志里只有“认不出”这个事实可不够，得知道它叫什么。
             //
             // 只在调试日志开着时才写得出来：这行走 debug 级，日志关掉时被丢掉（不会上线上刷屏）。
-            note_unrecognised_soter_token(data, tr.code);
+            note_unrecognised_soter_token(data, tr.code, tr.sender_euid);
             // 称呼不出来也得把调用者留下：`sender_euid` 是内核在事务头上填的，跟接口名毫无关系。
             // 宿主自己发往 HAL 的那笔 sender 是宿主（uid 1000），**只有 App 发进来的那笔**才是
             // 应用 uid —— 所以这一条就足够分辨方向，不需要认得接口。
@@ -881,21 +884,37 @@ fn interface_token_of(data: &[u8]) -> Option<&str> {
 /// 认不出来的接口 token 里，看着像 SOTER/滕讯的都记一条 —— 用来兜住那些换了描述符的 ROM。
 ///
 /// 只在调试日志开着时才输出：先问 log 层，关着就直接返回，一个字都不写。
-fn note_unrecognised_soter_token(data: &[u8], code: u32) {
-    if !log::log_enabled!(log::Level::Debug) {
-        return;
-    }
+fn note_unrecognised_soter_token(data: &[u8], code: u32, sender_euid: i32) {
     let Some(token) = interface_token_of(data) else {
         return;
     };
-    let lowered = token.to_ascii_lowercase();
-    if !(lowered.contains("soter") || lowered.contains("tencent")) {
-        return;
+    // 每条**不同的**描述符只记一次：binder 流量很猛，不去重就把日志刷爆了。
+    // 去重表有个上限，满了就不再收新名字（先到先得，够定位用）。
+    {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        if let Ok(mut seen) = SEEN.lock() {
+            if seen.iter().any(|old| old == token) {
+                return;
+            }
+            if seen.len() < 64 {
+                seen.push(token.to_string());
+            }
+        }
     }
-    debug!(
-        "event=soter unknown-descriptor token={token:?} code={code} bytes={}",
-        data.len()
-    );
+    let lowered = token.to_ascii_lowercase();
+    if lowered.contains("soter") || lowered.contains("tencent") {
+        info!(
+            "event=soter unknown-descriptor token={token:?} code={code} uid={sender_euid} bytes={}",
+            data.len()
+        );
+    } else {
+        // 看着跟 SOTER 无关的也记一条：这是「某个调用进了我们注入的进程、但我们没认出来」
+        // 的通用痕迹。2026-10-05 那台小米就是靠这层才把「没到」和「到了没认」分开的。
+        info!(
+            "event=binder unknown-descriptor token={token:?} code={code} uid={sender_euid} bytes={}",
+            data.len()
+        );
+    }
 }
 
 fn log_call(call: &SoterCall) {

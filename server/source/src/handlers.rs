@@ -929,6 +929,24 @@ pub async fn soter(
     if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
+    // 「这笔到底谁发来的」：`requested=` 那个设备 id 是多台机器共用的同一个值（实测我自己
+    // 的 nubia 和用户那台是同一个），光看它分不清是谁。这里打真 TCP 对端（中间件塞的
+    // X-Real-IP）—— 2026-10-05 就是靠它才把「别人的请求」和「某人那台」分开的。
+    // `tracing` 宏展开里自带一个叫 `Value` 的东西，`Value::as_str` 写在宏参数里会被它抢走
+    // （`error[E0782]: expected a type, found a trait`），所以先取出来。
+    //
+    // 一行里把 ip / op / uid / 包名 都写上：光有 ip 对不上「哪个 uid」，光有 uid 又分不出
+    // 「谁发来的」（`requested=` 那个设备 id 是多台机器共用的同一个值）。
+    let op_for_log = body.get("op").and_then(Value::as_str).unwrap_or("-");
+    let uid_for_log = body.get("uid").and_then(Value::as_i64).unwrap_or(-1);
+    let pkg_for_log = body
+        .get(crate::soter_probe::CALLER_PKG_FIELD)
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    tracing::info!(
+        "soter: in ip={} op={op_for_log} uid={uid_for_log} pkg={pkg_for_log}",
+        client_ip(&headers)
+    );
     run_soter_task(&state, &body).await
 }
 
@@ -1212,15 +1230,25 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     } else {
         false
     };
-    if let Some(why) = crate::soter_probe::reason_with_caller(
-        &state.cfg,
-        requested,
-        uid_arg,
-        probe_alias_arg,
-        body.get(crate::soter_probe::CALLER_PKG_FIELD)
-            .and_then(Value::as_str),
-    )
-    .or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
+    // 临时开关：`RELAY_SOTER_NO_BUILTIN=1` 时这道短路整个关掉，所有请求都进下面的层顺序。
+    // 配合 `RELAY_SOTER_B_ONLY=1` 就是「全走 B」—— 2026-10-05 现场排查用。
+    let no_builtin = std::env::var("RELAY_SOTER_NO_BUILTIN")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let builtin_reason = if no_builtin {
+        None
+    } else {
+        crate::soter_probe::reason_with_caller(
+            &state.cfg,
+            requested,
+            uid_arg,
+            probe_alias_arg,
+            body.get(crate::soter_probe::CALLER_PKG_FIELD)
+                .and_then(Value::as_str),
+        )
+        .or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
+    };
+    if let Some(why) = builtin_reason
     {
         let reply = run_layer_soter(state, "builtin", body, requested).await;
         if let Some(v) = reply.filter(|v| v.get("error").is_none()) {
@@ -1255,7 +1283,15 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     }
 
     let serverbox = state.fulfill.is_enabled();
-    let order: &[&str] = if serverbox {
+    // 临时开关：`RELAY_SOTER_B_ONLY=1` 时只走 B（真机）那一层，不再往 keybox / self_signed
+    // 兜。2026-10-05 现场排查用：只有真机那份料对得上，兜底层答的东西 App 不认。
+    // 拿掉这个环境变量就回到原来的顺序，不需要改代码。
+    let b_only = std::env::var("RELAY_SOTER_B_ONLY")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let order: &[&str] = if b_only {
+        &["b"]
+    } else if serverbox {
         &["keybox", "b", "self_signed"]
     } else {
         &["b", "keybox", "self_signed"]

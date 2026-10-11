@@ -78,8 +78,86 @@ fn request(call: &SoterCall) -> Option<String> {
         out.push_str(",\"caller_uid\":");
         out.push_str(&uid.to_string());
     }
+    // 包名自己翻一份带上。为什么在这边翻：实测有的机器（小米那台）SOTER 根本不走 daemon
+    // 那段转发（daemon 侧的翻名代码一次都没跑到），服务端就一直收到 `caller_pkg=-`、
+    // 认不出这是真应用。这里直接拿 `uid`（= 要钥匙的那个应用，微信就是 10339）自己查表：
+    // 表是 root 侧 daemon-injector 写的世界可读副本，宿主域读得到。
+    if let Some(uid) = call.uid {
+        let pkg = caller_package_for_uid(uid as u32);
+        log::info!(
+            "event=soter caller uid={uid} pkg={}",
+            pkg.as_deref().unwrap_or("-")
+        );
+        if let Some(pkg) = pkg {
+            out.push_str(",\"caller_pkg\":");
+            push_json_string(&mut out, &pkg);
+        }
+    }
     out.push('}');
     Some(out)
+}
+
+/// root 侧（`daemon-injector`）写的世界可读副本：一行 `<uid> <包名>`。
+///
+/// 为什么不用那个 0770 的 keystore 目录：宿主域（指纹进程/应用）打不开它。
+const UID_TABLE_FALLBACK: &str = "/data/misc/ommega/uid_packages";
+/// 同一份内容的前台应用副本：一行 `<epoch 秒> <包名>`，翻不到 uid 时用它兜底。
+const FOREGROUND_FALLBACK: &str = "/data/misc/ommega/foreground";
+/// 表只在装/卸应用时变，缓存一分钟；前台那份短一点，别拿刚才那个应用去顶现在这笔。
+const UID_TABLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `uid` → 包名（共享 uid 会好几个，逗号连起来）。表里没有就退回前台应用。
+fn caller_package_for_uid(uid: u32) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, String)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().ok()?;
+    if let Some((at, table)) = guard.as_ref() {
+        if at.elapsed() < UID_TABLE_TTL {
+            if let Some(pkg) = lookup_in_table(table, uid) {
+                return Some(pkg);
+            }
+            return foreground_package();
+        }
+    }
+    let table = std::fs::read_to_string(UID_TABLE_FALLBACK).ok()?;
+    let hit = lookup_in_table(&table, uid);
+    *guard = Some((std::time::Instant::now(), table));
+    hit.or_else(foreground_package)
+}
+
+/// 在表里找这个 uid：行形如 `10339 com.tencent.mm`，可能有多个包，逗号连起来。
+fn lookup_in_table(table: &str, uid: u32) -> Option<String> {
+    let mut hits: Vec<&str> = Vec::new();
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(id) = fields.next() else { continue };
+        let Some(name) = fields.next() else { continue };
+        if id.parse::<u32>() == Ok(uid) && !name.starts_with('#') {
+            hits.push(name);
+        }
+    }
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits.join(","))
+    }
+}
+
+/// 前台应用兜底。文件超过 20 秒就算陈旧（写侧每 ~10 秒刷一次）。
+fn foreground_package() -> Option<String> {
+    let text = std::fs::read_to_string(FOREGROUND_FALLBACK).ok()?;
+    let mut fields = text.split_whitespace();
+    let at = fields.next()?.parse::<u64>().ok()?;
+    let pkg = fields.next()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if now.saturating_sub(at) > 20 || pkg == "-" {
+        return None;
+    }
+    Some(pkg.to_string())
 }
 
 /// 拼一个 JSON 字符串字面量。alias 里有 `&`、challenge 是十六进制，正常都不带引号，
