@@ -62,14 +62,13 @@ BINARY_SPECS = (
     {"package": "ommega-injector", "bin": "ommega-inject", "output_name": "ommega-inject"},
 )
 
-# resetprop 单列：它是独立 crate（`resetprop/`），有自己的 target 目录和 rustflags。
-# 为什么要拆开见那边 Cargo.toml —— 它要**完全静态**（`+crt-static`），而 ommega 那几个
-# bin 不能加同一个 flag（keymint 是被 dlopen 进 keystore2 的 PIE 载荷）。同一个 package、
-# 同一个 target 目录里混两种 rustflags，会让 cargo 每次因为指纹变化而全量重编。
+# resetprop 单列：它是独立 crate（`resetprop/`），走自己的 target 目录。
+# 实现是 vendor/ 下那两个 crate（resetprop-rs），运行时要 dlopen 设备的 libc.so
+# 去用 bionic 自己的属性实现，所以**不能**静态链接（静态 libc 里没有可用的 dlopen）。
+# 单独开一个 target 目录，只是不想跟 keymint/inject 那几个 PIE 载荷的缓存互相顶掉。
 RESETPROP_PACKAGE = "ommega-resetprop"
 RESETPROP_BIN = "resetprop"
-RESETPROP_TARGET_DIR = TARGET_ROOT / "static"
-STATIC_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=-lc++abi"
+RESETPROP_TARGET_DIR = TARGET_ROOT / "resetprop"
 
 REQUIRED_TEMPLATE_FILES = (
     "customize.sh",
@@ -224,14 +223,12 @@ def copy_binary(binary: Path, output_name: str, abi: str, stage_dir: Path) -> No
 
 
 def build_resetprop(*, abi: str, target: str, release: bool) -> Path:
-    """编一个完全静态的 resetprop（模块自带，不依赖 root 管理器提供）。"""
+    """编一个 resetprop（模块自带，不依赖 root 管理器提供）。"""
     build_type = "release" if release else "debug"
-    print(f"Building resetprop for {abi} ({target}, {build_type}, static)...")
+    print(f"Building resetprop for {abi} ({target}, {build_type})...")
 
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = os.fspath(RESETPROP_TARGET_DIR)
-    key = f"CARGO_TARGET_{target.upper().replace('-', '_')}_RUSTFLAGS"
-    env[key] = f"{env.get(key, '')} {STATIC_RUSTFLAGS}".strip()
 
     cmd = [
         "cargo",

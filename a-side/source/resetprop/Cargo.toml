@@ -8,11 +8,21 @@ license = "AGPL-3.0-or-later"
 # 单独一个 crate，是因为它要**完全静态**链接（`-C target-feature=+crt-static`），
 # 而 ommega 那几个 bin 不能加这个 flag（keymint 是被 dlopen 进 keystore2 的 PIE 载荷，
 # 静态二进制根本装载不了）。同一个 package 里混两种 rustflags 会让 cargo 来回全量重编，
-# 所以拆开：这个 crate 只依赖 libc，冷编只要几秒。
+# 所以拆开。
+#
+# 实现用的是 resetprop-rs（vendor/ 下那两个 crate，Apache-2.0），
+# 跟 Magisk 那套改属性的做法一致：改属性时同时维护 prop area 的 dirty 备份，
+# 所以 `sysprop scan` 之类的检查看不到「空洞/dirty」这种改属性留下的痕迹。
 
 [[bin]]
 name = "resetprop"
 path = "src/main.rs"
 
 [dependencies]
+prop-rs = { path = "../vendor/prop-rs" }
+prop-rs-android = { path = "../vendor/prop-rs-android" }
 libc = "0.2.189"
+memmap2 = "0.9"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"

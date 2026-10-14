@@ -75,6 +75,8 @@ members = [
   "watchdog",
   "ommega-injector",
   "resetprop",
+  "vendor/prop-rs",
+  "vendor/prop-rs-android",
 ]
 
 [patch.crates-io]
