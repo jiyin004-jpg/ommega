@@ -153,6 +153,24 @@ pub fn is_device_id_attestation_tag(tag: Tag) -> bool {
     )
 }
 
+/// 是否属于「设备 ID 证明」整组 tag（含公开的 brand/device/product/manufacturer/model，
+/// 以及敏感的 serial/IMEI/MEID）。比 `is_device_id_attestation_tag` 宽：那个只涵盖
+/// 需要 READ_PRIVILEGED_PHONE_STATE 的那几项。
+pub fn is_attestation_id_tag(tag: Tag) -> bool {
+    matches!(
+        tag,
+        Tag::ATTESTATION_ID_BRAND
+            | Tag::ATTESTATION_ID_DEVICE
+            | Tag::ATTESTATION_ID_PRODUCT
+            | Tag::ATTESTATION_ID_SERIAL
+            | Tag::ATTESTATION_ID_IMEI
+            | Tag::ATTESTATION_ID_MEID
+            | Tag::ATTESTATION_ID_MANUFACTURER
+            | Tag::ATTESTATION_ID_MODEL
+            | Tag::ATTESTATION_ID_SECOND_IMEI
+    )
+}
+
 /// This function checks whether a given tag corresponds to the access of any IMEI attestation.
 pub fn is_imei_attestation_tag(tag: Tag) -> bool {
     matches!(

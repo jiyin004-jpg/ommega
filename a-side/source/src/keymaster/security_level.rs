@@ -55,9 +55,10 @@ use crate::keymaster::permission::{
 use crate::keymaster::security_level_manager;
 use crate::keymaster::super_key::{KeyBlob, SuperKeyManager};
 use crate::keymaster::utils::{
-    app_info_for_uid, count_key_entries, is_device_id_attestation_tag, is_imei_attestation_tag,
-    key_characteristics_to_internal, key_parameters_to_authorizations, log_security_safe_params,
-    upgrade_keyblob_if_required_with, AndroidUserId, AppUid, Challenge, UNDEFINED_NOT_AFTER,
+    app_info_for_uid, count_key_entries, is_attestation_id_tag, is_device_id_attestation_tag,
+    is_imei_attestation_tag, key_characteristics_to_internal, key_parameters_to_authorizations,
+    log_security_safe_params, upgrade_keyblob_if_required_with, AndroidUserId, AppUid, Challenge,
+    UNDEFINED_NOT_AFTER,
 };
 use crate::plat::utils as plat_utils;
 use crate::top::jiyin004::ommega::{
@@ -610,6 +611,28 @@ impl KeystoreSecurityLevel {
             granted.context(ks_err!(
                 "Caller does not have the permission to attest device identifiers."
             ))?;
+        }
+
+        // 持有 READ_PRIVILEGED_PHONE_STATE 的调用方（GMS 的 DroidGuard、Play 商店自己的
+        // 完整性钥匙等）把 ID 类 tag 全部摘掉再往下走。
+        //
+        // 原因：中继给不了「叶子带本机 710..717 + 真 TEE 链」这两头。带上 ID 后 B 的真
+        // TEE 会以 CannotAttestIds(-66) 拒，链就掉到服务端的 keybox（那份已吊销），拿链的
+        // 一方（Google 服务端）会直接判不过 —— 反而不如给一条真 TEE 链、叶子不带 ID，
+        // 也就是改动前的行为。而普通 App（自查类）要的是公开的 brand/device/product/…，
+        // 这些带上去由中继 keybox 层照写、叶子自洽，那一类检查才过。
+        if params.iter().any(|kp| is_attestation_id_tag(kp.tag))
+            && check_device_attestation_permissions(ctx).is_ok()
+        {
+            let before = result.len();
+            result.retain(|kp| !is_attestation_id_tag(kp.tag));
+            if result.len() != before {
+                log::debug!(
+                    "event=device_id_attest uid={} stripped={} (privileged caller: keep a real TEE chain)",
+                    uid.0,
+                    before - result.len()
+                );
+            }
         }
 
         // If we are generating/importing an asymmetric key, we need to make sure
