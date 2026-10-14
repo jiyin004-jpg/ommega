@@ -572,20 +572,25 @@ impl KeystoreSecurityLevel {
             if check_key_permission(KeyPerm::GenUniqueId, key, None, ctx).is_err()
                 && check_unique_id_attestation_permissions(ctx).is_err()
             {
-                // 没权限就是没权限：回 PERMISSION_DENIED（跟 AOSP keystore2 一样），
-                // 不能把这个 tag 摸掉把请求放过去。
+                // 没权限就把这个 tag 摸掉、让 key 照常生成（真机 TEE 就是这个行为）。
                 //
-                // 以前这里是「默默摘掉 INCLUDE_UNIQUE_ID、让 key 照常生成」，理由是
-                // Google Wallet 建 attestation key 时会带这个 tag。但那是把
-                // 「权限被绕过」打开了：检查方（TrustAttestor）自己不带
-                // REQUEST_UNIQUE_ID_ATTESTATION，发两发带 INCLUDE_UNIQUE_ID 的请求，
-                // 只要有一发成功它就判 `hardware.attestation.unique_id_permission`
-                // ——「要了不该要的东西、你还给了」。真机上这条路径是拒的。
-                return Err(Error::perm()).context(ks_err!(
-                    "Caller does not have the permission to generate a unique ID"
-                ));
-            }
-            if self
+                // 不回 PERMISSION_DENIED：GMS / Google Wallet 那类流程会带
+                // INCLUDE_UNIQUE_ID（它们不持有 REQUEST_UNIQUE_ID_ATTESTATION），
+                // 整笔拒掉会把 Google 那边的完整性流程带下水。
+                //
+                // 代价是自查类检测项（TrustAttestor
+                // `hardware.attestation.unique_id_permission`）会把「请求成功了」
+                // 当成权限被绕过；要过它就得改成回错，两者不能兼得，先用这条。
+                let before = result.len();
+                result.retain(|kp| kp.tag != Tag::INCLUDE_UNIQUE_ID);
+                if result.len() != before {
+                    log::warn!(
+                        "INCLUDE_UNIQUE_ID stripped: uid={} holds neither \
+                         keystore_key:gen_unique_id nor REQUEST_UNIQUE_ID_ATTESTATION",
+                        uid.0
+                    );
+                }
+            } else if self
                 .id_rotation_state
                 .had_factory_reset_since_id_rotation(&creation_datetime)
                 .context(ks_err!(
