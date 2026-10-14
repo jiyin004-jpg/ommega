@@ -898,6 +898,97 @@ pub fn flat_debug_logging() -> bool {
     flat_config_truthy(&["debug_logging", "debug", "verbose"])
 }
 
+/// 允许把设备 ID 证明（710..717 / 723）带给中继的调用方，按包名，逗号或空格分隔。
+/// 默认只给自查类 App：它们要的正是「叶子里的 brand/device/product/…」，走中继
+/// keybox 层才写得进去；其他 App（GMS、Play 商店、银行…）带上这些 ID 会被 B 真
+/// TEE 以 -66 拒、链掉到已泄露的 keybox，Google 的完整性反而会挂。
+const DEFAULT_ATTEST_IDS_PACKAGES: &str = "com.lingqing.trustattestor";
+
+/// `uid 包名` 表（每行一条，`#` 开头是注释），模块自己维护，用来把调用方 uid 翻成包名。
+const UID_PACKAGES_PATH: &str = "/data/misc/keystore/ommega/uid_packages";
+
+/// 读平铺 A 侧配置里的一个字符串键（`键: 值`，`#` 开头是注释）。
+fn flat_config_string(keys: &[&str]) -> Option<String> {
+    let contents = std::fs::read_to_string(CLIENTA_CONFIG_PATH).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = line.find(':') else { continue };
+        let key = line[..idx].trim().to_lowercase();
+        if keys.iter().any(|k| *k == key) {
+            let value = line[idx + 1..].trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+pub fn attest_ids_packages() -> Vec<String> {
+    let raw = flat_config_string(&["attest_ids_packages", "attest_ids_pkgs"])
+        .unwrap_or_else(|| DEFAULT_ATTEST_IDS_PACKAGES.to_string());
+    raw.split([',', ' ', '\t'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 这个调用方是不是「可以带设备 ID」的。
+pub fn attest_ids_allowed_for_uid(uid: i64) -> bool {
+    let packages = attest_ids_packages();
+    if packages.is_empty() {
+        return false;
+    }
+    match package_for_uid(uid) {
+        Some(package) => packages.iter().any(|p| *p == package),
+        None => false,
+    }
+}
+
+/// uid -> 包名，带 mtime 缓存（表 600 行上下，没必要每个请求都读）。
+fn package_for_uid(uid: i64) -> Option<String> {
+    type Cache = std::sync::Mutex<
+        Option<(
+            std::time::SystemTime,
+            std::collections::HashMap<i64, String>,
+        )>,
+    >;
+    static CACHE: Cache = std::sync::Mutex::new(None);
+
+    let mtime = std::fs::metadata(UID_PACKAGES_PATH).ok()?.modified().ok()?;
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((cached_mtime, map)) = guard.as_ref() {
+            if *cached_mtime == mtime {
+                return map.get(&uid).cloned();
+            }
+        }
+    }
+
+    let contents = std::fs::read_to_string(UID_PACKAGES_PATH).ok()?;
+    let mut map = std::collections::HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(uid_str), Some(package)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if let Ok(parsed) = uid_str.parse::<i64>() {
+            map.insert(parsed, package.to_string());
+        }
+    }
+    let found = map.get(&uid).cloned();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((mtime, map));
+    }
+    found
+}
+
 /// Reads one boolean key out of the flat A-side config.  Truthy spellings are
 /// `1` / `true` / `yes` / `on` (case-insensitive): the WebUI writes
 /// `true`/`false` for the relay flags and `0`/`1` for the mask/inject ones, and

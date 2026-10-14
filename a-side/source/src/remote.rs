@@ -834,6 +834,23 @@ impl RemoteRelay {
                 ),
             );
         }
+        // Device-ID attestation (KM_TAG_ATTESTATION_ID_*, 710..717 + 723 second
+        // IMEI). Values are the A-side's own (config `[device]`), picked and
+        // validated by the TA — the caller's declared values are never trusted.
+        // Without these the relay-minted leaf carries no device properties at
+        // all and self-check apps report `hardware.attestation.device_properties`.
+        if !params.attestation_ids.is_empty() {
+            ctx.insert(
+                "attestation_ids".to_string(),
+                Value::Array(
+                    params
+                        .attestation_ids
+                        .iter()
+                        .map(|(tag, value)| json!([*tag, base64_encode(value)]))
+                        .collect(),
+                ),
+            );
+        }
         // Forward the device's OS version + security patch level so the relay
         // can emit KM_TAG_OS_VERSION (705) / KM_TAG_OS_PATCH_LEVEL (706) in the
         // teeEnforced authorization list. Software attestations that omit these
@@ -898,7 +915,20 @@ impl RemoteRelay {
             "device_id": Self::device_id()?,
             "device_attest_context": Value::Object(ctx),
         });
-        Self::post_json("/api/attest/", &body)
+        let resp = Self::post_json("/api/attest/", &body)?;
+        // 把拿到的链是哪来的记一笔：`source` 是服务端标的层（physical = B 真 TEE，
+        // server_keybox = 服务端 keybox 兜底），后者是已泄露的那套，拿链去 Google 验
+        // 会被认出来。出问题时有这一行就能直接定位。
+        if let Some(v) = resp.as_ref() {
+            let source = v.get("source").and_then(Value::as_str).unwrap_or("unknown");
+            let certs = v
+                .get("cert_chain")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            log::info!("remote_chain alias={alias} source={source} certs={certs}");
+        }
+        Ok(resp)
     }
 
     /// Millis since epoch (used for `creation_datetime_ms`).

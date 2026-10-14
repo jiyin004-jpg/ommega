@@ -1545,7 +1545,7 @@ fn der_int(raw: &[u8]) -> Option<i64> {
 /// Returns the package names, `name@version` when a non-zero version is given,
 /// comma-separated.  `None` when there is nothing readable in there: this is a
 /// diagnostic string, so a malformed AAID is dropped rather than reported.
-fn parse_attestation_application_id(entry: &[u8]) -> Option<String> {
+pub(crate) fn parse_attestation_application_id(entry: &[u8]) -> Option<String> {
     /// Everything beyond this is cut — the device entry has to stay small.
     const MAX_CHARS: usize = 160;
     const SEQUENCE_TAG: u64 = 0x30;

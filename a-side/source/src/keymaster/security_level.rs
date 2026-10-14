@@ -55,9 +55,10 @@ use crate::keymaster::permission::{
 use crate::keymaster::security_level_manager;
 use crate::keymaster::super_key::{KeyBlob, SuperKeyManager};
 use crate::keymaster::utils::{
-    app_info_for_uid, count_key_entries, is_device_id_attestation_tag, is_imei_attestation_tag,
-    key_characteristics_to_internal, key_parameters_to_authorizations, log_security_safe_params,
-    upgrade_keyblob_if_required_with, AndroidUserId, AppUid, Challenge, UNDEFINED_NOT_AFTER,
+    app_info_for_uid, count_key_entries, is_attestation_id_tag, is_device_id_attestation_tag,
+    is_imei_attestation_tag, key_characteristics_to_internal, key_parameters_to_authorizations,
+    log_security_safe_params, upgrade_keyblob_if_required_with, AndroidUserId, AppUid, Challenge,
+    UNDEFINED_NOT_AFTER,
 };
 use crate::plat::utils as plat_utils;
 use crate::top::jiyin004::ommega::{
@@ -571,26 +572,16 @@ impl KeystoreSecurityLevel {
             if check_key_permission(KeyPerm::GenUniqueId, key, None, ctx).is_err()
                 && check_unique_id_attestation_permissions(ctx).is_err()
             {
-                // 没权限就把这个 tag 摸掉，别拒整笔 —— 这是真机 TEE 的行为，也是钱包要的：
-                // Google Wallet 建 attestation key 时带着 INCLUDE_UNIQUE_ID，却既不持有
-                // SELinux 的 keystore_key:gen_unique_id 也没有
-                // REQUEST_UNIQUE_ID_ATTESTATION；照 AOSP 那套回 PERMISSION_DENIED 的话，
-                // 钱包直接报「这台手机不满足安全要求」。摸掉之后 key 照常生成，attestation
-                // extension 里就是不带 unique_id（TA 那边没有这个 tag 就返回空）。
+                // 没权限就是没权限：回 PERMISSION_DENIED（跟 AOSP keystore2 一样）。
                 //
-                // 也不能「干脆不查、直接放过」：GMS 那些 attestation 流程会把 tag 带
-                // 下去，extension 里多出一个跟调用方对不上的 unique_id，Play Integrity
-                // 反而会判三红（同行项目实测）。
-                let before = result.len();
-                result.retain(|kp| kp.tag != Tag::INCLUDE_UNIQUE_ID);
-                if result.len() != before {
-                    log::warn!(
-                        "INCLUDE_UNIQUE_ID stripped: uid={} holds neither \
-                         keystore_key:gen_unique_id nor REQUEST_UNIQUE_ID_ATTESTATION",
-                        uid.0
-                    );
-                }
-            } else if self
+                // 不改成「摘掉 INCLUDE_UNIQUE_ID、让请求成功」：自查类的
+                // `hardware.attestation.unique_id_permission` 就是拿「要了不该要的东西、
+                // 你还给了」判红的（实测：改成回错后该位清掉）。
+                return Err(Error::perm()).context(ks_err!(
+                    "Caller does not have the permission to generate a unique ID"
+                ));
+            }
+            if self
                 .id_rotation_state
                 .had_factory_reset_since_id_rotation(&creation_datetime)
                 .context(ks_err!(
@@ -607,9 +598,42 @@ impl KeystoreSecurityLevel {
         // If the caller requests any device identifier attestation tag, check that they hold the
         // correct Android permission.
         if params.iter().any(|kp| is_device_id_attestation_tag(kp.tag)) {
-            check_device_attestation_permissions(ctx).context(ks_err!(
+            let granted = check_device_attestation_permissions(ctx);
+            log::debug!(
+                "event=device_id_attest uid={} granted={}",
+                uid.0,
+                granted.is_ok()
+            );
+            granted.context(ks_err!(
                 "Caller does not have the permission to attest device identifiers."
             ))?;
+        }
+
+        // 持有 READ_PRIVILEGED_PHONE_STATE 的调用方（GMS 的 DroidGuard、Play 商店自己的
+        // 完整性钥匙等）把 ID 类 tag 全部摘掉再往下走。
+        //
+        // 原因：中继给不了「叶子带本机 710..717 + 真 TEE 链」这两头。带上 ID 后 B 的真
+        // TEE 会以 CannotAttestIds(-66) 拒，链就掉到服务端的 keybox（那份已吊销），拿链的
+        // 一方（Google 服务端）会直接判不过 —— 反而不如给一条真 TEE 链、叶子不带 ID，
+        // 也就是改动前的行为。而普通 App（自查类）要的是公开的 brand/device/product/…，
+        // 这些带上去由中继 keybox 层照写、叶子自洽，那一类检查才过。
+        // 只有名单里的「自查类」调用方才允许把设备 ID 证明带出去：那类请求会被 B 真
+        // TEE 以 -66 拒掉，中继自动落到服务端 keybox 层，叶子里的 brand/device/… 才写得
+        // 进去（自查项要的就是这个）。
+        // 其他调用方（GMS、Play 商店、银行、普通 App）一律摸掉这些 tag：请求继续由 B 真
+        // TEE 出真链，Google 的完整性不受影响。名单在平铺配置的 `attest_ids_packages`。
+        if params.iter().any(|kp| is_attestation_id_tag(kp.tag))
+            && !crate::config::attest_ids_allowed_for_uid(uid.0 as i64)
+        {
+            let before = result.len();
+            result.retain(|kp| !is_attestation_id_tag(kp.tag));
+            if result.len() != before {
+                log::debug!(
+                    "event=device_id_attest uid={} stripped={} (not in attest_ids_packages)",
+                    uid.0,
+                    before - result.len()
+                );
+            }
         }
 
         // If we are generating/importing an asymmetric key, we need to make sure
@@ -785,6 +809,17 @@ impl KeystoreSecurityLevel {
                 .context(ks_err!("Alias must be specified"));
         }
         let caller_uid = caller_uid(ctx);
+
+        // 取证用：把调用方（App）原样送进来的参数整条打出来。检查方那几种探针
+        // 全靠参数形状区分，出问题时得先看清它到底要了什么。
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "event=generate_key uid={} alias={:?} params={:?}",
+                caller_uid.0,
+                key.alias,
+                params
+            );
+        }
 
         let key = match key.domain {
             Domain::APP => KeyDescriptor {

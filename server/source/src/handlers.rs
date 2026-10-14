@@ -623,6 +623,46 @@ fn refuse_strongbox_body(kind: &str, msg: &str) -> Response {
 /// A layer "succeeds" when it returns a result without an `error` field;
 /// otherwise the next layer is tried, and only when every layer fails is an
 /// error returned.
+/// 这些 App 的认证直接走服务端 keybox 造：它们要的是「叶子里的 brand/device/… 跟本机声明值
+/// 一致」，而 B 真 TEE 只会签自己那套、还会因为这些 ID 回 -66。逗号分隔，缺省只有自查类
+/// App；用 `RELAY_KEYBOX_APPS` 覆盖（置空 = 一个都不走 keybox）。
+const DEFAULT_KEYBOX_APPS: &str = "com.lingqing.trustattestor";
+
+fn keybox_apps() -> Vec<String> {
+    std::env::var("RELAY_KEYBOX_APPS")
+        .unwrap_or_else(|_| DEFAULT_KEYBOX_APPS.to_string())
+        .split([',', ' ', '\t'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 从 `device_attest_context.attestation_application_id`（DER，base64）里抠出包名。
+/// 解析出来是 `包名@版本` 的形状，只取包名那一段。
+fn request_package(body: &Value) -> Option<String> {
+    use base64::Engine as _;
+    let b64 = body
+        .get("device_attest_context")
+        .and_then(|c| c.get("attestation_application_id"))
+        .and_then(Value::as_str)?;
+    let der = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let aaid = crate::cert::parse_attestation_application_id(&der)?;
+    Some(aaid.split('@').next().unwrap_or(&aaid).to_string())
+}
+
+/// 名单之外的认证请求把 `attestation_ids` 摘下：这些 ID 到了 B 真 TEE 会被拒（-66），
+/// 链会掉到已泄露的 keybox 层，拿链去 Google 验的那类流程（Play 商店 / GMS）反而会挂。
+fn strip_attestation_ids(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(ctx) = body
+        .get_mut("device_attest_context")
+        .and_then(Value::as_object_mut)
+    {
+        ctx.remove("attestation_ids");
+    }
+    body
+}
+
 async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Response {
     let device_id = body
         .get("device_id")
@@ -687,7 +727,19 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
         return run_refuse_strongbox_attest(state, &device_id, body, any_b_online).await;
     }
 
-    let serverbox = state.fulfill.is_enabled();
+    // 命中名单的 App（自查类）直接由服务端 keybox 造链返回；其余请求把 ID 类参数摘掉，
+    // 保证它们走 B 真 TEE 出真链（Google 那边不再被假链带下水）。
+    let keybox_app = task_type == "attest"
+        && request_package(body).is_some_and(|p| keybox_apps().iter().any(|k| *k == p));
+    let stripped_body;
+    let body: &Value = if task_type == "attest" && !keybox_app {
+        stripped_body = strip_attestation_ids(body);
+        &stripped_body
+    } else {
+        body
+    };
+
+    let serverbox = state.fulfill.is_enabled() || keybox_app;
 
     // StrongBox (security_level=2) requests follow the SAME layer order as TEE.
     // Each layer handles them according to its own capability:
