@@ -671,7 +671,9 @@ pub struct AttestationIds<'a> {
 }
 
 impl AttestationIds<'_> {
-    fn new_from_key_params<'a>(keygen_params: &'a [KeyParam]) -> Result<AttestationIds<'a>, Error> {
+    pub(crate) fn new_from_key_params<'a>(
+        keygen_params: &'a [KeyParam],
+    ) -> Result<AttestationIds<'a>, Error> {
         let mut ids = AttestationIds::default();
         for param in keygen_params {
             match param {
@@ -718,11 +720,11 @@ impl AttestationIds<'_> {
         Ok(ids)
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         *self == AttestationIds::default()
     }
 
-    fn check_match(&self, wanted: &crate::AttestationIdInfo) -> Result<(), Error> {
+    pub(crate) fn check_match(&self, wanted: &crate::AttestationIdInfo) -> Result<(), Error> {
         if self
             .brand
             .as_ref()

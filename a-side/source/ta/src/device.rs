@@ -227,6 +227,11 @@ pub struct RemoteAttestParams {
     /// the policy entirely (TrustAttestor reports
     /// `hardware.attestation.user_auth_metadata` / `user_auth_policy`).
     pub user_auth: Vec<(u32, i64)>,
+    /// 调用方要求写进叶子里的设备 ID（`(KeyMint tag, 值)`）。值一律取**本机那套**
+    /// （`config [device]` / `AttestationIdInfo`），不是调用方上报的原值 ——
+    /// 与 AOSP 的 `check_match` 语义一致：HAL 只签自己手里的真值，调用方报的值
+    /// 对不上就回 `CannotAttestIds`。空 = 调用方没要求这一项。
+    pub attestation_ids: Vec<(u32, Vec<u8>)>,
 }
 
 /// there.  Each method returns `Ok(None)` when the remote is unavailable or not

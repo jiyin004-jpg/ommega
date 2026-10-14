@@ -834,6 +834,23 @@ impl RemoteRelay {
                 ),
             );
         }
+        // Device-ID attestation (KM_TAG_ATTESTATION_ID_*, 710..717 + 723 second
+        // IMEI). Values are the A-side's own (config `[device]`), picked and
+        // validated by the TA — the caller's declared values are never trusted.
+        // Without these the relay-minted leaf carries no device properties at
+        // all and self-check apps report `hardware.attestation.device_properties`.
+        if !params.attestation_ids.is_empty() {
+            ctx.insert(
+                "attestation_ids".to_string(),
+                Value::Array(
+                    params
+                        .attestation_ids
+                        .iter()
+                        .map(|(tag, value)| json!([*tag, base64_encode(value)]))
+                        .collect(),
+                ),
+            );
+        }
         // Forward the device's OS version + security patch level so the relay
         // can emit KM_TAG_OS_VERSION (705) / KM_TAG_OS_PATCH_LEVEL (706) in the
         // teeEnforced authorization list. Software attestations that omit these

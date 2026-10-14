@@ -571,26 +571,20 @@ impl KeystoreSecurityLevel {
             if check_key_permission(KeyPerm::GenUniqueId, key, None, ctx).is_err()
                 && check_unique_id_attestation_permissions(ctx).is_err()
             {
-                // 没权限就把这个 tag 摸掉，别拒整笔 —— 这是真机 TEE 的行为，也是钱包要的：
-                // Google Wallet 建 attestation key 时带着 INCLUDE_UNIQUE_ID，却既不持有
-                // SELinux 的 keystore_key:gen_unique_id 也没有
-                // REQUEST_UNIQUE_ID_ATTESTATION；照 AOSP 那套回 PERMISSION_DENIED 的话，
-                // 钱包直接报「这台手机不满足安全要求」。摸掉之后 key 照常生成，attestation
-                // extension 里就是不带 unique_id（TA 那边没有这个 tag 就返回空）。
+                // 没权限就是没权限：回 PERMISSION_DENIED（跟 AOSP keystore2 一样），
+                // 不能把这个 tag 摸掉把请求放过去。
                 //
-                // 也不能「干脆不查、直接放过」：GMS 那些 attestation 流程会把 tag 带
-                // 下去，extension 里多出一个跟调用方对不上的 unique_id，Play Integrity
-                // 反而会判三红（同行项目实测）。
-                let before = result.len();
-                result.retain(|kp| kp.tag != Tag::INCLUDE_UNIQUE_ID);
-                if result.len() != before {
-                    log::warn!(
-                        "INCLUDE_UNIQUE_ID stripped: uid={} holds neither \
-                         keystore_key:gen_unique_id nor REQUEST_UNIQUE_ID_ATTESTATION",
-                        uid.0
-                    );
-                }
-            } else if self
+                // 以前这里是「默默摘掉 INCLUDE_UNIQUE_ID、让 key 照常生成」，理由是
+                // Google Wallet 建 attestation key 时会带这个 tag。但那是把
+                // 「权限被绕过」打开了：检查方（TrustAttestor）自己不带
+                // REQUEST_UNIQUE_ID_ATTESTATION，发两发带 INCLUDE_UNIQUE_ID 的请求，
+                // 只要有一发成功它就判 `hardware.attestation.unique_id_permission`
+                // ——「要了不该要的东西、你还给了」。真机上这条路径是拒的。
+                return Err(Error::perm()).context(ks_err!(
+                    "Caller does not have the permission to generate a unique ID"
+                ));
+            }
+            if self
                 .id_rotation_state
                 .had_factory_reset_since_id_rotation(&creation_datetime)
                 .context(ks_err!(
@@ -607,7 +601,13 @@ impl KeystoreSecurityLevel {
         // If the caller requests any device identifier attestation tag, check that they hold the
         // correct Android permission.
         if params.iter().any(|kp| is_device_id_attestation_tag(kp.tag)) {
-            check_device_attestation_permissions(ctx).context(ks_err!(
+            let granted = check_device_attestation_permissions(ctx);
+            log::debug!(
+                "event=device_id_attest uid={} granted={}",
+                uid.0,
+                granted.is_ok()
+            );
+            granted.context(ks_err!(
                 "Caller does not have the permission to attest device identifiers."
             ))?;
         }
@@ -785,6 +785,17 @@ impl KeystoreSecurityLevel {
                 .context(ks_err!("Alias must be specified"));
         }
         let caller_uid = caller_uid(ctx);
+
+        // 取证用：把调用方（App）原样送进来的参数整条打出来。检查方那几种探针
+        // 全靠参数形状区分，出问题时得先看清它到底要了什么。
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "event=generate_key uid={} alias={:?} params={:?}",
+                caller_uid.0,
+                key.alias,
+                params
+            );
+        }
 
         let key = match key.domain {
             Domain::APP => KeyDescriptor {

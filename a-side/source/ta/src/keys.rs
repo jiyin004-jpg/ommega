@@ -418,6 +418,16 @@ impl crate::KeyMintTa {
         let remote_attest = get_opt_tag_value!(params, AttestationChallenge)?.is_some()
             && attestation_key.is_none()
             && self.dev.remote.as_ref().is_some_and(|r| r.enabled());
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "event=ta_generate_key has_attest_key={} challenge_len={} remote={}",
+                attestation_key.is_some(),
+                get_opt_tag_value!(params, AttestationChallenge)?
+                    .map(|c| c.len())
+                    .unwrap_or(0),
+                remote_attest
+            );
+        }
         if remote_attest {
             // `Ok(None)` from the remote backend means it was unavailable; fall
             // back to the local software keybox when `fallback_local` allows.
@@ -482,6 +492,15 @@ impl crate::KeyMintTa {
         // Tag the relay-minted chain with the requesting security level so a
         // STRONGBOX request is not misreported as TEE by the relay's default.
         remote_params.security_level = Some(self.hw_info.security_level as i32);
+        // 设备 ID 证明：调用方要了就随请求带上，值取本机那套（见
+        // `remote_attestation_ids`）。不带的话中继铸出来的叶子里没有 710..717，
+        // 检查方直接报「Device Properties 返回异常」。
+        if needs_attestation_ids(params) {
+            let ids = self
+                .get_attestation_ids()
+                .ok_or_else(|| km_err!(CannotAttestIds, "no attestation IDs provisioned"))?;
+            remote_params.attestation_ids = remote_attestation_ids(params, &ids)?;
+        }
 
         let remote = self
             .dev
@@ -1269,6 +1288,49 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
         }
     }
     out
+}
+
+/// 调用方要求做设备 ID 证明时，算出要随请求带给中继的 `(tag, 值)` 列表。
+///
+/// 值一律取**本机那套**（`config [device]` / `AttestationIdInfo`），和 AOSP 的
+/// `AttestationIds::check_match` 一个口径：调用方上报的值对不上本机真值就回
+/// `CannotAttestIds`，绝不把调用方报的原值写进叶子 —— 拿一个投递的假值去问、
+/// 叶子把假值原样吐回来，是「软件代铸」最明显的特征。
+fn remote_attestation_ids(
+    params: &[KeyParam],
+    ids: &crate::AttestationIdInfo,
+) -> Result<Vec<(u32, Vec<u8>)>, Error> {
+    let requested = cert::AttestationIds::new_from_key_params(params)?;
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    requested.check_match(ids)?;
+    let mut out = Vec::new();
+    for p in params {
+        // 中继/服务端认识的就是 710..717 与 723（第二个 IMEI）这套编号。
+        let (tag, value) = match p {
+            KeyParam::AttestationIdBrand(_) => (710, ids.brand.as_slice()),
+            KeyParam::AttestationIdDevice(_) => (711, ids.device.as_slice()),
+            KeyParam::AttestationIdProduct(_) => (712, ids.product.as_slice()),
+            KeyParam::AttestationIdSerial(_) => (713, ids.serial.as_slice()),
+            KeyParam::AttestationIdImei(_) => (714, ids.imei.as_slice()),
+            KeyParam::AttestationIdMeid(_) => (715, ids.meid.as_slice()),
+            KeyParam::AttestationIdManufacturer(_) => (716, ids.manufacturer.as_slice()),
+            KeyParam::AttestationIdModel(_) => (717, ids.model.as_slice()),
+            KeyParam::AttestationIdSecondImei(_) => (723, ids.imei2.as_slice()),
+            _ => continue,
+        };
+        if value.is_empty() {
+            // 本机没这项真值（比如没读到 IMEI）：那是「签不了这一项」，不是空字符串。
+            return Err(km_err!(
+                CannotAttestIds,
+                "no local value for attestation ID tag {}",
+                tag
+            ));
+        }
+        out.try_push((tag, value.to_vec()))?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
