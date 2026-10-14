@@ -572,25 +572,16 @@ impl KeystoreSecurityLevel {
             if check_key_permission(KeyPerm::GenUniqueId, key, None, ctx).is_err()
                 && check_unique_id_attestation_permissions(ctx).is_err()
             {
-                // 没权限就把这个 tag 摸掉、让 key 照常生成（真机 TEE 就是这个行为）。
+                // 没权限就是没权限：回 PERMISSION_DENIED（跟 AOSP keystore2 一样）。
                 //
-                // 不回 PERMISSION_DENIED：GMS / Google Wallet 那类流程会带
-                // INCLUDE_UNIQUE_ID（它们不持有 REQUEST_UNIQUE_ID_ATTESTATION），
-                // 整笔拒掉会把 Google 那边的完整性流程带下水。
-                //
-                // 代价是自查类检测项（TrustAttestor
-                // `hardware.attestation.unique_id_permission`）会把「请求成功了」
-                // 当成权限被绕过；要过它就得改成回错，两者不能兼得，先用这条。
-                let before = result.len();
-                result.retain(|kp| kp.tag != Tag::INCLUDE_UNIQUE_ID);
-                if result.len() != before {
-                    log::warn!(
-                        "INCLUDE_UNIQUE_ID stripped: uid={} holds neither \
-                         keystore_key:gen_unique_id nor REQUEST_UNIQUE_ID_ATTESTATION",
-                        uid.0
-                    );
-                }
-            } else if self
+                // 不改成「摘掉 INCLUDE_UNIQUE_ID、让请求成功」：自查类的
+                // `hardware.attestation.unique_id_permission` 就是拿「要了不该要的东西、
+                // 你还给了」判红的（实测：改成回错后该位清掉）。
+                return Err(Error::perm()).context(ks_err!(
+                    "Caller does not have the permission to generate a unique ID"
+                ));
+            }
+            if self
                 .id_rotation_state
                 .had_factory_reset_since_id_rotation(&creation_datetime)
                 .context(ks_err!(
