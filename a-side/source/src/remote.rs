@@ -211,9 +211,24 @@ fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
     match &choice {
         // These two need no probe, so there is nothing to cache.
         BindChoice::Never => return None,
-        // An explicit name is taken at face value: whether it exists or works is
-        // the kernel's call, not ours.
-        BindChoice::Named(name) => return Some(name.clone()),
+        // 显式写的接口名先探一下再绑：Wi-Fi 断了、接口名写错、hotspot 还没起来的时候，
+        // 直接 `SO_BINDTODEVICE` 上去等于把整条远程链弄断（请求连 SYN 都发不出去）。
+        // 探不通就退回自动选一个能到服务器的上联。
+        BindChoice::Named(name) => {
+            if let Some(hit) = cached_pick(bind_iface, base_url) {
+                return hit;
+            }
+            let picked = if probe_iface(Some(name), base_url) {
+                Some(name.clone())
+            } else {
+                log::warn!(
+                    "uplink: configured interface {name} cannot reach the relay, picking one"
+                );
+                pick_uplink(base_url)
+            };
+            store_pick(bind_iface, base_url, picked.clone());
+            return picked;
+        }
         _ => {}
     }
     if choice == BindChoice::Auto && !vpn_present() {
