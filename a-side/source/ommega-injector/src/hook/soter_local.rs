@@ -37,6 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::pss::SigningKey as PssSigningKey;
 use rsa::pss::VerifyingKey as PssVerifyingKey;
@@ -58,7 +59,7 @@ const SALT_LEN: i32 = 32;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
-/// 换本地兜底 ATTK 用的文件（PKCS#8 PEM，`openssl genpkey -algorithm RSA` 那种）。
+/// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM，`openssl genpkey` / `openssl genrsa` 的都行）。
 /// 存在且解析得过就用它，跟 keybox 一个路子：丢文件进去、重启 SOTER 宿主就生效。
 ///
 /// 两个位置对应两个域，谁在哪个域里读得到就认谁：
@@ -116,7 +117,10 @@ impl Key {
         // 文件里允许带 `cpu_id: 09000000…` 这类注释行（WebUI 导入时 daemon 靠它设 force），
         // PEM 解析器不认那些行，先只取 BEGIN…END 之间那段。
         let block = pem_block(pem);
-        let private = RsaPrivateKey::from_pkcs8_pem(block.trim()).ok()?;
+        // PKCS#8 和 PKCS#1 都认：`openssl genpkey` 给前者，`openssl genrsa` 给后者。
+        let private = RsaPrivateKey::from_pkcs8_pem(block.trim())
+            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(block.trim()))
+            .ok()?;
         let pem = rsa::RsaPublicKey::from(&private)
             .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
             .ok()?;
@@ -237,7 +241,7 @@ fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key,
             Some(key) => return Some((key, path.display().to_string())),
             // 文件在那儿但读不出私钥：别当没事，也别拿它顶，继续往下找。
             None => log::warn!(
-                "soter local attk at {} is not a usable PKCS#8 PEM; ignoring it",
+                "soter local attk at {} is not a usable RSA PEM; ignoring it",
                 path.display()
             ),
         }
@@ -438,7 +442,7 @@ fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
         match Key::from_pem(&pem) {
             Some(key) => return Some((key, format!("store:uid={uid}"))),
             None => log::warn!(
-                "soter local ask for uid {uid} in the store is not a usable PKCS#8 PEM; ignoring it"
+                "soter local ask for uid {uid} in the store is not a usable RSA PEM; ignoring it"
             ),
         }
     }
@@ -450,7 +454,7 @@ fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
         };
         let Some(key) = Key::from_pem(&pem) else {
             log::warn!(
-                "soter local ask for uid {uid} at {path} is not a usable PKCS#8 PEM; ignoring it"
+                "soter local ask for uid {uid} at {path} is not a usable RSA PEM; ignoring it"
             );
             continue;
         };

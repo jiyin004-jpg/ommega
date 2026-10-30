@@ -154,7 +154,10 @@ impl KeyBox {
         if entry.chain.is_empty() {
             bail!("EC certificate chain is empty");
         }
+        // 跟 RSA 一边：EC 私钥也是两种形状——SEC1（BEGIN EC PRIVATE KEY）和
+        // PKCS#8（BEGIN PRIVATE KEY，openssl genpkey 默认）。两种都认。
         let key = ec::import_sec1_private_key(&entry.key_der)
+            .or_else(|_| ec::import_pkcs8_key(&entry.key_der))
             .map_err(|e| anyhow!("failed to import EC private key: {e:?}"))?;
         let chain: Vec<keymint::Certificate> = entry
             .chain
