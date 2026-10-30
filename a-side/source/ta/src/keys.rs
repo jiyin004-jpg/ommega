@@ -523,6 +523,11 @@ impl crate::KeyMintTa {
                     KeyParam::ModuleHash(hash) if !hash.is_empty() => Some(hash.clone()),
                     _ => None,
                 });
+        log::info!(
+            "remote attest: forwarding module_hash={:?} (additional_attestation_info={} entries)",
+            remote_params.module_hash.as_deref().map(<[u8]>::len),
+            self.additional_attestation_info.len()
+        );
 
         let remote = self
             .dev

@@ -1428,25 +1428,28 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         return Err(Error::Km(ErrorCode::UNKNOWN_ERROR)).context(err!("Failed to set HAL version"));
     }
 
-    if profile.version_number >= KeyMintDevice::KEY_MINT_V4 {
-        if let Some(bundle) = crate::global::module_info_bundle() {
-            let resp = ta.process_req(PerformOpReq::SetAdditionalAttestationInfo(
-                kmr_wire::SetAdditionalAttestationInfoRequest {
-                    info: vec![KeyParam::ModuleHash(bundle.sha256.clone())],
-                },
-            ));
-            if resp.error_code != 0 {
-                return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))
-                    .context(err!("Failed to set additional attestation info"));
-            }
-        } else {
-            warn!("moduleHash attestation bootstrap skipped because APEX module info bundle is unavailable");
+    // MODULE_HASH 的 bootstrap 不再按 KeyMint 版本卡：framework 只在 KM4+ 上主动
+    // 调 `IKeyMintDevice::setAdditionalAttestationInfo`，可设备侧
+    // `getSupplementaryAttestationInfo(MODULE_HASH)` 不看 HAL 版本、照样返回本机
+    // APEX 摘要。KM3 上手不 bootstrap 就会现成一对矛盾（证书没有 724、接口却给
+    // 出 bundle，校验方报 MODULE_HASH omitted），远程铸证也会因为这里没值而转发
+    // 不了。bundle 拿得到就写上，本地和转发两条路就都有 724。
+    if let Some(bundle) = crate::global::module_info_bundle() {
+        let resp = ta.process_req(PerformOpReq::SetAdditionalAttestationInfo(
+            kmr_wire::SetAdditionalAttestationInfoRequest {
+                info: vec![KeyParam::ModuleHash(bundle.sha256.clone())],
+            },
+        ));
+        if resp.error_code != 0 {
+            return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))
+                .context(err!("Failed to set additional attestation info"));
         }
-    } else {
         info!(
-            "Skipping moduleHash attestation bootstrap for KeyMint version {}",
+            "moduleHash attestation bootstrap done for KeyMint version {}",
             profile.version_number
         );
+    } else {
+        warn!("moduleHash attestation bootstrap skipped because APEX module info bundle is unavailable");
     }
 
     if EARLY_BOOT_ENDED.load(Ordering::Acquire) {

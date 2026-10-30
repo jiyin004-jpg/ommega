@@ -717,6 +717,18 @@ impl Fulfill {
             .and_then(Value::as_str)
             .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
             .filter(|hash| !hash.is_empty());
+        match p.module_hash.as_deref() {
+            Some(h) if h.len() >= 4 => tracing::info!(
+                "attest: module_hash {} bytes, prefix {:02x}{:02x}{:02x}{:02x}",
+                h.len(),
+                h[0],
+                h[1],
+                h[2],
+                h[3]
+            ),
+            Some(h) => tracing::info!("attest: module_hash {} bytes", h.len()),
+            None => tracing::info!("attest: no module_hash forwarded"),
+        }
         // User-authentication / authorization-list entries ([tag, value] pairs,
         // tags 502..=509) — the policy the app asked for. Dropping them is what
         // makes a server-minted leaf claim `NO_AUTH_REQUIRED` for an auth-bound
