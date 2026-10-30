@@ -326,13 +326,11 @@ mask_enabled() {
 OMMEGA_MASK_DEFAULT=0 mask_enabled hide_strongbox hide_strongbox_keystore && mask_sb=1 || mask_sb=0
 OMMEGA_MASK_DEFAULT=0 mask_enabled hide_device_ids hide_device_id_attestation && mask_ids=1 || mask_ids=0
 
-# 清掉老实现留在模块 system/ 下的 whiteout / 空声明。不清的话管理器挂载时它们还会把
-# 厂商那整份 XML 删掉，连带 app_attest_key 这种同一文件里的其它 feature 一起消失。
+# 老版本把过能力声明 XML（以及更早的 whiteout）放进模块的 system/ 里。现在完全不走那条路：
+# 留着这个目录只会让 metamodule 的 auto 模式继续把 ommega 当成“有 system 文件的模块”纳管，
+# 开机直接整个删掉（本次开机已挂上的不受影响，下次就不会再被纳管）。
 if [ -d "$MODDIR/system" ]; then
-  for mf_stale in android.hardware.security.strongbox_keystore.xml android.software.device_id_attestation.xml; do
-    find "$MODDIR/system" -type f -name "$mf_stale" 2>/dev/null | while IFS= read -r mf_old; do rm -f "$mf_old"; done
-    find "$MODDIR/system" -type c -name "$mf_stale" 2>/dev/null | while IFS= read -r mf_old; do rm -f "$mf_old"; done
-  done
+  rm -rf "$MODDIR/system" 2>/dev/null
 fi
 
 # 开机诊断（不看 debug 开关）：开关状态先落一行，后面 bind 的结果跟着写同一个文件。
