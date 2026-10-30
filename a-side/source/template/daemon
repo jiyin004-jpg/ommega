@@ -198,6 +198,25 @@ id_prop_name() {
 }
 
 sync_remote_identity() {
+  # 先看模式：本地模式（remote 关）不跟远程身份，还要把上次远程留下的
+  # boot 状态改回本机自己 —— 证书那侧已经按开关切回去了，属性不跟上就是
+  # A09 那个命中（cert locked=true state=0 vs prop locked=0 state=orange）。
+  # 注意这一步必须在读 remote_identity 之前：本地模式往往没那个文件，
+  # 早 return 的话属性就没人管了。
+  ri_remote=$(grep -iE '^[[:space:]]*remote[[:space:]]*:' "$CONF_PATH" 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+  case "$ri_remote" in
+    1|true|yes|on) ;;
+    *)
+      # 幂等：已经是本机说法就不重复写（这个函数每 2 秒跑一次）。
+      [ "$(getprop ro.boot.vbmeta.device_state 2>/dev/null)" = "locked" ] || \
+        resetprop_set ro.boot.vbmeta.device_state locked
+      [ "$(getprop ro.boot.flash.locked 2>/dev/null)" = "1" ] || \
+        resetprop_set ro.boot.flash.locked 1
+      [ "$(getprop ro.boot.verifiedbootstate 2>/dev/null)" = "green" ] || \
+        resetprop_set ro.boot.verifiedbootstate green
+      return 0
+      ;;
+  esac
   [ -f "$REMOTE_IDENTITY_FILE" ] || return 0
   # 面板「伪装参数」里手动写过身份就以面板为准（props.conf 里有 ro.product.model 就不动）。
   if [ -f "$CONF_DIR/props.conf" ] && grep -q '^[[:space:]]*ro\.product\.model[[:space:]]*:' "$CONF_DIR/props.conf" 2>/dev/null; then
@@ -227,6 +246,7 @@ sync_remote_identity() {
     esac
   done
   # boot 锁定 / 验证状态 —— 这两项不是 1:1 映射到属性名（值要转文案），单独处理。
+  # （remote 开关已经在函数开头判过了，走到这里说明是在跟 B 的说法。）
   ri_locked=$(sed -n 's/^device_locked=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
   case "$ri_locked" in
     0)
