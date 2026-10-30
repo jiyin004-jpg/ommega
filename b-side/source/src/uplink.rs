@@ -79,7 +79,22 @@ pub fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
     match &choice {
         // 这两种不用探，缓存也没意义。
         BindChoice::Never => return None,
-        BindChoice::Named(name) => return Some(name.clone()),
+        // 显式写的接口名先探一下再绑：Wi-Fi 断了、接口名写错、热点还没起来时，
+        // 直接 `SO_BINDTODEVICE` 上去等于把整条 poll 循环弄断（连 SYN 都发不出去）。
+        // 探不通就退回自动选一条能到服务器的上联。
+        BindChoice::Named(name) => {
+            if let Some(hit) = cached_pick(bind_iface, base_url) {
+                return hit;
+            }
+            let picked = if probe(base_url, Some(name)) {
+                Some(name.clone())
+            } else {
+                log::warn!("出口：配的 {name} 到不了 relay，自己挑一条");
+                pick_uplink(base_url)
+            };
+            store_pick(bind_iface, base_url, picked.clone());
+            return picked;
+        }
         _ => {}
     }
     // 没 VPN 就不动，而且这一步只看文件，不必缓存。
@@ -123,7 +138,11 @@ struct CachedPick {
 }
 
 /// 结论留多久。链路断了最多等这么久就会重挑，再短就等于没缓存。
-const PICK_TTL: Duration = Duration::from_secs(5);
+///
+/// 选了具体接口之后要能「一段时间内优先走它」，不然每 5 秒一次探测（一次 HTTP
+/// 往返）把省下的延迟又吃回去了。断网由两个机制兜：探测失败会重选，请求失败时
+/// `reset_http_client()` 会调 `invalidate_pick()` 把这份缓存清掉。
+const PICK_TTL: Duration = Duration::from_secs(60);
 
 /// 把缓存的结论扔掉，下次重新挑。调用方在「这条路刚证明打不通」时用。
 pub fn invalidate_pick() {
