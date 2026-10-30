@@ -37,6 +37,20 @@ const CONFIRMATION_DATA_PREFIX: &[u8] = b"confirmation token";
 /// See <https://source.android.com/security/protected-confirmation/implementation>
 const CONFIRMATION_MESSAGE_MAX_LEN: usize = 6144;
 
+/// 大端无符号比较：`a >= b`（忽略前导零）。只用于 NoPadding 解密的 c < n 检查，
+/// 不值得为此拉一个大数库进来。
+fn be_ge(a: &[u8], b: &[u8]) -> bool {
+    fn trim(v: &[u8]) -> &[u8] {
+        let mut i = 0;
+        while i + 1 < v.len() && v[i] == 0 {
+            i += 1;
+        }
+        &v[i..]
+    }
+    let (a, b) = (trim(a), trim(b));
+    a.len() > b.len() || (a.len() == b.len() && a >= b)
+}
+
 /// Union holder for in-progress cryptographic operations, each of which is an instance
 /// of the relevant trait.
 pub(crate) enum CryptoOperation {
@@ -70,6 +84,9 @@ pub(crate) enum CryptoOperation {
         /// 同一台机上本地/远程两边不一致就是检测器能看到的差异。所以在这里先按模长
         /// 拦一道，行为以本地为准。
         expected_len: Option<usize>,
+        /// RSA 的模数 n（大端）。NoPadding 解密要先比一下 c < n（远程私钥在 B 端，
+        /// 真机 KeyMint（含 AOSP 原版）不查这一点，得在转发前拦）。
+        modulus: Vec<u8>,
     },
 }
 
@@ -463,6 +480,7 @@ impl crate::KeyMintTa {
                 algorithm,
                 mut data,
                 expected_len,
+                modulus,
             } => {
                 if let Some(input) = finish_data {
                     data.try_extend_from_slice(input).map_err(|_| {
@@ -483,6 +501,16 @@ impl crate::KeyMintTa {
                             "RSA ciphertext is {in_len} bytes, expected {expected}"
                         ));
                     }
+                }
+                // NoPadding 解密：c 必须严格小于模数 n。远程私钥在 B 端，真机
+                // KeyMint（包括 AOSP 原版）对这一点不检查，得在这里拦（aprobe C09）。
+                if algorithm == "RSA/ECB/NoPadding" && !modulus.is_empty() && be_ge(&data, &modulus)
+                {
+                    error!("remote_decrypt rejected alias={alias}: c >= n");
+                    return Err(km_err!(
+                        InvalidArgument,
+                        "ciphertext representative out of range"
+                    ));
                 }
                 let remote = self.dev.remote.as_ref().ok_or_else(|| {
                     km_err!(
@@ -720,16 +748,26 @@ impl crate::KeyMintTa {
                 algorithm.clone(),
                 *raw_digest_len,
                 None,
+                None,
             )),
             CryptoOperation::RemoteDecrypt {
                 alias,
                 algorithm,
                 expected_len,
+                modulus,
                 ..
-            } => Some((false, alias.clone(), algorithm.clone(), None, *expected_len)),
+            } => Some((
+                false,
+                alias.clone(),
+                algorithm.clone(),
+                None,
+                *expected_len,
+                Some(modulus.clone()),
+            )),
             _ => None,
         };
-        let Some((is_sign, alias, algorithm, raw_digest_len, expected_len)) = remote else {
+        let Some((is_sign, alias, algorithm, raw_digest_len, expected_len, modulus)) = remote
+        else {
             // 不是远程 key：放回去，让正常 finish 路径处理。
             self.operations[op_idx] = Some(op);
             return Ok(None);
@@ -757,6 +795,18 @@ impl crate::KeyMintTa {
                     "RSA ciphertext is {} bytes, expected {expected}",
                     buf.len()
                 ));
+            }
+        }
+        // NoPadding 解密：c 必须严格小于模数 n（真机 KeyMint 不查这个）。
+        if !is_sign && algorithm == "RSA/ECB/NoPadding" {
+            if let Some(n) = modulus.as_deref() {
+                if !n.is_empty() && be_ge(&buf, n) {
+                    error!("remote finish rejected alias={alias}: c >= n");
+                    return Err(km_err!(
+                        InvalidArgument,
+                        "ciphertext representative out of range"
+                    ));
+                }
             }
         }
         Ok(Some((is_sign, alias, algorithm, buf)))

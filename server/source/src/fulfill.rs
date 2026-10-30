@@ -1513,7 +1513,10 @@ fn sign_rsa_pkcs1(
         LeafDigest::Sha384 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha384>(), hashed),
         LeafDigest::Sha512 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha512>(), hashed),
         // PKCS#1 v1.5 的 DigestInfo 必须标一个摘要；真机也不会用 NONE 走这条。
-        LeafDigest::None => rk.sign(Pkcs1v15Sign::new::<Sha256>(), hashed),
+        // DIGEST=NONE 的 PKCS#1 签名是「type-1 填充 + 裸模幂」，不能套任何 DigestInfo。
+        // 之前这里用 `new::<Sha256>()`，签出来的是「SHA-256 DigestInfo || data」，
+        // Java 的 NONEwithRSA 验签自然过不了（aprobe C03）。
+        LeafDigest::None => rk.sign(Pkcs1v15Sign::new_unprefixed(), hashed),
     }?;
     Ok(sig)
 }

@@ -349,6 +349,7 @@ impl crate::KeyMintTa {
                         algorithm: remote_decrypt_algorithm(key_chars, &params)?,
                         data: Vec::new(),
                         expected_len: rsa_modulus_len(key_chars)?,
+                        modulus: rsa_modulus_from_spki(&remote.public_key).unwrap_or_default(),
                     },
                     _ => {
                         return Err(km_err!(
@@ -1162,6 +1163,62 @@ fn nonce<const N: usize>(caller_nonce: Option<&[u8]>, rng: &mut dyn Rng) -> Resu
             arr
         }
     })
+}
+
+/// 从 SPKI DER 里取 RSA 模数（大端，去前导零）。真机不查 c < n，A 端得自己拿一个 n。
+fn rsa_modulus_from_spki(spki_der: &[u8]) -> Option<Vec<u8>> {
+    fn tlv(buf: &[u8], pos: usize) -> Option<(u8, &[u8], usize)> {
+        let tag = *buf.get(pos)?;
+        let mut p = pos + 1;
+        let first = *buf.get(p)?;
+        p += 1;
+        let len = if first & 0x80 == 0 {
+            first as usize
+        } else {
+            let n = (first & 0x7f) as usize;
+            if n == 0 || n > 4 {
+                return None;
+            }
+            let mut v = 0usize;
+            for _ in 0..n {
+                v = (v << 8) | *buf.get(p)? as usize;
+                p += 1;
+            }
+            v
+        };
+        let end = p.checked_add(len)?;
+        if end > buf.len() {
+            return None;
+        }
+        Some((tag, &buf[p..end], end))
+    }
+
+    let (tag, spki, _) = tlv(spki_der, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, _alg, next) = tlv(spki, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, bitstr, _) = tlv(spki, next)?;
+    if tag != 0x03 {
+        return None;
+    }
+    let inner = bitstr.get(1..)?;
+    let (tag, rsa, _) = tlv(inner, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, modulus, _) = tlv(rsa, 0)?;
+    if tag != 0x02 {
+        return None;
+    }
+    let mut m = modulus.to_vec();
+    while m.len() > 1 && m[0] == 0 {
+        m.remove(0);
+    }
+    Some(m)
 }
 
 #[cfg(test)]
