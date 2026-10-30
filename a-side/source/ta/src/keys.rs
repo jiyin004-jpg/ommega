@@ -242,7 +242,15 @@ impl crate::KeyMintTa {
                     });
                     remote_boot.as_ref().unwrap()
                 }
-                _ => &hashed_boot,
+                _ => {
+                    // 叶子由本机 keybox 签（ATTEST_KEY 子钥那条路径）。如果这台机器
+                    // 用过远程 B 出链，RKP 路径证书里的 RootOfTrust 是 B 的
+                    // （unlocked / Unverified），这里再用本机的（locked / Verified）
+                    // 就成了两条链说法不一 —— Duck Detector 的
+                    // `ROOT_OF_TRUST_DIVERGENCE` 抓的就是这个。
+                    remote_boot = load_remote_boot_override(&hashed_boot);
+                    remote_boot.as_ref().unwrap_or(&hashed_boot)
+                }
             };
             // The attestation version must follow the attestation key's when a
             // remote (B-side TEE) attestation key signs this leaf: relay-minted
@@ -1303,6 +1311,51 @@ fn self_hash_sha256(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// 从 `remote_identity` 里读回 B 真机的 RootOfTrust 字段，用来给**本地签的**
+/// 叶子证书对齐说法。文件里只有三条相关：`device_locked`、`verified_boot_state`、
+/// `vbmeta_digest`（TA 出远程链时自己写的）。没文件/没字段就返回 None，
+/// 本机继续用自己的值（本地模式不受影响）。
+fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::BootInfo> {
+    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
+    let text = std::fs::read_to_string(PATH).ok()?;
+    let mut locked: Option<i32> = None;
+    let mut state: Option<i32> = None;
+    let mut digest: Option<Vec<u8>> = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("device_locked=") {
+            locked = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("verified_boot_state=") {
+            state = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("vbmeta_digest=") {
+            digest = hex_to_bytes(v.trim());
+        }
+    }
+    let locked = locked?;
+    let state = state?;
+    Some(keymint::BootInfo {
+        verified_boot_key: fallback.verified_boot_key.clone(),
+        device_boot_locked: locked != 0,
+        verified_boot_state: keymint::VerifiedBootState::try_from(state)
+            .unwrap_or(keymint::VerifiedBootState::Unverified),
+        verified_boot_hash: digest.unwrap_or_else(|| fallback.verified_boot_hash.clone()),
+        boot_patchlevel: fallback.boot_patchlevel,
+    })
+}
+
+fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 || text.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
 /// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写（避免触发重启循环）。
 ///
 /// TA 跑在 keystore2 进程里（uid 1017），只能写 keystore 状态目录；
@@ -1342,18 +1395,23 @@ fn persist_remote_identity(leaf_der: &[u8]) {
             out.push('\n');
         }
     }
-    // boot 锁定状态：走远程时证书里的 RootOfTrust 是 B 端真机的（多半 unlocked/orange），
-    // 本机那套 green/locked 跟它一对就不一致（A09 命中），所以把 B 的说法也写下来，
-    // 由 post-fs-data / daemon 拿它去 resetprop。
-    if let Some(locked) = identity.device_locked {
-        out.push_str(if locked {
+    // boot 锁定状态：走远程时证书里的 RootOfTrust 是 B 端真机的（多半
+    // unlocked / Unverified），本机那套 locked / Verified 跟它一对就不一致。
+    //
+    // 这里改用 `parse_remote_root_of_trust`：它是给子证书续链用的那条路径，
+    // 已经处理过 EAT/CBOR 和 [704] 的包装；复用 `parse_remote_device_identity`
+    // 里那份解析时拿到的是错位后的值（曾经写出 locked=1 / state=0，
+    // 而证书里明明是 0 / 2）。
+    if let Ok(Some(rot)) = crate::cert::parse_remote_root_of_trust(leaf_der) {
+        out.push_str(if rot.device_locked {
             "device_locked=1\n"
         } else {
             "device_locked=0\n"
         });
-    }
-    if let Some(state) = identity.verified_boot_state {
-        out.push_str(&format!("verified_boot_state={state}\n"));
+        out.push_str(&format!(
+            "verified_boot_state={}\n",
+            rot.verified_boot_state
+        ));
     }
     if let Some(patch) = identity.boot_patchlevel {
         out.push_str(&format!("boot_patchlevel={patch}\n"));
