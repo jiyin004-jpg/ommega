@@ -672,6 +672,16 @@ fn http_request(
     for (k, v) in headers {
         req = req.header(k, v);
     }
+    // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验（换机要解绑）。
+    // 以前只给 A 端加了这两个头，B 端一直没带 —— 所以 B 那边的私卡永远
+    // 停在「未绑定」。值只读一次（属性区是 mmap，但没必要每笔都读）。
+    let (dev_serial, dev_sn) = device_fingerprint();
+    if !dev_serial.is_empty() {
+        req = req.header("X-Device-Serial", dev_serial);
+    }
+    if !dev_sn.is_empty() {
+        req = req.header("X-Device-Sn", dev_sn);
+    }
     if let Some(b) = body {
         req = req.body(b.to_vec());
     }
@@ -1001,6 +1011,20 @@ fn parse_attestation_key(value: Option<&Value>) -> Result<Option<tee_ops::Attest
 
 fn b64(v: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(v)
+}
+
+/// 本机指纹（`ro.serialno` / `ro.boot.serialno`），给服务端做私卡绑定用。
+///
+/// 进程生命周期内不变，读一次就够；读不到就是空串，那两个头不发。
+fn device_fingerprint() -> (&'static str, &'static str) {
+    static FP: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let fp = FP.get_or_init(|| {
+        (
+            ommegaclient_b::keymaster::tee_ops::device_prop("ro.serialno").unwrap_or_default(),
+            ommegaclient_b::keymaster::tee_ops::device_prop("ro.boot.serialno").unwrap_or_default(),
+        )
+    });
+    (fp.0.as_str(), fp.1.as_str())
 }
 
 /// 把本机设备身份拼成 poll 的查询参数（URL 编码后）。
