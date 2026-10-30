@@ -421,8 +421,12 @@ impl AuthState {
                     if !row.enabled {
                         return false;
                     }
-                    // 私卡绑定设备：首次带指纹就绑，之后每次都要对得上
-                    if role == Some("a")
+                    // 私卡绑定设备：首次带指纹就绑，之后每次都要对得上。
+                    //
+                    // A 端和 B 端都绑 —— 以前只给 A 端绑，B 端的私卡/配对卡
+                    // 永远停在「未绑定」（它的请求也带指纹，就是没人理），
+                    // 卡店卖出去的那些 B 卡换台机器照样能用。公开卡照旧不绑。
+                    if role.is_some()
                         && Self::is_private_card(&row)
                         && !Self::device_binding_ok(db, &row, fp)
                     {
