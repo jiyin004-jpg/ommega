@@ -430,6 +430,7 @@ impl crate::KeyMintTa {
         // 可铸，用它 begin(SIGN) 恒被拒）。
         let remote_attest = wants_attest_challenge
             && !requests_user_auth(params)
+            && !agrees_only(params)
             && self.dev.remote.as_ref().is_some_and(|r| r.enabled())
             && (attestation_key.is_none() || remote_issuer.is_some());
         if remote_attest {
@@ -1477,6 +1478,27 @@ fn requests_user_auth(params: &[KeyParam]) -> bool {
     params
         .iter()
         .any(|p| matches!(p, KeyParam::UserAuthType(_) | KeyParam::AuthTimeout(_)))
+}
+
+/// 只拿来跑 ECDH 的 key（`PURPOSE_AGREE_KEY`，而且没有签名/解密用途）。
+///
+/// 这类 key 不该走远程：私钥在 B 那边，每次 ECDH 都得把请求打到 B 的 TEE 上，
+/// 而 B 的 `AGREE_KEY` 在实测里会把 TEE 打进 `-49` 的坏状态（之后连签名都 -1000），
+/// 等于用一个探针把整条链拖死。本地软件 keybox 生成一把、本地算 ECDH 就够了 ——
+/// 这类探针只看协商出的 secret 是否一致，不验证书链。
+fn agrees_only(params: &[KeyParam]) -> bool {
+    let mut purposes = params.iter().filter_map(|p| match p {
+        KeyParam::Purpose(purpose) => Some(*purpose),
+        _ => None,
+    });
+    let mut only_agree = false;
+    for purpose in purposes.by_ref() {
+        match purpose {
+            keymint::KeyPurpose::AgreeKey => only_agree = true,
+            _ => return false,
+        }
+    }
+    only_agree
 }
 
 #[cfg(test)]

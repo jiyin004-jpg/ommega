@@ -73,16 +73,7 @@ case "$_ri_locked" in
     resetprop ro.boot.vbmeta.device_state locked
     ;;
 esac
-# boot 补丁级别（719）：证书里是 YYYYMMDD，属性是 YYYY-MM-DD。
-# A 端本地证书这个值是按本机 boot 镜像日期算的，不跟 B 对齐就会像 A14/S06 那样对上。
-_ri_patch=$(sed -n 's/^boot_patchlevel=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
-case "$_ri_patch" in
-    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
-        _ri_patch_fmt=$(printf '%s' "$_ri_patch" | sed 's/^\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)$/\1-\2-\3/')
-        resetprop ro.boot.build.security_patch "$_ri_patch_fmt"
-        ;;
-esac
-unset _OMMEGA_RI _ri_locked _ri_state _ri_patch _ri_patch_fmt
+unset _OMMEGA_RI _ri_locked _ri_state
 resetprop ro.boot.veritymode enforcing
 resetprop ro.secure 1
 resetprop ro.adb.secure 1
