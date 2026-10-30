@@ -2,6 +2,18 @@
 
 [English](CHANGELOG.en.md)
 
+## 1.7.12
+
+- ECDH 只用于协商的 key（`PURPOSE_AGREE_KEY` 且没有签名/解密用途）不再转发到 B，本地 keybox 生成、本地算 —— B 的 TEE 被 `begin(AGREE_KEY)` 进去一次就会掉进 `-49` 且不恢复，之后连普通签名都 `-1000`。
+- B 端收到 `agree` 直接回 `unsupported`，不再把任务挂在 binder 上（以前会卡死、服务端反复重投，整条链跟着废）。
+- 本地签的 ATTEST_KEY 子钥证书改用远程证书里的 RootOfTrust（`remote_identity` 里的 `device_locked` / `verified_boot_state` / `vbmeta_digest`），两条路径说法一致，Duck Detector 的 `ROOT_OF_TRUST_DIVERGENCE` 不再命中。
+- 同一套身份同步按 `remote` 开关走：本地模式下不跟远程的值，并把上次留下的 `orange/unlocked` 主动改回 `green/locked`（daemon 每 2 秒自检，切模式不用重启）。
+- 设备指纹（`ro.serialno` / `ro.boot.serialno`）现在 A、B 两端都随请求上报，服务端对私卡（`pair` / `private`）在 A 和 B 两侧都做首次绑定和一致性校验，`public` 卡照旧不受限。
+- 选路：绑定的接口先探测再绑、结论缓存 60 秒、请求失败立刻作废并回退；`uplink_absent` / `vpn_present` 这两个每笔都要走的 sysfs 检查缓存 3 秒。
+- B 端长轮询从 0 改成 5 秒（必须小于 8 秒的墙钟看门狗），任务到达少等一个轮询间隔；KeyMint HAL 版本探测按 service 名缓存，不再每笔问一次。
+- 服务端鉴权结果缓存 10 秒（A 端连发几十笔时只查一次库），`run_a_side_task` 的全量 ctx 日志降到 debug。
+- 修正 B 端补丁日期跟随的判断：只比当前值，值变回原值也会真的写回并重读（以前拿固定的基线比，改回原值时会被跳过）。
+
 ## 1.7.11
 
 - 能力声明隐藏（`hide_strongbox` / `hide_device_ids`）改成完全自己挂：模块里不再放 `system/` 目录，mountify 这类 metamodule 的 auto 模式也就不会再纳管 ommega。生效方式是 post-fs-data 里把厂商那份权限 XML 拓一份、删掉对应 `<feature>` 行再单文件 bind 回去，`service.sh` 等到 `sys.boot_completed` 之后 `umount -l` 撤掉，`mountinfo` 里只在开机头几十秒看得到。代价是软重启（只重启 system_server）后会重读 XML，需要再冷重启一次。
