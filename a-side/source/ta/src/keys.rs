@@ -1341,6 +1341,22 @@ fn persist_remote_identity(leaf_der: &[u8]) {
             out.push('\n');
         }
     }
+    // boot 锁定状态：走远程时证书里的 RootOfTrust 是 B 端真机的（多半 unlocked/orange），
+    // 本机那套 green/locked 跟它一对就不一致（A09 命中），所以把 B 的说法也写下来，
+    // 由 post-fs-data / daemon 拿它去 resetprop。
+    if let Some(locked) = identity.device_locked {
+        out.push_str(if locked {
+            "device_locked=1\n"
+        } else {
+            "device_locked=0\n"
+        });
+    }
+    if let Some(state) = identity.verified_boot_state {
+        out.push_str(&format!("verified_boot_state={state}\n"));
+    }
+    if let Some(patch) = identity.boot_patchlevel {
+        out.push_str(&format!("boot_patchlevel={patch}\n"));
+    }
     if out.is_empty() {
         return;
     }

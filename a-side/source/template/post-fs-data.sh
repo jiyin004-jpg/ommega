@@ -49,10 +49,41 @@ resetprop -p persist.logd.size ""
 resetprop -p persist.logd.size.crash ""
 resetprop -p persist.logd.size.system ""
 resetprop -p persist.logd.size.main ""
-resetprop ro.boot.flash.locked 1
-resetprop ro.boot.verifiedbootstate green
+# boot 锁定状态：走远程时证书是 B 端真机出的，RootOfTrust 里写的是 B 的说法。
+# 本机属性必须跟它一致，否则 A09（cert locked/state vs prop locked/green）一查就中。
+# 远程身份的落盘由 TA 写（/data/misc/keystore/ommega/remote_identity），这里读它；
+# 还没有这个键（本地模式 / 没出过链）就保持原来的 green+locked。
+_OMMEGA_RI=/data/misc/keystore/ommega/remote_identity
+_ri_locked=$(sed -n 's/^device_locked=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+_ri_state=$(sed -n 's/^verified_boot_state=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+case "$_ri_state" in
+  0) resetprop ro.boot.verifiedbootstate green ;;
+  1) resetprop ro.boot.verifiedbootstate yellow ;;
+  2) resetprop ro.boot.verifiedbootstate orange ;;
+  3) resetprop ro.boot.verifiedbootstate red ;;
+  *) resetprop ro.boot.verifiedbootstate green ;;
+esac
+case "$_ri_locked" in
+  0)
+    resetprop ro.boot.flash.locked 0
+    resetprop ro.boot.vbmeta.device_state unlocked
+    ;;
+  *)
+    resetprop ro.boot.flash.locked 1
+    resetprop ro.boot.vbmeta.device_state locked
+    ;;
+esac
+# boot 补丁级别（719）：证书里是 YYYYMMDD，属性是 YYYY-MM-DD。
+# A 端本地证书这个值是按本机 boot 镜像日期算的，不跟 B 对齐就会像 A14/S06 那样对上。
+_ri_patch=$(sed -n 's/^boot_patchlevel=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+case "$_ri_patch" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+        _ri_patch_fmt=$(printf '%s' "$_ri_patch" | sed 's/^\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)$/\1-\2-\3/')
+        resetprop ro.boot.build.security_patch "$_ri_patch_fmt"
+        ;;
+esac
+unset _OMMEGA_RI _ri_locked _ri_state _ri_patch _ri_patch_fmt
 resetprop ro.boot.veritymode enforcing
-resetprop ro.boot.vbmeta.device_state locked
 resetprop ro.secure 1
 resetprop ro.adb.secure 1
 resetprop ro.debuggable 0

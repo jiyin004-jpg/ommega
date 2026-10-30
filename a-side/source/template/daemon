@@ -226,6 +226,33 @@ sync_remote_identity() {
       device) device_changed=1 ;;
     esac
   done
+  # boot 锁定 / 验证状态 —— 这两项不是 1:1 映射到属性名（值要转文案），单独处理。
+  ri_locked=$(sed -n 's/^device_locked=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
+  case "$ri_locked" in
+    0)
+      resetprop_set ro.boot.vbmeta.device_state unlocked
+      resetprop_set ro.boot.flash.locked 0
+      ;;
+    1)
+      resetprop_set ro.boot.vbmeta.device_state locked
+      resetprop_set ro.boot.flash.locked 1
+      ;;
+  esac
+  ri_state=$(sed -n 's/^verified_boot_state=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
+  case "$ri_state" in
+    0) resetprop_set ro.boot.verifiedbootstate green ;;
+    1) resetprop_set ro.boot.verifiedbootstate yellow ;;
+    2) resetprop_set ro.boot.verifiedbootstate orange ;;
+    3) resetprop_set ro.boot.verifiedbootstate red ;;
+  esac
+  # 719：证书里是 YYYYMMDD，属性是 YYYY-MM-DD
+  ri_patch=$(sed -n 's/^boot_patchlevel=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
+  case "$ri_patch" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+      resetprop_set ro.boot.build.security_patch \
+        "$(printf '%s' "$ri_patch" | sed 's/^\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)$/\1-\2-\3/')"
+      ;;
+  esac
   if [ "$changed" = "1" ]; then
     [ "$model_changed" = "1" ] && resetprop_set ro.product.model "$(sed -n 's/^model=//p' "$REMOTE_IDENTITY_APPLIED" | head -n1)"
     [ "$brand_changed" = "1" ] && resetprop_set ro.product.brand "$(sed -n 's/^brand=//p' "$REMOTE_IDENTITY_APPLIED" | head -n1)"
