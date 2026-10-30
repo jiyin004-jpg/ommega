@@ -461,7 +461,7 @@ impl AuthState {
                         }
                     }
                     // check expiry against activation time
-                    return token_is_valid(db, token, row.duration_seconds);
+                    return token_is_valid(&row, row.duration_seconds);
                 }
             }
         }
@@ -596,27 +596,24 @@ fn prune_rate_bucket(bucket: &mut VecDeque<Instant>, now: Instant, window: Durat
 
 /// Check expiry of an already-activated token. Returns true if not expired.
 /// A token with no `activated_at` is treated as not-yet-activated (valid).
-fn token_is_valid(db: &Arc<Db>, token: &str, duration_seconds: i64) -> bool {
-    match db.get_api_token(token) {
-        Ok(Some(row)) => {
-            if row.activated_at.is_empty() {
-                return true; // not activated yet
-            }
-            // activated_at is stored as `YYYY-MM-DD HH:MM:SS` in Beijing time
-            // (MySQL session time_zone = +08:00). Parse it and add duration_seconds.
-            let act = match parse_beijing_datetime(&row.activated_at) {
-                Some(t) => t,
-                None => return false,
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            now <= act + duration_seconds
-        }
-        Ok(None) => false,
-        Err(_) => false,
+///
+/// 直接吃调用方手里那行，不再自己查一次库 —— 以前 `check_token` 刚查完
+/// 又把 token 传进来重查，同一笔请求两次 MySQL。
+fn token_is_valid(row: &crate::db::ApiTokenRow, duration_seconds: i64) -> bool {
+    if row.activated_at.is_empty() {
+        return true; // not activated yet
     }
+    // activated_at is stored as `YYYY-MM-DD HH:MM:SS` in Beijing time
+    // (MySQL session time_zone = +08:00). Parse it and add duration_seconds.
+    let act = match parse_beijing_datetime(&row.activated_at) {
+        Some(t) => t,
+        None => return false,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now <= act + duration_seconds
 }
 
 /// Parse `YYYY-MM-DD HH:MM:SS` (Beijing time, +08:00) into a unix timestamp
