@@ -273,7 +273,11 @@ struct CachedPick {
 
 /// How long a pick is trusted.  A link that dies is re-picked after at most this
 /// long; much shorter and the cache does nothing.
-const PICK_TTL: Duration = Duration::from_secs(5);
+///
+/// 选了具体接口之后要能「一段时间内优先走它」，不然每 5 秒一次探测（一次完整 HTTP
+/// 往返）把省下的延迟又吃回去。断网由两个机制兜：探测失败会重新选，请求失败会调
+/// `invalidate_pick()` 把这份缓存清掉。
+const PICK_TTL: Duration = Duration::from_secs(60);
 
 /// 「结论是不绑接口」的缓存时间，比选中某个接口长得多。
 ///
@@ -306,6 +310,16 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
             iface,
             at: Instant::now(),
         });
+    }
+}
+
+/// 把选路缓存清掉。
+///
+/// 只在「按这个选路出去结果没通」的时候调（Wi-Fi 刚断、切网、VPN 拉起）：
+/// 缓存的有效期是 PICK_TTL，但那条路是真的会死的，不能等到过期。
+fn invalidate_pick() {
+    if let Ok(mut guard) = PICK_CACHE.lock() {
+        *guard = None;
     }
 }
 
@@ -640,8 +654,11 @@ fn uplink_rank(name: &str) -> u8 {
 ///
 /// Returns `(status, body)`.  HTTP error responses (4xx / 5xx) are returned as
 /// `Ok` with the corresponding status code — only transport-level failures
-/// produce `Err`.  This matches the original hand-written client contract so
-/// callers (`post_json` and its retry logic) behave identically.
+/// produce `Err`.  `post_json` 现在直接拿 `get_client()` / `unbound_client()`
+/// 构造好的两个客户端发请求（这样才能分清「绑定的接口」和「OS 默认路由」
+/// 两条路各自的结果），所以这个便捷函数暂无用偶。保留着，后面还有别的调用点时
+/// 直接用，不用再想到底绑不绑。
+#[allow(dead_code)]
 fn http_request(
     method: &str,
     url: &str,
@@ -753,11 +770,12 @@ impl RemoteRelay {
         // briefly emits a self-signed chain. HTTP error responses are NOT
         // retried — the server answered, and its body carries the real result.
         //
-        // 先按「不绑接口」直发，不预先探测：正常网络下一个往返就够了。
-        // 只有这一发真的失败（默认路由被 VPN 吞了、或者指到死上游）才去探测
-        // 候选接口、绑定后重试——那时多花一次探测是值得的。
+        // 主路走 `get_client()`（它按 `bind_iface` 选/验证接口）：配了 wlan0 就该真的
+        // 从 Wi-Fi 出去 —— 实测 Wi-Fi 30ms、蜂窝 67ms 还带 200ms 尾巴。以前这里先拿
+        // `unbound_client()`（不绑、走 OS 默认路由）直发，bind_iface 只在重试时才生效，
+        // 等于白配。不通时再退回不绑的客户端，让 OS 自己挑路。
         let (status, resp) = match http_request_with(
-            &unbound_client()?,
+            &get_client()?,
             "POST",
             &url,
             &headers,
@@ -766,10 +784,18 @@ impl RemoteRelay {
             Ok(v) => v,
             Err(first) => {
                 log::warn!(
-                    "remote {path} transport error on the default route, retrying bound: {first:#}"
+                    "remote {path} transport error on the bound route, retrying unbound: {first:#}"
                 );
-                http_request("POST", &url, &headers, Some(body_str.as_bytes()))
-                    .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
+                // 这条接口刚死（Wi-Fi 掉了、切网了）：把选路缓存清掉，下一笔重新探。
+                invalidate_pick();
+                http_request_with(
+                    &unbound_client()?,
+                    "POST",
+                    &url,
+                    &headers,
+                    Some(body_str.as_bytes()),
+                )
+                .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
             }
         };
         if !(200..300).contains(&status) {
