@@ -674,10 +674,25 @@ fn reload_from_disk_inner(retire_db_entries: bool) -> Result<bool> {
     let _io_guard = KEYBOX_IO_LOCK.lock().unwrap();
     let (keybox, used_fallback) = load_keybox_with_fallback(KEYBOX_PATH)?;
     let changed = install_keybox(keybox, retire_db_entries, !used_fallback);
-    // StrongBox 那份是可选层：没有文件就是「没配」，读坏了也不影响主 keybox。
+    // StrongBox 那份：没有文件就用内置的，读坏了也一样，永不回落到主 keybox。
     let sb = load_strongbox_keybox();
+    // 换了 StrongBox 的链也要把已缓存的 attestation key 清掉，否则 kmr-ta 会继续用
+    // 上一次初始化好的叶子，面板里换了文件也看不到变化（只有主 keybox 变化才清的
+    // 旧逻辑漏掉了这一边）。
+    let sb_changed = {
+        let old = KEYBOX_SB
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|k| k.identity_digest()));
+        let new = sb.as_ref().map(|k| k.identity_digest());
+        old != new
+    };
     if let Ok(mut guard) = KEYBOX_SB.write() {
         *guard = sb;
+    }
+    if sb_changed {
+        crate::keymaster::keymint_device::clear_initialized_attestation_caches();
+        info!("strongbox keybox identity updated from {STRONGBOX_KEYBOX_PATH}");
     }
     if changed {
         info!(
