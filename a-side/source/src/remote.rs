@@ -337,14 +337,29 @@ fn invalidate_pick() {
 /// is no VPN" (nothing is bound), never a wrong link, and a false positive costs
 /// at most one extra probe.
 fn vpn_present() -> bool {
+    // 每笔请求都会问到（auto 模式下）；readdir `/sys/class/net` + 每个接口
+    // 读 flags，同样存 3 秒。
+    static CACHE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(3);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((present, at)) = *guard {
+            if at.elapsed() < TTL {
+                return present;
+            }
+        }
+    }
     let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
         return false;
     };
-    entries.flatten().any(|e| {
+    let present = entries.flatten().any(|e| {
         e.file_name()
             .to_str()
             .is_some_and(|n| is_vpn_name(n) && iface_is_up(n))
-    })
+    });
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((present, Instant::now()));
+    }
+    present
 }
 
 /// Whether the name looks like a VPN tunnel.
@@ -605,8 +620,25 @@ fn candidates() -> (Vec<String>, Vec<String>) {
 /// 飞行模式、数据与 WiFi 都关的时候，把请求发出去只会白撞一轮连接超时（还要重试
 /// 一次），App 那边早就不等了 —— 看起来就是「远程不通也不回退本地」。
 fn uplink_absent() -> bool {
+    // 这条路每笔请求都会问一次，而 `candidates()` 要读 `/proc/net/route`
+    // + 每个接口的 `operstate` / `physical_like` —— 几十微秒到几毫秒的纯 IO，
+    // 跟“快速失败”这个目的比起来划不来。存 3 秒：飞行模式切回来时最晚 3 秒
+    // 后就能重新发请求，而平时每笔都省掉这一下。
+    static CACHE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(3);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((absent, at)) = *guard {
+            if at.elapsed() < TTL {
+                return absent;
+            }
+        }
+    }
     let (preferred, rest) = candidates();
-    preferred.is_empty() && rest.is_empty()
+    let absent = preferred.is_empty() && rest.is_empty();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((absent, Instant::now()));
+    }
+    absent
 }
 
 /// Splits candidates by "does it look physical", best first inside each group.

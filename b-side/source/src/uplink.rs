@@ -186,14 +186,29 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
 /// 它只决定「要不要开始挑」：漏判的后果跟没 VPN 一样（不绑），不会把链路选错；
 /// 误判最多白花一次探针。
 fn vpn_present() -> bool {
+    // 每笔请求（poll / result / ping）都会问到（auto 模式下）；readdir `/sys/class/net`
+    // + 每个接口读 flags，存 3 秒。VPN 拉起／断开最多晚 3 秒被发现，对选路无影响。
+    static CACHE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(3);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((present, at)) = *guard {
+            if at.elapsed() < TTL {
+                return present;
+            }
+        }
+    }
     let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
         return false;
     };
-    entries.flatten().any(|e| {
+    let present = entries.flatten().any(|e| {
         e.file_name()
             .to_str()
             .is_some_and(|n| is_vpn_name(n) && iface_is_up(n))
-    })
+    });
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((present, Instant::now()));
+    }
+    present
 }
 
 /// 名字像不像 VPN 隧道。
