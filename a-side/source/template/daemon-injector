@@ -42,9 +42,9 @@ LOG_FILE=$LOG_DIR/daemon-injector.log
 # app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
 # 得给它一个自己写得动的位置，权限开到 system 组。
 APP_LOG_DIR=$LOG_FLAG_DIR/logs
-# 换本地兜底 ASK 的通道：往真配置目录里放一份 soter_ask.pem（PKCS#8 PEM），
+# 换本地兜底 ATTK 的通道：往真配置目录里放一份 soter_attk.pem（PKCS#8 PEM），
 # 这里抄到 app 域读得到的位置，再把 SOTER 宿主踢一次让新 key 生效。
-SOTER_ASK_DST=/data/misc/ommega/soter_ask.pem
+SOTER_ATTK_DST=/data/misc/ommega/soter_attk.pem
 # daemon 学到的真机 cpu_id：它自己那份写在 keystore 域（它跑在 keystore uid 里，别处
 # 写不动），这里抄到 app 域给宿主里那份 payload 读。内容就一行 `soter_cpu_id: <32 hex>`。
 SOTER_CPU_ID_DST=/data/misc/ommega/soter_cpu_id
@@ -210,11 +210,11 @@ sync_log_flag() {
     *) [ "$sog_size" -gt 65536 ] && : > "$SIGN_OK_FILE" 2>/dev/null ;;
   esac
   mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
-  # 这个目录里可能放着用户自己替换的 soter_ask.pem（本地兜底的私钥），
+  # 这个目录里可能放着用户自己替换的 soter_attk.pem（本地兜底的签名根），
   # 所以不能让 other 进得来读：属主给 system(1000) 是因为 app 域的 payload
   # 要进来读开关和钥匙。
   chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
-  # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_ask.pem（本地兜底
+  # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_attk.pem（本地兜底
   # 私钥，0640）还在别的权限保护着，列不出来也读不到；但宿主得能穿过这一层去
   # 写 logs/，所以 x 必须给。每轮都补：boot 时的 restorecon 不碰权限，但用户
   # 手动改过或者从别的版本升上来就不一定了。
@@ -233,35 +233,35 @@ soter_pid() {
   pidof "$SOTER_PKG" 2>/dev/null | awk '{print $1}'
 }
 
-# 配置目录里的 soter_ask.pem 变过就抄一份到 app 域能读的位置（宿主进不去 keystore
-# 目录）。抄完置 soter_ask_changed=1，主循环把宿主踢掉重来。
-sync_soter_ask() {
-  soter_ask_changed=0
-  src=$(dirname "$CONF_PATH")/soter_ask.pem
+# 配置目录里的 soter_attk.pem 变过就抄一份到 app 域能读的位置（宿主进不去 keystore
+# 目录）。抄完置 soter_attk_changed=1，主循环把宿主踢掉重来。
+sync_soter_attk() {
+  soter_attk_changed=0
+  src=$(dirname "$CONF_PATH")/soter_attk.pem
 
   # 源没了就把镜像那份也删掉，回到 payload 里编进去的那把。只做单向镜像不改的话，
   # 换过一次钥匙之后，就算把文件删了也还是那把旧的（镜像还在）。
   if [ ! -f "$src" ]; then
-    if [ -f "$SOTER_ASK_DST" ]; then
-      if rm -f "$SOTER_ASK_DST" 2>/dev/null; then
-        soter_ask_changed=1
+    if [ -f "$SOTER_ATTK_DST" ]; then
+      if rm -f "$SOTER_ATTK_DST" 2>/dev/null; then
+        soter_attk_changed=1
         log "[injector-daemon] local soter ask removed; back to the built-in key"
       fi
     fi
     return 0
   fi
 
-  if [ -f "$SOTER_ASK_DST" ] \
-    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_ASK_DST" 2>/dev/null)" ]; then
+  if [ -f "$SOTER_ATTK_DST" ] \
+    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_ATTK_DST" 2>/dev/null)" ]; then
     return 0
   fi
 
-  if cp -f "$src" "$SOTER_ASK_DST" 2>/dev/null; then
+  if cp -f "$src" "$SOTER_ATTK_DST" 2>/dev/null; then
     # 640 而不是 644：这是私钥。app 域的 payload 是 uid 1000，靠 system
     # 组权限读得到，其他 app 就不行了。
-    chown 0:1000 "$SOTER_ASK_DST" 2>/dev/null
-    chmod 0640 "$SOTER_ASK_DST" 2>/dev/null
-    soter_ask_changed=1
+    chown 0:1000 "$SOTER_ATTK_DST" 2>/dev/null
+    chmod 0640 "$SOTER_ATTK_DST" 2>/dev/null
+    soter_attk_changed=1
     log "[injector-daemon] local soter ask updated from $src"
     # 文件里带了 cpu_id 就跟着设 force：ATTK 和 cpu_id 必须是同一台设备的，
     # 不然腾讯验 ASK 时对不上直接拒（2026-10-30 实测）。
@@ -276,7 +276,7 @@ sync_soter_ask() {
       fi
     fi
   else
-    log "[injector-daemon] failed to copy $src to $SOTER_ASK_DST"
+    log "[injector-daemon] failed to copy $src to $SOTER_ATTK_DST"
   fi
 }
 
@@ -472,7 +472,7 @@ restart_keystore() {
 
 mkdir -p "$STATE_DIR"
 LOG_ON=0
-soter_ask_changed=0
+soter_attk_changed=0
 sog_once=0
 pending_restart=0
 last_attempt_pid=
@@ -556,9 +556,9 @@ while true; do
     sync_foreground
   fi
   tick=$((tick + 1))
-  sync_soter_ask
+  sync_soter_attk
   sync_soter_cpu_id
-  if [ "$soter_ask_changed" = "1" ]; then
+  if [ "$soter_attk_changed" = "1" ]; then
     # ASK/ATTK 换了：keystore2 里那份 payload 的 state（ATTK 与已加载的 ASK）是启动时
     # 一次性加载的，只踢 SOTER 宿主不会重读，必须让 keystore2 重新注入一次。
     : > "$RESTART_FILE"

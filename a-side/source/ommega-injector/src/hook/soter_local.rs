@@ -58,27 +58,18 @@ const SALT_LEN: i32 = 32;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
-/// 换本地兜底 ASK 用的文件（PKCS#8 PEM，`openssl genpkey -algorithm RSA` 那种）。
+/// 换本地兜底 ATTK 用的文件（PKCS#8 PEM，`openssl genpkey -algorithm RSA` 那种）。
 /// 存在且解析得过就用它，跟 keybox 一个路子：丢文件进去、重启 SOTER 宿主就生效。
 ///
 /// 两个位置对应两个域，谁在哪个域里读得到就认谁：
 /// - `/data/misc/ommega/`：payload 落进 app 域（SOTER 宿主是 uid 1000）时读得到；
 /// - `/data/misc/keystore/ommega/`：跟真配置同一个目录，keystore 域读得到。
-const ASK_FILE_PATHS: [&str; 2] = [
-    "/data/misc/ommega/soter_ask.pem",
-    "/data/misc/keystore/ommega/soter_ask.pem",
+const ATTK_FILE_PATHS: [&str; 2] = [
+    "/data/misc/ommega/soter_attk.pem",
+    "/data/misc/keystore/ommega/soter_attk.pem",
 ];
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
-const ASK_FILE_ENV: &str = "OMMEGA_SOTER_ASK_PEM";
-
-/// 独立的 ASK 私钥（可选）。有它的时候两条路分开：`exportAskPublicKey` 吐它的公钥，
-/// `exportAttkPublicKey` 吐 ATTK 的公钥 —— 真机上这两个永远不相等，相等就是假的。
-/// 没有就退回旧行为（ASK 兼 ATTK）。
-const ASK_KEY_FILE_PATHS: [&str; 2] = [
-    "/data/misc/ommega/soter_ask_key.pem",
-    "/data/misc/keystore/ommega/soter_ask_key.pem",
-];
-const ASK_KEY_FILE_ENV: &str = "OMMEGA_SOTER_ASK_KEY_PEM";
+const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
 /// counter 起点。真机上这个号早就几千了（PLC110 实测 7394），从 1 开始会被当回滚。
 const COUNTER_BASE: u64 = 10_000;
@@ -203,7 +194,7 @@ struct State {
 
 /// ATTK 到底从哪儿来的（换 key 之后一眼看得出生效没有）。
 static ATTK_ORIGIN: OnceLock<String> = OnceLock::new();
-/// uid -> 该 uid 的 ASK 来自哪里（per-uid 文件 / 旧全局文件 / 现生成）。
+/// uid -> 该 uid 的 ASK 来自哪里（per-uid store / 旧 per-uid 文件迁移 / 现生成）。
 static ASK_ORIGINS: std::sync::LazyLock<Mutex<HashMap<i32, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -232,11 +223,11 @@ pub(crate) fn ask_origin() -> Option<String> {
 fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let from_env =
-        override_path.or_else(|| std::env::var_os(ASK_FILE_ENV).map(std::path::PathBuf::from));
+        override_path.or_else(|| std::env::var_os(ATTK_FILE_ENV).map(std::path::PathBuf::from));
     if let Some(path) = from_env {
         candidates.push(path);
     }
-    candidates.extend(ASK_FILE_PATHS.iter().map(std::path::PathBuf::from));
+    candidates.extend(ATTK_FILE_PATHS.iter().map(std::path::PathBuf::from));
 
     for path in candidates {
         let Ok(pem) = std::fs::read_to_string(&path) else {
@@ -388,7 +379,7 @@ fn forget_uid_keys(uid: i32) {
 static ATTK_STAMP: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
 
 fn attk_stamp() -> Option<std::time::SystemTime> {
-    ASK_FILE_PATHS
+    ATTK_FILE_PATHS
         .iter()
         .filter_map(|path| {
             std::fs::metadata(path)
@@ -443,15 +434,6 @@ fn ask_for(state: &State, uid: i32) -> Option<Key> {
 /// 读某个 uid 的 ASK：环境变量 → 单文件 store → 旧的 per-uid 文件（读到就迁走）→
 /// 旧的全局文件 → 现生成并写进 store。
 fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
-    if let Some(path) = std::env::var_os(ASK_KEY_FILE_ENV) {
-        let path = std::path::PathBuf::from(path);
-        if let Ok(pem) = std::fs::read_to_string(&path) {
-            if let Some(key) = Key::from_pem(&pem) {
-                return Some((key, path.display().to_string()));
-            }
-        }
-    }
-
     if let Some(pem) = read_store_pem(ASK_SECTION, &uid.to_string()) {
         match Key::from_pem(&pem) {
             Some(key) => return Some((key, format!("store:uid={uid}"))),
@@ -480,20 +462,6 @@ fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
             None => format!("file:{path}"),
         };
         return Some((key, origin));
-    }
-
-    // 兼容更旧的全局那一把（所有 uid 共用）。升级上来的设备先跑这里，
-    // 以后重新建料时自然收敛到 store 里的 per-uid 条目。
-    for path in ASK_KEY_FILE_PATHS {
-        let Ok(pem) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match Key::from_pem(&pem) {
-            Some(key) => return Some((key, format!("legacy:{path}"))),
-            None => log::warn!(
-                "soter local legacy ask at {path} is not a usable PKCS#8 PEM; ignoring it"
-            ),
-        }
     }
 
     generate_ask_for(uid)
@@ -1665,7 +1633,7 @@ mod tests {
     #[test]
     fn a_supplied_attk_file_wins_over_the_embedded_one() {
         let pem = fresh_pem();
-        let path = temp_pem("soter_ask.pem", &pem);
+        let path = temp_pem("soter_attk.pem", &pem);
         let (key, origin) = load_attk_key_with(Some(path.clone())).expect("the file must be used");
 
         // 用的确实是文件里那把，不是编进来的那把
