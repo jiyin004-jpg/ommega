@@ -95,7 +95,14 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         None
     } else {
         match Db::open(&cfg.mysql_url) {
-            Ok(d) => Some(Arc::new(d)),
+            Ok(d) => {
+                // 旧库补列：卡密绑设备用的 bound_serial / bound_sn / bound_at。
+                // 建表是手工做的（没 DDL 文件），所以启动时自己对齐。
+                if let Err(e) = d.ensure_token_device_columns() {
+                    tracing::warn!("api_token device-binding columns not ensured: {e}");
+                }
+                Some(Arc::new(d))
+            }
             Err(e) => {
                 tracing::warn!("DB open failed ({e}); running without persistence");
                 None
@@ -177,6 +184,9 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         )
         .route("/api/card/order/status/", post(card::card_order_status))
         .route("/api/card/query/", post(card::card_query_by_contact))
+        // 卡密自助查询 / 解绑（凭卡密本身，无需登录）
+        .route("/api/card/lookup/", post(card::card_lookup))
+        .route("/api/card/unbind/", post(card::card_unbind))
         .route("/api/cert_chain_dump/", get(handlers::cert_chain_dump))
         // 公开 keybox：A 端匿名取，内容是从公开仓库采的，无需鉴权。
         .route("/api/keybox/public/", get(handlers::public_keybox))
@@ -221,6 +231,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         )
         .route("/api/admin/tokens/", get(admin::admin_tokens))
         .route("/api/admin/tokens/", post(admin::admin_generate_token))
+        .route("/api/admin/token_unbind/", post(admin::admin_token_unbind))
         .route(
             "/api/admin/autokeybox/",
             get(admin::admin_autokeybox_status),

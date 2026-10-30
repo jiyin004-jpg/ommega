@@ -4,6 +4,9 @@
 
 ## 1.7.11
 
+- 私卡绑定设备：A 端第一次成功请求时，服务端把 `api_token` 的 `bound_serial` / `bound_sn` 记成当前机器的 `ro.serialno` / `ro.boot.serialno`，之后每次请求都要对得上，换设备直接被拒（401）。公开卡和配对卡不参与绑定。
+- 卡密自助页：`/card` 底部加了「查询卡密 / 解绑设备」。完整输入卡密才显示内容，能看到卡密、备注、作用域、首次激活、有效期、当前绑定设备，并能就地解绑。
+- 控制台 Token 管理加了「绑定设备」列和解绑按钮（只对私卡显示），公开卡照旧不受限。
 - MODULE_HASH 的 bootstrap 不再按 KeyMint 版本卡：framework 只在 KM4+ 上主动调 setAdditionalAttestationInfo，但 getSupplementaryAttestationInfo(MODULE_HASH) 不看 HAL 版本、照样返回本机 APEX 摘要，KM3 设备上就成了「证书没有 724、接口却给出 bundle」的矛盾，远程铸证也因此转发不了。现在 bundle 拿得到就写上，本地和转发两条路都有 724。
 - 远程铸证补上 MODULE_HASH（tag 724）：本地路径一直有，走中继时 A 端从来不转发这个摘要，铸出的叶子缺 724，设备侧 getSupplementaryAttestationInfo(MODULE_HASH) 却仍返回本机 APEX 摘要，校验方据此报缺失。现在 A 端从 SetAdditionalAttestationInfo 取值原样下发，服务端按 [724] EXPLICIT OCTET STRING 写出（PR #11）。
 - 面板「AOSP 密钥」预设换成仍然有效的那条 AOSP 软件链（RSA，2035-12-30 到期）：原来那条 EC 中级证书 2026-01-08 就过期了，同块的 RSA 条目还缺证书链，keybox.rs 会判整份 keybox 无效、根本加载不上。

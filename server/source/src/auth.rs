@@ -23,6 +23,22 @@ pub struct TokenMeta {
     pub kind: String,
 }
 
+/// 请求方带过来的设备指纹：`ro.serialno` 与 `ro.boot.serialno`。
+///
+/// A 端私卡首次成功鉴权时把这两个值写进 `api_token`，之后每次请求
+/// 必须跟已绑定的一致，换设备就过不去（要换机器得先在 /card 页面解绑）。
+#[derive(Debug, Clone, Default)]
+pub struct DeviceFp {
+    pub serial: String,
+    pub sn: String,
+}
+
+impl DeviceFp {
+    pub fn is_empty(&self) -> bool {
+        self.serial.trim().is_empty() && self.sn.trim().is_empty()
+    }
+}
+
 impl TokenMeta {
     /// 能不能跟另一端的 token 配对互通。
     ///
@@ -326,7 +342,16 @@ impl AuthState {
     /// `None` for role-agnostic endpoints (ping/health). Returns true when the
     /// request is authorized. Also activates the token on first use and records
     /// the client IP.
-    pub fn check_token(&self, header: Option<&str>, role: Option<&str>, ip: &str) -> bool {
+    ///
+    /// `fp`: 设备指纹（`ro.serialno` / `ro.boot.serialno`）。A 端私卡用它做
+    /// 首次绑定与后续一致性校验；B 端几百台共用一把 token，不参与绑定。
+    pub fn check_token(
+        &self,
+        header: Option<&str>,
+        role: Option<&str>,
+        ip: &str,
+        fp: Option<&DeviceFp>,
+    ) -> bool {
         let token = header.unwrap_or("");
 
         // 1) static env token (back-compat)
@@ -346,6 +371,21 @@ impl AuthState {
                     }
                     // activated / expiry (activation-based)
                     if !row.enabled {
+                        return false;
+                    }
+                    // 私卡绑定设备：首次带指纹就绑，之后每次都要对得上
+                    if role == Some("a")
+                        && Self::is_private_card(&row)
+                        && !Self::device_binding_ok(db, &row, fp)
+                    {
+                        tracing::warn!(
+                            "check_token: device mismatch token={} bound=({},{}) got=({},{})",
+                            token,
+                            row.bound_serial,
+                            row.bound_sn,
+                            fp.map(|f| f.serial.as_str()).unwrap_or("-"),
+                            fp.map(|f| f.sn.as_str()).unwrap_or("-")
+                        );
                         return false;
                     }
                     // activate on first use
@@ -390,6 +430,49 @@ impl AuthState {
         false
     }
 
+    /// 这张卡是不是「私卡」：私发、需要跟设备绑定的那种。
+    ///
+    /// `public`（公开测试）和 `pair`（专用配对）都不绑：前者本来就不限设备，
+    /// 后者已经用 pair_id 限住了互通范围。老卡密 kind 为空，按私卡处理 ——
+    /// 它们是单发出去的，换设备该拒。
+    fn is_private_card(row: &crate::db::ApiTokenRow) -> bool {
+        row.kind.is_empty() || row.kind.eq_ignore_ascii_case("private")
+    }
+
+    /// 设备指纹一致性检查：没绑就绑上，绑了就要求每次都对上。
+    ///
+    /// 两个细节：
+    /// - 两者都空时只绑定不检查（不传指纹的老 A 端仍能用，但永远绑不上）；
+    /// - 旧库里可能只记了其中一项，那就只比非空的那项。
+    fn device_binding_ok(
+        db: &Arc<Db>,
+        row: &crate::db::ApiTokenRow,
+        fp: Option<&DeviceFp>,
+    ) -> bool {
+        let bound_serial = row.bound_serial.trim();
+        let bound_sn = row.bound_sn.trim();
+
+        if bound_serial.is_empty() && bound_sn.is_empty() {
+            if let Some(fp) = fp {
+                if !fp.is_empty() {
+                    if let Err(e) = db.bind_token_device(&row.token, &fp.serial, &fp.sn) {
+                        tracing::warn!("bind_token_device failed token={} err={e}", row.token);
+                    }
+                }
+            }
+            return true;
+        }
+
+        let Some(fp) = fp else { return false };
+        if fp.is_empty() {
+            // 已绑定的卡却不报指纹：只能当不匹配，不然换个客户端不带 header 就绕过了。
+            return false;
+        }
+        let serial_ok = bound_serial.is_empty() || fp.serial.trim() == bound_serial;
+        let sn_ok = bound_sn.is_empty() || fp.sn.trim() == bound_sn;
+        serial_ok && sn_ok
+    }
+    /// Returns true if the request is allowed.
     /// Sliding-window rate limit. `key` 就是客户端 IP（见 check_auth）。
     /// Returns true if the request is allowed.
     pub fn allow(&self, key: &str) -> bool {

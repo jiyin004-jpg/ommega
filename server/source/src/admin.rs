@@ -577,6 +577,9 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
                     "last_used_at": t.last_used_at,
                     "kind": t.kind,
                     "pair_id": t.pair_id,
+                    "bound_serial": t.bound_serial,
+                    "bound_sn": t.bound_sn,
+                    "bound_at": t.bound_at,
                 })
             })
             .collect(),
@@ -591,6 +594,57 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
         }
     };
     Json(json!({ "status": "ok", "tokens": tokens })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct TokenUnbindBody {
+    pub token: String,
+}
+
+/// POST /api/admin/token_unbind/ — 控制台里给私卡解绑设备。
+///
+/// 只清设备指纹，不动激活时间与有效期；公开卡/配对卡不参与绑定，调了也只是
+/// 返回“本来就没绑”。
+pub async fn admin_token_unbind(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TokenUnbindBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    let token = body.token.trim().to_string();
+    if token.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "token is required");
+    }
+    let db2 = db.clone();
+    let token2 = token.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let row = db2
+            .get_api_token(&token2)
+            .map_err(|e| format!("db error: {e}"))?
+            .ok_or("token not found")?;
+        db2.unbind_token_device(&token2)
+            .map_err(|e| format!("db error: {e}"))?;
+        Ok::<_, String>((row.bound_serial, row.bound_sn))
+    })
+    .await;
+    match result {
+        Ok(Ok((serial, sn))) => Json(json!({
+            "status": "ok",
+            "released_serial": serial,
+            "released_sn": sn,
+        }))
+        .into_response(),
+        Ok(Err(e)) => json_err(StatusCode::NOT_FOUND, &e),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
 }
 
 /// POST /api/admin/tokens/ — generate a new API token.

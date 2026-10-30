@@ -719,9 +719,18 @@ impl RemoteRelay {
             );
         }
         let body_str = serde_json::to_string(body)?;
+        // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验（换机要解绑）。
+        // `ro.serialno` 与 `ro.boot.serialno` 在大多数机器上相同，但个别机型只
+        // 有一个 —— 两个都带上，服务端会各自比对非空的那项。
+        let dev_serial =
+            crate::plat::resetprop::read_string_property("ro.serialno").unwrap_or_default();
+        let dev_sn =
+            crate::plat::resetprop::read_string_property("ro.boot.serialno").unwrap_or_default();
         let headers = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             ("X-Relay-Token".to_string(), Self::token()?),
+            ("X-Device-Serial".to_string(), dev_serial),
+            ("X-Device-Sn".to_string(), dev_sn),
         ];
         // Transient transport failures (connect timeout, network jitter, TLS
         // handshake) are retried once before giving up. Without the retry a

@@ -43,6 +43,22 @@ fn token_from_headers(headers: &HeaderMap) -> Option<&str> {
         .or_else(|| headers.get("x-api-token").and_then(|v| v.to_str().ok()))
 }
 
+/// A 端上报的设备指纹（私卡绑定用）。缺哪个就是空串，不做额外校验。
+fn device_fp_from_headers(headers: &HeaderMap) -> crate::auth::DeviceFp {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    crate::auth::DeviceFp {
+        serial: get("x-device-serial"),
+        sn: get("x-device-sn"),
+    }
+}
+
 pub(crate) fn client_ip(headers: &HeaderMap) -> String {
     // Prefer X-Real-IP injected by the inject_client_ip middleware, which is the
     // actual TCP socket address. X-Forwarded-For is client-supplied and trivially
@@ -119,6 +135,7 @@ async fn check_auth(
 ) -> Result<String, Box<Response>> {
     let token = token_from_headers(headers).unwrap_or("").to_string();
     let ip = client_ip(headers);
+    let fp = device_fp_from_headers(headers);
 
     // IP allow/deny filter (A/B-side only; admin uses its own session auth).
     if !state.auth.ip_allowed(&ip) {
@@ -137,9 +154,12 @@ async fn check_auth(
         let token = token.clone();
         let ip = ip.clone();
         let role = role.map(str::to_string);
-        tokio::task::spawn_blocking(move || auth.check_token(Some(&token), role.as_deref(), &ip))
-            .await
-            .unwrap_or(false)
+        let fp = fp.clone();
+        tokio::task::spawn_blocking(move || {
+            auth.check_token(Some(&token), role.as_deref(), &ip, Some(&fp))
+        })
+        .await
+        .unwrap_or(false)
     };
     if !authorized {
         if !state.auth.allow_invalid(&ip) {

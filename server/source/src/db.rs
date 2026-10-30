@@ -106,6 +106,12 @@ pub struct ApiTokenRow {
     pub pair_id: String,
     /// `"pair"`（专用配对）/ `"public"`（公开测试）/ 空（老卡密）。
     pub kind: String,
+    /// 首次激活时绑定的设备序列号（`ro.serialno`）。空 = 还没绑定。
+    pub bound_serial: String,
+    /// 首次激活时绑定的设备 SN（`ro.boot.serialno`）。空 = 还没绑定。
+    pub bound_sn: String,
+    /// 绑定的时间（北京时间字符串）。
+    pub bound_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +408,9 @@ impl Db {
             last_used_at: row_str(&row, "last_used_at"),
             pair_id: row_str(&row, "pair_id"),
             kind: row_str(&row, "kind"),
+            bound_serial: row_str(&row, "bound_serial"),
+            bound_sn: row_str(&row, "bound_sn"),
+            bound_at: row_str(&row, "bound_at"),
         })
     }
 
@@ -448,7 +457,8 @@ impl Db {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
-                    created_at, last_ip, last_used_at, pair_id, kind
+                    created_at, last_ip, last_used_at, pair_id, kind,
+                    bound_serial, bound_sn, bound_at
              FROM api_token ORDER BY id DESC",
             (),
         )?;
@@ -464,7 +474,8 @@ impl Db {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
-                    created_at, last_ip, last_used_at, pair_id, kind
+                    created_at, last_ip, last_used_at, pair_id, kind,
+                    bound_serial, bound_sn, bound_at
              FROM api_token WHERE token = :token LIMIT 1",
             params! {
                 "token" => token,
@@ -474,6 +485,71 @@ impl Db {
             Some(r) => Ok(Some(Self::api_token_from_row(r)?)),
             None => Ok(None),
         }
+    }
+
+    /// 首次给卡密绑设备（只写还没绑的那行）。返回 true = 本次真的写进去了。
+    ///
+    /// 用 `WHERE bound_serial IS NULL` 做乐观锁，两台设备同时首次请求时只有
+    /// 一台能绑上，另一台下次请求就会被按「不匹配」拒掉 —— 这正是想要的：
+    /// 卡密跟着第一台设备走。
+    pub fn bind_token_device(&self, token: &str, serial: &str, sn: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "UPDATE api_token
+                SET bound_serial = :serial, bound_sn = :sn, bound_at = NOW()
+              WHERE token = :token AND (bound_serial IS NULL OR bound_serial = '')",
+            params! {
+                "serial" => serial,
+                "sn" => sn,
+                "token" => token,
+            },
+        )?;
+        Ok(conn.affected_rows() > 0)
+    }
+
+    /// 解绑：清掉设备指纹，不改激活时间与有效期（下次使用重新绑定）。
+    pub fn unbind_token_device(&self, token: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "UPDATE api_token
+                SET bound_serial = NULL, bound_sn = NULL, bound_at = NULL
+              WHERE token = :token",
+            params! { "token" => token },
+        )?;
+        Ok(conn.affected_rows() > 0)
+    }
+
+    /// 旧库补列：线上 `api_token` 是手工建的，没有 DDL 文件，升级时要能自己补上。
+    /// 用 information_schema 先查再加（MySQL 8 的 `ADD COLUMN IF NOT EXISTS` 只在
+    /// MariaDB 有，不能直接用）。
+    pub fn ensure_token_device_columns(&self) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        let existing: Vec<String> = conn.exec(
+            "SELECT column_name FROM information_schema.columns
+              WHERE table_schema = DATABASE() AND table_name = 'api_token'",
+            (),
+        )?;
+        for (col, ddl) in [
+            (
+                "bound_serial",
+                "ALTER TABLE api_token ADD COLUMN bound_serial VARCHAR(64) NULL",
+            ),
+            (
+                "bound_sn",
+                "ALTER TABLE api_token ADD COLUMN bound_sn VARCHAR(64) NULL",
+            ),
+            (
+                "bound_at",
+                "ALTER TABLE api_token ADD COLUMN bound_at DATETIME NULL",
+            ),
+        ] {
+            if existing.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                continue;
+            }
+            conn.query_drop(ddl)?;
+            tracing::info!("api_token: added column {col}");
+        }
+        Ok(())
     }
 
     /// Set `activated_at` on first use (activation-based expiry). Returns true

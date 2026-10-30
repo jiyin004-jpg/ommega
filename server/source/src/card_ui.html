@@ -8,7 +8,7 @@
   :root {
     --bg: #0d1117; --panel: #161b22; --panel2: #1c2230;
     --border: #2a3240; --text: #e6edf3; --muted: #8b949e;
-    --green: #3fb950; --blue: #4f7cff;
+    --green: #3fb950; --blue: #4f7cff; --red: #f85149;
   }
   * { box-sizing: border-box; }
   body {
@@ -45,6 +45,34 @@
     color: #9db8ff; font-size: 15px; font-weight: 700; letter-spacing: .5px;
   }
   .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 8px; }
+
+  /* 卡密查询 / 解绑 */
+  .row { display: flex; gap: 10px; }
+  .row input {
+    flex: 1; min-width: 0; padding: 11px 13px; border-radius: 8px;
+    border: 1px solid var(--border); background: #0b0f14; color: var(--text);
+    font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+  }
+  .row input:focus { outline: none; border-color: var(--blue); }
+  button {
+    padding: 11px 18px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); font-size: 13.5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--blue); }
+  button:disabled { opacity: .55; cursor: default; }
+  button.danger { border-color: rgba(248,81,73,.45); color: #ff9a93; }
+  button.danger:hover { border-color: var(--red); }
+  .msg { margin-top: 12px; font-size: 13px; color: var(--muted); min-height: 18px; }
+  .msg.err { color: #ff9a93; }
+  .msg.ok { color: var(--green); }
+  .info { margin-top: 14px; border-top: 1px dashed var(--border); padding-top: 14px; }
+  .kv { display: flex; gap: 12px; padding: 7px 0; font-size: 13.5px; }
+  .kv > span { width: 76px; flex: none; color: var(--muted); }
+  .kv > code, .kv > b {
+    flex: 1; min-width: 0; font-weight: 500; word-break: break-all;
+  }
+  .kv > code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; color: #9db8ff; }
+  .hint { margin-top: 10px; font-size: 12px; color: var(--muted); line-height: 1.7; }
 </style>
 </head>
 <body>
@@ -90,7 +118,144 @@
     </div>
   </div>
 
+  <div class="panel">
+    <h2>查询卡密 / 解绑设备</h2>
+    <div class="body">
+      <div class="row">
+        <input id="tk" placeholder="完整卡密（必须一模一样）" autocomplete="off" spellcheck="false">
+        <button id="btnLookup">查询</button>
+      </div>
+      <div id="tkMsg" class="msg"></div>
+
+      <div id="tkInfo" class="info" hidden>
+        <div class="kv"><span>卡密</span><code id="fToken"></code></div>
+        <div class="kv"><span>备注</span><b id="fNote"></b></div>
+        <div class="kv"><span>作用域</span><b id="fScope"></b></div>
+        <div class="kv"><span>首次激活</span><b id="fAct"></b></div>
+        <div class="kv"><span>有效期至</span><b id="fExp"></b></div>
+        <div class="kv"><span>绑定设备</span><b id="fBound"></b></div>
+        <div class="kv"><span>最近使用</span><b id="fLast"></b></div>
+        <button id="btnUnbind" class="danger">解绑这台设备</button>
+        <div class="hint">解绑只清掉设备绑定，激活时间和有效期不变；下次使用会绑定到新的设备。</div>
+      </div>
+
+      <div class="hint">只有完整输入卡密才能查到内容。换了手机、或者提示「设备不匹配」时，在这里解绑后重新用一次即可。</div>
+    </div>
+  </div>
+
   <div class="foot">卡密首次使用开始计时，到期自动失效。</div>
 </div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var tokenInput = $("tk"), msg = $("tkMsg"), info = $("tkInfo");
+  var btnLookup = $("btnLookup"), btnUnbind = $("btnUnbind");
+  var current = "";
+
+  function setMsg(text, kind) {
+    msg.textContent = text || "";
+    msg.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  function fmtDuration(sec) {
+    if (sec < 0) return "已过期";
+    var d = Math.floor(sec / 86400);
+    var h = Math.floor((sec % 86400) / 3600);
+    if (d > 0) return d + " 天 " + h + " 小时";
+    if (h > 0) return h + " 小时";
+    return Math.floor(sec / 60) + " 分钟";
+  }
+
+  function show(data) {
+    current = data.token;
+    $("fToken").textContent = data.token;
+    $("fNote").textContent = data.note || "—";
+    $("fScope").textContent = data.scope || "—";
+    $("fAct").textContent = data.activated_at || "未激活（首次使用开始计时）";
+
+    if (!data.activated_at) {
+      $("fExp").textContent = "未开始计时";
+    } else if (data.expires_at === "永久") {
+      $("fExp").textContent = "永久";
+    } else {
+      var left = data.remaining_seconds;
+      $("fExp").textContent = (data.expires_at || "—") + "（" + fmtDuration(left) + "）";
+    }
+
+    if (data.bound_serial || data.bound_sn) {
+      $("fBound").textContent = (data.bound_serial || "—") + " / " + (data.bound_sn || "—");
+      btnUnbind.disabled = false;
+      btnUnbind.textContent = "解绑这台设备";
+    } else {
+      $("fBound").textContent = "未绑定（下次使用自动绑定当前设备）";
+      btnUnbind.disabled = true;
+      btnUnbind.textContent = "当前没有绑定";
+    }
+
+    $("fLast").textContent = data.last_used_at
+      ? data.last_used_at + (data.last_ip ? " · " + data.last_ip : "")
+      : "—";
+
+    info.hidden = false;
+  }
+
+  function post(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        return { ok: r.ok, status: r.status, data: j };
+      });
+    });
+  }
+
+  btnLookup.addEventListener("click", function () {
+    var t = tokenInput.value.trim();
+    info.hidden = true;
+    current = "";
+    if (!t) { setMsg("请先输入完整卡密", "err"); return; }
+    btnLookup.disabled = true;
+    setMsg("查询中…");
+    post("/api/card/lookup/", { token: t }).then(function (res) {
+      btnLookup.disabled = false;
+      if (!res.ok) {
+        setMsg((res.data && res.data.error) || "卡密不存在", "err");
+        return;
+      }
+      setMsg("查询成功", "ok");
+      show(res.data);
+    }).catch(function (e) {
+      btnLookup.disabled = false;
+      setMsg("请求失败：" + e.message, "err");
+    });
+  });
+
+  btnUnbind.addEventListener("click", function () {
+    if (!current) return;
+    if (!confirm("确定解绑这张卡上的设备？解绑后下次使用会绑定新设备。")) return;
+    btnUnbind.disabled = true;
+    post("/api/card/unbind/", { token: current }).then(function (res) {
+      if (!res.ok) {
+        btnUnbind.disabled = false;
+        setMsg((res.data && res.data.error) || "解绑失败", "err");
+        return;
+      }
+      setMsg((res.data && res.data.message) || "已解绑", "ok");
+      $("fBound").textContent = "未绑定（下次使用自动绑定当前设备）";
+      btnUnbind.textContent = "当前没有绑定";
+    }).catch(function (e) {
+      btnUnbind.disabled = false;
+      setMsg("请求失败：" + e.message, "err");
+    });
+  });
+
+  tokenInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") btnLookup.click();
+  });
+})();
+</script>
 </body>
 </html>

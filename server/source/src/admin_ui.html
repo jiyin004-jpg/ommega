@@ -427,8 +427,8 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
     </div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>Token</th><th>角色</th><th>类型</th><th>配对组</th><th>有效期</th><th>状态</th><th>激活时间</th><th>最后使用 IP</th><th>最后使用时间</th><th>备注</th><th>操作</th></tr></thead>
-      <tbody id="tokenBody"><tr><td colspan="11" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>Token</th><th>角色</th><th>类型</th><th>配对组</th><th>有效期</th><th>状态</th><th>激活时间</th><th>最后使用 IP</th><th>最后使用时间</th><th>备注</th><th>绑定设备</th><th>操作</th></tr></thead>
+      <tbody id="tokenBody"><tr><td colspan="12" class="empty">加载中…</td></tr></tbody>
     </table>
     </div>
     <div class="collapse-bar" id="tokenCollapse" style="display:none" onclick="toggleCollapse('token')">显示全部</div>
@@ -900,6 +900,23 @@ async function deleteToken(id) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+// 私卡解绑：只清设备指纹，激活时间与有效期不变；下次使用重新绑定。
+async function unbindToken(encodedToken) {
+  const token = decodeURIComponent(encodedToken);
+  if (!confirm('确认解绑这张卡的设备？下次使用会绑定到新的设备。')) return;
+  try {
+    const d = await api('/api/admin/token_unbind/', {
+      method: 'POST',
+      body: JSON.stringify({ token })
+    });
+    const released = d && (d.released_serial || d.released_sn)
+      ? `（原设备 ${d.released_serial || '-'} / ${d.released_sn || '-'}）`
+      : '';
+    toast('已解绑' + released);
+    loadTokens();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 async function viewTokenIps(tokenEncoded) {
   const token = decodeURIComponent(tokenEncoded);
   openModal('历史使用 IP', '加载中…');
@@ -1057,7 +1074,7 @@ function renderTokens() {
     ? `${filtered.length} / ${_tokenData.length} 条`
     : `${_tokenData.length} 条`;
   if (!filtered.length) {
-    document.getElementById('tokenBody').innerHTML = '<tr><td colspan="11" class="empty">' + (q ? '无匹配 Token' : '暂无 API Token') + '</td></tr>';
+    document.getElementById('tokenBody').innerHTML = '<tr><td colspan="12" class="empty">' + (q ? '无匹配 Token' : '暂无 API Token') + '</td></tr>';
     document.getElementById('tokenCollapse').style.display = 'none';
     return;
   }
@@ -1078,8 +1095,14 @@ function renderTokens() {
       <td class="mono">${esc(t.last_ip || '—')}</td>
       <td>${t.last_used_at ? fmtTimeStr(t.last_used_at) : '—'}</td>
       <td>${esc(t.note || '—')}</td>
+      <td class="mono">${(t.bound_serial || t.bound_sn)
+        ? `${esc(t.bound_serial || '—')}<br><span class="muted">${esc(t.bound_sn || '—')}</span>`
+        : '<span class="muted">未绑定</span>'}</td>
       <td>
         <button class="btn small" onclick="viewTokenIps('${encodeURIComponent(t.token)}')">查看 IP</button>
+        ${(t.bound_serial || t.bound_sn) && (!t.kind || t.kind === 'private')
+          ? `<button class="btn small" onclick="unbindToken('${encodeURIComponent(t.token)}')">解绑</button>`
+          : ''}
         ${t.enabled
           ? `<button class="btn small" onclick="toggleToken(${t.id}, false)">禁用</button>`
           : `<button class="btn small" onclick="toggleToken(${t.id}, true)">启用</button>`}

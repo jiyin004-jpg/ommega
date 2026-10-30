@@ -478,3 +478,167 @@ pub async fn card_query_by_contact(
     }
     Json(json!({ "status": "ok", "cards": cards })).into_response()
 }
+
+// ---------------------------------------------------------------------------
+// 卡密自助查询 / 解绑
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct CardTokenBody {
+    pub token: String,
+}
+
+/// 北京时间字符串 → unix 秒（库里的 DATETIME 都是 +08:00）。
+fn parse_bj(ts: &str) -> Option<i64> {
+    let s = ts.trim();
+    let s = if let Some(dot) = s.find('.') {
+        &s[..dot]
+    } else {
+        s
+    };
+    if s.is_empty() {
+        return None;
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()?;
+    let off = chrono::FixedOffset::east_opt(8 * 3600)?;
+    naive
+        .and_local_timezone(off)
+        .single()
+        .map(|dt| dt.timestamp())
+}
+
+fn fmt_bj(unix: i64) -> String {
+    let off = match chrono::FixedOffset::east_opt(8 * 3600) {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    chrono::DateTime::from_timestamp(unix, 0)
+        .unwrap_or_default()
+        .with_timezone(&off)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+/// 作用域文案：A/B 端 + 配对/公开/私卡。
+fn card_scope(role: &str, kind: &str, pair_id: &str) -> String {
+    let side = match role {
+        "a" => "A 端",
+        "b" => "B 端",
+        _ => role,
+    };
+    let scope = if kind.eq_ignore_ascii_case("public") {
+        "公开卡".to_string()
+    } else if kind.eq_ignore_ascii_case("pair") {
+        if pair_id.is_empty() {
+            "配对卡".to_string()
+        } else {
+            format!("配对卡 · {pair_id}")
+        }
+    } else {
+        "私卡（绑定设备）".to_string()
+    };
+    format!("{side} · {scope}")
+}
+
+/// POST /api/card/lookup/ — 凭卡密自助查询。卡密必须完全一致才返回内容。
+pub async fn card_lookup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CardTokenBody>,
+) -> Response {
+    let ip = client_ip(&headers);
+    if !state.auth.allow(&ip) {
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded, try again later",
+        );
+    }
+    let token = body.token.trim();
+    if token.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "卡密不能为空");
+    }
+    let Some(db) = &state.db else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    let row = match db.get_api_token(token) {
+        Ok(Some(r)) => r,
+        Ok(None) => return json_err(StatusCode::NOT_FOUND, "卡密不存在"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+    };
+
+    // 只有激活过才有到期时间；没激活的卡是「首次使用开始计时」。
+    let now = chrono::Utc::now().timestamp();
+    let mut expires_at = String::new();
+    let mut remaining_seconds: i64 = -1;
+    if let Some(act) = parse_bj(&row.activated_at) {
+        if row.duration_seconds > 0 {
+            let end = act + row.duration_seconds;
+            expires_at = fmt_bj(end);
+            remaining_seconds = end - now;
+        } else {
+            expires_at = "永久".to_string();
+            remaining_seconds = 0;
+        }
+    }
+
+    Json(json!({
+        "status": "ok",
+        "token": row.token,
+        "role": row.role,
+        "kind": row.kind,
+        "scope": card_scope(&row.role, &row.kind, &row.pair_id),
+        "note": row.note,
+        "enabled": row.enabled,
+        "activated_at": row.activated_at,
+        "expires_at": expires_at,
+        "remaining_seconds": remaining_seconds,
+        "duration_seconds": row.duration_seconds,
+        "bound_serial": row.bound_serial,
+        "bound_sn": row.bound_sn,
+        "bound_at": row.bound_at,
+        "last_ip": row.last_ip,
+        "last_used_at": row.last_used_at,
+        "created_at": row.created_at,
+    }))
+    .into_response()
+}
+
+/// POST /api/card/unbind/ — 凭卡密解绑设备。只清指纹，不动激活时间与有效期。
+pub async fn card_unbind(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CardTokenBody>,
+) -> Response {
+    let ip = client_ip(&headers);
+    if !state.auth.allow(&ip) {
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded, try again later",
+        );
+    }
+    let token = body.token.trim();
+    if token.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "卡密不能为空");
+    }
+    let Some(db) = &state.db else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    let row = match db.get_api_token(token) {
+        Ok(Some(r)) => r,
+        Ok(None) => return json_err(StatusCode::NOT_FOUND, "卡密不存在"),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+    };
+    if row.bound_serial.is_empty() && row.bound_sn.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "这张卡还没有绑定设备");
+    }
+    match db.unbind_token_device(token) {
+        Ok(_) => Json(json!({
+            "status": "ok",
+            "message": "已解绑，下次使用会绑定到新的设备",
+            "released_serial": row.bound_serial,
+            "released_sn": row.bound_sn,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+    }
+}
