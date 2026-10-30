@@ -527,12 +527,12 @@ fn card_scope(role: &str, kind: &str, pair_id: &str) -> String {
         _ => role,
     };
     let scope = if kind.eq_ignore_ascii_case("public") {
-        "公开卡".to_string()
+        "公开卡（不限设备）".to_string()
     } else if kind.eq_ignore_ascii_case("pair") {
         if pair_id.is_empty() {
-            "配对卡".to_string()
+            "配对卡（绑定设备）".to_string()
         } else {
-            format!("配对卡 · {pair_id}")
+            format!("配对卡 · {pair_id}（绑定设备）")
         }
     } else {
         "私卡（绑定设备）".to_string()
