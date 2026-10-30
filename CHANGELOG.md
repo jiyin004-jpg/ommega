@@ -4,6 +4,7 @@
 
 ## 1.7.11
 
+- 远程铸证补上 MODULE_HASH（tag 724）：本地路径一直有，走中继时 A 端从来不转发这个摘要，铸出的叶子缺 724，设备侧 getSupplementaryAttestationInfo(MODULE_HASH) 却仍返回本机 APEX 摘要，校验方据此报缺失。现在 A 端从 SetAdditionalAttestationInfo 取值原样下发，服务端按 [724] EXPLICIT OCTET STRING 写出（PR #11）。
 - 面板「AOSP 密钥」预设换成仍然有效的那条 AOSP 软件链（RSA，2035-12-30 到期）：原来那条 EC 中级证书 2026-01-08 就过期了，同块的 RSA 条目还缺证书链，keybox.rs 会判整份 keybox 无效、根本加载不上。
 - 内置两把 keybox：主 `keybox_tee.xml` 是 TEE 级别（001 那份三级链），`keybox_strongbox.xml` 是 StrongBox 级别，安装时都写入设备。两个级别不再共用一份密钥，TEE 请求不会再拿到 StrongBox 自签的那套。
 - 在线源（服务器公开库、Yuri、AOSP）只更新 TEE 那份；StrongBox 那份只能在面板里选文件或恢复内置，没有在线来源。
