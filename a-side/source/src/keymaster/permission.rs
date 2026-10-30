@@ -712,11 +712,10 @@ pub fn check_device_attestation_permissions(caller: Option<&CallerInfo>) -> anyh
 
 pub fn check_unique_id_attestation_permissions(caller: Option<&CallerInfo>) -> anyhow::Result<()> {
     let caller = resolve_caller_info(caller);
-    check_android_permission(
-        &caller,
-        REQUEST_UNIQUE_ID_ATTESTATION,
-        KsError::Km(crate::keymaster::error::ErrorCode::CANNOT_ATTEST_IDS),
-    )
+    // AOSP 这里就是 `KsError::perm()`（keystore2 的 PERMISSION_DENIED = 6）。
+    // 之前用的是 KeyMint 的 CANNOT_ATTEST_IDS(-66)，检测器只把 6 / -32 当成
+    // 「普通 app 没这个权限，跳过」，拿到 -66 会当成意外异常判 INCONCLUSIVE。
+    check_android_permission(&caller, REQUEST_UNIQUE_ID_ATTESTATION, KsError::perm())
 }
 
 pub fn check_manage_users_permission(caller: Option<&CallerInfo>) -> anyhow::Result<()> {
