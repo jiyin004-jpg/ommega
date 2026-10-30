@@ -127,7 +127,12 @@ impl KeyBox {
         if entry.chain.is_empty() {
             bail!("RSA certificate chain is empty");
         }
+        // keybox 里的 RSA 私钥两种形状都有：PKCS#1（BEGIN RSA PRIVATE KEY，多数
+        // keybox 就是这种）和 PKCS#8（BEGIN PRIVATE KEY，openssl genpkey 的默认输出）。
+        // 以前只认 PKCS#1，换个工具生成的 keybox 就直接报「failed to parse inner
+        // PKCS#1 key」，然后悄悄回落成内置模板。两种都试，失败才报。
         let key = rsa::import_pkcs1_key(&entry.key_der)
+            .or_else(|_| rsa::import_pkcs8_key(&entry.key_der))
             .map(|(key, _, _)| key)
             .map_err(|e| anyhow!("failed to import RSA private key: {e:?}"))?;
         let chain: Vec<keymint::Certificate> = entry
