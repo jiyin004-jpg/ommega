@@ -203,18 +203,15 @@ keep_daemons_alive() {
 }
 
 # ---- 能力声明隐藏的自检（不看 debug 开关，每次开机落一行）----
-# 面板里开了「声明不支持」却仍然被检测到，只有三种可能：模块那份 XML 没被管理器挂上、
-# 自己那套单文件 bind 没盖成、或者开关本来就没开。看这行就能分出来。
-cap_mask_want=$MODDIR/system/etc/permissions/ommega-capability-mask.xml
-cap_mask_live=/system/etc/permissions/ommega-capability-mask.xml
-cap_mask_state=xml-missing
-if [ -f "$cap_mask_live" ]; then
-  if cmp -s "$cap_mask_want" "$cap_mask_live" 2>/dev/null; then
-    cap_mask_state=xml-mounted
-  else
-    cap_mask_state=xml-mismatch
-  fi
+# 现在完全自己挂：post-fs-data 从厂商声明里摸掉那一行、单文件 bind 回去，目标记在
+# conf/mask.binds 里。面板上开了开关却还被检测到，看这行就能分出来是没挂上还是开关没开。
+cap_binds_file=$STATE_DIR/conf/mask.binds
+cap_bind_n=0
+if [ -s "$cap_binds_file" ]; then
+  cap_bind_n=$(grep -c '[^[:space:]]' "$cap_binds_file" 2>/dev/null || true)
+  cap_bind_n=${cap_bind_n:-0}
 fi
+cap_mask_state=binds-${cap_bind_n}
 # service 阶段 package 服务未必已经就绪（实测过刚开机问会回 `Can't find service`），
 # 所以先等它回话再落日志。
 cap_has_sb=""; cap_has_ids=""
@@ -238,7 +235,28 @@ printf '%s mask=%s decl_sb=%s decl_ids=%s has_strongbox=%s has_device_ids=%s\n' 
   "$cap_mask_state" "${cap_sb_decl:-none}" "${cap_ids_decl:-none}" \
   "${cap_has_sb:-unknown}" "${cap_has_ids:-unknown}" \
   >> /data/adb/ommega/boot-debug.log 2>/dev/null
-unset cap_mask_want cap_mask_live cap_mask_state cap_sb_decl cap_ids_decl cap_has_sb cap_has_ids i
+
+# system_server 已经把权限 XML 读进内存了（后面 PackageManager 查的都是缓存），
+# 这时把我们那几条单文件 bind 撤掉：mountinfo 里那条挂载不会一整天都在。
+# 软重启（只重启 system_server）会重读 XML，那时 bind 已经撤了 —— 这种情况得再冷重启一次。
+(
+  i=0
+  while [ $i -lt 150 ]; do
+    [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ] && break
+    i=$((i + 1))
+    sleep 2
+  done
+  sleep 5
+  cap_unmounted=0
+  for cap_tgt in $(cat "$cap_binds_file" 2>/dev/null); do
+    umount -l "$cap_tgt" 2>/dev/null && cap_unmounted=$((cap_unmounted + 1))
+  done
+  : > "$cap_binds_file" 2>/dev/null
+  printf '%s mask-revert: unmounted %s bind(s)\n' "$(date -u '+%H-%M-%S')" "$cap_unmounted" \
+    >> /data/adb/ommega/boot-debug.log 2>/dev/null
+) &
+
+unset cap_mask_want cap_mask_live cap_mask_state cap_sb_decl cap_ids_decl cap_has_sb cap_has_ids i cap_binds_file cap_bind_n
 
 (
   while true; do

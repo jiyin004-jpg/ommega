@@ -269,23 +269,24 @@ if [ -r "$PROP_OVERRIDES" ]; then
 fi
 
 # ---- 能力声明隐藏（flat config 键 hide_strongbox / hide_device_ids）----
-# 这里只维护模块自己的那一份能力声明 XML：
-#   <unavailable-feature name="..."/> 是 AOSP SystemConfig 支持的写法 —— 它读完所有权限
-# XML 之后会把同名 feature 从可用表里删掉，于是 PackageManager 的 hasSystemFeature、
-# feature 枚举、以及 Android 16 起进程绑定时下发的 SystemFeaturesCache 看到的是同一份
-# 「本机没有这个能力」。
+# 完全自己挂：不往模块 system/ 里放 XML，也不依赖任何 metamodule。
 #
-# 为什么不改厂商那份 XML（以前的做法，2026-10-28 在 peridot 上翻车）：老实现给 vendor/odm
-# 下的声明文件种 whiteout（0:0 字符设备），或者在 /mnt/vendor 挂个小 tmpfs 再把单文件 bind
-# 盖上去。两条路都要动真实分区的文件：暂存文件被复用（四个目标最终拿到同一份非 XML 内容）
-# 时 system_server 解析 /odm/etc/permissions 直接失败、设备开不了机；平时 mountinfo 里也
-# 能看见我们挂的东西。现在厂商文件一个字节都不碰，只多出模块里这一份 XML —— 管理器的
-# 系统文件挂载没开时结果就是「没生效」，不会把系统搞坏。
+# 本机把这条 feature 的声明改成 unavailable 的方式只有两种，我们都走：
+#   1. 厂商那份权限 XML 里删掉 <feature name="..."/> 那一行，复制到暂存目录，单文件 bind 盖回原处；
+#   2. （已不用）以前还有一条“模块自带一份 <unavailable-feature> XML、靠管理器/metamodule
+#      挂到 /system/etc/permissions”的路。那条依赖外部元模块，而且配置改完要重启两次才生效，
+#      已经拆掉：现在模块里根本没有 system 目录，mountify 之类的 auto 模式也不会再纳管它。
 #
-# 生效时机：这份 XML 必须赶在 system_server 读权限 XML 之前到位，所以 WebUI 保存、安装、
-# 以及这里开机都会写一遍（内容一致就只是覆盖同一个文件）。开关改动一律要重启才生效。
-MASK_XML_REL=system/etc/permissions/ommega-capability-mask.xml
-MASK_XML=$MODDIR/$MASK_XML_REL
+# 挂载痕迹怎么处理（借鉴 mountify 那段）：
+#   - 暂存目录优先放在 /mnt/vendor 下、起个像 OEM 权限目录的名字（vendor_permissions），
+#     mountinfo 里只露一个看起来属于厂商的 bind 源；
+#   - system_server 读完权限 XML 之后（service.sh 等到 sys.boot_completed），把这批 bind
+#     用 umount -l 撤掉，mountinfo 里那条挂载一天都在不了，只留开机头几十秒。
+#
+# 三条保守规则（/odm 的权限 XML 一旦变成非法 XML，system_server 就起不来，代价太大）：
+#   - 该 feature 必须是单独一行的 <feature ... />；
+#   - 删完必须正好少一条 feature、且剩下 </permissions>，否则跳过这个文件、只记日志；
+#   - 挂完回读一次，feature 还在就立刻 umount。
 mask_state_file=$STATE_DIR/conf/mask.state
 
 # mask_enabled <配置键> [其它等价键...]
@@ -334,18 +335,9 @@ if [ -d "$MODDIR/system" ]; then
   done
 fi
 
-mkdir -p "$MODDIR/system/etc/permissions" 2>/dev/null
-{
-  printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions>\n'
-  [ "$mask_sb" = 1 ] && printf '  <unavailable-feature name="android.hardware.strongbox_keystore" />\n'
-  [ "$mask_ids" = 1 ] && printf '  <unavailable-feature name="android.software.device_id_attestation" />\n'
-  printf '</permissions>\n'
-} > "$MASK_XML.tmp" 2>/dev/null && mv -f "$MASK_XML.tmp" "$MASK_XML" 2>/dev/null
-chcon u:object_r:system_file:s0 "$MASK_XML" 2>/dev/null
-
-# 开机诊断（不看 debug 开关）：内容是什么、厂商侧还有没有声明。
-printf '%s mask_sb=%s mask_ids=%s xml=%s\n' "$(date -u '+%H-%M-%S')" "$mask_sb" "$mask_ids" \
-  "$(tr -d '\n' < "$MASK_XML" 2>/dev/null)" >> /data/adb/ommega/boot-debug.log 2>/dev/null
+# 开机诊断（不看 debug 开关）：开关状态先落一行，后面 bind 的结果跟着写同一个文件。
+printf '%s mask_sb=%s mask_ids=%s\n' "$(date -u '+%H-%M-%S')" "$mask_sb" "$mask_ids" \
+  >> /data/adb/ommega/boot-debug.log 2>/dev/null
 
 # ---- 主力：我们自己把那条 feature 从厂商声明里摘掉 ----
 # KernelSU 3.x 天生不做模块文件挂载（要装挂载 metamodule 才有），所以模块 system/ 里那份
@@ -436,20 +428,17 @@ mask_declaration_by_bind() {
 
 rm -rf "$mask_stage" 2>/dev/null
 mkdir -p "$mask_stage" 2>/dev/null
-# 管理器真挂了模块 system/ 的话 feature 已经没了，不用再盖厂商文件（少一层挂载痕迹）
-if [ -f "/system/etc/permissions/ommega-capability-mask.xml" ]; then
-  mask_log "mask-tier: module xml mounted, self bind skipped"
-else
-  [ "$mask_sb" = 1 ] && mask_declaration_by_bind android.hardware.strongbox_keystore
-  [ "$mask_ids" = 1 ] && mask_declaration_by_bind android.software.device_id_attestation
-fi
-# 记一份自己挂过谁：面板/自检要看，将来加「立即撤销」也认这个。
+# 不管有没有 metamodule：总是自己从厂商 XML 摘掉那一行再 bind。以前这里会先看模块那份
+# XML 在不在（靠元模块挂），挂上了就跳过 —— 现在模块里根本没有 system/，这条分支拆了。
+[ "$mask_sb" = 1 ] && mask_declaration_by_bind android.hardware.strongbox_keystore
+[ "$mask_ids" = 1 ] && mask_declaration_by_bind android.software.device_id_attestation
+# 记一份自己挂过谁：service.sh 等到 boot_completed 后按这份清单 umount -l 撤掉。
 mkdir -p "$STATE_DIR/conf" 2>/dev/null
 printf '%s\n' ${mask_binds:-} > "$mask_binds_file" 2>/dev/null
 mask_log "mask-tier: self bind ->${mask_binds:- none}"
 unset mask_stage mask_binds_file mask_n mask_binds ms_dir mx_src mx_feature mx_stage mx_before mx_after mx_stage_dir
 unset md_feature md_dir md_src
-unset MASK_XML_REL MASK_XML mask_state_file mask_sb mask_ids me_name me_enabled me_state me_pat me_value mf_stale mf_old
+unset mask_state_file mask_sb mask_ids me_name me_enabled me_state me_pat me_value mf_stale mf_old
 
 # ── 尽早把两个守护拉起来 ─────────────────────────────────────────────────
 # 为什么抢在 post-fs-data（最早那个阶段）而不是 service.sh（late_start）：注入 keystore2

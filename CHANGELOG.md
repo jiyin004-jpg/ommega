@@ -4,6 +4,7 @@
 
 ## 1.7.11
 
+- 能力声明隐藏（`hide_strongbox` / `hide_device_ids`）改成完全自己挂：模块里不再放 `system/` 目录，mountify 这类 metamodule 的 auto 模式也就不会再纳管 ommega。生效方式是 post-fs-data 里把厂商那份权限 XML 拓一份、删掉对应 `<feature>` 行再单文件 bind 回去，`service.sh` 等到 `sys.boot_completed` 之后 `umount -l` 撤掉，`mountinfo` 里只在开机头几十秒看得到。代价是软重启（只重启 system_server）后会重读 XML，需要再冷重启一次。
 - 私卡绑定设备：A 端第一次成功请求时，服务端把 `api_token` 的 `bound_serial` / `bound_sn` 记成当前机器的 `ro.serialno` / `ro.boot.serialno`，之后每次请求都要对得上，换设备直接被拒（401）。公开卡和配对卡不参与绑定。
 - 卡密自助页：`/card` 底部加了「查询卡密 / 解绑设备」。完整输入卡密才显示内容，能看到卡密、备注、作用域、首次激活、有效期、当前绑定设备，并能就地解绑。
 - 控制台 Token 管理加了「绑定设备」列和解绑按钮（只对私卡显示），公开卡照旧不受限。

@@ -1823,26 +1823,15 @@ async function openSysApp(){
 }
 
 /* --------------------------------- 动作 --------------------------------- */
-/* 两个能力开关（StrongBox / 设备 ID 认证）都只落到模块自己的一份声明 XML：
-   /data/adb/modules/ommega/system/etc/permissions/ommega-capability-mask.xml
-   里面写 <unavailable-feature name="..." />，SystemConfig 读完所有权限 XML 后会把同名
-   feature 从可用表删掉，于是 PackageManager、feature 枚举、以及进程里的
-   SystemFeaturesCache 拿到的是同一份「本机没有这个能力」。
-   为什么不种 whiteout / 不 bind 厂商那份 XML：那两条都要动真实分区的文件，整份文件被清掉
-   会连带同文件里的 app_attest_key 一起消失；万一内容不合法（暂存文件复用踩过一次），
-   system_server 解析 /odm/etc/permissions 失败，设备直接开不了机。
-   XML 必须赶在 system_server 之前就位，所以保存时先写一遍，重启后由 post-fs-data 再对齐一次。 */
+/* 两个能力开关（StrongBox / 设备 ID 认证）现在完全由模块自己处理：
+   post-fs-data 里把厂商那份权限 XML 拓一份、删掉对应 <feature> 行，单文件 bind 盖回去，
+   system_server 读完权限 XML 之后（service.sh 等 boot_completed）再 umount -l 撤掉。
+   模块里已经不放 system/ 目录了，所以 metamodule（mountify 之类）不会再纳管 ommega。
+   面板这边只负责把开关落成 mask.state（post-fs-data 会读）+ config，不需要写 XML。 */
 async function syncCapabilityMask(sb, ids){
-  var dir = MODDIR + "/system/etc/permissions";
-  var f = dir + "/ommega-capability-mask.xml";
-  var lines = ['<?xml version="1.0" encoding="utf-8"?>', '<permissions>'];
-  if (sb) lines.push('  <unavailable-feature name="android.hardware.strongbox_keystore" />');
-  if (ids) lines.push('  <unavailable-feature name="android.software.device_id_attestation" />');
-  lines.push('</permissions>');
-  var args = lines.map(function(s){ return "'" + s.replace(/'/g, "'\\''") + "'"; });
-  var cmd = 'mkdir -p ' + dir + ' && printf \'%s\\n\' ' + args.join(" ") +
-            ' > ' + f + '.new && mv -f ' + f + '.new ' + f + ' && chmod 644 ' + f;
-  var r = await exec(cmd);
+  var text = "hide_strongbox=" + (sb ? 1 : 0) + "\n" + "hide_device_ids=" + (ids ? 1 : 0) + "\n";
+  var r = await exec("mkdir -p " + STATE + "/conf && printf '%s' '" + text.replace(/'/g, "'\\''") +
+                     "' > " + STATE + "/conf/mask.state");
   return Number(r.errno) === 0;
 }
 

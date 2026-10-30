@@ -213,23 +213,16 @@ for stale_feature in android.hardware.security.strongbox_keystore.xml android.so
         "$MODPATH/system/etc/permissions/$stale_feature" 2>/dev/null
 done
 
-CAP_XML_DIR="$MODPATH/system/etc/permissions"
-mkdir -p "$CAP_XML_DIR" 2>/dev/null
-{
-  printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions>\n'
-  [ "$STRONGBOX_HIDDEN" = true ] && printf '  <unavailable-feature name="android.hardware.strongbox_keystore" />\n'
-  [ "$DEVICE_IDS_HIDDEN" = true ] && printf '  <unavailable-feature name="android.software.device_id_attestation" />\n'
-  printf '</permissions>\n'
-} > "$CAP_XML_DIR/ommega-capability-mask.xml" 2>/dev/null
-# 模块 system/ 下的文件要 root:root 0644 + system_file，不然管理器挂上之后 system_server
-# 读不到这份声明（KSU/APatch 的 set_perm_recursive 是 no-op，失败也不影响）。
-set_perm_recursive "$MODPATH/system" 0 0 0755 0644 u:object_r:system_file:s0 2>/dev/null || true
+# 能力声明不再走模块 system/：模块里连 system 目录都不放了，免得 metamodule（mountify 之类）
+# 的 auto 模式把它纳管、跟自己的挂载打架。真正生效的是 post-fs-data 里“从厂商 XML 摸掉
+# 那一行再单文件 bind”那条路，每次开机重建，service.sh 在 boot_completed 后撤掉。
+rm -rf "$MODPATH/system" 2>/dev/null
 if [ "$STRONGBOX_HIDDEN" = true ] || [ "$DEVICE_IDS_HIDDEN" = true ]; then
   ui_print "- Capability declaration: strongbox=$STRONGBOX_HIDDEN device_ids=$DEVICE_IDS_HIDDEN (applies from this boot)"
 else
   ui_print "- Capability declaration: nothing masked"
 fi
-unset STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF CAP_XML_DIR stale_feature
+unset STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF stale_feature
 
 # resetprop：模块自己带一个（实现是 vendor/ 里的 resetprop-rs，源码在 vendor/prop-rs*、
 # vendor/prop-rs-android 和 resetprop/src/）。
