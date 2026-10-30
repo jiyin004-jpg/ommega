@@ -73,7 +73,13 @@ use ommegaclient_b::wakelock;
 /// 控制。之前用长轮询（15s→5s→1s）时，任务落在两轮之间就要等满一个周期，实测
 /// 端到端多出 1 秒以上的固定延迟；改成 120ms 短轮询后，最坏等 120ms。
 /// 短轮询的空响应只有几字节，服务端压力可以忽略。
-const POLL_TIMEOUT_SEC: u32 = 0;
+/// 长轮询秒数：0 = 短轮询（问一次就回，任务到达最多等一个轮询间隔 ~70ms）。
+/// 设成 5 之后 B 挂在服务端等，有任务立刻推回来，attested 路径能少 20~40ms ——
+/// T04 那个「远程/本地配对差」就卡在 120ms 线上，这点延迟很关键。
+///
+/// **不能超过 POLL_WALL_LIMIT（8s）**：超了 watchdog 会判「循环不往前转」直接退进程，
+/// service.sh 再拉起来，就变成 15s 一次的崩溃重起了。
+const POLL_TIMEOUT_SEC: u32 = 5;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
 /// 一轮 poll 最多允许的墙钟时间。刻意比上面的 READ_TIMEOUT_MS 早一步收网：那个
@@ -1267,23 +1273,13 @@ fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
 }
 
 fn handle_agree(_task_type: &str, payload: &Value) -> Result<Value> {
-    let alias = alias_of(payload, "attest");
-    let algorithm = payload
-        .get("algorithm")
-        .and_then(Value::as_str)
-        .unwrap_or("ECDH")
-        .to_string();
-    let data = b64_decode(
-        payload
-            .get("data")
-            .ok_or_else(|| anyhow!("payload missing data"))?,
-    )?;
-    let secret = tee_ops::agree(&alias, &data, &algorithm)?;
-    Ok(json!({
-        "alias": alias,
-        "algorithm": algorithm,
-        "secret": b64(&secret),
-    }))
+    // 不在 B 上跑 ECDH。实测这台真机的 TEE 被 `begin(AGREE_KEY)` 进去一次就会落到
+    // `-49: ServiceSpecific` 的坏状态，之后连普通签名都回 `-1000`，整条链跟着废，
+    // 而且 binder 调用不返回 —— 任务永远不 post_result，服务端只能反复重投。
+    // 直接回一个明确的不支持，让 A 端自己回落本地 keybox 算 ECDH。
+    let _ = payload;
+    log::warn!("agree: not supported on this B device, asking the A-side to fall back");
+    Err(anyhow!("unsupported task type: agree"))
 }
 
 /// SOTER forwarding: the payload selects a HAL op (see `ommegaclient_b::soter`).

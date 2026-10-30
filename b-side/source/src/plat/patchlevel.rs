@@ -101,17 +101,6 @@ fn baseline_slot() -> &'static Mutex<Option<Baseline>> {
     BASELINE.get_or_init(|| Mutex::new(None))
 }
 
-fn baseline_value(prop: &str) -> Option<String> {
-    let slot = match baseline_slot().lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
-    };
-    slot.as_ref()?
-        .iter()
-        .find(|(k, _)| k == prop)
-        .map(|(_, v)| v.clone())
-}
-
 /// 第一次动属性前把三项的原值记下来（只记一次）。
 fn remember_baseline(props: &[&str]) {
     let mut slot = match baseline_slot().lock() {
@@ -370,11 +359,10 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
                 continue;
             }
         };
-        let base = baseline_value(prop).unwrap_or_else(|| current.clone());
-        // 请求要的就是本机原值 → 不碰属性、不弹 HAL（A 端全同步之后每笔都走这条）。
-        if value_matches(prop, &base, &want) {
-            continue;
-        }
+        // 只以**当前值**为准：值一致就不动、不弹 HAL；不一致（包括从上次的 A1
+        // 改回本机原值）就写回去再重读。以前这里先拿 baseline（第一次记下的本机
+        // 原值）比 want，一旦 want 又回到原值就直接 continue —— 但那时 current
+        // 还是上一次写进去的 A1，属性/HAL 就停在旧值上了。
         if value_matches(prop, &current, &want) {
             continue;
         }

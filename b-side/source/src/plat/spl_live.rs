@@ -259,13 +259,10 @@ pub fn apply_from_payload(payload: &Value, hold_ms: u32) -> Result<LiveGuard> {
         return Err(anyhow!("上次失败还没过冷却期"));
     }
     let st = status().inspect_err(|_| note_failure())?;
-    let Some(want) = values_from_payload(payload, &st.base) else {
-        // 跟本机基线一样：不用改，也就没有窗口。
-        return Ok(LiveGuard {
-            restored: true,
-            sent: st.base,
-        });
-    };
+    // 目标值 = 请求里要的那组；请求没带就用本机基线。注意不能因为
+    // 「请求值 == 基线」就直接跳过 —— daemon 最后下发的 `cur` 也可能是
+    // 上一次留下的（上一笔 RESTORE 没走到），不补一次 APPLY 就纠不回来。
+    let want = values_from_payload(payload, &st.base).unwrap_or(st.base);
     if want == st.cur {
         // daemon 最后下发的就是它：可能上一笔的 RESTORE 没走到，但值已经是
         // 我们要的，直接沿用，不再开一次窗口。
