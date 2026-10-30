@@ -447,12 +447,22 @@ fn sign_ecdsa_prehashed(key: &Key, curve: ec::NistCurve, msg: &[u8]) -> Result<V
             s.to_der().to_vec()
         }
         ec::NistCurve::P521 => {
-            // RustCrypto's P-521 has no `DigestPrimitive`/`PrehashSigner` impl, so
-            // signing is unsupported here. (P-256/P-384 cover normal usage.)
-            return Err(km_err!(
-                UnsupportedEcCurve,
-                "P-521 ECDSA signing unsupported"
-            ));
+            // RustCrypto 的 P-521 没给 `PrehashSigner`/`DigestPrimitive` 实现，但
+            // 底层标量运算有：走 `SignPrimitive::try_sign_prehashed`，自己做
+            // bits2field + reduce（aprobe C11 的 P-521 项）。
+            use ecdsa::hazmat::SignPrimitive as _;
+            use p521::elliptic_curve::ff::Field as _;
+            let sk = EcdsaSigningKey::<p521::NistP521>::from_slice(&priv_bytes)
+                .map_err(|e| km_err!(UnknownError, "P-521 key: {e:?}"))?;
+            let field = ecdsa::hazmat::bits2field::<p521::NistP521>(msg)
+                .map_err(|e| km_err!(UnknownError, "P-521 bits2field: {e:?}"))?;
+            let mut rng = rand_core::OsRng;
+            let k = p521::Scalar::random(&mut rng);
+            let (sig, _) = sk
+                .as_nonzero_scalar()
+                .try_sign_prehashed(k, &field)
+                .map_err(|e| km_err!(UnknownError, "P-521 prehash sign: {e:?}"))?;
+            sig.to_der().to_vec()
         }
     };
     Ok(sig)
