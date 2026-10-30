@@ -2,8 +2,8 @@
 //!
 //! 这台机器的 SOTER TA 是没 provisioning 的 —— 实测 `generateAskKeyPair` 直接回
 //! -20，key 一把都建不出来，所以本地真 HAL 这条腿是瘸的。这个模块补的就是那一
-//! 块：拿 `assets/soter_ask.pem` 里那把 RSA，在用户态直接算签名，造一份"自洽"
-//! 的 SOTER 应答出来。
+//! 块：拿编译进来的 ATTK（构建时现生成的那把自签 RSA）签 ASK 的认证信封，
+//! ASK 本身按 uid 用到才现生成、落盘复用。
 //!
 //! 形状跟服务端 `soter_mint.rs` 一模一样（那边的测试验过：ASK 的签名拿导出的
 //! ATTK 公钥验得过）。要吐信封的三处都是同一个形状：
@@ -55,8 +55,9 @@ const NOT_FOUND: i32 = -5;
 const AUTH_KEY_NOT_READY: i32 = -6;
 /// ASK 里写死的盐长，也正好是 SHA-256 的摘要长度。
 const SALT_LEN: i32 = 32;
-/// 编译进来的那把私钥（PKCS#8 PEM）—— 候选文件都没有时才用它。
-const ASK_PEM: &[u8] = include_bytes!("../../assets/soter_ask.pem");
+/// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
+/// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
+const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
 /// 换本地兜底 ASK 用的文件（PKCS#8 PEM，`openssl genpkey -algorithm RSA` 那种）。
 /// 存在且解析得过就用它，跟 keybox 一个路子：丢文件进去、重启 SOTER 宿主就生效。
 ///
@@ -67,7 +68,7 @@ const ASK_FILE_PATHS: [&str; 2] = [
     "/data/misc/ommega/soter_ask.pem",
     "/data/misc/keystore/ommega/soter_ask.pem",
 ];
-/// 环境变量覆盖，写测试和临时探针用。
+/// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ASK_FILE_ENV: &str = "OMMEGA_SOTER_ASK_PEM";
 
 /// 独立的 ASK 私钥（可选）。有它的时候两条路分开：`exportAskPublicKey` 吐它的公钥，
@@ -225,10 +226,10 @@ pub(crate) fn ask_origin() -> Option<String> {
     }
 }
 
-/// 按候选顺序找一把可用的 ASK：环境变量指定的文件 → 两个候选文件 → 编进来的那把。
+/// 按候选顺序找一把可用的 ATTK：环境变量指定的文件 → 两个候选文件 → 编进来的那把。
 ///
 /// `override_path` 是给测试用的显式覆盖（不去碰进程环境变量，免得多线程下互相干扰）。
-fn load_ask_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
+fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let from_env =
         override_path.or_else(|| std::env::var_os(ASK_FILE_ENV).map(std::path::PathBuf::from));
@@ -245,18 +246,18 @@ fn load_ask_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, 
             Some(key) => return Some((key, path.display().to_string())),
             // 文件在那儿但读不出私钥：别当没事，也别拿它顶，继续往下找。
             None => log::warn!(
-                "soter local ask at {} is not a usable PKCS#8 PEM; ignoring it",
+                "soter local attk at {} is not a usable PKCS#8 PEM; ignoring it",
                 path.display()
             ),
         }
     }
 
-    let pem = std::str::from_utf8(ASK_PEM).ok()?;
-    Some((Key::from_pem(pem)?, "embedded asset".to_string()))
+    let pem = std::str::from_utf8(ATTK_PEM).ok()?;
+    Some((Key::from_pem(pem)?, "embedded attk".to_string()))
 }
 
-fn load_ask_key() -> Option<(Key, String)> {
-    load_ask_key_with(None)
+fn load_attk_key() -> Option<(Key, String)> {
+    load_attk_key_with(None)
 }
 
 /// 旧版按 uid 散落的 ASK 文件位置（读到就迁进 store，然后把旧文件删掉）。
@@ -406,7 +407,7 @@ fn current_attk() -> Option<Key> {
         if *known == stamp {
             return Some(cached.clone());
         }
-        if let Some((key, origin)) = load_ask_key() {
+        if let Some((key, origin)) = load_attk_key() {
             *cached = key.clone();
             *known = stamp;
             log::info!("event=soter ATTK hot-reloaded from {origin}");
@@ -517,7 +518,7 @@ fn state() -> Option<&'static State> {
     static STATE: OnceLock<Option<State>> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            let (attk, origin) = load_ask_key()?;
+            let (attk, origin) = load_attk_key()?;
             log::info!("soter local ATTK loaded from {origin}");
             let _ = ATTK_ORIGIN.set(origin);
             if let Ok(mut known) = ATTK_STAMP.lock() {
@@ -1656,38 +1657,38 @@ mod tests {
             .to_string()
     }
 
-    /// 编进 binary 的那把（不经 `state()`，免得受 OnceLock 初始化顺序影响）。
-    fn embedded_ask() -> Key {
-        Key::from_pem(std::str::from_utf8(ASK_PEM).unwrap()).unwrap()
+    /// 编进 binary 的那把 ATTK（不经 `state()`，免得受 OnceLock 初始化顺序影响）。
+    fn embedded_attk() -> Key {
+        Key::from_pem(std::str::from_utf8(ATTK_PEM).unwrap()).unwrap()
     }
 
     #[test]
-    fn a_supplied_ask_file_wins_over_the_embedded_one() {
+    fn a_supplied_attk_file_wins_over_the_embedded_one() {
         let pem = fresh_pem();
         let path = temp_pem("soter_ask.pem", &pem);
-        let (key, origin) = load_ask_key_with(Some(path.clone())).expect("the file must be used");
+        let (key, origin) = load_attk_key_with(Some(path.clone())).expect("the file must be used");
 
         // 用的确实是文件里那把，不是编进来的那把
         assert_eq!(key.pem, Key::from_pem(&pem).unwrap().pem);
-        assert_ne!(key.pem, embedded_ask().pem, "换 key 得真换掉");
+        assert_ne!(key.pem, embedded_attk().pem, "换 key 得真换掉");
         assert_eq!(origin, path.display().to_string());
     }
 
     #[test]
-    fn a_missing_ask_file_falls_back_to_the_embedded_one() {
+    fn a_missing_attk_file_falls_back_to_the_embedded_one() {
         let missing = std::env::temp_dir().join("ommega-soter-ask-does-not-exist.pem");
         let _ = std::fs::remove_file(&missing);
-        let (key, origin) = load_ask_key_with(Some(missing)).expect("embedded key must load");
-        assert_eq!(key.pem, embedded_ask().pem);
-        assert_eq!(origin, "embedded asset");
+        let (key, origin) = load_attk_key_with(Some(missing)).expect("embedded key must load");
+        assert_eq!(key.pem, embedded_attk().pem);
+        assert_eq!(origin, "embedded attk");
     }
 
     #[test]
-    fn a_broken_ask_file_falls_back_to_the_embedded_one() {
+    fn a_broken_attk_file_falls_back_to_the_embedded_one() {
         let path = temp_pem("broken.pem", "-----BEGIN PRIVATE KEY-----\nnope\n");
-        let (key, origin) = load_ask_key_with(Some(path)).expect("embedded key must load");
-        assert_eq!(key.pem, embedded_ask().pem);
-        assert_eq!(origin, "embedded asset");
+        let (key, origin) = load_attk_key_with(Some(path)).expect("embedded key must load");
+        assert_eq!(key.pem, embedded_attk().pem);
+        assert_eq!(origin, "embedded attk");
     }
 
     #[test]

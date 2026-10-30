@@ -29,6 +29,9 @@ TARGET_ROOT = REPO_ROOT / "target"
 # 版本号唯一来源：仓库根的 VERSION（三端同号，b-app 跟 B 端一起走）。
 VERSION_FILE = REPO_ROOT.parent.parent / "VERSION"
 
+# 构建时现生成的本地兜底 ATTK（PKCS#8 PEM，不要提交，*.pem 已被 .gitignore 排掉）。
+SOTER_ATTK_PATH = REPO_ROOT / "ommega-injector" / "assets" / "soter_attk.pem"
+
 
 def ensure_cargo_config() -> None:
     """`.cargo/config.toml` 不入库，干净 clone 里没有它，cargo 不知道 Android
@@ -247,7 +250,7 @@ def get_version() -> str:
 # 1.6.9+0 = 1006009）—— 管理器会当成降级，1.6.9 根本推不下去。所以换版本号也
 # 只能接着往上加：必须 > 线上那颗 1006026，18 刚好到 1006027。
 # 这个数跟 b-side 各算各的，别顺手对齐。
-VERSION_CODE_OFFSET = 75
+VERSION_CODE_OFFSET = 76
 
 
 def version_code(version: str) -> str:
@@ -660,6 +663,41 @@ def build_combined_package(
             shutil.rmtree(stage_dir)
 
 
+def ensure_soter_attk() -> None:
+    """每次构建现生成一把 ATTK（PKCS#8 RSA-2048），编进 injector。
+
+    以前是从 CI secret 还原一把固定的 ASK 编进二进制；现在不内置固定材料：
+    ATTK 每次发版构建时按当时时间重新生成一把自签的，进了二进制就不再变（除非
+    设备上手动换 ATTK 文件）；ASK 由运行时按 uid 现生成、落盘复用。
+    """
+    path = SOTER_ATTK_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+    tmp = path.with_name(path.name + ".tmp")
+    run(
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            os.fspath(tmp),
+        ]
+    )
+    # 生成完当场验一遍，坏钥匙宁可构建失败也不要编进包里。
+    run(["openssl", "pkey", "-in", os.fspath(tmp), "-noout", "-check"])
+    body = tmp.read_text(encoding="ascii")
+    tmp.unlink()
+    with path.open("w", encoding="ascii", newline="\n") as fh:
+        fh.write(f"# ommega local ATTK, generated at {stamp}\n")
+        fh.write(body)
+        if not body.endswith("\n"):
+            fh.write("\n")
+    print(f"Generated a fresh self-signed ATTK at {path} ({stamp})")
+
+
 def main() -> None:
 
     # 四个 ABI 都要：arm64 / armv7 / x86_64 / x86。缺 target 就现装，别让 CI 的
@@ -710,6 +748,7 @@ def main() -> None:
     args = parser.parse_args()
 
     ensure_cargo_config()
+    ensure_soter_attk()
 
     version = get_version()
     vcode = str(args.version_code) if args.version_code else version_code(version)
