@@ -847,7 +847,7 @@ async fn run_a_side_task(
         }
         _ => format!("{ctx}"),
     };
-    tracing::info!(
+    tracing::debug!(
         "run_a_side_task: type={task_type} device={device_id} alias={} ctx=[{ctx_short}]",
         body.get("alias").and_then(|v| v.as_str()).unwrap_or("")
     );

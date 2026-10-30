@@ -109,6 +109,13 @@ pub struct AuthState {
     /// anonymous access is allowed when neither a static token nor any DB
     /// token is configured (backward-compatibility fallback).
     pub auth_required: bool,
+    /// 鉴权结果的短缓存：token -> (整行, 时间)。
+    ///
+    /// `get_api_token` 是同步 MySQL 查询，而 A 端每笔 attest/sign/decrypt、
+    /// B 端每 5 秒一次 poll 都要走一次鉴权 —— 全部落在关键路径上。卡密的
+    /// role/kind/enabled/绑定这些字段几秒内不会变，存 10 秒最划算；运营改卡或
+    /// 用户解绑最多晚 10 秒生效。
+    token_cache: Arc<Mutex<HashMap<String, (crate::db::ApiTokenRow, Instant)>>>,
 }
 
 /// Admin session TTL: 12 hours of inactivity.
@@ -142,6 +149,7 @@ impl AuthState {
             ip_filter_whitelist: Arc::new(AtomicBool::new(false)),
             ip_filter_list: Arc::new(Mutex::new(HashSet::new())),
             auth_required,
+            token_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -149,6 +157,45 @@ impl AuthState {
     pub fn with_db(mut self, db: Option<Arc<Db>>) -> Self {
         self.db = db;
         self
+    }
+
+    /// 卡密鉴权结果的缓存时长。
+    ///
+    /// 10 秒：A 端连着发几十笔时只查一次库，运营改卡 / 用户解绑最多晚 10 秒生效。
+    const TOKEN_CACHE_TTL: Duration = Duration::from_secs(10);
+
+    fn cached_token(&self, token: &str) -> Option<crate::db::ApiTokenRow> {
+        let guard = self.token_cache.lock().ok()?;
+        let (row, at) = guard.get(token)?;
+        if at.elapsed() < Self::TOKEN_CACHE_TTL {
+            Some(row.clone())
+        } else {
+            None
+        }
+    }
+
+    fn remember_token(&self, token: &str, row: &crate::db::ApiTokenRow) {
+        if let Ok(mut guard) = self.token_cache.lock() {
+            // 正常不会到这个量；到了就顺手清一轮过期的，别让它无限长。
+            if guard.len() > 1024 {
+                guard.retain(|_, (_, at)| at.elapsed() < Self::TOKEN_CACHE_TTL);
+            }
+            guard.insert(token.to_string(), (row.clone(), Instant::now()));
+        }
+    }
+
+    /// 拿 token 行：先看缓存，没命中再查库（查到就存进去）。
+    ///
+    /// 鉴权、配对、绑定都在关键路径上，`get_api_token` 是同步 MySQL 查询，
+    /// 每笔请求一次很浪费；这几个字段几秒内不会变。
+    fn lookup_token(&self, token: &str) -> Option<crate::db::ApiTokenRow> {
+        if let Some(row) = self.cached_token(token) {
+            return Some(row);
+        }
+        let db = self.db.as_ref()?;
+        let row = db.get_api_token(token).ok().flatten()?;
+        self.remember_token(token, &row);
+        Some(row)
     }
 
     /// Set admin credentials (user/password/extra accounts).
@@ -325,7 +372,8 @@ impl AuthState {
             return None;
         }
         let db = self.db.as_ref()?;
-        let row = db.get_api_token(token).ok().flatten()?;
+        let _ = db;
+        let row = self.lookup_token(token)?;
         if !row.enabled {
             return None;
         }
@@ -362,7 +410,7 @@ impl AuthState {
         // 2) DB card token
         if let Some(db) = &self.db {
             if !token.is_empty() {
-                if let Ok(Some(row)) = db.get_api_token(token) {
+                if let Some(row) = self.lookup_token(token) {
                     // role check
                     if let Some(required) = role {
                         if row.role != required {
