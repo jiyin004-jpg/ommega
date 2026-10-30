@@ -36,8 +36,8 @@ http = "1"
 anyhow = "1"
 # Pure-Rust crypto (no system OpenSSL needed)
 p224 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
-p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
-p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8", "ecdh"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8", "ecdh"] }
 p521 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 ecdsa = { version = "0.16", features = ["pem", "signing"] }
 rsa = { version = "0.9", features = ["sha2", "pem"] }

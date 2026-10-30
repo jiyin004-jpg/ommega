@@ -1284,6 +1284,44 @@ impl Fulfill {
         }))
     }
 
+    /// ECDH against the session's leaf key. `data` is the peer public key in
+    /// X.509 SubjectPublicKeyInfo DER; the result is the raw shared secret (the
+    /// x coordinate), matching what KeyMint returns from finish(AGREE_KEY).
+    pub fn try_handle_agree(&self, _device_id: &str, body: &Value) -> Option<Value> {
+        let alias = body
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // 没 session 就是本层不管，交给下一层。
+        let s = self.get_session(&alias)?;
+        let Some(data) = body
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        else {
+            return Some(json!({ "error": "server_keybox agree: missing or bad base64 data" }));
+        };
+        let key = match s.leaf_key() {
+            Ok(key) => key,
+            Err(e) => {
+                return Some(json!({
+                    "error": format!("server_keybox agree: unusable leaf key: {e}")
+                }))
+            }
+        };
+        match ecdh_shared_secret(&key, &data) {
+            Ok(secret) => Some(json!({
+                "secret": base64::engine::general_purpose::STANDARD.encode(secret),
+                "source": "server_keybox",
+            })),
+            Err(e) => {
+                tracing::warn!("try_handle_agree: alias={alias} failed: {e:#}");
+                Some(json!({ "error": format!("server_keybox agree failed: {e:#}") }))
+            }
+        }
+    }
+
     pub fn try_handle_b_upload_keybox_identity(
         &self,
         device_id: &str,
@@ -1395,6 +1433,27 @@ impl std::fmt::Debug for LeafKey {
             LeafKey::Ec(_) => f.write_str("LeafKey::Ec(..)"),
             LeafKey::Rsa(_) => f.write_str("LeafKey::Rsa(..)"),
         }
+    }
+}
+
+fn ecdh_shared_secret(key: &LeafKey, peer_spki: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match key {
+        LeafKey::Ec(cert::EcKey::P256(sk)) => {
+            use p256::pkcs8::DecodePublicKey;
+            let peer = p256::PublicKey::from_public_key_der(peer_spki)
+                .map_err(|e| anyhow::anyhow!("bad P-256 peer key: {e}"))?;
+            let shared = p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), peer.as_affine());
+            Ok(shared.raw_secret_bytes().to_vec())
+        }
+        LeafKey::Ec(cert::EcKey::P384(sk)) => {
+            use p384::pkcs8::DecodePublicKey;
+            let peer = p384::PublicKey::from_public_key_der(peer_spki)
+                .map_err(|e| anyhow::anyhow!("bad P-384 peer key: {e}"))?;
+            let shared = p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), peer.as_affine());
+            Ok(shared.raw_secret_bytes().to_vec())
+        }
+        LeafKey::Ec(_) => anyhow::bail!("ECDH is only wired for P-256/P-384 identities"),
+        LeafKey::Rsa(_) => anyhow::bail!("ECDH needs an EC key, this identity is RSA"),
     }
 }
 

@@ -425,6 +425,7 @@ fn try_keybox_layer_sync(
         "attest" => fulfill.try_handle_attest(device_id, body, prefer_slot),
         "sign" => fulfill.try_handle_sign(device_id, body),
         "decrypt" => fulfill.try_handle_decrypt(device_id, body),
+        "agree" => fulfill.try_handle_agree(device_id, body),
         _ => None,
     }
 }
