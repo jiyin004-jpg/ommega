@@ -632,7 +632,7 @@ fn mint_attest_key_with(
     // Probe the actual HAL version instead of assuming V5. A StrongBox HAL
     // may only implement KeyMint V2/V3; sending V5-encoded parameters can
     // cause version-mismatch errors that look like "not supported".
-    let km_version = probe_keymint_version(&keymint);
+    let km_version = probe_keymint_version(&keymint, service);
     let params = build_attestation_params(app_id_der, challenge, spec, km_version)?;
 
     // 调用方自带的证明密钥（App AttestKey 委派）：先在本机找到那把 key，确认它
