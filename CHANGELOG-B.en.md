@@ -2,6 +2,8 @@
 
 [中文](CHANGELOG-B.md)
 
-## 1.7.11
+## 1.7.12
 
-- Released together with the A side; no functional change on the B side.
+- Pairs with A-side 1.7.12: reject `agree` outright (it used to wedge the TEE with
+  `-49`), report the device fingerprint for private-card binding, long-poll for 5s,
+  cache the KeyMint version probe, and fix the patch-level follow-up check.
