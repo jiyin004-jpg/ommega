@@ -1609,10 +1609,14 @@ fn decrypt_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<V
     }
     if up.contains("NOPADDING") {
         // 原始 RSA：m = c^d mod n，按模长补零输出。
+        // c 必须严格小于 n，否则是非法代表（A 端已经预拦，这里再兵一道）。
         use rsa::traits::{PrivateKeyParts, PublicKeyParts};
         let n = rk.n();
         let d = rk.d();
         let c = rsa::BigUint::from_bytes_be(data);
+        if &c >= n {
+            anyhow::bail!("ciphertext representative out of range");
+        }
         let m = c.modpow(d, n);
         let mut out = vec![0u8; rk.size()];
         let bytes = m.to_bytes_be();
