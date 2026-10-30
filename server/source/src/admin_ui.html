@@ -1100,7 +1100,7 @@ function renderTokens() {
         : '<span class="muted">未绑定</span>'}</td>
       <td>
         <button class="btn small" onclick="viewTokenIps('${encodeURIComponent(t.token)}')">查看 IP</button>
-        ${(t.bound_serial || t.bound_sn) && t.kind !== 'public'
+        ${(t.bound_serial || t.bound_sn) && t.kind && t.kind !== 'public'
           ? `<button class="btn small" onclick="unbindToken('${encodeURIComponent(t.token)}')">解绑</button>`
           : ''}
         ${t.enabled

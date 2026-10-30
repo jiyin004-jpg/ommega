@@ -526,9 +526,10 @@ fn card_scope(role: &str, kind: &str, pair_id: &str) -> String {
         "b" => "B 端",
         _ => role,
     };
-    let scope = if kind.eq_ignore_ascii_case("public") {
+    let k = kind.trim();
+    let scope = if k.is_empty() || k.eq_ignore_ascii_case("public") {
         "公开卡（不限设备）".to_string()
-    } else if kind.eq_ignore_ascii_case("pair") {
+    } else if k.eq_ignore_ascii_case("pair") {
         if pair_id.is_empty() {
             "配对卡（绑定设备）".to_string()
         } else {

@@ -430,13 +430,14 @@ impl AuthState {
         false
     }
 
-    /// 这张卡要不要绑定设备：**除公开卡外都绑**。
+    /// 这张卡要不要绑定设备：**只有显式私卡/配对卡才绑**。
     ///
-    /// 公开/测试卡（`public`）本来就不限设备，不能绑；剩下的 —— 私发的老卡
-    /// （kind 空）、`private`、卡店卖的 `pair` 配对卡 —— 都是「一卡一机」，
-    /// 第一次用哪台就锁哪台。
+    /// - `kind` 为空（老卡密、控制台默认生成的那种）：公开卡，谁都能用，不绑；
+    /// - `public`：公开/测试卡，不绑；
+    /// - `pair`（卡店卖的配对卡）、`private`：一卡一机，第一次用哪台就锁哪台。
     fn is_private_card(row: &crate::db::ApiTokenRow) -> bool {
-        !row.kind.eq_ignore_ascii_case("public")
+        let k = row.kind.trim();
+        !(k.is_empty() || k.eq_ignore_ascii_case("public"))
     }
 
     /// 设备指纹一致性检查：没绑就绑上，绑了就要求每次都对上。
