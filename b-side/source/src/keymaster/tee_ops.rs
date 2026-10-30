@@ -1174,6 +1174,27 @@ pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// ECDH agreement (`data` = peer public key, X.509 SubjectPublicKeyInfo DER).
+/// Runs begin(AGREE_KEY) + update(peer) + finish on the real TEE.
+pub fn agree(alias: &str, data: &[u8], _algorithm: &str) -> Result<Vec<u8>> {
+    let session = session_get(alias)?;
+    if !matches!(session.algorithm, KeyAlgorithm::EcP256) {
+        return Err(anyhow!("ECDH needs an EC key, alias {alias} is RSA"));
+    }
+    let params = vec![KeyParam::Purpose(KmKeyPurpose::AgreeKey)];
+    let op_params = key_params_to_aidl(&params, KEY_MINT_V5)
+        .with_context(|| ks_err!("encode agree begin parameters"))?;
+    let (out, upgraded) = run_single_input_op(
+        &session.key_blob,
+        session.hal_service,
+        KeyPurpose::AGREE_KEY,
+        &op_params,
+        data,
+    )?;
+    persist_upgraded_blob(alias, session, upgraded);
+    Ok(out)
+}
+
 /// TEE 把 blob 升过级就换掉会话里那份：下次 begin 直接用新的，不用每次都升。
 /// 证书链、算法、HAL 名都不动 —— 升级只改 blob 里的版本/补丁级别记录。
 fn persist_upgraded_blob(alias: &str, mut session: TeeSession, upgraded: Option<Vec<u8>>) {

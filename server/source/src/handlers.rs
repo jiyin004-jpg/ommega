@@ -1174,6 +1174,24 @@ pub async fn decrypt(
     .await
 }
 
+/// POST /api/agree/ — ECDH agreement against a remote (B-side) key.
+pub async fn agree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
+        return *r;
+    }
+    run_a_side_task(
+        &state,
+        "agree",
+        &body,
+        state.auth.token_meta(token_from_headers(&headers)),
+    )
+    .await
+}
+
 /// POST /api/soter/ — SOTER 转发的入口，鉴权后交给 `run_soter_task`。
 pub async fn soter(
     State(state): State<AppState>,

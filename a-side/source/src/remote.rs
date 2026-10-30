@@ -1050,6 +1050,17 @@ impl RemoteRelay {
         Self::post_json("/api/decrypt/", &body)
     }
 
+    /// Forward an ECDH agreement for a remote key (`data` = peer public key SPKI).
+    pub fn agree(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
+        let body = json!({
+            "alias": alias,
+            "data": base64_encode(data),
+            "algorithm": algorithm,
+            "device_id": Self::device_id()?,
+        });
+        Self::post_json("/api/agree/", &body)
+    }
+
     /// Forward one SOTER operation to a B-side device.
     ///
     /// `payload` is the operation plus its arguments (`{"op": "export_ask_public_key",
@@ -1318,6 +1329,42 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             .decode(plain_b64)
             .map_err(|e| kmr_common::km_err!(UnknownError, "bad remote decrypt base64: {e}"))?;
         Ok(Some(plain))
+    }
+
+    fn agree(
+        &self,
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+    ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
+        let Some(resp) = RemoteRelay::agree(alias, data, algorithm)
+            .map_err(|e| kmr_common::km_err!(UnknownError, "remote agree: {e:#}"))?
+        else {
+            return Ok(None);
+        };
+        let result = resp.get("result").cloned().unwrap_or(resp);
+        if let Some(kind) = result.get("relay_error_kind").and_then(Value::as_str) {
+            let msg = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("relay agree refused");
+            log::warn!("remote agree refused (kind={kind}): {msg}");
+            return Err(match kind {
+                "key_not_found" => kmr_common::km_err!(InvalidKeyBlob, "{msg}"),
+                _ => kmr_common::km_err!(UnknownError, "{msg}"),
+            });
+        }
+        let secret_b64 = result
+            .get("secret")
+            .or_else(|| result.get("data"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                kmr_common::km_err!(UnknownError, "remote agree response missing secret")
+            })?;
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(secret_b64)
+            .map_err(|e| kmr_common::km_err!(UnknownError, "bad remote agree base64: {e}"))?;
+        Ok(Some(secret))
     }
 
     fn enabled(&self) -> bool {

@@ -351,6 +351,11 @@ impl crate::KeyMintTa {
                         expected_len: rsa_modulus_len(key_chars)?,
                         modulus: rsa_modulus_from_spki(&remote.public_key).unwrap_or_default(),
                     },
+                    KeyPurpose::AgreeKey => CryptoOperation::RemoteAgree {
+                        alias: remote.alias.clone(),
+                        algorithm: "ECDH".to_string(),
+                        data: Vec::new(),
+                    },
                     _ => {
                         return Err(km_err!(
                             IncompatiblePurpose,

@@ -1266,6 +1266,26 @@ fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
     }))
 }
 
+fn handle_agree(_task_type: &str, payload: &Value) -> Result<Value> {
+    let alias = alias_of(payload, "attest");
+    let algorithm = payload
+        .get("algorithm")
+        .and_then(Value::as_str)
+        .unwrap_or("ECDH")
+        .to_string();
+    let data = b64_decode(
+        payload
+            .get("data")
+            .ok_or_else(|| anyhow!("payload missing data"))?,
+    )?;
+    let secret = tee_ops::agree(&alias, &data, &algorithm)?;
+    Ok(json!({
+        "alias": alias,
+        "algorithm": algorithm,
+        "secret": b64(&secret),
+    }))
+}
+
 /// SOTER forwarding: the payload selects a HAL op (see `ommegaclient_b::soter`).
 ///
 /// Read-only ops always run; the ops that create or remove keys are gated by
@@ -1281,6 +1301,7 @@ fn handle_task(cfg: &RelayConfig, task_id: &str, task_type: &str, payload: &Valu
         "attest" => handle_generate_attest,
         "sign" => |_cfg, task_type, payload| handle_sign(task_type, payload),
         "decrypt" => |_cfg, task_type, payload| handle_decrypt(task_type, payload),
+        "agree" => |_cfg, task_type, payload| handle_agree(task_type, payload),
         // SOTER forwarding needs the config (mutation policy), so it gets the
         // config-aware handler signature directly.
         "soter" => handle_soter,

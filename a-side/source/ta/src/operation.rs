@@ -88,6 +88,13 @@ pub(crate) enum CryptoOperation {
         /// 真机 KeyMint（含 AOSP 原版）不查这一点，得在转发前拦）。
         modulus: Vec<u8>,
     },
+    /// Remote (B-side TEE) ECDH agreement: the peer public key is accumulated
+    /// locally and forwarded at `finish`, which returns the shared secret.
+    RemoteAgree {
+        alias: String,
+        algorithm: String,
+        data: Vec<u8>,
+    },
 }
 
 /// Current state of an operation.
@@ -136,6 +143,7 @@ impl Operation {
             CryptoOperation::RemoteSign { .. } | CryptoOperation::RemoteDecrypt { .. } => {
                 Some(Self::REMOTE_OP_MAX_INPUT)
             }
+            CryptoOperation::RemoteAgree { .. } => Some(Self::REMOTE_OP_MAX_INPUT),
             _ => None,
         };
         if let Some(max_size) = max_size {
@@ -310,6 +318,10 @@ impl crate::KeyMintTa {
                     buf.try_extend_from_slice(data)?;
                     Ok(Vec::new())
                 }
+                CryptoOperation::RemoteAgree { data: buf, .. } => {
+                    buf.try_extend_from_slice(data)?;
+                    Ok(Vec::new())
+                }
             }
         })
     }
@@ -474,6 +486,31 @@ impl crate::KeyMintTa {
                     );
                 }
                 signed?.ok_or_else(|| km_err!(UnknownError, "remote sign failed"))
+            }
+            CryptoOperation::RemoteAgree {
+                alias,
+                algorithm,
+                mut data,
+            } => {
+                if let Some(input) = finish_data {
+                    data.try_extend_from_slice(input).map_err(|_| {
+                        km_err!(MemoryAllocationFailed, "remote agree buffer overflow")
+                    })?;
+                }
+                let remote = self.dev.remote.as_ref().ok_or_else(|| {
+                    km_err!(
+                        UnknownError,
+                        "remote key used but no remote backend configured"
+                    )
+                })?;
+                if !remote.enabled() {
+                    return Err(km_err!(UnknownError, "remote backend disabled"));
+                }
+                let secret = remote.agree(&alias, &data, &algorithm);
+                if let Err(error) = &secret {
+                    error!("remote_agree failed alias={alias} algorithm={algorithm}: {error:?}");
+                }
+                secret?.ok_or_else(|| km_err!(UnknownError, "remote agree failed"))
             }
             CryptoOperation::RemoteDecrypt {
                 alias,

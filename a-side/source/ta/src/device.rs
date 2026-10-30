@@ -270,6 +270,14 @@ pub trait RemoteBackend: Send {
     /// `None` if the remote is unavailable.
     fn decrypt(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error>;
 
+    /// Forward an ECDH agreement for a remote key (`data` is the peer public key,
+    /// X.509 SubjectPublicKeyInfo DER).  Returns the shared secret, or `None` if
+    /// the remote cannot do it.
+    fn agree(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error> {
+        let _ = (alias, data, algorithm);
+        Ok(None)
+    }
+
     /// Indicate whether the remote backend is currently enabled.
     fn enabled(&self) -> bool;
 
