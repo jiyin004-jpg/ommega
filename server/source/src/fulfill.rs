@@ -708,6 +708,15 @@ impl Fulfill {
                 })
                 .collect();
         }
+        // MODULE_HASH (KeyMint tag 724): the A-side forwards the APEX module-info
+        // digest it already receives through `SetAdditionalAttestationInfo`.
+        // Emitting it keeps the minted leaf consistent with
+        // `getSupplementaryAttestationInfo(MODULE_HASH)` on the device.
+        p.module_hash = ctx
+            .get("module_hash")
+            .and_then(Value::as_str)
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .filter(|hash| !hash.is_empty());
         // User-authentication / authorization-list entries ([tag, value] pairs,
         // tags 502..=509) — the policy the app asked for. Dropping them is what
         // makes a server-minted leaf claim `NO_AUTH_REQUIRED` for an auth-bound

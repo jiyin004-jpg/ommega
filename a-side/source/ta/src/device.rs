@@ -235,6 +235,16 @@ pub struct RemoteAttestParams {
     /// 调用方自带的证明密钥（App AttestKey 委派）。有值时这把 key 的证书必须由
     /// B 端真 TEE 用那把已有的 ATTEST_KEY 原生签发，**不是**由本端软件 keybox 伪造。
     pub attestation_key: Option<RemoteAttestationKey>,
+    /// SHA-256 of the device's APEX module info bundle (`KM_TAG_MODULE_HASH`,
+    /// KeyMint tag 724), exactly as the local software keybox path already
+    /// receives it through `PerformOpReq::SetAdditionalAttestationInfo`.
+    ///
+    /// AOSP requires KeyMint 4.0+ to echo this tag into the attestation
+    /// extension; the local path does, but the remote path used to drop it, so
+    /// a relay-minted leaf came back without `[724]` while
+    /// `getSupplementaryAttestationInfo(MODULE_HASH)` still returned the local
+    /// bundle — the mismatch verifiers report as "module hash omitted".
+    pub module_hash: Option<Vec<u8>>,
 }
 
 /// 调用方指定的证据签发密钥在本端的引用（只留公开信息，私钥永远在 B）。

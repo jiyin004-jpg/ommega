@@ -511,6 +511,18 @@ impl crate::KeyMintTa {
                 .ok_or_else(|| km_err!(CannotAttestIds, "no attestation IDs provisioned"))?;
             remote_params.attestation_ids = remote_attestation_ids(params, &ids)?;
         }
+        // MODULE_HASH（tag 724）：本机软件 keybox 路径由 HAL 在
+        // `SetAdditionalAttestationInfo` 里塞进来（见 `keymint_device.rs` 的
+        // `KeyParam::ModuleHash`），远程路径要原样转发同一份摘要，否则中继铸出的
+        // 叶子缺 724，而 `getSupplementaryAttestationInfo(MODULE_HASH)` 仍返回本机
+        // 那 1213 字节 bundle —— 校验方会报 MODULE_HASH 缺失。
+        remote_params.module_hash =
+            self.additional_attestation_info
+                .iter()
+                .find_map(|param| match param {
+                    KeyParam::ModuleHash(hash) if !hash.is_empty() => Some(hash.clone()),
+                    _ => None,
+                });
 
         let remote = self
             .dev

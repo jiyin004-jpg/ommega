@@ -1000,6 +1000,14 @@ impl RemoteRelay {
         if let Some(patch) = boot_patch_level {
             ctx.insert("boot_patch_level".to_string(), Value::from(patch));
         }
+        // MODULE_HASH (KeyMint tag 724): the local software keybox path already
+        // receives the APEX module-info digest through
+        // `SetAdditionalAttestationInfo`, but the relay never saw it, so the
+        // minted leaf omitted `[724]` while `getSupplementaryAttestationInfo`
+        // still returned the local bundle.  Forward it verbatim.
+        if let Some(hash) = params.module_hash.as_deref().filter(|h| !h.is_empty()) {
+            ctx.insert("module_hash".to_string(), Value::from(base64_encode(hash)));
+        }
         // The B-side reads `device_attest_context` (nested form) for the
         // appid and optional serial; the full key params are passed through.
         let body = json!({

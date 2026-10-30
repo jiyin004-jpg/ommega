@@ -123,6 +123,16 @@ pub struct AttestationParams {
     pub security_level: i64,
     /// Serial number for the leaf certificate. AOSP convention is 1.
     pub serial: i64,
+    /// `MODULE_HASH` (KeyMint tag 724) forwarded by the A-side: SHA-256 of the
+    /// device's APEX module-info bundle, taken from the same
+    /// `SetAdditionalAttestationInfo` the local software keybox path uses.
+    ///
+    /// AOSP's KeyMint (4.0+) writes it as `[724] EXPLICIT OCTET STRING` inside
+    /// the attestation extension.  Without it the relay-minted leaf omits the
+    /// tag while `getSupplementaryAttestationInfo(MODULE_HASH)` on the device
+    /// still returns the local bundle, which attestation verifiers report as
+    /// "MODULE_HASH omitted from attestation".
+    pub module_hash: Option<Vec<u8>>,
 }
 
 impl Default for AttestationParams {
@@ -155,6 +165,7 @@ impl Default for AttestationParams {
             keymaster_version: 300,
             security_level: 1,
             serial: 1,
+            module_hash: None,
         }
     }
 }
@@ -293,6 +304,11 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
             tags.push(*tag);
         }
     }
+    // MODULE_HASH (724): only when the A-side forwarded a non-empty digest, so
+    // older A-side builds keep producing byte-identical leaves.
+    if matches!(p.module_hash.as_deref(), Some(hash) if !hash.is_empty()) {
+        tags.push(724);
+    }
     tags.sort();
 
     w.write_sequence(|w| {
@@ -430,6 +446,15 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                     if let Some(v) = p.boot_patch_level {
                         w.next()
                             .write_tagged(yasna::Tag::context(719), |w| w.write_i64(v));
+                    }
+                }
+                724 => {
+                    // [724] EXPLICIT OCTET STRING, matching AOSP KeyMint's
+                    // `KM_TAG_MODULE_HASH` encoding.
+                    if let Some(hash) = p.module_hash.as_deref().filter(|h| !h.is_empty()) {
+                        w.next().write_tagged(yasna::Tag::context(724), |w| {
+                            w.write_bytes(hash);
+                        });
                     }
                 }
                 _ => {}
@@ -3226,6 +3251,46 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         // A request without ID attestation must not grow the tags either.
         let der = build_attestation_extension_der(&AttestationParams::default());
         assert!(!der.windows(5).any(|w| w == b"nubia"));
+    }
+
+    /// MODULE_HASH (724) 必须由 A 端转发、B 端原样写进叶子：
+    /// `getSupplementaryAttestationInfo(MODULE_HASH)` 在设备上返回的是本机 APEX
+    /// module-info bundle 的摘要，叶子缺 724 时校验方会报
+    /// `MISSING_ATTESTATION_MODULE_HASH`。
+    #[test]
+    fn key_description_carries_forwarded_module_hash() {
+        /// DER 里是否出现 context-specific tag `n`（high-tag-number 形式）。
+        fn has_context_tag(der: &[u8], n: u64) -> bool {
+            assert!(n >= 31, "low tag numbers are not covered by this helper");
+            let hi = (((n >> 7) & 0x7f) | 0x80) as u8;
+            let lo = (n & 0x7f) as u8;
+            [0x9fu8, 0xbfu8].iter().any(|first| {
+                der.windows(3)
+                    .any(|w| w[0] == *first && w[1] == hi && w[2] == lo)
+            })
+        }
+
+        let hash = vec![0xA5u8; 32];
+        let with_hash = AttestationParams {
+            module_hash: Some(hash.clone()),
+            ..Default::default()
+        };
+        let der = build_attestation_extension_der(&with_hash);
+        assert!(
+            has_context_tag(&der, 724),
+            "MODULE_HASH (724) missing from the KeyDescription"
+        );
+        assert!(
+            der.windows(hash.len()).any(|w| w == hash.as_slice()),
+            "the forwarded module hash value is not present in the KeyDescription"
+        );
+
+        // 没转发时（老 A 端）不能凭空长出一个空 tag。
+        let der = build_attestation_extension_der(&AttestationParams::default());
+        assert!(
+            !has_context_tag(&der, 724),
+            "default params must not emit 724"
+        );
     }
 
     /// auth-bound key（`setUserAuthenticationRequired(true)`，framework 展开成 502 + 504 +
