@@ -51,11 +51,23 @@ resetprop -p persist.logd.size.system ""
 resetprop -p persist.logd.size.main ""
 # boot 锁定状态：走远程时证书是 B 端真机出的，RootOfTrust 里写的是 B 的说法。
 # 本机属性必须跟它一致，否则 A09（cert locked/state vs prop locked/green）一查就中。
-# 远程身份的落盘由 TA 写（/data/misc/keystore/ommega/remote_identity），这里读它；
-# 还没有这个键（本地模式 / 没出过链）就保持原来的 green+locked。
+# 远程身份的落盘由 TA 写（/data/misc/keystore/ommega/remote_identity），这里读它。
+#
+# 只在 remote 开启时才跟：本地模式下没有 RKP 路径，证书说的是本机自己
+# （locked / green），属性也得说本机；否则切回本地后还会被上次远程留在
+# remote_identity 里的 false/2 污染。
 _OMMEGA_RI=/data/misc/keystore/ommega/remote_identity
-_ri_locked=$(sed -n 's/^device_locked=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
-_ri_state=$(sed -n 's/^verified_boot_state=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+_ri_remote=$(grep -iE '^[[:space:]]*remote[[:space:]]*:' "$TARGET_CONF" 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+case "$_ri_remote" in
+  1|true|yes|on) _ri_apply=1 ;;
+  *) _ri_apply=0 ;;
+esac
+_ri_locked=
+_ri_state=
+if [ "$_ri_apply" = 1 ]; then
+  _ri_locked=$(sed -n 's/^device_locked=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+  _ri_state=$(sed -n 's/^verified_boot_state=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+fi
 case "$_ri_state" in
   0) resetprop ro.boot.verifiedbootstate green ;;
   1) resetprop ro.boot.verifiedbootstate yellow ;;

@@ -244,11 +244,24 @@ impl crate::KeyMintTa {
                 }
                 _ => {
                     // 叶子由本机 keybox 签（ATTEST_KEY 子钥那条路径）。如果这台机器
-                    // 用过远程 B 出链，RKP 路径证书里的 RootOfTrust 是 B 的
+                    // 正在走远程，RKP 路径证书里的 RootOfTrust 是 B 的
                     // （unlocked / Unverified），这里再用本机的（locked / Verified）
                     // 就成了两条链说法不一 —— Duck Detector 的
                     // `ROOT_OF_TRUST_DIVERGENCE` 抓的就是这个。
-                    remote_boot = load_remote_boot_override(&hashed_boot);
+                    //
+                    // 本地模式（remote 关）不跟：那时根本没有 RKP 路径，证书就该
+                    // 说本机自己的话；否则切回本地后还会被上次远程留下的
+                    // remote_identity 污染，把一台锁定的机器说成已解锁。
+                    remote_boot = if self
+                        .dev
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.enabled())
+                    {
+                        load_remote_boot_override(&hashed_boot)
+                    } else {
+                        None
+                    };
                     remote_boot.as_ref().unwrap_or(&hashed_boot)
                 }
             };
@@ -1316,8 +1329,7 @@ fn self_hash_sha256(data: &[u8]) -> Vec<u8> {
 /// `vbmeta_digest`（TA 出远程链时自己写的）。没文件/没字段就返回 None，
 /// 本机继续用自己的值（本地模式不受影响）。
 fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::BootInfo> {
-    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
-    let text = std::fs::read_to_string(PATH).ok()?;
+    let text = remote_identity_text()?;
     let mut locked: Option<i32> = None;
     let mut state: Option<i32> = None;
     let mut digest: Option<Vec<u8>> = None;
@@ -1340,6 +1352,30 @@ fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::Bo
         verified_boot_hash: digest.unwrap_or_else(|| fallback.verified_boot_hash.clone()),
         boot_patchlevel: fallback.boot_patchlevel,
     })
+}
+
+/// 读 `remote_identity` 的文本内容，存 5 秒。
+///
+/// 每笔本地铸证都会问一次（要跟 RKP 链对齐 RootOfTrust），而文件只有一百多字节；
+/// 5 秒的缓存已经能躲掉绝大多数重复读，同时保证 B 那边换了 boot 状态后很快跟上。
+fn remote_identity_text() -> Option<String> {
+    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((text, at)) = guard.as_ref() {
+            if at.elapsed() < TTL {
+                return Some(text.clone());
+            }
+        }
+    }
+    let text = std::fs::read_to_string(PATH).ok()?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((text.clone(), std::time::Instant::now()));
+    }
+    Some(text)
 }
 
 fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
