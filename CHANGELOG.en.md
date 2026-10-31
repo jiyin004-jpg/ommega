@@ -4,6 +4,7 @@
 
 ## 1.7.12
 
+- Much lower idle CPU: the keymint RPC accept loop now polls every 50ms instead of 5ms, and the daemon's identity sync runs every 10s instead of every 2s.
 - The injector supervisor now runs a tick only when a watched file changes (Rust), cutting its idle CPU from 8% to 0.1%.
 - Panel: the boot patch level now writes `ro.bootimage.build.date.utc`, so the property and the chain always agree.
 - Fixed the adbr debug channel burning about a third of a CPU core while idle (a leftover property made the watchdog start and kill adbd forever).
