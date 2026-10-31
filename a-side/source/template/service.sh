@@ -137,20 +137,21 @@ else
   start_daemon "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"
 fi
 
-# ro.boot.* 的伪装必须等 keymint 起稳再改：这些值既是 A 端 keymint 的
-# root-of-trust 来源（vb_hash/vb_key=auto 读 ro.boot.vbmeta.digest），也是 vold /
-# keystore2 在开机早期判断用的。改早了 SetBootInfo 会写进伪装的 ROT，用户之前
-# 加密的 FBE keyblob 就解不开（锁屏密码对也进不去桌面）。
-# app 层的 getprop 是实时的，这时改完检测器看到的照样是伪装值。
+# ro.boot 的启动状态三连（verifiedbootstate / flash.locked / vbmeta.device_state）
+# 等 keymint 起稳再改：它们是 vold 早期判断用的，改早了会干扰部分机型的解锁流程。
+# 注意这里**必须整段丢后台**：service.sh 是 late_start，前台 sleep 会把开机拖慢，
+# 也会挡住后面的 SOTER 接管和内核模块加载。app 层 getprop 是实时的，晚几秒没影响。
 if [ -x "$MODDIR/apply-boot-props.sh" ]; then
-  i=0
-  while [ "$i" -lt 40 ]; do
-    pidof keymint >/dev/null 2>&1 && break
-    pgrep -f "$BIN_DIR/keymint" >/dev/null 2>&1 && break
-    sleep 0.5
-    i=$((i + 1))
-  done
-  sh "$MODDIR/apply-boot-props.sh" >>"$(log_target service.log)" 2>&1 &
+  (
+    i=0
+    while [ "$i" -lt 40 ]; do
+      pidof keymint >/dev/null 2>&1 && break
+      pgrep -f "$BIN_DIR/keymint" >/dev/null 2>&1 && break
+      sleep 0.5
+      i=$((i + 1))
+    done
+    sh "$MODDIR/apply-boot-props.sh" >>"$(log_target service.log)" 2>&1
+  ) &
 fi
 
 # Bundled PathMask kernel module: pick the .ko matching this kernel and hide
