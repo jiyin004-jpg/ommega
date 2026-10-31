@@ -778,9 +778,26 @@ fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'stati
     // 模式自动分层没区别了，调试时也看不出到底是哪一层出的链。
     const ONLY_B: &[&str] = &["b"];
     const ONLY_KB: &[&str] = &["keybox"];
+    // 证明密钥的「智能模式」：不走 B，但允许回退到自签（不然 keybox 一时不可用
+    // 就整把 AK 建不出来）。
+    const KB_NO_B: &[&str] = &["keybox", "self_signed"];
     let by_mode = if serverbox { KB_CHAIN } else { B_CHAIN };
     if task_type != "attest" {
         return by_mode;
+    }
+    // 证明密钥（`PURPOSE_ATTEST_KEY` = 8）：真机上它和普通密钥同一套 keybox，
+    // 根相同；我们物理模式下普通认证走 B、证明密钥留本地就让两边根分叉。
+    if is_attest_key_request(body) {
+        return match crate::attest_policy::attest_key_order() {
+            crate::attest_policy::AttestKeyOrder::Smart => KB_NO_B,
+            crate::attest_policy::AttestKeyOrder::Follow => {
+                match crate::attest_policy::attest_order() {
+                    crate::attest_policy::Order::Auto => by_mode,
+                    crate::attest_policy::Order::BFirst => ONLY_B,
+                    crate::attest_policy::Order::KeyboxFirst => ONLY_KB,
+                }
+            }
+        };
     }
     let policy = if request_has_attestation_ids(body) {
         crate::attest_policy::id_attest_order()
@@ -792,6 +809,18 @@ fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'stati
         crate::attest_policy::Order::BFirst => ONLY_B,
         crate::attest_policy::Order::KeyboxFirst => ONLY_KB,
     }
+}
+
+/// 是不是在铸一把证明密钥（`KeyPurpose::AttestKey` = 8）的请求。
+///
+/// A 端会把这个 purpose 原样放进 `device_attest_context.purpose`（跟普通 keygen
+/// 一个口径），所以这里只看那个数组里有没有 8。
+fn is_attest_key_request(body: &Value) -> bool {
+    body.get("device_attest_context")
+        .and_then(|c| c.get("purpose"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().any(|v| v.as_i64() == Some(8)))
+        .unwrap_or(false)
 }
 
 async fn run_a_side_task(

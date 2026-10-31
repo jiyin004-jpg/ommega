@@ -1305,13 +1305,14 @@ pub async fn admin_attest_policy_status(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let (attest, id_attest) = crate::attest_policy::snapshot();
+    let (attest, id_attest, attest_key) = crate::attest_policy::snapshot();
     let persisted = std::path::Path::new(crate::attest_policy::PATH).is_file();
     let serverbox = crate::config::Config::load().server_keybox_enabled();
     Json(json!({
         "status": "ok",
         "attest_order": attest.as_str(),
         "id_attest_order": id_attest.as_str(),
+        "attest_key_order": attest_key.as_str(),
         "mode": if serverbox { "server_keybox" } else { "physical" },
         "persisted": persisted,
         "path": crate::attest_policy::PATH,
@@ -1380,6 +1381,9 @@ pub struct AttestPolicyBody {
     /// Same tokens, for attestations that carry device IDs.
     #[serde(default)]
     pub id_attest_order: Option<String>,
+    /// `smart`（服务端 keybox，物理模式下不占 B）| `follow`（跟普通认证一条路）。
+    #[serde(default)]
+    pub attest_key_order: Option<String>,
     /// Legacy boolean: true -> keybox_first, false -> auto.
     #[serde(default)]
     pub keybox_first: Option<bool>,
@@ -1440,23 +1444,36 @@ pub async fn admin_attest_policy_set(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if attest.is_none() && id_attest.is_none() {
+    let attest_key = match body.attest_key_order.as_ref() {
+        None => None,
+        Some(tok) => match tok.parse::<crate::attest_policy::AttestKeyOrder>() {
+            Ok(o) => Some(o),
+            Err(_) => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid attest_key_order {tok:?}: expected \"smart\" | \"follow\""),
+                )
+            }
+        },
+    };
+    if attest.is_none() && id_attest.is_none() && attest_key.is_none() {
         return json_err(
             StatusCode::BAD_REQUEST,
-            "nothing to change: pass attest_order and/or id_attest_order",
+            "nothing to change: pass attest_order, id_attest_order and/or attest_key_order",
         );
     }
-    if let Err(e) = crate::attest_policy::set(attest, id_attest) {
+    if let Err(e) = crate::attest_policy::set(attest, id_attest, attest_key) {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to persist attest policy: {e}"),
         );
     }
-    let (attest, id_attest) = crate::attest_policy::snapshot();
+    let (attest, id_attest, attest_key) = crate::attest_policy::snapshot();
     Json(json!({
         "status": "ok",
         "attest_order": attest.as_str(),
         "id_attest_order": id_attest.as_str(),
+        "attest_key_order": attest_key.as_str(),
     }))
     .into_response()
 }

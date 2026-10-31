@@ -422,6 +422,18 @@ impl crate::KeyMintTa {
         // （私钥在 B 端真 TEE）时，才改由 B 的原生 KeyMint 用它签发子证书；
         // 如果那是一把本地签发密钥（私钥在本机），仍旧走本地路径。
         let wants_attest_challenge = get_opt_tag_value!(params, AttestationChallenge)?.is_some();
+        // 证明密钥（`PURPOSE_ATTEST_KEY`）生成时 App 一般不带 challenge（它是长期
+        // 密钥）。真机上它的链和普通密钥同一套 keybox，根相同；而物理模式下普通
+        // 认证走 B、证明密钥留本地，两边根就分叉了。
+        //
+        // 所以只有「远程开着」才把它也送出去（远程出证必须有 challenge，这里自己
+        // 造一个 32 字节随机值）。本地模式（remote 关）保持原样：直接用本地对应
+        // 级别的 keybox 出证。
+        let is_attest_key_keygen = params
+            .iter()
+            .any(|p| matches!(p, KeyParam::Purpose(KeyPurpose::AttestKey)));
+        let remote_on = self.dev.remote.as_ref().is_some_and(|r| r.enabled());
+        let auto_challenge = is_attest_key_keygen && !wants_attest_challenge && remote_on;
         let remote_issuer = match attestation_key.as_ref() {
             Some(info)
                 if wants_attest_challenge
@@ -449,12 +461,24 @@ impl crate::KeyMintTa {
         // 认证密钥（PURPOSE_ATTEST_KEY）则改走远端：B 用调用方那把 ATTEST_KEY
         // 原生签发子证书，不再需要本机拿它的私钥签 TBS（真机实测：独占 ATTEST_KEY
         // 可铸，用它 begin(SIGN) 恒被拒）。
-        let remote_attest = wants_attest_challenge
+        let remote_attest = (wants_attest_challenge || auto_challenge)
             && !requests_user_auth(params)
             && !agrees_only(params)
             && self.dev.remote.as_ref().is_some_and(|r| r.enabled())
             && (attestation_key.is_none() || remote_issuer.is_some());
         if remote_attest {
+            // 证明密钥自己造了 challenge：远程出证要有它，但调用方看不到也无所谓
+            // （challenge 只影响叶子里的标签，没人会去校验它）。
+            let mut owned; // 存住注入后的参数，作用域盖住下面两次调用
+            let params: &[KeyParam] = if auto_challenge && !wants_attest_challenge {
+                owned = params.to_vec();
+                let mut challenge = vec![0u8; 32];
+                self.imp.rng.fill_bytes(&mut challenge);
+                owned.push(KeyParam::AttestationChallenge(challenge));
+                &owned
+            } else {
+                params
+            };
             // `Ok(None)` from the remote backend means it was unavailable; fall
             // back to the local software keybox when `fallback_local` allows.
             if let Some(result) = self.generate_key_remote(params, remote_issuer.as_ref())? {

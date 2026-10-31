@@ -527,6 +527,13 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
         <option value="keybox_first">服务端优先</option>
       </select>
     </div>
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">证明密钥</span>
+      <select id="apAttestKeyOrder" style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+        <option value="smart">智能（服务端密钥）</option>
+        <option value="follow">跟随（物理模式走真机）</option>
+      </select>
+    </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
       <button class="btn primary" onclick="saveAttestPolicy()">保存</button>
     </div>
@@ -1283,14 +1290,16 @@ async function setStrongboxMode(mode) {
 }
 
 const ORDER_LABEL = { auto: '自动（跟随模式）', b_first: '真机优先', keybox_first: '服务端优先' };
+const ATTEST_KEY_LABEL = { smart: '智能（服务端密钥）', follow: '跟随（物理模式走真机）' };
 
 async function loadAttestPolicy() {
   try {
     const d = await api('/api/admin/attest_policy/');
     $('#apAttestOrder').value = d.attest_order || 'auto';
     $('#apIdAttestOrder').value = d.id_attest_order || 'auto';
+    $('#apAttestKeyOrder').value = d.attest_key_order || 'smart';
     const mode = d.mode === 'server_keybox' ? '本地出证（keybox 先）' : 'A/B 转发（真机先）';
-    $('#apStatus').textContent = `当前模式：${mode} · 普通=${ORDER_LABEL[d.attest_order] || d.attest_order} · 设备 ID=${ORDER_LABEL[d.id_attest_order] || d.id_attest_order}`;
+    $('#apStatus').textContent = `当前模式：${mode} · 普通=${ORDER_LABEL[d.attest_order] || d.attest_order} · 设备 ID=${ORDER_LABEL[d.id_attest_order] || d.id_attest_order} · 证明密钥=${ATTEST_KEY_LABEL[d.attest_key_order] || d.attest_key_order}`;
   } catch (e) { $('#apStatus').textContent = '读取失败: ' + e.message; }
 }
 
@@ -1301,6 +1310,7 @@ async function saveAttestPolicy() {
       body: JSON.stringify({
         attest_order: $('#apAttestOrder').value,
         id_attest_order: $('#apIdAttestOrder').value,
+        attest_key_order: $('#apAttestKeyOrder').value,
       }),
     });
     toast('认证层序已保存（立即生效）');
