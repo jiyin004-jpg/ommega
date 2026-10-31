@@ -80,9 +80,6 @@ use ommegaclient_b::wakelock;
 /// **不能超过 POLL_WALL_LIMIT（8s）**：超了 watchdog 会判「循环不往前转」直接退进程，
 /// service.sh 再拉起来，就变成 15s 一次的崩溃重起了。
 const POLL_TIMEOUT_SEC: u32 = 5;
-/// 一次领几个任务。串行处理一个要半秒到一秒，只领一个时后面的请求得陪它排队，
-/// A 端那边就是 1~2 秒的延迟。老服务端不认这个参数会忽略。
-const POLL_BATCH: usize = 3;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
 /// 一轮 poll 最多允许的墙钟时间。刻意比上面的 READ_TIMEOUT_MS 早一步收网：那个
@@ -713,7 +710,7 @@ fn http_request(
 // Relay protocol helpers.
 // ---------------------------------------------------------------------------
 
-fn poll_tasks(cfg: &RelayConfig) -> Result<Option<Vec<(String, String, Value)>>> {
+fn poll_tasks(cfg: &RelayConfig) -> Result<Option<(String, String, Value)>> {
     // 带上本机能力声明：服务端靠它把 SOTER 任务路由到真能做的设备上，状态页也
     // 显示这几个。SOTER 那一支会真去签一次（命中缓存时不再碰 HAL），其余只查
     // 服务实例在不在，没有副作用。
@@ -728,16 +725,8 @@ fn poll_tasks(cfg: &RelayConfig) -> Result<Option<Vec<(String, String, Value)>>>
     // 否则链是真机出的、属性却是调用方那台，检测器一对就不一致。
     let ident = device_identity_query();
     let url = format!(
-        "{}/api/b/poll/?device_id={}&machine_id={}&timeout={}&batch={}&caps={}&skip_pkgs={}&ver={}{}",
-        cfg.server,
-        cfg.device_id,
-        cfg.machine_id,
-        POLL_TIMEOUT_SEC,
-        POLL_BATCH,
-        caps,
-        skip,
-        ver,
-        ident
+        "{}/api/b/poll/?device_id={}&machine_id={}&timeout={}&caps={}&skip_pkgs={}&ver={}{}",
+        cfg.server, cfg.device_id, cfg.machine_id, POLL_TIMEOUT_SEC, caps, skip, ver, ident
     );
     let headers = vec![("X-Relay-Token".to_string(), cfg.token.clone())];
     let (status, body) =
@@ -747,25 +736,6 @@ fn poll_tasks(cfg: &RelayConfig) -> Result<Option<Vec<(String, String, Value)>>>
         204 => Ok(None),
         200 => {
             let v: Value = serde_json::from_slice(&body).with_context(|| "b/poll bad json")?;
-            // 新服务端一次给一批（`tasks` 数组），老服务端只给单个。统一转成 Vec，
-            // 主循环按顺序处理，行为和老版一致（只是少跑了几趟长轮询）。
-            if let Some(list) = v.get("tasks").and_then(Value::as_array) {
-                let mut out = Vec::with_capacity(list.len());
-                for item in list {
-                    let Some(task_id) = item.get("task_id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    out.push((
-                        task_id.to_string(),
-                        item.get("task_type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        item.get("payload").cloned().unwrap_or(Value::Null),
-                    ));
-                }
-                return Ok(if out.is_empty() { None } else { Some(out) });
-            }
             let task_id = v
                 .get("task_id")
                 .and_then(Value::as_str)
@@ -777,7 +747,7 @@ fn poll_tasks(cfg: &RelayConfig) -> Result<Option<Vec<(String, String, Value)>>>
                 .unwrap_or("")
                 .to_string();
             let payload = v.get("payload").cloned().unwrap_or(Value::Null);
-            Ok(Some(vec![(task_id, task_type, payload)]))
+            Ok(Some((task_id, task_type, payload)))
         }
         other => Err(anyhow!("b/poll unexpected status {other}")),
     }
@@ -1524,18 +1494,14 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
         let polled = poll_tasks(&cfg);
         watchdog.disarm();
         match polled {
-            Ok(Some(tasks)) => {
+            Ok(Some((task_id, task_type, payload))) => {
                 error_backoff = Duration::from_secs(1);
-                // 一批任务按顺序处理：同一 uid 的 soter 操作有先后依赖（建钥 → 签 → 删），
-                // 这里不能并发，串行才是对的；省下的只是“每处理完一个就多跑一趟长轮询”。
-                for (task_id, task_type, payload) in tasks {
-                    log::info!("poll received task {task_id} type={task_type}");
-                    watchdog.arm(TASK_WALL_LIMIT);
-                    let handled = handle_task(&cfg, &task_id, &task_type, &payload);
-                    watchdog.disarm();
-                    if let Err(e) = handled {
-                        log::error!("handle_task failed: {e:#}");
-                    }
+                log::info!("poll received task {task_id} type={task_type}");
+                watchdog.arm(TASK_WALL_LIMIT);
+                let handled = handle_task(&cfg, &task_id, &task_type, &payload);
+                watchdog.disarm();
+                if let Err(e) = handled {
+                    log::error!("handle_task failed: {e:#}");
                 }
             }
             Ok(None) => {

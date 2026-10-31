@@ -598,11 +598,7 @@ impl TaskStore {
         machine_id: &str,
         caps: DeviceCaps,
         timeout: Duration,
-        // 一次最多领几个。B 端串行处理时，一次只领一个会让后面的任务白等；
-        // 领一批回去处理能直接把排队延迟抹平。老 B 端不传就是 1。
-        max: usize,
-    ) -> Vec<Task> {
-        let max = max.clamp(1, 8);
+    ) -> Option<Task> {
         let deadline = Instant::now() + timeout;
         // 订阅版本号：入队那一刻不管我们有没有注册上，`changed()` 都会立刻返回。
         let mut rx = self.tick.subscribe();
@@ -763,27 +759,15 @@ impl TaskStore {
                 // `SWEEP_INTERVAL_MS` 节流（见常量注释）。
                 self.sweep_locked(&mut inner);
 
-                // 一次最多取 max 个：dequeue_locked 每次弹一个，取空或取满就停。
-                // B 端处理一个任务平均要半秒到一秒，一次只领一个的话，排在后面的
-                // 请求要陪它串行等——实测 A 端体验到的延迟就有 1~2 秒。
-                let mut batch = Vec::with_capacity(max);
-                while batch.len() < max {
-                    match self.dequeue_locked(&mut inner, device_id) {
-                        Some(task) => {
-                            Self::record_event_locked(&mut inner, device_id, 1);
-                            batch.push(task);
-                        }
-                        None => break,
-                    }
-                }
-                if !batch.is_empty() {
-                    return batch;
+                if let Some(task) = self.dequeue_locked(&mut inner, device_id) {
+                    Self::record_event_locked(&mut inner, device_id, 1);
+                    return Some(task);
                 }
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Vec::new();
+                return None;
             }
             // 版本号变了就是有新任务或新结果；兜底轮询只防「消息真丢了」。
             let poll_interval = remaining.min(Duration::from_millis(100));
