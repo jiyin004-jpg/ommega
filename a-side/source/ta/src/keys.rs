@@ -451,6 +451,7 @@ impl crate::KeyMintTa {
                         alias: remote.alias,
                         public_key: remote.public_key,
                         issuer_subject_name: info.issuer_subject_name.clone(),
+                        device_id: remote.device_id.clone(),
                         key_blob: info.key_blob.clone(),
                     }),
                     _ => None,
@@ -591,7 +592,7 @@ impl crate::KeyMintTa {
             .as_ref()
             .ok_or_else(|| km_err!(UnknownError, "remote backend not configured"))?;
         let t_remote = std::time::Instant::now();
-        let Some(chain) = remote.attest(
+        let Some((chain, born_on)) = remote.attest(
             challenge,
             app_id,
             &alias,
@@ -651,6 +652,7 @@ impl crate::KeyMintTa {
             alias,
             public_key,
             root_of_trust,
+            device_id: born_on,
         });
 
         let mut certificate_chain = Vec::new();

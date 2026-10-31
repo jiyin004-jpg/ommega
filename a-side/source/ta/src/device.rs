@@ -256,6 +256,11 @@ pub struct RemoteAttestationKey {
     pub public_key: Vec<u8>,
     /// 那把 key 自己的证书 Subject（DER X.501 Name），随请求下发。
     pub issuer_subject_name: Vec<u8>,
+    /// 这把 AK 铸在哪台 B（服务端 keybox 铸的为空）。
+    ///
+    /// 子钥请求钉回这台：另一台没有它的私钥，只会报 `issuer key ... is not
+    /// available on this device`。
+    pub device_id: Option<String>,
     /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
     ///
     /// 真机的 `generateKey(.., attestationKey)` 直接把这个 blob 交给 HAL 用，
@@ -269,7 +274,8 @@ pub struct RemoteAttestationKey {
 /// configured, letting the TA fall back to the local software keybox.
 pub trait RemoteBackend: Send {
     /// Forward an attestation request.  Returns the B-side certificate chain
-    /// (DER, leaf first) on success, or `None` if the remote is unavailable.
+    /// (DER, leaf first) plus the B device that minted it (empty for the
+    /// server keybox layer), or `None` if the remote is unavailable.
     fn attest(
         &self,
         challenge: &[u8],
@@ -277,7 +283,7 @@ pub trait RemoteBackend: Send {
         alias: &str,
         cert_serial: Option<&[u8]>,
         params: &RemoteAttestParams,
-    ) -> Result<Option<Vec<Vec<u8>>>, Error>;
+    ) -> Result<Option<(Vec<Vec<u8>>, Option<String>)>, Error>;
 
     /// Forward a sign request for a remote key.  Returns the signature bytes,
     /// or `None` if the remote is unavailable.

@@ -183,6 +183,11 @@ pub struct RemoteRef {
     /// on verified_boot_key/hash and detectors flag the attestation key as
     /// tampered.
     pub root_of_trust: Option<RemoteRootOfTrust>,
+    /// 这把 key 是哪台 B 铸的（服务端 keybox 层层铸的为空）。
+    ///
+    /// 拿它当证明密钥签子钥时必须回到同一台：另一台 B 没有它的私钥，
+    /// 只会报 `issuer key ... is not available on this device`。
+    pub device_id: Option<String>,
 }
 
 /// Root of trust + attestation version reported by the remote (B-side) TEE
@@ -416,14 +421,33 @@ impl AsCborValue for KeyMaterial {
             }
             1000 => {
                 // Remote TEE key (reserved algorithm value).
-                // Array is [alias, public_key] (legacy) or
-                // [alias, public_key, root_of_trust] (captured ROT).
+                // Array is [alias, public_key] (legacy),
+                // [alias, public_key, root_of_trust] (captured ROT), or
+                // [alias, public_key, root_of_trust|null, device_id].
                 let mut a = match raw_key_value {
-                    cbor::value::Value::Array(a) if a.len() == 2 || a.len() == 3 => a,
-                    _ => return cbor_type_error(&raw_key_value, "arr len 2 or 3"),
+                    cbor::value::Value::Array(a) if (2..=4).contains(&a.len()) => a,
+                    _ => return cbor_type_error(&raw_key_value, "arr len 2..4"),
                 };
-                let root_of_trust = if a.len() == 3 {
-                    Some(<RemoteRootOfTrust>::from_cbor_value(a.remove(2))?)
+                let device_id = if a.len() == 4 {
+                    let raw = <Vec<u8>>::from_cbor_value(a.remove(3))?;
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            String::from_utf8(raw)
+                                .map_err(|_| CborError::UnexpectedItem("utf8", "device_id"))?,
+                        )
+                    }
+                } else {
+                    None
+                };
+                let root_of_trust = if a.len() >= 3 {
+                    let raw = a.remove(2);
+                    if matches!(raw, cbor::value::Value::Null) {
+                        None
+                    } else {
+                        Some(<RemoteRootOfTrust>::from_cbor_value(raw)?)
+                    }
                 } else {
                     None
                 };
@@ -435,6 +459,7 @@ impl AsCborValue for KeyMaterial {
                     alias,
                     public_key: pub_key_raw,
                     root_of_trust,
+                    device_id,
                 }))
             }
             _ => Err(CborError::UnexpectedItem("unknown enum", "algo enum")),
@@ -562,9 +587,13 @@ impl AsCborValue for KeyMaterial {
                         cbor::value::Value::Bytes(try_to_vec(&remote.public_key)?),
                     ]
                     .map_err(cbor_alloc_err)?;
-                    if let Some(rot) = &remote.root_of_trust {
-                        items.push(rot.clone().to_cbor_value()?);
-                    }
+                    items.push(match &remote.root_of_trust {
+                        Some(rot) => rot.clone().to_cbor_value()?,
+                        None => cbor::value::Value::Null,
+                    });
+                    items.push(cbor::value::Value::Bytes(try_to_vec(
+                        remote.device_id.as_deref().unwrap_or("").as_bytes(),
+                    )?));
                     items
                 }),
             ]

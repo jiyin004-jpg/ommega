@@ -864,6 +864,8 @@ impl RemoteRelay {
                 json!({
                     "alias": issuer.alias,
                     "issuer_subject_name": base64_encode(&issuer.issuer_subject_name),
+                    // 这把 AK 的出生地：服务端据此把子钥钉回同一台 B。
+                    "device_id": issuer.device_id,
                     // AOSP 的 `AttestationKey.keyBlob`：B 端优先用它，找不到 session 也能签。
                     "key_blob": base64_encode(&issuer.key_blob),
                 }),
@@ -1271,7 +1273,7 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         alias: &str,
         cert_serial: Option<&[u8]>,
         params: &kmr_ta::device::RemoteAttestParams,
-    ) -> Result<Option<Vec<Vec<u8>>>, kmr_common::Error> {
+    ) -> Result<Option<(Vec<Vec<u8>>, Option<String>)>, kmr_common::Error> {
         // Transport-level failure (connect timeout / network unreachable / TLS
         // handshake) means the relay is unavailable — report `Ok(None)` so the
         // TA falls back to the local software keybox (matching client-a, which
@@ -1345,7 +1347,13 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
                 "remote delegation returned no issuer certificate; the attestation key must be recreated"
             ));
         }
-        Ok(Some(chain))
+        // 这张链是哪台 B 铸的：记下来，以后拿这把 AK 签子钥得回到同一台。
+        let born_on = result
+            .get("device_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok(Some((chain, born_on)))
     }
 
     fn sign(
