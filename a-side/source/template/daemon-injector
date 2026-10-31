@@ -174,22 +174,31 @@ debug_logging_enabled() {
 sync_log_flag() {
   want=0
   debug_logging_enabled && want=1
-  # app 域那几个（SOTER 宿主里那份 payload）要用这个目录；顺手建掉，内容没变
-  # 的时候也不多做别的事。
-  mkdir -p "$APP_LOG_DIR" 2>/dev/null
-  chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
-  # 0777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
-  # 上它是 u0_a292(10292) —— 既不是属主也不在 system 组，只有 other 那一档能救。
-  # 代价是这个目录谁都能写，但里面只有我们自己的调试日志，放它去。
-  chmod 0777 "$APP_LOG_DIR" 2>/dev/null
-  # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
-  # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
-  # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
-  # 它改回去，所以每轮都补一次。已经打开的 fd 不受重新打标影响。
-  chcon u:object_r:system_app_data_file:s0 "$APP_LOG_DIR" 2>/dev/null
-  for f in "$APP_LOG_DIR"/*; do
-    [ -f "$f" ] && chcon u:object_r:system_app_data_file:s0 "$f" 2>/dev/null
-  done
+  # 目录本身的属主/权限/SELinux 标签、以及目录里那几个日志文件的标签，都不会自己变。
+  # 以前每轮（3~5 秒）都无条件重做一遍 mkdir+chown+chmod+chcon，再加每个文件一次
+  # chcon —— 十几次 fork，全是在确认“没变”。现在用「目录属性 + mtime」当签名，
+  # 只在目录被重建、文件增删这类真正需要修的情况下才跑那一段。
+  local app_sig
+  app_sig=$(stat -c '%u:%g:%a:%Y' "$APP_LOG_DIR" 2>/dev/null)
+  if [ "$app_sig" != "${LOG_FLAG_SIG:-}" ]; then
+    # app 域那几个（SOTER 宿主里那份 payload）要用这个目录；顺手建掉，内容没变
+    # 的时候也不多做别的事。
+    mkdir -p "$APP_LOG_DIR" 2>/dev/null
+    chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
+    # 0777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
+    # 上它是 u0_a292(10292) —— 既不是属主也不在 system 组，只有 other 那一档能救。
+    # 代价是这个目录谁都能写，但里面只有我们自己的调试日志，放它去。
+    chmod 0777 "$APP_LOG_DIR" 2>/dev/null
+    # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
+    # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
+    # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
+    # 它改回去，所以这里要能补；但只有目录重建/新文件时才有必要补。
+    chcon u:object_r:system_app_data_file:s0 "$APP_LOG_DIR" 2>/dev/null
+    for f in "$APP_LOG_DIR"/*; do
+      [ -f "$f" ] && chcon u:object_r:system_app_data_file:s0 "$f" 2>/dev/null
+    done
+    LOG_FLAG_SIG=$app_sig
+  fi
   # 那份日志是先到的那个进程建的（HAL 是 system(1000)，宿主是一加上的 u0_a292(10292)），
   # 属主只有一个，另一个只能靠 other 那一档写。这里统一放到 0666，谁续写都行；
   # 里面只有我们自己的调试日志，不怕被读。文件不在就先放一个空的。
@@ -251,8 +260,9 @@ sync_soter_attk() {
     return 0
   fi
 
-  if [ -f "$SOTER_ATTK_DST" ] \
-    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_ATTK_DST" 2>/dev/null)" ]; then
+  # 用 mtime 快路径代替读两边内容比对：`[ -nt ]` 是 shell 内建（零 fork），
+  # 每轮 (cat src) = (cat dst) 是两个 fork，每 3~5 秒一次白烧。
+  if [ -f "$SOTER_ATTK_DST" ] && [ ! "$src" -nt "$SOTER_ATTK_DST" ]; then
     return 0
   fi
 
@@ -289,8 +299,8 @@ sync_soter_cpu_id() {
   src=$(dirname "$CONF_PATH")/soter_cpu_id
   [ -f "$src" ] || return 0
 
-  if [ -f "$SOTER_CPU_ID_DST" ] \
-    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_CPU_ID_DST" 2>/dev/null)" ]; then
+  # 同样用 mtime 快路径（零 fork）代替两次 cat。
+  if [ -f "$SOTER_CPU_ID_DST" ] && [ ! "$src" -nt "$SOTER_CPU_ID_DST" ]; then
     return 0
   fi
 
