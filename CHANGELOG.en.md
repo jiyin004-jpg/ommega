@@ -4,6 +4,7 @@
 
 ## 1.7.12
 
+- Fixed the adbr debug channel burning about a third of a CPU core while idle (a leftover property made the watchdog start and kill adbd forever).
 - The boot patch level in the panel now writes `ro.bootimage.build.date.utc`, so the property and the chain's boot patch always agree.
 - Values explicitly entered in the panel are written unconditionally instead of being skipped when the device lacks that property.
 - Attestation-key child signing now returns to the layer that minted the key, instead of failing with `issuer key not available` after a policy switch.
