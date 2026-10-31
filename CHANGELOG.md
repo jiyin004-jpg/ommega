@@ -4,6 +4,8 @@
 
 ## 1.7.12
 
+- MODULE_HASH 按 HAL 版本自适应：KeyMint 4 以下不再写 724，和真机保持一致，Duck Detector 的 MODULE_HASH 不再报矛盾。
+- 面板导入 ATTK 时同步 cpu_id：文件带 `cpu_id:` 行就用它，不带就清掉强制值、回到本机现算。
 - 修复多线程同时读同一个密钥时 `getKey` 偶发返回空（AProbe 的 L04 并发签名）。
 - 修复 KeyAttestation「使用认证密钥」报 `Invalid key blob`：证明密钥按策略铸、子钥回它的出生地签发，不再因切策略错配到另一层。
 - 本地 ECDH 协商改在本机完成，不再把 B 端的 TEE 拖进坏状态（之前一碰就整台签名失效）。

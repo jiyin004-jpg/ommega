@@ -4,6 +4,8 @@
 
 ## 1.7.12
 
+- MODULE_HASH now follows the HAL version: nothing is written below KeyMint 4, matching real devices, so Duck Detector's MODULE_HASH check no longer contradicts itself.
+- Importing an ATTK from the panel now syncs cpu_id: a `cpu_id:` line in the file is honoured, otherwise the forced value is cleared and recomputed locally.
 - Fix `getKey` occasionally returning null when several threads read the same key at once (AProbe L04 concurrent signing).
 - Fix `Invalid key blob` from KeyAttestation's "use attestation key": the attest key follows the policy when minted, while child keys are always signed back at the key's origin layer.
 - ECDH for key-agreement-only keys now runs locally, so it can no longer wedge the
