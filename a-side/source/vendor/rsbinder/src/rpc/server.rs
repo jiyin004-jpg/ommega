@@ -1416,7 +1416,8 @@ impl RpcServer {
                 .expect("max_connections poisoned")
             {
                 if self.live_worker_count() >= max {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // 满员时的退避。5ms 太密了：这是纯轮询，每轮什么都没干。
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
             }
@@ -1430,9 +1431,14 @@ impl RpcServer {
                     self.serve_connection_raw(raw);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Listener is non-blocking only so we can poll
-                    // `shutdown`; no pending connection.
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // Listener 是 non-blocking 的，只为了能定期看一眼 `shutdown`。
+                    // 这里原来是 5ms（每秒 200 次空转）—— A 端有两个 RPC server
+                    // （主 server + app domain 那个），两个循环加起来的常驻 CPU
+                    // 就有 1.8%，是 keymint 那 2% 的全部来源。
+                    //
+                    // 放宽到 50ms：接入延迟最坏多等 45ms（本地 socket，正常情况下
+                    // accept 立即返回，感知不到），而空转次数降到原来的 1/10。
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e)
                     if matches!(
