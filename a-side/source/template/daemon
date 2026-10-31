@@ -321,7 +321,11 @@ while true; do
       break
     fi
     sync_remote_identity
-    sleep 2
+    # 10 秒而不是 2 秒：sync_remote_identity 每轮要跑十几次 fork（grep / getprop /
+    # resetprop），而它同步的是「B 真机声明的身份」，只在远程出证时才变一次。
+    # 实测每 2 秒的那版光这一个 shell 就占 4.9% CPU。重启请求跟这里共用同一个
+    # sleep，10 秒延迟对面板操作来说无感。
+    sleep 10
   done
 
   wait "$child_pid"
