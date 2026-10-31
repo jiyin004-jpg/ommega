@@ -1810,6 +1810,18 @@ async function fpPick(path){
           : ATTK_PEM;
   var r = await exec("cp -f '" + path.replace(/'/g, "'\\''") + "' '" + dst + "' 2>/dev/null && chmod 0644 '" + dst + "' && echo ok");
   if (r.errno !== 0 || (r.stdout || "").indexOf("ok") < 0){ toast(t("toast.fileFail", {msg: r.stderr || r.errno}), true); return; }
+  // 切 ATTK 时同步 cpu_id：文件带了 `cpu_id: xxx` 就用它（重放别台设备的 ATTK 时要
+  // 跟那台报同一个号），没带就把强制值删掉，回到本机属性现算。
+  if (fpTarget === "sk"){
+    var g = await exec("grep -m1 -Ei '^[[:space:]]*cpu_id[[:space:]]*:' '" + path.replace(/'/g, "'\\''") + "' 2>/dev/null");
+    var line = ((g && g.stdout) || "").trim();
+    var cpu = line ? line.replace(/^[^:]*:[[:space:]]*/, "").trim() : "";
+    if (cpu) {
+      await exec("mkdir -p /data/misc/ommega && printf '%s\\n' 'cpu_id: " + cpu.replace(/'/g, "'\\''") + "' > /data/misc/ommega/soter_cpu_id.force");
+    } else {
+      await exec("rm -f /data/misc/ommega/soter_cpu_id.force");
+    }
+  }
   fpClose();
   if (fpTarget === "keybox"){ toast(t("toast.kbFile")); }
   else if (fpTarget === "sbkeybox"){ toast(t("sbkb.written")); refreshStrongboxKeybox(); }
