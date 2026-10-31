@@ -193,7 +193,7 @@ def get_version() -> str:
 # 别归零：公式是 major*1e6 + minor*1e3 + patch，patch 只值 1，历史偏移早超过 10，
 # 归零后 1.6.9 算出来（1006009）比线上那颗 1006022 还小 —— 管理器当降级，推不下去。
 # 接着往上加：14 到 1006023，15 到 1006024（B 端重发一次）。跟 a-side 各算各的，别顺手对齐。
-VERSION_CODE_OFFSET = 30
+VERSION_CODE_OFFSET = 31
 
 
 def version_code(version: str) -> str:
