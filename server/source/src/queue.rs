@@ -880,7 +880,11 @@ impl TaskStore {
                 return None;
             }
             // 版本号变了就是有新任务或新结果；兜底轮询只防「消息真丢了」。
-            let poll_interval = remaining.min(Duration::from_millis(100));
+            // 500ms 而不是 100ms：每个挂着长轮询的 B 都在这个 select 里循环，
+            // 300 台在线时 100ms 就是 3000 次/秒的定时器唤醒（watch 正常工作时
+            // 这些唤醒全是在确认「没变化」）。真的入队会通过 rx.changed() 即时唤醒，
+            // 兜底放宽到 500ms 不会影响派发时效。
+            let poll_interval = remaining.min(Duration::from_millis(500));
             tokio::select! {
                 _ = rx.changed() => {},
                 _ = tokio::time::sleep(poll_interval) => {},
