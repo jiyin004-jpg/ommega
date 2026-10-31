@@ -68,23 +68,11 @@ if [ "$_ri_apply" = 1 ]; then
   _ri_locked=$(sed -n 's/^device_locked=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
   _ri_state=$(sed -n 's/^verified_boot_state=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
 fi
-case "$_ri_state" in
-  0) resetprop ro.boot.verifiedbootstate green ;;
-  1) resetprop ro.boot.verifiedbootstate yellow ;;
-  2) resetprop ro.boot.verifiedbootstate orange ;;
-  3) resetprop ro.boot.verifiedbootstate red ;;
-  *) resetprop ro.boot.verifiedbootstate green ;;
-esac
-case "$_ri_locked" in
-  0)
-    resetprop ro.boot.flash.locked 0
-    resetprop ro.boot.vbmeta.device_state unlocked
-    ;;
-  *)
-    resetprop ro.boot.flash.locked 1
-    resetprop ro.boot.vbmeta.device_state locked
-    ;;
-esac
+# 注意：这里**不再**改 ro.boot.verifiedbootstate / flash.locked / vbmeta.device_state。
+# 那三项和下面的 ro.boot.vbmeta.digest 都会被 A 端 keymint（vb_hash=auto）和 vold /
+# keystore2 在开机早期读到，改早了 SetBootInfo 就把伪装的 root-of-trust 写进 TA，
+# 用户之前加密的 FBE keyblob 再也解不开（锁屏密码对也进不去桌面）。
+# 它们由 service.sh 在 keymint 起稳后调用 apply-boot-props.sh 补上。
 unset _OMMEGA_RI _ri_locked _ri_state
 resetprop ro.boot.veritymode enforcing
 resetprop ro.secure 1
@@ -108,7 +96,7 @@ if [ -f "$_OMMEGA_IDENTITY" ]; then
   _id_set ro.product.manufacturer "$(_id_get manufacturer)"
   _id_set ro.product.model "$(_id_get model)"
   _id_set ro.serialno "$(_id_get serial)"
-  _id_set ro.boot.vbmeta.digest "$(_id_get vbmeta_digest)"
+  # ro.boot.vbmeta.digest 见 apply-boot-props.sh：必须等 keymint 读完真值再改。
 fi
 mkdir -p "$TARGET_DIR"
 chmod 0770 "$TARGET_DIR"
@@ -266,11 +254,10 @@ if [ -f "$DECLARED_CONF" ]; then
   done
   # 引导器锁定状态：不少检测器会看。只有真的存在这个键的机型才改。
   setprop_if_present ro.secureboot.lockstate locked
-  d_vbkey=$(cfg_val vb_key)
-  case "$d_vbkey" in ""|auto|random) ;; *) setprop_if_present ro.boot.vbmeta.public_key_digest "$d_vbkey"; log_line "ommega: declared vbmeta key (boot stage)" ;; esac
-  d_vbhash=$(cfg_val vb_hash)
-  case "$d_vbhash" in ""|auto|random) ;; *) setprop_if_present ro.boot.vbmeta.digest "$d_vbhash"; log_line "ommega: declared vbmeta hash (boot stage)" ;; esac
-  unset d_patch d_os d_vendor d_boot d_vbkey d_vbhash
+  # vb_key / vb_hash（ro.boot.vbmeta.public_key_digest、ro.boot.vbmeta.digest）不在这里设：
+  # 它们参与 KeyMint 的 root-of-trust，早设会让 FBE keyblob 解不开，改由
+  # service.sh 在 keymint 起稳后跑 apply-boot-props.sh。
+  unset d_patch d_os d_vendor d_boot
 fi
 
 # ---- 面板里设的属性覆盖 ----
@@ -293,6 +280,7 @@ if [ -r "$PROP_OVERRIDES" ]; then
       \"*\") p_val=${p_val#\"}; p_val=${p_val%\"} ;;
     esac
     case "$p_key" in
+      ro.boot.*) continue ;;
       ro.*|persist.*|sys.*) : ;;
       *) continue ;;
     esac
