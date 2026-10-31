@@ -1415,7 +1415,7 @@ fn remote_identity_text() -> Option<String> {
 }
 
 fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 || text.is_empty() {
+    if !text.len().is_multiple_of(2) || text.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 2);

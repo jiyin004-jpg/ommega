@@ -651,7 +651,7 @@ fn mint_attest_key_with(
     let parent = match spec.attestation_key.as_ref() {
         Some(request) => match resolve_issuer(request, service) {
             Ok(parent) => Some(parent),
-            Err(e) if request.key_blob.is_some() => {
+            Err(_) if request.key_blob.is_some() => {
                 log::info!(
                     "issuer key '{}' not in session, falling back to request key blob",
                     request.alias

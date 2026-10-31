@@ -272,6 +272,9 @@ pub struct RemoteAttestationKey {
 
 /// there.  Each method returns `Ok(None)` when the remote is unavailable or not
 /// configured, letting the TA fall back to the local software keybox.
+/// 远程铸造回来的证链，以及铸它的那台 B（服务端 keybox 层为空）。
+pub type RemoteAttestChain = (Vec<Vec<u8>>, Option<String>);
+
 pub trait RemoteBackend: Send {
     /// Forward an attestation request.  Returns the B-side certificate chain
     /// (DER, leaf first) plus the B device that minted it (empty for the
@@ -283,7 +286,7 @@ pub trait RemoteBackend: Send {
         alias: &str,
         cert_serial: Option<&[u8]>,
         params: &RemoteAttestParams,
-    ) -> Result<Option<(Vec<Vec<u8>>, Option<String>)>, Error>;
+    ) -> Result<Option<RemoteAttestChain>, Error>;
 
     /// Forward a sign request for a remote key.  Returns the signature bytes,
     /// or `None` if the remote is unavailable.

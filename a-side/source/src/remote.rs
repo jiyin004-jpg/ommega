@@ -1273,7 +1273,7 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         alias: &str,
         cert_serial: Option<&[u8]>,
         params: &kmr_ta::device::RemoteAttestParams,
-    ) -> Result<Option<(Vec<Vec<u8>>, Option<String>)>, kmr_common::Error> {
+    ) -> Result<Option<kmr_ta::device::RemoteAttestChain>, kmr_common::Error> {
         // Transport-level failure (connect timeout / network unreachable / TLS
         // handshake) means the relay is unavailable — report `Ok(None)` so the
         // TA falls back to the local software keybox (matching client-a, which
