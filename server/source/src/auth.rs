@@ -47,26 +47,24 @@ impl TokenMeta {
     /// - 任一方的 kind 为空（老卡密 / 静态 token）→ 通（历史行为不变）
     /// - 都是 `pair` → 只有 `pair_id` 相同才通。
     /// - 配对卡遇到「对方根本没登记 token」（离线/老客户端）也放行，`who` 为 None 时由调用方决定。
+    /// 卡密只有两种：
+    ///
+    /// - **普通卡**（`kind = "public"`）：任意互通，但只能配普通卡；
+    /// - **私卡**（`kind = "pair"`）：按 `pair_id` 配对；`pair_id` 没填 = 没约束。
+    ///
+    /// 没有第三种。历史上 `kind` 为空的早期记录一律按**私卡**处理（`pair_id`
+    /// 一般也是空 → 无约束放行），所以不需要单独一条兼容分支 —— 早期加的那条
+    /// “kind 为空就直接放行”会把白卡和私卡混在一起，已经删了。
     pub fn allows(&self, other: &TokenMeta) -> bool {
-        // 老卡密（kind 为空）走历史行为：不参与配对校验。
-        let legacy = |m: &TokenMeta| m.kind.is_empty();
-        if legacy(self) || legacy(other) {
-            return true;
+        let public = |m: &TokenMeta| m.kind.eq_ignore_ascii_case("public");
+
+        // 普通卡：两边都是普通卡才放行（公开卡不能指挥别人的私机）。
+        if public(self) || public(other) {
+            return public(self) && public(other);
         }
 
-        let self_public = self.kind.eq_ignore_ascii_case("public");
-        let other_public = other.kind.eq_ignore_ascii_case("public");
-
-        // 公开卡和私卡不能互串：公开卡只能配公开卡。
-        // （以前是「任一方是 public 就放行」，等于任何白卡都能用别人的私机。）
-        if self_public || other_public {
-            return self_public && other_public;
-        }
-
-        // 两边都是私卡：pair_id 没填的当「无约束」放行，填了就严格同组。
-        // 以前只判 `!self.pair_id.is_empty() && self.pair_id == other.pair_id`，
-        // 结果是 A 端 token kind=pair 而 pair_id 留空时，跟任何正常配对卡都对不上，
-        // 所有请求都被 pair_mismatch 打回去（实测 8443 上 PLK110-17 连刷几百条）。
+        // 剩下都是私卡（含早期 kind 为空的记录）：pair_id 任一方为空 →
+        // 没填就是没约束，放行；都有值就严格同组。
         if self.pair_id.is_empty() || other.pair_id.is_empty() {
             return true;
         }
@@ -739,10 +737,9 @@ mod allows_tests {
         }
     }
 
-    /// 公开卡与私卡不许互串：以前是「任一方是 public 就放行」，
-    /// 等于任何白卡都能指挥别人的私机。
+    /// 普通卡只跟普通卡互通（任意），不渗到私卡。
     #[test]
-    fn public_and_private_do_not_cross() {
+    fn public_cards_only_pair_with_public() {
         assert!(meta("public", "").allows(&meta("public", "")));
         assert!(!meta("public", "").allows(&meta("pair", "x")));
         assert!(!meta("pair", "x").allows(&meta("public", "")));
@@ -757,10 +754,13 @@ mod allows_tests {
         assert!(!meta("pair", "x").allows(&meta("pair", "y")));
     }
 
-    /// kind 为空的老卡密依旧不参与配对校验。
+    /// kind 为空的早期记录按私卡处理，而不是单独的第三种卡。
     #[test]
-    fn legacy_kind_is_permissive() {
+    fn empty_kind_behaves_like_private() {
+        // 早期卡 pair_id 一般也为空 → 无约束放行
         assert!(meta("", "").allows(&meta("pair", "x")));
         assert!(meta("pair", "x").allows(&meta("", "")));
+        // 但如果它带上了 pair_id，就按私卡严格比
+        assert!(!meta("", "x").allows(&meta("pair", "y")));
     }
 }
