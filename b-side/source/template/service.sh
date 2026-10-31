@@ -313,7 +313,9 @@ find_spl_bin() {
 }
 
 spl_daemon_running() {
-  # 只看进程名（/proc/<pid>/comm），不看整条 cmdline：我们自己的调试命令
+  # 快路径：pidof 一次就能问到，不必每轮扫 900 个 /proc（service.sh 实测吃 30% CPU）
+  pidof spl_daemon >/dev/null 2>&1 && return 0
+  # 回退：只看进程名（/proc/<pid>/comm），不看整条 cmdline：我们自己的调试命令
   # （pidof spl_daemon、ls .../spl_daemon）cmdline 里也带这个字，用 cmdline 判会把
   # 命 令行当成 daemon 在跑，结果永远不拉起（2026-10-22 踩到）。
   for d in /proc/[0-9]*; do
@@ -414,7 +416,8 @@ stop_spl_if_unused() {
       keep_adbr_watchdog_alive
       keep_spl_alive
       stop_spl_if_unused
-      sleep 2
+      # 10 秒：这三个检查都会读文件甚至扫 /proc，没必要 2 秒一次
+      sleep 10
     done
     wait "$child"
     rc=$?
