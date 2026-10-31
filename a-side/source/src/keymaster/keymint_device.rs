@@ -1428,13 +1428,17 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         return Err(Error::Km(ErrorCode::UNKNOWN_ERROR)).context(err!("Failed to set HAL version"));
     }
 
-    // MODULE_HASH 的 bootstrap 不再按 KeyMint 版本卡：framework 只在 KM4+ 上主动
-    // 调 `IKeyMintDevice::setAdditionalAttestationInfo`，可设备侧
-    // `getSupplementaryAttestationInfo(MODULE_HASH)` 不看 HAL 版本、照样返回本机
-    // APEX 摘要。KM3 上手不 bootstrap 就会现成一对矛盾（证书没有 724、接口却给
-    // 出 bundle，校验方报 MODULE_HASH omitted），远程铸证也会因为这里没值而转发
-    // 不了。bundle 拿得到就写上，本地和转发两条路就都有 724。
-    if let Some(bundle) = crate::global::module_info_bundle() {
+    // MODULE_HASH（724）是 KeyMint 4 才有的标签，反查接口
+    // `getSupplementaryAttestationInfo` 也是 4 才有的 AIDL 方法。老 HAL（V3）上
+    // 只 bootstrap 不声明版本，就会落得「证书里有 724、反查却说 INFO_NOT_AVAILABLE」
+    // 的自相矛盾（Duck Detector 的 MODULE_HASH 项正是抓这个）。所以按本机 VINTF
+    // 声明的版本走：V4+ 才写，V3 保持与真机一致（没有 724）。
+    if profile.version_number < 400 {
+        info!(
+            "moduleHash attestation skipped: KeyMint version {} is below 4",
+            profile.version_number
+        );
+    } else if let Some(bundle) = crate::global::module_info_bundle() {
         let resp = ta.process_req(PerformOpReq::SetAdditionalAttestationInfo(
             kmr_wire::SetAdditionalAttestationInfoRequest {
                 info: vec![KeyParam::ModuleHash(bundle.sha256.clone())],
