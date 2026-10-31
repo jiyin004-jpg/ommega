@@ -645,20 +645,35 @@ fn mint_attest_key_with(
     // 属于同一个 HAL、证书 Subject 与请求一致，然后交给**真 TEE** 原生签发子证书。
     // 本进程不持有任何私钥，也不用自己的批量 key 冒充。
     //
-    // 请求带了 key blob（AOSP `AttestationKey.keyBlob`）时不再查 session：那把 AK
-    // 可能压根不是本机铸的（智能模式铸在服务端、或换了一台 B），只要有 blob 就能签。
-    let native_attest = spec.attestation_key.as_ref().and_then(|request| {
-        request.key_blob.as_ref().map(|blob| {
-            crate::android::hardware::security::keymint::AttestationKey::AttestationKey {
-                keyBlob: blob.clone(),
-                attestKeyParams: vec![],
-                issuerSubjectName: request.issuer_subject_name.clone(),
-            }
-        })
-    });
+    // **session 优先，key blob 兜底**：AK 就是本机铸的（跟随模式）时 session 里
+    // 有它，直接用最可靠；查不到再退回请求带过来的 blob，但那个 blob 也必须是
+    // 本机 TEE 能解的真机 blob，否则 `generateKey` 会直接 -33（INVALID_KEY_BLOB）。
     let parent = match spec.attestation_key.as_ref() {
-        Some(request) if native_attest.is_none() => Some(resolve_issuer(request, service)?),
-        _ => None,
+        Some(request) => match resolve_issuer(request, service) {
+            Ok(parent) => Some(parent),
+            Err(e) if request.key_blob.is_some() => {
+                log::info!(
+                    "issuer key '{}' not in session, falling back to request key blob",
+                    request.alias
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    let native_attest = if parent.is_none() {
+        spec.attestation_key.as_ref().and_then(|request| {
+            request.key_blob.as_ref().map(|blob| {
+                crate::android::hardware::security::keymint::AttestationKey::AttestationKey {
+                    keyBlob: blob.clone(),
+                    attestKeyParams: vec![],
+                    issuerSubjectName: request.issuer_subject_name.clone(),
+                }
+            })
+        })
+    } else {
+        None
     };
 
     let result = match (spec.attestation_key.as_ref(), parent.as_ref()) {
