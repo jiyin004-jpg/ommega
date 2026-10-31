@@ -48,14 +48,29 @@ impl TokenMeta {
     /// - 都是 `pair` → 只有 `pair_id` 相同才通。
     /// - 配对卡遇到「对方根本没登记 token」（离线/老客户端）也放行，`who` 为 None 时由调用方决定。
     pub fn allows(&self, other: &TokenMeta) -> bool {
+        // 老卡密（kind 为空）走历史行为：不参与配对校验。
         let legacy = |m: &TokenMeta| m.kind.is_empty();
         if legacy(self) || legacy(other) {
             return true;
         }
-        if self.kind == "public" || other.kind == "public" {
+
+        let self_public = self.kind.eq_ignore_ascii_case("public");
+        let other_public = other.kind.eq_ignore_ascii_case("public");
+
+        // 公开卡和私卡不能互串：公开卡只能配公开卡。
+        // （以前是「任一方是 public 就放行」，等于任何白卡都能用别人的私机。）
+        if self_public || other_public {
+            return self_public && other_public;
+        }
+
+        // 两边都是私卡：pair_id 没填的当「无约束」放行，填了就严格同组。
+        // 以前只判 `!self.pair_id.is_empty() && self.pair_id == other.pair_id`，
+        // 结果是 A 端 token kind=pair 而 pair_id 留空时，跟任何正常配对卡都对不上，
+        // 所有请求都被 pair_mismatch 打回去（实测 8443 上 PLK110-17 连刷几百条）。
+        if self.pair_id.is_empty() || other.pair_id.is_empty() {
             return true;
         }
-        !self.pair_id.is_empty() && self.pair_id == other.pair_id
+        self.pair_id == other.pair_id
     }
 }
 
@@ -709,5 +724,43 @@ mod rate_tests {
         let prefix = start.elapsed();
         assert_eq!(old.len(), new.len());
         eprintln!("{rounds} prunes, 60000 live entries: scan={scan:?}, prefix={prefix:?}");
+    }
+}
+
+#[cfg(test)]
+mod allows_tests {
+    use super::TokenMeta;
+
+    fn meta(kind: &str, pair: &str) -> TokenMeta {
+        TokenMeta {
+            role: "a".to_string(),
+            pair_id: pair.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    /// 公开卡与私卡不许互串：以前是「任一方是 public 就放行」，
+    /// 等于任何白卡都能指挥别人的私机。
+    #[test]
+    fn public_and_private_do_not_cross() {
+        assert!(meta("public", "").allows(&meta("public", "")));
+        assert!(!meta("public", "").allows(&meta("pair", "x")));
+        assert!(!meta("pair", "x").allows(&meta("public", "")));
+    }
+
+    /// 私卡之间：pair_id 没填的当无约束放行，填了就严格同组。
+    #[test]
+    fn private_pair_rules() {
+        assert!(meta("pair", "").allows(&meta("pair", "x")));
+        assert!(meta("pair", "x").allows(&meta("pair", "")));
+        assert!(meta("pair", "x").allows(&meta("pair", "x")));
+        assert!(!meta("pair", "x").allows(&meta("pair", "y")));
+    }
+
+    /// kind 为空的老卡密依旧不参与配对校验。
+    #[test]
+    fn legacy_kind_is_permissive() {
+        assert!(meta("", "").allows(&meta("pair", "x")));
+        assert!(meta("pair", "x").allows(&meta("", "")));
     }
 }
