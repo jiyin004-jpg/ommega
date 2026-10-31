@@ -63,6 +63,8 @@ ABI_TO_MODULE_ARCHES = {
 BINARY_SPECS = (
     {"package": None, "bin": "keymint", "output_name": "keymint"},
     {"package": "ommega-injector", "bin": "ommega-inject", "output_name": "ommega-inject"},
+    # 文件变化驱动的 injector 调度器：替掉 daemon-injector 里那个每 3~5 秒轮询的 shell 循环
+    {"package": "ommega-injector", "bin": "inject-watchdog", "output_name": "inject-watchdog"},
 )
 
 # resetprop 单列：它是独立 crate（`resetprop/`），走自己的 target 目录。

@@ -502,6 +502,11 @@ pid_matches_script() {
 start_daemon_early() {
   script=$1
   pidfile=$2
+  # 注入器改由 Rust 的 inject-watchdog 调度（stat 轮询，文件变了才跑一轮 shell）。
+  # 这一步要在查 pidfile **之前**，否则存活检查拿的还是旧路径，每次都判“不匹配”重拉。
+  if [ "$script" = "$MODDIR/daemon-injector" ] && [ -x "$BIN_DIR/inject-watchdog" ]; then
+    script=$BIN_DIR/inject-watchdog
+  fi
   if [ -f "$pidfile" ]; then
     pid=$(cat "$pidfile" 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$script"; then
@@ -510,7 +515,18 @@ start_daemon_early() {
     rm -f "$pidfile"
   fi
   # 离开 post-fs-data 阶段后子进程可能被收走，所以用 setsid 脱开（没有就退回普通后台）。
-  if command -v setsid >/dev/null 2>&1; then
+  # watchdog 是 ELF，不能套 sh。
+  case "$script" in
+    */inject-watchdog) start_cmd=$script ;;
+    *) start_cmd= ;;
+  esac
+  if [ -n "$start_cmd" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$start_cmd" >/dev/null 2>&1 &
+    else
+      "$start_cmd" >/dev/null 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
     setsid sh "$script" >/dev/null 2>&1 &
   else
     sh "$script" >/dev/null 2>&1 &
@@ -532,7 +548,7 @@ if [ -f "$MODDIR/daemon" ]; then
     log_line "ommega: keymint daemon early start failed; service.sh will retry"
   fi
 fi
-if [ -f "$MODDIR/daemon-injector" ]; then
+if [ -f "$MODDIR/daemon-injector" ] || [ -x "$BIN_DIR/inject-watchdog" ]; then
   if start_daemon_early "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"; then
     log_line "ommega: injector daemon started early in post-fs-data"
   else

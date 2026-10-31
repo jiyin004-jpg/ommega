@@ -510,6 +510,13 @@ tick=0
 # 都是“过期的没有”，等于这一道不存在。
 FOREGROUND_EVERY=2
 tick_sleep() {
+  ticks=$((ticks + 1))
+  # --once：跑完一轮就退出（由 Rust 的 inject-watchdog 在文件变化时叫它）。
+  # 放在这里而不是循环末尾，是因为 prepare_injector 失败那条 continue 也会调到这里。
+  if [ "${MAX_TICKS:-0}" -gt 0 ] && [ "$ticks" -ge "$MAX_TICKS" ]; then
+    release_lock
+    exit 0
+  fi
   now=$(date +%s 2>/dev/null)
   if [ -n "$now" ] && [ "$started_at" -gt 0 ] && [ $((now - started_at)) -lt $EARLY_POLL_SECONDS ]; then
     sleep 3
@@ -517,6 +524,13 @@ tick_sleep() {
     sleep 5
   fi
 }
+
+# --once：只跑一轮（给 Rust watchdog 用）；不带参数时是常驻轮询。
+ticks=0
+MAX_TICKS=0
+case "${1:-}" in
+  --once) MAX_TICKS=1 ;;
+esac
 
 # 单实例：同 daemon 那层 —— service.sh 的看门循环可能同时存在多份，每份 fork 一个
 # 注入器；多份并存时每轮都会 pkill 掉对方正在用的 keystore2/注入进程。抢不到锁就退。
@@ -536,7 +550,11 @@ holder_is_us() {
 lock_owned() { [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; }
 release_lock() { lock_owned && rm -rf "$LOCK_DIR" 2>/dev/null; return 0; }
 
-if mkdir "$LOCK_DIR" 2>/dev/null; then
+if [ "${OMMEGA_SKIP_LOCK:-0}" = 1 ]; then
+  # 由 Rust 的 inject-watchdog 持锁，这里只负责跑一轮，不抢锁（否则它会以为自己
+  # 是第二实例直接退出）。
+  :
+elif mkdir "$LOCK_DIR" 2>/dev/null; then
   :
 else
   holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
@@ -547,9 +565,12 @@ else
   rm -rf "$LOCK_DIR" 2>/dev/null
   mkdir "$LOCK_DIR" 2>/dev/null || exit 0
 fi
-echo $$ > "$LOCK_DIR/pid"
-sleep 1
-lock_owned || exit 0
+# 只有自己真的是持锁者才写 pid：--once 模式（watchdog 持锁）写了会把别人的锁偷走。
+if [ "${OMMEGA_SKIP_LOCK:-0}" != 1 ]; then
+  echo $$ > "$LOCK_DIR/pid"
+  sleep 1
+  lock_owned || exit 0
+fi
 trap 'release_lock' EXIT INT TERM HUP
 
 while true; do

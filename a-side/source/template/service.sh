@@ -7,6 +7,11 @@ DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 PROP_FILE="$MODDIR/module.prop"
 
+# 注入器的调度者：优先用 Rust 的 inject-watchdog（stat 轮询，文件变了才跑一轮），
+# 二进制不存在时退回老的自循环 shell。两者 cmdline 不一样，所以外部存活检查也得跟着走。
+INJECTOR_CMD=$MODDIR/daemon-injector
+[ -x "$BIN_DIR/inject-watchdog" ] && INJECTOR_CMD=$BIN_DIR/inject-watchdog
+
 mkdir -p "$STATE_DIR"
 
 # 「启用调试日志」关着时不要建 logs 目录、也不要往里面开任何 .log：
@@ -63,7 +68,11 @@ start_daemon() {
     rm -f "$pidfile"
   fi
 
-  sh "$script" &
+  # inject-watchdog 是 ELF 二进制，不能套 sh；其余仍是 shell 脚本。
+  case "$script" in
+    */inject-watchdog) "$script" & ;;
+    *) sh "$script" & ;;
+  esac
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
@@ -117,7 +126,7 @@ kill_all() {
 # post-fs-data 阶段可能已经把两个守护拉起来了（为了抢在 keystore2 之前守着，好接住开机
 # 解锁那份材料）。那两个还活着就别 kill 重来 —— 那会把刚抢到的时间窗白白丢掉。
 daemons_alive() {
-  for spec in "$RUN_DIR/keymint-daemon.pid:$MODDIR/daemon" "$RUN_DIR/injector-daemon.pid:$MODDIR/daemon-injector"; do
+  for spec in "$RUN_DIR/keymint-daemon.pid:$MODDIR/daemon" "$RUN_DIR/injector-daemon.pid:$INJECTOR_CMD"; do
     pf=${spec%%:*}
     sp=${spec#*:}
     [ -f "$pf" ] || return 1
@@ -134,7 +143,7 @@ else
   update_status "Ommega ⏳ 启动中"
   start_daemon "$MODDIR/daemon" "$RUN_DIR/keymint-daemon.pid"
   ensure_sepolicy
-  start_daemon "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"
+  start_daemon "$INJECTOR_CMD" "$RUN_DIR/injector-daemon.pid"
 fi
 
 # 属性伪装全部在 post-fs-data 一次性做完（含 ro.boot 启动状态三连）。
@@ -183,12 +192,12 @@ daemon_one_alive() {
 
 keep_daemons_alive() {
   fixed=0
-  for spec in "$MODDIR/daemon:$RUN_DIR/keymint-daemon.pid" "$MODDIR/daemon-injector:$RUN_DIR/injector-daemon.pid"; do
+  for spec in "$MODDIR/daemon:$RUN_DIR/keymint-daemon.pid" "$INJECTOR_CMD:$RUN_DIR/injector-daemon.pid"; do
     sp=${spec%%:*}
     pf=${spec#*:}
     if ! daemon_one_alive "$sp" "$pf"; then
       case "$sp" in
-        *daemon-injector) ensure_sepolicy ;;
+        *daemon-injector|*inject-watchdog) ensure_sepolicy ;;
       esac
       start_daemon "$sp" "$pf" && fixed=1
     fi
