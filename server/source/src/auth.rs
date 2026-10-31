@@ -737,21 +737,58 @@ mod allows_tests {
         }
     }
 
-    /// 普通卡只跟普通卡互通（任意），不渗到私卡。
+    /// 普通卡只跟普通卡互通（任意），不渗到私卡。两个方向都要拒。
     #[test]
     fn public_cards_only_pair_with_public() {
         assert!(meta("public", "").allows(&meta("public", "")));
+        // 普通卡在左
         assert!(!meta("public", "").allows(&meta("pair", "x")));
+        // 普通卡在右（反过来）
         assert!(!meta("pair", "x").allows(&meta("public", "")));
+        // 普通卡带 pair_id 也一样，kind 优先
+        assert!(!meta("public", "y").allows(&meta("pair", "y")));
+        assert!(!meta("pair", "y").allows(&meta("public", "y")));
     }
 
-    /// 私卡之间：pair_id 没填的当无约束放行，填了就严格同组。
+    /// 私卡之间：pair_id 没填的当无约束放行，填了就严格同组。两个方向都要试。
     #[test]
     fn private_pair_rules() {
+        // 空在 A 侧
         assert!(meta("pair", "").allows(&meta("pair", "x")));
+        // 空在 B 侧（反过来）
         assert!(meta("pair", "x").allows(&meta("pair", "")));
+        // 都空
+        assert!(meta("pair", "").allows(&meta("pair", "")));
+        // 同组
         assert!(meta("pair", "x").allows(&meta("pair", "x")));
+        // 不同组，两个方向都拒
         assert!(!meta("pair", "x").allows(&meta("pair", "y")));
+        assert!(!meta("pair", "y").allows(&meta("pair", "x")));
+    }
+
+    /// allows 必须对称：换一下 self/other 结果不变。
+    #[test]
+    fn allows_is_symmetric() {
+        let cases = [
+            ("public", ""),
+            ("public", "x"),
+            ("pair", ""),
+            ("pair", "x"),
+            ("pair", "y"),
+            ("", ""),
+            ("", "x"),
+        ];
+        for (ka, pa) in cases {
+            for (kb, pb) in cases {
+                let a = meta(ka, pa);
+                let b = meta(kb, pb);
+                assert_eq!(
+                    a.allows(&b),
+                    b.allows(&a),
+                    "不对称: ({ka},{pa}) vs ({kb},{pb})"
+                );
+            }
+        }
     }
 
     /// kind 为空的早期记录按私卡处理，而不是单独的第三种卡。
