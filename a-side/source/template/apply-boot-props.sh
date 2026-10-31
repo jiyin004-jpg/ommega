@@ -99,6 +99,7 @@ if [ -r "$PROP_OVERRIDES" ]; then
       ro.boot.verifiedbootstate|ro.boot.flash.locked|ro.boot.vbmeta.device_state) ;;
       *) continue ;;
     esac
-    set_if_present "$p_key" "$p_val"
+    # 用户显式写的项强写：有的机型 bootconfig 里没有这些键，走“存在才改”会白写。
+    rp "$p_key" "$p_val"
   done < "$PROP_OVERRIDES"
 fi

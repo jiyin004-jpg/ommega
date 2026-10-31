@@ -292,7 +292,10 @@ if [ -r "$PROP_OVERRIDES" ]; then
       *) continue ;;
     esac
     [ -n "$p_val" ] || continue
-    setprop_if_present "$p_key" "$p_val"
+    # 用户在这里显式写的项一律强写：像 ro.boot.build.security_patch 这类属性，
+    # 这台机器的 bootconfig 里压根没有，走 setprop_if_present 会被直接跳过，
+    # 面板上写了等于没写。
+    resetprop "$p_key" "$p_val"
     log_line "ommega: override $p_key=$p_val (boot stage)"
   done < "$PROP_OVERRIDES"
 fi
