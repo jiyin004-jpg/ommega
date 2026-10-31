@@ -186,28 +186,32 @@ impl DeviceIdentityReport {
 impl DeviceEntry {
     /// 设备质量分级（越高越优先占名额）。
     ///
-    /// 判断依据是它最近一张证里的启动状态（`boot`，由 `cert` 从叶子解析）：
-    /// - 2 = 锁定 + 可信启动（`device_locked=true` 且 verified / self-signed）
-    /// - 1 = 锁定但启动状态不明，或还没出过证（质量未知，按中性算）
-    /// - 0 = 解锁的
-    ///
-    /// 没名额限制时这个值不影响任何东西，只在「满了、必须挑一台踢」的时候用。
+    /// 判断依据是它自己出过的证（`boot`，由 `cert` 从叶子解析）和自检结果：
+    /// - 3 = 锁定 + 可信启动（`device_locked=true` 且 verified / self-signed）
+    /// - 2 = 锁定但启动状态不明，或还没出过证（质量未知，按中性算）
+    /// - 1 = 解锁的（能出链，只是链不好看）
+    /// - 0 = **自检失败**（`tee_error` 有值）：根本出不了链，占着名额也没用，
+    ///       排在解锁的后面，让能用的设备优先
     pub fn seat_quality(&self) -> u8 {
+        // 出不了链的排最低：自检失败往往是 TA 卡住 / 未预制，占名额纯浪费。
+        if self.tee_error.is_some() {
+            return 0;
+        }
         let Some(boot) = self.boot.as_ref() else {
-            return 1;
+            return 2;
         };
         match boot.device_locked {
             Some(true) => {
                 // 0 = verified, 1 = self-signed（自定义 key，也是可信链）
                 if matches!(boot.verified_boot_state, Some(0) | Some(1)) {
-                    2
+                    3
                 } else {
-                    1
+                    2
                 }
             }
-            Some(false) => 0,
+            Some(false) => 1,
             // 证里没带 locked 标记：当锁定但无法确认，别让它比真解锁的还差
-            None => 1,
+            None => 2,
         }
     }
     /// 这台是模块 relay（`Some(true)`）、手机 App（`Some(false)`）还是分不出来（`None`）。
