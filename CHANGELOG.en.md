@@ -4,6 +4,9 @@
 
 ## 1.7.12
 
+- The boot patch level in the panel now writes `ro.bootimage.build.date.utc`, so the property and the chain's boot patch always agree.
+- Values explicitly entered in the panel are written unconditionally instead of being skipped when the device lacks that property.
+- Attestation-key child signing now returns to the layer that minted the key, instead of failing with `issuer key not available` after a policy switch.
 - MODULE_HASH now follows the HAL version: nothing is written below KeyMint 4, matching real devices, so Duck Detector's MODULE_HASH check no longer contradicts itself.
 - Importing an ATTK from the panel now syncs cpu_id: a `cpu_id:` line in the file is honoured, otherwise the forced value is cleared and recomputed locally.
 - Fix `getKey` occasionally returning null when several threads read the same key at once (AProbe L04 concurrent signing).

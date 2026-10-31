@@ -4,6 +4,9 @@
 
 ## 1.7.12
 
+- 面板「伪装参数」里的启动补丁日期改成写 `ro.bootimage.build.date.utc`：属性与证书里的 boot 补丁天然一致。
+- 面板里显式填写的伪装项一律强写，不再因设备本身没有那个属性而静默失效。
+- 证明密钥签子钥时回到它出生的那一层，不再因切换策略而报 `issuer key not available`。
 - MODULE_HASH 按 HAL 版本自适应：KeyMint 4 以下不再写 724，和真机保持一致，Duck Detector 的 MODULE_HASH 不再报矛盾。
 - 面板导入 ATTK 时同步 cpu_id：文件带 `cpu_id:` 行就用它，不带就清掉强制值、回到本机现算。
 - 修复多线程同时读同一个密钥时 `getKey` 偶发返回空（AProbe 的 L04 并发签名）。
