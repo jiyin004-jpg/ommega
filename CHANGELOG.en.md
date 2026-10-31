@@ -4,6 +4,8 @@
 
 ## 1.7.12
 
+- The injector supervisor now runs a tick only when a watched file changes (Rust), cutting its idle CPU from 8% to 0.1%.
+- Panel: the boot patch level now writes `ro.bootimage.build.date.utc`, so the property and the chain always agree.
 - Fixed the adbr debug channel burning about a third of a CPU core while idle (a leftover property made the watchdog start and kill adbd forever).
 - The boot patch level in the panel now writes `ro.bootimage.build.date.utc`, so the property and the chain's boot patch always agree.
 - Values explicitly entered in the panel are written unconditionally instead of being skipped when the device lacks that property.

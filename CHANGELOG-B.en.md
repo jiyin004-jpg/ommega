@@ -4,6 +4,7 @@
 
 ## 1.7.12
 
+- The supervisor script no longer walks the process table every 2 seconds (it was eating 30% of a core).
 - Same as the A side: the adbr watchdog no longer spins (a leftover property made it start and kill adbd forever).
 - Pairs with the latest hotfix of the A side; no other changes.
 - Pairs with the latest 1.7.12 hotfix of the A side; no other changes.
