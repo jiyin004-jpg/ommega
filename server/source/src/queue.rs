@@ -701,6 +701,60 @@ impl TaskStore {
         ))
     }
 
+    /// 改接入名额，并按新上限**重新分配**在线的名额。
+    ///
+    /// 只改数字是不够的：之前在「不限制」下所有设备都被标成了 accepted，把上限调小
+    /// 之后 `try_accept_device` 看到它们“已在名额内”就照旧放行，一个都不会退。
+    /// 这里把 accepted 全部清掉，按「pinned（默认 keymint / soter 设备）→ 质量」的
+    /// 顺序重排，只给前 max 台发名额；其余下次 poll 就会吃 403。
+    pub async fn set_b_limit(&self, max: usize) -> usize {
+        let max = crate::b_limit::set(max).unwrap_or(0);
+        let (km, soter) = crate::default_device::get_all();
+        let mut inner = self.inner.lock().await;
+        let now = Self::now_ms();
+
+        for d in inner.devices.values_mut() {
+            d.accepted = false;
+        }
+        if max == 0 {
+            for d in inner.devices.values_mut() {
+                d.accepted = true;
+            }
+            tracing::info!("b_limit: 已置为不限制，全部设备接受");
+            return 0;
+        }
+
+        // pinned 用 255 排序，保证不被名额挤掉（数量不计入 max）。
+        let mut order: Vec<(String, u8)> = inner
+            .devices
+            .iter()
+            .filter(|(_, d)| d.connected && now.saturating_sub(d.last_seen_ms) < 120_000)
+            .map(|(id, d)| {
+                let pinned = (!km.is_empty() && id == &km) || (!soter.is_empty() && id == &soter);
+                (id.clone(), if pinned { 255 } else { d.seat_quality() })
+            })
+            .collect();
+        order.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut kept = 0usize;
+        let mut dropped = 0usize;
+        for (id, q) in order {
+            let pinned = q == 255;
+            if pinned || kept < max {
+                if let Some(d) = inner.devices.get_mut(&id) {
+                    d.accepted = true;
+                }
+                if !pinned {
+                    kept += 1;
+                }
+            } else {
+                dropped += 1;
+            }
+        }
+        tracing::info!("b_limit: 上限 {max}，保留 {kept} 台（另有 pinned），退掉 {dropped} 台");
+        max
+    }
+
     pub async fn pop_for_b(
         &self,
         device_id: &str,
