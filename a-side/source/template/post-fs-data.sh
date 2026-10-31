@@ -68,11 +68,27 @@ if [ "$_ri_apply" = 1 ]; then
   _ri_locked=$(sed -n 's/^device_locked=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
   _ri_state=$(sed -n 's/^verified_boot_state=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
 fi
-# 注意：这里**不再**改 ro.boot.verifiedbootstate / flash.locked / vbmeta.device_state。
-# 那三项和下面的 ro.boot.vbmeta.digest 都会被 A 端 keymint（vb_hash=auto）和 vold /
-# keystore2 在开机早期读到，改早了 SetBootInfo 就把伪装的 root-of-trust 写进 TA，
-# 用户之前加密的 FBE keyblob 再也解不开（锁屏密码对也进不去桌面）。
-# 它们由 service.sh 在 keymint 起稳后调用 apply-boot-props.sh 补上。
+# 启动状态三连在开机时就对齐：它们只是 bootloader 传下来的状态描述（真机解锁设备
+# 是 orange / 0 / unlocked），改它们不会影响 FBE —— keyblob 是 keymint HAL 用 TA 内部的
+# 密钥加的，vold 解 FBE 时也不比对这几个值（查过 AOSP 的 metadata 加密与 keystore2 两条链）。
+# 注：ro.boot.vbmeta.digest 同理，它只喂给我们自己的 keymint 填证书。
+case "$_ri_state" in
+  0) resetprop ro.boot.verifiedbootstate green ;;
+  1) resetprop ro.boot.verifiedbootstate yellow ;;
+  2) resetprop ro.boot.verifiedbootstate orange ;;
+  3) resetprop ro.boot.verifiedbootstate red ;;
+  *) resetprop ro.boot.verifiedbootstate green ;;
+esac
+case "$_ri_locked" in
+  0)
+    resetprop ro.boot.flash.locked 0
+    resetprop ro.boot.vbmeta.device_state unlocked
+    ;;
+  *)
+    resetprop ro.boot.flash.locked 1
+    resetprop ro.boot.vbmeta.device_state locked
+    ;;
+esac
 unset _OMMEGA_RI _ri_locked _ri_state
 resetprop ro.boot.veritymode enforcing
 resetprop ro.secure 1
@@ -285,7 +301,7 @@ if [ -r "$PROP_OVERRIDES" ]; then
     esac
     case "$p_key" in
       # digest 只喂给 keymint 填证书，boot 补丁只进 HAL info，两者都不参与 FBE 解密，
-      # 可以早写；其余 ro.boot.*（启动状态三连）得等 keymint 起稳，见 apply-boot-props.sh。
+      # 可以早写；其余 ro.boot.*（启动状态三连）本脚本前面已经设过。
       ro.boot.vbmeta.digest|ro.boot.vbmeta.public_key_digest|ro.boot.build.security_patch) : ;;
       ro.boot.*) continue ;;
       ro.*|persist.*|sys.*) : ;;

@@ -137,22 +137,11 @@ else
   start_daemon "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"
 fi
 
-# ro.boot 的启动状态三连（verifiedbootstate / flash.locked / vbmeta.device_state）
-# 等 keymint 起稳再改：它们是 vold 早期判断用的，改早了会干扰部分机型的解锁流程。
-# 注意这里**必须整段丢后台**：service.sh 是 late_start，前台 sleep 会把开机拖慢，
-# 也会挡住后面的 SOTER 接管和内核模块加载。app 层 getprop 是实时的，晚几秒没影响。
-if [ -x "$MODDIR/apply-boot-props.sh" ]; then
-  (
-    i=0
-    while [ "$i" -lt 40 ]; do
-      pidof keymint >/dev/null 2>&1 && break
-      pgrep -f "$BIN_DIR/keymint" >/dev/null 2>&1 && break
-      sleep 0.5
-      i=$((i + 1))
-    done
-    sh "$MODDIR/apply-boot-props.sh" >>"$(log_target service.log)" 2>&1
-  ) &
-fi
+# 属性伪装全部在 post-fs-data 一次性做完（含 ro.boot 启动状态三连）。
+# 曾经把三连挪到这里延迟到 keymint 之后，是因为怀疑它会弄死 FBE 解密；
+# 后来查了 AOSP 的 metadata 加密和 keystore2 两条链，以及我们自己的注入过滤
+# （vold / system_server 的调用按 SELinux 域放行，不走影子 keystore），确认这两件事
+# 无关，就把那层延迟拆了 —— 少一个后台任务和一个额外脚本。
 
 # Bundled PathMask kernel module: pick the .ko matching this kernel and hide
 # /system/priv-app/SoterService only when its binder service cannot be reached
