@@ -5,6 +5,7 @@ pub mod attest_policy;
 pub mod attstatus;
 pub mod auth;
 pub mod autokeybox;
+pub mod b_limit;
 pub mod card;
 pub mod cert;
 pub mod config;

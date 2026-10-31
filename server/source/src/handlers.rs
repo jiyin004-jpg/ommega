@@ -2836,6 +2836,13 @@ pub async fn b_poll(
         }
     }
 
+    // 名额检查：先看这台还能不能接活，再接下面的心跳/长轮询。
+    // 名额 0（默认）时这里直接放行，跟以前一模一样。
+    if let Err(msg) = state.store.try_accept_device(&q.device_id).await {
+        tracing::info!("b_poll: 拒绝 {}：{msg}", q.device_id);
+        return json_err(StatusCode::FORBIDDEN, &msg);
+    }
+
     let timeout_secs = q.timeout.unwrap_or(state.cfg.poll_timeout_secs);
     let timeout = Duration::from_secs(timeout_secs.min(120));
 

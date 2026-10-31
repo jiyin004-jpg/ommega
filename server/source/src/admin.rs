@@ -1320,6 +1320,54 @@ pub async fn admin_attest_policy_status(
     .into_response()
 }
 
+/// GET /api/admin/b_limit/ - B 端接入名额上限。
+///
+/// `max_b_devices = 0` 表示不限制（默认）。大于 0 时，在线的 B 超过这个数就按
+/// 「锁定+可信启动」优先的顺序筛选：新设备质量更高会顶掉最差的，否则拒（403）。
+/// 面板上配的默认 keymint / soter 设备无条件放行。
+pub async fn admin_b_limit_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let (km, soter) = crate::default_device::get_all();
+    Json(json!({
+        "status": "ok",
+        "max_b_devices": crate::b_limit::get(),
+        "path": crate::b_limit::path().display().to_string(),
+        // 这两台不受名额限制，面板上一起显示出来比较好理解
+        "unlimited": {
+            "keymint": km,
+            "soter": soter,
+        },
+    }))
+    .into_response()
+}
+
+/// POST /api/admin/b_limit/ - 改 B 端接入名额。
+pub async fn admin_b_limit_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(raw) = body.get("max_b_devices").and_then(Value::as_u64) else {
+        return json_err(StatusCode::BAD_REQUEST, "max_b_devices is required");
+    };
+    match crate::b_limit::set(raw as usize) {
+        Ok(v) => Json(json!({
+            "status": "ok",
+            "max_b_devices": v,
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("save failed: {e}"),
+        ),
+    }
+}
+
 /// GET /api/admin/identity_policy/ - 服务端 keybox 按安全级别用哪份身份。
 pub async fn admin_identity_policy_status(
     State(state): State<AppState>,

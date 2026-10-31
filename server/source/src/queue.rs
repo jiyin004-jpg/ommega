@@ -139,6 +139,9 @@ pub struct DeviceEntry {
     /// 还没收到 poll：按历史行为「任意 A 都能用」。
     pub token_pair_id: String,
     pub token_kind: String,
+    /// 占着 B 接入名额吗。`b_limit` 打开时只有 true 的设备会被派活；
+    /// 名额满了之后要么踢掉质量更差的、要么被拒，见 `Store::try_accept_device`。
+    pub accepted: bool,
 }
 
 /// B 端报上来的设备身份（键值都来自它自己的 `ro.product.*` / `ro.serialno`）。
@@ -181,6 +184,32 @@ impl DeviceIdentityReport {
 }
 
 impl DeviceEntry {
+    /// 设备质量分级（越高越优先占名额）。
+    ///
+    /// 判断依据是它最近一张证里的启动状态（`boot`，由 `cert` 从叶子解析）：
+    /// - 2 = 锁定 + 可信启动（`device_locked=true` 且 verified / self-signed）
+    /// - 1 = 锁定但启动状态不明，或还没出过证（质量未知，按中性算）
+    /// - 0 = 解锁的
+    ///
+    /// 没名额限制时这个值不影响任何东西，只在「满了、必须挑一台踢」的时候用。
+    pub fn seat_quality(&self) -> u8 {
+        let Some(boot) = self.boot.as_ref() else {
+            return 1;
+        };
+        match boot.device_locked {
+            Some(true) => {
+                // 0 = verified, 1 = self-signed（自定义 key，也是可信链）
+                if matches!(boot.verified_boot_state, Some(0) | Some(1)) {
+                    2
+                } else {
+                    1
+                }
+            }
+            Some(false) => 0,
+            // 证里没带 locked 标记：当锁定但无法确认，别让它比真解锁的还差
+            None => 1,
+        }
+    }
     /// 这台是模块 relay（`Some(true)`）、手机 App（`Some(false)`）还是分不出来（`None`）。
     ///
     /// 心跳带了模块专属参数的一定是模块 relay；没带的看它出过的链 —— App 铸的链
@@ -592,6 +621,86 @@ impl TaskStore {
 
     /// Pop the next pending task matching this device, with long-poll semantics.
     /// Returns None after `timeout` elapsed with no match.
+    /// B 端连上来时先问一句：还有名额吗？
+    ///
+    /// - `Ok(())`：接受（已占名额，后续心跳继续放行）
+    /// - `Err(msg)`：拒绝，调用方回 403，B 端日志里能看到原因
+    ///
+    /// 名额满了之后的取舍按质量来（见 [`DeviceEntry::seat_quality`]）：
+    /// 新设备比在线那批里最差的更好，就顶掉最差的那台；否则拒绝。
+    /// 掉线的（120 秒没 poll）自动腾名额，不需要人工清理。
+    pub async fn try_accept_device(&self, device_id: &str) -> Result<(), String> {
+        let max = crate::b_limit::get();
+        let mut inner = self.inner.lock().await;
+        let now = Self::now_ms();
+        let online = |d: &DeviceEntry| d.connected && now.saturating_sub(d.last_seen_ms) < 120_000;
+
+        // 面板上配的「默认 keymint 设备」和「默认 soter 设备」**无条件接入**：
+        // 它们是业务上的主设备，哪怕名额满了也得能进来（否则名额一调小，
+        // A 端默认指向的那台反而被挡在外面）。
+        let (km_default, soter_default) = crate::default_device::get_all();
+        if (!km_default.is_empty() && device_id == km_default)
+            || (!soter_default.is_empty() && device_id == soter_default)
+        {
+            if let Some(d) = inner.devices.get_mut(device_id) {
+                d.accepted = true;
+            }
+            return Ok(());
+        }
+
+        // 已经在名额内：心跳不该把它踢出去。
+        if inner.devices.get(device_id).is_some_and(|d| d.accepted) {
+            return Ok(());
+        }
+        // 0 = 不限制：直接接受并标记（标记是为了状态页能看出“被接受”）。
+        if max == 0 {
+            if let Some(d) = inner.devices.get_mut(device_id) {
+                d.accepted = true;
+            }
+            return Ok(());
+        }
+
+        let seated: Vec<(String, u8)> = inner
+            .devices
+            .iter()
+            .filter(|(_, d)| d.accepted && online(d))
+            .map(|(id, d)| (id.clone(), d.seat_quality()))
+            .collect();
+
+        if seated.len() < max {
+            if let Some(d) = inner.devices.get_mut(device_id) {
+                d.accepted = true;
+            }
+            return Ok(());
+        }
+
+        // 满了：质量更高才顶人。
+        let new_q = inner
+            .devices
+            .get(device_id)
+            .map(|d| d.seat_quality())
+            .unwrap_or(1);
+        let worst = seated.iter().min_by_key(|(_, q)| *q).cloned();
+        if let Some((worst_id, worst_q)) = worst {
+            if new_q > worst_q {
+                if let Some(d) = inner.devices.get_mut(&worst_id) {
+                    d.accepted = false;
+                }
+                if let Some(d) = inner.devices.get_mut(device_id) {
+                    d.accepted = true;
+                }
+                tracing::info!(
+                    "b_limit: 名额满（{max}），{device_id}（质量 {new_q}）顶掉 {worst_id}（质量 {worst_q}）"
+                );
+                return Ok(());
+            }
+        }
+        tracing::info!("b_limit: 拒绝 {device_id}（质量 {new_q}），名额已满且在线设备质量不低于它");
+        Err(format!(
+            "B device limit reached ({max}); all seated devices are at least as trusted as this one"
+        ))
+    }
+
     pub async fn pop_for_b(
         &self,
         device_id: &str,
@@ -650,6 +759,7 @@ impl TaskStore {
                         known_version,
                         known_from_module,
                         known_identity,
+                        known_accepted,
                     ) = match inner.devices.get(device_id) {
                         Some(d) => (
                             d.boot.clone(),
@@ -664,6 +774,7 @@ impl TaskStore {
                             d.version.clone(),
                             d.from_module,
                             d.identity.clone(),
+                            d.accepted,
                         ),
                         None => (
                             None,
@@ -678,6 +789,7 @@ impl TaskStore {
                             None,
                             false,
                             DeviceIdentityReport::default(),
+                            false,
                         ),
                     };
                     let no_boot_yet = known_boot.is_none();
@@ -706,6 +818,9 @@ impl TaskStore {
                             // upsert 不碰它。
                             token_pair_id: String::new(),
                             token_kind: String::new(),
+                            // 名额由 try_accept_device 单独维护；心跳重建条目时保留上次的
+                            // 结论，否则每轮都会把已接入的设备变回「未接受」。
+                            accepted: known_accepted,
                         },
                     );
                     self.mark_online_sync(device_id, hb_now);

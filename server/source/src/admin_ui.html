@@ -538,6 +538,19 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
       <button class="btn primary" onclick="saveAttestPolicy()">保存</button>
     </div>
     <p class="hint" id="apStatus" style="margin:12px 0 0;line-height:1.7;">加载中…</p>
+    <hr style="margin:18px 0;border:none;border-top:1px solid var(--border);">
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">B 接入上限</span>
+      <input id="bLimit" type="number" min="0" max="512" step="1" value="0"
+             style="flex:1;min-width:160px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+      <button class="btn primary" onclick="saveBLimit()">保存</button>
+    </div>
+    <p class="hint" id="bLimitStatus" style="margin:10px 0 0;line-height:1.7;">加载中…</p>
+    <p class="hint" style="margin:6px 0 0;line-height:1.7;">
+      0 = 不限制。大于 0 时，同时在线的 B 超过这个数就按「锁定 + 可信启动」优先挑：
+      新设备比在线那批里最差的更可信，就顶掉最差的那台；否则拒（403，B 端日志里能看到原因）。
+      掉线超过 120 秒自动腾名额。上面的「默认 keymint / soter 设备」不受这个限制。
+    </p>
   </div>
 </div>
 
@@ -1318,6 +1331,31 @@ async function saveAttestPolicy() {
   } catch (e) { toast('保存失败: ' + e.message, 'err'); }
 }
 
+async function loadBLimit() {
+  try {
+    const d = await api('/api/admin/b_limit/');
+    $('#bLimit').value = d.max_b_devices ?? 0;
+    const u = d.unlimited || {};
+    const unlimited = [u.keymint && `keymint=${u.keymint}`, u.soter && `soter=${u.soter}`]
+      .filter(Boolean).join(' · ') || '（未配置）';
+    $('#bLimitStatus').textContent =
+      `当前上限：${d.max_b_devices > 0 ? d.max_b_devices + ' 台' : '不限制'} · 无条件接入：${unlimited}`;
+  } catch (e) { $('#bLimitStatus').textContent = '读取失败: ' + e.message; }
+}
+
+async function saveBLimit() {
+  try {
+    const raw = Number($('#bLimit').value || 0);
+    if (!Number.isFinite(raw) || raw < 0) { toast('上限必须是非负整数', 'err'); return; }
+    await api('/api/admin/b_limit/', {
+      method: 'POST',
+      body: JSON.stringify({ max_b_devices: Math.floor(raw) }),
+    });
+    toast('B 接入上限已保存（立即生效）');
+    loadBLimit();
+  } catch (e) { toast('保存失败: ' + e.message, 'err'); }
+}
+
 async function loadIdentityPolicy() {
   try {
     // 先把存着的那几份身份列出来，再回填当前选择（值不在列表里就手动补一个 option）
@@ -1403,7 +1441,7 @@ async function clearDefaultDevice() {
 }
 
 function loadAll() {
-  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadIdentityPolicy(); loadDefaultDevice();
+  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadIdentityPolicy(); loadDefaultDevice(); loadBLimit();
 }
 
 /* Upload */
