@@ -621,140 +621,75 @@ impl TaskStore {
 
     /// Pop the next pending task matching this device, with long-poll semantics.
     /// Returns None after `timeout` elapsed with no match.
-    /// B 端连上来时先问一句：还有名额吗？
+    /// B 端连上来时问一句：按当前在线情况，这台排得上名额吗？
     ///
-    /// - `Ok(())`：接受（已占名额，后续心跳继续放行）
-    /// - `Err(msg)`：拒绝，调用方回 403，B 端日志里能看到原因
+    /// **无状态实现**：不维护任何 `accepted` 占位标记，每次 poll 现场把在线设备
+    /// 排一遍，看本设备排在不在前 `max` 名里。之前用标记 + 清理 + 补位那套，
+    /// 三者互相打脸（掉线释放的名额被新人补上、老人回来又放行），实测一路涨到 217。
     ///
-    /// 名额满了之后的取舍按质量来（见 [`DeviceEntry::seat_quality`]）：
-    /// 新设备比在线那批里最差的更好，就顶掉最差的那台；否则拒绝。
-    /// 掉线的（120 秒没 poll）自动腾名额，不需要人工清理。
-    pub async fn try_accept_device(&self, device_id: &str) -> Result<(), String> {
-        let max = crate::b_limit::get();
-        let mut inner = self.inner.lock().await;
-        let now = Self::now_ms();
-        // 只按「最近 120 秒内活动过」算在线，**不看 `connected`**：`connected` 要等
-        // 走到 pop_for_b 的心跳才置 true，而名额是在那之前就占的 —— 拿它做统计会把
-        // “刚接受、还没走完这一轮”的设备漏掉，每台新设备都以为没满（实测放进来 231 台）。
-        let online = |d: &DeviceEntry| now.saturating_sub(d.last_seen_ms) < 120_000;
-        // 占名额时就把 last_seen 打上：统计靠它，不打的话同一轮会重复发名额。
-        let touch = |inner: &mut Inner, id: &str, now: u64| {
-            if let Some(d) = inner.devices.get_mut(id) {
-                d.accepted = true;
-                d.last_seen_ms = now;
-            }
-        };
-
-        // 面板上配的「默认 keymint 设备」和「默认 soter 设备」**无条件接入**：
-        // 它们是业务上的主设备，哪怕名额满了也得能进来（否则名额一调小，
-        // A 端默认指向的那台反而被挡在外面）。
-        let (km_default, soter_default) = crate::default_device::get_all();
-        if (!km_default.is_empty() && device_id == km_default)
-            || (!soter_default.is_empty() && device_id == soter_default)
-        {
-            touch(&mut inner, device_id, now);
-            return Ok(());
-        }
-
-        // 已经在名额内：心跳不该把它踢出去。
-        if inner.devices.get(device_id).is_some_and(|d| d.accepted) {
-            return Ok(());
-        }
-        // 0 = 不限制：直接接受并标记（标记是为了状态页能看出“被接受”）。
+    /// 排序：固定的默认设备（`pinned`）优先，其次按「锁定+可信启动」的质量，
+    /// 同质量按最近活跃时间。掉线超过 120 秒的不参与排名，名额自然腾出来。
+    ///
+    /// 拒绝时**不更新**任何状态，所以被拒的设备 120 秒后自然掉出在线列表，
+    /// 面板上的"在线 B 端"也就不会虚高。
+    pub async fn allow_poll(&self, device_id: &str, max: usize) -> Result<(), String> {
         if max == 0 {
-            touch(&mut inner, device_id, now);
+            // 只在第一次提醒（无限制是默认值，也可能说明配置文件没读上）
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::info!("b_limit: 未设置上限（max=0），全部放行");
+            });
             return Ok(());
         }
-
-        let seated: Vec<(String, u8)> = inner
-            .devices
-            .iter()
-            .filter(|(_, d)| d.accepted && online(d))
-            .map(|(id, d)| (id.clone(), d.seat_quality()))
-            .collect();
-
-        if seated.len() < max {
-            touch(&mut inner, device_id, now);
-            return Ok(());
-        }
-
-        // 满了：质量更高才顶人。
-        let new_q = inner
-            .devices
-            .get(device_id)
-            .map(|d| d.seat_quality())
-            .unwrap_or(1);
-        let worst = seated.iter().min_by_key(|(_, q)| *q).cloned();
-        if let Some((worst_id, worst_q)) = worst {
-            if new_q > worst_q {
-                if let Some(d) = inner.devices.get_mut(&worst_id) {
-                    d.accepted = false;
-                }
-                touch(&mut inner, device_id, now);
-                tracing::info!(
-                    "b_limit: 名额满（{max}），{device_id}（质量 {new_q}）顶掉 {worst_id}（质量 {worst_q}）"
-                );
-                return Ok(());
-            }
-        }
-        tracing::info!("b_limit: 拒绝 {device_id}（质量 {new_q}），名额已满且在线设备质量不低于它");
-        Err(format!(
-            "B device limit reached ({max}); all seated devices are at least as trusted as this one"
-        ))
-    }
-
-    /// 改接入名额，并按新上限**重新分配**在线的名额。
-    ///
-    /// 只改数字是不够的：之前在「不限制」下所有设备都被标成了 accepted，把上限调小
-    /// 之后 `try_accept_device` 看到它们“已在名额内”就照旧放行，一个都不会退。
-    /// 这里把 accepted 全部清掉，按「pinned（默认 keymint / soter 设备）→ 质量」的
-    /// 顺序重排，只给前 max 台发名额；其余下次 poll 就会吃 403。
-    pub async fn set_b_limit(&self, max: usize) -> usize {
-        let max = crate::b_limit::set(max).unwrap_or(0);
         let (km, soter) = crate::default_device::get_all();
-        let mut inner = self.inner.lock().await;
+        if (!km.is_empty() && device_id == km) || (!soter.is_empty() && device_id == soter) {
+            return Ok(());
+        }
+
+        let inner = self.inner.lock().await;
         let now = Self::now_ms();
+        let online = |d: &DeviceEntry| now.saturating_sub(d.last_seen_ms) < 120_000;
 
-        for d in inner.devices.values_mut() {
-            d.accepted = false;
-        }
-        if max == 0 {
-            for d in inner.devices.values_mut() {
-                d.accepted = true;
-            }
-            tracing::info!("b_limit: 已置为不限制，全部设备接受");
-            return 0;
-        }
-
-        // pinned 用 255 排序，保证不被名额挤掉（数量不计入 max）。
-        let mut order: Vec<(String, u8)> = inner
+        // (device_id, 质量, 最近活跃, pinned)
+        let mut rank: Vec<(String, u8, u64, bool)> = inner
             .devices
             .iter()
-            .filter(|(_, d)| now.saturating_sub(d.last_seen_ms) < 120_000)
+            .filter(|(_, d)| online(d))
             .map(|(id, d)| {
                 let pinned = (!km.is_empty() && id == &km) || (!soter.is_empty() && id == &soter);
-                (id.clone(), if pinned { 255 } else { d.seat_quality() })
+                (id.clone(), d.seat_quality(), d.last_seen_ms, pinned)
             })
             .collect();
-        order.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let mut kept = 0usize;
-        let mut dropped = 0usize;
-        for (id, q) in order {
-            let pinned = q == 255;
-            if pinned || kept < max {
-                if let Some(d) = inner.devices.get_mut(&id) {
-                    d.accepted = true;
-                }
-                if !pinned {
-                    kept += 1;
-                }
-            } else {
-                dropped += 1;
-            }
+        // 本设备可能还不在这张表里（首次 poll 要等 pop_for_b 才 insert）。
+        // 给它**最旧**的时间戳参与排名：之前这里用的是 `now`，排序按最近活跃降序，
+        // 结果新设备天然排第一、名次永远 < max，544 台全放行 ✓
+        if !rank.iter().any(|(id, _, _, _)| id == device_id) {
+            rank.push((device_id.to_string(), 1, 0, false));
         }
-        tracing::info!("b_limit: 上限 {max}，保留 {kept} 台（另有 pinned），退掉 {dropped} 台");
-        max
+
+        rank.sort_by(|a, b| {
+            b.3.cmp(&a.3) // pinned 优先
+                .then(b.1.cmp(&a.1)) // 质量高的优先
+                .then(b.2.cmp(&a.2)) // 同等质量按最近活跃
+        });
+
+        let idx = rank
+            .iter()
+            .position(|(id, _, _, _)| id == device_id)
+            .unwrap_or(usize::MAX);
+        if idx < max {
+            return Ok(());
+        }
+        // 顺带把当前的真实在线数写进日志，方便对照面板
+        tracing::info!(
+            "b_limit: 拒绝 {device_id}（排名 {idx}，在线 {} 台，上限 {max}）",
+            rank.len()
+        );
+        Err(format!(
+            "B device limit reached ({max} online); this device ranks #{}",
+            idx + 1
+        ))
     }
 
     pub async fn pop_for_b(

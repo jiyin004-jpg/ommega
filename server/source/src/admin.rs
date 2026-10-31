@@ -1355,14 +1355,18 @@ pub async fn admin_b_limit_set(
     let Some(raw) = body.get("max_b_devices").and_then(Value::as_u64) else {
         return json_err(StatusCode::BAD_REQUEST, "max_b_devices is required");
     };
-    // 走 Store 的方法：改完数字还会按新上限重新分配在线名额，把超出的那些退掉
-    // （只改数字的话，之前 accepted 的设备会一直赖着不走）。
-    let v = state.store.set_b_limit(raw as usize).await;
-    Json(json!({
-        "status": "ok",
-        "max_b_devices": v,
-    }))
-    .into_response()
+    // 只改数字：判定是无状态的（每次 poll 现场排名），不需要重新分配什么。
+    match crate::b_limit::set(raw as usize) {
+        Ok(v) => Json(json!({
+            "status": "ok",
+            "max_b_devices": v,
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("save failed: {e}"),
+        ),
+    }
 }
 
 /// GET /api/admin/identity_policy/ - 服务端 keybox 按安全级别用哪份身份。

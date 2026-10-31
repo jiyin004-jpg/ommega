@@ -2836,9 +2836,12 @@ pub async fn b_poll(
         }
     }
 
-    // 名额检查：先看这台还能不能接活，再接下面的心跳/长轮询。
-    // 名额 0（默认）时这里直接放行，跟以前一模一样。
-    if let Err(msg) = state.store.try_accept_device(&q.device_id).await {
+    // 无名额限制时直接放行（默认 0）；有上限就用现场排名判定，不做任何占位标记。
+    if let Err(msg) = state
+        .store
+        .allow_poll(&q.device_id, crate::b_limit::get())
+        .await
+    {
         tracing::info!("b_poll: 拒绝 {}：{msg}", q.device_id);
         return json_err(StatusCode::FORBIDDEN, &msg);
     }
