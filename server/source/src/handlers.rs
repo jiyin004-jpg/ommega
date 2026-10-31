@@ -2781,6 +2781,9 @@ pub struct PollQuery {
     pub device_id: String,
     pub machine_id: Option<String>,
     pub timeout: Option<u64>,
+    /// 一次领几个任务。缺失/0 = 1（老 B 端）。新 B 端传 3，把串行处理造成的
+    /// 排队延迟抹平（实测不领批时 A 端能感到 1~2 秒延迟）。
+    pub batch: Option<usize>,
     /// 设备能力声明（逗号分隔，例如 `soter,strongbox`）。缺失 = 没上报，
     /// 空串 = 上报了一个都没有。见 `queue::DeviceCaps::parse`。
     pub caps: Option<String>,
@@ -2838,6 +2841,8 @@ pub async fn b_poll(
 
     let timeout_secs = q.timeout.unwrap_or(state.cfg.poll_timeout_secs);
     let timeout = Duration::from_secs(timeout_secs.min(120));
+    // 一次领几个：老 B 端不传就是 1，新 B 端传 3。上限 8 是队列侧的事。
+    let batch = q.batch.unwrap_or(1);
 
     // 这台上报的「不跟随补丁日期」名单先记下来：命中名单的认证请求不再往它派。
     if let Some(raw) = q.skip_pkgs.as_deref() {
@@ -2886,38 +2891,51 @@ pub async fn b_poll(
             &machine_id,
             crate::queue::DeviceCaps::parse(q.caps.as_deref()),
             timeout,
+            batch,
         )
         .await
     {
-        Some(task) => {
-            // Which device actually took the task — the counterpart of the
-            // `b_layer` log line, so a mismatch is visible from the log alone.
-            tracing::info!(
-                "b_poll: device={} machine={} claimed task={} type={} requested={}",
-                q.device_id,
-                if machine_id.is_empty() {
-                    "<none>"
-                } else {
-                    machine_id.as_str()
-                },
-                task.task_id,
-                task.task_type,
-                // NB: inside tracing's macro `Value` resolves to tracing's own
-                // Value trait, so go through a closure instead of Value::as_str.
-                task.payload
-                    .get("device_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
+        tasks if !tasks.is_empty() => {
+            for task in &tasks {
+                tracing::info!(
+                    "b_poll: device={} machine={} claimed task={} type={} requested={}",
+                    q.device_id,
+                    if machine_id.is_empty() {
+                        "<none>"
+                    } else {
+                        machine_id.as_str()
+                    },
+                    task.task_id,
+                    task.task_type,
+                    task.payload
+                        .get("device_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                );
+            }
+            // 新格式：`tasks` 数组；同时把第一个任务的字段平铺出来，
+            // 让没升级的 B 端（只认 `task_id`）也能照旧工作。
+            let first = &tasks[0];
+            let mut body = serde_json::Map::new();
+            body.insert("task_id".into(), json!(first.task_id));
+            body.insert("task_type".into(), json!(first.task_type));
+            body.insert("payload".into(), first.payload.clone());
+            body.insert("target_device_id".into(), json!(first.target_device_id));
+            body.insert(
+                "tasks".into(),
+                json!(tasks
+                    .iter()
+                    .map(|t| json!({
+                        "task_id": t.task_id,
+                        "task_type": t.task_type,
+                        "payload": t.payload,
+                        "target_device_id": t.target_device_id,
+                    }))
+                    .collect::<Vec<_>>()),
             );
-            Json(json!({
-                "task_id": task.task_id,
-                "task_type": task.task_type,
-                "payload": task.payload,
-                "target_device_id": task.target_device_id,
-            }))
-            .into_response()
+            Json(Value::Object(body)).into_response()
         }
-        None => StatusCode::NO_CONTENT.into_response(),
+        _ => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
