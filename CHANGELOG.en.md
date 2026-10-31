@@ -4,6 +4,7 @@
 
 ## 1.7.12
 
+- Fix `Invalid key blob` from KeyAttestation's "use attestation key": the attest key follows the policy when minted, while child keys are always signed back at the key's origin layer.
 - ECDH for key-agreement-only keys now runs locally, so it can no longer wedge the
   B-side TEE (a single attempt used to break signing on that device).
 - The locally minted attestation key now carries the same boot state as the remote
