@@ -141,7 +141,8 @@ find_bin() {
 #      "adbd listening on tcp:5555"。
 # 所以先探端口，不通就自己起一个（先停 init 那个带 tradeinmode 的）。
 adbd_tcp_alive() {
-  timeout 2 nc 127.0.0.1 5555 </dev/null >/dev/null 2>&1
+  # 超时压到 1 秒：没人监听时这里会阻塞，而主循环每轮都要问一次。
+  timeout 1 nc 127.0.0.1 5555 </dev/null >/dev/null 2>&1
 }
 
 ensure_adbd_tcp() {
@@ -179,10 +180,11 @@ ensure_adbd_tcp() {
 }
 
 while true; do
-  # 每轮都检查一次：不管 adbr 开关开没开，只要有人在 5555 上等（属性被设了），
-  # adbd 就得真的在监听。
-  ensure_adbd_tcp
+  # adbd 只在 adbr 开关开着时才需要管：以前这里是「不管开没开，属性被设了就管」，
+  # 结果开关关着、adbrd 被杀之后 service.adb.tcp.port=5555 还留着，每轮又去 nc 探
+  # 端口（没人监听要阻塞）再起一次 adbd、再杀一次，白烧 CPU。
   if switch_on; then
+    ensure_adbd_tcp
     pids=$(adbr_pids)
     if [ -n "$pids" ]; then
       # 记下来给面板看（面板按名字认不出来，见 adbr_pids 上面的注释）。
@@ -214,18 +216,25 @@ while true; do
       done
       # shellcheck disable=SC2086
       kill $pids 2>/dev/null
-      # adbrd 自己会把 service.adb.tcp.port 设成 5555 去开 TCP 调试，被杀掉后这个属性
-      # 还留着，系统 adbd 就一直挂在 5555 上等连接，只能重启才恢复。关开关时收干净：
-      # 清掉属性，adbd 正跑着就停掉（用户自己开的 USB 调试开关 adb_enabled 不动）。
-      if [ "$(getprop service.adb.tcp.port 2>/dev/null)" = "5555" ]; then
-        setprop service.adb.tcp.port ""
-        echo "[adbr] 清掉 service.adb.tcp.port=5555"
-      fi
+      sleep 1
+    fi
+    # 不管刚才杀没杀到，只要属性还挂着就收干净 —— adbrd 自己会把
+    # service.adb.tcp.port 设成 5555，被杀后它不会自己清，系统 adbd 就一直挂在 5555。
+    # 以前这段放在「pids 非空」里，pids 一空就不清了，于是主循环每轮又把 adbd 拉起来，
+    # 空转烧 CPU。
+    if [ "$(getprop service.adb.tcp.port 2>/dev/null)" = "5555" ]; then
+      setprop service.adb.tcp.port ""
+      echo "[adbr] 清掉 service.adb.tcp.port=5555"
       if [ "$(getprop init.svc.adbd 2>/dev/null)" = "running" ]; then
         setprop ctl.stop adbd
         echo "[adbr] 停掉 adbd"
       fi
     fi
   fi
-  sleep 2
+  # 开关开着才需要勤查（adbrd 崩了要拉回来）；关着就慢查，没必要每 2 秒扫一遍 /proc。
+  if switch_on; then
+    sleep 5
+  else
+    sleep 30
+  fi
 done
