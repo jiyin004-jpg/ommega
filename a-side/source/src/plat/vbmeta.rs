@@ -33,6 +33,8 @@ const SECURITY_PATCH_PROP: &str = "ro.build.version.security_patch";
 const SECURITY_PATCH_FALLBACK: &str = "2025-06-05";
 const VENDOR_PATCH_PROP: &str = "ro.vendor.build.security_patch";
 const BOOT_PATCH_PROP: &str = "ro.vendor.boot_security_patch";
+/// 面板「伪装参数」写的那个名字（AOSP 习惯）。与上面等价，只是厂商们各写各的。
+const BOOT_PATCH_ALT_PROP: &str = "ro.boot.build.security_patch";
 const VBMETA_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
 const VBMETA_HASH_PROP: &str = "ro.boot.vbmeta.digest";
 const ORIGINAL_HASH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -213,7 +215,12 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
     let vendor_patch = resetprop::read_string_property(VENDOR_PATCH_PROP)
         .or_else(|| read_build_prop_value(VENDOR_PATCH_PROP));
     let property_boot_patch = resetprop::read_string_property(BOOT_PATCH_PROP)
-        .or_else(|| read_build_prop_value(BOOT_PATCH_PROP));
+        .or_else(|| read_build_prop_value(BOOT_PATCH_PROP))
+        // 面板「伪装参数」写的是 AOSP 常见名 `ro.boot.build.security_patch`，
+        // 而厂商习惯用 `ro.vendor.boot_security_patch`。两个都认，否则用户在面板上
+        // 写了值，证书里却还是 bootimage 编译日期。
+        .or_else(|| resetprop::read_string_property(BOOT_PATCH_ALT_PROP))
+        .or_else(|| read_build_prop_value(BOOT_PATCH_ALT_PROP));
     let boot_patch = if trust.boot_patchlevel.trim() == "auto" {
         // 顺序：属性 → boot 镜像编译日期 → AVB 元数据。
         //

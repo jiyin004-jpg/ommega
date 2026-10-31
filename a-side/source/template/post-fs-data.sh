@@ -284,7 +284,9 @@ if [ -r "$PROP_OVERRIDES" ]; then
       \"*\") p_val=${p_val#\"}; p_val=${p_val%\"} ;;
     esac
     case "$p_key" in
-      ro.boot.vbmeta.digest|ro.boot.vbmeta.public_key_digest) : ;;
+      # digest 只喂给 keymint 填证书，boot 补丁只进 HAL info，两者都不参与 FBE 解密，
+      # 可以早写；其余 ro.boot.*（启动状态三连）得等 keymint 起稳，见 apply-boot-props.sh。
+      ro.boot.vbmeta.digest|ro.boot.vbmeta.public_key_digest|ro.boot.build.security_patch) : ;;
       ro.boot.*) continue ;;
       ro.*|persist.*|sys.*) : ;;
       *) continue ;;
