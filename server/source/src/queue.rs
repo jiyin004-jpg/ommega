@@ -633,7 +633,17 @@ impl TaskStore {
         let max = crate::b_limit::get();
         let mut inner = self.inner.lock().await;
         let now = Self::now_ms();
-        let online = |d: &DeviceEntry| d.connected && now.saturating_sub(d.last_seen_ms) < 120_000;
+        // 只按「最近 120 秒内活动过」算在线，**不看 `connected`**：`connected` 要等
+        // 走到 pop_for_b 的心跳才置 true，而名额是在那之前就占的 —— 拿它做统计会把
+        // “刚接受、还没走完这一轮”的设备漏掉，每台新设备都以为没满（实测放进来 231 台）。
+        let online = |d: &DeviceEntry| now.saturating_sub(d.last_seen_ms) < 120_000;
+        // 占名额时就把 last_seen 打上：统计靠它，不打的话同一轮会重复发名额。
+        let touch = |inner: &mut Inner, id: &str, now: u64| {
+            if let Some(d) = inner.devices.get_mut(id) {
+                d.accepted = true;
+                d.last_seen_ms = now;
+            }
+        };
 
         // 面板上配的「默认 keymint 设备」和「默认 soter 设备」**无条件接入**：
         // 它们是业务上的主设备，哪怕名额满了也得能进来（否则名额一调小，
@@ -642,9 +652,7 @@ impl TaskStore {
         if (!km_default.is_empty() && device_id == km_default)
             || (!soter_default.is_empty() && device_id == soter_default)
         {
-            if let Some(d) = inner.devices.get_mut(device_id) {
-                d.accepted = true;
-            }
+            touch(&mut inner, device_id, now);
             return Ok(());
         }
 
@@ -654,9 +662,7 @@ impl TaskStore {
         }
         // 0 = 不限制：直接接受并标记（标记是为了状态页能看出“被接受”）。
         if max == 0 {
-            if let Some(d) = inner.devices.get_mut(device_id) {
-                d.accepted = true;
-            }
+            touch(&mut inner, device_id, now);
             return Ok(());
         }
 
@@ -668,9 +674,7 @@ impl TaskStore {
             .collect();
 
         if seated.len() < max {
-            if let Some(d) = inner.devices.get_mut(device_id) {
-                d.accepted = true;
-            }
+            touch(&mut inner, device_id, now);
             return Ok(());
         }
 
@@ -686,9 +690,7 @@ impl TaskStore {
                 if let Some(d) = inner.devices.get_mut(&worst_id) {
                     d.accepted = false;
                 }
-                if let Some(d) = inner.devices.get_mut(device_id) {
-                    d.accepted = true;
-                }
+                touch(&mut inner, device_id, now);
                 tracing::info!(
                     "b_limit: 名额满（{max}），{device_id}（质量 {new_q}）顶掉 {worst_id}（质量 {worst_q}）"
                 );
@@ -728,7 +730,7 @@ impl TaskStore {
         let mut order: Vec<(String, u8)> = inner
             .devices
             .iter()
-            .filter(|(_, d)| d.connected && now.saturating_sub(d.last_seen_ms) < 120_000)
+            .filter(|(_, d)| now.saturating_sub(d.last_seen_ms) < 120_000)
             .map(|(id, d)| {
                 let pinned = (!km.is_empty() && id == &km) || (!soter.is_empty() && id == &soter);
                 (id.clone(), if pinned { 255 } else { d.seat_quality() })
