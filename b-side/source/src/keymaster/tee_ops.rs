@@ -145,6 +145,12 @@ pub struct KeySpec {
 /// 是同一把，再交给 HAL；HAL 侧的权限来自那把钥匙 keyblob 里的 ATTEST_KEY 用途。
 #[derive(Clone, Debug)]
 pub struct AttestationKeyRef {
+    /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
+    ///
+    /// 有值时直接拿去给 HAL 签，不再查 session —— AK 不在本机铸（智能模式在
+    /// 服务端、或换了一台 B）时，只靠 alias 会直接报
+    /// `issuer key ... is not available on this device`。
+    pub key_blob: Option<Vec<u8>>,
     pub alias: String,
     pub issuer_subject_name: Vec<u8>,
 }
@@ -638,9 +644,21 @@ fn mint_attest_key_with(
     // 调用方自带的证明密钥（App AttestKey 委派）：先在本机找到那把 key，确认它
     // 属于同一个 HAL、证书 Subject 与请求一致，然后交给**真 TEE** 原生签发子证书。
     // 本进程不持有任何私钥，也不用自己的批量 key 冒充。
+    //
+    // 请求带了 key blob（AOSP `AttestationKey.keyBlob`）时不再查 session：那把 AK
+    // 可能压根不是本机铸的（智能模式铸在服务端、或换了一台 B），只要有 blob 就能签。
+    let native_attest = spec.attestation_key.as_ref().and_then(|request| {
+        request.key_blob.as_ref().map(|blob| {
+            crate::android::hardware::security::keymint::AttestationKey::AttestationKey {
+                keyBlob: blob.clone(),
+                attestKeyParams: vec![],
+                issuerSubjectName: request.issuer_subject_name.clone(),
+            }
+        })
+    });
     let parent = match spec.attestation_key.as_ref() {
-        Some(request) => Some(resolve_issuer(request, service)?),
-        None => None,
+        Some(request) if native_attest.is_none() => Some(resolve_issuer(request, service)?),
+        _ => None,
     };
 
     let result = match (spec.attestation_key.as_ref(), parent.as_ref()) {
@@ -648,7 +666,7 @@ fn mint_attest_key_with(
             generate_with_native_issuer(service, &*keymint, &params, request, parent)?
         }
         // `mint_with_attestation_key` 那只自检入口直接把 keyblob 传进来，照旧支持。
-        _ => match keymint.generateKey(&params, attest) {
+        _ => match keymint.generateKey(&params, native_attest.as_ref().or(attest)) {
             Ok(result) => result,
             Err(status) => {
                 if is_dead_object_status(&status) {

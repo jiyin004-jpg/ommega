@@ -864,6 +864,8 @@ impl RemoteRelay {
                 json!({
                     "alias": issuer.alias,
                     "issuer_subject_name": base64_encode(&issuer.issuer_subject_name),
+                    // AOSP 的 `AttestationKey.keyBlob`：B 端优先用它，找不到 session 也能签。
+                    "key_blob": base64_encode(&issuer.key_blob),
                 }),
             );
         }

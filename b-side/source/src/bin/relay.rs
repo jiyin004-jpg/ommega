@@ -1004,6 +1004,14 @@ fn parse_attestation_key(value: Option<&Value>) -> Result<Option<tee_ops::Attest
         return Err(anyhow!("attestation_key.issuer_subject_name is empty"));
     }
     Ok(Some(tee_ops::AttestationKeyRef {
+        // AOSP 的 `AttestationKey.keyBlob`：有就用它直接签，不靠 alias 查 session。
+        key_blob: value
+            .get("key_blob")
+            .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            .map(b64_decode)
+            .transpose()
+            .with_context(|| "decode attestation_key.key_blob")?
+            .filter(|blob| !blob.is_empty()),
         alias: alias.to_string(),
         issuer_subject_name,
     }))

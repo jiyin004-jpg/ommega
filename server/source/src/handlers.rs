@@ -811,16 +811,22 @@ fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'stati
     }
 }
 
-/// 是不是在铸一把证明密钥（`KeyPurpose::AttestKey` = 8）的请求。
+/// 是不是证明密钥相关的请求：铸 AK 本身（`KeyPurpose::AttestKey` = 8），
+/// 或者用一把 AK 签子钥（`attestation_key`）。
 ///
-/// A 端会把这个 purpose 原样放进 `device_attest_context.purpose`（跟普通 keygen
-/// 一个口径），所以这里只看那个数组里有没有 8。
+/// 两者必须走同一层 —— AK 铸在服务端 keybox、子钥却派给 B，B 那边找不到这把
+/// AK 的 session（`issuer key ... is not available on this device`），整笔就废了。
 fn is_attest_key_request(body: &Value) -> bool {
-    body.get("device_attest_context")
+    let ctx = body.get("device_attest_context");
+    let keygen = ctx
         .and_then(|c| c.get("purpose"))
         .and_then(Value::as_array)
         .map(|list| list.iter().any(|v| v.as_i64() == Some(8)))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let signing = ctx
+        .and_then(|c| c.get("attestation_key"))
+        .is_some_and(|v| !v.is_null());
+    keygen || signing
 }
 
 async fn run_a_side_task(

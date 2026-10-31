@@ -256,6 +256,13 @@ pub struct RemoteAttestationKey {
     pub public_key: Vec<u8>,
     /// 那把 key 自己的证书 Subject（DER X.501 Name），随请求下发。
     pub issuer_subject_name: Vec<u8>,
+    /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
+    ///
+    /// 真机的 `generateKey(.., attestationKey)` 直接把这个 blob 交给 HAL 用，
+    /// 不靠任何会话表。B 端以前只能拿 alias 去查自己的 session，一旦那把 AK
+    /// 不是在它那里铸的（智能模式在服务端、或换了另一台 B）就报
+    /// `issuer key ... is not available on this device`。
+    pub key_blob: Vec<u8>,
 }
 
 /// there.  Each method returns `Ok(None)` when the remote is unavailable or not

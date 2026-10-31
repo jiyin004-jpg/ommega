@@ -433,6 +433,7 @@ impl crate::KeyMintTa {
             .iter()
             .any(|p| matches!(p, KeyParam::Purpose(KeyPurpose::AttestKey)));
         let remote_on = self.dev.remote.as_ref().is_some_and(|r| r.enabled());
+        let has_app_id = get_opt_tag_value!(params, AttestationApplicationId)?.is_some();
         let auto_challenge = is_attest_key_keygen && !wants_attest_challenge && remote_on;
         let remote_issuer = match attestation_key.as_ref() {
             Some(info)
@@ -450,6 +451,7 @@ impl crate::KeyMintTa {
                         alias: remote.alias,
                         public_key: remote.public_key,
                         issuer_subject_name: info.issuer_subject_name.clone(),
+                        key_blob: info.key_blob.clone(),
                     }),
                     _ => None,
                 }
@@ -472,6 +474,14 @@ impl crate::KeyMintTa {
             let mut owned; // 存住注入后的参数，作用域盖住下面两次调用
             let params: &[KeyParam] = if auto_challenge && !wants_attest_challenge {
                 owned = params.to_vec();
+                // 远程出证要求带 app id，而生成 ATTEST_KEY 时 App 通常不带 ——
+                // 自己补一个最小的合法 `AttestationApplicationId`（`SEQUENCE { SET {} }`，
+                // 空的 packageInfos），而不是因为这个可选字段把整笔转发放弃。
+                if !has_app_id {
+                    // 空 `SEQUENCE OF`：B 端 `check_app_id_der` 只认 SET OF / SEQUENCE OF
+                    // 两种编码，之前写的 `SEQUENCE { SET {} }` 会被判成非法。
+                    owned.push(KeyParam::AttestationApplicationId(vec![0x30, 0x00]));
+                }
                 let mut challenge = vec![0u8; 32];
                 self.imp.rng.fill_bytes(&mut challenge);
                 owned.push(KeyParam::AttestationChallenge(challenge));
