@@ -191,8 +191,13 @@ chmod 0755 "$CLIENTA_DIR"
 # build, a manual step or a file manager puts both sides on separate copies —
 # UI saves would then silently never reach the daemon.  Repair it every boot:
 # migrate what is there, then replace it with the symlink.
-if [ -L "$CLIENTA_DIR/ommegadata" ]; then
-  : # already the symlink
+if [ -L "$CLIENTA_DIR/ommegadata" ] && [ "$(readlink "$CLIENTA_DIR/ommegadata" 2>/dev/null)" = "$TARGET_DIR" ]; then
+  : # already the right symlink
+elif [ -L "$CLIENTA_DIR/ommegadata" ]; then
+  # 指到别处（老版本指 /data/misc/keystore/ommega）：直接换掉，不然面板写的东西
+  # 落在程序不读的位置，而且一声不响。
+  rm -f "$CLIENTA_DIR/ommegadata"
+  ln -s "$TARGET_DIR" "$CLIENTA_DIR/ommegadata" 2>/dev/null
 elif [ -d "$CLIENTA_DIR/ommegadata" ]; then
   for f in config target.txt system_app keybox_tee.xml keybox_strongbox.xml; do
     stray="$CLIENTA_DIR/ommegadata/$f"
