@@ -120,15 +120,35 @@ elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64-v8a" ]; then
   extract "$ZIPFILE" 'libs/arm64-v8a/adbrd' "$MODPATH"
   # 文件变化驱动的注入器调度器（替掉 daemon-injector 里那个 3~5 秒轮询的 shell 循环）
   extract "$ZIPFILE" 'libs/arm64-v8a/inject-watchdog' "$MODPATH"
-  # pathmask 内核模块只对 arm64 有意义（上游只提供 arm64 构建），逐个 extract
-  # 让 verify.sh 对每个 .ko 做 sha256 校验；缺文件或哈希不符会直接中止安装。
-  ui_print "- Extracting pathmask kernel modules"
-  for kmi in android12-5.10 android13-5.10 android13-5.15 android14-5.15 \
-             android14-6.1 android15-6.6 android16-6.12; do
-    extract "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" "$MODPATH"
+  # pathmask 内核模块只对 arm64 有意义（上游只提供 arm64 构建）。
+  #
+  # 包里带全 7 个变体是为了分发给不同内核的设备，但**设备上只需要一个**：
+  # 按 `uname -r` 的 major.minor（5.10/5.15/6.1/6.6/6.12）选系列，再优先拿
+  # Android 标签匹配的那个（GKI 内核会把标签写进版本串，如 6.1.145-android14-11）。
+  # 全部解压会在模块目录里留 456K 用不上的 .ko。
+  ui_print "- Extracting pathmask kernel module for this kernel"
+  krel=$(uname -r 2>/dev/null)
+  kmajor=${krel%%.*}
+  krest=${krel#*.}
+  kminor=${krest%%.*}
+  kseries="$kmajor.$kminor"
+  ktag=$(echo "$krel" | sed -n 's/.*-android\([0-9][0-9]\).*/\1/p')
+  pathmask_done=0
+  for kmi in ${ktag:+android${ktag}-${kseries}} \
+             android16-${kseries} android15-${kseries} android14-${kseries} \
+             android13-${kseries} android12-${kseries}; do
+    if unzip -l "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" 2>/dev/null | grep -q 'pathmask/.*_pathmask\.ko'; then
+      extract "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" "$MODPATH"
+      ui_print "  -> ${kmi}"
+      pathmask_done=1
+      break
+    fi
   done
+  if [ "$pathmask_done" = "0" ]; then
+    ui_print "  -> no matching .ko for kernel $krel (path masking disabled)"
+  fi
   extract "$ZIPFILE" 'pathmask/UPSTREAM.md' "$MODPATH"
-  chmod 0644 "$MODPATH"/pathmask/*.ko
+  chmod 0644 "$MODPATH"/pathmask/*.ko 2>/dev/null
 else
   abort "! Unsupported platform: $ARCH"
 fi

@@ -7,9 +7,14 @@ DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 PROP_FILE="$MODDIR/module.prop"
 
-# 注入器的调度者：优先用 Rust 的 inject-watchdog（stat 轮询，文件变了才跑一轮），
-# 二进制不存在时退回老的自循环 shell。两者 cmdline 不一样，所以外部存活检查也得跟着走。
-INJECTOR_CMD=$BIN_DIR/inject-watchdog
+# 注入器的调度者：直接用 shell 版 daemon-injector。
+#
+# 不走 `inject-watchdog` 的原因：watchdog 是 ELF，由本脚本（magiskd 域）拉起后自己跑
+# `sh daemon-injector`—— 那个 sh 继承的是 ksu 域，而模块目录的文件标签是 magisk_file，
+# ksu 域**读不了**（`sh: Permission denied`，退出码 127），注入根本不会发生。
+# 直接在本脚本里 `sh` 就没有这道坎：本脚本是 magiskd 执行的，fork 出来的 sh 读得到。
+# 代价是回到「自己循环」的调度方式，但能跑比省那点开销重要。
+INJECTOR_CMD=$MODDIR/daemon-injector
 
 mkdir -p "$STATE_DIR"
 
@@ -69,7 +74,12 @@ start_daemon() {
     rm -f "$pidfile"
   fi
 
-  "$script" &
+  # 脚本用 sh 跑（ELF 直接 exec）。injector 是 shell 脚本，而且必须由本脚本这支
+  #  fork 出来的 sh 去读 —— 外部起个进程去读模块目录会被 SELinux 拒掉。
+  case "$script" in
+    *.sh|*/daemon-injector) sh "$script" & ;;
+    *) "$script" & ;;
+  esac
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
