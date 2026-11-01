@@ -30,7 +30,7 @@ use crate::keymaster::error::anyhow_error_to_cstring;
 use crate::keymaster::error::Error as KeystoreError;
 use crate::keymaster::keymint_device::{localize_auth_token_for_ommega, KeyMintDevice};
 use crate::keymaster::permission::{self, require_forwarded_context, KeystorePerm};
-use crate::keymaster::super_key::WipeKeyOption;
+use crate::keymaster::super_key::{UserState, WipeKeyOption};
 use crate::keymaster::utils::{
     check_keystore_permission, get_interface_once, key_params_to_aidl, watchdog as wd,
     AndroidUserId, Challenge, SecureUserId,
@@ -912,6 +912,32 @@ impl IAuthorizationService for AuthorizationManager {
         };
         self.update_lock_state(op);
         Ok(())
+    }
+
+    /// 查一个用户的 super key 状态（0=Uninitialized、1=CeLocked、2=CeUnlocked）。
+    ///
+    /// 给注入器 replay 完回查用：`onDeviceUnlocked` 里 `unlock_or_initialize_user` 失败
+    /// 只记一行 error，binder 照样回 Ok。不断言返回值的调用方就会以为喂进去了，
+    /// 实际 super key 还是锁的。
+    fn getUserState(&self, ctx: Option<&CallerInfo>, user_id: i32) -> BinderResult<i32> {
+        let _wp = wd::watch("IAuthorizationService::getUserState");
+        let ctx = require_ommega_ctx(ctx, "IAuthorizationService::getUserState")?;
+        check_ommega_keystore_permission(
+            ctx,
+            KeystorePerm::Unlock,
+            "caller missing Unlock permissions",
+        )?;
+
+        let user = AndroidUserId(user_id);
+        let skm = SUPER_KEY.read().unwrap();
+        let state = DB
+            .with(|db| skm.get_user_state(&mut db.borrow_mut(), user))
+            .map_err(into_logged_binder)?;
+        Ok(match state {
+            UserState::Uninitialized => 0,
+            UserState::CeLocked => 1,
+            UserState::CeUnlocked(_) => 2,
+        })
     }
 
     fn onDeviceLocked(

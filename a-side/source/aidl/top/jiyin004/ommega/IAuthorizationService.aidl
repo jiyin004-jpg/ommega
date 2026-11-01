@@ -10,6 +10,11 @@ interface IAuthorizationService {
 
     void onDeviceUnlocked(in @nullable CallerInfo ctx, in int userId, in @nullable byte[] password);
 
+    // 查一个用户的 super key 状态，给注入器 replay 完回查用：
+    // 0 = Uninitialized（没 super key）、1 = CeLocked（有但没解开）、2 = CeUnlocked。
+    // onDeviceUnlocked 内部失败只记一行 error，binder 照旧回 Ok，光看返回值骗人。
+    int getUserState(in @nullable CallerInfo ctx, in int userId);
+
     void onDeviceLocked(in @nullable CallerInfo ctx, in int userId, in long[] unlockingSids,
             in boolean weakUnlockEnabled);
 

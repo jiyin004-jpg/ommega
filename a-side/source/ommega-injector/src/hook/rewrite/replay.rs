@@ -37,7 +37,16 @@ struct StandingDeviceUnlock {
     /// The original caller (the framework); replayed as-is so the shadow sees the
     /// same identity it saw the first time.
     caller: CallerInfo,
+    /// 影子连着拒了几次。一次拒绝就丢太狠（binder 层一个误判就永久没材料），
+    /// 攒到 [`MAX_REJECTS`] 才真丢。
+    rejects: u32,
 }
+
+/// 影子连着拒这么多次，才认为材料真的过期（改过密码、DB 被清）。
+const MAX_REJECTS: u32 = 3;
+
+/// 跟 `IAuthorizationService::getUserState` 的返回值对齐。
+const USER_STATE_UNLOCKED: i32 = 2;
 
 /// The last unlock material keystore2 was given, per user. Reloaded from the disk mirror
 /// the first time it is touched, so a payload that starts after a keystore2 restart still
@@ -83,6 +92,7 @@ fn remember_device_unlock_at(
             .or_insert_with(|| StandingDeviceUnlock {
                 password: None,
                 caller: caller.clone(),
+                rejects: 0,
             });
         if let Some(password) = password {
             if let Some(old) = entry.password.take() {
@@ -183,7 +193,39 @@ fn replay_standing_device_unlocks() -> anyhow::Result<()> {
         };
         match result {
             Ok(()) => {
-                info!("event=replay restored device unlock user={user_id} after a shadow restart")
+                // feed 回 Ok 不代表真解开了：影子里 `unlock_or_initialize_user` 失败只记一行
+                // error，binder 照旧返回成功。回查一次真实状态，CeUnlocked 才算数，
+                // 否则材料会被当成"已喂过"再也不会重试。
+                match query_user_state(user_id, &caller) {
+                    Ok(state) if state == USER_STATE_UNLOCKED => {
+                        clear_rejects(user_id);
+                        info!(
+                            "event=replay restored device unlock user={user_id} after a shadow restart"
+                        )
+                    }
+                    Ok(state) => {
+                        let rejects = bump_rejects(user_id);
+                        deferred = Some(anyhow::anyhow!(
+                            "shadow reports user state {state} after the replay"
+                        ));
+                        if rejects >= MAX_REJECTS {
+                            warn!(
+                                "event=replay user={user_id} still not unlocked (state={state}) after {rejects} attempts; dropping the material"
+                            );
+                            forget_device_unlock(user_id);
+                        } else {
+                            warn!(
+                                "event=replay user={user_id} still not unlocked (state={state}, attempt {rejects}/{MAX_REJECTS}); keeping the material"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            "event=replay could not confirm user={user_id} unlock state: {error:#}"
+                        );
+                        deferred = Some(error);
+                    }
+                }
             }
             // The shadow is not up yet (still starting, socket gone, service not
             // registered): keep the material and try again on the next contact.
@@ -193,13 +235,24 @@ fn replay_standing_device_unlocks() -> anyhow::Result<()> {
                 );
                 deferred = Some(error);
             }
-            // The shadow answered and refused it: the material is stale (password
-            // changed, super keys gone), so drop it instead of replaying forever.
+            // The shadow answered and refused it: the material is probably stale (password
+            // changed, super keys gone). Still do not drop it on the first refusal.
             Err(error) => {
-                warn!(
-                    "event=replay ommega rejected standing device unlock user={user_id}: {error:#}; dropping it"
-                );
-                forget_device_unlock(user_id);
+                let rejects = bump_rejects(user_id);
+                let reason = format!("{error:#}");
+                deferred = Some(error);
+                if rejects >= MAX_REJECTS {
+                    warn!(
+                        "event=replay ommega rejected standing device unlock user={user_id}: \
+                         {reason}; dropping after {rejects} attempts"
+                    );
+                    forget_device_unlock(user_id);
+                } else {
+                    warn!(
+                        "event=replay ommega rejected standing device unlock user={user_id}: \
+                         {reason}; keeping the material (attempt {rejects}/{MAX_REJECTS})"
+                    );
+                }
             }
         }
     }
@@ -207,6 +260,34 @@ fn replay_standing_device_unlocks() -> anyhow::Result<()> {
     match deferred {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// 问影子这个用户到底解没解开（0=Uninitialized、1=CeLocked、2=CeUnlocked）。
+fn query_user_state(user_id: i32, caller: &CallerInfo) -> anyhow::Result<i32> {
+    let _guard = BypassGuard::enter();
+    ipc::with_ommega_authorization_once(|auth| Ok(auth.getUserState(Some(caller), user_id)?))
+}
+
+fn bump_rejects(user_id: i32) -> u32 {
+    let mut cache = DEVICE_UNLOCK
+        .lock()
+        .expect("ommega device unlock cache poisoned");
+    match cache.get_mut(&user_id) {
+        Some(entry) => {
+            entry.rejects = entry.rejects.saturating_add(1);
+            entry.rejects
+        }
+        None => 0,
+    }
+}
+
+fn clear_rejects(user_id: i32) {
+    let mut cache = DEVICE_UNLOCK
+        .lock()
+        .expect("ommega device unlock cache poisoned");
+    if let Some(entry) = cache.get_mut(&user_id) {
+        entry.rejects = 0;
     }
 }
 
@@ -236,7 +317,16 @@ fn restore_from_disk() -> HashMap<i32, StandingDeviceUnlock> {
     }
     restored
         .into_iter()
-        .map(|(user_id, password, caller)| (user_id, StandingDeviceUnlock { password, caller }))
+        .map(|(user_id, password, caller)| {
+            (
+                user_id,
+                StandingDeviceUnlock {
+                    password,
+                    caller,
+                    rejects: 0,
+                },
+            )
+        })
         .collect()
 }
 
