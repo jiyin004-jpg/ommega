@@ -273,7 +273,8 @@ fn lookup_in_table(table: &str, uid: u32) -> Option<String> {
 /// 不自己翻了——前台恰好是别的 App 时，真应用被安上别人的包名（实测 SoterChecker 被
 /// 当成 bin.mt.plus / com.tencent.mobileqq），整轮退回本地。
 ///
-/// `/data/misc/ommega/foreground` 那份副本也不再读，留给 daemon 用。
+/// `/data/misc/ommega/foreground` 那份文件也不再落盘：前台由 keymint 走到兜底时现问
+/// （root helper 跑一次 dumpsys），定时采一份旧的对判断「现在是谁在调」没意义。
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
     for c in value.chars() {

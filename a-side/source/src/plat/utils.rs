@@ -264,39 +264,19 @@ fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
     map
 }
 
-/// root 侧（`daemon-injector`）周期性写出来的「当前前台应用」：一行 `<epoch 秒> <包名>`。
+/// 前台应用兜底：前面三层（内核 uid、root 侧表、appId 回退）都拿不到包名时才走到这里。
 ///
-/// 它是最后一道兜底：前面三层（内核 uid、root 侧表、appId 回退）都拿不到包名时才用它。
-/// 它比前三层弱 —— 前台是谁不等于谁在调 SOTER（支付流程可能在子进程/后台）—— 所以还带
-/// 新鲜度阀（文件超过这个秒数就不用）和配置开关（root 侧得不写，它就不存在）。
-const FOREGROUND_PATH: &str = "/data/misc/ommega/foreground";
-
-/// 前台信息算多新鲜才能用。要比写侧的间隔大（写侧 `FOREGROUND_EVERY=12` × 5 秒 ≈ 60 秒），
-/// 否则大部分时候都是“过期的没有”——那就等于这一道不存在。
-const FOREGROUND_TTL_SECS: u64 = 90;
-
-/// 前台应用兜底：把那个文件读出来，太旧/格式不对就回 `None`。
+/// 现问现答 —— 通过 root helper 跑一次 `dumpsys`。以前是 daemon 每 N 秒写一个文件、
+/// 这里读文件，但「N 秒前的前台」对判断「现在是谁在调」没有意义：切个 App 就对不上，
+/// 分钟级更是不可能对上。这条路径只在前三层全落空时走，频率极低，多跑一次 dumpsys 值得。
 pub fn foreground_package() -> Option<String> {
-    let text = std::fs::read_to_string(FOREGROUND_PATH).ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    parse_foreground(&text, now)
-}
-
-/// 解析「前台应用」那个文件：`<epoch 秒> <包名>`，太旧（`FOREGROUND_TTL_SECS`）就不算。
-fn parse_foreground(text: &str, now_epoch_secs: u64) -> Option<String> {
-    let mut fields = text.split_whitespace();
-    let at = fields.next()?.parse::<u64>().ok()?;
-    let package = fields.next()?;
-    if now_epoch_secs.saturating_sub(at) > FOREGROUND_TTL_SECS {
-        return None;
+    match crate::plat::resetprop::runtime_foreground_package() {
+        Ok(pkg) => pkg,
+        Err(error) => {
+            log::debug!("event=soter foreground helper unavailable: {error:#}");
+            None
+        }
     }
-    if package.is_empty() || package == "-" {
-        return None;
-    }
-    Some(package.to_string())
 }
 
 fn package_names_of(application_id: &KeyAttestationApplicationId) -> Vec<String> {
@@ -637,36 +617,5 @@ mod tests {
         );
         assert_eq!(table.get(&10491), None);
         assert_eq!(table.len(), 3);
-    }
-
-    /// 前台应用兜底：格式对、且够新鲜才用；旧了/写的是空就回 None。
-    #[test]
-    fn the_foreground_fallback_needs_to_be_fresh() {
-        let now = 1_791_000_000u64;
-        assert_eq!(
-            parse_foreground(&format!("{now} com.tencent.mm\n"), now),
-            Some("com.tencent.mm".to_string())
-        );
-        // 刚过阀（8 秒）还能用，再旧就不算。
-        assert_eq!(
-            parse_foreground(
-                &format!("{} com.tencent.mm", now - FOREGROUND_TTL_SECS),
-                now
-            ),
-            Some("com.tencent.mm".to_string())
-        );
-        assert_eq!(
-            parse_foreground(
-                &format!("{} com.tencent.mm", now - FOREGROUND_TTL_SECS - 1),
-                now
-            ),
-            None,
-            "太旧的前台信息不能用"
-        );
-        // 空包名 / 只有时间 / 根本读不出时间，都不算。
-        assert_eq!(parse_foreground(&format!("{now} -\n"), now), None);
-        assert_eq!(parse_foreground(&format!("{now}\n"), now), None);
-        assert_eq!(parse_foreground("乱写", now), None);
-        assert_eq!(parse_foreground("", now), None);
     }
 }
