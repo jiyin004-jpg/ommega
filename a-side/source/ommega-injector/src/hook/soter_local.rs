@@ -71,8 +71,10 @@ const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
-/// counter 起点。真机上这个号早就几千了（PLC110 实测 7394），从 1 开始会被当回滚。
-const COUNTER_BASE: u64 = 10_000;
+/// counter 起点：导入 ATTK 时会把 ASK/authkey/counter 全部清掉，之后每个 App
+/// 第一次请求现造 ASK，counter 从 1 开始严格 +1。
+/// （那时腾讯那边也是全新的身份，没有历史值要追；用时间戳反而会让步长乱跳。）
+const COUNTER_BASE: u64 = 1;
 
 /// 强制覆盖 cpu_id 的文件。拿别台设备的 ATTK 重放时要跟那台报同一个号，
 /// 否则服务端按 cpu_id 查不到设备。daemon 不认识这个文件名，不会写回。
@@ -496,14 +498,6 @@ fn state() -> Option<&'static State> {
             })
         })
         .as_ref()
-}
-
-/// 单调递增的下限。重启后即使文件丢了/读不到，也拿着它保证不回退。
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn now_millis() -> i64 {
@@ -1070,7 +1064,7 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
     // 平铺在目录根下，装十几个 App 就是一屏垃圾文件。
     //
     // 读-改-写放在文件锁里：injector 会同时跑在 keystore 和 SOTER 宿主几个进程里，
-    // 不加锁会互相覆盖。即使真丢了也还能靠 `now_secs()` 兜底，确保不会回退。
+    // 不加锁会互相覆盖。计数器就是这条 `uid=counter` 的唯一来源。
     const PATH: &str = "/data/misc/ommega/soter_counter";
 
     let mem = state
@@ -1091,12 +1085,12 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            let next = counter_for(&text, uid)
-                .unwrap_or(0)
-                .max(mem)
-                .max(COUNTER_BASE)
-                .max(now_secs())
-                + 1;
+            // 严格 +1（真机就是连续递增）。文件里没有这个 uid（刚导入 ATTK 被清过、
+            // 或者第一次见这个 App）就从 1 开始，**不要**拿 now_secs() 去抬。
+            let next = match counter_for(&text, uid) {
+                Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
+                None => COUNTER_BASE,
+            };
             let updated = set_counter(&text, uid, next);
             let _ = file.set_len(0);
             let _ = file.seek(SeekFrom::Start(0));
@@ -1104,7 +1098,7 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             next
         }
         // 开不了文件（权限异常）：只能拿内存里的值兜一下，至少不回退到比本进程见过的更小。
-        Err(_) => mem.max(COUNTER_BASE).max(now_secs()) + 1,
+        Err(_) => mem.max(COUNTER_BASE) + 1,
     };
 
     if let Ok(mut map) = state.counters.lock() {
