@@ -40,7 +40,26 @@ fn watched() -> Vec<PathBuf> {
         data.join("keybox_strongbox.xml"),
         // 面板写的伪装项、能力开关都在这里；目录 mtime 变就说明有增删
         state.join("conf"),
+        // 热替换 payload 时自动重新注入。以前这里不监控它，换完得手动跑
+        // `daemon-injector --once` 才生效（注入记录里按 payload 的 hash 认，
+        // 二进制换了 hash 就变，会自动重新注入）。
+        state.join("bin/ommega-inject"),
     ]
+}
+
+/// keymint 二进制单独盯：**换文件不等于换进程**。
+///
+/// 它变了就给主 daemon 落一个重启标记（杀和重启都归那边管，这边不去碰 pid）。
+fn keymint_binary() -> PathBuf {
+    PathBuf::from(STATE_DIR).join("bin/keymint")
+}
+
+fn request_keymint_restart() {
+    let run_dir = PathBuf::from(STATE_DIR).join("run");
+    let _ = fs::create_dir_all(&run_dir);
+    if let Err(e) = fs::write(run_dir.join("restart.keymint"), b"watchdog\n") {
+        log_line(&format!("failed to request keymint restart: {e}"));
+    }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -123,12 +142,20 @@ fn main() {
     run_once();
     let mut last_run = Instant::now();
     let mut last = snapshot();
+    let mut last_keymint = mtime(&keymint_binary());
 
     loop {
         thread::sleep(POLL);
         let current = snapshot();
         let changed = current != last;
-        if changed || last_run.elapsed() >= IDLE_TICK {
+        let keymint_now = mtime(&keymint_binary());
+        let keymint_changed = keymint_now != last_keymint;
+        if changed || keymint_changed || last_run.elapsed() >= IDLE_TICK {
+            if keymint_changed {
+                log_line("keymint binary changed; requesting restart");
+                request_keymint_restart();
+                last_keymint = keymint_now;
+            }
             if changed {
                 log_line("watched file changed; running a tick");
             }
