@@ -3,6 +3,8 @@ use super::super::*;
 pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
     fd: c_int,
     read: &mut Vec<u8>,
+    // 宿主这次给的读缓冲总容量。合成回复装不下就不换，绝不换完再截。
+    max_total: usize,
 ) -> PendingReadEffects {
     let base = read.as_mut_ptr();
     let total_size = read.len();
@@ -58,11 +60,25 @@ pub(in crate::hook::intercept) unsafe fn parse_read_buffer(
             // 换成备好的真回复，宿主就当这个调用成功了。
             if cmd_nr == BR_FAILED_REPLY_NR {
                 if let Some(framed) = peek_intercepted_soter(connection) {
-                    replacements.push((
-                        command_start as usize - base as usize,
-                        size_of::<u32>() + cmd_size,
-                        framed,
-                    ));
+                    let replaced_len = size_of::<u32>() + cmd_size;
+                    let projected = total_size - replaced_len + framed.len();
+                    if projected <= max_total {
+                        replacements.push((
+                            command_start as usize - base as usize,
+                            replaced_len,
+                            framed,
+                        ));
+                    } else {
+                        // 装不下就别换。换成更长的再截断，留下的是
+                        // 「BR_TRANSACTION_COMPLETE + 没有 BR_REPLY」，宿主会一直在
+                        // 下一次 read 等一条永远不会来的回复（那条线程就废了），
+                        // 队列里那条也会跟着滞留下去。保留内核原始的 BR_FAILED_REPLY，
+                        // 宿主本就能处理失败。
+                        warn!(
+                            "event=soter synthetic reply does not fit the host read buffer fd={} need={} have={}; keeping BR_FAILED_REPLY",
+                            fd, projected, max_total
+                        );
+                    }
                 }
             }
         } else if is_read {

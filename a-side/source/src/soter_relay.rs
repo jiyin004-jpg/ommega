@@ -282,15 +282,35 @@ fn heal_soter_slot(pkg: &str, uid: i64) -> anyhow::Result<()> {
             "/data/user/{user}/{pkg}/shared_prefs/soter_status.xml"
         ));
     }
+    let mut removed = 0usize;
+    let mut failed = 0usize;
     for path in paths {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
         let _ = std::fs::copy(&path, format!("{path}.bak"));
         match std::fs::remove_file(&path) {
-            Ok(()) => log::info!("event=soter selfheal removed {path}"),
-            Err(error) => log::warn!("event=soter selfheal cannot remove {path}: {error}"),
+            Ok(()) => {
+                removed += 1;
+                log::info!("event=soter selfheal removed {path}");
+            }
+            Err(error) => {
+                failed += 1;
+                log::warn!("event=soter selfheal cannot remove {path}: {error}");
+            }
         }
+    }
+    // 本地脏缓存没清掉就别去动 B 的料。
+    //
+    // payload 跑在 keystore uid 下，删 /data/data/<pkg> 是跨应用操作，基本都会被挡；
+    // 以前这两步失败被忽略、第三步（清 B 槽位）照做，结果是 App 侧缓存一点没动、
+    // B 上还可用的钥匙反而被清掉了，然后进 10 分钟冷却 —— 比不修更糟，用户看到的就是
+    // 「一直系统错误，而且现在连料都没了」。
+    if removed == 0 && failed > 0 {
+        log::warn!(
+            "event=soter selfheal cannot clear local cache for {pkg}; leaving the B slot alone"
+        );
+        return Ok(());
     }
     // 3) 清 B 上的槽位（带 force_scope_wipe，服务端只对这一笔放行）
     let body = serde_json::json!({
@@ -631,7 +651,16 @@ fn encode_reply(op: &str, reply: &Value) -> Option<Outcome> {
     let code = reply.get("error_code").and_then(Value::as_i64)? as i32;
 
     if soter_relay::answers_with_session(op) {
-        let session = reply.get("session").and_then(Value::as_i64).unwrap_or(0);
+        let session = match reply.get("session").and_then(Value::as_i64) {
+            Some(session) => session,
+            // 答了成功却没有会话号：这张会话在 TA 里根本没建起来。服务端那边对同
+            // 一形状就是这个判据（还额外要求 session != 0）。照撒成 status=0/session=0
+            // 等于递一个假成功给 App，App 拿着 session=0 去 finish_sign 才报错，
+            // 本该在这一步走「透传给真 HAL / 本地兜底」的分支就吃不到了。
+            None if code == 0 => return None,
+            // 失败码本来就没有会话号，保留原状态码。
+            None => 0,
+        };
         return Some(Outcome::Init {
             status: code,
             session,

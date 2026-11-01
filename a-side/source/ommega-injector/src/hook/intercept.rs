@@ -510,6 +510,13 @@ fn binder_state_key(fd: c_int) -> BinderStateKey {
 fn reset_current_thread_binder_state(connection: BinderStateKey) {
     ioctl::abort_prepared_bc_replies_for_connection(connection);
     clear_binder_fd_thread_state(connection);
+    // 已经备好、但这次事务没能正常结束的 SOTER 回复也得丢掉。它只在宿主回
+    // BC_FREE_BUFFER 时才出队，而错误路径（EPROTO / 写阶段失败 / fd 退役）上
+    // 那条 BC_FREE_BUFFER 永远不会来；留在队首会让下一条失败的同步事务收到
+    // 上一条 SOTER 方法的应答 parcel —— 方法都不同，字段全错位。
+    INTERCEPTED_SOTER.with(|slot| {
+        slot.borrow_mut().remove(&connection);
+    });
     PENDING_IOCTL_COPYBACKS.with(|pending| {
         pending.borrow_mut().remove(&connection);
     });

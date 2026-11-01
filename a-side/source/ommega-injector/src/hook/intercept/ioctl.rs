@@ -237,17 +237,18 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
             .expect("read address was validated before ioctl");
         match copy_process_buffer(read_address, read_len) {
             Ok(mut read) => {
-                read_effects = parse_read_buffer(fd, &mut read);
-                // 我们可能把一条 4 字节的失败回复换成了更长的真回复：长度得跟着涨。
-                // 但宿主给的 read 缓冲就那么大，塞不下就退回内核给的那份长度。
-                let grown = read.len();
+                // 可用空间算在前面：parse_read_buffer 靠它决定「装不下就别换」。
                 let available = original_read_size.saturating_sub(input_read_consumed);
+                read_effects = parse_read_buffer(fd, &mut read, available);
+                let grown = read.len();
                 if grown > available {
+                    // 理论上到不了：能换的都已经在 parse_read_buffer 里卡过长度了。
+                    // 真到了也不能截断 —— 截断只会留下「BR_TRANSACTION_COMPLETE +
+                    // 没有 BR_REPLY」，宿主的这条线程会一直等一条永远不来的回复。
                     warn!(
-                        "event=soter synthetic reply does not fit the host read buffer fd={} need={} have={}",
+                        "event=soter processed read buffer exceeds the host buffer fd={} need={} have={}",
                         fd, grown, available
                     );
-                    read.truncate(read_len);
                 } else {
                     bwr.read_consumed = input_read_consumed + grown;
                 }
