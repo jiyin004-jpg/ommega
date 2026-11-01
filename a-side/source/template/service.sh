@@ -9,11 +9,6 @@ PROP_FILE="$MODDIR/module.prop"
 
 # 注入器的调度者：直接用 shell 版 daemon-injector。
 #
-# 不走 `inject-watchdog` 的原因：watchdog 是 ELF，由本脚本（magiskd 域）拉起后自己跑
-# `sh daemon-injector`—— 那个 sh 继承的是 ksu 域，而模块目录的文件标签是 magisk_file，
-# ksu 域**读不了**（`sh: Permission denied`，退出码 127），注入根本不会发生。
-# 直接在本脚本里 `sh` 就没有这道坎：本脚本是 magiskd 执行的，fork 出来的 sh 读得到。
-# 代价是回到「自己循环」的调度方式，但能跑比省那点开销重要。
 INJECTOR_CMD=$MODDIR/daemon-injector
 
 mkdir -p "$STATE_DIR"
@@ -60,8 +55,7 @@ pid_matches_script() {
   echo "$cmdline" | grep -F "$script" >/dev/null 2>&1
 }
 
-# 启动一个**ELF**守护（`inject-watchdog`）并按 pidfile 守着。
-# keymint 那个不用它了，见下面的 start_keymint_daemon。
+# 启动一个守护（脚本或 ELF）并按 pidfile 守着。
 start_daemon() {
   script=$1
   pidfile=$2
@@ -124,7 +118,6 @@ ensure_sepolicy() {
 # module-owned paths are matched; the system keymint HAL is never touched.
 kill_all() {
   pkill -9 -f "$BIN_DIR/keymint" 2>/dev/null
-  pkill -9 -f "$BIN_DIR/inject-watchdog" 2>/dev/null
   pkill -9 -f "$BIN_DIR/ommega-inject" 2>/dev/null
   sleep 1
 }
@@ -233,7 +226,7 @@ keep_daemons_alive() {
     pf=${spec#*:}
     if ! daemon_one_alive "$sp" "$pf"; then
       case "$sp" in
-        *daemon-injector|*inject-watchdog) ensure_sepolicy ;;
+        *daemon-injector) ensure_sepolicy ;;
       esac
       start_daemon "$sp" "$pf" && fixed=1
     fi

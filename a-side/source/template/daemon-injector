@@ -511,7 +511,7 @@ tick=0
 FOREGROUND_EVERY=2
 tick_sleep() {
   ticks=$((ticks + 1))
-  # --once：跑完一轮就退出（由 Rust 的 inject-watchdog 在文件变化时叫它）。
+  # --once：跑完一轮就退出（给调试用，正常情况下 service.sh 拉起的是常驻循环）。
   # 放在这里而不是循环末尾，是因为 prepare_injector 失败那条 continue 也会调到这里。
   if [ "${MAX_TICKS:-0}" -gt 0 ] && [ "$ticks" -ge "$MAX_TICKS" ]; then
     release_lock
@@ -551,7 +551,7 @@ lock_owned() { [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; }
 release_lock() { lock_owned && rm -rf "$LOCK_DIR" 2>/dev/null; return 0; }
 
 if [ "${OMMEGA_SKIP_LOCK:-0}" = 1 ]; then
-  # 由 Rust 的 inject-watchdog 持锁，这里只负责跑一轮，不抢锁（否则它会以为自己
+  # 由外层持锁时（`OMMEGA_SKIP_LOCK=1`）这里只负责跑一轮，不抢锁（否则会以为自己
   # 是第二实例直接退出）。
   :
 elif mkdir "$LOCK_DIR" 2>/dev/null; then

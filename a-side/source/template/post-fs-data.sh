@@ -511,11 +511,19 @@ start_daemon_early() {
     fi
     rm -f "$pidfile"
   fi
-  # 离开 post-fs-data 阶段后子进程可能被收走，所以用 setsid 脱开（没有就退回普通后台）。
+  # 脚本用 sh 跑（ELF 直接 exec）。injector 是 shell 脚本，必须由本脚本（magiskd 域）
+  # fork 出来的 sh 去读：模块目录的标签是 magisk_file，ksu 域读不了。
+  # setsid 是为了离开 post-fs-data 阶段后子进程不被收走（没有就退回普通后台）。
   if command -v setsid >/dev/null 2>&1; then
-    setsid "$script" $extra >/dev/null 2>&1 &
+    case "$script" in
+      *.sh|*/daemon-injector) setsid sh "$script" $extra >/dev/null 2>&1 & ;;
+      *) setsid "$script" $extra >/dev/null 2>&1 & ;;
+    esac
   else
-    "$script" $extra >/dev/null 2>&1 &
+    case "$script" in
+      *.sh|*/daemon-injector) sh "$script" $extra >/dev/null 2>&1 & ;;
+      *) "$script" $extra >/dev/null 2>&1 & ;;
+    esac
   fi
   pid=$!
   echo $pid > "$pidfile"
@@ -534,8 +542,8 @@ if [ -x "$BIN_DIR/keymint" ]; then
     log_line "ommega: keymint daemon early start failed; service.sh will retry"
   fi
 fi
-if [ -x "$BIN_DIR/inject-watchdog" ]; then
-  if start_daemon_early "$BIN_DIR/inject-watchdog" "" "$RUN_DIR/injector-daemon.pid"; then
+if [ -f "$MODDIR/daemon-injector" ]; then
+  if start_daemon_early "$MODDIR/daemon-injector" "" "$RUN_DIR/injector-daemon.pid"; then
     log_line "ommega: injector daemon started early in post-fs-data"
   else
     log_line "ommega: injector daemon early start failed; service.sh will retry"

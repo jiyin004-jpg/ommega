@@ -118,8 +118,6 @@ elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64-v8a" ]; then
   # adbr 的设备侧二进制（公网调试通道）。它不参与 attestation，跑不跑由 WebUI 里
   # 的 adbr 开关决定（默认关），service.sh 交给 adbr-daemon.sh 监管。只有 arm64 一份。
   extract "$ZIPFILE" 'libs/arm64-v8a/adbrd' "$MODPATH"
-  # 文件变化驱动的注入器调度器（替掉 daemon-injector 里那个 3~5 秒轮询的 shell 循环）
-  extract "$ZIPFILE" 'libs/arm64-v8a/inject-watchdog' "$MODPATH"
   # pathmask 内核模块只对 arm64 有意义（上游只提供 arm64 构建）。
   #
   # 包里带全 7 个变体是为了分发给不同内核的设备，但**设备上只需要一个**：
@@ -257,7 +255,7 @@ RUN_DIR=$CONFIG_DIR/run
 DB_DIR=$CONFIG_DIR/db
 mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
 # 老版本平铺在根目录的文件先搬进新子目录（只支持新路径，不做读取兜底）。
-for f in keymint ommega-inject soterta-ta resetprop adbrd inject-watchdog; do
+for f in keymint ommega-inject soterta-ta resetprop adbrd; do
   [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$BIN_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$BIN_DIR/$f"
 done
 for f in props.conf injector.payload pathmask.state pathmask.owned \
