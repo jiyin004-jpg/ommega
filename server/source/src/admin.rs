@@ -1586,7 +1586,11 @@ pub struct DefaultDeviceBody {
 
 /// POST /api/admin/default_device/ — 保存「默认设备 id」。
 ///
-/// 落盘到 `data/default_device.json`，重启后仍然生效；写空就是清掉。
+/// **只改内存，不落盘**：这段设置唯一来源是环境变量（README 里那几项），
+/// 重启后回到 `.env` 里的值。以前还有一份 `data/default_device.json`，与
+/// 环境变量两个写入口互相覆盖，排查时分不清用的是哪个——8443 那个实例就因为
+/// 没有那份文件、归一回落到代码默认，把 SOTER 请求派到了一台没有 SOTER 能力的 B。
+/// 要长期生效就改环境变量再重启。
 /// 两条链路互不影响：只传 `keymint_device_id` 时 SOTER 那台一个字都不动。
 pub async fn admin_default_device_set(
     State(state): State<AppState>,

@@ -464,13 +464,21 @@ fn rebuild_material_then_sign(
     challenge: &str,
     original: SoterSession,
 ) -> SoterSession {
-    // 探 HAL 的返回码：0 = 有材料，非 0（-5 / -6）= 缺。探不动（HAL 报错）就当
-    // "不缺"，免得在别的问题上乱改设备状态。
-    let ask_missing = soter.has_ask_already(uid).map(|c| c != 0).unwrap_or(false);
-    let auth_missing = soter
-        .has_auth_key(uid, alias)
-        .map(|c| c != 0)
-        .unwrap_or(false);
+    // 探 HAL 的返回码。只有「这个槽位确实没有」的码才算缺：-5 ASK 没好、
+    // -6 AuthKey 没好、-65528 item not found。
+    //
+    // 别把「非 0」都当缺：-26（这一笔的验证没过，真应用就是指纹那步）、-204（会话
+    // 句柄被顶掉）、-18/-20（TA 坏了）都是「有料，但这次没成」。当它们缺会去
+    // generate_* 把 App 已经和腾讯/支付宝注册过的那把真材料覆盖掉，服务端存档从此
+    // 对不上，而且没有恢复路径。探不动（HAL 报错）同样当「不缺」。
+    let ask_missing = matches!(
+        soter.has_ask_already(uid),
+        Ok(SOTER_ASK_NOT_READY) | Ok(SOTER_ITEM_NOT_FOUND)
+    );
+    let auth_missing = matches!(
+        soter.has_auth_key(uid, alias),
+        Ok(SOTER_AUTH_KEY_NOT_READY) | Ok(SOTER_ITEM_NOT_FOUND)
+    );
     if !ask_missing && !auth_missing {
         log::warn!(
             "soter: init_sign uid={uid} alias={alias} returned {} but the slot has material; \
