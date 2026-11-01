@@ -61,6 +61,8 @@ SERVICE=
 HAL=
 BIN=
 
+# 统一写 daemon.log（见上面 LOG 那行）；纯查询用 QUIET=1 跳过，
+# 不然每 5 秒一条把文件刷满。
 log() {
   mkdir -p "$STATE_DIR/logs" 2>/dev/null
   printf '%s %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
@@ -252,6 +254,10 @@ HIDL_PLATFORM=
 hidl_platform() {
   if [ -z "$HIDL_PLATFORM" ]; then
     if soter_hal_is_hidl; then HIDL_PLATFORM=1; else HIDL_PLATFORM=0; fi
+    # 顺手落盘：daemon-injector 每 5 秒要问一次，读文件比扫 VINTF 便宜。
+    # 任何一次 converge 都会把缓存建起来，不依赖 `hidl` 那一支恰好抢到锁。
+    mkdir -p "${HIDL_CACHE%/*}" 2>/dev/null
+    printf '%s\n' "$HIDL_PLATFORM" > "$HIDL_CACHE" 2>/dev/null
   fi
   [ "$HIDL_PLATFORM" = "1" ]
 }
