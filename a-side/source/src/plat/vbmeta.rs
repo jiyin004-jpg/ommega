@@ -101,11 +101,11 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
 
 /// 出证路径上 key / hash 的短缓存：一次出证要读两个属性，各 fork 一个进程（实测
 /// 单次 22ms）。而 attest 往往是连着来几笔（generateKey 一笔、getKeyEntry 一笔、
-/// 再换算法一笔），2 秒内复用同一份读结果就够了。
+/// 再换算法一笔），3 秒内复用同一份读结果就够了。
 ///
 /// 只缓存**成功**的结果：读失败不缓存，下一次直接重试（不会把一次性的权限问题
 /// 锁死两秒）。
-const ROT_CACHE_TTL: Duration = Duration::from_secs(2);
+const ROT_CACHE_TTL: Duration = Duration::from_secs(3);
 
 fn cached_hex_property(name: &'static str) -> Option<[u8; 32]> {
     type Slot = Mutex<Option<(Instant, [u8; 32])>>;

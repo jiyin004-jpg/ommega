@@ -35,6 +35,7 @@
 //! 实测宿主也是这么回的），这样上层看不出区别。
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Mutex, OnceLock};
 
 use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -1075,24 +1076,86 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
 
 fn bump_counter(state: &State, uid: i32) -> u64 {
     // counter 必须单调递增，而且**重启不能回退**：App 会记着上次看到的值，
-    // 小回去就当成重放，把本地钥匙删了重来。所以落到文件里。
-    let path = format!("/data/misc/ommega/soter_counter.{uid}");
-    let disk = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+    // 小回去就当成重放，把本地钥匙删了重来。
+    //
+    // 所有 App 共用一个文件（每行 `uid=counter`）。以前是 `soter_counter.<uid>`
+    // 平铺在目录根下，装十几个 App 就是一屏垃圾文件。
+    //
+    // 读-改-写放在文件锁里：injector 会同时跑在 keystore 和 SOTER 宿主几个进程里，
+    // 不加锁会互相覆盖。即使真丢了也还能靠 `now_secs()` 兜底，确保不会回退。
+    const PATH: &str = "/data/misc/ommega/soter_counter";
+
     let mem = state
         .counters
         .lock()
         .ok()
         .and_then(|map| map.get(&uid).copied())
         .unwrap_or(0);
-    let next = disk.max(mem).max(COUNTER_BASE).max(now_secs()) + 1;
+
+    let next = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PATH)
+    {
+        Ok(mut file) => {
+            let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
+            let mut text = String::new();
+            let _ = file.read_to_string(&mut text);
+            let next = counter_for(&text, uid)
+                .unwrap_or(0)
+                .max(mem)
+                .max(COUNTER_BASE)
+                .max(now_secs())
+                + 1;
+            let updated = set_counter(&text, uid, next);
+            let _ = file.set_len(0);
+            let _ = file.seek(SeekFrom::Start(0));
+            let _ = file.write_all(updated.as_bytes());
+            next
+        }
+        // 开不了文件（权限异常）：只能拿内存里的值兜一下，至少不回退到比本进程见过的更小。
+        Err(_) => mem.max(COUNTER_BASE).max(now_secs()) + 1,
+    };
+
     if let Ok(mut map) = state.counters.lock() {
         map.insert(uid, next);
     }
-    let _ = std::fs::write(&path, format!("{next}\n"));
     next
+}
+
+/// 从 `uid=counter` 行里取某个 uid 的计数。
+fn counter_for(text: &str, uid: i32) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim().parse::<i32>().ok()? != uid {
+            return None;
+        }
+        value.trim().parse::<u64>().ok()
+    })
+}
+
+/// 把某个 uid 的计数写回去（已有就替换、没有就追加），其它行原样保留。
+fn set_counter(text: &str, uid: i32, value: u64) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut replaced = false;
+    for line in text.lines() {
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().parse::<i32>().ok() == Some(uid) {
+            out.push_str(&format!("{uid}={value}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&format!("{uid}={value}\n"));
+    }
+    out
 }
 
 /// 包 SOTER 的信封：`[i32 le JSON 长度][JSON][签名]`。三处回信封的地方都走它，
@@ -1669,5 +1732,30 @@ mod tests {
         assert!(state().is_some());
         let origin = ask_origin().expect("state() 初始化时写下了来源");
         assert!(!origin.is_empty());
+    }
+
+    #[test]
+    fn counter_file_keeps_every_uid_on_its_own_line() {
+        let text = "10491=100\n10494=200\n";
+        assert_eq!(counter_for(text, 10491), Some(100));
+        assert_eq!(counter_for(text, 10494), Some(200));
+        assert_eq!(counter_for(text, 99999), None);
+
+        // 已有 uid：只改那一行，别的行原样保留
+        let updated = set_counter(text, 10494, 300);
+        assert_eq!(updated, "10491=100\n10494=300\n");
+
+        // 新 uid：追加到末尾
+        let appended = set_counter(text, 55555, 7);
+        assert_eq!(appended, "10491=100\n10494=200\n55555=7\n");
+    }
+
+    #[test]
+    fn counter_file_ignores_junk_lines() {
+        let text = "# 注释\nbroken\n10491=42\n\n";
+        assert_eq!(counter_for(text, 10491), Some(42));
+        // 垃圾行会被丢掉，但有效行仍然是有效的
+        let updated = set_counter(text, 10491, 43);
+        assert_eq!(counter_for(&updated, 10491), Some(43));
     }
 }
