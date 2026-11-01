@@ -14,3 +14,7 @@
 - Fixed clearing a custom ATTK not actually returning to the built-in one: only the file was removed, the old key stayed in memory.
 - Fixed the server address and token saved from the panel never applying: the config was written where the program does not read it.
 - Fixed the app side never receiving the certificate chain after attestation.
+- Fixed apps keeping the old enrollment state after the attestation key was swapped, which forced repeated fingerprint prompts before enrollment worked again.
+- Fixed occasional key generation failures on some devices killing the keystore process.
+- Fixed the background process staying alive after the module was uninstalled and injecting again.
+- Fixed keys being reclaimed on every boot on some devices, forcing apps to create a new key.
