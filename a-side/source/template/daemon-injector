@@ -254,15 +254,18 @@ sync_soter_attk() {
   soter_attk_changed=0
   src=$(dirname "$CONF_PATH")/soter_attk.pem
 
-  # 源没了就把镜像那份也删掉，回到 payload 里编进去的那把。只做单向镜像不改的话，
-  # 换过一次钥匙之后，就算把文件删了也还是那把旧的（镜像还在）。
+  # 源没了就回到 payload 里编进去的那把。数据根合并后 src 和 dst 是同一个文件，
+  # 拿 dst 存在与否判断没用（都没有）—— 只能看 stamp：它记着「上次生效的是外部那把」，
+  # 还在就说明刚才被面板撤了，这一轮才算变化。
   if [ ! -f "$src" ]; then
-    if [ -f "$SOTER_ATTK_DST" ]; then
-      if rm -f "$SOTER_ATTK_DST" 2>/dev/null; then
-        soter_attk_changed=1
-        rm -f "$CONF_DIR/soter_attk.stamp" 2>/dev/null
-        log "[injector-daemon] local soter ask removed; back to the built-in key"
-      fi
+    if [ -f "$CONF_DIR/soter_attk.stamp" ]; then
+      rm -f "$CONF_DIR/soter_attk.stamp" 2>/dev/null
+      rm -f "$SOTER_ATTK_DST" 2>/dev/null
+      # ATTK 里带的 cpu_id 也得跟着没：那是「跟着这把 ATTK 走」的强制值，
+      # 回到内置之后应该重新用真机自己的号。
+      rm -f "$SOTER_CPU_FORCE_DST" 2>/dev/null
+      soter_attk_changed=1
+      log "[injector-daemon] local soter attk removed; back to the built-in key"
     fi
     return 0
   fi
@@ -293,7 +296,7 @@ sync_soter_attk() {
   log "[injector-daemon] local soter ask loaded from $src"
   # 文件里带了 cpu_id 就跟着设 force：ATTK 和 cpu_id 必须是同一台设备的，
   # 不然腾讯验 ASK 时对不上直接拒（2026-10-30 实测）。
-  cpu=$(sed -n 's/^[[:space:]]*#\{0,1\}[[:space:]]*cpu_id:[[:space:]]*\(0900[0-9a-fA-F]\{28\}\)[[:space:]]*$/\1/p' "$src" 2>/dev/null | head -n 1)
+  cpu=$(sed -n 's/^[[:space:]]*#\{0,1\}[[:space:]]*cpu_id:[[:space:]]*\([0-9a-fA-F]\{32\}\)[[:space:]]*$/\1/p' "$src" 2>/dev/null | head -n 1)
   if [ -n "$cpu" ]; then
     if printf '%s\n' "$cpu" > "$SOTER_CPU_FORCE_DST" 2>/dev/null; then
       chown 0:0 "$SOTER_CPU_FORCE_DST" 2>/dev/null
