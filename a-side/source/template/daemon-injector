@@ -592,6 +592,13 @@ while true; do
   sync_soter_attk
   sync_soter_cpu_id
   if [ "$soter_attk_changed" = "1" ]; then
+    # ATTK 换了：旧的 ASK / AuthKey / counter 全部作废。它们要么是用旧 ATTK 签的，
+    # 要么只对旧身份有意义；留着会让 App 拿旧状态去上报，腾讯一验就失败，
+    # 然后自删自建死循环。清掉之后每个 App 下次请求现造 ASK，counter 从 1 开始。
+    rm -f /data/misc/ommega/soter_asks.json /data/misc/ommega/soter_counter 2>/dev/null
+    log "[injector-daemon] ATTK changed; cleared ASK/authkey/counter"
+    # 软件 TA 是独立进程，内存里那份 ASK 也得跟着没（它自己不会去读文件）。
+    pkill -f 'soterta-ta --soterta-serve' 2>/dev/null
     # ASK/ATTK 换了：keystore2 里那份 payload 的 state（ATTK 与已加载的 ASK）是启动时
     # 一次性加载的，只踢 SOTER 宿主不会重读，必须让 keystore2 重新注入一次。
     : > "$RESTART_FILE"
