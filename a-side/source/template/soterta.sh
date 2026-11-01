@@ -353,7 +353,9 @@ start_daemon() {
   done
   log "starting software SOTER TA: $BIN (service=$SERVICE)"
   # 服务名和描述符只能运行时定（各家接口名不一样），由脚本从 VINTF 读出来传进去。
-  OMMEGA_SOTER_SERVICE="$SERVICE" "$BIN" --soterta-serve >>"$LOG" 2>&1 &
+  # `9>&-` 不能省：顶上那个 flock 挂在 fd 9 上，这个 fd 如果被 TA 继承，锁就永远
+  # 不会释放 —— 之后每次 `flock -n 9` 都失败，脚本静默 exit 0，接管/释放/巡检全停。
+  OMMEGA_SOTER_SERVICE="$SERVICE" "$BIN" --soterta-serve >>"$LOG" 2>&1 9>&- &
   pid=$!
   echo "$pid" > "$PIDFILE.tmp" 2>/dev/null
   mv -f "$PIDFILE.tmp" "$PIDFILE" 2>/dev/null

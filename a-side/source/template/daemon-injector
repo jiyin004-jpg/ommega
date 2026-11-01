@@ -633,6 +633,21 @@ while true; do
   # 它们调的是 `vendor.qti.hardware.soter@1.0::ISoter`，跟宿主那条 AIDL 路不是一套，
   # 不注进去，工程模式那页的 SOTER 项就一直吃原厂 TA 的 -20。injector 自己是幂等的
   # （已经注过的目标会直接跳过），所以每 60 秒点一次就够，不用在这里做发现。
+  # 宿主「收得到 App 调用、却一笔都不往 HAL 发」时没人救：payload 判定完写这个标记，
+  # 这里读到就换实例——只有换实例能把它拽回来。读完即删，免得每拍都踢。
+  if [ -f "$SOTER_STUCK_FILE" ]; then
+    rm -f "$SOTER_STUCK_FILE" 2>/dev/null
+    log "[injector-daemon] soter host reported stuck; restarting it"
+    restart_soter_host "it stopped forwarding to the HAL"
+  fi
+
+  # 宿主是 bind-only：没人喊就没人起。开了接管但宿主还没起来的，替客户端先喊一声；
+  # 只试一次，不成就靠下一拍的巡检报出来，不在这里循环重试。
+  if soter_inject_enabled && [ "$soter_start_attempted" = "0" ] && [ -z "$(soter_pid)" ]; then
+    soter_start_attempted=1
+    start_soter_service
+  fi
+
   if soter_inject_enabled; then
     now_hidl=$(date +%s 2>/dev/null || echo 0)
     if [ "$now_hidl" -gt 0 ] && [ $((now_hidl - last_soter_hidl_at)) -ge 60 ]; then

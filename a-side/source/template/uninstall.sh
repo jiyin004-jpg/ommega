@@ -25,12 +25,25 @@ KS_DIR=/data/misc/keystore/ommega
 # ---------------------------------------------------------------------------
 pkill -9 -f "$MODDIR/libs/.*/keymint" 2>/dev/null
 pkill -9 -f "$MODDIR/libs/.*/ommega-inject" 2>/dev/null
+# 壳脚本守护（cmdline 里没有 libs/，上两条抓不到）：daemon-injector 每拍都会把载荷
+# 重新写回 keystore2，不杀它的话卸完之后仍然在注入。
+pkill -9 -f "$MODDIR/daemon-injector" 2>/dev/null
+pkill -9 -f "$MODDIR/soterta.sh" 2>/dev/null
+pkill -9 -f "$MODDIR/kmod-loader.sh" 2>/dev/null
+pkill -9 -x soterta-ta 2>/dev/null
 
 # adbr 公网调试通道：先停监管循环（那个进程是 sh 在跑我们的 adbr-daemon.sh，按路径认），
 # 再按进程名停 adbrd 本身（-x 是 comm 精确匹配，不会误伤监管脚本）。
 # 顺序不能反：先杀 adbrd 的话监管循环两秒后又把它拉起来。
 pkill -9 -f 'modules/ommega/adbr-daemon.sh' 2>/dev/null
-pkill -9 -x adbrd 2>/dev/null
+# `-x adbrd` 杀不到：二进制会改自己 comm，实测是 `adbrd-v0.1.0-an`（15 字符截断），
+# adbr-daemon.sh 认进程用的也是 comm 前缀。这里同样按 comm 前缀来。
+for d in /proc/[0-9]*; do
+  [ -r "$d/comm" ] || continue
+  case "$(cat "$d/comm" 2>/dev/null)" in
+    adbrd*) kill -9 "${d#/proc/}" 2>/dev/null ;;
+  esac
+done
 rm -rf "$RUN_DIR/adbr-daemon.lock"
 sleep 1
 
