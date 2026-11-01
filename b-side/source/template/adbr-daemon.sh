@@ -2,7 +2,6 @@
 
 # adbrd 监管脚本 —— A / B 两端共用同一份，用参数选读哪份配置：
 #
-#   sh adbr-daemon.sh --a   A 端：/data/misc/ommega/config 里的 `adbr:`
 #   sh adbr-daemon.sh --b   B 端：/data/adb/ommega-b/conf/relay.conf 里的 OMMEGA_RELAY_ABDR_ENABLED
 #
 # 设备被公网远控这件事必须由用户显式点头，所以这里只认配置里的开关，不开就不跑：
@@ -16,38 +15,25 @@
 #
 # 二进制只有 arm64 一份（见仓库 vendor/adbrd/README.md），别的架构直接退出。
 
-MODE=""
+# 这份只服务 B 端（A 端模块里另有一份带 --a/--b 的）。B 端 service.sh 用 --b 拉它，
+# 别的参数一律当调用错误：名字认错就会在旁边再起一条，同一台设备在服务端成两条通道。
 case "$1" in
-  --a|a) MODE=a ;;
-  --b|b) MODE=b ;;
-  *) echo "[adbr] 用法: sh adbr-daemon.sh --a|--b" >&2; exit 2 ;;
+  --b|b|"") ;;
+  *) echo "[adbr] 用法: sh adbr-daemon.sh --b" >&2; exit 2 ;;
 esac
 
 MODDIR=${0%/*}
-# B 端有自己的一套目录（/data/adb/ommega-b），A/B 装在同一台机器上也不会打架
-case "$MODE" in
-  a) STATE_DIR=/data/adb/ommega ;;
-  b) STATE_DIR=/data/adb/ommega-b ;;
-esac
+STATE_DIR=/data/adb/ommega-b
 BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-# A 端日志统一到 /data/misc/ommega/logs/daemon.log；B 端还是自己的目录。
-if [ "$MODE" = "a" ]; then
-  LOG=/data/misc/ommega/logs/daemon.log
-else
-  LOG="$STATE_DIR/logs/adbr.log"
-fi
+LOG="$STATE_DIR/logs/adbr.log"
 mkdir -p "${LOG%/*}" 2>/dev/null
 LOCK_DIR="$RUN_DIR/adbr-daemon.lock"
 
-if [ "$MODE" = "a" ]; then
-  CONF=/data/misc/ommega/config
-else
-  CONF="$CONF_DIR/relay.conf"
-fi
+CONF="$CONF_DIR/relay.conf"
 
 mkdir -p "$STATE_DIR/logs"
 
@@ -102,11 +88,7 @@ truthy() {
 
 # 配置里的开关。没写这个键 = 关（adbr 是额外开的口子，绝不能不写就自己开）。
 switch_on() {
-  if [ "$MODE" = "a" ]; then
-    value=$(sed -n 's/^[[:space:]]*adbr[[:space:]]*:[[:space:]]*//p' "$CONF" 2>/dev/null | head -n 1)
-  else
-    value=$(sed -n 's/^OMMEGA_RELAY_ABDR_ENABLED=//p' "$CONF" 2>/dev/null | tail -n 1)
-  fi
+  value=$(sed -n 's/^OMMEGA_RELAY_ABDR_ENABLED=//p' "$CONF" 2>/dev/null | tail -n 1)
   truthy "$value"
 }
 
