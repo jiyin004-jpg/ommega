@@ -67,6 +67,10 @@ release_lock() { lock_owned && rm -rf "$LOCK_DIR" 2>/dev/null; return 0; }
 
 if mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "$$" > "$LOCK_DIR/pid"
+  # 快路径也要复核：从 mkdir 成功到写 pid 之间，竞争方读到空 holder 会把锁目录
+  # 整个 rm 掉再建自己那份，不核一次就会两个监管循环并存。
+  sleep 1
+  lock_owned || exit 0
 else
   if holder_is_us "$(cat "$LOCK_DIR/pid" 2>/dev/null)" "$0"; then
     exit 0

@@ -321,15 +321,24 @@ fn take_restart_request() -> bool {
 // 身份同步
 // ---------------------------------------------------------------------------
 
-fn set_prop(name: &str, value: &str) {
+fn set_prop(name: &str, value: &str) -> bool {
     if name.is_empty() || value.is_empty() {
-        return;
+        return true;
     }
     // 值一样就不写（这个函数每 10 秒跑一次，不幂等会一直在改属性）。
     if resetprop::read_string_property(name).as_deref() == Some(value) {
-        return;
+        return true;
     }
-    let _ = resetprop::direct_write_and_verify_property(name, value);
+    match resetprop::direct_write_and_verify_property(name, value) {
+        Ok(()) => true,
+        Err(error) => {
+            // 写失败必须让调用方知道：否则会把"没写成"记成"已应用"，之后每拍都
+            // 因为"这个值已经在 applied 里"而跳过，整轮开机就停在旧值上，而且日志
+            // 里一点痕迹都没有。
+            log(&format!("failed to set {name}={value}: {error:#}"));
+            false
+        }
+    }
 }
 
 /// 把链里声明的身份对齐到本机属性。
@@ -393,7 +402,10 @@ fn sync_remote_identity() {
             continue;
         }
         if let Some(prop) = identity_prop(key) {
-            set_prop(prop, value);
+            // 没写进去就别记账，下一拍还要再试。
+            if !set_prop(prop, value) {
+                continue;
+            }
         }
         applied.retain(|(k, _)| k != key);
         applied.push((key.to_string(), value.to_string()));

@@ -207,9 +207,18 @@ load_pathmask() {
 }
 
 mask_path_visible_again() {
-  rm -f "$OWNED_FILE" 2>/dev/null
-  pathmask_loaded || return 0
-  unload_pathmask && write_state "healthy-unmasked" "soter binder service reachable"
+  if ! pathmask_loaded; then
+    rm -f "$OWNED_FILE" 2>/dev/null
+    return 0
+  fi
+  # 标记必须卸成功之后再删：先删的话，rmmod 一旦失败（模块还被引用）标记就没了，
+  # 之后既不会再接管（看到 loaded 无标记就当别人的），关开关时也不会去卸。
+  if unload_pathmask; then
+    rm -f "$OWNED_FILE" 2>/dev/null
+    write_state "healthy-unmasked" "soter binder service reachable"
+  else
+    write_state "failed-rmmod-healthy" "mask still loaded"
+  fi
 }
 
 main() {

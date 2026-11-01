@@ -1748,7 +1748,16 @@ impl KeystoreDB {
                             && km_uuid.is_keybox_bound()
                             && prefix.as_slice() == km_uuid.get_digest() =>
                     {
-                        !km_uuid.is_bound_to_keybox_digest(current_identity_digest)
+                        // 每个 key 绑的是它自己那个级别的 keybox：StrongBox 的 uuid 用
+                        // StrongBox 那份的摘要（`Uuid::from` 里就这么取的）。拿 TEE 的摘要去
+                        // 比，所有 StrongBox key 都会被判成过期删掉。
+                        let digest = match km_uuid.to_security_level() {
+                            Some(SecurityLevel::STRONGBOX) => {
+                                crate::keybox::current_identity_digest_for(true)
+                            }
+                            _ => current_identity_digest,
+                        };
+                        !km_uuid.is_bound_to_keybox_digest(digest)
                     }
                     Value::Blob(prefix) => {
                         log::warn!(
