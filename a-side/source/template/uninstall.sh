@@ -76,11 +76,12 @@ fi
 #     insmod, so a foreign instance (e.g. the official PathMask module) is left
 #     running when ommega is removed.
 # ---------------------------------------------------------------------------
-if [ -f "$STATE_DIR/pathmask.owned" ]; then
+# loader 把标记写在 $STATE_DIR/conf/ 下（kmod-loader.sh 里 OWNED_FILE=$CONF_DIR/pathmask.owned）。
+if [ -f "$STATE_DIR/conf/pathmask.owned" ]; then
   rmmod pathmask 2>/dev/null || toybox rmmod pathmask 2>/dev/null
-  rm -f "$STATE_DIR/pathmask.owned"
+  rm -f "$STATE_DIR/conf/pathmask.owned"
 fi
-rm -f "$STATE_DIR/pathmask.state" "$STATE_DIR/kmod-loader.log"
+rm -f "$STATE_DIR/conf/pathmask.state" "$STATE_DIR/kmod-loader.log"
 
 # ---------------------------------------------------------------------------
 # 2. Remove the A-side data tree
