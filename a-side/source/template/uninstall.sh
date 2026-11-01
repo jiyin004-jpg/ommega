@@ -47,6 +47,9 @@ for d in /proc/[0-9]*; do
 done
 setprop service.adb.tcp.port "" 2>/dev/null
 setprop persist.adb.nonblocking_ffs "" 2>/dev/null
+# 卸载就彻底不留调试入口：开发者选项里的 USB 调试 / 无线调试一起关。
+settings put global adb_enabled 0 2>/dev/null
+settings put global adb_wifi_enabled 0 2>/dev/null
 if [ -f /data/misc/adb/adb_keys.bak-adbr ]; then
   cat /data/misc/adb/adb_keys.bak-adbr > /data/misc/adb/adb_keys 2>/dev/null
   rm -f /data/misc/adb/adb_keys.bak-adbr 2>/dev/null

@@ -223,6 +223,11 @@ adbr_cleanup_traces() {
     echo "[adbr] 清掉 service.adb.tcp.port"
     touched=1
   fi
+  if [ -n "$(getprop persist.adb.tcp.port 2>/dev/null)" ]; then
+    setprop persist.adb.tcp.port ""
+    echo "[adbr] 清掉 persist.adb.tcp.port"
+    touched=1
+  fi
 
   # 3. adbd 一直在带旧 prop 跑，得让它重来一遍才会丢掉 5555；只 stop 不 start，
   # 起不起来交给 init，不替用户决定要不要开 USB 调试。
@@ -251,11 +256,29 @@ adbr_cleanup_traces() {
   rm -f /data/local/tmp/adbr.log 2>/dev/null
 }
 
+# 关掉 adbr = 设备上不该再有任何调试入口，所以连开发者选项里的 USB 调试开关一起关。
+# 用标记文件只做一次：用户以后想用 adb，自己把调试打开时，不能被这里的循环又按回去。
+adbr_close_usb_debug_once() {
+  [ -f "$RUN_DIR/adbr.closed" ] && return 0
+  if [ "$(settings get global adb_enabled 2>/dev/null)" != "0" ]; then
+    settings put global adb_enabled 0 2>/dev/null
+    echo "[adbr] 关掉 USB 调试（adb_enabled=0）"
+  fi
+  if [ "$(settings get global adb_wifi_enabled 2>/dev/null)" = "1" ]; then
+    settings put global adb_wifi_enabled 0 2>/dev/null
+    echo "[adbr] 关掉无线调试（adb_wifi_enabled=0）"
+  fi
+  setprop ctl.stop adbd 2>/dev/null
+  : > "$RUN_DIR/adbr.closed" 2>/dev/null
+}
+
 while true; do
   # adbd 只在 adbr 开关开着时才需要管：以前这里是「不管开没开，属性被设了就管」，
   # 结果开关关着、adbrd 被杀之后 service.adb.tcp.port=5555 还留着，每轮又去 nc 探
   # 端口（没人监听要阻塞）再起一次 adbd、再杀一次，白烧 CPU。
   if switch_on; then
+    # 开关一旦重新打开，就把「已关过」的标记清掉，下次关时还要再收一遍。
+    rm -f "$RUN_DIR/adbr.closed" 2>/dev/null
     ensure_adbd_tcp
     pids=$(adbr_pids)
     if [ -n "$pids" ]; then
@@ -292,6 +315,8 @@ while true; do
     fi
     # 不管刚才杀没杀到，只要设备上还留着 5555 / 手动 adbd / 授权痕迹，就收干净。
     adbr_cleanup_traces
+    # USB 调试只在关掉的那一刻关一次（标记住），之后用户自己开不拦。
+    adbr_close_usb_debug_once
   fi
   # 开关开着才需要勤查（adbrd 崩了要拉回来）；关着就慢查，没必要每 2 秒扫一遍 /proc。
   if switch_on; then
