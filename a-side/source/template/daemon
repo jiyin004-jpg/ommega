@@ -232,7 +232,14 @@ sync_remote_identity() {
   # `ro.boot.vbmeta.digest`。而现在链是服务端 keybox 造的，B 根本不参与，服务端
   # 用的就是 A 上报的哈希 —— A 把 prop 改成 B 的，证书和属性立刻对不上，
   # Duck 的 Boot consistency 一比就是 mismatch。
-  for key in brand device product manufacturer model serial; do
+  # 只同步机型/品牌/序列号这几项 + 哈希；boot 补丁在下面单独处理。
+  #
+  # 来源是 `remote_identity`：TA 每次收到**链**（服务端 keybox 或真机 B 都算）
+  # 都把链里的 RootOfTrust 写进去。所以：
+  #   - 服务端 keybox：链里的哈希就是本机属性（A 上报的那份）→ 值相同，不写；
+  #   - 真机 B：链里是 B 的说法 → 同步一次，下次检查就一致了；
+  #   - 本地模式：文件不更新，压根不会走到这里。
+  for key in brand device product manufacturer model serial vbmeta_digest; do
     new=$(sed -n "s/^$key=//p" "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
     [ -n "$new" ] || continue
     old=$(sed -n "s/^$key=//p" "$REMOTE_IDENTITY_APPLIED" 2>/dev/null | head -n1)
@@ -251,6 +258,27 @@ sync_remote_identity() {
       device) device_changed=1 ;;
     esac
   done
+  # boot 补丁日期：`boot_patchlevel` 是链里的 YYYYMMDD（tag 708），跟面板那套
+  # 属性对齐（三家厂商/ AProbe 的写法 + 面板用的 epoch）。幂等：值一样就不写。
+  ri_boot=$(sed -n 's/^boot_patchlevel=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
+  case "$ri_boot" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+      b_y=${ri_boot%????}
+      b_rest=${ri_boot#????}
+      b_m=${b_rest%??}
+      b_d=${b_rest#??}
+      b_text="$b_y-$b_m-$b_d"
+      for b_prop in ro.vendor.boot_security_patch ro.boot.build.security_patch \
+                    ro.boot.image.build.security_patch; do
+        [ "$(getprop "$b_prop" 2>/dev/null)" = "$b_text" ] || resetprop_set "$b_prop" "$b_text"
+      done
+      b_epoch=$(date -u -d "$b_text" +%s 2>/dev/null)
+      if [ -n "$b_epoch" ]; then
+        [ "$(getprop ro.bootimage.build.date.utc 2>/dev/null)" = "$b_epoch" ] || \
+          resetprop_set ro.bootimage.build.date.utc "$b_epoch"
+      fi
+      ;;
+  esac
   # boot 锁定 / 验证状态：一律落成「已锁定 + 已验证」。
   #
   # 证书那边是固定这么声明的（见 remote.rs 的 RootOfTrust：device_locked=true、
