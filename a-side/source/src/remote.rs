@@ -1059,7 +1059,7 @@ impl RemoteRelay {
             Err(_) => None,
         }
         .or_else(|| {
-            crate::plat::resetprop::read_string_property("ro.build.version.security_patch")
+            patch_property("OMMEGA_PATCH_SECURITY", "ro.build.version.security_patch")
                 .as_deref()
                 .and_then(patch_level_to_yyyymm)
         });
@@ -1075,7 +1075,7 @@ impl RemoteRelay {
         // 718 / 719 是 YYYYMMDD（带日），别再过 patch_level_to_yyyymm —— 那会把
         // 2026-08-01 截成 202608，A 本地出的链和走远程的链就对不上。
         let vendor_patch_level =
-            crate::plat::resetprop::read_string_property("ro.vendor.build.security_patch")
+            patch_property("OMMEGA_PATCH_VENDOR", "ro.vendor.build.security_patch")
                 .as_deref()
                 .and_then(patch_level_to_yyyymmdd)
                 .or_else(|| match config::config().read() {
@@ -1182,6 +1182,22 @@ impl RemoteRelay {
 
 fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// 读一个属性，但**优先用 daemon 启动时传进来的环境变量**。
+///
+/// 为什么：keymint 自己读属性不可靠 —— `rsproperties` 在静态进程里拿不到属性区，
+/// 失败后要 exec 一次 resetprop 兜底，那可是 fork。daemon 是 shell 域，开机时
+/// `getprop` 读一次就够了：这几个属性运行期几乎不变（只有刷机 / 改伪装参数才变，
+/// 而那时 keymint 会被 daemon 重启）。于是正常路径**一次 fork 都没有**。
+///
+/// 环境变量没传（手动启动、旧 daemon）就退回真实读属性。
+fn patch_property(env: &str, prop: &str) -> Option<String> {
+    std::env::var(env)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::plat::resetprop::read_string_property(prop))
 }
 
 /// Convert a "YYYY-MM-DD" patch level string to the YYYYMM integer the relay

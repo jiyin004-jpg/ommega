@@ -54,17 +54,25 @@ impl PhoneIdentifierKind {
     }
 }
 
+/// 只用模块自己带的那两份，**不信任管理器提供的 resetprop**。
+///
+/// 以前这里还列了 `/system_ext/bin/resetprop`、`/data/adb/ksu/bin/resetprop`、
+/// `/data/adb/ksud` 做兼底。问题是那几份的行为不统一（有的会改属性区直接写、
+/// 有的只发 socket），读出来的值到底反映的是哪个时刻说不清。证书里的值必须和
+/// 检测器 `getprop` 看到的完全一致，所以只认我们自己编译的那份。
+///
+/// 两个路径都列上：`bin/` 是 `layout.sh` 搬过去的运行位置，`libs/<abi>/` 是安装
+/// 包里那份（还没搬、或者被手动清掉时也能跑）。
 const RESETPROP_FALLBACKS: &[(&str, Option<&str>)] = &[
-    // 管理器提供的那几个，只当兼底。
-    ("/system_ext/bin/resetprop", None),
-    ("/system/bin/resetprop", None),
-    ("/data/adb/ksu/bin/resetprop", None),
-    ("/data/adb/ksud", Some("resetprop")),
+    ("/data/adb/ommega/bin/resetprop", None),
+    ("/data/adb/modules/ommega/libs/arm64-v8a/resetprop", None),
+    ("/data/adb/modules/ommega/libs/armeabi-v7a/resetprop", None),
+    ("/data/adb/modules/ommega/libs/x86_64/resetprop", None),
+    ("/data/adb/modules/ommega/libs/x86/resetprop", None),
 ];
 
 /// 模块自己带的那份（实现是 vendor/ 里的 resetprop-rs，安装时
-/// customize.sh 把与设备 ABI 匹配的那份拷到这里）。它排在最前面：管理器的
-/// resetprop 不是每家都有、行为也不一致，不再依赖它们。
+/// customize.sh 把与设备 ABI 匹配的那份拷进 libs/，`layout.sh` 再搬到 bin/）。
 const RESETPROP_BUNDLED: &str = "/data/adb/ommega/bin/resetprop";
 
 #[derive(Clone)]
@@ -247,10 +255,14 @@ fn read_property_via_resetprop(name: &str) -> Option<String> {
 
 /// 所有可用的 resetprop，按优先级排。
 ///
-/// **自己的那份排最前**（管理器的不是每家都有、行为也不一致），但不能只认它：
-/// 调用方可能是 keystore 里的那个 forked helper，而 keystore 域未必有权限 exec
-/// /data/adb 下的文件（域的转换归 SELinux 管，`sepolicy.rule` 里只给 keystore
-/// 放开了 `system_file`）。所以调用方拿到的是个**列表**：第一个 exec 不通就顺着往下试。
+/// 只列模块自己带的（`bin/` 和 `libs/<abi>/` 两个位置都试），**不搜 PATH**：
+/// PATH 里命中的是管理器那份，行为跟我们的实现不一致，证书里的值必须来自
+/// 和检测器同一个真相源。
+///
+/// 为什么是个列表而不直接写死一个路径：调用方可能是 keystore 里的 forked helper，
+/// 而 keystore 域未必有权限 exec `/data/adb` 下的文件（域的转换归 SELinux 管，
+/// `sepolicy.rule` 里只给 keystore 放开了 `system_file`）—— 这时第一个 exec 不通，
+/// 会顺着往下试。
 pub fn resetprop_candidates() -> Vec<ResetpropCommand> {
     let mut out = Vec::new();
 
@@ -261,19 +273,10 @@ pub fn resetprop_candidates() -> Vec<ResetpropCommand> {
         });
     }
 
-    if let Some(program) = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join("resetprop"))
-            .find(|candidate| candidate.exists())
-            .map(|candidate| candidate.to_string_lossy().into_owned())
-    }) {
-        out.push(ResetpropCommand {
-            program,
-            prepend_arg: None,
-        });
-    }
-
     for (program, prepend_arg) in RESETPROP_FALLBACKS {
+        if *program == RESETPROP_BUNDLED {
+            continue;
+        }
         if Path::new(program).exists() {
             out.push(ResetpropCommand {
                 program: program.to_string(),

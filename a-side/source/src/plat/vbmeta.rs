@@ -97,19 +97,18 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
     parse_hex_32(raw.trim()).ok()
 }
 
-/// 当前 RootOfTrust：key / hash 取**当刻属性**，锁定与验证状态固定为「已锁定 + 已验证」。
+/// 当前 RootOfTrust：key / hash 读**当刻属性**，锁定与验证状态固定「已锁定 + 已验证」。
 ///
-/// 等级策略是固定的：对外一律声明锁定、已验证，不跟设备真实状态走。只有 key / hash
-/// 需要跟设备对齐 —— 它们从属性实时读（daemon 传进来的环境变量优先），所以证书和
-/// `getprop` 看到的永远是同一个值。
-///
-/// 以前这套值来自 `[trust]` 配置里的一份开机快照，属性一变两边就分叉。
+/// 顺序：实时读属性 → daemon 启动时读好的环境变量（兜底）→ 全零。
+/// **不能反过来**：env 是开机快照，运行中 daemon 会把 B 的属性同步过来（physical
+/// 模式），快照就是旧的 —— 证书和 `getprop` 一对就是 mismatch。代价是每笔出证
+/// 两次 exec（`resetprop` 读属性），相比出证本身的网络开销可以忽略。
 pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
-    let key = boot_key_from_env()
-        .or_else(|| read_hex_property(VBMETA_KEY_PROP))
+    let key = read_hex_property(VBMETA_KEY_PROP)
+        .or_else(boot_key_from_env)
         .unwrap_or([0u8; 32]);
-    let hash = boot_hash_from_env()
-        .or_else(|| read_hex_property(VBMETA_HASH_PROP))
+    let hash = read_hex_property(VBMETA_HASH_PROP)
+        .or_else(boot_hash_from_env)
         .unwrap_or([0u8; 32]);
     (key, hash, true, 0)
 }

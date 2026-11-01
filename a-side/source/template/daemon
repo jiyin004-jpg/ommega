@@ -333,15 +333,21 @@ while true; do
   pkill -9 -f "$TARGET" 2>/dev/null
   sleep 1
 
-  # 启动 keymint 前把两个 boot 属性读好，用环境变量传进去。
+  # 启动 keymint 前把出证要用的几个属性读好，用环境变量传进去。
   #
-  # keymint 自己读属性在这个进程里不可靠（`rsproperties` 读取失败时不报错，静默退回
-  # “原机分区算出来的值”）：结果就是证书里的 verifiedBootHash 跟 `getprop
-  # ro.boot.vbmeta.digest` 对不上。daemon 是 shell 域，getprop 拿到的就是检测器看到的
-  # 那一份，所以在这里读一次，让 keymint 直接用。
+  # 两个理由：
+  #   1) keymint 自己读属性不可靠（`rsproperties` 在静态进程里拿不到属性区，
+  #      失败后要 exec 一次 resetprop 兜底 —— 那就是 fork）；
+  #   2) daemon 是 shell 域，`getprop` 拿到的一定是检测器也能看到的那一份。
+  #
+  # 这几个值运行期几乎不变（刷机 / 改伪装参数才变），而那时 keymint 会被本脚本
+  # 重启，重新读一遍就对了。所以正常出证路径一次 fork 都没有。
   OMMEGA_BOOT_HASH=$(getprop ro.boot.vbmeta.digest 2>/dev/null)
   OMMEGA_BOOT_KEY=$(getprop ro.boot.vbmeta.public_key_digest 2>/dev/null)
-  export OMMEGA_BOOT_HASH OMMEGA_BOOT_KEY
+  OMMEGA_PATCH_SECURITY=$(getprop ro.build.version.security_patch 2>/dev/null)
+  OMMEGA_PATCH_VENDOR=$(getprop ro.vendor.build.security_patch 2>/dev/null)
+  OMMEGA_PATCH_BOOT=$(getprop ro.boot.build.security_patch 2>/dev/null)
+  export OMMEGA_BOOT_HASH OMMEGA_BOOT_KEY OMMEGA_PATCH_SECURITY OMMEGA_PATCH_VENDOR OMMEGA_PATCH_BOOT
 
   "$TARGET" "$@" &
   child_pid=$!
