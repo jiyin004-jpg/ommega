@@ -194,6 +194,22 @@ async fn check_auth(
     Ok(token)
 }
 
+/// 管理接口的会话校验。跟 `check_auth` 不是一回事：这里要的是控制台登录后的
+/// `X-Relay-Session`，不是 A/B 端的 API token。
+fn require_admin_session(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let sid = headers
+        .get("x-relay-session")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if state.auth.check_session(sid) {
+        return None;
+    }
+    Some(json_err(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized: missing or invalid session",
+    ))
+}
+
 /// Enqueue a task for an already-resolved target and wait for the B-side
 /// result.  Shared by the layer helper and the SOTER path (which resolves its
 /// target by capability instead of by load only).
@@ -291,7 +307,7 @@ async fn try_b_device_layer(
                 kind,
             });
         if let Some(b_meta) = b_meta {
-            if a.kind == "pair" && !a.allows(&b_meta) {
+            if a.kind.eq_ignore_ascii_case("pair") && !a.allows(&b_meta) {
                 tracing::info!(
                     "b_layer: pair mismatch for {target}: A pair={} B pair={}",
                     a.pair_id,
@@ -1320,12 +1336,19 @@ pub async fn soter(
     if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
-    run_soter_task(&state, &body).await
+    // A 的卡身份要一路带到 B 端那一跳：配对判定跟 `/api/attest/` 一个口径。
+    // 不带的话，任意一张 A 卡都能指挥别人家的真机建料、签名。
+    let a_meta = state.auth.token_meta(token_from_headers(&headers));
+    run_soter_task(&state, &body, a_meta.as_ref()).await
 }
 
 /// SOTER 入口；设备会话在 inner 的设备层补签之后按实际设备清理。
 /// 服务端回退层不消费其他设备的同号会话。
-async fn run_soter_task(state: &AppState, body: &Value) -> Response {
+async fn run_soter_task(
+    state: &AppState,
+    body: &Value,
+    a_meta: Option<&crate::auth::TokenMeta>,
+) -> Response {
     // 同一台 B 的 SOTER 请求排队执行（见 `soter_device_guard`）。设备 ID 在这里就归一：
     // A 端留空 + 配了默认设备 = 等同于它带了那个 id，跟 inner 一个口径。
     let filled = crate::default_device::fill_in_body(crate::default_device::Chain::Soter, body);
@@ -1335,7 +1358,7 @@ async fn run_soter_task(state: &AppState, body: &Value) -> Response {
         .unwrap_or("")
         .to_string();
     let _guard = soter_device_guard(&device).await;
-    run_soter_task_inner(state, &filled).await
+    run_soter_task_inner(state, &filled, a_meta).await
 }
 
 /// 设备级串行锁：同一台 B 上的 SOTER 请求一个个来。
@@ -1392,6 +1415,7 @@ async fn repair_clobbered_finish(
     body: &Value,
     requested: &str,
     target: Option<&str>,
+    a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Result<Option<Value>, ()> {
     let Some(session) = body.get("session").and_then(Value::as_i64) else {
         return Ok(None);
@@ -1420,7 +1444,9 @@ async fn repair_clobbered_finish(
             tracing::info!("soter: 补签第 {attempt} 次重试（会话 {session}）");
             tokio::time::sleep(REPAIR_RETRY_GAP).await;
         }
-        if let Some(done) = repair_once(state, body, requested, target, session, &spec).await? {
+        if let Some(done) =
+            repair_once(state, body, requested, target, session, &spec, a_meta).await?
+        {
             return Ok(Some(done));
         }
     }
@@ -1435,12 +1461,13 @@ async fn repair_once(
     target: Option<&str>,
     session: i64,
     spec: &crate::soter_sign_sessions::SlotSpec,
+    a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Result<Option<Value>, ()> {
     let (Some(alias), Some(challenge)) = (spec.alias.as_deref(), spec.challenge.as_deref()) else {
         return Ok(None);
     };
     let init_body = repair_init_body(body, spec.uid, alias, challenge);
-    let init = try_b_soter_layer(state, &init_body, requested, target)
+    let init = try_b_soter_layer(state, &init_body, requested, target, a_meta)
         .await
         .ok_or(())?;
     repair_reply_known(
@@ -1469,7 +1496,7 @@ async fn repair_once(
         obj.insert("session".to_string(), json!(new_session));
     }
     // The new handle belongs to the device that actually answered init, not the request.
-    let done = try_b_soter_layer(state, &fin_body, requested, init.device.as_deref())
+    let done = try_b_soter_layer(state, &fin_body, requested, init.device.as_deref(), a_meta)
         .await
         .ok_or(())?;
     repair_reply_known(
@@ -1591,7 +1618,11 @@ fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Val
 ///
 /// 服务端两层（见 `soter_mint`）用服务端自己的 RSA 物料现造一份自洽的 ASK，让
 /// A 端本地流程先闭环；腾讯那边的根谁也拿不到，这两层不假装自己是腾讯认得的东西。
-async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
+async fn run_soter_task_inner(
+    state: &AppState,
+    body: &Value,
+    a_meta: Option<&crate::auth::TokenMeta>,
+) -> Response {
     if !body.is_object() {
         return json_err(StatusCode::BAD_REQUEST, "json object body required");
     }
@@ -2061,7 +2092,9 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                     if let Some(guard) = lease.as_mut() {
                         guard.dispatch();
                     }
-                    match try_b_soter_layer(state, body, requested, b_target.as_deref()).await {
+                    match try_b_soter_layer(state, body, requested, b_target.as_deref(), a_meta)
+                        .await
+                    {
                         Some(mut b) => {
                             if b.mutation_outcome_unknown(op, b_target.as_deref()) {
                                 if crate::queue::soter_op_needs_sign(op) {
@@ -2117,6 +2150,7 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
                                     body,
                                     requested,
                                     b.device.as_deref(),
+                                    a_meta,
                                 )
                                 .await
                                 {
@@ -2402,6 +2436,7 @@ async fn try_b_soter_layer(
     body: &Value,
     requested: &str,
     target: Option<&str>,
+    a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Option<BSoterLayer> {
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
     let Some(target) = target else {
@@ -2414,6 +2449,43 @@ async fn try_b_soter_layer(
             hardware_reply: None,
         });
     };
+    // A/B 配对：跟 `/api/attest/` 那条路同一个判据。`pair` 卡的 A 只能派给同组的 B；
+    // 两边有一方没登记（老客户端 / 老卡密 / 静态 token）就按历史行为放行。
+    //
+    // 这条以前只在认证那条路上有，SOTER 整条是裸的：任何一张 A 卡都能拿着 device_id
+    // 指挥别人客户的真机建料、签名。不匹配时不碰那台设备，直接交给下面的服务端层
+    // （自签兜底不需要别人的真机）。
+    if let Some(a) = a_meta {
+        if a.kind.eq_ignore_ascii_case("pair") {
+            let b_meta = state
+                .store
+                .device_token_meta(target)
+                .await
+                .map(|(pair_id, kind)| crate::auth::TokenMeta {
+                    role: "b".to_string(),
+                    pair_id,
+                    kind,
+                });
+            if let Some(b_meta) = b_meta {
+                if !a.allows(&b_meta) {
+                    tracing::warn!(
+                        "soter: pair mismatch for {target}: A pair={} B pair={}",
+                        a.pair_id,
+                        b_meta.pair_id
+                    );
+                    return Some(BSoterLayer {
+                        value: json!({
+                            "error": "pair mismatch: this A token is not paired with that B token",
+                            "relay_error_kind": "pair_mismatch",
+                        }),
+                        unavailable: true,
+                        device: None,
+                        hardware_reply: None,
+                    });
+                }
+            }
+        }
+    }
     if !requested.is_empty() && target != requested {
         tracing::warn!(
             "soter: requested device {requested} cannot serve SOTER; task served by {target} instead"
@@ -2968,8 +3040,10 @@ pub async fn b_upload_keybox_identity(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("b")).await {
-        return *r;
+    // 这条写的是服务端出链用的私钥和证书链，本质是管理操作。以前只要求一张 B 卡
+    // token，而 B 卡是公开卖的 —— 任何买家都能把任意 device_id 的身份换成自己的。
+    if let Some(r) = require_admin_session(&state, &headers) {
+        return r;
     }
     let fulfill = state.fulfill.clone();
     let b = body.clone();
@@ -3008,8 +3082,9 @@ pub async fn b_revoke_server_identity(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("b")).await {
-        return *r;
+    // 跟上传身份同一个道理：能下线任意设备的身份也是管理操作。
+    if let Some(r) = require_admin_session(&state, &headers) {
+        return r;
     }
     let Some(db) = state.db.clone() else {
         return json_err(StatusCode::NOT_FOUND, "no db");
@@ -3038,16 +3113,8 @@ pub async fn admin_cancel_task(
 ) -> Response {
     // This is an admin operation: require a valid admin session (X-Relay-Session),
     // not just any A/B token.
-    let sid = headers
-        .get("x-relay-session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if !state.auth.check_session(&sid) {
-        return json_err(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized: missing or invalid session",
-        );
+    if let Some(r) = require_admin_session(&state, &headers) {
+        return r;
     }
     let task_id = body
         .get("task_id")

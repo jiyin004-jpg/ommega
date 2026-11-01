@@ -53,6 +53,13 @@ const ACTIVITY_WINDOW_MS: u64 = 60_000;
 /// Sticky offline-device routing lifetime, shared by KeyMint and SOTER.
 const SUBSTITUTE_TTL_MS: u64 = 10 * 60 * 1000;
 
+/// 设备「最近一次心跳」在这个窗口内，就不许把它的配对组换成别的组。
+///
+/// 窗口跟在线判定一样（`resolve_online_target` 的 120 秒）：一台还在心跳的 B，
+/// 只有它自己那把 token 能改它的配对组。别人拿着另一张 B 卡来改，说明想把它
+/// 认领进自己的组，从而让配对检查放行别人的 A —— 这种一律不认。
+const TOKEN_META_REBIND_AFTER_MS: u64 = 120_000;
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub task_id: String,
@@ -135,10 +142,6 @@ pub struct DeviceEntry {
     /// A 端「伪装参数 → 从服务器同步」拿它去 resetprop，把本机属性对齐到这台 B，
     /// 否则链是真机出的、属性却是调用方那台，检测器一对就报不一致。
     pub identity: DeviceIdentityReport,
-    /// 这台 B 上线时用的 token 身份（配对组 + 类型）。`None` = 老卡密 / 静态 token /
-    /// 还没收到 poll：按历史行为「任意 A 都能用」。
-    pub token_pair_id: String,
-    pub token_kind: String,
     /// 占着 B 接入名额吗。`b_limit` 打开时只有 true 的设备会被派活；
     /// 名额满了之后要么踢掉质量更差的、要么被拒，见 `Store::try_accept_device`。
     pub accepted: bool,
@@ -809,10 +812,6 @@ impl TaskStore {
                             version: known_version,
                             from_module: known_from_module,
                             identity: known_identity,
-                            // token 身份由 poll 处的 set_device_token_meta 单独维护，
-                            // upsert 不碰它。
-                            token_pair_id: String::new(),
-                            token_kind: String::new(),
                             // 名额由 try_accept_device 单独维护；心跳重建条目时保留上次的
                             // 结论，否则每轮都会把已接入的设备变回「未接受」。
                             accepted: known_accepted,
@@ -1629,14 +1628,35 @@ impl TaskStore {
         }
     }
 
-    /// 记下这台设备心跳里上报的模块版本号（见 `DeviceEntry::version`）。
-    /// 设备还没进表时什么都不做：同一轮 poll 马上会把它建出来，下一次心跳就带上了。
     /// 记下这台 B 上线时用的 token 身份（配对组 + 类型）。
     ///
     /// 只是给「A/B 必须配对」的判断用；没登记过的设备（老客户端 / 老卡密 / 静态 token）
     /// 一律按历史行为「任意 A 都能用」。
+    ///
+    /// 换组要过一道闸（见 [`TOKEN_META_REBIND_AFTER_MS`]）：设备还在心跳时，只有同一组的
+    /// token 能更新，别的组、或者把组洗成空，一律不认。不拦的话，任意一张 B 卡对别人的
+    /// device_id 心跳一笔，就能把它认领进自己组（或者反过来把约束洗掉），配对检查随之
+    /// 放行别人的 A。
+    ///
+    /// 设备真换了卡（离线超过窗口再回来）照样能改，只是多等一个在线窗口 —— 换卡本来
+    /// 就要重装/重启，那段时间自然就过了。
     pub async fn set_device_token_meta(&self, device_id: &str, pair_id: &str, kind: &str) {
         let mut inner = self.inner.lock().await;
+        let now = Self::now_ms();
+        if let Some((old_pair, _)) = inner.device_token_meta.get(device_id).cloned() {
+            let wants_change = old_pair != pair_id;
+            let still_alive = inner
+                .devices
+                .get(device_id)
+                .is_some_and(|d| now.saturating_sub(d.last_seen_ms) < TOKEN_META_REBIND_AFTER_MS);
+            if wants_change && still_alive {
+                tracing::warn!(
+                    "device {device_id} keeps pair group '{old_pair}': \
+                     refusing '{pair_id}' (kind={kind}) while it is still polling"
+                );
+                return;
+            }
+        }
         inner.device_token_meta.insert(
             device_id.to_string(),
             (pair_id.to_string(), kind.to_string()),
@@ -1649,6 +1669,8 @@ impl TaskStore {
         inner.device_token_meta.get(device_id).cloned()
     }
 
+    /// 记下这台设备心跳里上报的模块版本号（见 `DeviceEntry::version`）。
+    /// 设备还没进表时什么都不做：同一轮 poll 马上会把它建出来，下一次心跳就带上了。
     pub async fn set_device_version(&self, device_id: &str, version: Option<&str>) {
         let Some(version) = version else { return };
         let mut inner = self.inner.lock().await;
@@ -2171,6 +2193,73 @@ mod online_snapshot_tests {
         let ids = store.connected_device_ids_sync();
         assert_eq!(ids.len(), 1, "stale device must be evicted on read");
         assert_eq!(ids[0], "fresh");
+    }
+}
+
+#[cfg(test)]
+mod token_meta_tests {
+    use super::*;
+
+    /// 一笔心跳，把它放进 devices 表（`last_seen_ms` 就是当下）。
+    async fn heartbeat(store: &TaskStore, id: &str) {
+        store
+            .pop_for_b(id, "M-1", DeviceCaps::default(), Duration::ZERO)
+            .await;
+    }
+
+    async fn go_offline(store: &TaskStore, id: &str) {
+        store
+            .inner
+            .lock()
+            .await
+            .devices
+            .get_mut(id)
+            .unwrap()
+            .last_seen_ms = TaskStore::now_ms().saturating_sub(TOKEN_META_REBIND_AFTER_MS + 1);
+    }
+
+    /// 还在心跳的设备，别的组改不动它：不然任意一张 B 卡对别人的 device_id 心跳
+    /// 一笔就能把它认领进自己组，配对检查就形同虚设。
+    #[tokio::test]
+    async fn a_polling_device_keeps_its_pair_group() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        store.set_device_token_meta("dev", "pair-x", "pair").await;
+        heartbeat(&store, "dev").await;
+
+        store.set_device_token_meta("dev", "pair-y", "pair").await;
+        assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-x");
+
+        // 洗成空组同样不行：一张没配对的卡发笔空 pair 心跳，约束就没了。
+        store.set_device_token_meta("dev", "", "").await;
+        assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-x");
+
+        // 同一组照常更新（kind 跟着变）。
+        store.set_device_token_meta("dev", "pair-x", "public").await;
+        assert_eq!(
+            store.device_token_meta("dev").await.unwrap(),
+            ("pair-x".to_string(), "public".to_string())
+        );
+    }
+
+    /// 真机换卡（离线超过一个在线窗口再回来）能改成新组：不然换卡的人永远
+    /// 被旧组锁着。
+    #[tokio::test]
+    async fn an_offline_device_can_move_to_another_group() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        store.set_device_token_meta("dev", "pair-x", "pair").await;
+        heartbeat(&store, "dev").await;
+        go_offline(&store, "dev").await;
+
+        store.set_device_token_meta("dev", "pair-y", "pair").await;
+        assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-y");
+    }
+
+    /// 首次登记（没历史）总是收下，管它是不是空组。
+    #[tokio::test]
+    async fn a_first_registration_is_always_taken() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        store.set_device_token_meta("dev", "pair-x", "pair").await;
+        assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-x");
     }
 }
 
