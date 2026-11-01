@@ -1395,7 +1395,10 @@ fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::Bo
 /// 每笔本地铸证都会问一次（要跟 RKP 链对齐 RootOfTrust），而文件只有一百多字节；
 /// 5 秒的缓存已经能躲掉绝大多数重复读，同时保证 B 那边换了 boot 状态后很快跟上。
 fn remote_identity_text() -> Option<String> {
-    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
+    // 单一数据根：daemon 写在 /data/misc/ommega，TA 也从这读。
+    // 路径当时没跟着搬，还是 keystore 那份（已被迁移删掉），于是每次铸证都读不到，
+    // RootOfTrust 对不上 RKP 链 —— 现象就是一条链都不出。
+    const PATH: &str = "/data/misc/ommega/remote_identity";
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
         std::sync::OnceLock::new();
     const TTL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1430,10 +1433,10 @@ fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
 
 /// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写（避免触发重启循环）。
 ///
-/// TA 跑在 keystore2 进程里（uid 1017），只能写 keystore 状态目录；
-/// 真正 resetprop + 重启 zygote 的是 root 侧的 `template/daemon`。
+/// TA 跑在 keystore2 进程里（uid 1017），现在写 /data/misc/ommega（sepolicy 已放行 keystore 域）；
+/// 真正 resetprop + 重启 zygote 的是 root 侧的 daemon。
 fn persist_remote_identity(leaf_der: &[u8]) {
-    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
+    const PATH: &str = "/data/misc/ommega/remote_identity";
     let Some(identity) = crate::cert::parse_remote_device_identity(leaf_der) else {
         return;
     };

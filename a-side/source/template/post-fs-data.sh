@@ -20,10 +20,25 @@ DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 
 # KernelSU 开机不会重放 sepolicy.rule，而 keystore 域要读 /data/misc/ommega。
-# 这里是能抢在 keystore2 之前跑的最早时机，所以**同步**应用（带超时），规则先到位，
-# 否则 keystore2 一启动就会因 avc 读不到 injector.toml 而用上默认配置。
-if [ -x /data/adb/ksu/bin/ksud ] && [ -f "$MODDIR/sepolicy.rule" ]; then
-  timeout 15 /data/adb/ksu/bin/ksud sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1
+# 这里是能抢在 keystore2 之前跑的最早时机，所以同步应用（带超时）。
+#
+# 结果写到 /data/local/tmp（adb 读得到）：之前它静默失败，avc 一直在刷，
+# 但没有任何地方能看到到底跑没跑、失败在哪。
+if [ -f "$MODDIR/sepolicy.rule" ]; then
+  _apply_log=/data/local/tmp/ommega-sepolicy-apply.log
+  : > "$_apply_log" 2>/dev/null
+  if [ -x /data/adb/ksu/bin/ksud ]; then
+    for _try in 1 2 3; do
+      if timeout 15 /data/adb/ksu/bin/ksud sepolicy apply "$MODDIR/sepolicy.rule" >>"$_apply_log" 2>&1; then
+        echo "apply ok on try $_try" >> "$_apply_log"
+        break
+      fi
+      echo "apply failed on try $_try rc=$?" >> "$_apply_log"
+      sleep 2
+    done
+  else
+    echo "ksud missing" >> "$_apply_log"
+  fi
 fi
 # A-side config directory (webroot UI writes here; `ommegadata` is a symlink to
 # $TARGET_DIR, so the UI and the keystore process (uid 1017) share one copy).

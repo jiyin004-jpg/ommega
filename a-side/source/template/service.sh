@@ -58,7 +58,30 @@ pid_matches_script() {
   script=$2
   [ -r "/proc/$pid/cmdline" ] || return 1
   cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-  echo "$cmdline" | grep -F "$script" >/dev/null 2>&1
+  # `--` 不能省：token 可能是 "--daemon" 这种以 - 开头的东西，不加就被 grep 当成选项，
+  # 直接报错返回非 0 —— 巡检永远认为进程不在，module.prop 也就永远停在「启动中」。
+  echo "$cmdline" | grep -F -- "$script" >/dev/null 2>&1
+}
+
+# keymint 守护的 cmdline 只剩 `keymint`（参数 ——daemon 在 /proc 里读不到），
+# 而且 pidfile 可能丢（daemon 自己管锁、或者启动那一下没写成）。
+# 所以巡检不能只信 pidfile：丢了就当场扫一遍进程，找到了顺手把 pidfile 补回去。
+# 以前只认 pidfile + `--daemon` 字符串，结果每次都判没起、kill_all 重来，keymint 反复被杀。
+keymint_alive() {
+  pid=$1
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "keymint"; then
+    return 0
+  fi
+  for p in $(pgrep -f "$MODDIR/libs/.*/keymint" 2>/dev/null); do
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+    case "$cmd" in
+      *--daemon*)
+        echo "$p" > "$RUN_DIR/keymint-daemon.pid" 2>/dev/null
+        return 0
+        ;;
+    esac
+  done
+  return 1
 }
 
 # 启动一个守护（脚本或 ELF）并按 pidfile 守着。
@@ -97,9 +120,14 @@ start_daemon() {
 # 这里在拉起 injector 之前补一次规则；规则是全局的，apply 完对已在跑的进程也立即生效。
 # 用时间戳节流，5 分钟内不重复 apply（keep-alive 每 5 秒跑一轮，不节流会刷爆）。
 SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
+# ksud / magiskpolicy 的**绝对路径**。以前这里用 `command -v ksud` 判断，但 ksud 不在
+# PATH 里（它只在 /data/adb/ksu/bin 下），于是这个函数直接 return 0、从来没 apply 过 ——
+# 症状就是：开机后 20 秒（service 阶段）规则失效，payload 读 injector.toml 吃 EACCES，
+# keymint 一条链都出不来，而面板看着一切正常。
+KSUS_KSud=/data/adb/ksu/bin/ksud
 ensure_sepolicy() {
   [ -f "$MODDIR/sepolicy.rule" ] || return 0
-  command -v ksud >/dev/null 2>&1 || return 0
+  [ -x "$KSUS_KSud" ] || return 0
   now=$(date +%s 2>/dev/null || echo 0)
   last=$(cat "$SEPOLICY_STAMP" 2>/dev/null || echo 0)
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
@@ -107,7 +135,7 @@ ensure_sepolicy() {
   if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
     return 0
   fi
-  if ksud sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1; then
+  if timeout 15 "$KSUS_KSud" sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1; then
     mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
     printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
   fi
@@ -160,7 +188,7 @@ start_keymint_daemon() {
 
   if [ -f "$pidfile" ]; then
     pid=$(cat "$pidfile" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "--daemon"; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && keymint_alive "$pid"; then
       return 0
     fi
     rm -f "$pidfile"
@@ -171,7 +199,7 @@ start_keymint_daemon() {
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
-  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "--daemon"; then
+  if ! kill -0 "$pid" 2>/dev/null || ! keymint_alive "$pid"; then
     rm -f "$pidfile"
     return 1
   fi
@@ -181,15 +209,19 @@ start_keymint_daemon() {
 # post-fs-data 阶段可能已经把两个守护拉起来了（为了抢在 keystore2 之前守着，好接住开机
 # 解锁那份材料）。那两个还活着就别 kill 重来 —— 那会把刚抢到的时间窗白白丢掉。
 daemons_alive() {
-  for spec in "$RUN_DIR/keymint-daemon.pid:--daemon" "$RUN_DIR/injector-daemon.pid:$INJECTOR_CMD"; do
-    pf=${spec%%:*}
-    sp=${spec#*:}
-    [ -f "$pf" ] || return 1
-    p=$(cat "$pf" 2>/dev/null)
-    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && pid_matches_script "$p" "$sp" || return 1
-  done
+  # keymint：pidfile 可能丢，用 keymint_alive 扫一遍
+  kpid=$(cat "$RUN_DIR/keymint-daemon.pid" 2>/dev/null)
+  keymint_alive "$kpid" || return 1
+  # injector：pidfile 是 start_daemon 写的，它不会自删
+  [ -f "$RUN_DIR/injector-daemon.pid" ] || return 1
+  p=$(cat "$RUN_DIR/injector-daemon.pid" 2>/dev/null)
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && pid_matches_script "$p" "$INJECTOR_CMD" || return 1
   return 0
 }
+
+# sepolicy 先于一切：规则没应用前，payload 读 injector.toml 全是 EACCES。
+# 以前它在 else 分支里，守护都活着时就跳过了 —— 开机后进程刚好在跑的那次就漏掉。
+ensure_sepolicy
 
 if daemons_alive; then
   update_status "Ommega ✅ 运行中"
@@ -197,10 +229,12 @@ else
   kill_all
   update_status "Ommega ⏳ 启动中"
   start_keymint_daemon
-  ensure_sepolicy
-  # injector：优先 watchdog；`[ -x ]` 过了但它自己跑不起来（锁、标签、依赖）
-  # 也不能让注入器缺位，直接回落 shell 版，保证注入一定发生。
+  # 注入器的唯一实现是 shell 版 daemon-injector（Rust 的 watchdog 走不通，见文首）。
   start_daemon "$INJECTOR_CMD" "$RUN_DIR/injector-daemon.pid" || true
+  # 起来之后要回写一次：以前只写了「启动中」就再没确认，module.prop 永远停在启动中，
+  # 看起来像一直没起来，实际进程一直在跑。
+  sleep 2
+  daemons_alive && update_status "Ommega ✅ 运行中"
 fi
 
 # 属性伪装全部在 post-fs-data 一次性做完（含 ro.boot 启动状态三连）。
