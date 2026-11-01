@@ -55,8 +55,10 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长，也正好是 SHA-256 的摘要长度。
-const SALT_LEN: i32 = 32;
+/// ASK 里写死的盐长。**必须跟厂商 TA 一致（RSA-PSS / SHA-256 / salt=20）**：
+/// 腾讯按登记信息验签时用的是 20，我们签 32 就永远 `verify signature fail`。
+/// 本地自洽（32 签 32 验）看不出来，只有上报腾讯才暴露。
+const SALT_LEN: i32 = 20;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
@@ -133,9 +135,10 @@ impl Key {
         Some(Self { private, pem })
     }
 
-    /// RSA-PSS-SHA256，盐长 = 摘要长度 = 32，跟 JSON 里那个字段对得上。
+    /// RSA-PSS-SHA256，盐长 20（跟厂商 TA 一致，见 [`SALT_LEN`]）。
     fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
-        let signing = PssSigningKey::<PssSha256>::new(self.private.clone());
+        let signing =
+            PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), SALT_LEN as usize);
         let mut rng = OsRng;
         Some(signing.sign_with_rng(&mut rng, message).to_bytes().to_vec())
     }
@@ -156,7 +159,7 @@ pub(crate) fn selftest() -> anyhow::Result<()> {
     let signature = rsa::pss::Signature::try_from(raw.as_slice())
         .map_err(|error| anyhow::anyhow!("malformed signature: {error}"))?;
     let public = rsa::RsaPublicKey::from(&attk.private);
-    PssVerifyingKey::<PssSha256>::new(public)
+    PssVerifyingKey::<PssSha256>::new_with_salt_len(public, SALT_LEN as usize)
         .verify(message, &signature)
         .map_err(|error| anyhow::anyhow!("the signature did not verify: {error}"))
 }
@@ -1307,9 +1310,10 @@ mod tests {
         // 文档是 ASK 的自描述，签名那把是 ATTK（ATTK 签 ASK 的认证）
         use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
         use rsa::signature::Verifier;
-        let verifying = PssVerifyingKey::<PssSha256>::new(rsa::RsaPublicKey::from(
-            &current_attk().unwrap().private,
-        ));
+        let verifying = PssVerifyingKey::<PssSha256>::new_with_salt_len(
+            rsa::RsaPublicKey::from(&current_attk().unwrap().private),
+            SALT_LEN as usize,
+        );
         verifying
             .verify(
                 document,
@@ -1496,7 +1500,7 @@ mod tests {
         let Ok(signature) = PssSignature::try_from(signature) else {
             return false;
         };
-        PssVerifyingKey::<PssSha256>::new(public)
+        PssVerifyingKey::<PssSha256>::new_with_salt_len(public, SALT_LEN as usize)
             .verify(message, &signature)
             .is_ok()
     }
@@ -1574,7 +1578,7 @@ mod tests {
             "key order changed: {text}"
         );
         assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
-        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
+        assert!(text.contains("\"rsa_pss_saltlen\":20"), "salt len: {text}");
     }
 
     #[test]
