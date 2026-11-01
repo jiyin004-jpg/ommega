@@ -55,10 +55,9 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长。**必须跟厂商 TA 一致（RSA-PSS / SHA-256 / salt=20）**：
-/// 腾讯按登记信息验签时用的是 20，我们签 32 就永远 `verify signature fail`。
-/// 本地自洽（32 签 32 验）看不出来，只有上报腾讯才暴露。
-const SALT_LEN: i32 = 20;
+/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签，32（= SHA-256 摘要长度）
+/// 本身就是自洽的，厂商 TA 用 20 也能过 —— 两边都行，这里保持原值 32。
+const SALT_LEN: i32 = 32;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
@@ -71,9 +70,9 @@ const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
-/// counter 起点：导入 ATTK 时会把 ASK/authkey/counter 全部清掉，之后每个 App
-/// 第一次请求现造 ASK，counter 从 1 开始严格 +1。
-/// （那时腾讯那边也是全新的身份，没有历史值要追；用时间戳反而会让步长乱跳。）
+/// counter 起点：换 ATTK 时它会被清掉（连同 ASK/authkey/App 开通状态），
+/// 之后每个 App 第一次请求现造 ASK，counter 从 1 开始严格 +1。
+/// ATTK 换了就是新身份（新 cpu_id），腾讯那边也是新记录，从 1 合理。
 const COUNTER_BASE: u64 = 1;
 
 /// 强制覆盖 cpu_id 的文件。拿别台设备的 ATTK 重放时要跟那台报同一个号，
@@ -137,7 +136,7 @@ impl Key {
         Some(Self { private, pem })
     }
 
-    /// RSA-PSS-SHA256，盐长 20（跟厂商 TA 一致，见 [`SALT_LEN`]）。
+    /// RSA-PSS-SHA256，盐长 = 摘要长度 = 32，跟 JSON 里那个字段对得上。
     fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
         let signing =
             PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), SALT_LEN as usize);
@@ -273,6 +272,21 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
 const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
 const ASK_SECTION: &str = "asks";
 const AUTH_SECTION: &str = "authkeys";
+/// store 里记的「这把 ASK/AuthKey 是哪把 ATTK 签的」（ATTK 公钥的 sha256）。
+///
+/// 真机不用担心这个（ATTK 在 TEE 里换不了），我们能换 ATTK，就必须自己管一致性：
+/// 否则换了一把 ATTK 之后，store 里旧 AuthKey 照用 —— 本地签名链自洽、微信本地
+/// 验得过，但那一笔根本没再问过腾讯，表现为「不重启就能用、重启就不行」。
+const ATTK_FIELD: &str = "attk";
+
+/// 当前 ATTK 公钥的指纹（sha256 hex）。
+fn attk_fingerprint() -> Option<String> {
+    use rsa::sha2::{Digest, Sha256};
+    let attk = current_attk()?;
+    let mut hasher = Sha256::new();
+    hasher.update(attk.pem.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
 
 /// 落盘那一瞬间的互斥：读改写不是原子操作，两个 uid 同时进来会互相盖掉。
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
@@ -291,7 +305,17 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
                 wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
                 return wrapped;
             }
-            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION);
+            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION || key == ATTK_FIELD);
+            // 指纹对不上（换了 ATTK）或者是没记指纹的旧 store：整份作废，让调用方
+            // 重新生成。留着只会拿旧 ATTK 签的链去跑，本地能过、腾讯不认。
+            let want = attk_fingerprint();
+            let got = map.get(ATTK_FIELD).and_then(|v| v.as_str());
+            if !matches!((want.as_deref(), got), (Some(w), Some(g)) if w == g) {
+                log::info!(
+                    "soter local ask store was not minted by the current ATTK; discarding it"
+                );
+                return serde_json::Map::new();
+            }
             map
         }
         _ => {
@@ -302,7 +326,14 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
 }
 
 fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    let text = serde_json::to_string_pretty(map).ok()?;
+    let mut out = map.clone();
+    if let Some(fingerprint) = attk_fingerprint() {
+        out.insert(
+            ATTK_FIELD.to_string(),
+            serde_json::Value::String(fingerprint),
+        );
+    }
+    let text = serde_json::to_string_pretty(&out).ok()?;
     let path = ASK_STORE_PATH;
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1085,8 +1116,9 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            // 严格 +1（真机就是连续递增）。文件里没有这个 uid（刚导入 ATTK 被清过、
-            // 或者第一次见这个 App）就从 1 开始，**不要**拿 now_secs() 去抬。
+            // 换了 ATTK = 新身份（新 cpu_id），腾讯那边也是新记录，counter 从 1 开始。
+            // 前提是 App 侧的开通状态也清了（daemon 会删 soter_status.xml）——
+            // 否则 App 记着旧 counter，看到 1 就当回退，得连按好几次才追上来。
             let next = match counter_for(&text, uid) {
                 Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
                 None => COUNTER_BASE,
@@ -1572,7 +1604,7 @@ mod tests {
             "key order changed: {text}"
         );
         assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
-        assert!(text.contains("\"rsa_pss_saltlen\":20"), "salt len: {text}");
+        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
     }
 
     #[test]
