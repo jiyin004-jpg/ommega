@@ -923,6 +923,16 @@ pub fn chain_rdn_shape(chain_pem: &str) -> RdnShape {
 ///
 /// 真机 keybox 整条链只会有一个值；出现两个就是拼出来的（比如 TEE 的中间 CA 配了
 /// StrongBox 的根），这种链自己就矛盾，不该发出去。没标（AOSP 软件链、自签链）返回空。
+///
+/// 级别写在哪个字段要按签发方分开看：
+///   - AOSP 自己签的 keybox 写在 `title`（2.5.4.12）里；
+///   - **Google RKP 签的写在 `O`（2.5.4.10）里**，DN 长这样：
+///     `CN=<16 hex>,O=TEE` / `CN=<16 hex>,O=StrongBox`。
+///
+/// 以前只认 `title`，RKP 那批链就全是“没标级别”，连带的后果是：级别不匹配
+/// 的 session 会被当成同一个级别复用（要 StrongBox 的请求拿回 TEE 链），兜底挑
+/// 身份时也拦不住 StrongBox 那份被 TEE 请求用上。
+/// `O` / `OU` 里只收本来就是级别名的值，避免把 `O=Google LLC` 当成级别。
 pub fn chain_security_levels(chain_pem: &str) -> Vec<String> {
     let Ok(ders) = parse_chain_pem(chain_pem) else {
         return Vec::new();
@@ -934,14 +944,24 @@ pub fn chain_security_levels(chain_pem: &str) -> Vec<String> {
         };
         for rdn in cert.subject().iter() {
             for attr in rdn.iter() {
-                if attr.attr_type().to_id_string() != "2.5.4.12" {
+                let oid = attr.attr_type().to_id_string();
+                // 2.5.4.12 = title，2.5.4.10 = O，2.5.4.11 = OU
+                let is_title = oid == "2.5.4.12";
+                if !is_title && oid != "2.5.4.10" && oid != "2.5.4.11" {
                     continue;
                 }
                 let Ok(value) = attr.as_str() else {
                     continue;
                 };
                 let value = value.trim();
-                if !value.is_empty() && !out.iter().any(|v| v.eq_ignore_ascii_case(value)) {
+                if value.is_empty() {
+                    continue;
+                }
+                // title 以外的字段只有长得像级别名的才收。
+                if !is_title && level_from_title(value).is_none() {
+                    continue;
+                }
+                if !out.iter().any(|v| v.eq_ignore_ascii_case(value)) {
                     out.push(value.to_string());
                 }
             }

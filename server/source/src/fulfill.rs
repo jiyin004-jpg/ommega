@@ -434,13 +434,16 @@ impl Fulfill {
     /// Serialize check -> generate -> publish for the alias, not globally.
     /// A cancelled HTTP waiter cannot cancel its spawn_blocking worker: retries
     /// must wait for that worker and reuse its key instead of replacing it.
-    /// Do not reject differing request snapshots (e.g. StrongBox -> TEE retry):
-    /// failures are not cached; after success the alias's key/chain is immutable
-    /// for the existing seven-day session lifetime. Attestation callers must
-    /// validate the cached leaf algorithm before returning it.
+    ///
+    /// 但缓存**只在本级别内复用**。`want_level` 是这次请求的
+    /// `attestation_security_level`（1 = TEE、2 = StrongBox）：缓存的链级别和它
+    /// 对不上就丢掉重建。以前完全不看级别，同一个 alias 先出 TEE 再请求 StrongBox
+    /// 会直接复用那条 TEE 链 —— App 要 StrongBox 却拿到 TEE，级别就串了（实测
+    /// level=2 请求回来 `O=TEE`）。
     fn session_or_generate(
         &self,
         alias: &str,
+        want_level: i64,
         generate: impl FnOnce() -> anyhow::Result<Session>,
     ) -> anyhow::Result<(Session, bool)> {
         let gate = {
@@ -456,10 +459,26 @@ impl Fulfill {
         };
         let _guard = crate::util::mu(&gate);
         if let Some(session) = self.get_session(alias) {
-            return Ok((session, false));
+            if Self::session_level_matches(&session.chain_pem, want_level) {
+                return Ok((session, false));
+            }
+            tracing::info!(
+                "session_or_generate: alias={alias} 缓存的链级别与请求级别 {want_level} 不符，重建"
+            );
+            // 先丢掉旧的：put_session 的规则是「先发布的赢」，不删就写不进去。
+            self.forget_session(alias);
         }
         let session = self.put_session(alias, generate()?);
         Ok((session, true))
+    }
+
+    /// 缓存的链和这次请求的级别对得上吗。
+    ///
+    /// 没标级别（软件链 / 自签链 / 老 keybox）按 TEE 算：这也是 AOSP 的语义，
+    /// 软件级证书不可能被当成 StrongBox。
+    fn session_level_matches(chain_pem: &str, want_level: i64) -> bool {
+        let cached_strongbox = cert::chain_security_level(chain_pem) == Some(2);
+        cached_strongbox == (want_level >= 2)
     }
 
     /// Algorithm string implied by an A-side attest context ("ec" | "rsa"),
@@ -531,6 +550,18 @@ impl Fulfill {
             }
             _ => None,
         }
+    }
+
+    /// 兜底：不看请求的 device id，按级别挑一条能用的身份。
+    ///
+    /// 跟 `identity_for` 最后那一步的区别就是多了一道级别过滤 —— TEE 请求不能
+    /// 拿 StrongBox 的链，不然链上标的级别和请求对不上。
+    fn identity_any_for_level(&self, want_strongbox: bool) -> Option<DeviceIdentity> {
+        self.db
+            .as_ref()?
+            .get_any_usable_identity_for_level(want_strongbox)
+            .ok()
+            .flatten()
     }
 
     /// 按设备 id 找一份存下的身份：先不挑算法（一台设备的 EC / RSA 两条算法本来就
@@ -907,7 +938,8 @@ impl Fulfill {
         // （serverbox 模式下的 session），就用它自己签发子证书；不在本端则交给
         // 下一层（真机 B），**不**改用身份自带的签发密钥冒充。
         let issuer = self.server_issuer(ctx)?;
-        let (session, generated) = self.session_or_generate(alias, || {
+        let want_level = params.security_level;
+        let (session, generated) = self.session_or_generate(alias, want_level, || {
             let (chain_pem, leaf_key_pem) = match &issuer {
                 Some((issuer_key_pem, issuer_chain_pem)) => cert::build_attested_chain_with_issuer(
                     identity,
@@ -1148,14 +1180,39 @@ impl Fulfill {
                 }
                 None => device_id,
             };
-            match self.identity_for(lookup_id, &algorithm, prefer_slot && pinned.is_none()) {
-                Some(identity) => identity,
-                None => {
-                    return Some(json!({
-                        "error": format!(
-                            "server_keybox: no stored server identity for device {lookup_id} (algorithm {algorithm})"
-                        )
-                    }));
+            let found = self.identity_for(lookup_id, &algorithm, prefer_slot && pinned.is_none());
+            // 兜底那一步（`get_any_usable_identity`）以前不看级别：库里同时有 TEE 和
+            // StrongBox 两份时，TEE 请求会拿到 StrongBox 的链，级别就串了。这里拦一道：
+            // 拿到的是 StrongBox 就不用它，换一份同级别（无标 / TEE）的；换不到就报错。
+            let wrong_level = found
+                .as_ref()
+                .map(|i| cert::chain_security_level(&i.certificate_chain_pem) == Some(2))
+                .unwrap_or(false);
+            if wrong_level {
+                tracing::warn!(
+                    "server_keybox: level={level} 挑中的身份是 StrongBox 级别，改挑一份 TEE 的（请求 device={device_id}）"
+                );
+                match self.identity_any_for_level(false) {
+                    Some(alt) => alt,
+                    None => {
+                        return Some(json!({
+                            "error": format!(
+                                "server_keybox: level={level} 需要 TEE 身份，但库里没有同级别的（请求 device={lookup_id}）"
+                            ),
+                            "relay_error_kind": "tee_identity_missing",
+                        }));
+                    }
+                }
+            } else {
+                match found {
+                    Some(identity) => identity,
+                    None => {
+                        return Some(json!({
+                            "error": format!(
+                                "server_keybox: no stored server identity for device {lookup_id} (algorithm {algorithm})"
+                            )
+                        }));
+                    }
                 }
             }
         };
@@ -1776,7 +1833,7 @@ mod tests {
             let worker_calls = &calls;
             let late = scope.spawn(move || {
                 worker_f
-                    .session_or_generate("same", || {
+                    .session_or_generate("same", 1, || {
                         worker_calls.fetch_add(1, Ordering::SeqCst);
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
@@ -1787,7 +1844,7 @@ mod tests {
             });
             entered_rx.recv().unwrap();
             let retry = scope.spawn(|| {
-                f.session_or_generate("same", || {
+                f.session_or_generate("same", 1, || {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(session("replacement"))
                 })
@@ -1796,7 +1853,7 @@ mod tests {
             });
             scope.spawn(|| {
                 let s = f
-                    .session_or_generate("other", || Ok(session("independent")))
+                    .session_or_generate("other", 1, || Ok(session("independent")))
                     .unwrap()
                     .0;
                 other_tx.send(s).unwrap();
@@ -1821,14 +1878,14 @@ mod tests {
     fn failed_snapshot_allows_demotion_but_success_cannot_be_replaced() {
         let f = fulfill();
         assert!(f
-            .session_or_generate("alias", || anyhow::bail!("StrongBox failed"))
+            .session_or_generate("alias", 1, || anyhow::bail!("StrongBox failed"))
             .is_err());
         let (tee, generated) = f
-            .session_or_generate("alias", || Ok(session("TEE")))
+            .session_or_generate("alias", 1, || Ok(session("TEE")))
             .unwrap();
         assert!(generated);
         let (retry, generated) = f
-            .session_or_generate("alias", || panic!("must reuse success"))
+            .session_or_generate("alias", 1, || panic!("must reuse success"))
             .unwrap();
         assert!(!generated);
         assert_eq!(retry.chain_pem, tee.chain_pem);
@@ -1913,7 +1970,7 @@ mod tests {
             .sessions
             .insert("alias".into(), old.clone());
         let (reused, generated) = f
-            .session_or_generate("alias", || panic!("loaded session must be reused"))
+            .session_or_generate("alias", 1, || panic!("loaded session must be reused"))
             .unwrap();
         assert!(!generated);
         assert_eq!(reused.created_epoch_ms, old.created_epoch_ms);
@@ -1929,12 +1986,7 @@ mod tests {
             created_at: String::new(),
         };
         let (chain, fingerprint) = f
-            .attest_and_cache(
-                &identity,
-                "alias",
-                &json!({"attestation_security_level": 2}),
-                b"different",
-            )
+            .attest_and_cache(&identity, "alias", &json!({}), b"different")
             .unwrap();
         assert_eq!(chain, old.chain_pem);
         assert_eq!(
@@ -1949,10 +2001,43 @@ mod tests {
             .used_epoch_ms =
             Utc::now().timestamp_millis() as u64 - SESSION_TTL.as_millis() as u64 - 1;
         let (fresh, generated) = f
-            .session_or_generate("alias", || Ok(session("fresh")))
+            .session_or_generate("alias", 1, || Ok(session("fresh")))
             .unwrap();
         assert!(generated);
         assert_eq!(fresh.leaf_key_pem, "fresh");
+    }
+
+    /// 同一个 alias 换了安全级别就不能再复用：以前不看级别，App 要 StrongBox
+    /// 却拿到缓存的 TEE 链（实测 level=2 请求回来 `O=TEE`），级别就串了。
+    #[test]
+    fn cached_session_is_rebuilt_when_the_level_changes() {
+        let f = fulfill();
+        // 用真实链：自签链没标级别，按 TEE 算（跟 AOSP 语义一致）。
+        let material = cert::generate_self_signed("ec").unwrap();
+        let tee_chain = material.certificate_chain_pem.clone();
+        let mut tee = session(&material.private_key_pem);
+        tee.chain_pem = tee_chain.clone();
+        crate::util::mu(&f.inner)
+            .sessions
+            .insert("level-alias".into(), tee.clone());
+
+        // 同级别：复用，不重新生成。
+        let (again, generated) = f
+            .session_or_generate("level-alias", 1, || panic!("same level must reuse"))
+            .unwrap();
+        assert!(!generated);
+        assert_eq!(again.leaf_key_pem, tee.leaf_key_pem);
+
+        // 换成 StrongBox：必须重建。
+        let (sb, generated) = f
+            .session_or_generate("level-alias", 2, || Ok(session("sb-new")))
+            .unwrap();
+        assert!(generated, "级别变了就不能再复用缓存");
+        assert_eq!(sb.leaf_key_pem, "sb-new");
+
+        // 级别判定本身：没标级别的链只能算 TEE。
+        assert!(Fulfill::session_level_matches(&tee_chain, 1));
+        assert!(!Fulfill::session_level_matches(&tee_chain, 2));
     }
 
     /// 热缓存里没有的会话得回库查出来，而且用一次就把「最后使用」顶到当下。

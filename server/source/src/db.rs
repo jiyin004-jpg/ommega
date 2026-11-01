@@ -297,6 +297,41 @@ impl Db {
         }
     }
 
+    /// 按链上标的级别挑一条能用的身份（`want_strongbox` = 要 StrongBox 那份）。
+    ///
+    /// 兜底专用。以前兜底走 `get_any_usable_identity`，不看级别：库里既存了 TEE
+    /// 的一份又存了 StrongBox 的一份时，TEE 请求可能拿到 StrongBox 的链，级别就
+    /// 串了（实测 level=1 请求返回 `O=StrongBox`）。没标级别的链（软件 / 自签 / 老
+    /// keybox）也算 TEE，跟 AOSP 语义一致。
+    ///
+    /// 排序跟 `get_any_usable_identity` 一样（自动采集的优先、新的优先），只是多
+    /// 了一道级别过滤；同一份库里挑到的结果稳定。
+    pub fn get_any_usable_identity_for_level(
+        &self,
+        want_strongbox: bool,
+    ) -> anyhow::Result<Option<DeviceIdentity>> {
+        let mut conn = self.conn()?;
+        let rows: Vec<mysql::Row> = conn.exec(
+            "SELECT device_id, algorithm, certificate_chain_pem, private_key_pem_cipher,
+                    active, machine_id, created_at
+             FROM device_server_identity WHERE active = 1
+             ORDER BY (machine_id LIKE 'auto%') DESC, created_at DESC, device_id",
+            (),
+        )?;
+        for r in rows {
+            let mut d = Self::device_identity_from_row(r)?;
+            let is_strongbox =
+                crate::cert::chain_security_level(&d.certificate_chain_pem) == Some(2);
+            if is_strongbox != want_strongbox {
+                continue;
+            }
+            d.private_key_pem_cipher =
+                crate::crypto::decrypt_private_pem(&d.private_key_pem_cipher);
+            return Ok(Some(d));
+        }
+        Ok(None)
+    }
+
     /// Fetch any active identity for a device regardless of algorithm — a
     /// targeted lookup replacing a full `list_device_identities()` scan when
     /// the exact algorithm match is missing.
