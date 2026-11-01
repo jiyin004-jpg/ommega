@@ -831,17 +831,20 @@ impl Fulfill {
             .unwrap_or(p.attestation_version);
 
         // verified_boot_key / verified_boot_hash 应当是 32 字节。A 端没带、或者带过来的
-        // 解不出 32 字节时，不要发全 0（看着像没锁，而且所有机器都是同一串 0），按
-        // 「设备 + 当前年月日时」派生一个：同一小时里稳定，换小时才换。精确到分换得太勤，
-        // 同一轮会话里前后两笔就对不上。
-        let stamp = boot_value_stamp();
+        // 解不出 32 字节时，用「设备 + 固定串」派生一个：**不能带时间戳**。
+        //
+        // 以前是按「设备 + 当前小时」派生，结果同一台设备换个小时出的链哈希就变了，
+        // 跟设备上任何固定属性都对不上（Duck 的 Boot consistency 直接拿证书里的
+        // verifiedBootHash 比 ro.boot.vbmeta.digest，必 mismatch）。现在同一设备永远
+        // 得到同一个值；正常路径是 A 端带上伪装参数解出来的哈希，直接用它。
+        let stamp = "fixed";
         let vb_key = match b64("verified_boot_key") {
             Some(k) if k.len() == 32 => k,
-            _ => boot_value_seed(device_id, "bootkey", &stamp).to_vec(),
+            _ => boot_value_seed(device_id, "bootkey", stamp).to_vec(),
         };
         let vb_hash = match b64("verified_boot_hash") {
             Some(h) if h.len() == 32 => h,
-            _ => boot_value_seed(device_id, "boothash", &stamp).to_vec(),
+            _ => boot_value_seed(device_id, "boothash", stamp).to_vec(),
         };
         p.root_of_trust = Some(RootOfTrust {
             verified_boot_key: vb_key,
@@ -1764,17 +1767,11 @@ fn decrypt_oaep(
     }
 }
 
-/// 「年月日时」时间戳，给合成的 boot 值当种子用。
+/// 按 (用途, 设备, 固定串) 派生一个 32 字节值。
 ///
-/// 到小时为止：分/秒级会让同一轮会话里前后两笔的 boot key 不一样，看着更像假的。
-fn boot_value_stamp() -> String {
-    chrono::Utc::now().format("%Y%m%d%H").to_string()
-}
-
-/// 按 (用途, 设备, 时间戳) 派生一个 32 字节值。
-///
-/// 同一台设备、同一个小时内结果相同；换小时或换设备都会变。`kind` 把 boot key 和
-/// boot hash 分开，避免两者变成同一串。
+/// 同一台设备永远得到同一个值（以前带小时时间戳，导致隔小时出的链哈希就变了，
+/// 跟设备上任何固定属性都对不上）。`kind` 把 boot key 和 boot hash 分开，
+/// 避免两者变成同一串。
 fn boot_value_seed(device_id: &str, kind: &str, stamp: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

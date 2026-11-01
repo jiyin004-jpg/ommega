@@ -251,26 +251,18 @@ sync_remote_identity() {
       device) device_changed=1 ;;
     esac
   done
-  # boot 锁定 / 验证状态 —— 这两项不是 1:1 映射到属性名（值要转文案），单独处理。
-  # （remote 开关已经在函数开头判过了，走到这里说明是在跟 B 的说法。）
-  ri_locked=$(sed -n 's/^device_locked=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
-  case "$ri_locked" in
-    0)
-      resetprop_set ro.boot.vbmeta.device_state unlocked
-      resetprop_set ro.boot.flash.locked 0
-      ;;
-    1)
-      resetprop_set ro.boot.vbmeta.device_state locked
-      resetprop_set ro.boot.flash.locked 1
-      ;;
-  esac
-  ri_state=$(sed -n 's/^verified_boot_state=//p' "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
-  case "$ri_state" in
-    0) resetprop_set ro.boot.verifiedbootstate green ;;
-    1) resetprop_set ro.boot.verifiedbootstate yellow ;;
-    2) resetprop_set ro.boot.verifiedbootstate orange ;;
-    3) resetprop_set ro.boot.verifiedbootstate red ;;
-  esac
+  # boot 锁定 / 验证状态：一律落成「已锁定 + 已验证」。
+  #
+  # 证书那边是固定这么声明的（见 remote.rs 的 RootOfTrust：device_locked=true、
+  # verified_boot_state=0），属性就得跟它同一个口径。这里不再看 B 自报的
+  # device_locked / verified_boot_state —— 那台就算自己是 unlocked / orange，
+  # 写过来就是「证书说锁着、属性说解着」，检测器一比就抓。
+  [ "$(getprop ro.boot.vbmeta.device_state 2>/dev/null)" = "locked" ] || \
+    resetprop_set ro.boot.vbmeta.device_state locked
+  [ "$(getprop ro.boot.flash.locked 2>/dev/null)" = "1" ] || \
+    resetprop_set ro.boot.flash.locked 1
+  [ "$(getprop ro.boot.verifiedbootstate 2>/dev/null)" = "green" ] || \
+    resetprop_set ro.boot.verifiedbootstate green
   if [ "$changed" = "1" ]; then
     [ "$model_changed" = "1" ] && resetprop_set ro.product.model "$(sed -n 's/^model=//p' "$REMOTE_IDENTITY_APPLIED" | head -n1)"
     [ "$brand_changed" = "1" ] && resetprop_set ro.product.brand "$(sed -n 's/^brand=//p' "$REMOTE_IDENTITY_APPLIED" | head -n1)"

@@ -875,26 +875,27 @@ impl RemoteRelay {
             "attestation_application_id".to_string(),
             Value::String(base64_encode(app_id_der)),
         );
-        // RootOfTrust 一律**实时读属性**，不要用启动时缓存的 config。
+        // RootOfTrust：**固定声明锁定 + 已验证**，不跟设备真实状态走。
         //
-        // `daemon` 每 10 秒会把 B 端身份里的 `vbmeta_digest` resetprop 进
-        // `ro.boot.vbmeta.digest`（而且特意不重启 keymint，不然会死循环），但
-        // `config().trust.vb_hash` 只在进程启动那一刻解析一次。结果是：属性早换成
-        // 新值了，证书里还是旧值 —— Duck 的 Boot consistency 直接比
-        // `verifiedBootHash != ro.boot.vbmeta.digest`，一比就 mismatch。
+        // 目的是让链看起来就是一台锁着、验证过的机器；设备实际是 orange /
+        // unlocked 也一样这么写。属性那边由 daemon 一并改成 locked / green，
+        // 两边口径一致，检测器拿证书和 `ro.boot.flash.locked`、
+        // `ro.boot.verifiedbootstate` 去比不会出现矛盾。
         //
-        // 属性读不到（老 ROM / 属性被刷掉）才回落 config，再不行才用全零。
-        let rot = Self::runtime_root_of_trust();
+        // hash 不取 `config().trust` 那份启动快照：daemon 会在运行时改
+        // `ro.boot.vbmeta.digest`，必须实时读，否则证书和属性对不上。
+        let vb_key = Self::runtime_vb_key();
+        let vb_hash = Self::runtime_vb_hash();
         ctx.insert(
             "verified_boot_key".to_string(),
-            Value::String(base64_encode(&rot.vb_key)),
+            Value::String(base64_encode(&vb_key)),
         );
         ctx.insert(
             "verified_boot_hash".to_string(),
-            Value::String(base64_encode(&rot.vb_hash)),
+            Value::String(base64_encode(&vb_hash)),
         );
-        ctx.insert("device_locked".to_string(), Value::Bool(rot.locked));
-        ctx.insert("verified_boot_state".to_string(), Value::from(rot.state));
+        ctx.insert("device_locked".to_string(), Value::Bool(true));
+        ctx.insert("verified_boot_state".to_string(), Value::from(0));
         ctx.insert(
             "creation_datetime_ms".to_string(),
             Value::from(Self::now_ms()),
@@ -1129,52 +1130,24 @@ impl RemoteRelay {
         }
     }
 
-    /// 证书里要声明的 RootOfTrust：**以调用方此刻能 getprop 到的值为准**。
+    /// 证书里要声明的 vbmeta digest：以 `ro.boot.vbmeta.digest` 的**当前**值为准。
     ///
-    /// 每条都是从属性现读，读不到才回落 `config().trust`（那是启动时的快照）。
-    /// 锁定状态和验证状态也一样从属性推，不能硬写 true / 0 —— 设备要是 orange /
-    /// unlocked，证书说 locked 就是自相矛盾，检测器一比就出来。
-    fn runtime_root_of_trust() -> RootOfTrustValues {
-        let (cfg_key, cfg_hash) = Self::verified_boot_values();
-        let vb_key =
-            crate::plat::resetprop::read_string_property("ro.boot.vbmeta.public_key_digest")
-                .as_deref()
-                .and_then(parse_hex32)
-                .unwrap_or(cfg_key);
-        let vb_hash = crate::plat::resetprop::read_string_property("ro.boot.vbmeta.digest")
+    /// 不直接用 `config().trust.vb_hash`：那是 keymint 启动时解析一次的快照，而
+    /// daemon 会在运行时改这个属性。证书和属性必须永远相等，检测器拿两边一比就
+    /// 知道是不是同一台机器。
+    fn runtime_vb_hash() -> [u8; 32] {
+        crate::plat::resetprop::read_string_property("ro.boot.vbmeta.digest")
             .as_deref()
             .and_then(parse_hex32)
-            .unwrap_or(cfg_hash);
-        // `ro.boot.flash.locked` 是 1/0；没有就看 `ro.boot.vbmeta.device_state`。
-        let locked = match crate::plat::resetprop::read_string_property("ro.boot.flash.locked")
+            .unwrap_or(Self::verified_boot_values().1)
+    }
+
+    /// 同上，vbmeta 公钥摘要。
+    fn runtime_vb_key() -> [u8; 32] {
+        crate::plat::resetprop::read_string_property("ro.boot.vbmeta.public_key_digest")
             .as_deref()
-            .map(str::trim)
-        {
-            Some("1") => true,
-            Some("0") => false,
-            _ => match crate::plat::resetprop::read_string_property("ro.boot.vbmeta.device_state")
-                .as_deref()
-                .map(str::trim)
-            {
-                Some(v) if v.eq_ignore_ascii_case("unlocked") => false,
-                _ => true,
-            },
-        };
-        let state = match crate::plat::resetprop::read_string_property("ro.boot.verifiedbootstate")
-            .as_deref()
-            .map(str::trim)
-        {
-            Some(v) if v.eq_ignore_ascii_case("yellow") => 1,
-            Some(v) if v.eq_ignore_ascii_case("orange") => 2,
-            Some(v) if v.eq_ignore_ascii_case("red") => 3,
-            _ => 0,
-        };
-        RootOfTrustValues {
-            vb_key,
-            vb_hash,
-            locked,
-            state,
-        }
+            .and_then(parse_hex32)
+            .unwrap_or(Self::verified_boot_values().0)
     }
 
     /// Forward a sign request for a remote key.
@@ -1234,14 +1207,6 @@ impl RemoteRelay {
 
 fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-/// 证书 RootOfTrust 的四个字段，全部取自当局属性。
-struct RootOfTrustValues {
-    vb_key: [u8; 32],
-    vb_hash: [u8; 32],
-    locked: bool,
-    state: i64,
 }
 
 /// 64 个 hex 字符 → 32 字节；长度或字符不对就当没读到。
