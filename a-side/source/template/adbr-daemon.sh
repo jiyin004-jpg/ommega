@@ -185,6 +185,66 @@ ensure_adbd_tcp() {
   return 1
 }
 
+adbd_manual_pids() {
+  for d in /proc/[0-9]*; do
+    [ -r "$d/comm" ] || continue
+    [ "$(cat "$d/comm" 2>/dev/null)" = "adbd" ] || continue
+    tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'root_seclabel=u:r:su:s0' && printf '%s\n' "${d#/proc/}"
+  done
+}
+
+# 关掉 adbr 之后把留在设备上的痕迹收干净：
+#   - 5555 不能继续监听（检测器会看这个口，用户明确要的）
+#   - adbd 不能一真挂在 TCP 调试形态（ctl.stop 只管 init 那个，手动起的杀不到）
+#   - persist 属性、adb_keys 里的公钥、adbrd 的临时日志一起收
+# 幂等：没痕迹就什么都不动，所以放在主循环里每轮调也不会反复杀 adbd。
+adbr_cleanup_traces() {
+  touched=0
+
+  # 1. 我们手动起的 adbd 实例（带 --root_seclabel=u:r:su:s0），ctl.stop 管不到它。
+  mpids=$(adbd_manual_pids)
+  if [ -n "$mpids" ]; then
+    for p in $mpids; do
+      echo "[adbr] 停掉手动起的 adbd: $p"
+      kill -9 "$p" 2>/dev/null
+    done
+    touched=1
+  fi
+
+  # 2. TCP 端口开关：adbrd 启动时会设成 5555，被杀之后它不会自己清。
+  if [ -n "$(getprop service.adb.tcp.port 2>/dev/null)" ]; then
+    setprop service.adb.tcp.port ""
+    echo "[adbr] 清掉 service.adb.tcp.port"
+    touched=1
+  fi
+
+  # 3. adbd 一直在带旧 prop 跑，得让它重来一遍才会丢掉 5555；只 stop 不 start，
+  # 起不起来交给 init，不替用户决定要不要开 USB 调试。
+  if [ "$touched" = "1" ]; then
+    setprop ctl.stop adbd 2>/dev/null
+  fi
+
+  # 4. ensure_adbd_tcp 设过的 persist 属性（不清的话重启还在）。
+  if [ "$(getprop persist.adb.nonblocking_ffs 2>/dev/null)" = "1" ]; then
+    setprop persist.adb.nonblocking_ffs ""
+    echo "[adbr] 清掉 persist.adb.nonblocking_ffs"
+  fi
+
+  # 5. adb 授权名单：`adbr authorize` 会往 adb_keys 里追加本机公钥，改之前备份成
+  #    adb_keys.bak-adbr。有备份就按备份恢复（那就是我们动手之前的样子）。
+  A=/data/misc/adb/adb_keys
+  B=/data/misc/adb/adb_keys.bak-adbr
+  if [ -f "$B" ]; then
+    cat "$B" > "$A" 2>/dev/null && echo "[adbr] 按备份恢复 adb_keys"
+    rm -f "$B" 2>/dev/null
+    chown system:shell "$A" 2>/dev/null
+    chmod 0640 "$A" 2>/dev/null
+  fi
+
+  # 6. adbrd 的默认日志位置。
+  rm -f /data/local/tmp/adbr.log 2>/dev/null
+}
+
 while true; do
   # adbd 只在 adbr 开关开着时才需要管：以前这里是「不管开没开，属性被设了就管」，
   # 结果开关关着、adbrd 被杀之后 service.adb.tcp.port=5555 还留着，每轮又去 nc 探
@@ -224,18 +284,8 @@ while true; do
       kill $pids 2>/dev/null
       sleep 1
     fi
-    # 不管刚才杀没杀到，只要属性还挂着就收干净 —— adbrd 自己会把
-    # service.adb.tcp.port 设成 5555，被杀后它不会自己清，系统 adbd 就一直挂在 5555。
-    # 以前这段放在「pids 非空」里，pids 一空就不清了，于是主循环每轮又把 adbd 拉起来，
-    # 空转烧 CPU。
-    if [ "$(getprop service.adb.tcp.port 2>/dev/null)" = "5555" ]; then
-      setprop service.adb.tcp.port ""
-      echo "[adbr] 清掉 service.adb.tcp.port=5555"
-      if [ "$(getprop init.svc.adbd 2>/dev/null)" = "running" ]; then
-        setprop ctl.stop adbd
-        echo "[adbr] 停掉 adbd"
-      fi
-    fi
+    # 不管刚才杀没杀到，只要设备上还留着 5555 / 手动 adbd / 授权痕迹，就收干净。
+    adbr_cleanup_traces
   fi
   # 开关开着才需要勤查（adbrd 崩了要拉回来）；关着就慢查，没必要每 2 秒扫一遍 /proc。
   if switch_on; then

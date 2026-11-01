@@ -33,6 +33,25 @@ pkill -9 -x adbrd 2>/dev/null
 rm -rf "$STATE_DIR/adbr-daemon.lock"
 sleep 1
 
+# adbr 留在设备上的痕迹：卸载之后 adbr-daemon.sh 不在了，没人再收这几个，
+# 只能在这里一次清完（5555 监听 / 手动起的 adbd / 授权名单备份 / persist 属性）。
+for d in /proc/[0-9]*; do
+  [ -r "$d/comm" ] || continue
+  [ "$(cat "$d/comm" 2>/dev/null)" = "adbd" ] || continue
+  tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'root_seclabel=u:r:su:s0' || continue
+  kill -9 "${d#/proc/}" 2>/dev/null
+done
+setprop service.adb.tcp.port "" 2>/dev/null
+setprop persist.adb.nonblocking_ffs "" 2>/dev/null
+if [ -f /data/misc/adb/adb_keys.bak-adbr ]; then
+  cat /data/misc/adb/adb_keys.bak-adbr > /data/misc/adb/adb_keys 2>/dev/null
+  rm -f /data/misc/adb/adb_keys.bak-adbr 2>/dev/null
+  chown system:shell /data/misc/adb/adb_keys 2>/dev/null
+  chmod 0640 /data/misc/adb/adb_keys 2>/dev/null
+fi
+rm -f /data/local/tmp/adbr.log 2>/dev/null
+setprop ctl.stop adbd 2>/dev/null
+
 # Restart keystore2 so it drops any Ommega payload the injector loaded into it.
 # The system service manager respawns keystore2 automatically; the fresh
 # process no longer carries the injected library and falls back to the stock
