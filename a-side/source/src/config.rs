@@ -977,6 +977,31 @@ pub fn flat_debug_logging() -> bool {
     flat_config_truthy(&["debug_logging", "debug", "verbose"])
 }
 
+/// 日志级别：平铺 config 的 `log_level` 键（`trace`/`debug`/`info`/`warn`/`error`/`off`），
+/// 没写就是 `Info`。
+///
+/// 以前这里是硬编码 `Debug`，一次开机就写四百多 KB（`rsproperties` 每开一个属性域
+/// 打一行，跟真正要看的东西没关系），既费 IO 也把日志文件刷得快。要现场就把
+/// `log_level: debug` 写进配置，默认只留 `info`。
+pub fn flat_log_level() -> log::LevelFilter {
+    let Ok(contents) = std::fs::read_to_string(CLIENTA_CONFIG_PATH) else {
+        return log::LevelFilter::Info;
+    };
+    let map = parse_flat_config(&contents);
+    match map
+        .get("log_level")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("trace") => log::LevelFilter::Trace,
+        Some("debug") => log::LevelFilter::Debug,
+        Some("warn") => log::LevelFilter::Warn,
+        Some("error") => log::LevelFilter::Error,
+        Some("off") => log::LevelFilter::Off,
+        _ => log::LevelFilter::Info,
+    }
+}
+
 /// Reads one boolean key out of the flat A-side config.  Truthy spellings are
 /// `1` / `true` / `yes` / `on` (case-insensitive): the WebUI writes
 /// `true`/`false` for the relay flags and `0`/`1` for the mask/inject ones, and

@@ -30,6 +30,8 @@ FOREGROUND_OUT=/data/misc/ommega/foreground
 # 读的是同一个文件，不再有「抄一份给宿主」的副本和那轮 cp。
 INJECTOR_TOML=/data/misc/ommega/injector.toml
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
+# soterta.sh 算完落盘的「这台是不是 HIDL 平台」，读文件比每 5 秒 fork 一次便宜得多。
+HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
 LOG_DIR=/data/misc/ommega/logs
 LOG_FILE=$LOG_DIR/daemon.log
@@ -135,6 +137,18 @@ soter_inject_enabled() {
 
 # 日志只落文件。「启用调试日志」关着时一条都不打，开关按循环现读，WebUI 一改
 # 下一次循环就跟着变。
+# 这台是不是 HIDL 平台。soterta.sh 算完就落盘，这里直接读；文件不在才现问一次。
+# 以前是每 5 秒 fork 一个 sh + 扫一遍 VINTF，就为了一个永远不变的常量。
+hidl_platform_flag() {
+  if [ -f "$HIDL_CACHE" ]; then
+    cat "$HIDL_CACHE" 2>/dev/null
+    return
+  fi
+  v=$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r')
+  [ -n "$v" ] && printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null
+  printf '%s' "$v"
+}
+
 log() {
   [ "$LOG_ON" = "1" ] || return 0
   mkdir -p "$LOG_DIR" 2>/dev/null
@@ -471,10 +485,10 @@ EARLY_POLL_SECONDS=90
 started_at=$(date +%s 2>/dev/null || echo 0)
 # 主循环的拍数：前台那个活代价比读文件大，没必要每拍都干（见 sync_foreground）。
 tick=0
-# 前台应用多久采一次（拍数）。5 秒一拍 × 2 = 约 10 秒；daemon 那边认 20 秒内的，所以
-# 任何时候它读到的那份最多 10 秒旧——之前是 3 拍（≈15 秒）写一次、只认 8 秒，大部分时候
-# 都是“过期的没有”，等于这一道不存在。
-FOREGROUND_EVERY=2
+# 前台应用多久采一次（拍数）。5 秒一拍 × 12 = 约 60 秒；daemon 那边认 90 秒内的。
+# `dumpsys window` 单次代价是几百毫秒，以前每 10 秒跑一次（×2）就是在持续白烧 CPU：
+# 它只是最后一道兜底（uid_packages 表 + appId 回退在前面），没必要这么密。
+FOREGROUND_EVERY=12
 tick_sleep() {
   ticks=$((ticks + 1))
   # --once：跑完一轮就退出（调试用）。
@@ -599,7 +613,7 @@ while true; do
   #   客户端走 hwservicemanager，我们顶不了那个名字，只能注进宿主，在它进程里把发往
   #   HAL 的那笔截下来自己答（hook/soter.rs 按 HIDL 布局回包）。不注就等于没接管，
   #   原厂 TA 死着的时候整族调用 -20。
-  if [ "$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r')" = "1" ] && soter_inject_enabled; then
+  if [ "$(hidl_platform_flag)" = "1" ] && soter_inject_enabled; then
     inject_targets=keystore2,soter
   else
     inject_targets=keystore2

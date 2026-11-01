@@ -118,6 +118,8 @@ rm -f "$STATE_DIR/restart.injector"
 rm -f "$STATE_DIR/restart.all"
 rm -f "$STATE_DIR/keymint-daemon.pid"
 rm -f "$STATE_DIR/injector-daemon.pid"
+# HIDL 平台缓存（soterta.sh 算完落的那份）：换机器/重装时不该沿用上一次的结论。
+rm -f "$STATE_DIR/conf/soter_hidl_platform" 2>/dev/null
 # 以前一个脚本一个日志文件，现在统一成 daemon.log；把旧的散件也收掉。
 rm -f "$STATE_DIR/boot-debug.log" 2>/dev/null
 rm -f "$STATE_DIR"/logs/adbr.log "$STATE_DIR"/logs/adbr-daemon.log \

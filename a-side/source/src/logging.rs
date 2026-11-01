@@ -34,28 +34,29 @@ pub fn init_logger() {
             log::set_max_level(LevelFilter::Off);
             return;
         }
-        if let Err(error) = init_logger_inner() {
+        let level = crate::config::flat_log_level();
+        if let Err(error) = init_logger_inner(level) {
             eprintln!("keymint logging failed to initialize: {error:#}");
         }
     });
 }
 
-fn init_logger_inner() -> Result<()> {
+fn init_logger_inner(level: LevelFilter) -> Result<()> {
     // 只落文件，不走 logcat。
     let (config, file_logging_ready) = kmr_common::runtime::logging::build_file_config(
         DEFAULT_LOG_PATH,
         PATTERN,
-        LevelFilter::Trace,
+        level,
         "keymint logging",
     )?;
     log4rs::init_config(config)?;
-    log::set_max_level(LevelFilter::Debug);
+    log::set_max_level(level);
 
     if file_logging_ready {
         log::info!(
             "file logging enabled at {} with level {:?}",
             DEFAULT_LOG_PATH,
-            LevelFilter::Debug
+            level
         );
     }
 

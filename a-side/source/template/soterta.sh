@@ -36,6 +36,15 @@ LOG=/data/misc/ommega/logs/daemon.log
 # 所以：结果没变就不打；hidl/status 这种纯查询连缓存都不碰（QUIET=1）。
 RESOLVED_CACHE=$STATE_DIR/conf/soter_hal.cache
 QUIET=0
+# `hidl` 是纯查询（daemon-injector 每 5 秒问一次），**不参与单实例锁**：
+# 抢不到锁时 `exit 0` 不输出，调用方就会把「没输出」当成「不是 HIDL 平台」，
+# 于是那一轮 inject_targets 不含 soter —— HIDL 机器上表现为偶尔不注 SOTER 宿主。
+# 平台不会变，第一次算完就落盘（见下面 hidl) 分支），之后这里直读文件。
+HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
+if [ "$1" = "hidl" ] && [ -f "$HIDL_CACHE" ]; then
+  cat "$HIDL_CACHE"
+  exit 0
+fi
 # 单实例：service.sh 的 keep-alive 和 daemon-injector 都会调这个脚本，并发跑两次就会
 # 同时起两个 `--soterta-serve`（实测 6212/6213 并存一个多小时）。会话号存在进程内存里，
 # initSign 落在 A 进程、finishSign 落到 B 进程就回 -1000 —— 检测器的 T12 每轮必挂，
@@ -403,8 +412,12 @@ case "$1" in
     # 是就打印 1、不是打印 0（它据此决定注不注 SOTER 宿主）。
     # 纯查询：不写日志（这条每 5 秒被问一次）。
     QUIET=1
-    resolve_hal
-    if hidl_platform; then echo 1; else echo 0; fi
+    # 注意：这里**不要**调 resolve_hal —— hidl 只看 VINTF，跟服务名解析无关，
+    # 少一次 hwservicemanager 查询。算完顺手落盘，下次直接读缓存文件。
+    if hidl_platform; then v=1; else v=0; fi
+    mkdir -p "${HIDL_CACHE%/*}" 2>/dev/null
+    printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null
+    echo "$v"
     exit 0
     ;;
   status)

@@ -1256,7 +1256,14 @@ impl TaskStore {
         // 把任务回收成 Pending 后，原设备的晚到结果依旧是有效结果，此时
         // assigned_device_id 已被清空，下面的归属校验自然跳过。
         {
-            let task = inner.tasks.get(task_id).expect("checked above");
+            // 上面刚查过，但这里不能用 expect：panic 会毒化整个状态锁，
+            // 等于服务停摆。真跑到这只能是锁内逻辑被改过，当重复回传幂等处理。
+            let Some(task) = inner.tasks.get(task_id) else {
+                tracing::warn!(
+                    "complete_task: task {task_id} vanished under the lock; ignoring report from {device_id}"
+                );
+                return Ok(());
+            };
             match task.status {
                 TaskStatus::Assigned | TaskStatus::Pending => {}
                 // 重复回传当幂等处理：结果已经在里面了，不动它，也不报错 ——
