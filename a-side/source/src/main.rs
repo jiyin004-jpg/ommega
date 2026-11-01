@@ -27,6 +27,7 @@ use crate::{
 pub mod att_mgr;
 pub mod config;
 pub mod consts;
+pub mod daemon;
 pub mod global;
 pub mod keybox;
 pub mod keymaster;
@@ -303,6 +304,17 @@ fn install_module_info_bundle_if_available() -> Result<()> {
 }
 
 fn main() {
+    // 守护模式：`keymint --daemon` 直接进守护循环（替掉原来的 `template/daemon`
+    // shell 脚本）。放在最前面，连日志初始化都不需要 —— 守护只在「启用调试日志」
+    // 开着时自己落文件，跟 shell 版一致。
+    if std::env::args().any(|arg| arg == "--daemon") {
+        let extra: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|arg| arg != "--daemon")
+            .collect();
+        daemon::run(extra);
+    }
+
     logging::init_logger();
     prepare_android_storage();
     panic::set_hook(Box::new(|panic_info| {

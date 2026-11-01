@@ -123,10 +123,34 @@ kill_all() {
   sleep 1
 }
 
+# keymint 守护：优先用 Rust 版（`keymint --daemon`），二进制缺失时回落 shell 脚本。
+#
+# 装 Rust 版就是为了干掉每 10 秒那十几次 fork（grep/sed/getprop/resetprop），
+# shell 版实测光它自己就吃 4.9% CPU。两者行为一致，回退只是保底。
+start_keymint_daemon() {
+  pidfile=$RUN_DIR/keymint-daemon.pid
+
+  if [ -f "$pidfile" ]; then
+    pid=$(cat "$pidfile" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "--daemon"; then
+      return 0
+    fi
+    rm -f "$pidfile"
+  fi
+
+  if [ -x "$BIN_DIR/keymint" ]; then
+    "$BIN_DIR/keymint" --daemon &
+  else
+    sh "$MODDIR/daemon" &
+  fi
+  echo "$!" > "$pidfile"
+  return 0
+}
+
 # post-fs-data 阶段可能已经把两个守护拉起来了（为了抢在 keystore2 之前守着，好接住开机
 # 解锁那份材料）。那两个还活着就别 kill 重来 —— 那会把刚抢到的时间窗白白丢掉。
 daemons_alive() {
-  for spec in "$RUN_DIR/keymint-daemon.pid:$MODDIR/daemon" "$RUN_DIR/injector-daemon.pid:$INJECTOR_CMD"; do
+  for spec in "$RUN_DIR/keymint-daemon.pid:--daemon" "$RUN_DIR/injector-daemon.pid:$INJECTOR_CMD"; do
     pf=${spec%%:*}
     sp=${spec#*:}
     [ -f "$pf" ] || return 1
@@ -141,7 +165,7 @@ if daemons_alive; then
 else
   kill_all
   update_status "Ommega ⏳ 启动中"
-  start_daemon "$MODDIR/daemon" "$RUN_DIR/keymint-daemon.pid"
+  start_keymint_daemon
   ensure_sepolicy
   start_daemon "$INJECTOR_CMD" "$RUN_DIR/injector-daemon.pid"
 fi
@@ -192,7 +216,11 @@ daemon_one_alive() {
 
 keep_daemons_alive() {
   fixed=0
-  for spec in "$MODDIR/daemon:$RUN_DIR/keymint-daemon.pid" "$INJECTOR_CMD:$RUN_DIR/injector-daemon.pid"; do
+  # keymint 守护优先 Rust 版（`keymint --daemon`），回落到 shell 脚本。
+  if ! daemon_one_alive "--daemon" "$RUN_DIR/keymint-daemon.pid"; then
+    start_keymint_daemon && fixed=1
+  fi
+  for spec in "$INJECTOR_CMD:$RUN_DIR/injector-daemon.pid"; do
     sp=${spec%%:*}
     pf=${spec#*:}
     if ! daemon_one_alive "$sp" "$pf"; then

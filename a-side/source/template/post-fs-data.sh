@@ -507,24 +507,34 @@ start_daemon_early() {
   if [ "$script" = "$MODDIR/daemon-injector" ] && [ -x "$BIN_DIR/inject-watchdog" ]; then
     script=$BIN_DIR/inject-watchdog
   fi
+  # keymint 守护改由 Rust 版（`keymint --daemon`）跑；二进制不在时仍用 shell 脚本。
+  if [ "$script" = "$MODDIR/daemon" ] && [ -x "$BIN_DIR/keymint" ]; then
+    script=$BIN_DIR/keymint
+    extra=--daemon
+  else
+    extra=
+  fi
+  check=$script
+  [ -n "$extra" ] && check=$extra
   if [ -f "$pidfile" ]; then
     pid=$(cat "$pidfile" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$script"; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$check"; then
       return 0
     fi
     rm -f "$pidfile"
   fi
   # 离开 post-fs-data 阶段后子进程可能被收走，所以用 setsid 脱开（没有就退回普通后台）。
-  # watchdog 是 ELF，不能套 sh。
+  # watchdog / keymint 都是 ELF，不能套 sh。
   case "$script" in
     */inject-watchdog) start_cmd=$script ;;
+    */keymint) start_cmd="$script $extra" ;;
     *) start_cmd= ;;
   esac
   if [ -n "$start_cmd" ]; then
     if command -v setsid >/dev/null 2>&1; then
-      setsid "$start_cmd" >/dev/null 2>&1 &
+      setsid $start_cmd >/dev/null 2>&1 &
     else
-      "$start_cmd" >/dev/null 2>&1 &
+      $start_cmd >/dev/null 2>&1 &
     fi
   elif command -v setsid >/dev/null 2>&1; then
     setsid sh "$script" >/dev/null 2>&1 &
@@ -534,7 +544,7 @@ start_daemon_early() {
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
-  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$script"; then
+  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$check"; then
     rm -f "$pidfile"
     return 1
   fi
