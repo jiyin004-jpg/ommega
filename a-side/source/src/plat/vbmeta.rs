@@ -147,6 +147,12 @@ fn resolve_vb_key(spec: &TrustValueSpec, device_locked: bool, slot_suffix: &str)
         },
         TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
         TrustValueSpec::Auto => {
+            if let Some(value) = boot_key_from_env() {
+                return ResolvedField {
+                    value,
+                    source: TrustValueSource::Property,
+                };
+            }
             if let Some(value) = read_hex_property(VBMETA_KEY_PROP) {
                 return ResolvedField {
                     value,
@@ -176,6 +182,15 @@ fn resolve_vb_hash(spec: &TrustValueSpec) -> ResolvedField {
         },
         TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
         TrustValueSpec::Auto => {
+            // 环境变量优先：daemon 启动本进程时用 `getprop` 读好的那一份，就是
+            // 检测器能看到的 `ro.boot.vbmeta.digest`。keymint 自己读属性不可靠
+            // （读不到就静默退回「原机分区算出来的值」），那样子证书和属性就对不上。
+            if let Some(value) = boot_hash_from_env() {
+                return ResolvedField {
+                    value,
+                    source: TrustValueSource::Property,
+                };
+            }
             if let Some(value) = read_hex_property(VBMETA_HASH_PROP) {
                 return ResolvedField {
                     value,
@@ -195,6 +210,18 @@ fn resolve_vb_hash(spec: &TrustValueSpec) -> ResolvedField {
             }
         }
     }
+}
+
+/// daemon 通过环境变量传进来的 verified-boot hash（`OMMEGA_BOOT_HASH`）。
+fn boot_hash_from_env() -> Option<[u8; 32]> {
+    let raw = std::env::var("OMMEGA_BOOT_HASH").ok()?;
+    parse_hex_32(raw.trim()).ok()
+}
+
+/// 同理，vbmeta 公钥摘要。
+fn boot_key_from_env() -> Option<[u8; 32]> {
+    let raw = std::env::var("OMMEGA_BOOT_KEY").ok()?;
+    parse_hex_32(raw.trim()).ok()
 }
 
 fn random_field(source: TrustValueSource) -> ResolvedField {

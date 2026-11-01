@@ -846,6 +846,16 @@ impl Fulfill {
             Some(h) if h.len() == 32 => h,
             _ => boot_value_seed(device_id, "boothash", stamp).to_vec(),
         };
+        // 排障：A 端到底报了什么。Boot consistency 那类问题全看这一行。
+        tracing::info!(
+            "parse_ctx: device={device_id} A 上报 hash={} locked={:?} state={:?} keys={:?}",
+            hex_prefix(&vb_hash, 12),
+            ctx.get("device_locked"),
+            ctx.get("verified_boot_state"),
+            ctx.as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<String>>())
+                .unwrap_or_default(),
+        );
         p.root_of_trust = Some(RootOfTrust {
             verified_boot_key: vb_key,
             device_locked: ctx
@@ -1765,6 +1775,15 @@ fn decrypt_oaep(
         Some(e) => Err(anyhow::anyhow!("rsa oaep decrypt failed: {e}")),
         None => Err(anyhow::anyhow!("rsa oaep decrypt failed")),
     }
+}
+
+/// 把前 `n` 字节打成 hex，排障日志用。
+fn hex_prefix(bytes: &[u8], n: usize) -> String {
+    bytes
+        .iter()
+        .take(n)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 /// 按 (用途, 设备, 固定串) 派生一个 32 字节值。

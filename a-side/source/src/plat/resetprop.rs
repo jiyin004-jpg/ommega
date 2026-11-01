@@ -209,10 +209,40 @@ pub fn direct_write_and_verify_property(property: &str, value: &str) -> Result<(
 }
 
 pub fn read_string_property(name: &str) -> Option<String> {
-    rsproperties::get::<String>(name)
+    if let Some(value) = rsproperties::get::<String>(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+    // rsproperties 直接 mmap `/dev/__properties__` 解析属性区，在 keymint 这种静态
+    // 链接的进程里拿不到（返回 Err，被 `.ok()` 吞掉后静默走进兼容回退，于是证书就
+    // 用了开机快照而不是当前属性）。
+    //
+    // 退回模块自带的 resetprop：它在同一台设备上实测能读到实时值（`resetprop <name>`
+    // 打印当前值），而且就住在 `/data/adb` 下，keymint 一定 exec 得动。
+    read_property_via_resetprop(name)
+}
+
+/// 用模块自带的 resetprop 读一次属性（`resetprop <name>` 打印当前值）。
+fn read_property_via_resetprop(name: &str) -> Option<String> {
+    for command in resetprop_candidates() {
+        let Ok(output) = std::process::Command::new(&command.program)
+            .arg(name)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// 所有可用的 resetprop，按优先级排。
