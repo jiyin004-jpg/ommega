@@ -597,6 +597,15 @@ while true; do
     # 然后自删自建死循环。清掉之后每个 App 下次请求现造 ASK，counter 从 1 开始。
     rm -f /data/misc/ommega/soter_asks.json /data/misc/ommega/soter_counter 2>/dev/null
     log "[injector-daemon] ATTK changed; cleared ASK/authkey/counter"
+    # App 自己那份「已开通」也得作废：微信这类把 WechatASK=1 记在
+    # shared_prefs/soter_status.xml 里，不清它就不会重走开通，继续拿旧链签名 ——
+    # 本地验得过、腾讯不认，就是「换了 ATTK 也没反应」那种卡住。
+    _cleared=0
+    for _f in /data/user/*/*/shared_prefs/soter_status.xml; do
+      [ -f "$_f" ] || continue
+      if rm -f "$_f" 2>/dev/null; then _cleared=$((_cleared + 1)); fi
+    done
+    log "[injector-daemon] ATTK changed; cleared soter_status of $_cleared app(s)"
     # 软件 TA 是独立进程，内存里那份 ASK 也得跟着没（它自己不会去读文件）。
     pkill -f 'soterta-ta --soterta-serve' 2>/dev/null
     # ASK/ATTK 换了：keystore2 里那份 payload 的 state（ATTK 与已加载的 ASK）是启动时
