@@ -272,6 +272,21 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
 const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
 const ASK_SECTION: &str = "asks";
 const AUTH_SECTION: &str = "authkeys";
+/// store 里记的「这把 ASK/AuthKey 是哪把 ATTK 签的」（ATTK 公钥的 sha256）。
+///
+/// 真机不用担心这个（ATTK 在 TEE 里换不了），我们能换 ATTK，就必须自己管一致性：
+/// 否则换了一把 ATTK 之后，store 里旧 AuthKey 照用 —— 本地签名链自洽、微信本地
+/// 验得过，但那一笔根本没再问过腾讯，表现为「不重启就能用、重启就不行」。
+const ATTK_FIELD: &str = "attk";
+
+/// 当前 ATTK 公钥的指纹（sha256 hex）。
+fn attk_fingerprint() -> Option<String> {
+    use rsa::sha2::{Digest, Sha256};
+    let attk = current_attk()?;
+    let mut hasher = Sha256::new();
+    hasher.update(attk.pem.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
 
 /// 落盘那一瞬间的互斥：读改写不是原子操作，两个 uid 同时进来会互相盖掉。
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
@@ -290,7 +305,17 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
                 wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
                 return wrapped;
             }
-            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION);
+            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION || key == ATTK_FIELD);
+            // 指纹对不上（换了 ATTK）或者是没记指纹的旧 store：整份作废，让调用方
+            // 重新生成。留着只会拿旧 ATTK 签的链去跑，本地能过、腾讯不认。
+            let want = attk_fingerprint();
+            let got = map.get(ATTK_FIELD).and_then(|v| v.as_str());
+            if !matches!((want.as_deref(), got), (Some(w), Some(g)) if w == g) {
+                log::info!(
+                    "soter local ask store was not minted by the current ATTK; discarding it"
+                );
+                return serde_json::Map::new();
+            }
             map
         }
         _ => {
@@ -301,7 +326,14 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
 }
 
 fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    let text = serde_json::to_string_pretty(map).ok()?;
+    let mut out = map.clone();
+    if let Some(fingerprint) = attk_fingerprint() {
+        out.insert(
+            ATTK_FIELD.to_string(),
+            serde_json::Value::String(fingerprint),
+        );
+    }
+    let text = serde_json::to_string_pretty(&out).ok()?;
     let path = ASK_STORE_PATH;
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
