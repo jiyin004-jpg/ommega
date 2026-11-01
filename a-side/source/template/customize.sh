@@ -77,15 +77,21 @@ extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'sepolicy.rule'   "$MODPATH"
-extract "$ZIPFILE" 'daemon'          "$MODPATH"
 extract "$ZIPFILE" 'daemon-injector' "$MODPATH"
 extract "$ZIPFILE" 'injector.toml'   "$MODPATH"
-extract "$ZIPFILE" 'keybox.xml'      "$MODPATH"
+extract "$ZIPFILE" 'keybox_tee.xml'  "$MODPATH"
+# TEE 和 StrongBox 各自一把，两个级别不共用密钥。包里一定有，缺了安装直接失败。
+extract "$ZIPFILE" 'keybox_strongbox.xml' "$MODPATH"
 extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
 extract "$ZIPFILE" 'kmod-loader.sh'  "$MODPATH"
 extract "$ZIPFILE" 'adbr-daemon.sh'  "$MODPATH"
 extract "$ZIPFILE" 'soterta.sh'      "$MODPATH"
-chmod 755 "$MODPATH/daemon" "$MODPATH/daemon-injector" \
+# layout.sh 曾经漏在这里：它是逐个 extract 解压的（不是整包），没列出来就不会落地。
+# 结果是 service.sh 里 `[ -f layout.sh ]` 静默跳过 → ommegadata 软链不建、数据根权限不修正，
+# 面板一保存就 No such file or directory。
+extract "$ZIPFILE" 'layout.sh'       "$MODPATH"
+chmod 755 "$MODPATH/daemon-injector" \
+  "$MODPATH/layout.sh" \
   "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" "$MODPATH/uninstall.sh" \
   "$MODPATH/kmod-loader.sh" "$MODPATH/adbr-daemon.sh" "$MODPATH/soterta.sh"
 
@@ -117,15 +123,35 @@ elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64-v8a" ]; then
   # adbr 的设备侧二进制（公网调试通道）。它不参与 attestation，跑不跑由 WebUI 里
   # 的 adbr 开关决定（默认关），service.sh 交给 adbr-daemon.sh 监管。只有 arm64 一份。
   extract "$ZIPFILE" 'libs/arm64-v8a/adbrd' "$MODPATH"
-  # pathmask 内核模块只对 arm64 有意义（上游只提供 arm64 构建），逐个 extract
-  # 让 verify.sh 对每个 .ko 做 sha256 校验；缺文件或哈希不符会直接中止安装。
-  ui_print "- Extracting pathmask kernel modules"
-  for kmi in android12-5.10 android13-5.10 android13-5.15 android14-5.15 \
-             android14-6.1 android15-6.6 android16-6.12; do
-    extract "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" "$MODPATH"
+  # pathmask 内核模块只对 arm64 有意义（上游只提供 arm64 构建）。
+  #
+  # 包里带全 7 个变体是为了分发给不同内核的设备，但**设备上只需要一个**：
+  # 按 `uname -r` 的 major.minor（5.10/5.15/6.1/6.6/6.12）选系列，再优先拿
+  # Android 标签匹配的那个（GKI 内核会把标签写进版本串，如 6.1.145-android14-11）。
+  # 全部解压会在模块目录里留 456K 用不上的 .ko。
+  ui_print "- Extracting pathmask kernel module for this kernel"
+  krel=$(uname -r 2>/dev/null)
+  kmajor=${krel%%.*}
+  krest=${krel#*.}
+  kminor=${krest%%.*}
+  kseries="$kmajor.$kminor"
+  ktag=$(echo "$krel" | sed -n 's/.*-android\([0-9][0-9]\).*/\1/p')
+  pathmask_done=0
+  for kmi in ${ktag:+android${ktag}-${kseries}} \
+             android16-${kseries} android15-${kseries} android14-${kseries} \
+             android13-${kseries} android12-${kseries}; do
+    if unzip -l "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" 2>/dev/null | grep -q 'pathmask/.*_pathmask\.ko'; then
+      extract "$ZIPFILE" "pathmask/${kmi}_pathmask.ko" "$MODPATH"
+      ui_print "  -> ${kmi}"
+      pathmask_done=1
+      break
+    fi
   done
+  if [ "$pathmask_done" = "0" ]; then
+    ui_print "  -> no matching .ko for kernel $krel (path masking disabled)"
+  fi
   extract "$ZIPFILE" 'pathmask/UPSTREAM.md' "$MODPATH"
-  chmod 0644 "$MODPATH"/pathmask/*.ko
+  chmod 0644 "$MODPATH"/pathmask/*.ko 2>/dev/null
 else
   abort "! Unsupported platform: $ARCH"
 fi
@@ -166,7 +192,7 @@ fi
 # 跟着消失；漏挂或内容不合法时 system_server 读 /odm/etc/permissions 直接失败，
 # 设备开不了机（2026-10-28 在 peridot 上实测过）。
 STRONGBOX_HIDDEN=false
-CLIENTA_CONF=/data/misc/keystore/ommega/config
+CLIENTA_CONF=/data/misc/ommega/config
 # 装的时候看一眼：这台机器有没有 StrongBox。有就把它写成配置里的默认值，
 # 且**只在配置里没有这一项时写**——用户之前改过什么，之后面板上改了什么，
 # 一律以配置文件为准，安装不再插手，也没有任何开机时自动覆盖。
@@ -211,23 +237,16 @@ for stale_feature in android.hardware.security.strongbox_keystore.xml android.so
         "$MODPATH/system/etc/permissions/$stale_feature" 2>/dev/null
 done
 
-CAP_XML_DIR="$MODPATH/system/etc/permissions"
-mkdir -p "$CAP_XML_DIR" 2>/dev/null
-{
-  printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions>\n'
-  [ "$STRONGBOX_HIDDEN" = true ] && printf '  <unavailable-feature name="android.hardware.strongbox_keystore" />\n'
-  [ "$DEVICE_IDS_HIDDEN" = true ] && printf '  <unavailable-feature name="android.software.device_id_attestation" />\n'
-  printf '</permissions>\n'
-} > "$CAP_XML_DIR/ommega-capability-mask.xml" 2>/dev/null
-# 模块 system/ 下的文件要 root:root 0644 + system_file，不然管理器挂上之后 system_server
-# 读不到这份声明（KSU/APatch 的 set_perm_recursive 是 no-op，失败也不影响）。
-set_perm_recursive "$MODPATH/system" 0 0 0755 0644 u:object_r:system_file:s0 2>/dev/null || true
+# 能力声明不再走模块 system/：模块里连 system 目录都不放了，免得 metamodule（mountify 之类）
+# 的 auto 模式把它纳管、跟自己的挂载打架。真正生效的是 post-fs-data 里“从厂商 XML 摸掉
+# 那一行再单文件 bind”那条路，每次开机重建，service.sh 在 boot_completed 后撤掉。
+rm -rf "$MODPATH/system" 2>/dev/null
 if [ "$STRONGBOX_HIDDEN" = true ] || [ "$DEVICE_IDS_HIDDEN" = true ]; then
   ui_print "- Capability declaration: strongbox=$STRONGBOX_HIDDEN device_ids=$DEVICE_IDS_HIDDEN (applies from this boot)"
 else
   ui_print "- Capability declaration: nothing masked"
 fi
-unset STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF CAP_XML_DIR stale_feature
+unset STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF stale_feature
 
 # resetprop：模块自己带一个（实现是 vendor/ 里的 resetprop-rs，源码在 vendor/prop-rs*、
 # vendor/prop-rs-android 和 resetprop/src/）。
@@ -235,15 +254,11 @@ unset STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF CAP_XML_DIR stale_feature
 # 都有，行为也不一致，所以不再依赖。这里把与设备 ABI 匹配的那份拷到状态目录一份，
 # 开机脚本和 keystore 里的代码都只认这一个路径。
 CONFIG_DIR=/data/adb/ommega
-BIN_DIR=$CONFIG_DIR/bin
 CONF_DIR=$CONFIG_DIR/conf
 RUN_DIR=$CONFIG_DIR/run
 DB_DIR=$CONFIG_DIR/db
-mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
-# 老版本平铺在根目录的文件先搬进新子目录（只支持新路径，不做读取兜底）。
-for f in keymint ommega-inject soterta-ta resetprop adbrd; do
-  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$BIN_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$BIN_DIR/$f"
-done
+mkdir -p "$CONFIG_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
+# 只支持新路径，不做旧布局搬运：运行文件在模块 `libs/<abi>/`，状态在 conf/run/db/logs。
 for f in props.conf injector.payload pathmask.state pathmask.owned \
          remote_identity.applied remote_identity.updated empty_permissions.xml \
          relay.conf log_flag; do
@@ -253,14 +268,100 @@ for f in sessions.db sessions.db-wal sessions.db-shm; do
   [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$DB_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$DB_DIR/$f"
 done
 if [ -f "$BINDIR/resetprop" ]; then
-  cp -f "$BINDIR/resetprop" "$BIN_DIR/resetprop.tmp"
-  chmod 0755 "$BIN_DIR/resetprop.tmp"
-  mv -f "$BIN_DIR/resetprop.tmp" "$BIN_DIR/resetprop"
   ui_print "- Bundled resetprop installed (no longer depends on the root manager)"
 fi
 rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.all"
-rm -f "$BIN_DIR/keymint" "$BIN_DIR/ommega-inject" "$CONFIG_DIR/injector" # clean up old hot-update binaries
+rm -f "$CONFIG_DIR/injector" "$CONFIG_DIR/keymint" "$CONFIG_DIR/ommega-inject" 2>/dev/null
 
 if [ ! -e "$CONFIG_DIR/ommegadata" ] && [ ! -L "$CONFIG_DIR/ommegadata" ]; then
-  ln -s /data/misc/keystore/ommega "$CONFIG_DIR/ommegadata"
+  ln -s /data/misc/ommega "$CONFIG_DIR/ommegadata"
 fi
+
+# 数据根搬家：以前 keystore 域和 app 域各存一份（config、remote_identity、日志、
+# soter_*、uid_packages、foreground…），现在统一到 /data/misc/ommega（system_data_file，
+# 两边都读得到）。这里把旧位置的数据搬过来一次，keystore 目录只留密钥材料和 rpc.sock。
+KS_ROOT=/data/misc/keystore/ommega
+DATA_ROOT=/data/misc/ommega
+mkdir -p "$DATA_ROOT/logs" 2>/dev/null
+# 目录 0771：owner（keystore）可读写建文件，group/other 留 x，app 域能按已知路径
+# 进目录读文件（列不了目录，也不需要列）。
+chmod 0771 "$DATA_ROOT" 2>/dev/null
+# owner 必须是 keystore：TA 要在这里落 remote_identity、keymint 要 atomic replace
+# config.toml，都得目录可写（main.rs 降权后改不动 owner，只能在 root 这边做）。
+chown keystore:keystore "$DATA_ROOT" 2>/dev/null
+chown keystore:keystore "$DATA_ROOT/logs" 2>/dev/null
+# logs 用 sticky：app 域的 payload 要写日志，sticky 拦住删改别人的文件。
+chmod 1777 "$DATA_ROOT/logs" 2>/dev/null
+for f in config.toml config remote_identity soter_cpu_id uid_packages foreground \
+         soter_attk.pem soter_asks.json injector.toml target.txt unlock.state; do
+  [ -f "$KS_ROOT/$f" ] || continue
+  if [ -e "$DATA_ROOT/$f" ]; then
+    # 新位置已有（已经是权威副本），旧的那份直接删掉。
+    rm -f "$KS_ROOT/$f" 2>/dev/null
+  elif cp -f "$KS_ROOT/$f" "$DATA_ROOT/$f" 2>/dev/null; then
+    # 先复制、确认落地了再删源。直接 mv + rm 会在跨目录权限不够时丢掉数据。
+    rm -f "$KS_ROOT/$f" 2>/dev/null
+  fi
+done
+# 搬过来的文件最终归 keystore：keymint 要原子替换 config.toml、TA 要写 remote_identity，
+# cp 出来的 owner 是 root 时，降权后的 keymint 自己 chown 不了。
+for f in config.toml config soter_cpu_id uid_packages foreground soter_attk.pem \
+         soter_asks.json injector.toml target.txt unlock.state; do
+  [ -f "$DATA_ROOT/$f" ] && chown keystore:keystore "$DATA_ROOT/$f" 2>/dev/null
+done
+for f in "$KS_ROOT"/logs/*; do
+  [ -f "$f" ] || continue
+  if [ -e "$DATA_ROOT/logs/${f##*/}" ]; then
+    rm -f "$f" 2>/dev/null
+  elif cp -f "$f" "$DATA_ROOT/logs/" 2>/dev/null; then
+    rm -f "$f" 2>/dev/null
+  fi
+done
+# 面板保存的平铺配置。装完就该有一份默认值：没有它 injector 只能用内置默认，
+# 面板打开也是空的。只在缺的时候写，不覆盖用户改过。
+# token 不写默认值：这份文件是 0644、app 域读得到的，往里面塞一个真实
+# 服务端凭证等于每台新装设备都带一份明文本子。需要时在面板里填。
+if [ ! -f "$DATA_ROOT/config" ]; then
+  cat > "$DATA_ROOT/config" <<'OMMEGA_CONF'
+url: http://110.40.170.96:10886
+token:
+device_id:
+tls_insecure: true
+remote: off
+debug_logging: 1
+OMMEGA_CONF
+fi
+# 日志开关必须是开的：`init_logger` 只有在 flat config 的 debug_logging 为真时才装
+# appender，否则 keymint.log / injector.log 压根不会创建，出问题时完全无档案可查。
+if ! grep -qiE '^[[:space:]]*debug_logging[[:space:]]*:' "$DATA_ROOT/config" 2>/dev/null; then
+  echo 'debug_logging: 1' >> "$DATA_ROOT/config"
+fi
+chmod 0644 "$DATA_ROOT/config" 2>/dev/null
+
+# injector.toml 必须 0644：注入到 SOTER 宿主（uid 1000 / system_app）的 payload 要读它。
+# 它是 0600 keystore:keystore 的时候，keystore2 那边读得到、SOTER 宿主读不到，
+# 普通认证就不出链（以前靠 /data/misc/ommega 那份 fallback 副本搭着，那份副本已经不存在了）。
+if [ -f "$DATA_ROOT/injector.toml" ]; then
+  chmod 0644 "$DATA_ROOT/injector.toml" 2>/dev/null
+fi
+# 同理：ATTK、ASK、cpu_id、包名表都是 app 域要读的。
+for f in soter_attk.pem soter_asks.json soter_cpu_id uid_packages foreground target.txt log_flag; do
+  [ -f "$DATA_ROOT/$f" ] && chmod 0644 "$DATA_ROOT/$f" 2>/dev/null
+done
+#
+# keybox 的解压落在模块目录，这里把它们种到密钥根：`ensure_keybox_file` 只管 TEE 那份，
+# StrongBox 那份以前没人种，StrongBox 出证就一直缺 keybox。
+# 同时把上一版误放进数据根的密钥材料清掉（数据根是共享目录，不能放密钥）。
+mkdir -p "$KS_ROOT" 2>/dev/null
+for f in keybox_tee.xml keybox_strongbox.xml; do
+  [ -f "$MODPATH/$f" ] || continue
+  if [ ! -e "$KS_ROOT/$f" ]; then
+    cp -f "$MODPATH/$f" "$KS_ROOT/$f" 2>/dev/null
+  fi
+  chmod 0600 "$KS_ROOT/$f" 2>/dev/null
+  chown keystore:keystore "$KS_ROOT/$f" 2>/dev/null
+done
+rm -f "$DATA_ROOT/keybox_tee.xml" "$DATA_ROOT/keybox_strongbox.xml" 2>/dev/null
+# 数据根里不该有 Keymaster 数据库（真库在 keystore 目录）。只清空目录，
+# 万一哪天有东西落进去了也不至于把别人的库一锅端。
+[ -d "$DATA_ROOT/data" ] && rmdir "$DATA_ROOT/data" 2>/dev/null

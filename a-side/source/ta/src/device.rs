@@ -235,6 +235,16 @@ pub struct RemoteAttestParams {
     /// 调用方自带的证明密钥（App AttestKey 委派）。有值时这把 key 的证书必须由
     /// B 端真 TEE 用那把已有的 ATTEST_KEY 原生签发，**不是**由本端软件 keybox 伪造。
     pub attestation_key: Option<RemoteAttestationKey>,
+    /// SHA-256 of the device's APEX module info bundle (`KM_TAG_MODULE_HASH`,
+    /// KeyMint tag 724), exactly as the local software keybox path already
+    /// receives it through `PerformOpReq::SetAdditionalAttestationInfo`.
+    ///
+    /// AOSP requires KeyMint 4.0+ to echo this tag into the attestation
+    /// extension; the local path does, but the remote path used to drop it, so
+    /// a relay-minted leaf came back without `[724]` while
+    /// `getSupplementaryAttestationInfo(MODULE_HASH)` still returned the local
+    /// bundle — the mismatch verifiers report as "module hash omitted".
+    pub module_hash: Option<Vec<u8>>,
 }
 
 /// 调用方指定的证据签发密钥在本端的引用（只留公开信息，私钥永远在 B）。
@@ -246,13 +256,29 @@ pub struct RemoteAttestationKey {
     pub public_key: Vec<u8>,
     /// 那把 key 自己的证书 Subject（DER X.501 Name），随请求下发。
     pub issuer_subject_name: Vec<u8>,
+    /// 这把 AK 铸在哪台 B（服务端 keybox 铸的为空）。
+    ///
+    /// 子钥请求钉回这台：另一台没有它的私钥，只会报 `issuer key ... is not
+    /// available on this device`。
+    pub device_id: Option<String>,
+    /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
+    ///
+    /// 真机的 `generateKey(.., attestationKey)` 直接把这个 blob 交给 HAL 用，
+    /// 不靠任何会话表。B 端以前只能拿 alias 去查自己的 session，一旦那把 AK
+    /// 不是在它那里铸的（智能模式在服务端、或换了另一台 B）就报
+    /// `issuer key ... is not available on this device`。
+    pub key_blob: Vec<u8>,
 }
 
 /// there.  Each method returns `Ok(None)` when the remote is unavailable or not
 /// configured, letting the TA fall back to the local software keybox.
+/// 远程铸造回来的证链，以及铸它的那台 B（服务端 keybox 层为空）。
+pub type RemoteAttestChain = (Vec<Vec<u8>>, Option<String>);
+
 pub trait RemoteBackend: Send {
     /// Forward an attestation request.  Returns the B-side certificate chain
-    /// (DER, leaf first) on success, or `None` if the remote is unavailable.
+    /// (DER, leaf first) plus the B device that minted it (empty for the
+    /// server keybox layer), or `None` if the remote is unavailable.
     fn attest(
         &self,
         challenge: &[u8],
@@ -260,7 +286,7 @@ pub trait RemoteBackend: Send {
         alias: &str,
         cert_serial: Option<&[u8]>,
         params: &RemoteAttestParams,
-    ) -> Result<Option<Vec<Vec<u8>>>, Error>;
+    ) -> Result<Option<RemoteAttestChain>, Error>;
 
     /// Forward a sign request for a remote key.  Returns the signature bytes,
     /// or `None` if the remote is unavailable.
@@ -269,6 +295,14 @@ pub trait RemoteBackend: Send {
     /// Forward a decrypt request for a remote key.  Returns the plaintext, or
     /// `None` if the remote is unavailable.
     fn decrypt(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error>;
+
+    /// Forward an ECDH agreement for a remote key (`data` is the peer public key,
+    /// X.509 SubjectPublicKeyInfo DER).  Returns the shared secret, or `None` if
+    /// the remote cannot do it.
+    fn agree(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error> {
+        let _ = (alias, data, algorithm);
+        Ok(None)
+    }
 
     /// Indicate whether the remote backend is currently enabled.
     fn enabled(&self) -> bool;

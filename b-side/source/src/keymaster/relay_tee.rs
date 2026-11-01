@@ -397,7 +397,19 @@ pub fn extract_km_error_code(status: &rsbinder::Status) -> Option<i32> {
 /// implement KeyMint V2/V3; encoding parameters for a newer version can
 /// cause version-mismatch errors that look like "not supported".
 /// Falls back to `KEY_MINT_V5` if the probe itself fails.
-pub fn probe_keymint_version(keymint: &Strong<dyn IKeyMintDevice>) -> i32 {
+///
+/// 结果按 HAL service 名缓存：`getHardwareInfo` 一辈子不会变，而这里每笔 attest 都会
+/// 走一次 —— 一次 binder 往返 + 一条 info 日志（同步写文件），几十笔叠起来就是可观测的
+/// 几毫秒，T04 那种卡在 120ms 线上的探针很在意这点。
+pub fn probe_keymint_version(keymint: &Strong<dyn IKeyMintDevice>, service: &'static str) -> i32 {
+    static CACHE: std::sync::OnceLock<MatchBTree> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(version) = guard.get(service) {
+            return *version;
+        }
+    }
+
     match keymint.getHardwareInfo() {
         Ok(info) => {
             log::info!(
@@ -406,6 +418,9 @@ pub fn probe_keymint_version(keymint: &Strong<dyn IKeyMintDevice>) -> i32 {
                 info.securityLevel,
                 info.keyMintName
             );
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(service, info.versionNumber);
+            }
             info.versionNumber
         }
         Err(status) => {
@@ -414,6 +429,8 @@ pub fn probe_keymint_version(keymint: &Strong<dyn IKeyMintDevice>) -> i32 {
         }
     }
 }
+
+type MatchBTree = std::sync::Mutex<std::collections::HashMap<&'static str, i32>>;
 
 // ---------------------------------------------------------------------------
 // Key parameter conversion (kmr_wire::KeyParam -> AIDL KeyParameter).

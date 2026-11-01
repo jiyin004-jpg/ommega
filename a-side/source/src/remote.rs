@@ -211,9 +211,24 @@ fn desired_iface(bind_iface: &str, base_url: &str) -> Option<String> {
     match &choice {
         // These two need no probe, so there is nothing to cache.
         BindChoice::Never => return None,
-        // An explicit name is taken at face value: whether it exists or works is
-        // the kernel's call, not ours.
-        BindChoice::Named(name) => return Some(name.clone()),
+        // 显式写的接口名先探一下再绑：Wi-Fi 断了、接口名写错、hotspot 还没起来的时候，
+        // 直接 `SO_BINDTODEVICE` 上去等于把整条远程链弄断（请求连 SYN 都发不出去）。
+        // 探不通就退回自动选一个能到服务器的上联。
+        BindChoice::Named(name) => {
+            if let Some(hit) = cached_pick(bind_iface, base_url) {
+                return hit;
+            }
+            let picked = if probe_iface(Some(name), base_url) {
+                Some(name.clone())
+            } else {
+                log::warn!(
+                    "uplink: configured interface {name} cannot reach the relay, picking one"
+                );
+                pick_uplink(base_url)
+            };
+            store_pick(bind_iface, base_url, picked.clone());
+            return picked;
+        }
         _ => {}
     }
     if choice == BindChoice::Auto && !vpn_present() {
@@ -258,7 +273,11 @@ struct CachedPick {
 
 /// How long a pick is trusted.  A link that dies is re-picked after at most this
 /// long; much shorter and the cache does nothing.
-const PICK_TTL: Duration = Duration::from_secs(5);
+///
+/// 选了具体接口之后要能「一段时间内优先走它」，不然每 5 秒一次探测（一次完整 HTTP
+/// 往返）把省下的延迟又吃回去。断网由两个机制兜：探测失败会重新选，请求失败会调
+/// `invalidate_pick()` 把这份缓存清掉。
+const PICK_TTL: Duration = Duration::from_secs(60);
 
 /// 「结论是不绑接口」的缓存时间，比选中某个接口长得多。
 ///
@@ -294,6 +313,16 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
     }
 }
 
+/// 把选路缓存清掉。
+///
+/// 只在「按这个选路出去结果没通」的时候调（Wi-Fi 刚断、切网、VPN 拉起）：
+/// 缓存的有效期是 PICK_TTL，但那条路是真的会死的，不能等到过期。
+fn invalidate_pick() {
+    if let Ok(mut guard) = PICK_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 /// Whether a VPN is currently up.  `VpnService` always leaves a `tun` device in
 /// `/sys/class/net`, the older pptp/l2tp paths leave a `ppp` and bridged VPNs
 /// leave a `tap` — an Android-wide convention, not something that varies per
@@ -308,14 +337,29 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
 /// is no VPN" (nothing is bound), never a wrong link, and a false positive costs
 /// at most one extra probe.
 fn vpn_present() -> bool {
+    // 每笔请求都会问到（auto 模式下）；readdir `/sys/class/net` + 每个接口
+    // 读 flags，同样存 3 秒。
+    static CACHE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(3);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((present, at)) = *guard {
+            if at.elapsed() < TTL {
+                return present;
+            }
+        }
+    }
     let Ok(entries) = std::fs::read_dir(SYS_CLASS_NET) else {
         return false;
     };
-    entries.flatten().any(|e| {
+    let present = entries.flatten().any(|e| {
         e.file_name()
             .to_str()
             .is_some_and(|n| is_vpn_name(n) && iface_is_up(n))
-    })
+    });
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((present, Instant::now()));
+    }
+    present
 }
 
 /// Whether the name looks like a VPN tunnel.
@@ -576,8 +620,25 @@ fn candidates() -> (Vec<String>, Vec<String>) {
 /// 飞行模式、数据与 WiFi 都关的时候，把请求发出去只会白撞一轮连接超时（还要重试
 /// 一次），App 那边早就不等了 —— 看起来就是「远程不通也不回退本地」。
 fn uplink_absent() -> bool {
+    // 这条路每笔请求都会问一次，而 `candidates()` 要读 `/proc/net/route`
+    // + 每个接口的 `operstate` / `physical_like` —— 几十微秒到几毫秒的纯 IO，
+    // 跟“快速失败”这个目的比起来划不来。存 3 秒：飞行模式切回来时最晚 3 秒
+    // 后就能重新发请求，而平时每笔都省掉这一下。
+    static CACHE: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(3);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((absent, at)) = *guard {
+            if at.elapsed() < TTL {
+                return absent;
+            }
+        }
+    }
     let (preferred, rest) = candidates();
-    preferred.is_empty() && rest.is_empty()
+    let absent = preferred.is_empty() && rest.is_empty();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((absent, Instant::now()));
+    }
+    absent
 }
 
 /// Splits candidates by "does it look physical", best first inside each group.
@@ -625,8 +686,11 @@ fn uplink_rank(name: &str) -> u8 {
 ///
 /// Returns `(status, body)`.  HTTP error responses (4xx / 5xx) are returned as
 /// `Ok` with the corresponding status code — only transport-level failures
-/// produce `Err`.  This matches the original hand-written client contract so
-/// callers (`post_json` and its retry logic) behave identically.
+/// produce `Err`.  `post_json` 现在直接拿 `get_client()` / `unbound_client()`
+/// 构造好的两个客户端发请求（这样才能分清「绑定的接口」和「OS 默认路由」
+/// 两条路各自的结果），所以这个便捷函数暂无用偶。保留着，后面还有别的调用点时
+/// 直接用，不用再想到底绑不绑。
+#[allow(dead_code)]
 fn http_request(
     method: &str,
     url: &str,
@@ -719,9 +783,18 @@ impl RemoteRelay {
             );
         }
         let body_str = serde_json::to_string(body)?;
+        // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验（换机要解绑）。
+        // `ro.serialno` 与 `ro.boot.serialno` 在大多数机器上相同，但个别机型只
+        // 有一个 —— 两个都带上，服务端会各自比对非空的那项。
+        let dev_serial =
+            crate::plat::resetprop::read_string_property("ro.serialno").unwrap_or_default();
+        let dev_sn =
+            crate::plat::resetprop::read_string_property("ro.boot.serialno").unwrap_or_default();
         let headers = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             ("X-Relay-Token".to_string(), Self::token()?),
+            ("X-Device-Serial".to_string(), dev_serial),
+            ("X-Device-Sn".to_string(), dev_sn),
         ];
         // Transient transport failures (connect timeout, network jitter, TLS
         // handshake) are retried once before giving up. Without the retry a
@@ -729,11 +802,12 @@ impl RemoteRelay {
         // briefly emits a self-signed chain. HTTP error responses are NOT
         // retried — the server answered, and its body carries the real result.
         //
-        // 先按「不绑接口」直发，不预先探测：正常网络下一个往返就够了。
-        // 只有这一发真的失败（默认路由被 VPN 吞了、或者指到死上游）才去探测
-        // 候选接口、绑定后重试——那时多花一次探测是值得的。
+        // 主路走 `get_client()`（它按 `bind_iface` 选/验证接口）：配了 wlan0 就该真的
+        // 从 Wi-Fi 出去 —— 实测 Wi-Fi 30ms、蜂窝 67ms 还带 200ms 尾巴。以前这里先拿
+        // `unbound_client()`（不绑、走 OS 默认路由）直发，bind_iface 只在重试时才生效，
+        // 等于白配。不通时再退回不绑的客户端，让 OS 自己挑路。
         let (status, resp) = match http_request_with(
-            &unbound_client()?,
+            &get_client()?,
             "POST",
             &url,
             &headers,
@@ -742,10 +816,18 @@ impl RemoteRelay {
             Ok(v) => v,
             Err(first) => {
                 log::warn!(
-                    "remote {path} transport error on the default route, retrying bound: {first:#}"
+                    "remote {path} transport error on the bound route, retrying unbound: {first:#}"
                 );
-                http_request("POST", &url, &headers, Some(body_str.as_bytes()))
-                    .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
+                // 这条接口刚死（Wi-Fi 掉了、切网了）：把选路缓存清掉，下一笔重新探。
+                invalidate_pick();
+                http_request_with(
+                    &unbound_client()?,
+                    "POST",
+                    &url,
+                    &headers,
+                    Some(body_str.as_bytes()),
+                )
+                .map_err(|second| anyhow!("{first:#}; retry also failed: {second:#}"))?
             }
         };
         if !(200..300).contains(&status) {
@@ -782,6 +864,10 @@ impl RemoteRelay {
                 json!({
                     "alias": issuer.alias,
                     "issuer_subject_name": base64_encode(&issuer.issuer_subject_name),
+                    // 这把 AK 的出生地：服务端据此把子钥钉回同一台 B。
+                    "device_id": issuer.device_id,
+                    // AOSP 的 `AttestationKey.keyBlob`：B 端优先用它，找不到 session 也能签。
+                    "key_blob": base64_encode(&issuer.key_blob),
                 }),
             );
         }
@@ -789,9 +875,18 @@ impl RemoteRelay {
             "attestation_application_id".to_string(),
             Value::String(base64_encode(app_id_der)),
         );
-        // Use the device's real verified-boot key/hash from the resolved trust
-        // config (client-a forwards `AndroidDeviceUtils.bootKey/bootHash`).
-        let (vb_key, vb_hash) = Self::verified_boot_values();
+        // RootOfTrust：**固定声明锁定 + 已验证**，不跟设备真实状态走。
+        //
+        // 目的是让链看起来就是一台锁着、验证过的机器；设备实际是 orange /
+        // unlocked 也一样这么写。属性那边由 daemon 一并改成 locked / green，
+        // 两边口径一致，检测器拿证书和 `ro.boot.flash.locked`、
+        // `ro.boot.verifiedbootstate` 去比不会出现矛盾。
+        //
+        // RootOfTrust：key / hash 取**当刻属性**（daemon 传进来的环境变量优先，
+        // 其次自己读），锁定与验证状态固定「已锁定 + 已验证」（不在代码里分两处写）。
+        // 这套值早先来自 `[trust]` 配置的开机快照，属性一变就和证书对不上。
+        let (vb_key, vb_hash, device_locked, verified_boot_state) =
+            crate::plat::vbmeta::runtime_root_of_trust();
         ctx.insert(
             "verified_boot_key".to_string(),
             Value::String(base64_encode(&vb_key)),
@@ -800,8 +895,11 @@ impl RemoteRelay {
             "verified_boot_hash".to_string(),
             Value::String(base64_encode(&vb_hash)),
         );
-        ctx.insert("device_locked".to_string(), Value::Bool(true));
-        ctx.insert("verified_boot_state".to_string(), Value::from(0));
+        ctx.insert("device_locked".to_string(), Value::Bool(device_locked));
+        ctx.insert(
+            "verified_boot_state".to_string(),
+            Value::from(verified_boot_state),
+        );
         ctx.insert(
             "creation_datetime_ms".to_string(),
             Value::from(Self::now_ms()),
@@ -961,7 +1059,7 @@ impl RemoteRelay {
             Err(_) => None,
         }
         .or_else(|| {
-            crate::plat::resetprop::read_string_property("ro.build.version.security_patch")
+            patch_property("OMMEGA_PATCH_SECURITY", "ro.build.version.security_patch")
                 .as_deref()
                 .and_then(patch_level_to_yyyymm)
         });
@@ -977,7 +1075,7 @@ impl RemoteRelay {
         // 718 / 719 是 YYYYMMDD（带日），别再过 patch_level_to_yyyymm —— 那会把
         // 2026-08-01 截成 202608，A 本地出的链和走远程的链就对不上。
         let vendor_patch_level =
-            crate::plat::resetprop::read_string_property("ro.vendor.build.security_patch")
+            patch_property("OMMEGA_PATCH_VENDOR", "ro.vendor.build.security_patch")
                 .as_deref()
                 .and_then(patch_level_to_yyyymmdd)
                 .or_else(|| match config::config().read() {
@@ -1000,6 +1098,14 @@ impl RemoteRelay {
         if let Some(patch) = boot_patch_level {
             ctx.insert("boot_patch_level".to_string(), Value::from(patch));
         }
+        // MODULE_HASH (KeyMint tag 724): the local software keybox path already
+        // receives the APEX module-info digest through
+        // `SetAdditionalAttestationInfo`, but the relay never saw it, so the
+        // minted leaf omitted `[724]` while `getSupplementaryAttestationInfo`
+        // still returned the local bundle.  Forward it verbatim.
+        if let Some(hash) = params.module_hash.as_deref().filter(|h| !h.is_empty()) {
+            ctx.insert("module_hash".to_string(), Value::from(base64_encode(hash)));
+        }
         // The B-side reads `device_attest_context` (nested form) for the
         // appid and optional serial; the full key params are passed through.
         let body = json!({
@@ -1017,15 +1123,6 @@ impl RemoteRelay {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
-    }
-
-    /// Resolved verified-boot key/hash from `config().trust` (32 bytes each).
-    /// Falls back to zeros if the config lock is unavailable (never fatal).
-    fn verified_boot_values() -> ([u8; 32], [u8; 32]) {
-        match config::config().read() {
-            Ok(g) => (g.trust.vb_key, g.trust.vb_hash),
-            Err(_) => ([0u8; 32], [0u8; 32]),
-        }
     }
 
     /// Forward a sign request for a remote key.
@@ -1048,6 +1145,17 @@ impl RemoteRelay {
             "device_id": Self::device_id()?,
         });
         Self::post_json("/api/decrypt/", &body)
+    }
+
+    /// Forward an ECDH agreement for a remote key (`data` = peer public key SPKI).
+    pub fn agree(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
+        let body = json!({
+            "alias": alias,
+            "data": base64_encode(data),
+            "algorithm": algorithm,
+            "device_id": Self::device_id()?,
+        });
+        Self::post_json("/api/agree/", &body)
     }
 
     /// Forward one SOTER operation to a B-side device.
@@ -1074,6 +1182,22 @@ impl RemoteRelay {
 
 fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// 读一个属性，但**优先用 daemon 启动时传进来的环境变量**。
+///
+/// 为什么：keymint 自己读属性不可靠 —— `rsproperties` 在静态进程里拿不到属性区，
+/// 失败后要 exec 一次 resetprop 兜底，那可是 fork。daemon 是 shell 域，开机时
+/// `getprop` 读一次就够了：这几个属性运行期几乎不变（只有刷机 / 改伪装参数才变，
+/// 而那时 keymint 会被 daemon 重启）。于是正常路径**一次 fork 都没有**。
+///
+/// 环境变量没传（手动启动、旧 daemon）就退回真实读属性。
+fn patch_property(env: &str, prop: &str) -> Option<String> {
+    std::env::var(env)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::plat::resetprop::read_string_property(prop))
 }
 
 /// Convert a "YYYY-MM-DD" patch level string to the YYYYMM integer the relay
@@ -1168,7 +1292,7 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         alias: &str,
         cert_serial: Option<&[u8]>,
         params: &kmr_ta::device::RemoteAttestParams,
-    ) -> Result<Option<Vec<Vec<u8>>>, kmr_common::Error> {
+    ) -> Result<Option<kmr_ta::device::RemoteAttestChain>, kmr_common::Error> {
         // Transport-level failure (connect timeout / network unreachable / TLS
         // handshake) means the relay is unavailable — report `Ok(None)` so the
         // TA falls back to the local software keybox (matching client-a, which
@@ -1242,7 +1366,13 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
                 "remote delegation returned no issuer certificate; the attestation key must be recreated"
             ));
         }
-        Ok(Some(chain))
+        // 这张链是哪台 B 铸的：记下来，以后拿这把 AK 签子钥得回到同一台。
+        let born_on = result
+            .get("device_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok(Some((chain, born_on)))
     }
 
     fn sign(
@@ -1318,6 +1448,42 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             .decode(plain_b64)
             .map_err(|e| kmr_common::km_err!(UnknownError, "bad remote decrypt base64: {e}"))?;
         Ok(Some(plain))
+    }
+
+    fn agree(
+        &self,
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+    ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
+        let Some(resp) = RemoteRelay::agree(alias, data, algorithm)
+            .map_err(|e| kmr_common::km_err!(UnknownError, "remote agree: {e:#}"))?
+        else {
+            return Ok(None);
+        };
+        let result = resp.get("result").cloned().unwrap_or(resp);
+        if let Some(kind) = result.get("relay_error_kind").and_then(Value::as_str) {
+            let msg = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("relay agree refused");
+            log::warn!("remote agree refused (kind={kind}): {msg}");
+            return Err(match kind {
+                "key_not_found" => kmr_common::km_err!(InvalidKeyBlob, "{msg}"),
+                _ => kmr_common::km_err!(UnknownError, "{msg}"),
+            });
+        }
+        let secret_b64 = result
+            .get("secret")
+            .or_else(|| result.get("data"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                kmr_common::km_err!(UnknownError, "remote agree response missing secret")
+            })?;
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(secret_b64)
+            .map_err(|e| kmr_common::km_err!(UnknownError, "bad remote agree base64: {e}"))?;
+        Ok(Some(secret))
     }
 
     fn enabled(&self) -> bool {

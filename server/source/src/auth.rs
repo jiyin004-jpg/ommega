@@ -23,23 +23,47 @@ pub struct TokenMeta {
     pub kind: String,
 }
 
+/// 请求方带过来的设备指纹：`ro.serialno` 与 `ro.boot.serialno`。
+///
+/// A 端私卡首次成功鉴权时把这两个值写进 `api_token`，之后每次请求
+/// 必须跟已绑定的一致，换设备就过不去（要换机器得先在 /card 页面解绑）。
+#[derive(Debug, Clone, Default)]
+pub struct DeviceFp {
+    pub serial: String,
+    pub sn: String,
+}
+
+impl DeviceFp {
+    pub fn is_empty(&self) -> bool {
+        self.serial.trim().is_empty() && self.sn.trim().is_empty()
+    }
+}
+
 impl TokenMeta {
     /// 能不能跟另一端的 token 配对互通。
     ///
-    /// 规则（跟控制台上的说法一致）：
-    /// - 任一方是 `public`（公开/测试卡）→ 通
-    /// - 任一方的 kind 为空（老卡密 / 静态 token）→ 通（历史行为不变）
-    /// - 都是 `pair` → 只有 `pair_id` 相同才通。
-    /// - 配对卡遇到「对方根本没登记 token」（离线/老客户端）也放行，`who` 为 None 时由调用方决定。
+    /// 卡密只有两种，判断就两条：
+    ///
+    /// - **普通卡**（`kind = "public"`）：两边都是普通卡才通，公开卡不能指挥别人的私机；
+    /// - **私卡**（`kind = "pair"`，含历史上 `kind` 为空的早期记录）：`pair_id` 任一方
+    ///   为空 = 没约束 → 通，都有值就必须同组。
+    ///
+    /// 没有第三种。早期那条「kind 为空就直接放行」的兼容分支会把白卡和私卡混在一起，
+    /// 已经删了。
     pub fn allows(&self, other: &TokenMeta) -> bool {
-        let legacy = |m: &TokenMeta| m.kind.is_empty();
-        if legacy(self) || legacy(other) {
+        let public = |m: &TokenMeta| m.kind.eq_ignore_ascii_case("public");
+
+        // 普通卡：两边都是普通卡才放行（公开卡不能指挥别人的私机）。
+        if public(self) || public(other) {
+            return public(self) && public(other);
+        }
+
+        // 剩下都是私卡（含早期 kind 为空的记录）：pair_id 任一方为空 →
+        // 没填就是没约束，放行；都有值就严格同组。
+        if self.pair_id.is_empty() || other.pair_id.is_empty() {
             return true;
         }
-        if self.kind == "public" || other.kind == "public" {
-            return true;
-        }
-        !self.pair_id.is_empty() && self.pair_id == other.pair_id
+        self.pair_id == other.pair_id
     }
 }
 
@@ -93,6 +117,13 @@ pub struct AuthState {
     /// anonymous access is allowed when neither a static token nor any DB
     /// token is configured (backward-compatibility fallback).
     pub auth_required: bool,
+    /// 鉴权结果的短缓存：token -> (整行, 时间)。
+    ///
+    /// `get_api_token` 是同步 MySQL 查询，而 A 端每笔 attest/sign/decrypt、
+    /// B 端每 5 秒一次 poll 都要走一次鉴权 —— 全部落在关键路径上。卡密的
+    /// role/kind/enabled/绑定这些字段几秒内不会变，存 10 秒最划算；运营改卡或
+    /// 用户解绑最多晚 10 秒生效。
+    token_cache: Arc<Mutex<HashMap<String, (crate::db::ApiTokenRow, Instant)>>>,
 }
 
 /// Admin session TTL: 12 hours of inactivity.
@@ -126,6 +157,7 @@ impl AuthState {
             ip_filter_whitelist: Arc::new(AtomicBool::new(false)),
             ip_filter_list: Arc::new(Mutex::new(HashSet::new())),
             auth_required,
+            token_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -133,6 +165,45 @@ impl AuthState {
     pub fn with_db(mut self, db: Option<Arc<Db>>) -> Self {
         self.db = db;
         self
+    }
+
+    /// 卡密鉴权结果的缓存时长。
+    ///
+    /// 10 秒：A 端连着发几十笔时只查一次库，运营改卡 / 用户解绑最多晚 10 秒生效。
+    const TOKEN_CACHE_TTL: Duration = Duration::from_secs(10);
+
+    fn cached_token(&self, token: &str) -> Option<crate::db::ApiTokenRow> {
+        let guard = self.token_cache.lock().ok()?;
+        let (row, at) = guard.get(token)?;
+        if at.elapsed() < Self::TOKEN_CACHE_TTL {
+            Some(row.clone())
+        } else {
+            None
+        }
+    }
+
+    fn remember_token(&self, token: &str, row: &crate::db::ApiTokenRow) {
+        if let Ok(mut guard) = self.token_cache.lock() {
+            // 正常不会到这个量；到了就顺手清一轮过期的，别让它无限长。
+            if guard.len() > 1024 {
+                guard.retain(|_, (_, at)| at.elapsed() < Self::TOKEN_CACHE_TTL);
+            }
+            guard.insert(token.to_string(), (row.clone(), Instant::now()));
+        }
+    }
+
+    /// 拿 token 行：先看缓存，没命中再查库（查到就存进去）。
+    ///
+    /// 鉴权、配对、绑定都在关键路径上，`get_api_token` 是同步 MySQL 查询，
+    /// 每笔请求一次很浪费；这几个字段几秒内不会变。
+    fn lookup_token(&self, token: &str) -> Option<crate::db::ApiTokenRow> {
+        if let Some(row) = self.cached_token(token) {
+            return Some(row);
+        }
+        let db = self.db.as_ref()?;
+        let row = db.get_api_token(token).ok().flatten()?;
+        self.remember_token(token, &row);
+        Some(row)
     }
 
     /// Set admin credentials (user/password/extra accounts).
@@ -309,7 +380,8 @@ impl AuthState {
             return None;
         }
         let db = self.db.as_ref()?;
-        let row = db.get_api_token(token).ok().flatten()?;
+        let _ = db;
+        let row = self.lookup_token(token)?;
         if !row.enabled {
             return None;
         }
@@ -326,7 +398,16 @@ impl AuthState {
     /// `None` for role-agnostic endpoints (ping/health). Returns true when the
     /// request is authorized. Also activates the token on first use and records
     /// the client IP.
-    pub fn check_token(&self, header: Option<&str>, role: Option<&str>, ip: &str) -> bool {
+    ///
+    /// `fp`: 设备指纹（`ro.serialno` / `ro.boot.serialno`）。A 端私卡用它做
+    /// 首次绑定与后续一致性校验；B 端几百台共用一把 token，不参与绑定。
+    pub fn check_token(
+        &self,
+        header: Option<&str>,
+        role: Option<&str>,
+        ip: &str,
+        fp: Option<&DeviceFp>,
+    ) -> bool {
         let token = header.unwrap_or("");
 
         // 1) static env token (back-compat)
@@ -337,7 +418,7 @@ impl AuthState {
         // 2) DB card token
         if let Some(db) = &self.db {
             if !token.is_empty() {
-                if let Ok(Some(row)) = db.get_api_token(token) {
+                if let Some(row) = self.lookup_token(token) {
                     // role check
                     if let Some(required) = role {
                         if row.role != required {
@@ -346,6 +427,25 @@ impl AuthState {
                     }
                     // activated / expiry (activation-based)
                     if !row.enabled {
+                        return false;
+                    }
+                    // 私卡绑定设备：首次带指纹就绑，之后每次都要对得上。
+                    //
+                    // A 端和 B 端都绑 —— 以前只给 A 端绑，B 端的私卡/配对卡
+                    // 永远停在「未绑定」（它的请求也带指纹，就是没人理），
+                    // 卡店卖出去的那些 B 卡换台机器照样能用。公开卡照旧不绑。
+                    if role.is_some()
+                        && Self::is_private_card(&row)
+                        && !Self::device_binding_ok(db, &row, fp)
+                    {
+                        tracing::warn!(
+                            "check_token: device mismatch token={} bound=({},{}) got=({},{})",
+                            token,
+                            row.bound_serial,
+                            row.bound_sn,
+                            fp.map(|f| f.serial.as_str()).unwrap_or("-"),
+                            fp.map(|f| f.sn.as_str()).unwrap_or("-")
+                        );
                         return false;
                     }
                     // activate on first use
@@ -369,7 +469,7 @@ impl AuthState {
                         }
                     }
                     // check expiry against activation time
-                    return token_is_valid(db, token, row.duration_seconds);
+                    return token_is_valid(&row, row.duration_seconds);
                 }
             }
         }
@@ -390,6 +490,50 @@ impl AuthState {
         false
     }
 
+    /// 这张卡要不要绑定设备：**只有显式私卡/配对卡才绑**。
+    ///
+    /// - `kind` 为空（老卡密、控制台默认生成的那种）：公开卡，谁都能用，不绑；
+    /// - `public`：公开/测试卡，不绑；
+    /// - `pair`（卡店卖的配对卡）、`private`：一卡一机，第一次用哪台就锁哪台。
+    fn is_private_card(row: &crate::db::ApiTokenRow) -> bool {
+        let k = row.kind.trim();
+        !(k.is_empty() || k.eq_ignore_ascii_case("public"))
+    }
+
+    /// 设备指纹一致性检查：没绑就绑上，绑了就要求每次都对上。
+    ///
+    /// 两个细节：
+    /// - 两者都空时只绑定不检查（不传指纹的老 A 端仍能用，但永远绑不上）；
+    /// - 旧库里可能只记了其中一项，那就只比非空的那项。
+    fn device_binding_ok(
+        db: &Arc<Db>,
+        row: &crate::db::ApiTokenRow,
+        fp: Option<&DeviceFp>,
+    ) -> bool {
+        let bound_serial = row.bound_serial.trim();
+        let bound_sn = row.bound_sn.trim();
+
+        if bound_serial.is_empty() && bound_sn.is_empty() {
+            if let Some(fp) = fp {
+                if !fp.is_empty() {
+                    if let Err(e) = db.bind_token_device(&row.token, &fp.serial, &fp.sn) {
+                        tracing::warn!("bind_token_device failed token={} err={e}", row.token);
+                    }
+                }
+            }
+            return true;
+        }
+
+        let Some(fp) = fp else { return false };
+        if fp.is_empty() {
+            // 已绑定的卡却不报指纹：只能当不匹配，不然换个客户端不带 header 就绕过了。
+            return false;
+        }
+        let serial_ok = bound_serial.is_empty() || fp.serial.trim() == bound_serial;
+        let sn_ok = bound_sn.is_empty() || fp.sn.trim() == bound_sn;
+        serial_ok && sn_ok
+    }
+    /// Returns true if the request is allowed.
     /// Sliding-window rate limit. `key` 就是客户端 IP（见 check_auth）。
     /// Returns true if the request is allowed.
     pub fn allow(&self, key: &str) -> bool {
@@ -460,27 +604,24 @@ fn prune_rate_bucket(bucket: &mut VecDeque<Instant>, now: Instant, window: Durat
 
 /// Check expiry of an already-activated token. Returns true if not expired.
 /// A token with no `activated_at` is treated as not-yet-activated (valid).
-fn token_is_valid(db: &Arc<Db>, token: &str, duration_seconds: i64) -> bool {
-    match db.get_api_token(token) {
-        Ok(Some(row)) => {
-            if row.activated_at.is_empty() {
-                return true; // not activated yet
-            }
-            // activated_at is stored as `YYYY-MM-DD HH:MM:SS` in Beijing time
-            // (MySQL session time_zone = +08:00). Parse it and add duration_seconds.
-            let act = match parse_beijing_datetime(&row.activated_at) {
-                Some(t) => t,
-                None => return false,
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            now <= act + duration_seconds
-        }
-        Ok(None) => false,
-        Err(_) => false,
+///
+/// 直接吃调用方手里那行，不再自己查一次库 —— 以前 `check_token` 刚查完
+/// 又把 token 传进来重查，同一笔请求两次 MySQL。
+fn token_is_valid(row: &crate::db::ApiTokenRow, duration_seconds: i64) -> bool {
+    if row.activated_at.is_empty() {
+        return true; // not activated yet
     }
+    // activated_at is stored as `YYYY-MM-DD HH:MM:SS` in Beijing time
+    // (MySQL session time_zone = +08:00). Parse it and add duration_seconds.
+    let act = match parse_beijing_datetime(&row.activated_at) {
+        Some(t) => t,
+        None => return false,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now <= act + duration_seconds
 }
 
 /// Parse `YYYY-MM-DD HH:MM:SS` (Beijing time, +08:00) into a unix timestamp
@@ -576,5 +717,82 @@ mod rate_tests {
         let prefix = start.elapsed();
         assert_eq!(old.len(), new.len());
         eprintln!("{rounds} prunes, 60000 live entries: scan={scan:?}, prefix={prefix:?}");
+    }
+}
+
+#[cfg(test)]
+mod allows_tests {
+    use super::TokenMeta;
+
+    fn meta(kind: &str, pair: &str) -> TokenMeta {
+        TokenMeta {
+            role: "a".to_string(),
+            pair_id: pair.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    /// 普通卡只跟普通卡互通（任意），不渗到私卡。两个方向都要拒。
+    #[test]
+    fn public_cards_only_pair_with_public() {
+        assert!(meta("public", "").allows(&meta("public", "")));
+        // 普通卡在左
+        assert!(!meta("public", "").allows(&meta("pair", "x")));
+        // 普通卡在右（反过来）
+        assert!(!meta("pair", "x").allows(&meta("public", "")));
+        // 普通卡带 pair_id 也一样，kind 优先
+        assert!(!meta("public", "y").allows(&meta("pair", "y")));
+        assert!(!meta("pair", "y").allows(&meta("public", "y")));
+    }
+
+    /// 私卡之间：pair_id 没填的当无约束放行，填了就严格同组。两个方向都要试。
+    #[test]
+    fn private_pair_rules() {
+        // 空在 A 侧
+        assert!(meta("pair", "").allows(&meta("pair", "x")));
+        // 空在 B 侧（反过来）
+        assert!(meta("pair", "x").allows(&meta("pair", "")));
+        // 都空
+        assert!(meta("pair", "").allows(&meta("pair", "")));
+        // 同组
+        assert!(meta("pair", "x").allows(&meta("pair", "x")));
+        // 不同组，两个方向都拒
+        assert!(!meta("pair", "x").allows(&meta("pair", "y")));
+        assert!(!meta("pair", "y").allows(&meta("pair", "x")));
+    }
+
+    /// allows 必须对称：换一下 self/other 结果不变。
+    #[test]
+    fn allows_is_symmetric() {
+        let cases = [
+            ("public", ""),
+            ("public", "x"),
+            ("pair", ""),
+            ("pair", "x"),
+            ("pair", "y"),
+            ("", ""),
+            ("", "x"),
+        ];
+        for (ka, pa) in cases {
+            for (kb, pb) in cases {
+                let a = meta(ka, pa);
+                let b = meta(kb, pb);
+                assert_eq!(
+                    a.allows(&b),
+                    b.allows(&a),
+                    "不对称: ({ka},{pa}) vs ({kb},{pb})"
+                );
+            }
+        }
+    }
+
+    /// kind 为空的早期记录按私卡处理，而不是单独的第三种卡。
+    #[test]
+    fn empty_kind_behaves_like_private() {
+        // 早期卡 pair_id 一般也为空 → 无约束放行
+        assert!(meta("", "").allows(&meta("pair", "x")));
+        assert!(meta("pair", "x").allows(&meta("", "")));
+        // 但如果它带上了 pair_id，就按私卡严格比
+        assert!(!meta("", "x").allows(&meta("pair", "y")));
     }
 }

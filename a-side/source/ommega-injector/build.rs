@@ -12,7 +12,38 @@ fn add_all_aidl_sources(builder: rsbinder_aidl::Builder, dir: &str) -> rsbinder_
     builder
 }
 
+fn ensure_soter_attk() {
+    let path = PathBuf::from("assets/soter_attk.pem");
+    println!("cargo:rerun-if-changed={}", path.display());
+    if path.exists() {
+        return;
+    }
+    // 发版时由 build.py 用当时时间现生成一把；这里只给直接 cargo build/clippy/test
+    // （CI 的 gate 那种）兜底，免得 include_bytes! 找不到文件。
+    fs::create_dir_all("assets").ok();
+    let status = Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+        ])
+        .arg(&path)
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            println!("cargo:warning=generated a local ATTK at {}", path.display());
+        }
+        _ => panic!(
+            "assets/soter_attk.pem is missing and openssl could not create one; install openssl or run a-side/source/build.py"
+        ),
+    }
+}
+
 fn main() {
+    ensure_soter_attk();
     println!("cargo:rerun-if-changed=../aidl");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=TARGET");

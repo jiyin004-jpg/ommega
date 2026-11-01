@@ -294,6 +294,14 @@ pub(crate) struct RemoteDeviceIdentity {
     pub manufacturer: Option<Vec<u8>>,
     pub model: Option<Vec<u8>>,
     pub verified_boot_hash: Option<Vec<u8>>,
+    /// RootOfTrust 里 `deviceLocked` 的值。走远程时证书是 B 端真机出的，
+    /// 本机属性必须说同一套，否则检测器一比就报 locked 不一致。
+    pub device_locked: Option<bool>,
+    /// RootOfTrust 里 `verifiedBootState` 的枚举值（0=green 1=yellow 2=orange 3=red）。
+    pub verified_boot_state: Option<i64>,
+    /// AuthorizationList 里的 `bootPatchlevel`（719，YYYYMMDD）。
+    /// A 端算本地证书的 719 用的是本机 boot 镜像日期，跟 B 的不一样就会像 A14/S06 那样对上。
+    pub boot_patchlevel: Option<i64>,
 }
 
 /// 从远端叶子证书里抽出上面那套身份。解不开就返回 `None`（不阻断生成）。
@@ -320,6 +328,9 @@ pub(crate) fn parse_remote_device_identity(cert_der: &[u8]) -> Option<RemoteDevi
             manufacturer: ids.manufacturer.as_ref().map(|v| v.to_vec()),
             model: ids.model.as_ref().map(|v| v.to_vec()),
             verified_boot_hash: None,
+            device_locked: None,
+            verified_boot_state: None,
+            boot_patchlevel: None,
         }
     };
     let mut identity = pick(&att.hw_enforced, &att.sw_enforced);
@@ -332,8 +343,19 @@ pub(crate) fn parse_remote_device_identity(cert_der: &[u8]) -> Option<RemoteDevi
     if let Some(rot_der) = rot_der {
         if let Ok(rot) = RootOfTrust::from_der(&rot_der) {
             identity.verified_boot_hash = Some(rot.verified_boot_hash.to_vec());
+            identity.device_locked = Some(rot.device_locked);
+            identity.verified_boot_state = Some(rot.verified_boot_state as i64);
         }
     }
+    // bootPatchlevel（719）：硬件强制优先，其次软件层。
+    let boot_patch = |auths: &[KeyParam]| -> Option<i64> {
+        auths.iter().find_map(|param| match param {
+            KeyParam::BootPatchlevel(value) => Some(i64::from(*value)),
+            _ => None,
+        })
+    };
+    identity.boot_patchlevel =
+        boot_patch(&att.hw_enforced.auths).or_else(|| boot_patch(&att.sw_enforced.auths));
     Some(identity)
 }
 

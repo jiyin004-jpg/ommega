@@ -1,8 +1,7 @@
 #!/system/bin/sh
 
-MODDIR=${0%/*}
+MODDIR=${OMMEGA_MODDIR:-${0%/*}}
 STATE_DIR=/data/adb/ommega
-BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
@@ -15,44 +14,45 @@ RESTART_ALL_FILE=$RUN_DIR/restart.all
 # A 端平铺 config（WebUI 写的），只有 soter_inject 这个键是本脚本读的：
 # 关着（键不在、或写了 0/false）就完全不碰 SOTER 宿主——不起服务、不注入；
 # 开着才 `am start-service` 把它拉起来再注进去。
-CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
+CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
 # 日志开关的副本：payload 有可能落进读不到上面那个配置的域（SOTER 宿主是 uid 1000），
 # 它按这个文件决定写不写日志。内容只有 `log_flag: 0|1` 一行，别往里放别的。
 # 放 /data/misc 下面是因为宿主（system_app）连 /data/adb（0700 root）都进不去，
 # 而这里的 context 是 system_data_file，它读得到。
 LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/ommega/log_flag}
 # root 侧写给 daemon 的「uid → 包名」表（它就从系统自己的 packages.list 抄）。
-# 放 keystore 那个目录里是因为 daemon 就跑在 keystore uid，那个目录它读得到。
-UID_PACKAGES_OUT=/data/misc/keystore/ommega/uid_packages
+# daemon 跑在 keystore uid，这文件在共享数据根里，它和宿主的 payload 读的是一份。
+UID_PACKAGES_OUT=/data/misc/ommega/uid_packages
 PACKAGES_LIST=/data/system/packages.list
-# daemon 拿去做最后一道兜底的「当前前台应用」（它跑在 keystore uid，只读得到这个目录）。
-FOREGROUND_OUT=/data/misc/keystore/ommega/foreground
-# 载荷（跑在 SOTER 宿主，system_app 域）读不到 keystore 那个 0770 目录，得给它一份
-# 读得到的配置副本 —— 那台小米就是这么在宿主里自我禁用的（injector.toml Permission denied）。
-INJECTOR_TOML=/data/misc/keystore/ommega/injector.toml
-INJECTOR_TOML_COPY=/data/misc/ommega/injector.toml
-# 载荷（宿主域）自己翻包名要用的两份副本：表 `uid package` 和前台应用。
-# 原理同 injector.toml —— keystore 那个 0770 目录宿主进不去，得给一份读得到的。
-UID_PACKAGES_COPY=/data/misc/ommega/uid_packages
-FOREGROUND_COPY=/data/misc/ommega/foreground
+# daemon 拿去做最后一道兜底的「当前前台应用」。
+FOREGROUND_OUT=/data/misc/ommega/foreground
+# 载荷读的配置。数据根已经统一到 /data/misc/ommega，keystore 域和 SOTER 宿主域
+# 读的是同一个文件，不再有「抄一份给宿主」的副本和那轮 cp。
+INJECTOR_TOML=/data/misc/ommega/injector.toml
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
+# soterta.sh 算完落盘的「这台是不是 HIDL 平台」，读文件比每 5 秒 fork 一次便宜得多。
+HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
-LOG_DIR=/data/misc/keystore/ommega/logs
-LOG_FILE=$LOG_DIR/daemon-injector.log
+LOG_DIR=/data/misc/ommega/logs
+LOG_FILE=$LOG_DIR/daemon.log
 # app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
 # 得给它一个自己写得动的位置，权限开到 system 组。
 APP_LOG_DIR=$LOG_FLAG_DIR/logs
-# 换本地兜底 ASK 的通道：往真配置目录里放一份 soter_ask.pem（PKCS#8 PEM），
+# 换本地兜底 ATTK 的通道：往真配置目录里放一份 soter_attk.pem（PKCS#8 PEM），
 # 这里抄到 app 域读得到的位置，再把 SOTER 宿主踢一次让新 key 生效。
-SOTER_ASK_DST=/data/misc/ommega/soter_ask.pem
+SOTER_ATTK_DST=/data/misc/ommega/soter_attk.pem
 # daemon 学到的真机 cpu_id：它自己那份写在 keystore 域（它跑在 keystore uid 里，别处
 # 写不动），这里抄到 app 域给宿主里那份 payload 读。内容就一行 `soter_cpu_id: <32 hex>`。
 SOTER_CPU_ID_DST=/data/misc/ommega/soter_cpu_id
+# ATTK 文件里可以带一行 `cpu_id: 09000000…`：导入时顺手写这里，
+# 免得 ATTK 换了、cpu_id 还是上一台的，腾讯一对不上就拒。
+SOTER_CPU_FORCE_DST=/data/misc/ommega/soter_cpu_id.force
 SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
-# daemon 判出「SOTER 宿主哑了」时写的标记。它跑在 keystore uid，只写得动自己那个目录
-# （`src/soter_host_health.rs`）；写一行原因，这里读走、删掉，再把宿主换成新实例。
-SOTER_STUCK_FILE=/data/misc/keystore/ommega/soter_host_stuck
+# daemon 判出「SOTER 宿主哑了」时写的标记（`src/soter_host_health.rs`）：写一行原因，
+# 这里读走、删掉，再把宿主换成新实例。daemon 跑在 keystore uid，能写这个目录靠的是
+# sepolicy.rule 里给 keystore 域的 system_data_file 写权限。
+SOTER_STUCK_FILE=/data/misc/ommega/soter_host_stuck
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
@@ -71,29 +71,14 @@ device_abi() {
 }
 
 find_module_injector() {
-  if [ -f "$BIN_DIR/ommega-inject" ]; then
-    echo "$BIN_DIR/ommega-inject"
-    return 0
-  fi
-  if [ -f "$MODDIR/ommega-inject" ]; then
-    echo "$MODDIR/ommega-inject"
-    return 0
-  fi
-
+  # 唯一位置：模块内 `libs/<abi>/ommega-inject`。
+  # 不搜模块根、不遍历其它 ABI：那都会在打包残缺时静默选错架构的二进制。
   local abi
   abi=$(device_abi)
   if [ -n "$abi" ] && [ -f "$MODDIR/libs/$abi/ommega-inject" ]; then
     echo "$MODDIR/libs/$abi/ommega-inject"
     return 0
   fi
-
-  # getprop/uname unavailable; accept any packaged ABI rather than nothing.
-  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-    if [ -f "$MODDIR/libs/$abi/ommega-inject" ]; then
-      echo "$MODDIR/libs/$abi/ommega-inject"
-      return 0
-    fi
-  done
   return 1
 }
 
@@ -150,11 +135,34 @@ soter_inject_enabled() {
   return 1
 }
 
+# 这台是不是 HIDL 平台。soterta.sh 算完就落盘，这里直接读；文件不在才现问一次。
+# 以前是每 5 秒 fork 一个 sh + 扫一遍 VINTF，就为了一个永远不变的常量。
+hidl_platform_flag() {
+  if [ -f "$HIDL_CACHE" ]; then
+    v=$(cat "$HIDL_CACHE" 2>/dev/null | tr -d ' \r\n')
+    case "$v" in
+      0|1) printf '%s' "$v"; return ;;
+    esac
+    # 缓存是坏的（空文件、写了一半、乱码）：删掉重算，别拿它当成「不是 HIDL」。
+    rm -f "$HIDL_CACHE" 2>/dev/null
+  fi
+  v=$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r\n')
+  case "$v" in
+    0|1) printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null ;;
+    *) v="" ;;
+  esac
+  printf '%s' "$v"
+}
+
 # 日志只落文件。「启用调试日志」关着时一条都不打，开关按循环现读，WebUI 一改
 # 下一次循环就跟着变。
 log() {
   [ "$LOG_ON" = "1" ] || return 0
   mkdir -p "$LOG_DIR" 2>/dev/null
+  # daemon.log 是所有 A 端脚本共用一份的，超过 1MB 滚成 .1，别让它无限长。
+  if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+  fi
   printf '%s [INFO] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null
   return 0
 }
@@ -171,22 +179,32 @@ debug_logging_enabled() {
 sync_log_flag() {
   want=0
   debug_logging_enabled && want=1
-  # app 域那几个（SOTER 宿主里那份 payload）要用这个目录；顺手建掉，内容没变
-  # 的时候也不多做别的事。
-  mkdir -p "$APP_LOG_DIR" 2>/dev/null
-  chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
-  # 0777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
-  # 上它是 u0_a292(10292) —— 既不是属主也不在 system 组，只有 other 那一档能救。
-  # 代价是这个目录谁都能写，但里面只有我们自己的调试日志，放它去。
-  chmod 0777 "$APP_LOG_DIR" 2>/dev/null
-  # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
-  # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
-  # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
-  # 它改回去，所以每轮都补一次。已经打开的 fd 不受重新打标影响。
-  chcon u:object_r:system_app_data_file:s0 "$APP_LOG_DIR" 2>/dev/null
-  for f in "$APP_LOG_DIR"/*; do
-    [ -f "$f" ] && chcon u:object_r:system_app_data_file:s0 "$f" 2>/dev/null
-  done
+  # 目录本身的属主/权限/SELinux 标签、以及目录里那几个日志文件的标签，都不会自己变。
+  # 以前每轮（3~5 秒）都无条件重做一遍 mkdir+chown+chmod+chcon，再加每个文件一次
+  # chcon —— 十几次 fork，全是在确认“没变”。现在用「目录属性 + mtime」当签名，
+  # 只在目录被重建、文件增删这类真正需要修的情况下才跑那一段。
+  local app_sig
+  app_sig=$(stat -c '%u:%g:%a:%Y' "$APP_LOG_DIR" 2>/dev/null)
+  if [ "$app_sig" != "${LOG_FLAG_SIG:-}" ]; then
+    # app 域那几个（SOTER 宿主里那份 payload）要用这个目录；顺手建掉，内容没变
+    # 的时候也不多做别的事。
+    mkdir -p "$APP_LOG_DIR" 2>/dev/null
+    chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
+    # 1777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
+    # 上它是 u0_a292(10292) —— 既不是属主也不在 system 组，只有 other 那一档能救。
+    # sticky 位挡住删掉 / 改名别人的日志文件（否则谁都能把 injector.log 换成软链，
+    # 等 keystore 域往里 append 的时候写穿到别处）。
+    chmod 1777 "$APP_LOG_DIR" 2>/dev/null
+    # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
+    # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
+    # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
+    # 它改回去，所以这里要能补；但只有目录重建/新文件时才有必要补。
+    chcon u:object_r:system_app_data_file:s0 "$APP_LOG_DIR" 2>/dev/null
+    for f in "$APP_LOG_DIR"/*; do
+      [ -f "$f" ] && chcon u:object_r:system_app_data_file:s0 "$f" 2>/dev/null
+    done
+    LOG_FLAG_SIG=$app_sig
+  fi
   # 那份日志是先到的那个进程建的（HAL 是 system(1000)，宿主是一加上的 u0_a292(10292)），
   # 属主只有一个，另一个只能靠 other 那一档写。这里统一放到 0666，谁续写都行；
   # 里面只有我们自己的调试日志，不怕被读。文件不在就先放一个空的。
@@ -207,11 +225,11 @@ sync_log_flag() {
     *) [ "$sog_size" -gt 65536 ] && : > "$SIGN_OK_FILE" 2>/dev/null ;;
   esac
   mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
-  # 这个目录里可能放着用户自己替换的 soter_ask.pem（本地兜底的私钥），
+  # 这个目录里可能放着用户自己替换的 soter_attk.pem（本地兜底的签名根），
   # 所以不能让 other 进得来读：属主给 system(1000) 是因为 app 域的 payload
   # 要进来读开关和钥匙。
   chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
-  # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_ask.pem（本地兜底
+  # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_attk.pem（本地兜底
   # 私钥，0640）还在别的权限保护着，列不出来也读不到；但宿主得能穿过这一层去
   # 写 logs/，所以 x 必须给。每轮都补：boot 时的 restorecon 不碰权限，但用户
   # 手动改过或者从别的版本升上来就不一定了。
@@ -230,39 +248,63 @@ soter_pid() {
   pidof "$SOTER_PKG" 2>/dev/null | awk '{print $1}'
 }
 
-# 配置目录里的 soter_ask.pem 变过就抄一份到 app 域能读的位置（宿主进不去 keystore
-# 目录）。抄完置 soter_ask_changed=1，主循环把宿主踢掉重来。
-sync_soter_ask() {
-  soter_ask_changed=0
-  src=$(dirname "$CONF_PATH")/soter_ask.pem
+# 配置目录里的 soter_attk.pem 变过就抄一份到 app 域能读的位置（宿主进不去 keystore
+# 目录）。抄完置 soter_attk_changed=1，主循环把宿主踢掉重来。
+sync_soter_attk() {
+  soter_attk_changed=0
+  src=$(dirname "$CONF_PATH")/soter_attk.pem
 
   # 源没了就把镜像那份也删掉，回到 payload 里编进去的那把。只做单向镜像不改的话，
   # 换过一次钥匙之后，就算把文件删了也还是那把旧的（镜像还在）。
   if [ ! -f "$src" ]; then
-    if [ -f "$SOTER_ASK_DST" ]; then
-      if rm -f "$SOTER_ASK_DST" 2>/dev/null; then
-        soter_ask_changed=1
+    if [ -f "$SOTER_ATTK_DST" ]; then
+      if rm -f "$SOTER_ATTK_DST" 2>/dev/null; then
+        soter_attk_changed=1
+        rm -f "$CONF_DIR/soter_attk.stamp" 2>/dev/null
         log "[injector-daemon] local soter ask removed; back to the built-in key"
       fi
     fi
     return 0
   fi
 
-  if [ -f "$SOTER_ASK_DST" ] \
-    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_ASK_DST" 2>/dev/null)" ]; then
+  # 数据根合并之后 src 和 dst 常常是**同一个文件**（都是 /data/misc/ommega/soter_attk.pem），
+  # 这时 `-nt` 恒为 false，ATTK 换了也检测不出来 —— WebUI 导入新私钥不生效就是这么来的。
+  # 改成记住上次处理时的「大小:mtime」，变了才算变化。
+  stamp=$CONF_DIR/soter_attk.stamp
+  cur=$(stat -c '%s:%Y' "$src" 2>/dev/null)
+  [ -n "$cur" ] || return 0
+  if [ -f "$stamp" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$cur" ]; then
     return 0
   fi
 
-  if cp -f "$src" "$SOTER_ASK_DST" 2>/dev/null; then
-    # 640 而不是 644：这是私钥。app 域的 payload 是 uid 1000，靠 system
-    # 组权限读得到，其他 app 就不行了。
-    chown 0:1000 "$SOTER_ASK_DST" 2>/dev/null
-    chmod 0640 "$SOTER_ASK_DST" 2>/dev/null
-    soter_ask_changed=1
-    log "[injector-daemon] local soter ask updated from $src"
-  else
-    log "[injector-daemon] failed to copy $src to $SOTER_ASK_DST"
+  # 不同路径才需要搬；同一份文件就别 cp 了（会报 same file）。
+  if [ "$src" != "$SOTER_ATTK_DST" ]; then
+    if ! cp -f "$src" "$SOTER_ATTK_DST" 2>/dev/null; then
+      log "[injector-daemon] failed to copy $src to $SOTER_ATTK_DST"
+      return 0
+    fi
   fi
+
+  # 640 而不是 644：这是私钥。app 域的 payload 是 uid 1000，靠 system
+  # 组权限读得到，其他 app 就不行了。
+  chown 0:1000 "$SOTER_ATTK_DST" 2>/dev/null
+  chmod 0640 "$SOTER_ATTK_DST" 2>/dev/null
+  soter_attk_changed=1
+  log "[injector-daemon] local soter ask loaded from $src"
+  # 文件里带了 cpu_id 就跟着设 force：ATTK 和 cpu_id 必须是同一台设备的，
+  # 不然腾讯验 ASK 时对不上直接拒（2026-10-30 实测）。
+  cpu=$(sed -n 's/^[[:space:]]*#\{0,1\}[[:space:]]*cpu_id:[[:space:]]*\(0900[0-9a-fA-F]\{28\}\)[[:space:]]*$/\1/p' "$src" 2>/dev/null | head -n 1)
+  if [ -n "$cpu" ]; then
+    if printf '%s\n' "$cpu" > "$SOTER_CPU_FORCE_DST" 2>/dev/null; then
+      chown 0:0 "$SOTER_CPU_FORCE_DST" 2>/dev/null
+      chmod 0644 "$SOTER_CPU_FORCE_DST" 2>/dev/null
+      log "[injector-daemon] cpu_id forced from $src: $cpu"
+    else
+      log "[injector-daemon] failed to write $SOTER_CPU_FORCE_DST"
+    fi
+  fi
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  printf '%s' "$cur" > "$stamp" 2>/dev/null
 }
 
 # 真机 cpu_id 镜像到 app 域。不删旧件：源不在只说明「daemon 还没学到」（B 端不在线、
@@ -273,9 +315,11 @@ sync_soter_ask() {
 sync_soter_cpu_id() {
   src=$(dirname "$CONF_PATH")/soter_cpu_id
   [ -f "$src" ] || return 0
+  # 数据根合并后 src 就是 dst（同一个文件），没有「镜像」这回事，直接读完事。
+  [ "$src" = "$SOTER_CPU_ID_DST" ] && return 0
 
-  if [ -f "$SOTER_CPU_ID_DST" ] \
-    && [ "$(cat "$src" 2>/dev/null)" = "$(cat "$SOTER_CPU_ID_DST" 2>/dev/null)" ]; then
+  # 同样用 mtime 快路径（零 fork）代替两次 cat。
+  if [ -f "$SOTER_CPU_ID_DST" ] && [ ! "$src" -nt "$SOTER_CPU_ID_DST" ]; then
     return 0
   fi
 
@@ -397,10 +441,6 @@ sync_uid_packages() {
   chmod 0644 "$tmp" 2>/dev/null
   mv -f "$tmp" "$UID_PACKAGES_OUT" 2>/dev/null || return 0
   echo "$stamp" > "$UID_PACKAGES_OUT.stamp" 2>/dev/null
-  # 再给载荷（宿主域）留一份读得动的：它就在转发 SOTER 那一步自己翻包名。
-  cp -f "$UID_PACKAGES_OUT" "$UID_PACKAGES_COPY" 2>/dev/null
-  chmod 0644 "$UID_PACKAGES_COPY" 2>/dev/null
-  chcon u:object_r:system_data_file:s0 "$UID_PACKAGES_COPY" 2>/dev/null
 }
 
 # root 侧写下「当前前台应用」（一行 `<epoch 秒> <包名>`）给 daemon 做最后一道兜底：
@@ -425,21 +465,6 @@ sync_foreground() {
   echo "$now $pkg" > "$tmp" 2>/dev/null || return 0
   chmod 0644 "$tmp" 2>/dev/null
   mv -f "$tmp" "$FOREGROUND_OUT" 2>/dev/null
-  cp -f "$FOREGROUND_OUT" "$FOREGROUND_COPY" 2>/dev/null
-  chmod 0644 "$FOREGROUND_COPY" 2>/dev/null
-  chcon u:object_r:system_data_file:s0 "$FOREGROUND_COPY" 2>/dev/null
-}
-
-# 把 injector.toml 抄一份到 app 域读得到的地方（载荷的 config 优先读主路径，读不到就用这份）。
-# 只在内容变了才写，省得每拍白抄。
-sync_injector_toml() {
-  [ -r "$INJECTOR_TOML" ] || return 0
-  cmp -s "$INJECTOR_TOML" "$INJECTOR_TOML_COPY" 2>/dev/null && return 0
-  local tmp="$INJECTOR_TOML_COPY.tmp"
-  cp -f "$INJECTOR_TOML" "$tmp" 2>/dev/null || return 0
-  chmod 0644 "$tmp" 2>/dev/null
-  chcon u:object_r:system_data_file:s0 "$tmp" 2>/dev/null
-  mv -f "$tmp" "$INJECTOR_TOML_COPY" 2>/dev/null
 }
 
 restart_keystore() {
@@ -457,7 +482,7 @@ restart_keystore() {
 
 mkdir -p "$STATE_DIR"
 LOG_ON=0
-soter_ask_changed=0
+soter_attk_changed=0
 sog_once=0
 pending_restart=0
 last_attempt_pid=
@@ -480,11 +505,21 @@ EARLY_POLL_SECONDS=90
 started_at=$(date +%s 2>/dev/null || echo 0)
 # 主循环的拍数：前台那个活代价比读文件大，没必要每拍都干（见 sync_foreground）。
 tick=0
-# 前台应用多久采一次（拍数）。5 秒一拍 × 2 = 约 10 秒；daemon 那边认 20 秒内的，所以
-# 任何时候它读到的那份最多 10 秒旧——之前是 3 拍（≈15 秒）写一次、只认 8 秒，大部分时候
-# 都是“过期的没有”，等于这一道不存在。
-FOREGROUND_EVERY=2
+# 前台应用每拍都采。拍子的节奏是：开机前 90 秒 3 秒一拍，之后 5 秒一拍（见 tick_sleep）。
+# 所以实际是「开机阶段 3 秒、平时 5 秒」——这条兜底的意义就是「现在是谁在调」，
+# 拖到 10 秒/60 秒切个 App 就对不上了。
+#
+# （试过改成「keymint 用到时现问」：行不通——keymint 跑在 keystore 域，
+#   exec dumpsys 会被 SELinux 挡；`am monitor` 只报崩溃/ANR，不报前台切换。）
+FOREGROUND_EVERY=1
 tick_sleep() {
+  ticks=$((ticks + 1))
+  # --once：跑完一轮就退出（调试用）。
+  # 放在这里而不是循环末尾，是因为 prepare_injector 失败那条 continue 也会调到这里。
+  if [ "${MAX_TICKS:-0}" -gt 0 ] && [ "$ticks" -ge "$MAX_TICKS" ]; then
+    release_lock
+    exit 0
+  fi
   now=$(date +%s 2>/dev/null)
   if [ -n "$now" ] && [ "$started_at" -gt 0 ] && [ $((now - started_at)) -lt $EARLY_POLL_SECONDS ]; then
     sleep 3
@@ -492,6 +527,13 @@ tick_sleep() {
     sleep 5
   fi
 }
+
+# --once：只跑一轮（给 Rust watchdog 用）；不带参数时是常驻轮询。
+ticks=0
+MAX_TICKS=0
+case "${1:-}" in
+  --once) MAX_TICKS=1 ;;
+esac
 
 # 单实例：同 daemon 那层 —— service.sh 的看门循环可能同时存在多份，每份 fork 一个
 # 注入器；多份并存时每轮都会 pkill 掉对方正在用的 keystore2/注入进程。抢不到锁就退。
@@ -511,7 +553,11 @@ holder_is_us() {
 lock_owned() { [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; }
 release_lock() { lock_owned && rm -rf "$LOCK_DIR" 2>/dev/null; return 0; }
 
-if mkdir "$LOCK_DIR" 2>/dev/null; then
+if [ "${OMMEGA_SKIP_LOCK:-0}" = 1 ]; then
+  # 由外层持锁时（`OMMEGA_SKIP_LOCK=1`）这里只负责跑一轮，不抢锁（否则会以为自己
+  # 是第二实例直接退出）。
+  :
+elif mkdir "$LOCK_DIR" 2>/dev/null; then
   :
 else
   holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
@@ -522,29 +568,33 @@ else
   rm -rf "$LOCK_DIR" 2>/dev/null
   mkdir "$LOCK_DIR" 2>/dev/null || exit 0
 fi
-echo $$ > "$LOCK_DIR/pid"
-sleep 1
-lock_owned || exit 0
+# 只有自己真的是持锁者才写 pid：--once 模式（watchdog 持锁）写了会把别人的锁偷走。
+if [ "${OMMEGA_SKIP_LOCK:-0}" != 1 ]; then
+  echo $$ > "$LOCK_DIR/pid"
+  sleep 1
+  lock_owned || exit 0
+fi
 trap 'release_lock' EXIT INT TERM HUP
 
 while true; do
   # Config and target list live in the single data location
-  # (/data/misc/keystore/ommega/); the webroot UI writes them through the
+  # (/data/misc/ommega/); the webroot UI writes them through the
   # ommegadata symlink, so no copy/sync is needed here.
 
   LOG_ON=0
   debug_logging_enabled && LOG_ON=1
   sync_log_flag
   sync_uid_packages
-  sync_injector_toml
   if [ $((tick % FOREGROUND_EVERY)) -eq 0 ]; then
     sync_foreground
   fi
   tick=$((tick + 1))
-  sync_soter_ask
+  sync_soter_attk
   sync_soter_cpu_id
-  if [ "$soter_ask_changed" = "1" ]; then
-    # ASK 换了不用再踢宿主：宿主里的载荷已经不注了，服务端自己的进程每次签都现读。
+  if [ "$soter_attk_changed" = "1" ]; then
+    # ASK/ATTK 换了：keystore2 里那份 payload 的 state（ATTK 与已加载的 ASK）是启动时
+    # 一次性加载的，只踢 SOTER 宿主不会重读，必须让 keystore2 重新注入一次。
+    : > "$RESTART_FILE"
     run_soter_selftest
   fi
 
@@ -586,7 +636,7 @@ while true; do
   #   客户端走 hwservicemanager，我们顶不了那个名字，只能注进宿主，在它进程里把发往
   #   HAL 的那笔截下来自己答（hook/soter.rs 按 HIDL 布局回包）。不注就等于没接管，
   #   原厂 TA 死着的时候整族调用 -20。
-  if [ "$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r')" = "1" ] && soter_inject_enabled; then
+  if [ "$(hidl_platform_flag)" = "1" ] && soter_inject_enabled; then
     inject_targets=keystore2,soter
   else
     inject_targets=keystore2

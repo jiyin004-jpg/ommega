@@ -70,7 +70,52 @@ impl std::str::FromStr for Order {
 
 static ATTEST_ORDER: AtomicU8 = AtomicU8::new(Order::Auto as u8);
 static ID_ATTEST_ORDER: AtomicU8 = AtomicU8::new(Order::Auto as u8);
+static ATTEST_KEY_ORDER: AtomicU8 = AtomicU8::new(AttestKeyOrder::Smart as u8);
 static LOADED: Once = Once::new();
+
+/// 证明密钥（`PURPOSE_ATTEST_KEY` 的密钥）出证时走哪层。
+///
+/// 真机上证明密钥和普通密钥同一套 keybox，链根相同；而我们的物理模式下普通
+/// 认证走 B 真机、证明密钥留在本地，两边根会分叉。这个开关决定要不要把证明
+/// 密钥也送出去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AttestKeyOrder {
+    /// 智能模式（默认）：证明密钥也走服务端 keybox（物理模式下不占用 B）。
+    /// 链来自服务端身份，稳定、快，但跟 B 那条链根不同。
+    Smart = 0,
+    /// 跟随模式：跟普通认证一条路，物理模式下真的交给 B 真机。
+    /// 链根与普通认证一致（都是 B 的），代价是依赖 B 在线。
+    Follow = 1,
+}
+
+impl AttestKeyOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttestKeyOrder::Smart => "smart",
+            AttestKeyOrder::Follow => "follow",
+        }
+    }
+
+    fn from_u8(v: u8) -> AttestKeyOrder {
+        match v {
+            1 => AttestKeyOrder::Follow,
+            _ => AttestKeyOrder::Smart,
+        }
+    }
+}
+
+impl std::str::FromStr for AttestKeyOrder {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<AttestKeyOrder, ()> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "smart" | "" | "auto" => Ok(AttestKeyOrder::Smart),
+            "follow" | "b" | "b_first" => Ok(AttestKeyOrder::Follow),
+            _ => Err(()),
+        }
+    }
+}
 
 fn env_keybox_first(key: &str) -> Order {
     match std::env::var(key)
@@ -119,6 +164,13 @@ fn load_file() {
     if let Some(o) = read_order("id_attest_order") {
         ID_ATTEST_ORDER.store(o as u8, Ordering::Relaxed);
     }
+    if let Some(o) = v
+        .get("attest_key_order")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<AttestKeyOrder>().ok())
+    {
+        ATTEST_KEY_ORDER.store(o as u8, Ordering::Relaxed);
+    }
     // 旧格式（bool 版 keybox_first）还能读：true 当强制服务端，false 当跟随模式。
     if v.get("attest_order").is_none() {
         if let Some(b) = v.get("keybox_first").and_then(|x| x.as_bool()) {
@@ -150,14 +202,24 @@ pub fn id_attest_order() -> Order {
     Order::from_u8(ID_ATTEST_ORDER.load(Ordering::Relaxed))
 }
 
-/// 当前两个策略。
-pub fn snapshot() -> (Order, Order) {
+/// 证明密钥（`PURPOSE_ATTEST_KEY`）的层序策略。
+pub fn attest_key_order() -> AttestKeyOrder {
     init();
-    (attest_order(), id_attest_order())
+    AttestKeyOrder::from_u8(ATTEST_KEY_ORDER.load(Ordering::Relaxed))
+}
+
+/// 当前三个策略。
+pub fn snapshot() -> (Order, Order, AttestKeyOrder) {
+    init();
+    (attest_order(), id_attest_order(), attest_key_order())
 }
 
 /// 改策略并落盘。`None` = 这个字段不动。
-pub fn set(attest: Option<Order>, id_attest: Option<Order>) -> std::io::Result<()> {
+pub fn set(
+    attest: Option<Order>,
+    id_attest: Option<Order>,
+    attest_key: Option<AttestKeyOrder>,
+) -> std::io::Result<()> {
     init();
     if let Some(o) = attest {
         ATTEST_ORDER.store(o as u8, Ordering::Relaxed);
@@ -165,10 +227,14 @@ pub fn set(attest: Option<Order>, id_attest: Option<Order>) -> std::io::Result<(
     if let Some(o) = id_attest {
         ID_ATTEST_ORDER.store(o as u8, Ordering::Relaxed);
     }
-    let (a, i) = snapshot();
+    if let Some(o) = attest_key {
+        ATTEST_KEY_ORDER.store(o as u8, Ordering::Relaxed);
+    }
+    let (a, i, k) = snapshot();
     let body = serde_json::json!({
         "attest_order": a.as_str(),
         "id_attest_order": i.as_str(),
+        "attest_key_order": k.as_str(),
     });
     if let Some(dir) = Path::new(PATH).parent() {
         std::fs::create_dir_all(dir)?;
@@ -206,9 +272,28 @@ mod tests {
         init();
         ATTEST_ORDER.store(Order::BFirst as u8, Ordering::Relaxed);
         ID_ATTEST_ORDER.store(Order::KeyboxFirst as u8, Ordering::Relaxed);
-        assert_eq!(snapshot(), (Order::BFirst, Order::KeyboxFirst));
+        ATTEST_KEY_ORDER.store(AttestKeyOrder::Follow as u8, Ordering::Relaxed);
+        assert_eq!(
+            snapshot(),
+            (Order::BFirst, Order::KeyboxFirst, AttestKeyOrder::Follow)
+        );
         ATTEST_ORDER.store(Order::Auto as u8, Ordering::Relaxed);
         ID_ATTEST_ORDER.store(Order::Auto as u8, Ordering::Relaxed);
-        assert_eq!(snapshot(), (Order::Auto, Order::Auto));
+        ATTEST_KEY_ORDER.store(AttestKeyOrder::Smart as u8, Ordering::Relaxed);
+        assert_eq!(
+            snapshot(),
+            (Order::Auto, Order::Auto, AttestKeyOrder::Smart)
+        );
+    }
+
+    #[test]
+    fn attest_key_order_tokens() {
+        assert_eq!("".parse::<AttestKeyOrder>(), Ok(AttestKeyOrder::Smart));
+        assert_eq!(
+            "FOLLOW".parse::<AttestKeyOrder>(),
+            Ok(AttestKeyOrder::Follow)
+        );
+        assert_eq!("smart".parse::<AttestKeyOrder>(), Ok(AttestKeyOrder::Smart));
+        assert_eq!("bogus".parse::<AttestKeyOrder>(), Err(()));
     }
 }

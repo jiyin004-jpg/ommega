@@ -577,6 +577,9 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
                     "last_used_at": t.last_used_at,
                     "kind": t.kind,
                     "pair_id": t.pair_id,
+                    "bound_serial": t.bound_serial,
+                    "bound_sn": t.bound_sn,
+                    "bound_at": t.bound_at,
                 })
             })
             .collect(),
@@ -591,6 +594,57 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
         }
     };
     Json(json!({ "status": "ok", "tokens": tokens })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct TokenUnbindBody {
+    pub token: String,
+}
+
+/// POST /api/admin/token_unbind/ — 控制台里给私卡解绑设备。
+///
+/// 只清设备指纹，不动激活时间与有效期；公开卡/配对卡不参与绑定，调了也只是
+/// 返回“本来就没绑”。
+pub async fn admin_token_unbind(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TokenUnbindBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    let token = body.token.trim().to_string();
+    if token.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "token is required");
+    }
+    let db2 = db.clone();
+    let token2 = token.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let row = db2
+            .get_api_token(&token2)
+            .map_err(|e| format!("db error: {e}"))?
+            .ok_or("token not found")?;
+        db2.unbind_token_device(&token2)
+            .map_err(|e| format!("db error: {e}"))?;
+        Ok::<_, String>((row.bound_serial, row.bound_sn))
+    })
+    .await;
+    match result {
+        Ok(Ok((serial, sn))) => Json(json!({
+            "status": "ok",
+            "released_serial": serial,
+            "released_sn": sn,
+        }))
+        .into_response(),
+        Ok(Err(e)) => json_err(StatusCode::NOT_FOUND, &e),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
 }
 
 /// POST /api/admin/tokens/ — generate a new API token.
@@ -1251,18 +1305,68 @@ pub async fn admin_attest_policy_status(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let (attest, id_attest) = crate::attest_policy::snapshot();
+    let (attest, id_attest, attest_key) = crate::attest_policy::snapshot();
     let persisted = std::path::Path::new(crate::attest_policy::PATH).is_file();
     let serverbox = crate::config::Config::load().server_keybox_enabled();
     Json(json!({
         "status": "ok",
         "attest_order": attest.as_str(),
         "id_attest_order": id_attest.as_str(),
+        "attest_key_order": attest_key.as_str(),
         "mode": if serverbox { "server_keybox" } else { "physical" },
         "persisted": persisted,
         "path": crate::attest_policy::PATH,
     }))
     .into_response()
+}
+
+/// GET /api/admin/b_limit/ - B 端接入名额上限。
+///
+/// `max_b_devices = 0` 表示不限制（默认）。大于 0 时，在线的 B 超过这个数就按
+/// 「锁定+可信启动」优先的顺序筛选：新设备质量更高会顶掉最差的，否则拒（403）。
+/// 面板上配的默认 keymint / soter 设备无条件放行。
+pub async fn admin_b_limit_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let (km, soter) = crate::default_device::get_all();
+    Json(json!({
+        "status": "ok",
+        "max_b_devices": crate::b_limit::get(),
+        "path": crate::b_limit::path().display().to_string(),
+        // 这两台不受名额限制，面板上一起显示出来比较好理解
+        "unlimited": {
+            "keymint": km,
+            "soter": soter,
+        },
+    }))
+    .into_response()
+}
+
+/// POST /api/admin/b_limit/ - 改 B 端接入名额。
+pub async fn admin_b_limit_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(raw) = body.get("max_b_devices").and_then(Value::as_u64) else {
+        return json_err(StatusCode::BAD_REQUEST, "max_b_devices is required");
+    };
+    // 只改数字：判定是无状态的（每次 poll 现场排名），不需要重新分配什么。
+    match crate::b_limit::set(raw as usize) {
+        Ok(v) => Json(json!({
+            "status": "ok",
+            "max_b_devices": v,
+        }))
+        .into_response(),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("save failed: {e}"),
+        ),
+    }
 }
 
 /// GET /api/admin/identity_policy/ - 服务端 keybox 按安全级别用哪份身份。
@@ -1326,6 +1430,9 @@ pub struct AttestPolicyBody {
     /// Same tokens, for attestations that carry device IDs.
     #[serde(default)]
     pub id_attest_order: Option<String>,
+    /// `smart`（服务端 keybox，物理模式下不占 B）| `follow`（跟普通认证一条路）。
+    #[serde(default)]
+    pub attest_key_order: Option<String>,
     /// Legacy boolean: true -> keybox_first, false -> auto.
     #[serde(default)]
     pub keybox_first: Option<bool>,
@@ -1386,23 +1493,36 @@ pub async fn admin_attest_policy_set(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if attest.is_none() && id_attest.is_none() {
+    let attest_key = match body.attest_key_order.as_ref() {
+        None => None,
+        Some(tok) => match tok.parse::<crate::attest_policy::AttestKeyOrder>() {
+            Ok(o) => Some(o),
+            Err(_) => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid attest_key_order {tok:?}: expected \"smart\" | \"follow\""),
+                )
+            }
+        },
+    };
+    if attest.is_none() && id_attest.is_none() && attest_key.is_none() {
         return json_err(
             StatusCode::BAD_REQUEST,
-            "nothing to change: pass attest_order and/or id_attest_order",
+            "nothing to change: pass attest_order, id_attest_order and/or attest_key_order",
         );
     }
-    if let Err(e) = crate::attest_policy::set(attest, id_attest) {
+    if let Err(e) = crate::attest_policy::set(attest, id_attest, attest_key) {
         return json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to persist attest policy: {e}"),
         );
     }
-    let (attest, id_attest) = crate::attest_policy::snapshot();
+    let (attest, id_attest, attest_key) = crate::attest_policy::snapshot();
     Json(json!({
         "status": "ok",
         "attest_order": attest.as_str(),
         "id_attest_order": id_attest.as_str(),
+        "attest_key_order": attest_key.as_str(),
     }))
     .into_response()
 }

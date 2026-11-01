@@ -21,7 +21,7 @@ pub static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 static CONFIG_WATCHER_STARTED: OnceLock<()> = OnceLock::new();
 static CONFIG_FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-const CONFIG_PATH: &str = "/data/misc/keystore/ommega/config.toml";
+const CONFIG_PATH: &str = "/data/misc/ommega/config.toml";
 /// Legacy A-side (client-a) flat `key: value` config. When present, the remote
 /// relay settings in this file override the `[remote]` table in `config.toml`,
 /// matching how the old A-side module was configured on-device.
@@ -29,7 +29,7 @@ const CONFIG_PATH: &str = "/data/misc/keystore/ommega/config.toml";
 /// This is the single data location: the webroot UI writes it through the
 /// `/data/adb/ommega/ommegadata` symlink (which points here), so both the UI
 /// and the keystore process (uid 1017) see the same file.  There is no copy.
-const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
+const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
 const CONFIG_VERSION_V1: u32 = 1;
 const CURRENT_CONFIG_VERSION: u32 = 2;
 
@@ -622,10 +622,6 @@ pub fn is_security_patch_date(value: &str) -> bool {
 
 fn trust_changed_beyond_patchlevels(old: &RawTrustConfig, new: &RawTrustConfig) -> bool {
     old.os_version != new.os_version
-        || old.vb_key != new.vb_key
-        || old.vb_hash != new.vb_hash
-        || old.verified_boot_state != new.verified_boot_state
-        || old.device_locked != new.device_locked
 }
 
 fn boot_patchlevel_changed(previous: &str, next: &str) -> bool {
@@ -648,7 +644,10 @@ pub struct Config {
 
 impl Config {
     fn from_file(config_file: &ConfigFile, resolved_trust: ResolvedTrust) -> Self {
-        let remote = load_clienta_remote_override().unwrap_or_else(|| config_file.remote.clone());
+        // 远程配置只有一个来源：面板写的平铺 config。平铺不存在/读不出来就是
+        // 默认值（不启用远程），不再回落到 `config.toml` 的 `[remote]` ——
+        // 同一组设置两个载体只会让“到底哪份生效”变成玄学。
+        let remote = load_clienta_remote_override().unwrap_or_default();
         Self {
             main: config_file.main.clone(),
             crypto: config_file.crypto.clone(),
@@ -832,10 +831,13 @@ pub struct ConfigFile {
     pub crypto: CryptoConfig,
     pub trust: RawTrustConfig,
     pub device: DeviceProperty,
-    /// Remote TEE relay settings (A-side: forward attestation/sign/decrypt to
-    /// a B-side real TEE through the relay_server). Absent in existing configs,
-    /// so defaults to disabled.
-    #[serde(default)]
+    /// Remote TEE relay settings.
+    ///
+    /// **不从 `config.toml` 读写**：远程配置的唯一载体是面板写的平铺
+    /// `/data/misc/keystore/ommega/config`（`load_clienta_remote_override`）。
+    /// 以前两处都能写 `[remote]`，平铺有内容就覆盖 TOML、没内容就用 TOML，
+    /// 同一组设置两个载体。`skip_serializing` 保证保存 TOML 时不会再写回去。
+    #[serde(default, skip_serializing)]
     pub remote: RemoteConfig,
 }
 
@@ -973,6 +975,31 @@ fn default_soter_local_only_prefixes() -> String {
 /// verbose.
 pub fn flat_debug_logging() -> bool {
     flat_config_truthy(&["debug_logging", "debug", "verbose"])
+}
+
+/// 日志级别：平铺 config 的 `log_level` 键（`trace`/`debug`/`info`/`warn`/`error`/`off`），
+/// 没写就是 `Info`。
+///
+/// 以前这里是硬编码 `Debug`，一次开机就写四百多 KB（`rsproperties` 每开一个属性域
+/// 打一行，跟真正要看的东西没关系），既费 IO 也把日志文件刷得快。要现场就把
+/// `log_level: debug` 写进配置，默认只留 `info`。
+pub fn flat_log_level() -> log::LevelFilter {
+    let Ok(contents) = std::fs::read_to_string(CLIENTA_CONFIG_PATH) else {
+        return log::LevelFilter::Info;
+    };
+    let map = parse_flat_config(&contents);
+    match map
+        .get("log_level")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("trace") => log::LevelFilter::Trace,
+        Some("debug") => log::LevelFilter::Debug,
+        Some("warn") => log::LevelFilter::Warn,
+        Some("error") => log::LevelFilter::Error,
+        Some("off") => log::LevelFilter::Off,
+        _ => log::LevelFilter::Info,
+    }
 }
 
 /// Reads one boolean key out of the flat A-side config.  Truthy spellings are
@@ -1150,14 +1177,15 @@ pub struct ResolvedTrust {
     pub os_patchlevel: String,
     pub vendor_patchlevel: String,
     pub boot_patchlevel: String,
-    pub vb_key: [u8; 32],
-    pub vb_hash: [u8; 32],
-    pub vb_key_source: TrustValueSource,
-    pub vb_hash_source: TrustValueSource,
-    pub verified_boot_state: bool,
-    pub device_locked: bool,
 }
 
+/// `[trust]` 段的原始配置。
+///
+/// 这里只管「补丁/版本」这类要推导的值；verified-boot 的 key / hash / 锁定状态
+/// **不放在这里** —— 它们是设备的运行时属性（`ro.boot.vbmeta.*`、
+/// `ro.boot.flash.locked`），证书应该直接读当刻的值。以前它们在配置里存一份
+/// 开机快照（还支持显式 hex / 随机），结果是快照和属性一旦错开，证书就和设备
+/// 自相矛盾（Duck 的 Boot consistency 就是这么抓到的）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawTrustConfig {
     pub os_version: OsVersionSpec,
@@ -1168,12 +1196,6 @@ pub struct RawTrustConfig {
     pub vendor_patchlevel: String,
     #[serde(default = "default_patchlevel_mode")]
     pub boot_patchlevel: String,
-    #[serde(default)]
-    pub vb_key: TrustValueSpec,
-    #[serde(default)]
-    pub vb_hash: TrustValueSpec,
-    pub verified_boot_state: bool,
-    pub device_locked: bool,
 }
 
 impl Default for RawTrustConfig {
@@ -1184,10 +1206,6 @@ impl Default for RawTrustConfig {
             os_patchlevel: default_patchlevel_mode(),
             vendor_patchlevel: default_patchlevel_mode(),
             boot_patchlevel: default_patchlevel_mode(),
-            vb_key: TrustValueSpec::Auto,
-            vb_hash: TrustValueSpec::Auto,
-            verified_boot_state: true,
-            device_locked: true,
         }
     }
 }
@@ -1232,75 +1250,6 @@ fn default_patchlevel_mode() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum TrustValueSpec {
-    #[default]
-    Auto,
-    Random,
-    Hex([u8; 32]),
-}
-
-impl Serialize for TrustValueSpec {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            TrustValueSpec::Auto => serializer.serialize_str("auto"),
-            TrustValueSpec::Random => serializer.serialize_str("random"),
-            TrustValueSpec::Hex(bytes) => serializer.serialize_str(&hex::encode(bytes)),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for TrustValueSpec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        match raw.trim() {
-            "auto" => Ok(TrustValueSpec::Auto),
-            "random" => Ok(TrustValueSpec::Random),
-            candidate => {
-                let decoded = hex::decode(candidate).map_err(serde::de::Error::custom)?;
-                if decoded.len() != 32 {
-                    return Err(serde::de::Error::custom(
-                        "vb_key/vb_hash hex values must be exactly 32 bytes",
-                    ));
-                }
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&decoded);
-                Ok(TrustValueSpec::Hex(bytes))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TrustValueSource {
-    ExplicitHex,
-    Property,
-    Computed,
-    Original,
-    RandomExplicit,
-    RandomFallback,
-}
-
-impl std::fmt::Display for TrustValueSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TrustValueSource::ExplicitHex => write!(f, "explicit_hex"),
-            TrustValueSource::Property => write!(f, "property"),
-            TrustValueSource::Computed => write!(f, "computed"),
-            TrustValueSource::Original => write!(f, "original"),
-            TrustValueSource::RandomExplicit => write!(f, "random_explicit"),
-            TrustValueSource::RandomFallback => write!(f, "random_fallback"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceProperty {
     pub brand: String,
@@ -1336,40 +1285,6 @@ impl Default for DeviceProperty {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn trust_value_spec_parses_tokens_and_hex() {
-        let parsed: TrustValueSpec = toml::from_str::<TrustValueToml>("value = \"auto\"")
-            .unwrap_or_else(|_| panic!("toml helper should parse"))
-            .value;
-        assert_eq!(parsed, TrustValueSpec::Auto);
-
-        let parsed: TrustValueSpec = toml::from_str::<TrustValueToml>("value = \"random\"")
-            .unwrap_or_else(|_| panic!("toml helper should parse"))
-            .value;
-        assert_eq!(parsed, TrustValueSpec::Random);
-
-        let parsed: TrustValueSpec = toml::from_str::<TrustValueToml>(
-            "value = \"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"",
-        )
-        .unwrap_or_else(|_| panic!("toml helper should parse"))
-        .value;
-        assert!(matches!(parsed, TrustValueSpec::Hex(_)));
-    }
-
-    #[test]
-    fn trust_value_spec_serializes_tokens() {
-        #[derive(Serialize)]
-        struct Wrapper {
-            value: TrustValueSpec,
-        }
-
-        let serialized = toml::to_string(&Wrapper {
-            value: TrustValueSpec::Random,
-        })
-        .unwrap();
-        assert!(serialized.contains("value = \"random\""));
-    }
 
     #[test]
     fn os_version_spec_accepts_auto_or_fixed_integer() {
@@ -1430,8 +1345,6 @@ mod tests {
         assert_eq!(trust.os_patchlevel, "auto");
         assert_eq!(trust.vendor_patchlevel, "auto");
         assert_eq!(trust.boot_patchlevel, "auto");
-        assert_eq!(trust.vb_key, TrustValueSpec::Auto);
-        assert_eq!(trust.vb_hash, TrustValueSpec::Auto);
     }
 
     #[test]
@@ -1509,10 +1422,6 @@ shared_secret_nonce = "333333333333333333333333333333333333333333333333333333333
 [trust]
 os_version = 16
 security_patch = "2026-04-05"
-vb_key = "2222222222222222222222222222222222222222222222222222222222222222"
-vb_hash = "3333333333333333333333333333333333333333333333333333333333333333"
-verified_boot_state = true
-device_locked = true
 
 [device]
 brand = "Google"
@@ -1531,8 +1440,6 @@ imei2 = ""
         .unwrap()
         .config_file;
 
-        assert!(matches!(config.trust.vb_key, TrustValueSpec::Hex(_)));
-        assert!(matches!(config.trust.vb_hash, TrustValueSpec::Hex(_)));
         assert_eq!(config.trust.os_version, OsVersionSpec::Auto);
         assert_eq!(config.trust.os_patchlevel, "2026-04-05");
         assert_eq!(config.trust.vendor_patchlevel, "2026-04-05");
@@ -1805,11 +1712,6 @@ imei2 = ""
         assert!(device.imei.is_empty());
         assert!(device.imei2.is_empty());
         assert!(device.meid.is_empty());
-    }
-
-    #[derive(Deserialize)]
-    struct TrustValueToml {
-        value: TrustValueSpec,
     }
 
     #[derive(Serialize, Deserialize)]

@@ -427,8 +427,8 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
     </div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>Token</th><th>角色</th><th>类型</th><th>配对组</th><th>有效期</th><th>状态</th><th>激活时间</th><th>最后使用 IP</th><th>最后使用时间</th><th>备注</th><th>操作</th></tr></thead>
-      <tbody id="tokenBody"><tr><td colspan="11" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>Token</th><th>角色</th><th>类型</th><th>配对组</th><th>有效期</th><th>状态</th><th>激活时间</th><th>最后使用 IP</th><th>最后使用时间</th><th>备注</th><th>绑定设备</th><th>操作</th></tr></thead>
+      <tbody id="tokenBody"><tr><td colspan="12" class="empty">加载中…</td></tr></tbody>
     </table>
     </div>
     <div class="collapse-bar" id="tokenCollapse" style="display:none" onclick="toggleCollapse('token')">显示全部</div>
@@ -519,7 +519,7 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
         <option value="keybox_first">服务端优先</option>
       </select>
     </div>
-    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
       <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">设备 ID 认证</span>
       <select id="apIdAttestOrder" style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
         <option value="auto">自动（跟随模式）</option>
@@ -527,16 +527,36 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
         <option value="keybox_first">服务端优先</option>
       </select>
     </div>
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">证明密钥</span>
+      <select id="apAttestKeyOrder" style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+        <option value="smart">智能（服务端密钥）</option>
+        <option value="follow">跟随（物理模式走真机）</option>
+      </select>
+    </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
       <button class="btn primary" onclick="saveAttestPolicy()">保存</button>
     </div>
     <p class="hint" id="apStatus" style="margin:12px 0 0;line-height:1.7;">加载中…</p>
+    <hr style="margin:18px 0;border:none;border-top:1px solid var(--border);">
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">B 接入上限</span>
+      <input id="bLimit" type="number" min="0" max="512" step="1" value="0"
+             style="flex:1;min-width:160px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+      <button class="btn primary" onclick="saveBLimit()">保存</button>
+    </div>
+    <p class="hint" id="bLimitStatus" style="margin:10px 0 0;line-height:1.7;">加载中…</p>
+    <p class="hint" style="margin:6px 0 0;line-height:1.7;">
+      0 = 不限制。大于 0 时，同时在线的 B 超过这个数就按「锁定 + 可信启动」优先挑：
+      新设备比在线那批里最差的更可信，就顶掉最差的那台；否则拒（403，B 端日志里能看到原因）。
+      掉线超过 120 秒自动腾名额。上面的「默认 keymint / soter 设备」不受这个限制。
+    </p>
   </div>
 </div>
 
 <!-- 服务端身份分级（StrongBox / TEE 各用哪份 keybox 身份） -->
 <div class="panel">
-  <h2>服务端身份分级 <span class="hint">用服务端 keybox 出链时，StrongBox 请求（security level 2）和 TEE 请求（1）各自用哪一份存好的身份。留空 = 维持旧行为（用请求里那台 B 的 id，找不到再借一份可用的）</span></h2>
+  <h2>服务端身份分级 <span class="hint">用服务端 keybox 出链时，StrongBox 请求（security level 2）和 TEE 请求（1）各自用哪一份存好的身份。StrongBox 必须钉死（留空则 level=2 请求直接拒绝，不会借用 TEE 身份）；TEE 留空 = 用请求里那台 B 的 id，找不到再借一份可用的</span></h2>
   <div class="body">
     <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
       <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">TEE 身份</span>
@@ -900,6 +920,23 @@ async function deleteToken(id) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+// 私卡解绑：只清设备指纹，激活时间与有效期不变；下次使用重新绑定。
+async function unbindToken(encodedToken) {
+  const token = decodeURIComponent(encodedToken);
+  if (!confirm('确认解绑这张卡的设备？下次使用会绑定到新的设备。')) return;
+  try {
+    const d = await api('/api/admin/token_unbind/', {
+      method: 'POST',
+      body: JSON.stringify({ token })
+    });
+    const released = d && (d.released_serial || d.released_sn)
+      ? `（原设备 ${d.released_serial || '-'} / ${d.released_sn || '-'}）`
+      : '';
+    toast('已解绑' + released);
+    loadTokens();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 async function viewTokenIps(tokenEncoded) {
   const token = decodeURIComponent(tokenEncoded);
   openModal('历史使用 IP', '加载中…');
@@ -1057,7 +1094,7 @@ function renderTokens() {
     ? `${filtered.length} / ${_tokenData.length} 条`
     : `${_tokenData.length} 条`;
   if (!filtered.length) {
-    document.getElementById('tokenBody').innerHTML = '<tr><td colspan="11" class="empty">' + (q ? '无匹配 Token' : '暂无 API Token') + '</td></tr>';
+    document.getElementById('tokenBody').innerHTML = '<tr><td colspan="12" class="empty">' + (q ? '无匹配 Token' : '暂无 API Token') + '</td></tr>';
     document.getElementById('tokenCollapse').style.display = 'none';
     return;
   }
@@ -1078,8 +1115,14 @@ function renderTokens() {
       <td class="mono">${esc(t.last_ip || '—')}</td>
       <td>${t.last_used_at ? fmtTimeStr(t.last_used_at) : '—'}</td>
       <td>${esc(t.note || '—')}</td>
+      <td class="mono">${(t.bound_serial || t.bound_sn)
+        ? `${esc(t.bound_serial || '—')}<br><span class="muted">${esc(t.bound_sn || '—')}</span>`
+        : '<span class="muted">未绑定</span>'}</td>
       <td>
         <button class="btn small" onclick="viewTokenIps('${encodeURIComponent(t.token)}')">查看 IP</button>
+        ${(t.bound_serial || t.bound_sn) && t.kind && t.kind !== 'public'
+          ? `<button class="btn small" onclick="unbindToken('${encodeURIComponent(t.token)}')">解绑</button>`
+          : ''}
         ${t.enabled
           ? `<button class="btn small" onclick="toggleToken(${t.id}, false)">禁用</button>`
           : `<button class="btn small" onclick="toggleToken(${t.id}, true)">启用</button>`}
@@ -1260,14 +1303,16 @@ async function setStrongboxMode(mode) {
 }
 
 const ORDER_LABEL = { auto: '自动（跟随模式）', b_first: '真机优先', keybox_first: '服务端优先' };
+const ATTEST_KEY_LABEL = { smart: '智能（服务端密钥）', follow: '跟随（物理模式走真机）' };
 
 async function loadAttestPolicy() {
   try {
     const d = await api('/api/admin/attest_policy/');
     $('#apAttestOrder').value = d.attest_order || 'auto';
     $('#apIdAttestOrder').value = d.id_attest_order || 'auto';
+    $('#apAttestKeyOrder').value = d.attest_key_order || 'smart';
     const mode = d.mode === 'server_keybox' ? '本地出证（keybox 先）' : 'A/B 转发（真机先）';
-    $('#apStatus').textContent = `当前模式：${mode} · 普通=${ORDER_LABEL[d.attest_order] || d.attest_order} · 设备 ID=${ORDER_LABEL[d.id_attest_order] || d.id_attest_order}`;
+    $('#apStatus').textContent = `当前模式：${mode} · 普通=${ORDER_LABEL[d.attest_order] || d.attest_order} · 设备 ID=${ORDER_LABEL[d.id_attest_order] || d.id_attest_order} · 证明密钥=${ATTEST_KEY_LABEL[d.attest_key_order] || d.attest_key_order}`;
   } catch (e) { $('#apStatus').textContent = '读取失败: ' + e.message; }
 }
 
@@ -1278,10 +1323,36 @@ async function saveAttestPolicy() {
       body: JSON.stringify({
         attest_order: $('#apAttestOrder').value,
         id_attest_order: $('#apIdAttestOrder').value,
+        attest_key_order: $('#apAttestKeyOrder').value,
       }),
     });
     toast('认证层序已保存（立即生效）');
     loadAttestPolicy();
+  } catch (e) { toast('保存失败: ' + e.message, 'err'); }
+}
+
+async function loadBLimit() {
+  try {
+    const d = await api('/api/admin/b_limit/');
+    $('#bLimit').value = d.max_b_devices ?? 0;
+    const u = d.unlimited || {};
+    const unlimited = [u.keymint && `keymint=${u.keymint}`, u.soter && `soter=${u.soter}`]
+      .filter(Boolean).join(' · ') || '（未配置）';
+    $('#bLimitStatus').textContent =
+      `当前上限：${d.max_b_devices > 0 ? d.max_b_devices + ' 台' : '不限制'} · 无条件接入：${unlimited}`;
+  } catch (e) { $('#bLimitStatus').textContent = '读取失败: ' + e.message; }
+}
+
+async function saveBLimit() {
+  try {
+    const raw = Number($('#bLimit').value || 0);
+    if (!Number.isFinite(raw) || raw < 0) { toast('上限必须是非负整数', 'err'); return; }
+    await api('/api/admin/b_limit/', {
+      method: 'POST',
+      body: JSON.stringify({ max_b_devices: Math.floor(raw) }),
+    });
+    toast('B 接入上限已保存（立即生效）');
+    loadBLimit();
   } catch (e) { toast('保存失败: ' + e.message, 'err'); }
 }
 
@@ -1370,7 +1441,7 @@ async function clearDefaultDevice() {
 }
 
 function loadAll() {
-  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadIdentityPolicy(); loadDefaultDevice();
+  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadIdentityPolicy(); loadDefaultDevice(); loadBLimit();
 }
 
 /* Upload */

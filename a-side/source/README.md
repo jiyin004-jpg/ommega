@@ -49,8 +49,9 @@ relay_server.
    (one package per line; `!` = force generate, `?` = force patch). The WebUI
    (`webroot/`) manages this for you under KernelSU.
 
-4. Replace the template `keybox.xml` if you want local-mode attestation with
-   your own keys.
+4. Replace the template `keybox_tee.xml` (TEE level) or
+   `keybox_strongbox.xml` (StrongBox level) if you want local-mode attestation
+   with your own keys. The two files are independent and never shared.
 
 > **Path note**: `/data/adb/` is root-only, so the keystore process (uid 1017)
 > cannot read `/data/adb/ommega/*` directly. The single data location is

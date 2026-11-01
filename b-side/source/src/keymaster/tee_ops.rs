@@ -145,6 +145,12 @@ pub struct KeySpec {
 /// 是同一把，再交给 HAL；HAL 侧的权限来自那把钥匙 keyblob 里的 ATTEST_KEY 用途。
 #[derive(Clone, Debug)]
 pub struct AttestationKeyRef {
+    /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
+    ///
+    /// 有值时直接拿去给 HAL 签，不再查 session —— AK 不在本机铸（智能模式在
+    /// 服务端、或换了一台 B）时，只靠 alias 会直接报
+    /// `issuer key ... is not available on this device`。
+    pub key_blob: Option<Vec<u8>>,
     pub alias: String,
     pub issuer_subject_name: Vec<u8>,
 }
@@ -632,15 +638,42 @@ fn mint_attest_key_with(
     // Probe the actual HAL version instead of assuming V5. A StrongBox HAL
     // may only implement KeyMint V2/V3; sending V5-encoded parameters can
     // cause version-mismatch errors that look like "not supported".
-    let km_version = probe_keymint_version(&keymint);
+    let km_version = probe_keymint_version(&keymint, service);
     let params = build_attestation_params(app_id_der, challenge, spec, km_version)?;
 
     // 调用方自带的证明密钥（App AttestKey 委派）：先在本机找到那把 key，确认它
     // 属于同一个 HAL、证书 Subject 与请求一致，然后交给**真 TEE** 原生签发子证书。
     // 本进程不持有任何私钥，也不用自己的批量 key 冒充。
+    //
+    // **session 优先，key blob 兜底**：AK 就是本机铸的（跟随模式）时 session 里
+    // 有它，直接用最可靠；查不到再退回请求带过来的 blob，但那个 blob 也必须是
+    // 本机 TEE 能解的真机 blob，否则 `generateKey` 会直接 -33（INVALID_KEY_BLOB）。
     let parent = match spec.attestation_key.as_ref() {
-        Some(request) => Some(resolve_issuer(request, service)?),
+        Some(request) => match resolve_issuer(request, service) {
+            Ok(parent) => Some(parent),
+            Err(_) if request.key_blob.is_some() => {
+                log::info!(
+                    "issuer key '{}' not in session, falling back to request key blob",
+                    request.alias
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        },
         None => None,
+    };
+    let native_attest = if parent.is_none() {
+        spec.attestation_key.as_ref().and_then(|request| {
+            request.key_blob.as_ref().map(|blob| {
+                crate::android::hardware::security::keymint::AttestationKey::AttestationKey {
+                    keyBlob: blob.clone(),
+                    attestKeyParams: vec![],
+                    issuerSubjectName: request.issuer_subject_name.clone(),
+                }
+            })
+        })
+    } else {
+        None
     };
 
     let result = match (spec.attestation_key.as_ref(), parent.as_ref()) {
@@ -648,7 +681,7 @@ fn mint_attest_key_with(
             generate_with_native_issuer(service, &*keymint, &params, request, parent)?
         }
         // `mint_with_attestation_key` 那只自检入口直接把 keyblob 传进来，照旧支持。
-        _ => match keymint.generateKey(&params, attest) {
+        _ => match keymint.generateKey(&params, native_attest.as_ref().or(attest)) {
             Ok(result) => result,
             Err(status) => {
                 if is_dead_object_status(&status) {
@@ -1167,6 +1200,27 @@ pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<Vec<u8>> {
         &session.key_blob,
         session.hal_service,
         KeyPurpose::DECRYPT,
+        &op_params,
+        data,
+    )?;
+    persist_upgraded_blob(alias, session, upgraded);
+    Ok(out)
+}
+
+/// ECDH agreement (`data` = peer public key, X.509 SubjectPublicKeyInfo DER).
+/// Runs begin(AGREE_KEY) + update(peer) + finish on the real TEE.
+pub fn agree(alias: &str, data: &[u8], _algorithm: &str) -> Result<Vec<u8>> {
+    let session = session_get(alias)?;
+    if !matches!(session.algorithm, KeyAlgorithm::EcP256) {
+        return Err(anyhow!("ECDH needs an EC key, alias {alias} is RSA"));
+    }
+    let params = vec![KeyParam::Purpose(KmKeyPurpose::AgreeKey)];
+    let op_params = key_params_to_aidl(&params, KEY_MINT_V5)
+        .with_context(|| ks_err!("encode agree begin parameters"))?;
+    let (out, upgraded) = run_single_input_op(
+        &session.key_blob,
+        session.hal_service,
+        KeyPurpose::AGREE_KEY,
         &op_params,
         data,
     )?;

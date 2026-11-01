@@ -2,7 +2,7 @@
 
 # adbrd 监管脚本 —— A / B 两端共用同一份，用参数选读哪份配置：
 #
-#   sh adbr-daemon.sh --a   A 端：/data/misc/keystore/ommega/config 里的 `adbr:`
+#   sh adbr-daemon.sh --a   A 端：/data/misc/ommega/config 里的 `adbr:`
 #   sh adbr-daemon.sh --b   B 端：/data/adb/ommega-b/conf/relay.conf 里的 OMMEGA_RELAY_ABDR_ENABLED
 #
 # 设备被公网远控这件事必须由用户显式点头，所以这里只认配置里的开关，不开就不跑：
@@ -34,11 +34,17 @@ CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-LOG="$STATE_DIR/logs/adbr.log"
+# A 端日志统一到 /data/misc/ommega/logs/daemon.log；B 端还是自己的目录。
+if [ "$MODE" = "a" ]; then
+  LOG=/data/misc/ommega/logs/daemon.log
+else
+  LOG="$STATE_DIR/logs/adbr.log"
+fi
+mkdir -p "${LOG%/*}" 2>/dev/null
 LOCK_DIR="$RUN_DIR/adbr-daemon.lock"
 
 if [ "$MODE" = "a" ]; then
-  CONF=/data/misc/keystore/ommega/config
+  CONF=/data/misc/ommega/config
 else
   CONF="$CONF_DIR/relay.conf"
 fi
@@ -141,7 +147,8 @@ find_bin() {
 #      "adbd listening on tcp:5555"。
 # 所以先探端口，不通就自己起一个（先停 init 那个带 tradeinmode 的）。
 adbd_tcp_alive() {
-  timeout 2 nc 127.0.0.1 5555 </dev/null >/dev/null 2>&1
+  # 超时压到 1 秒：没人监听时这里会阻塞，而主循环每轮都要问一次。
+  timeout 1 nc 127.0.0.1 5555 </dev/null >/dev/null 2>&1
 }
 
 ensure_adbd_tcp() {
@@ -178,11 +185,101 @@ ensure_adbd_tcp() {
   return 1
 }
 
+adbd_manual_pids() {
+  for d in /proc/[0-9]*; do
+    [ -r "$d/comm" ] || continue
+    [ "$(cat "$d/comm" 2>/dev/null)" = "adbd" ] || continue
+    c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    # init 起的那个也带 --root_seclabel=u:r:su:s0，但它还有 --tim_seclabel；
+    # 我们自己 ensure_adbd_tcp 起的只有 root_seclabel。别看错把 init 的当自己的杀了。
+    case "$c" in
+      *root_seclabel=u:r:su:s0*tim_seclabel*) continue ;;
+      *root_seclabel=u:r:su:s0*) printf '%s\n' "${d#/proc/}" ;;
+    esac
+  done
+}
+
+# 关掉 adbr 之后把留在设备上的痕迹收干净：
+#   - 5555 不能继续监听（检测器会看这个口，用户明确要的）
+#   - adbd 不能一真挂在 TCP 调试形态（ctl.stop 只管 init 那个，手动起的杀不到）
+#   - persist 属性、adb_keys 里的公钥、adbrd 的临时日志一起收
+# 幂等：没痕迹就什么都不动，所以放在主循环里每轮调也不会反复杀 adbd。
+adbr_cleanup_traces() {
+  touched=0
+
+  # 1. 我们手动起的 adbd 实例（带 --root_seclabel=u:r:su:s0），ctl.stop 管不到它。
+  mpids=$(adbd_manual_pids)
+  if [ -n "$mpids" ]; then
+    for p in $mpids; do
+      echo "[adbr] 停掉手动起的 adbd: $p"
+      kill -9 "$p" 2>/dev/null
+    done
+    touched=1
+  fi
+
+  # 2. TCP 端口开关：adbrd 启动时会设成 5555，被杀之后它不会自己清。
+  if [ -n "$(getprop service.adb.tcp.port 2>/dev/null)" ]; then
+    setprop service.adb.tcp.port ""
+    echo "[adbr] 清掉 service.adb.tcp.port"
+    touched=1
+  fi
+  if [ -n "$(getprop persist.adb.tcp.port 2>/dev/null)" ]; then
+    setprop persist.adb.tcp.port ""
+    echo "[adbr] 清掉 persist.adb.tcp.port"
+    touched=1
+  fi
+
+  # 3. adbd 一直在带旧 prop 跑，得让它重来一遍才会丢掉 5555；只 stop 不 start，
+  # 起不起来交给 init，不替用户决定要不要开 USB 调试。
+  if [ "$touched" = "1" ]; then
+    setprop ctl.stop adbd 2>/dev/null
+  fi
+
+  # 4. ensure_adbd_tcp 设过的 persist 属性（不清的话重启还在）。
+  if [ "$(getprop persist.adb.nonblocking_ffs 2>/dev/null)" = "1" ]; then
+    setprop persist.adb.nonblocking_ffs ""
+    echo "[adbr] 清掉 persist.adb.nonblocking_ffs"
+  fi
+
+  # 5. adb 授权名单：`adbr authorize` 会往 adb_keys 里追加本机公钥，改之前备份成
+  #    adb_keys.bak-adbr。有备份就按备份恢复（那就是我们动手之前的样子）。
+  A=/data/misc/adb/adb_keys
+  B=/data/misc/adb/adb_keys.bak-adbr
+  if [ -f "$B" ]; then
+    cat "$B" > "$A" 2>/dev/null && echo "[adbr] 按备份恢复 adb_keys"
+    rm -f "$B" 2>/dev/null
+    chown system:shell "$A" 2>/dev/null
+    chmod 0640 "$A" 2>/dev/null
+  fi
+
+  # 6. adbrd 的默认日志位置。
+  rm -f /data/local/tmp/adbr.log 2>/dev/null
+}
+
+# 关掉 adbr = 设备上不该再有任何调试入口，所以连开发者选项里的 USB 调试开关一起关。
+# 用标记文件只做一次：用户以后想用 adb，自己把调试打开时，不能被这里的循环又按回去。
+adbr_close_usb_debug_once() {
+  [ -f "$RUN_DIR/adbr.closed" ] && return 0
+  if [ "$(settings get global adb_enabled 2>/dev/null)" != "0" ]; then
+    settings put global adb_enabled 0 2>/dev/null
+    echo "[adbr] 关掉 USB 调试（adb_enabled=0）"
+  fi
+  if [ "$(settings get global adb_wifi_enabled 2>/dev/null)" = "1" ]; then
+    settings put global adb_wifi_enabled 0 2>/dev/null
+    echo "[adbr] 关掉无线调试（adb_wifi_enabled=0）"
+  fi
+  setprop ctl.stop adbd 2>/dev/null
+  : > "$RUN_DIR/adbr.closed" 2>/dev/null
+}
+
 while true; do
-  # 每轮都检查一次：不管 adbr 开关开没开，只要有人在 5555 上等（属性被设了），
-  # adbd 就得真的在监听。
-  ensure_adbd_tcp
+  # adbd 只在 adbr 开关开着时才需要管：以前这里是「不管开没开，属性被设了就管」，
+  # 结果开关关着、adbrd 被杀之后 service.adb.tcp.port=5555 还留着，每轮又去 nc 探
+  # 端口（没人监听要阻塞）再起一次 adbd、再杀一次，白烧 CPU。
   if switch_on; then
+    # 开关一旦重新打开，就把「已关过」的标记清掉，下次关时还要再收一遍。
+    rm -f "$RUN_DIR/adbr.closed" 2>/dev/null
+    ensure_adbd_tcp
     pids=$(adbr_pids)
     if [ -n "$pids" ]; then
       # 记下来给面板看（面板按名字认不出来，见 adbr_pids 上面的注释）。
@@ -214,18 +311,17 @@ while true; do
       done
       # shellcheck disable=SC2086
       kill $pids 2>/dev/null
-      # adbrd 自己会把 service.adb.tcp.port 设成 5555 去开 TCP 调试，被杀掉后这个属性
-      # 还留着，系统 adbd 就一直挂在 5555 上等连接，只能重启才恢复。关开关时收干净：
-      # 清掉属性，adbd 正跑着就停掉（用户自己开的 USB 调试开关 adb_enabled 不动）。
-      if [ "$(getprop service.adb.tcp.port 2>/dev/null)" = "5555" ]; then
-        setprop service.adb.tcp.port ""
-        echo "[adbr] 清掉 service.adb.tcp.port=5555"
-      fi
-      if [ "$(getprop init.svc.adbd 2>/dev/null)" = "running" ]; then
-        setprop ctl.stop adbd
-        echo "[adbr] 停掉 adbd"
-      fi
+      sleep 1
     fi
+    # 不管刚才杀没杀到，只要设备上还留着 5555 / 手动 adbd / 授权痕迹，就收干净。
+    adbr_cleanup_traces
+    # USB 调试只在关掉的那一刻关一次（标记住），之后用户自己开不拦。
+    adbr_close_usb_debug_once
   fi
-  sleep 2
+  # 开关开着才需要勤查（adbrd 崩了要拉回来）；关着就慢查，没必要每 2 秒扫一遍 /proc。
+  if switch_on; then
+    sleep 5
+  else
+    sleep 30
+  fi
 done

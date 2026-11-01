@@ -828,9 +828,26 @@ fn reject_reason(private_key_pem: &str, chain_pem: &str) -> Option<String> {
     None
 }
 
+/// 这个 device id 是否被控制台钉成了 StrongBox 身份。
+///
+/// 源采集（含 cover）只能更新 TEE 那份；StrongBox 一律人工指定，
+/// 所以采集入口都先过这道。
+fn is_strongbox_identity(device_id: &str) -> bool {
+    crate::identity_policy::snapshot().1.as_deref() == Some(device_id)
+}
+
 /// Store an identity under a source's target device id. Returns whether it was
 /// actually written (`false` when validation or the DB write failed).
 fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData) -> bool {
+    // 源采集只喂 TEE。控制台把某个 id 钉成 StrongBox 身份之后，这里不能写它 ——
+    // StrongBox 那份只能是人工指定的，混进源里的 TEE 链就又是级别串了。
+    if is_strongbox_identity(device_id) {
+        tracing::warn!(
+            "autokeybox skip device_id={device_id} source={} reason=strongbox identity is manual-only",
+            src.name
+        );
+        return false;
+    }
     // 采集是自动跑的，宁可少收一份也不能把坏材料塞进池子 —— 出证时会直接失败。
     if let Some(why) = reject_reason(&kb.private_key_pem, &kb.certificate_chain_pem) {
         tracing::warn!(
@@ -860,6 +877,12 @@ fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData)
 /// Store a fetched identity under `device_id`, tagged `auto-cover:<source>` so
 /// `clear_auto_cover` can later remove exactly the rows this mode wrote.
 fn store_cover_identity(db: &Db, device_id: &str, source: &str, kb: &KeyboxData) {
+    if is_strongbox_identity(device_id) {
+        tracing::warn!(
+            "autokeybox cover skip device_id={device_id} source={source} reason=strongbox identity is manual-only"
+        );
+        return;
+    }
     if let Some(why) = reject_reason(&kb.private_key_pem, &kb.certificate_chain_pem) {
         tracing::warn!("autokeybox cover skip device_id={device_id} source={source} reason={why}");
         return;

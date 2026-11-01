@@ -2,8 +2,8 @@
 //!
 //! 这台机器的 SOTER TA 是没 provisioning 的 —— 实测 `generateAskKeyPair` 直接回
 //! -20，key 一把都建不出来，所以本地真 HAL 这条腿是瘸的。这个模块补的就是那一
-//! 块：拿 `assets/soter_ask.pem` 里那把 RSA，在用户态直接算签名，造一份"自洽"
-//! 的 SOTER 应答出来。
+//! 块：拿编译进来的 ATTK（构建时现生成的那把自签 RSA）签 ASK 的认证信封，
+//! ASK 本身按 uid 用到才现生成、落盘复用。
 //!
 //! 形状跟服务端 `soter_mint.rs` 一模一样（那边的测试验过：ASK 的签名拿导出的
 //! ATTK 公钥验得过）。要吐信封的三处都是同一个形状：
@@ -35,8 +35,10 @@
 //! 实测宿主也是这么回的），这样上层看不出区别。
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Mutex, OnceLock};
 
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::pss::SigningKey as PssSigningKey;
 use rsa::pss::VerifyingKey as PssVerifyingKey;
@@ -55,29 +57,17 @@ const NOT_FOUND: i32 = -5;
 const AUTH_KEY_NOT_READY: i32 = -6;
 /// ASK 里写死的盐长，也正好是 SHA-256 的摘要长度。
 const SALT_LEN: i32 = 32;
-/// 编译进来的那把私钥（PKCS#8 PEM）—— 候选文件都没有时才用它。
-const ASK_PEM: &[u8] = include_bytes!("../../assets/soter_ask.pem");
-/// 换本地兜底 ASK 用的文件（PKCS#8 PEM，`openssl genpkey -algorithm RSA` 那种）。
-/// 存在且解析得过就用它，跟 keybox.xml 一个路子：丢文件进去、重启 SOTER 宿主就生效。
+/// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
+/// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
+const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
+/// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM，`openssl genpkey` / `openssl genrsa` 的都行）。
+/// 存在且解析得过就用它，跟 keybox 一个路子：丢文件进去、重启 SOTER 宿主就生效。
 ///
-/// 两个位置对应两个域，谁在哪个域里读得到就认谁：
-/// - `/data/misc/ommega/`：payload 落进 app 域（SOTER 宿主是 uid 1000）时读得到；
-/// - `/data/misc/keystore/ommega/`：跟真配置同一个目录，keystore 域读得到。
-const ASK_FILE_PATHS: [&str; 2] = [
-    "/data/misc/ommega/soter_ask.pem",
-    "/data/misc/keystore/ommega/soter_ask.pem",
-];
-/// 环境变量覆盖，写测试和临时探针用。
-const ASK_FILE_ENV: &str = "OMMEGA_SOTER_ASK_PEM";
-
-/// 独立的 ASK 私钥（可选）。有它的时候两条路分开：`exportAskPublicKey` 吐它的公钥，
-/// `exportAttkPublicKey` 吐 ATTK 的公钥 —— 真机上这两个永远不相等，相等就是假的。
-/// 没有就退回旧行为（ASK 兼 ATTK）。
-const ASK_KEY_FILE_PATHS: [&str; 2] = [
-    "/data/misc/ommega/soter_ask_key.pem",
-    "/data/misc/keystore/ommega/soter_ask_key.pem",
-];
-const ASK_KEY_FILE_ENV: &str = "OMMEGA_SOTER_ASK_KEY_PEM";
+/// 唯一位置是 `/data/misc/ommega/`：它的 context 是 `system_data_file`，
+/// app 域（SOTER 宿主是 uid 1000）和 keystore 域都读得到，不需要在两个目录各存一份。
+const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
+/// 环境变量覆盖 ATTK，写测试和临时探针用。
+const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
 /// counter 起点。真机上这个号早就几千了（PLC110 实测 7394），从 1 开始会被当回滚。
 const COUNTER_BASE: u64 = 10_000;
@@ -89,6 +79,28 @@ const CPU_ID_OVERRIDE: &str = "/data/misc/ommega/soter_cpu_id.force";
 /// 读不到就不报，绝不编一个（见 [`cpu_id`]）。
 const FALLBACK_SEED: &str = "ommega-a-side-local";
 
+/// 从一段可能夹着注释的文件里抽出 PEM 本体（`-----BEGIN` 到 `-----END`）。
+///
+/// WebUI 导入的 ATTK 文件可以在里面写一行 `cpu_id: 09000000…`，daemon 会拿它设
+/// `soter_cpu_id.force`；这里把这些非 PEM 行滤掉再交给解析器。
+fn pem_block(pem: &str) -> String {
+    let mut out = String::with_capacity(pem.len());
+    let mut inside = false;
+    for line in pem.lines() {
+        if line.contains("-----BEGIN") {
+            inside = true;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if line.contains("-----END") {
+            inside = false;
+        }
+    }
+    out
+}
+
 /// 一对 RSA，加它的公钥 PEM（SOTER 里的"证书"就是拿这个验的）。
 #[derive(Clone)]
 struct Key {
@@ -99,7 +111,13 @@ struct Key {
 
 impl Key {
     fn from_pem(pem: &str) -> Option<Self> {
-        let private = RsaPrivateKey::from_pkcs8_pem(pem.trim()).ok()?;
+        // 文件里允许带 `cpu_id: 09000000…` 这类注释行（WebUI 导入时 daemon 靠它设 force），
+        // PEM 解析器不认那些行，先只取 BEGIN…END 之间那段。
+        let block = pem_block(pem);
+        // PKCS#8 和 PKCS#1 都认：`openssl genpkey` 给前者，`openssl genrsa` 给后者。
+        let private = RsaPrivateKey::from_pkcs8_pem(block.trim())
+            .or_else(|_| RsaPrivateKey::from_pkcs1_pem(block.trim()))
+            .ok()?;
         let pem = rsa::RsaPublicKey::from(&private)
             .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
             .ok()?;
@@ -129,15 +147,15 @@ impl Key {
 /// 不碰 TEE**，所以不会阻塞任何签名路径。失败只说明「这次没成」，不当成「这台机器
 /// 不能签」（跟 `SignState` 那套一个口径）。
 pub(crate) fn selftest() -> anyhow::Result<()> {
-    let state = state().ok_or_else(|| anyhow::anyhow!("soter local state unavailable"))?;
+    state().ok_or_else(|| anyhow::anyhow!("soter local state unavailable"))?;
     let message: &[u8] = b"ommega-soter-selftest";
-    let raw = state
-        .attk
+    let attk = current_attk().ok_or_else(|| anyhow::anyhow!("soter local ATTK unavailable"))?;
+    let raw = attk
         .sign(message)
         .ok_or_else(|| anyhow::anyhow!("the local ATTK could not sign"))?;
     let signature = rsa::pss::Signature::try_from(raw.as_slice())
         .map_err(|error| anyhow::anyhow!("malformed signature: {error}"))?;
-    let public = rsa::RsaPublicKey::from(&state.attk.private);
+    let public = rsa::RsaPublicKey::from(&attk.private);
     PssVerifyingKey::<PssSha256>::new(public)
         .verify(message, &signature)
         .map_err(|error| anyhow::anyhow!("the signature did not verify: {error}"))
@@ -155,7 +173,8 @@ struct SignSession {
 /// 后端状态。签发用的 key 一开始就加载好（编译进来的，失败就是编坏了）。
 struct State {
     /// 签名根（ATTK）。本地模式里它就是 `exportAttkPublicKey` 吐的那把，全设备只有一把。
-    attk: Key,
+    /// 外面用 [`current_attk`] 取，文件换了会现读，跟 keybox 一个路子。
+    attk: Mutex<Key>,
     /// 对外导出的 ASK。真机是一把 ATTK 挂 N 把 ASK、每个 uid 一把，这里按 uid 存。
     asks: Mutex<HashMap<i32, Key>>,
     /// `{uid}|{alias}` -> AuthKey。
@@ -176,7 +195,7 @@ struct State {
 
 /// ATTK 到底从哪儿来的（换 key 之后一眼看得出生效没有）。
 static ATTK_ORIGIN: OnceLock<String> = OnceLock::new();
-/// uid -> 该 uid 的 ASK 来自哪里（per-uid 文件 / 旧全局文件 / 现生成）。
+/// uid -> 该 uid 的 ASK 来自哪里（per-uid store / 旧 per-uid 文件迁移 / 现生成）。
 static ASK_ORIGINS: std::sync::LazyLock<Mutex<HashMap<i32, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -199,17 +218,17 @@ pub(crate) fn ask_origin() -> Option<String> {
     }
 }
 
-/// 按候选顺序找一把可用的 ASK：环境变量指定的文件 → 两个候选文件 → 编进来的那把。
+/// 按候选顺序找一把可用的 ATTK：环境变量指定的文件 → 两个候选文件 → 编进来的那把。
 ///
 /// `override_path` 是给测试用的显式覆盖（不去碰进程环境变量，免得多线程下互相干扰）。
-fn load_ask_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
+fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let from_env =
-        override_path.or_else(|| std::env::var_os(ASK_FILE_ENV).map(std::path::PathBuf::from));
+        override_path.or_else(|| std::env::var_os(ATTK_FILE_ENV).map(std::path::PathBuf::from));
     if let Some(path) = from_env {
         candidates.push(path);
     }
-    candidates.extend(ASK_FILE_PATHS.iter().map(std::path::PathBuf::from));
+    candidates.extend([std::path::PathBuf::from(ATTK_FILE_PATH)]);
 
     for path in candidates {
         let Ok(pem) = std::fs::read_to_string(&path) else {
@@ -219,26 +238,23 @@ fn load_ask_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, 
             Some(key) => return Some((key, path.display().to_string())),
             // 文件在那儿但读不出私钥：别当没事，也别拿它顶，继续往下找。
             None => log::warn!(
-                "soter local ask at {} is not a usable PKCS#8 PEM; ignoring it",
+                "soter local attk at {} is not a usable RSA PEM; ignoring it",
                 path.display()
             ),
         }
     }
 
-    let pem = std::str::from_utf8(ASK_PEM).ok()?;
-    Some((Key::from_pem(pem)?, "embedded asset".to_string()))
+    let pem = std::str::from_utf8(ATTK_PEM).ok()?;
+    Some((Key::from_pem(pem)?, "embedded attk".to_string()))
 }
 
-fn load_ask_key() -> Option<(Key, String)> {
-    load_ask_key_with(None)
+fn load_attk_key() -> Option<(Key, String)> {
+    load_attk_key_with(None)
 }
 
-/// 旧版按 uid 散落的 ASK 文件位置（读到就迁进 store，然后把旧文件删掉）。
-fn legacy_ask_file_paths(uid: i32) -> [String; 2] {
-    [
-        format!("/data/misc/keystore/ommega/soter_ask_{uid}.pem"),
-        format!("/data/misc/ommega/soter_ask_{uid}.pem"),
-    ]
+/// 旧版按 uid 散落的 ASK 文件（读到就迁进 store，然后把旧文件删掉）。
+fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
+    [format!("/data/misc/ommega/soter_ask_{uid}.pem")]
 }
 
 /// 所有 uid 的 ASK 和 AuthKey 存在这一个文件里，不要按 uid/alias 散成一堆 pem。
@@ -248,11 +264,8 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 2] {
 /// { "asks": { "10496": "<pem>" }, "authkeys": { "10496|SoterAuthKey": "<pem>" } }
 /// ```
 ///
-/// 旧版只有一层（`{ "10496": "<pem>" }`），读的时候当成 `asks` 处理。
-const ASK_STORE_PATHS: [&str; 2] = [
-    "/data/misc/keystore/ommega/soter_asks.json",
-    "/data/misc/ommega/soter_asks.json",
-];
+/// 位置唯一：`/data/misc/ommega/`（`system_data_file`，app 域和 keystore 域都读得到）。
+const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
 const ASK_SECTION: &str = "asks";
 const AUTH_SECTION: &str = "authkeys";
 
@@ -260,42 +273,42 @@ const AUTH_SECTION: &str = "authkeys";
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
-    for path in ASK_STORE_PATHS {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(serde_json::Value::Object(mut map)) => {
-                // 旧版扁平格式：顶层全是 uid，整个当成 asks。
-                let flat = !map.is_empty() && map.keys().all(|key| key.parse::<i32>().is_ok());
-                if flat {
-                    let mut wrapped = serde_json::Map::new();
-                    wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
-                    return wrapped;
-                }
-                map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION);
-                return map;
+    let path = ASK_STORE_PATH;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return serde_json::Map::new();
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            // 旧版扁平格式：顶层全是 uid，整个当成 asks。
+            let flat = !map.is_empty() && map.keys().all(|key| key.parse::<i32>().is_ok());
+            if flat {
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
+                return wrapped;
             }
-            _ => log::warn!("soter local ask store at {path} is not a json object; ignoring it"),
+            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION);
+            map
+        }
+        _ => {
+            log::warn!("soter local ask store at {path} is not a json object; ignoring it");
+            serde_json::Map::new()
         }
     }
-    serde_json::Map::new()
 }
 
 fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     let text = serde_json::to_string_pretty(map).ok()?;
-    for path in ASK_STORE_PATHS {
-        if let Some(dir) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        // 写临时文件再 rename：中途掉电也不会留个半个 json。
-        let tmp = format!("{path}.tmp");
-        if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-            return Some(path.to_string());
-        }
-        let _ = std::fs::remove_file(&tmp);
-        log::warn!("soter local cannot write the ask store at {path}");
+    let path = ASK_STORE_PATH;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    // 写临时文件再 rename：中途掉电也不会留个半个 json。
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return Some(path.to_string());
+    }
+    let _ = std::fs::remove_file(&tmp);
+    log::warn!("soter local cannot write the ask store at {path}");
     None
 }
 
@@ -357,6 +370,34 @@ fn forget_uid_keys(uid: i32) {
     }
 }
 
+/// ATTK 文件的 mtime。换文件（WebUI 写新的、用户手放）时靠它判断要不要重读。
+static ATTK_STAMP: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
+
+fn attk_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(ATTK_FILE_PATH)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// 当前生效的 ATTK。文件没变就吃缓存，变了就现读 —— 换 key 不用重启 payload。
+fn current_attk() -> Option<Key> {
+    let state = state()?;
+    let stamp = attk_stamp();
+    let mut cached = state.attk.lock().ok()?;
+    if let Ok(mut known) = ATTK_STAMP.lock() {
+        if *known == stamp {
+            return Some(cached.clone());
+        }
+        if let Some((key, origin)) = load_attk_key() {
+            *cached = key.clone();
+            *known = stamp;
+            log::info!("event=soter ATTK hot-reloaded from {origin}");
+            return Some(key);
+        }
+    }
+    Some(cached.clone())
+}
+
 /// 取（必要时造）某个 uid 的 ASK。
 ///
 /// 真机的形状是一把 ATTK 下挂 N 把 ASK、每个 uid 一把，这里照做：
@@ -383,20 +424,11 @@ fn ask_for(state: &State, uid: i32) -> Option<Key> {
 /// 读某个 uid 的 ASK：环境变量 → 单文件 store → 旧的 per-uid 文件（读到就迁走）→
 /// 旧的全局文件 → 现生成并写进 store。
 fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
-    if let Some(path) = std::env::var_os(ASK_KEY_FILE_ENV) {
-        let path = std::path::PathBuf::from(path);
-        if let Ok(pem) = std::fs::read_to_string(&path) {
-            if let Some(key) = Key::from_pem(&pem) {
-                return Some((key, path.display().to_string()));
-            }
-        }
-    }
-
     if let Some(pem) = read_store_pem(ASK_SECTION, &uid.to_string()) {
         match Key::from_pem(&pem) {
             Some(key) => return Some((key, format!("store:uid={uid}"))),
             None => log::warn!(
-                "soter local ask for uid {uid} in the store is not a usable PKCS#8 PEM; ignoring it"
+                "soter local ask for uid {uid} in the store is not a usable RSA PEM; ignoring it"
             ),
         }
     }
@@ -408,7 +440,7 @@ fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
         };
         let Some(key) = Key::from_pem(&pem) else {
             log::warn!(
-                "soter local ask for uid {uid} at {path} is not a usable PKCS#8 PEM; ignoring it"
+                "soter local ask for uid {uid} at {path} is not a usable RSA PEM; ignoring it"
             );
             continue;
         };
@@ -420,20 +452,6 @@ fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
             None => format!("file:{path}"),
         };
         return Some((key, origin));
-    }
-
-    // 兼容更旧的全局那一把（所有 uid 共用）。升级上来的设备先跑这里，
-    // 以后重新建料时自然收敛到 store 里的 per-uid 条目。
-    for path in ASK_KEY_FILE_PATHS {
-        let Ok(pem) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match Key::from_pem(&pem) {
-            Some(key) => return Some((key, format!("legacy:{path}"))),
-            None => log::warn!(
-                "soter local legacy ask at {path} is not a usable PKCS#8 PEM; ignoring it"
-            ),
-        }
     }
 
     generate_ask_for(uid)
@@ -458,11 +476,14 @@ fn state() -> Option<&'static State> {
     static STATE: OnceLock<Option<State>> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            let (attk, origin) = load_ask_key()?;
+            let (attk, origin) = load_attk_key()?;
             log::info!("soter local ATTK loaded from {origin}");
             let _ = ATTK_ORIGIN.set(origin);
+            if let Ok(mut known) = ATTK_STAMP.lock() {
+                *known = attk_stamp();
+            }
             Some(State {
-                attk,
+                attk: Mutex::new(attk),
                 asks: Mutex::new(HashMap::new()),
                 auth: Mutex::new(HashMap::new()),
                 counters: Mutex::new(HashMap::new()),
@@ -836,7 +857,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             let counter = bump_counter(state, uid);
             let ask = ask_for(state, uid)?;
             let document = ask_json(&ask.pem, uid, counter).ok()?;
-            let signature = state.attk.sign(&document)?;
+            let signature = current_attk()?.sign(&document)?;
             Some(Answer::Buffer {
                 code: OK,
                 data: Some(envelope(&document, &signature)),
@@ -1006,10 +1027,13 @@ pub(crate) fn ask_public_document(uid: i32) -> Vec<u8> {
         return Vec::new();
     };
     let counter = bump_counter(state, uid);
-    let Ok(document) = ask_json(&state.attk.pem, uid, counter) else {
+    let Some(attk) = current_attk() else {
         return Vec::new();
     };
-    let Some(signature) = state.attk.sign(&document) else {
+    let Ok(document) = ask_json(&attk.pem, uid, counter) else {
+        return Vec::new();
+    };
+    let Some(signature) = attk.sign(&document) else {
         return Vec::new();
     };
     envelope(&document, &signature)
@@ -1037,24 +1061,86 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
 
 fn bump_counter(state: &State, uid: i32) -> u64 {
     // counter 必须单调递增，而且**重启不能回退**：App 会记着上次看到的值，
-    // 小回去就当成重放，把本地钥匙删了重来。所以落到文件里。
-    let path = format!("/data/misc/ommega/soter_counter.{uid}");
-    let disk = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+    // 小回去就当成重放，把本地钥匙删了重来。
+    //
+    // 所有 App 共用一个文件（每行 `uid=counter`）。以前是 `soter_counter.<uid>`
+    // 平铺在目录根下，装十几个 App 就是一屏垃圾文件。
+    //
+    // 读-改-写放在文件锁里：injector 会同时跑在 keystore 和 SOTER 宿主几个进程里，
+    // 不加锁会互相覆盖。即使真丢了也还能靠 `now_secs()` 兜底，确保不会回退。
+    const PATH: &str = "/data/misc/ommega/soter_counter";
+
     let mem = state
         .counters
         .lock()
         .ok()
         .and_then(|map| map.get(&uid).copied())
         .unwrap_or(0);
-    let next = disk.max(mem).max(COUNTER_BASE).max(now_secs()) + 1;
+
+    let next = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PATH)
+    {
+        Ok(mut file) => {
+            let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
+            let mut text = String::new();
+            let _ = file.read_to_string(&mut text);
+            let next = counter_for(&text, uid)
+                .unwrap_or(0)
+                .max(mem)
+                .max(COUNTER_BASE)
+                .max(now_secs())
+                + 1;
+            let updated = set_counter(&text, uid, next);
+            let _ = file.set_len(0);
+            let _ = file.seek(SeekFrom::Start(0));
+            let _ = file.write_all(updated.as_bytes());
+            next
+        }
+        // 开不了文件（权限异常）：只能拿内存里的值兜一下，至少不回退到比本进程见过的更小。
+        Err(_) => mem.max(COUNTER_BASE).max(now_secs()) + 1,
+    };
+
     if let Ok(mut map) = state.counters.lock() {
         map.insert(uid, next);
     }
-    let _ = std::fs::write(&path, format!("{next}\n"));
     next
+}
+
+/// 从 `uid=counter` 行里取某个 uid 的计数。
+fn counter_for(text: &str, uid: i32) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim().parse::<i32>().ok()? != uid {
+            return None;
+        }
+        value.trim().parse::<u64>().ok()
+    })
+}
+
+/// 把某个 uid 的计数写回去（已有就替换、没有就追加），其它行原样保留。
+fn set_counter(text: &str, uid: i32, value: u64) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut replaced = false;
+    for line in text.lines() {
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().parse::<i32>().ok() == Some(uid) {
+            out.push_str(&format!("{uid}={value}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&format!("{uid}={value}\n"));
+    }
+    out
 }
 
 /// 包 SOTER 的信封：`[i32 le JSON 长度][JSON][签名]`。三处回信封的地方都走它，
@@ -1222,7 +1308,7 @@ mod tests {
         use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
         use rsa::signature::Verifier;
         let verifying = PssVerifyingKey::<PssSha256>::new(rsa::RsaPublicKey::from(
-            &state().unwrap().attk.private,
+            &current_attk().unwrap().private,
         ));
         verifying
             .verify(
@@ -1591,38 +1677,38 @@ mod tests {
             .to_string()
     }
 
-    /// 编进 binary 的那把（不经 `state()`，免得受 OnceLock 初始化顺序影响）。
-    fn embedded_ask() -> Key {
-        Key::from_pem(std::str::from_utf8(ASK_PEM).unwrap()).unwrap()
+    /// 编进 binary 的那把 ATTK（不经 `state()`，免得受 OnceLock 初始化顺序影响）。
+    fn embedded_attk() -> Key {
+        Key::from_pem(std::str::from_utf8(ATTK_PEM).unwrap()).unwrap()
     }
 
     #[test]
-    fn a_supplied_ask_file_wins_over_the_embedded_one() {
+    fn a_supplied_attk_file_wins_over_the_embedded_one() {
         let pem = fresh_pem();
-        let path = temp_pem("soter_ask.pem", &pem);
-        let (key, origin) = load_ask_key_with(Some(path.clone())).expect("the file must be used");
+        let path = temp_pem("soter_attk.pem", &pem);
+        let (key, origin) = load_attk_key_with(Some(path.clone())).expect("the file must be used");
 
         // 用的确实是文件里那把，不是编进来的那把
         assert_eq!(key.pem, Key::from_pem(&pem).unwrap().pem);
-        assert_ne!(key.pem, embedded_ask().pem, "换 key 得真换掉");
+        assert_ne!(key.pem, embedded_attk().pem, "换 key 得真换掉");
         assert_eq!(origin, path.display().to_string());
     }
 
     #[test]
-    fn a_missing_ask_file_falls_back_to_the_embedded_one() {
+    fn a_missing_attk_file_falls_back_to_the_embedded_one() {
         let missing = std::env::temp_dir().join("ommega-soter-ask-does-not-exist.pem");
         let _ = std::fs::remove_file(&missing);
-        let (key, origin) = load_ask_key_with(Some(missing)).expect("embedded key must load");
-        assert_eq!(key.pem, embedded_ask().pem);
-        assert_eq!(origin, "embedded asset");
+        let (key, origin) = load_attk_key_with(Some(missing)).expect("embedded key must load");
+        assert_eq!(key.pem, embedded_attk().pem);
+        assert_eq!(origin, "embedded attk");
     }
 
     #[test]
-    fn a_broken_ask_file_falls_back_to_the_embedded_one() {
+    fn a_broken_attk_file_falls_back_to_the_embedded_one() {
         let path = temp_pem("broken.pem", "-----BEGIN PRIVATE KEY-----\nnope\n");
-        let (key, origin) = load_ask_key_with(Some(path)).expect("embedded key must load");
-        assert_eq!(key.pem, embedded_ask().pem);
-        assert_eq!(origin, "embedded asset");
+        let (key, origin) = load_attk_key_with(Some(path)).expect("embedded key must load");
+        assert_eq!(key.pem, embedded_attk().pem);
+        assert_eq!(origin, "embedded attk");
     }
 
     #[test]
@@ -1631,5 +1717,30 @@ mod tests {
         assert!(state().is_some());
         let origin = ask_origin().expect("state() 初始化时写下了来源");
         assert!(!origin.is_empty());
+    }
+
+    #[test]
+    fn counter_file_keeps_every_uid_on_its_own_line() {
+        let text = "10491=100\n10494=200\n";
+        assert_eq!(counter_for(text, 10491), Some(100));
+        assert_eq!(counter_for(text, 10494), Some(200));
+        assert_eq!(counter_for(text, 99999), None);
+
+        // 已有 uid：只改那一行，别的行原样保留
+        let updated = set_counter(text, 10494, 300);
+        assert_eq!(updated, "10491=100\n10494=300\n");
+
+        // 新 uid：追加到末尾
+        let appended = set_counter(text, 55555, 7);
+        assert_eq!(appended, "10491=100\n10494=200\n55555=7\n");
+    }
+
+    #[test]
+    fn counter_file_ignores_junk_lines() {
+        let text = "# 注释\nbroken\n10491=42\n\n";
+        assert_eq!(counter_for(text, 10491), Some(42));
+        // 垃圾行会被丢掉，但有效行仍然是有效的
+        let updated = set_counter(text, 10491, 43);
+        assert_eq!(counter_for(&updated, 10491), Some(43));
     }
 }

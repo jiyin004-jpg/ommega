@@ -1,20 +1,46 @@
 MODDIR=${0%/*}
-TARGET_DIR=/data/misc/keystore/ommega
+TARGET_DIR=/data/misc/ommega
 LOG_DIR=$TARGET_DIR/logs
-LOG_FILE=$LOG_DIR/post-fs-data.log
+LOG_FILE=$LOG_DIR/daemon.log
+mkdir -p "$LOG_DIR" 2>/dev/null
 # app 域（SOTER 宿主 uid 1000）进不去 keystore 那个 0770 目录，payload 的日志
 # 得有个它写得动的位置：权限开到 system 组。
 APP_LOG_DIR=/data/misc/ommega/logs
-TARGET_KEYBOX=$TARGET_DIR/keybox.xml
+# keybox 是密钥材料，属于 keystore 目录；其它（config / injector.toml / target.txt）
+# 才是共享数据，放 /data/misc/ommega。之前批量把路径都改成数据根，把 keybox 也
+# 投递了过去 —— keymint 读的是 keystore 那份，两边就对不上了。
+TARGET_KEYBOX=/data/misc/keystore/ommega/keybox_tee.xml
+TARGET_KEYBOX_SB=/data/misc/keystore/ommega/keybox_strongbox.xml
 TARGET_INJECTOR_CONFIG=$TARGET_DIR/injector.toml
 TARGET_CONF=$TARGET_DIR/config
 TARGET_TARGET_LIST=$TARGET_DIR/target.txt
 STATE_DIR=/data/adb/ommega
-BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
+
+# KernelSU 开机不会重放 sepolicy.rule，而 keystore 域要读 /data/misc/ommega。
+# 这里是能抢在 keystore2 之前跑的最早时机，所以同步应用（带超时）。
+#
+# 结果写到 /data/local/tmp（adb 读得到）：之前它静默失败，avc 一直在刷，
+# 但没有任何地方能看到到底跑没跑、失败在哪。
+if [ -f "$MODDIR/sepolicy.rule" ]; then
+  _apply_log=/data/local/tmp/ommega-sepolicy-apply.log
+  : > "$_apply_log" 2>/dev/null
+  if [ -x /data/adb/ksu/bin/ksud ]; then
+    for _try in 1 2 3; do
+      if timeout 15 /data/adb/ksu/bin/ksud sepolicy apply "$MODDIR/sepolicy.rule" >>"$_apply_log" 2>&1; then
+        echo "apply ok on try $_try" >> "$_apply_log"
+        break
+      fi
+      echo "apply failed on try $_try rc=$?" >> "$_apply_log"
+      sleep 2
+    done
+  else
+    echo "ksud missing" >> "$_apply_log"
+  fi
+fi
 # A-side config directory (webroot UI writes here; `ommegadata` is a symlink to
 # $TARGET_DIR, so the UI and the keystore process (uid 1017) share one copy).
 CLIENTA_DIR=/data/adb/ommega
@@ -23,7 +49,15 @@ CLIENTA_DIR=/data/adb/ommega
 # customize.sh 安装时会把与设备 ABI 匹配的那份拷到状态目录）。以前靠管理器提供：
 # Magisk 自带、APatch/KSU 走 busybox/ksud，不是每家都有、行为也不一致，所以不再依赖。
 # 定成同名函数，下面那一串调用一字不用改；实在找不到自己的才退回 PATH 里那个。
-RESETPROP_BIN=$BIN_DIR/resetprop
+# resetprop 的唯一位置：模块内 `libs/<abi>/resetprop`（ELF，ksu 域可 execute）
+pf_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+case "$pf_abi" in
+  arm64*|aarch64*) pf_abi=arm64-v8a ;;
+  armeabi*|armv7*) pf_abi=armeabi-v7a ;;
+  x86_64*) pf_abi=x86_64 ;;
+  *) pf_abi=x86 ;;
+esac
+RESETPROP_BIN=$MODDIR/libs/$pf_abi/resetprop
 if [ ! -x "$RESETPROP_BIN" ]; then
   rp_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
   case "$rp_abi" in
@@ -48,10 +82,48 @@ resetprop -p persist.logd.size ""
 resetprop -p persist.logd.size.crash ""
 resetprop -p persist.logd.size.system ""
 resetprop -p persist.logd.size.main ""
-resetprop ro.boot.flash.locked 1
-resetprop ro.boot.verifiedbootstate green
+# boot 锁定状态：走远程时证书是 B 端真机出的，RootOfTrust 里写的是 B 的说法。
+# 本机属性必须跟它一致，否则 A09（cert locked/state vs prop locked/green）一查就中。
+# 远程身份的落盘由 TA 写（/data/misc/ommega/remote_identity），这里读它。
+#
+# 只在 remote 开启时才跟：本地模式下没有 RKP 路径，证书说的是本机自己
+# （locked / green），属性也得说本机；否则切回本地后还会被上次远程留在
+# remote_identity 里的 false/2 污染。
+_OMMEGA_RI=/data/misc/ommega/remote_identity
+_ri_remote=$(grep -iE '^[[:space:]]*remote[[:space:]]*:' "$TARGET_CONF" 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+case "$_ri_remote" in
+  1|true|yes|on) _ri_apply=1 ;;
+  *) _ri_apply=0 ;;
+esac
+_ri_locked=
+_ri_state=
+if [ "$_ri_apply" = 1 ]; then
+  _ri_locked=$(sed -n 's/^device_locked=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+  _ri_state=$(sed -n 's/^verified_boot_state=//p' "$_OMMEGA_RI" 2>/dev/null | head -n1)
+fi
+# 启动状态三连在开机时就对齐：它们只是 bootloader 传下来的状态描述（真机解锁设备
+# 是 orange / 0 / unlocked），改它们不会影响 FBE —— keyblob 是 keymint HAL 用 TA 内部的
+# 密钥加的，vold 解 FBE 时也不比对这几个值（查过 AOSP 的 metadata 加密与 keystore2 两条链）。
+# 注：ro.boot.vbmeta.digest 同理，它只喂给我们自己的 keymint 填证书。
+case "$_ri_state" in
+  0) resetprop ro.boot.verifiedbootstate green ;;
+  1) resetprop ro.boot.verifiedbootstate yellow ;;
+  2) resetprop ro.boot.verifiedbootstate orange ;;
+  3) resetprop ro.boot.verifiedbootstate red ;;
+  *) resetprop ro.boot.verifiedbootstate green ;;
+esac
+case "$_ri_locked" in
+  0)
+    resetprop ro.boot.flash.locked 0
+    resetprop ro.boot.vbmeta.device_state unlocked
+    ;;
+  *)
+    resetprop ro.boot.flash.locked 1
+    resetprop ro.boot.vbmeta.device_state locked
+    ;;
+esac
+unset _OMMEGA_RI _ri_locked _ri_state
 resetprop ro.boot.veritymode enforcing
-resetprop ro.boot.vbmeta.device_state locked
 resetprop ro.secure 1
 resetprop ro.adb.secure 1
 resetprop ro.debuggable 0
@@ -61,7 +133,7 @@ resetprop ro.secureboot.devicelock 1
 # 开机时就把 B 真机声明的身份对齐到本机（文件由 TA 在远程出链时写入）：
 # 链是真机出的，本机属性必须说同一台机器，否则检测器报 device_properties /
 # VBMeta 摘要不一致。daemon 运行期也会再同步一次（带 zygote 软重启）。
-_OMMEGA_IDENTITY=/data/misc/keystore/ommega/remote_identity
+_OMMEGA_IDENTITY=/data/misc/ommega/remote_identity
 if [ -f "$_OMMEGA_IDENTITY" ]; then
   _id_set() {
     [ -n "$1" ] && [ -n "$2" ] && resetprop "$1" "$2"
@@ -73,6 +145,9 @@ if [ -f "$_OMMEGA_IDENTITY" ]; then
   _id_set ro.product.manufacturer "$(_id_get manufacturer)"
   _id_set ro.product.model "$(_id_get model)"
   _id_set ro.serialno "$(_id_get serial)"
+  # vbmeta 摘要早点写：只有我们自己的 keymint 读它（vb_hash=auto 时用来填证书的
+  # verified_boot_hash），vold 的 verity 判断看 ro.boot.veritymode，不看这个，所以
+  # 不存在影响 FBE 解锁的问题。晚写了证书里就只能是真机值，面板上设的伪装 hash 白设。
   _id_set ro.boot.vbmeta.digest "$(_id_get vbmeta_digest)"
 fi
 mkdir -p "$TARGET_DIR"
@@ -120,7 +195,7 @@ chmod 0755 "$CLIENTA_DIR"
 if [ -L "$CLIENTA_DIR/ommegadata" ]; then
   : # already the symlink
 elif [ -d "$CLIENTA_DIR/ommegadata" ]; then
-  for f in config target.txt system_app keybox.xml; do
+  for f in config target.txt system_app keybox_tee.xml keybox_strongbox.xml; do
     stray="$CLIENTA_DIR/ommegadata/$f"
     real="$TARGET_DIR/$f"
     [ -f "$stray" ] || continue
@@ -165,10 +240,14 @@ fi
 chmod 0644 "$TARGET_CONF" "$TARGET_TARGET_LIST" 2>/dev/null || true
 chown 1017:1017 "$TARGET_CONF" "$TARGET_TARGET_LIST" 2>/dev/null || true
 
-# Keybox: the webroot UI writes `/data/adb/ommega/ommegadata/keybox.xml` which IS
+# Keybox: the webroot UI writes `/data/adb/ommega/ommegadata/keybox_tee.xml` which IS
 # $TARGET_KEYBOX (via symlink).  Seed from the module keybox if absent.
-if [ ! -f "$TARGET_KEYBOX" ] && [ -f "$MODDIR/keybox.xml" ]; then
-  cp "$MODDIR/keybox.xml" "$TARGET_KEYBOX"
+# TEE 和 StrongBox 两份各自独立：各用各的级别，不再共用一份 keybox。
+if [ ! -f "$TARGET_KEYBOX" ] && [ -f "$MODDIR/keybox_tee.xml" ]; then
+  cp "$MODDIR/keybox_tee.xml" "$TARGET_KEYBOX"
+fi
+if [ ! -f "$TARGET_KEYBOX_SB" ] && [ -f "$MODDIR/keybox_strongbox.xml" ]; then
+  cp "$MODDIR/keybox_strongbox.xml" "$TARGET_KEYBOX_SB"
 fi
 
 if [ ! -f "$TARGET_INJECTOR_CONFIG" ] && [ -f "$MODDIR/injector.toml" ]; then
@@ -178,6 +257,10 @@ fi
 if [ -f "$TARGET_KEYBOX" ]; then
   chmod 0600 "$TARGET_KEYBOX"
   chown 1017:1017 "$TARGET_KEYBOX"
+fi
+if [ -f "$TARGET_KEYBOX_SB" ]; then
+  chmod 0600 "$TARGET_KEYBOX_SB"
+  chown 1017:1017 "$TARGET_KEYBOX_SB"
 fi
 
 if [ -f "$TARGET_INJECTOR_CONFIG" ]; then
@@ -250,38 +333,46 @@ if [ -r "$PROP_OVERRIDES" ]; then
       \"*\") p_val=${p_val#\"}; p_val=${p_val%\"} ;;
     esac
     case "$p_key" in
+      # digest 只喂给 keymint 填证书，boot 补丁只进 HAL info，两者都不参与 FBE 解密，
+      # 可以早写；其余 ro.boot.*（启动状态三连）本脚本前面已经设过。
+      ro.boot.vbmeta.digest|ro.boot.vbmeta.public_key_digest|ro.boot.build.security_patch) : ;;
+      ro.boot.*) continue ;;
       ro.*|persist.*|sys.*) : ;;
       *) continue ;;
     esac
     [ -n "$p_val" ] || continue
-    setprop_if_present "$p_key" "$p_val"
+    # 用户在这里显式写的项一律强写：像 ro.boot.build.security_patch 这类属性，
+    # 这台机器的 bootconfig 里压根没有，走 setprop_if_present 会被直接跳过，
+    # 面板上写了等于没写。
+    resetprop "$p_key" "$p_val"
     log_line "ommega: override $p_key=$p_val (boot stage)"
   done < "$PROP_OVERRIDES"
 fi
 
 # ---- 能力声明隐藏（flat config 键 hide_strongbox / hide_device_ids）----
-# 这里只维护模块自己的那一份能力声明 XML：
-#   <unavailable-feature name="..."/> 是 AOSP SystemConfig 支持的写法 —— 它读完所有权限
-# XML 之后会把同名 feature 从可用表里删掉，于是 PackageManager 的 hasSystemFeature、
-# feature 枚举、以及 Android 16 起进程绑定时下发的 SystemFeaturesCache 看到的是同一份
-# 「本机没有这个能力」。
+# 完全自己挂：不往模块 system/ 里放 XML，也不依赖任何 metamodule。
 #
-# 为什么不改厂商那份 XML（以前的做法，2026-10-28 在 peridot 上翻车）：老实现给 vendor/odm
-# 下的声明文件种 whiteout（0:0 字符设备），或者在 /mnt/vendor 挂个小 tmpfs 再把单文件 bind
-# 盖上去。两条路都要动真实分区的文件：暂存文件被复用（四个目标最终拿到同一份非 XML 内容）
-# 时 system_server 解析 /odm/etc/permissions 直接失败、设备开不了机；平时 mountinfo 里也
-# 能看见我们挂的东西。现在厂商文件一个字节都不碰，只多出模块里这一份 XML —— 管理器的
-# 系统文件挂载没开时结果就是「没生效」，不会把系统搞坏。
+# 本机把这条 feature 的声明改成 unavailable 的方式只有两种，我们都走：
+#   1. 厂商那份权限 XML 里删掉 <feature name="..."/> 那一行，复制到暂存目录，单文件 bind 盖回原处；
+#   2. （已不用）以前还有一条“模块自带一份 <unavailable-feature> XML、靠管理器/metamodule
+#      挂到 /system/etc/permissions”的路。那条依赖外部元模块，而且配置改完要重启两次才生效，
+#      已经拆掉：现在模块里根本没有 system 目录，mountify 之类的 auto 模式也不会再纳管它。
 #
-# 生效时机：这份 XML 必须赶在 system_server 读权限 XML 之前到位，所以 WebUI 保存、安装、
-# 以及这里开机都会写一遍（内容一致就只是覆盖同一个文件）。开关改动一律要重启才生效。
-MASK_XML_REL=system/etc/permissions/ommega-capability-mask.xml
-MASK_XML=$MODDIR/$MASK_XML_REL
+# 挂载痕迹怎么处理（借鉴 mountify 那段）：
+#   - 暂存目录优先放在 /mnt/vendor 下、起个像 OEM 权限目录的名字（vendor_permissions），
+#     mountinfo 里只露一个看起来属于厂商的 bind 源；
+#   - system_server 读完权限 XML 之后（service.sh 等到 sys.boot_completed），把这批 bind
+#     用 umount -l 撤掉，mountinfo 里那条挂载一天都在不了，只留开机头几十秒。
+#
+# 三条保守规则（/odm 的权限 XML 一旦变成非法 XML，system_server 就起不来，代价太大）：
+#   - 该 feature 必须是单独一行的 <feature ... />；
+#   - 删完必须正好少一条 feature、且剩下 </permissions>，否则跳过这个文件、只记日志；
+#   - 挂完回读一次，feature 还在就立刻 umount。
 mask_state_file=$STATE_DIR/conf/mask.state
 
 # mask_enabled <配置键> [其它等价键...]
 # 判开关：flat config 里有这个键就以它为准；没有就看调用方给的 OMMEGA_MASK_DEFAULT。
-# post-fs-data 阶段 /data/misc/keystore/ommega/config 可能还没就绪，那时退回上次开机
+# post-fs-data 阶段 /data/misc/ommega/config 可能还没就绪，那时退回上次开机
 # 缓存的结果（/data/adb 这个阶段一定读得到）。
 mask_enabled() {
   me_name=$1
@@ -316,27 +407,16 @@ mask_enabled() {
 OMMEGA_MASK_DEFAULT=0 mask_enabled hide_strongbox hide_strongbox_keystore && mask_sb=1 || mask_sb=0
 OMMEGA_MASK_DEFAULT=0 mask_enabled hide_device_ids hide_device_id_attestation && mask_ids=1 || mask_ids=0
 
-# 清掉老实现留在模块 system/ 下的 whiteout / 空声明。不清的话管理器挂载时它们还会把
-# 厂商那整份 XML 删掉，连带 app_attest_key 这种同一文件里的其它 feature 一起消失。
+# 老版本把过能力声明 XML（以及更早的 whiteout）放进模块的 system/ 里。现在完全不走那条路：
+# 留着这个目录只会让 metamodule 的 auto 模式继续把 ommega 当成“有 system 文件的模块”纳管，
+# 开机直接整个删掉（本次开机已挂上的不受影响，下次就不会再被纳管）。
 if [ -d "$MODDIR/system" ]; then
-  for mf_stale in android.hardware.security.strongbox_keystore.xml android.software.device_id_attestation.xml; do
-    find "$MODDIR/system" -type f -name "$mf_stale" 2>/dev/null | while IFS= read -r mf_old; do rm -f "$mf_old"; done
-    find "$MODDIR/system" -type c -name "$mf_stale" 2>/dev/null | while IFS= read -r mf_old; do rm -f "$mf_old"; done
-  done
+  rm -rf "$MODDIR/system" 2>/dev/null
 fi
 
-mkdir -p "$MODDIR/system/etc/permissions" 2>/dev/null
-{
-  printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions>\n'
-  [ "$mask_sb" = 1 ] && printf '  <unavailable-feature name="android.hardware.strongbox_keystore" />\n'
-  [ "$mask_ids" = 1 ] && printf '  <unavailable-feature name="android.software.device_id_attestation" />\n'
-  printf '</permissions>\n'
-} > "$MASK_XML.tmp" 2>/dev/null && mv -f "$MASK_XML.tmp" "$MASK_XML" 2>/dev/null
-chcon u:object_r:system_file:s0 "$MASK_XML" 2>/dev/null
-
-# 开机诊断（不看 debug 开关）：内容是什么、厂商侧还有没有声明。
-printf '%s mask_sb=%s mask_ids=%s xml=%s\n' "$(date -u '+%H-%M-%S')" "$mask_sb" "$mask_ids" \
-  "$(tr -d '\n' < "$MASK_XML" 2>/dev/null)" >> /data/adb/ommega/boot-debug.log 2>/dev/null
+# 开机诊断（不看 debug 开关）：开关状态先落一行，后面 bind 的结果跟着写同一个文件。
+printf '%s mask_sb=%s mask_ids=%s\n' "$(date -u '+%H-%M-%S')" "$mask_sb" "$mask_ids" \
+  >> "$LOG_FILE" 2>/dev/null
 
 # ---- 主力：我们自己把那条 feature 从厂商声明里摘掉 ----
 # KernelSU 3.x 天生不做模块文件挂载（要装挂载 metamodule 才有），所以模块 system/ 里那份
@@ -355,7 +435,7 @@ mask_stage=$STATE_DIR/perm-stage
 mask_binds_file=$STATE_DIR/conf/mask.binds
 mask_n=0
 mask_binds=""
-mask_log() { printf '%s %s\n' "$(date -u '+%H-%M-%S')" "$*" >> /data/adb/ommega/boot-debug.log 2>/dev/null; }
+mask_log() { printf '%s %s\n' "$(date -u '+%H-%M-%S')" "$*" >> "$LOG_FILE" 2>/dev/null; }
 
 # 暂存目录别长得像 root 模块：/mnt/vendor 已经是独立挂载点时，在里面挂个小 tmpfs，看起来
 # 像 OEM 自己挂的权限目录；不是的话退回状态目录（bind 源路径只在 mountinfo 里露一下）。
@@ -427,20 +507,17 @@ mask_declaration_by_bind() {
 
 rm -rf "$mask_stage" 2>/dev/null
 mkdir -p "$mask_stage" 2>/dev/null
-# 管理器真挂了模块 system/ 的话 feature 已经没了，不用再盖厂商文件（少一层挂载痕迹）
-if [ -f "/system/etc/permissions/ommega-capability-mask.xml" ]; then
-  mask_log "mask-tier: module xml mounted, self bind skipped"
-else
-  [ "$mask_sb" = 1 ] && mask_declaration_by_bind android.hardware.strongbox_keystore
-  [ "$mask_ids" = 1 ] && mask_declaration_by_bind android.software.device_id_attestation
-fi
-# 记一份自己挂过谁：面板/自检要看，将来加「立即撤销」也认这个。
+# 不管有没有 metamodule：总是自己从厂商 XML 摘掉那一行再 bind。以前这里会先看模块那份
+# XML 在不在（靠元模块挂），挂上了就跳过 —— 现在模块里根本没有 system/，这条分支拆了。
+[ "$mask_sb" = 1 ] && mask_declaration_by_bind android.hardware.strongbox_keystore
+[ "$mask_ids" = 1 ] && mask_declaration_by_bind android.software.device_id_attestation
+# 记一份自己挂过谁：service.sh 等到 boot_completed 后按这份清单 umount -l 撤掉。
 mkdir -p "$STATE_DIR/conf" 2>/dev/null
 printf '%s\n' ${mask_binds:-} > "$mask_binds_file" 2>/dev/null
 mask_log "mask-tier: self bind ->${mask_binds:- none}"
 unset mask_stage mask_binds_file mask_n mask_binds ms_dir mx_src mx_feature mx_stage mx_before mx_after mx_stage_dir
 unset md_feature md_dir md_src
-unset MASK_XML_REL MASK_XML mask_state_file mask_sb mask_ids me_name me_enabled me_state me_pat me_value mf_stale mf_old
+unset mask_state_file mask_sb mask_ids me_name me_enabled me_state me_pat me_value mf_stale mf_old
 
 # ── 尽早把两个守护拉起来 ─────────────────────────────────────────────────
 # 为什么抢在 post-fs-data（最早那个阶段）而不是 service.sh（late_start）：注入 keystore2
@@ -457,39 +534,59 @@ pid_matches_script() {
 
 start_daemon_early() {
   script=$1
-  pidfile=$2
+  extra=$2
+  pidfile=$3
+  check=${extra:-$script}
   if [ -f "$pidfile" ]; then
     pid=$(cat "$pidfile" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$script"; then
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$check"; then
       return 0
     fi
     rm -f "$pidfile"
   fi
-  # 离开 post-fs-data 阶段后子进程可能被收走，所以用 setsid 脱开（没有就退回普通后台）。
+  # 脚本用 sh 跑（ELF 直接 exec）。injector 是 shell 脚本，必须由本脚本（magiskd 域）
+  # fork 出来的 sh 去读：模块目录的标签是 magisk_file，ksu 域读不了。
+  # setsid 是为了离开 post-fs-data 阶段后子进程不被收走（没有就退回普通后台）。
   if command -v setsid >/dev/null 2>&1; then
-    setsid sh "$script" >/dev/null 2>&1 &
+    case "$script" in
+      *.sh|*/daemon-injector) setsid sh "$script" $extra >/dev/null 2>&1 & ;;
+      *) setsid "$script" $extra >/dev/null 2>&1 & ;;
+    esac
   else
-    sh "$script" >/dev/null 2>&1 &
+    case "$script" in
+      *.sh|*/daemon-injector) sh "$script" $extra >/dev/null 2>&1 & ;;
+      *) "$script" $extra >/dev/null 2>&1 & ;;
+    esac
   fi
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
-  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$script"; then
+  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$check"; then
     rm -f "$pidfile"
     return 1
   fi
   return 0
 }
 
-if [ -f "$MODDIR/daemon" ]; then
-  if start_daemon_early "$MODDIR/daemon" "$RUN_DIR/keymint-daemon.pid"; then
+pf_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+case "$pf_abi" in
+  arm64*|aarch64*) pf_abi=arm64-v8a ;;
+  armeabi*|armv7*) pf_abi=armeabi-v7a ;;
+  x86_64*) pf_abi=x86_64 ;;
+  *) pf_abi=x86 ;;
+esac
+km_bin=$MODDIR/libs/$pf_abi/keymint
+if [ -x "$km_bin" ]; then
+  if start_daemon_early "$km_bin" --daemon "$RUN_DIR/keymint-daemon.pid"; then
     log_line "ommega: keymint daemon started early in post-fs-data"
   else
     log_line "ommega: keymint daemon early start failed; service.sh will retry"
   fi
 fi
-if [ -f "$MODDIR/daemon-injector" ]; then
-  if start_daemon_early "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"; then
+# 注入器：唯一实现是 shell 版 daemon-injector（Rust 的 watchdog 走不通，见 service.sh）。
+injector_script=$MODDIR/daemon-injector
+if [ -f "$injector_script" ]; then
+  if start_daemon_early "$injector_script" "" "$RUN_DIR/injector-daemon.pid"; then
     log_line "ommega: injector daemon started early in post-fs-data"
   else
     log_line "ommega: injector daemon early start failed; service.sh will retry"

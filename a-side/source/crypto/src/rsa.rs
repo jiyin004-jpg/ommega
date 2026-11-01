@@ -139,8 +139,26 @@ impl crypto::AccumulatingOperation for OmmegaRsaDecryptOperation {
         let decrypted = match self.mode {
             DecryptionMode::NoPadding => {
                 // Raw RSA decrypt: m = c^d mod n, big-endian zero-padded to key size.
+                // c 必须严格小于模数 n（RSA 规范），否则是非法代表，要拒。
                 let n = priv_key.n();
                 let c = rsa::BigUint::from_bytes_be(ciphertext);
+                if ciphertext.len() > self.max_size || &c >= n {
+                    log::warn!(
+                        "rsa nopadding decrypt rejected: {} bytes (max {}), c >= n = {}",
+                        ciphertext.len(),
+                        self.max_size,
+                        &c >= n
+                    );
+                    return Err(km_err!(
+                        InvalidArgument,
+                        "ciphertext representative out of range"
+                    ));
+                }
+                log::warn!(
+                    "rsa nopadding decrypt accepted: {} bytes (max {})",
+                    ciphertext.len(),
+                    self.max_size
+                );
                 let m = c.modpow(priv_key.d(), n);
                 let key_len = self.max_size;
                 let mut out = vec_try![0; key_len]?;
@@ -471,5 +489,33 @@ mod undigest_padding_tests {
         assert!(ff_count >= 8, "FF 至少 8 字节，实际 {ff_count}");
         assert_eq!(em[2 + ff_count], 0x00, "填充结束的 0 分隔符");
         assert_eq!(&em[2 + ff_count + 1..], msg, "后面是消息本体");
+    }
+
+    #[test]
+    fn nopadding_decrypt_rejects_c_at_or_above_n() {
+        let key = rsa_key();
+        let priv_key = parse_key(&key).unwrap();
+        let k = priv_key.size();
+        let n = priv_key.n().clone();
+        let mut c = n.to_bytes_be();
+        if c.len() < k {
+            let mut v = vec![0u8; k - c.len()];
+            v.extend_from_slice(&c);
+            c = v;
+        }
+        assert_eq!(c.len(), k, "c 正好一个模长");
+
+        let mut op = OmmegaRsaDecryptOperation {
+            key,
+            mode: DecryptionMode::NoPadding,
+            pending_input: Vec::new(),
+            max_size: k,
+        };
+        crypto::AccumulatingOperation::update(&mut op, &c).unwrap();
+        let err = Box::new(op).finish().expect_err("c == n 必须被拒");
+        assert!(
+            format!("{err:?}").contains("out of range"),
+            "错误内容不对: {err:?}"
+        );
     }
 }

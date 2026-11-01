@@ -2,6 +2,6 @@
 
 [中文](CHANGELOG-B.md)
 
-## 1.7.11
+## 1.7.13
 
-- Released together with the A side; no functional change on the B side.
+- Follows the main release; no functional changes.

@@ -9,7 +9,7 @@
 #   soterta.sh             converge 一次（service.sh 每轮调）
 #   soterta.sh status      打一行状态
 #
-# 开关在 /data/misc/keystore/ommega/config 的 `soter_inject`（1/0），WebUI 写。
+# 开关在 /data/misc/ommega/config 的 `soter_inject`（1/0），WebUI 写。
 # 关掉就是「原厂 HAL 回来」：杀我们的守护、ctl.start vendor.soter。
 #
 # 为什么不用注入：soterserver 在这个机型上是 platform_app 域 + 它的 libbinder 带共享
@@ -23,18 +23,32 @@ CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-CONF=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
+CONF=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
 PIDFILE=$RUN_DIR/soterta.pid
 KICKED_FILE=$RUN_DIR/soterta.host.kicked
 # 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。
 TAKEOVER_PID=$RUN_DIR/soterta.takeover.pid
-LOG=$STATE_DIR/logs/soterta.log
+# 日志统一写 daemon.log（跟 service.sh / daemon-injector / adbr 共用一份）。
+LOG=/data/misc/ommega/logs/daemon.log
 # 解析结果缓存 + 静默开关。service.sh 的 keep-alive 和 daemon-injector 的
 # `soterta.sh hidl` 都是 5 秒一轮、每轮新起一个进程，resolve_hal 无条件 log 会把
 # 这个文件刷满「resolved hal=...」（实测每 2~5 秒一条），真正有用的事件全被埋掉。
 # 所以：结果没变就不打；hidl/status 这种纯查询连缓存都不碰（QUIET=1）。
 RESOLVED_CACHE=$STATE_DIR/conf/soter_hal.cache
 QUIET=0
+# `hidl` 是纯查询（daemon-injector 每 5 秒问一次），**不参与单实例锁**：
+# 抢不到锁时 `exit 0` 不输出，调用方就会把「没输出」当成「不是 HIDL 平台」，
+# 于是那一轮 inject_targets 不含 soter —— HIDL 机器上表现为偶尔不注 SOTER 宿主。
+# 平台不会变，第一次算完就落盘（见下面 hidl) 分支），之后这里直读文件。
+HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
+if [ "$1" = "hidl" ] && [ -f "$HIDL_CACHE" ]; then
+  _hv=$(cat "$HIDL_CACHE" 2>/dev/null | tr -d ' \r\n')
+  case "$_hv" in
+    0|1) printf '%s\n' "$_hv"; exit 0 ;;
+  esac
+  # 坏缓存（空文件/写了一半）：删掉重算
+  rm -f "$HIDL_CACHE" 2>/dev/null
+fi
 # 单实例：service.sh 的 keep-alive 和 daemon-injector 都会调这个脚本，并发跑两次就会
 # 同时起两个 `--soterta-serve`（实测 6212/6213 并存一个多小时）。会话号存在进程内存里，
 # initSign 落在 A 进程、finishSign 落到 B 进程就回 -1000 —— 检测器的 T12 每轮必挂，
@@ -51,6 +65,8 @@ SERVICE=
 HAL=
 BIN=
 
+# 统一写 daemon.log（见上面 LOG 那行）；纯查询用 QUIET=1 跳过，
+# 不然每 5 秒一条把文件刷满。
 log() {
   mkdir -p "$STATE_DIR/logs" 2>/dev/null
   printf '%s %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
@@ -242,6 +258,10 @@ HIDL_PLATFORM=
 hidl_platform() {
   if [ -z "$HIDL_PLATFORM" ]; then
     if soter_hal_is_hidl; then HIDL_PLATFORM=1; else HIDL_PLATFORM=0; fi
+    # 顺手落盘：daemon-injector 每 5 秒要问一次，读文件比扫 VINTF 便宜。
+    # 任何一次 converge 都会把缓存建起来，不依赖 `hidl` 那一支恰好抢到锁。
+    mkdir -p "${HIDL_CACHE%/*}" 2>/dev/null
+    printf '%s\n' "$HIDL_PLATFORM" > "$HIDL_CACHE" 2>/dev/null
   fi
   [ "$HIDL_PLATFORM" = "1" ]
 }
@@ -402,8 +422,12 @@ case "$1" in
     # 是就打印 1、不是打印 0（它据此决定注不注 SOTER 宿主）。
     # 纯查询：不写日志（这条每 5 秒被问一次）。
     QUIET=1
-    resolve_hal
-    if hidl_platform; then echo 1; else echo 0; fi
+    # 注意：这里**不要**调 resolve_hal —— hidl 只看 VINTF，跟服务名解析无关，
+    # 少一次 hwservicemanager 查询。算完顺手落盘，下次直接读缓存文件。
+    if hidl_platform; then v=1; else v=0; fi
+    mkdir -p "${HIDL_CACHE%/*}" 2>/dev/null
+    printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null
+    echo "$v"
     exit 0
     ;;
   status)

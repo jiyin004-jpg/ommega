@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use log::LevelFilter;
 
-const DEFAULT_LOG_PATH: &str = "/data/misc/keystore/ommega/logs/keymint.log";
+const DEFAULT_LOG_PATH: &str = "/data/misc/ommega/logs/keymint.log";
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -34,29 +34,29 @@ pub fn init_logger() {
             log::set_max_level(LevelFilter::Off);
             return;
         }
-        if let Err(error) = init_logger_inner() {
+        let level = crate::config::flat_log_level();
+        if let Err(error) = init_logger_inner(level) {
             eprintln!("keymint logging failed to initialize: {error:#}");
         }
     });
 }
 
-fn init_logger_inner() -> Result<()> {
-    // 只落文件。以前这里还挂了一个 logcat appender，但 A 端的日志统一走文件，
-    // logcat 那条线在 app 域里既不可靠也不好收。
+fn init_logger_inner(level: LevelFilter) -> Result<()> {
+    // 只落文件，不走 logcat。
     let (config, file_logging_ready) = kmr_common::runtime::logging::build_file_config(
         DEFAULT_LOG_PATH,
         PATTERN,
-        LevelFilter::Trace,
+        level,
         "keymint logging",
     )?;
     log4rs::init_config(config)?;
-    log::set_max_level(LevelFilter::Debug);
+    log::set_max_level(level);
 
     if file_logging_ready {
         log::info!(
             "file logging enabled at {} with level {:?}",
             DEFAULT_LOG_PATH,
-            LevelFilter::Debug
+            level
         );
     }
 

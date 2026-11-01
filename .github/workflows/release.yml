@@ -3,12 +3,11 @@
 # 产物一共五样：A 端 zip、B 端 zip、b-app 的 APK、服务端 Linux(musl) 二进制、
 # 服务端 Windows 二进制。以前后两样得在自己电脑上单独编，现在一起在这儿出。
 #
-# 为什么 A 端要拿 secret 里的 ASK：injector 用 `include_bytes!` 把本地兜底 SOTER 私钥
-# 编进二进制，而 `*.pem` 被 .gitignore 排除（私钥不进公开仓库）。CI 里只能用占位密钥
-# 让编译过，但**占位不能进发布包** —— 那会把用户设备上的兜底 ASK 换成一把没人认的钥匙。
-# 所以这里从 `secrets.SOTER_ASK_PEM`（base64）还原真实 PEM 再打包。
+# 本地兜底 SOTER 的 ATTK 不再内置固定材料：build.py 每次构建现生成一把自签
+# RSA（带生成时间），编进 injector；ASK 由运行时按 uid 现生成、落盘复用。
+# 所以 CI 不需要任何 ASK secret，也不会把固定私钥发进包里。
 #
-# b-app 的签名同理：debug.keystore 被 .gitignore 排除（里面有私钥），但从 secret
+# b-app 的签名还是得固定：debug.keystore 被 .gitignore 排除（里面有私钥），但从 secret
 # `B_APP_KEYSTORE_B64` 还原，保证每次发出来的 APK 签名一致，能覆盖升级。
 #
 # 手动触发：
@@ -64,23 +63,6 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
           protoc --version
 
-      # 真实 ASK（base64）→ ommega-injector/assets/soter_ask.pem。
-      # 缺 secret 就直接失败，不静默用占位。
-      - name: 还原真实 ASK
-        if: matrix.name == 'a-side'
-        working-directory: ${{ matrix.ws }}
-        env:
-          SOTER_ASK_PEM_B64: ${{ secrets.SOTER_ASK_PEM }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SOTER_ASK_PEM_B64:-}" ]; then
-            echo "缺少 secret SOTER_ASK_PEM（base64 后的 soter_ask.pem）" >&2
-            exit 1
-          fi
-          mkdir -p ommega-injector/assets
-          printf '%s' "$SOTER_ASK_PEM_B64" | base64 -d > ommega-injector/assets/soter_ask.pem
-          openssl pkey -in ommega-injector/assets/soter_ask.pem -noout -check
-
       - name: 取 NDK 缓存
         id: ndk
         uses: actions/cache@v4
@@ -120,8 +102,7 @@ jobs:
         with:
           name: ${{ matrix.name }}-zip
           path: ${{ matrix.ws }}/target/ommega-*-release-*.zip
-          # A 端 zip 里夹着内置兜底 ASK，少留一份副本（公开仓库的 artifact
-          # 对登录用户可下，默认存 90 天）。
+          # A 端 zip 里有运行时材料，artifact 对登录用户可下，默认存 90 天，少留一份副本。
           retention-days: 1
 
   b-app:

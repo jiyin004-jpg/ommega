@@ -1399,15 +1399,13 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         .map_err(anyhow::Error::msg)
         .context(err!("Failed to parse boot patch level"))?;
 
+    let (vb_key, vb_hash, device_locked, verified_boot_state) =
+        crate::plat::vbmeta::runtime_root_of_trust();
     let resp = ta.process_req(PerformOpReq::SetBootInfo(kmr_wire::SetBootInfoRequest {
-        verified_boot_state: if config.trust.verified_boot_state {
-            0
-        } else {
-            2
-        },
-        verified_boot_hash: config.trust.vb_hash.clone().to_vec(),
-        verified_boot_key: config.trust.vb_key.clone().to_vec(),
-        device_boot_locked: config.trust.device_locked,
+        verified_boot_state: verified_boot_state as i32,
+        verified_boot_hash: vb_hash.to_vec(),
+        verified_boot_key: vb_key.to_vec(),
+        device_boot_locked: device_locked,
         boot_patchlevel,
     }));
     if resp.error_code != 0 {
@@ -1428,25 +1426,32 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         return Err(Error::Km(ErrorCode::UNKNOWN_ERROR)).context(err!("Failed to set HAL version"));
     }
 
-    if profile.version_number >= KeyMintDevice::KEY_MINT_V4 {
-        if let Some(bundle) = crate::global::module_info_bundle() {
-            let resp = ta.process_req(PerformOpReq::SetAdditionalAttestationInfo(
-                kmr_wire::SetAdditionalAttestationInfoRequest {
-                    info: vec![KeyParam::ModuleHash(bundle.sha256.clone())],
-                },
-            ));
-            if resp.error_code != 0 {
-                return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))
-                    .context(err!("Failed to set additional attestation info"));
-            }
-        } else {
-            warn!("moduleHash attestation bootstrap skipped because APEX module info bundle is unavailable");
-        }
-    } else {
+    // MODULE_HASH（724）是 KeyMint 4 才有的标签，反查接口
+    // `getSupplementaryAttestationInfo` 也是 4 才有的 AIDL 方法。老 HAL（V3）上
+    // 只 bootstrap 不声明版本，就会落得「证书里有 724、反查却说 INFO_NOT_AVAILABLE」
+    // 的自相矛盾（Duck Detector 的 MODULE_HASH 项正是抓这个）。所以按本机 VINTF
+    // 声明的版本走：V4+ 才写，V3 保持与真机一致（没有 724）。
+    if profile.version_number < 400 {
         info!(
-            "Skipping moduleHash attestation bootstrap for KeyMint version {}",
+            "moduleHash attestation skipped: KeyMint version {} is below 4",
             profile.version_number
         );
+    } else if let Some(bundle) = crate::global::module_info_bundle() {
+        let resp = ta.process_req(PerformOpReq::SetAdditionalAttestationInfo(
+            kmr_wire::SetAdditionalAttestationInfoRequest {
+                info: vec![KeyParam::ModuleHash(bundle.sha256.clone())],
+            },
+        ));
+        if resp.error_code != 0 {
+            return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))
+                .context(err!("Failed to set additional attestation info"));
+        }
+        info!(
+            "moduleHash attestation bootstrap done for KeyMint version {}",
+            profile.version_number
+        );
+    } else {
+        warn!("moduleHash attestation bootstrap skipped because APEX module info bundle is unavailable");
     }
 
     if EARLY_BOOT_ENDED.load(Ordering::Acquire) {

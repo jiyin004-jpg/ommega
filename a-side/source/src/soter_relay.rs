@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     #[ignore = "读设备上的真配置（/data/misc/keystore/ommega/config），只在真机上手工跑"]
     fn the_device_config_diverts_detector_probes() {
-        use crate::config::{self, ResolvedTrust, TrustValueSource};
+        use crate::config::{self, ResolvedTrust};
 
         let config_file = config::bootstrap_config_file().expect("读设备配置");
         let trust = ResolvedTrust {
@@ -1018,12 +1018,6 @@ mod tests {
             os_patchlevel: String::new(),
             vendor_patchlevel: String::new(),
             boot_patchlevel: String::new(),
-            vb_key: [0u8; 32],
-            vb_hash: [0u8; 32],
-            vb_key_source: TrustValueSource::Original,
-            vb_hash_source: TrustValueSource::Original,
-            verified_boot_state: true,
-            device_locked: true,
         };
         config::install_runtime_config(config_file, trust).expect("装上运行时配置");
 

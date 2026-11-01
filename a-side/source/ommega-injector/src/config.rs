@@ -13,29 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/keystore/ommega/injector.toml";
-/// 同一份配置的副本，由 `daemon-injector` 抄过来。
-///
-/// 为什么要有它：SOTER 宿主是 uid 1000 的 system_app，keystore 那个 `0770` 目录在有些 ROM 上
-/// 它压根进不去 —— 实测小米那台就是：`injector.toml ... Permission denied (os error 13)` →
-/// `injector disabled here`，于是每一笔 SOTER 都直接透传真 HAL（微信指纹就是这幺坏的）。
-/// `/data/misc/ommega` 的 context 是 `system_data_file`，system_app 读得动
-/// （`log_flag` 就是这个道理，另外这份配置里只有包名/开关，没有敏感材料）。
-pub const FALLBACK_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
 /// Legacy A-side (client-a) per-app interception list.  Each non-comment line is
-/// a package name (optionally suffixed `!`/`?`, or a `[keybox.xml]` scope
+/// a package name (optionally suffixed `!`/`?`, or a `[keybox]` scope
 /// header).  These packages are merged into the effective scoop so apps selected
 /// in the webroot UI are intercepted exactly as under the old A-side module.
 ///
 /// This is the single data location: the webroot UI writes it through the
 /// `/data/adb/ommega/ommegadata` symlink (which points here), and the injected
 /// payload (keystore2, uid 1017) reads the same file.  There is no copy.
-const CLIENTA_TARGET_PATH: &str = "/data/misc/keystore/ommega/target.txt";
+const CLIENTA_TARGET_PATH: &str = "/data/misc/ommega/target.txt";
 /// Legacy A-side flat config (same directory as `target.txt`, written by the
 /// webroot UI and read by the keymint daemon).  The injector only looks at one
 /// key here: `global_scope`.  Everything else in that file belongs to the
 /// daemon's own parser (`crate::config` on the keymint side).
-const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
+const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
 /// 日志开关的副本，由 daemon-injector 按真配置写好：`log_flag: 1` / `log_flag: 0`。
 ///
 /// 位置挑在 `/data/misc` 下面是有讲究的：SOTER 宿主是 uid 1000 的 system_app，
@@ -129,17 +121,12 @@ impl Default for InjectorConfig {
 }
 
 fn default_scoop() -> Vec<String> {
-    [
-        "io.github.vvb2060.keyattestation",
-        "com.google.android.gsf",
-        "com.google.android.gms",
-        "com.android.vending",
-        "com.eltavine.duckdetector",
-        "com.oplus.engineermode",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    // 出厂作用域是**空**的：作用域只从面板写的 `target.txt` 来。
+    //
+    // 以前这里列了六个包当默认套餐，���果跟 `target.txt` 表达同一件事、靠“文件在不在”
+    // 判优先级。普通应用现在由 `global_scope` 覆盖，不需要默认值；需要接管的
+    // 系统 app 域（工程模式）由 `system_sid_packages` 自动补回。
+    Vec::new()
 }
 
 impl Default for MainConfig {
@@ -480,22 +467,10 @@ fn config_path() -> PathBuf {
     if let Some(path) = std::env::var_os("OMMEGA_INJECTOR_CONFIG_PATH") {
         return PathBuf::from(path);
     }
-    // 主路径读得到就用主的（那是 WebUI 在写的那份，最新）；读不到（域被拒 / 文件不在）
-    // 就用 daemon-injector 抄到 app 域那份。
-    let primary = PathBuf::from(DEFAULT_CONFIG_PATH);
-    if fs::File::open(&primary).is_ok() {
-        return primary;
-    }
-    let fallback = PathBuf::from(FALLBACK_CONFIG_PATH);
-    if fallback.is_file() {
-        log::warn!(
-            "{} is unreachable from this domain; using the app-readable copy {}",
-            primary.display(),
-            fallback.display()
-        );
-        return fallback;
-    }
-    primary
+    // 只有一份：keystore 域和 SOTER 宿主域读同一个路径（/data/misc/ommega 是
+    // system_data_file，两边的 sepolicy 都放行了）。以前那份「抄到 app 域」
+    // 的副本已经不存在，不要再读一遍同一个路径假装有 fallback。
+    PathBuf::from(DEFAULT_CONFIG_PATH)
 }
 
 fn load_from_path(path: &Path, allow_migration: bool) -> Result<InjectorConfig, LoadError> {

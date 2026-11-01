@@ -1559,7 +1559,7 @@ impl ISecurityLevel for OmmegaSecurityLevelWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConfigFile, ResolvedTrust, TrustValueSource};
+    use crate::config::{ConfigFile, ResolvedTrust};
     use std::sync::Once;
     use tempfile::TempDir;
 
@@ -1575,12 +1575,6 @@ mod tests {
                     os_patchlevel: "2025-06-05".to_string(),
                     vendor_patchlevel: "2025-06-05".to_string(),
                     boot_patchlevel: "2025-06-05".to_string(),
-                    vb_key: [0; 32],
-                    vb_hash: [0; 32],
-                    vb_key_source: TrustValueSource::ExplicitHex,
-                    vb_hash_source: TrustValueSource::ExplicitHex,
-                    verified_boot_state: true,
-                    device_locked: true,
                 },
             )
             .unwrap();

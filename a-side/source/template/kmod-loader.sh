@@ -18,7 +18,7 @@
 #     loops on retries.
 #
 # Optional keys, read from the A-side flat config
-# (/data/misc/keystore/ommega/config):
+# (/data/misc/ommega/config):
 #   soter_hide=1|<true>     "mask SOTER" switch on in the WebUI: mask the path
 #                           when the service cannot be reached. Key absent (the
 #                           fresh-install default) or 0/false/no/off = never
@@ -40,7 +40,7 @@ RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 KMOD_DIR="$MODDIR/pathmask"
-CONF_PATH=${KMOD_CONF_PATH:-/data/misc/keystore/ommega/config}
+CONF_PATH=${KMOD_CONF_PATH:-/data/misc/ommega/config}
 # Both overridable so the loader can be exercised from a scratch directory
 # (KMOD_DRY_RUN=1) without touching the real state.
 STATE_FILE="$CONF_DIR/pathmask.state"

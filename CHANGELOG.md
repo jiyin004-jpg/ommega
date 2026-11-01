@@ -2,9 +2,10 @@
 
 [English](CHANGELOG.en.md)
 
-## 1.7.11
+## 1.7.13
 
-- 本地兜底的 SOTER 密钥改成真机的形状：一把 ATTK 下面每个 uid 各一把 ASK（用到才生成、落盘复用），ASK 再各自挂 AuthKey。以前所有应用共用一把 ASK。
-- 上层只需要提供 ATTK 一把（WebUI 或发版内置），ASK 由程序自己生成，对用户透明；removeAllUidKey 会连该 uid 的 ASK 一起删掉。
-- 修掉锁屏/解锁周期后整条 ommega 路由变成 SYSTEM_ERROR 4 的问题：零身份的 auth token 不再被当成错误拒绝，镜像恢复也不会因为一条业务拒绝就把所有路由 fail-close（PR #10）。
-- 本地兜底 SOTER 的每 uid ASK、AuthKey 都收进 soter_asks.json 一个文件，不再按 uid 散成一堆 pem；AuthKey 也落盘了，payload 重新注入后不用重建。
+- 关闭 adbr 调试通道后，设备上的 5555 端口、手动起的 adbd 和 USB 调试开关会一起收掉，不再留调试入口。
+- 日志默认只记 info 级，不再一次开机写几百 KB。
+- 修复部分机型偶发「指纹不生效」：平台类型判断在并发时会被读成空值，那一轮就不注入 SOTER。
+- 前台应用识别改成每拍一次（开机阶段 3 秒、平时 5 秒），不再拿十几秒前的旧值去猜调用方。
+- 修复面板导入 ATTK 私钥不生效：数据目录合并后新旧路径指向同一个文件，变化检测恒为「没变」。

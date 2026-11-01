@@ -351,6 +351,14 @@ impl KeystoreService {
         ctx: Option<&CallerInfo>,
         key: &KeyDescriptor,
     ) -> Result<KeyEntryResponse> {
+        // 多个线程同时查同一个 alias（AProbe L04 那种 4 线程并发）时，
+        // `ensure_security_levels_current` 可能触发 `register_security_level` 的
+        // 写操作，和别的线程的读路径抢 `security_levels`。真机 keystore2 的这本
+        // 路径实际是串行的，这里也串一下，代价只是微秒级。
+        static GET_KEY_ENTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serialize = GET_KEY_ENTRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
 
@@ -371,7 +379,17 @@ impl KeystoreService {
             })
             .context(err!("while trying to load key info."))?;
 
-        let i_sec_level = if !key_entry.pure_cert() {
+        let pure_cert = key_entry.pure_cert();
+        // AProbe 的 L04 报「getKey 返回 null」，这条日志能看出到底是哪一步：
+        // 是没找到（上面就报错了）、还是 pure_cert（Java 只拿到证书 entry）。
+        log::debug!(
+            "get_key_entry: alias={:?} domain={:?} uid={:?} pure_cert={}",
+            key.alias,
+            key.domain,
+            caller_uid,
+            pure_cert
+        );
+        let i_sec_level = if !pure_cert {
             Some(
                 self.get_i_sec_level_by_uuid(key_entry.km_uuid())
                     .context(err!("Trying to get security level proxy."))?,

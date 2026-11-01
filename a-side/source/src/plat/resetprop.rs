@@ -54,18 +54,28 @@ impl PhoneIdentifierKind {
     }
 }
 
-const RESETPROP_FALLBACKS: &[(&str, Option<&str>)] = &[
-    // 管理器提供的那几个，只当兼底。
-    ("/system_ext/bin/resetprop", None),
-    ("/system/bin/resetprop", None),
-    ("/data/adb/ksu/bin/resetprop", None),
-    ("/data/adb/ksud", Some("resetprop")),
-];
-
-/// 模块自己带的那份（实现是 vendor/ 里的 resetprop-rs，安装时
-/// customize.sh 把与设备 ABI 匹配的那份拷到这里）。它排在最前面：管理器的
-/// resetprop 不是每家都有、行为也不一致，不再依赖它们。
-const RESETPROP_BUNDLED: &str = "/data/adb/ommega/bin/resetprop";
+/// 模块自带的那份 resetprop（`vendor/resetprop-rs` 编译出来的）。
+///
+/// 只认这一个路径：`customize.sh` 把与设备 ABI 匹配的那份装进 `libs/`，
+/// `layout.sh` 再搬到 `bin/`。管理器的 resetprop 行为不统一（有的直接写属性区、
+/// 有的只发 socket），读出来的值到底反映哪个时刻说不清，一律不用。
+/// resetprop 的唯一位置：模块内的 `libs/<abi>/resetprop`（ELF，ksu 域可 execute）。
+///
+/// ABI 用**编译期常量**（`cfg!`），不去读 `ro.product.cpu.abi`：
+/// `rsproperties` 在 keymint 这个静态进程里读不到属性区，读失败就会拼出
+/// `libs/x86/resetprop`（不存在）→ 属性全读不到 → 证书里的 verifiedBootKey 变全零。
+fn resetprop_path() -> String {
+    let abi = if cfg!(target_arch = "aarch64") {
+        "arm64-v8a"
+    } else if cfg!(target_arch = "arm") {
+        "armeabi-v7a"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "x86"
+    };
+    format!("/data/adb/modules/ommega/libs/{abi}/resetprop")
+}
 
 #[derive(Clone)]
 pub struct ResetpropCommand {
@@ -209,52 +219,57 @@ pub fn direct_write_and_verify_property(property: &str, value: &str) -> Result<(
 }
 
 pub fn read_string_property(name: &str) -> Option<String> {
-    rsproperties::get::<String>(name)
+    if let Some(value) = rsproperties::get::<String>(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+    // rsproperties 直接 mmap `/dev/__properties__` 解析属性区，在 keymint 这种静态
+    // 链接的进程里拿不到（返回 Err，被 `.ok()` 吞掉后静默走进兼容回退，于是证书就
+    // 用了开机快照而不是当前属性）。
+    //
+    // 退回模块自带的 resetprop：它在同一台设备上实测能读到实时值（`resetprop <name>`
+    // 打印当前值），而且就住在 `/data/adb` 下，keymint 一定 exec 得动。
+    read_property_via_resetprop(name)
 }
 
-/// 所有可用的 resetprop，按优先级排。
-///
-/// **自己的那份排最前**（管理器的不是每家都有、行为也不一致），但不能只认它：
-/// 调用方可能是 keystore 里的那个 forked helper，而 keystore 域未必有权限 exec
-/// /data/adb 下的文件（域的转换归 SELinux 管，`sepolicy.rule` 里只给 keystore
-/// 放开了 `system_file`）。所以调用方拿到的是个**列表**：第一个 exec 不通就顺着往下试。
-pub fn resetprop_candidates() -> Vec<ResetpropCommand> {
-    let mut out = Vec::new();
-
-    if Path::new(RESETPROP_BUNDLED).exists() {
-        out.push(ResetpropCommand {
-            program: RESETPROP_BUNDLED.to_string(),
-            prepend_arg: None,
-        });
-    }
-
-    if let Some(program) = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join("resetprop"))
-            .find(|candidate| candidate.exists())
-            .map(|candidate| candidate.to_string_lossy().into_owned())
-    }) {
-        out.push(ResetpropCommand {
-            program,
-            prepend_arg: None,
-        });
-    }
-
-    for (program, prepend_arg) in RESETPROP_FALLBACKS {
-        if Path::new(program).exists() {
-            out.push(ResetpropCommand {
-                program: program.to_string(),
-                prepend_arg: prepend_arg.map(str::to_string),
-            });
+/// 用模块自带的 resetprop 读一次属性（`resetprop <name>` 打印当前值）。
+fn read_property_via_resetprop(name: &str) -> Option<String> {
+    for command in resetprop_candidates() {
+        let Ok(output) = std::process::Command::new(&command.program)
+            .arg(name)
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
         }
     }
-
-    out
+    None
 }
 
+/// 所有可用的 resetprop（现在只有一个）。
+///
+/// 读写属性用的 resetprop。只有一个位置，所以这里永远返回 0 或 1 个元素
+/// （保留列表形态是为了让 `read_property_via_resetprop` / 写路径不必改签名）。
+pub fn resetprop_candidates() -> Vec<ResetpropCommand> {
+    let path = resetprop_path();
+    if Path::new(&path).exists() {
+        vec![ResetpropCommand {
+            program: path,
+            prepend_arg: None,
+        }]
+    } else {
+        Vec::new()
+    }
+}
 fn execute_write_and_verify(command: &ResetpropCommand, property: &str, value: &str) -> Result<()> {
     let mut process = Command::new(&command.program);
     if let Some(prepend_arg) = &command.prepend_arg {

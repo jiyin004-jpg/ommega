@@ -27,6 +27,7 @@ use crate::{
 pub mod att_mgr;
 pub mod config;
 pub mod consts;
+pub mod daemon;
 pub mod global;
 pub mod keybox;
 pub mod keymaster;
@@ -72,7 +73,8 @@ fn chown_path(path: &str, uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result
 }
 
 fn repair_ommega_data_files() {
-    let entries = match std::fs::read_dir(root_path!("data")) {
+    // 密钥库目录：`data/` 里是 keymint 自己的数据库，只有 keystore 域碰。
+    let entries = match std::fs::read_dir(secret_path!("data")) {
         Ok(entries) => entries,
         Err(e) => {
             storage_warn(format!("Failed to list ommega data directory: {e:?}"));
@@ -114,13 +116,21 @@ fn repair_ommega_data_files() {
 }
 
 fn prepare_android_storage() {
-    for dir in [root_path!(), root_path!("data"), root_path!("logs")] {
+    // 数据根 / 日志：keystore 域负责写，但读的一方不止 keystore 域 ——
+    // SOTER 宿主跑在 uid 1000（`system_app`），它按已知路径进目录读文件。
+    // 所以不能是 0770：`other` 连目录都进不去，SOTER 直接读不到 ATTK / cpu_id。
+    // 目录给 0771（other 只有 x，不能列举但能按名访问），文件给 0644。
+    //
+    // logs 必须是 1777 而不是 0777：注入到 app 域（SOTER 宿主不是 keystore uid）的
+    // payload 得往这里落日志，光靠 group 写不够。sticky 位拦住「删掉/改名别人的
+    // 日志文件」和拿软链顶替已有日志那条路，写内容还是允许的。
+    for (dir, mode) in [(root_path!(), 0o771), (root_path!("logs"), 0o1777)] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             storage_warn(format!("Failed to create ommega directory {dir}: {e:?}"));
             continue;
         }
 
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o770)) {
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)) {
             storage_warn(format!("Failed to chmod ommega directory {dir}: {e:?}"));
         }
 
@@ -129,10 +139,42 @@ fn prepare_android_storage() {
         }
     }
 
-    if let Err(e) = crate::keybox::ensure_keybox_file(root_path!("keybox.xml")) {
+    // 密钥库目录：keymint 的数据库就在这，keystore 独占。
+    // 这个目录必须在这里建：它不存在时开库直接 SIGABRT，整个 HAL 不起，一条链都不出。
+    let db_dir = secret_path!("data");
+    if let Err(e) = std::fs::create_dir_all(db_dir) {
+        storage_warn(format!(
+            "Failed to create ommega db directory {db_dir}: {e:?}"
+        ));
+    } else {
+        if let Err(e) = std::fs::set_permissions(db_dir, std::fs::Permissions::from_mode(0o770)) {
+            storage_warn(format!(
+                "Failed to chmod ommega db directory {db_dir}: {e:?}"
+            ));
+        }
+        if let Err(e) = chown_path(db_dir, KEYSTORE_UID, KEYSTORE_GID) {
+            storage_warn(format!(
+                "Failed to chown ommega db directory {db_dir}: {e:?}"
+            ));
+        }
+    }
+
+    // 日志给 app 域读写（面板/排查）：目录 1777（sticky），已有文件一律 0666。
+    // 文件是运行时新建的（keymint.log 由 payload 写），所以每次启动都得扇一遍，
+    // 否则新文件默认 0600，只有 keystore 域读得到。
+    if let Ok(entries) = std::fs::read_dir(root_path!("logs")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+            }
+        }
+    }
+
+    if let Err(e) = crate::keybox::ensure_keybox_file(secret_path!("keybox_tee.xml")) {
         storage_warn(format!(
             "Failed to seed ommega keybox {}: {e:?}",
-            root_path!("keybox.xml")
+            secret_path!("keybox_tee.xml")
         ));
     }
 
@@ -152,7 +194,19 @@ fn prepare_android_storage() {
     for file in [
         root_path!("config.toml"),
         root_path!("config.toml.bak"),
-        root_path!("keybox.xml"),
+        // 共享数据：注入到 SOTER 宿主（uid 1000）的 payload 要读，必须是 0644。
+        // 它们曾经是 0600，结果 keystore2 那边正常、SOTER 宿主那边读不到配置。
+        root_path!("config"),
+        root_path!("injector.toml"),
+        root_path!("target.txt"),
+        root_path!("soter_cpu_id"),
+        root_path!("soter_attk.pem"),
+        root_path!("soter_asks.json"),
+        root_path!("uid_packages"),
+        root_path!("foreground"),
+        root_path!("log_flag"),
+        secret_path!("keybox_tee.xml"),
+        secret_path!("keybox_strongbox.xml"),
         root_path!("crash_count"),
         root_path!("logs/keymint.log"),
         root_path!("logs/keymint.log.1"),
@@ -163,7 +217,15 @@ fn prepare_android_storage() {
             continue;
         }
 
-        let mode = if file.ends_with(".xml") { 0o600 } else { 0o660 };
+        // keybox 是密钥材料（只有 keystore 域用），其余是共享数据：
+        // `config*` / `injector.toml` 要给面板和注入器读，日志要给 app 域读。
+        let mode = if file.ends_with(".xml") {
+            0o600
+        } else if file.contains("/logs/") {
+            0o666
+        } else {
+            0o644
+        };
 
         if let Err(e) = std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)) {
             storage_warn(format!("Failed to chmod ommega file {file}: {e:?}"));
@@ -302,6 +364,17 @@ fn install_module_info_bundle_if_available() -> Result<()> {
 }
 
 fn main() {
+    // 守护模式：`keymint --daemon` 直接进守护循环（替掉原来的 `template/daemon`
+    // shell 脚本）。放在最前面，连日志初始化都不需要 —— 守护只在「启用调试日志」
+    // 开着时自己落文件，跟 shell 版一致。
+    if std::env::args().any(|arg| arg == "--daemon") {
+        let extra: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|arg| arg != "--daemon")
+            .collect();
+        daemon::run(extra);
+    }
+
     logging::init_logger();
     prepare_android_storage();
     panic::set_hook(Box::new(|panic_info| {

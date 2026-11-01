@@ -43,6 +43,22 @@ fn token_from_headers(headers: &HeaderMap) -> Option<&str> {
         .or_else(|| headers.get("x-api-token").and_then(|v| v.to_str().ok()))
 }
 
+/// A 端上报的设备指纹（私卡绑定用）。缺哪个就是空串，不做额外校验。
+fn device_fp_from_headers(headers: &HeaderMap) -> crate::auth::DeviceFp {
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    crate::auth::DeviceFp {
+        serial: get("x-device-serial"),
+        sn: get("x-device-sn"),
+    }
+}
+
 pub(crate) fn client_ip(headers: &HeaderMap) -> String {
     // Prefer X-Real-IP injected by the inject_client_ip middleware, which is the
     // actual TCP socket address. X-Forwarded-For is client-supplied and trivially
@@ -119,6 +135,7 @@ async fn check_auth(
 ) -> Result<String, Box<Response>> {
     let token = token_from_headers(headers).unwrap_or("").to_string();
     let ip = client_ip(headers);
+    let fp = device_fp_from_headers(headers);
 
     // IP allow/deny filter (A/B-side only; admin uses its own session auth).
     if !state.auth.ip_allowed(&ip) {
@@ -137,9 +154,12 @@ async fn check_auth(
         let token = token.clone();
         let ip = ip.clone();
         let role = role.map(str::to_string);
-        tokio::task::spawn_blocking(move || auth.check_token(Some(&token), role.as_deref(), &ip))
-            .await
-            .unwrap_or(false)
+        let fp = fp.clone();
+        tokio::task::spawn_blocking(move || {
+            auth.check_token(Some(&token), role.as_deref(), &ip, Some(&fp))
+        })
+        .await
+        .unwrap_or(false)
     };
     if !authorized {
         if !state.auth.allow_invalid(&ip) {
@@ -337,6 +357,14 @@ async fn try_b_device_layer(
             state.fulfill.forget_session(alias);
         }
     }
+    // 告诉 A 端这张链是哪台 B 铸的：以后拿这把 AK 签子钥，得回到同一台，
+    // 否则另一台 B 没有它的 session（`issuer key ... is not available`）。
+    let mut v = v;
+    if v.get("error").is_none() {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("device_id".to_string(), json!(target));
+        }
+    }
     Some(v)
 }
 
@@ -425,6 +453,7 @@ fn try_keybox_layer_sync(
         "attest" => fulfill.try_handle_attest(device_id, body, prefer_slot),
         "sign" => fulfill.try_handle_sign(device_id, body),
         "decrypt" => fulfill.try_handle_decrypt(device_id, body),
+        "agree" => fulfill.try_handle_agree(device_id, body),
         _ => None,
     }
 }
@@ -757,9 +786,37 @@ fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'stati
     // 模式自动分层没区别了，调试时也看不出到底是哪一层出的链。
     const ONLY_B: &[&str] = &["b"];
     const ONLY_KB: &[&str] = &["keybox"];
+    // 证明密钥的「智能模式」：不走 B，但允许回退到自签（不然 keybox 一时不可用
+    // 就整把 AK 建不出来）。
+    const KB_NO_B: &[&str] = &["keybox", "self_signed"];
     let by_mode = if serverbox { KB_CHAIN } else { B_CHAIN };
     if task_type != "attest" {
         return by_mode;
+    }
+    // 证明密钥（`PURPOSE_ATTEST_KEY` = 64）：真机上它和普通密钥同一套 keybox，
+    // 根相同；我们物理模式下普通认证走 B、证明密钥留本地就让两边根分叉。
+    if is_attest_key_request(body) {
+        // 用一把已有 AK 签子钥：不看当前策略，直接回那把 AK 的出生地。
+        // 政策随时会改，AK 却是早就铸好的 —— 跟着策略走就会「AK 在 keybox、子钥派给 B」
+        // 这种错配，B 那边没有它的私钥，只会报 `issuer key ... is not available`。
+        if let Some(issuer) = attestation_key_ref(body) {
+            return if issuer.device_id.is_some() {
+                ONLY_B
+            } else {
+                ONLY_KB
+            };
+        }
+        // 铸 AK 本身：跟着策略走。
+        return match crate::attest_policy::attest_key_order() {
+            crate::attest_policy::AttestKeyOrder::Smart => KB_NO_B,
+            crate::attest_policy::AttestKeyOrder::Follow => {
+                match crate::attest_policy::attest_order() {
+                    crate::attest_policy::Order::Auto => by_mode,
+                    crate::attest_policy::Order::BFirst => ONLY_B,
+                    crate::attest_policy::Order::KeyboxFirst => ONLY_KB,
+                }
+            }
+        };
     }
     let policy = if request_has_attestation_ids(body) {
         crate::attest_policy::id_attest_order()
@@ -771,6 +828,51 @@ fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'stati
         crate::attest_policy::Order::BFirst => ONLY_B,
         crate::attest_policy::Order::KeyboxFirst => ONLY_KB,
     }
+}
+
+/// 请求里带的证明密钥引用（用一把已有 AK 签子钥时才有）。
+struct AttestIssuer<'a> {
+    /// 那把 AK 铸在哪台 B；`None` 表示它铸在服务端 keybox 层。
+    device_id: Option<&'a str>,
+}
+
+fn attestation_key_ref(body: &Value) -> Option<AttestIssuer<'_>> {
+    let issuer = body
+        .get("device_attest_context")
+        .and_then(|c| c.get("attestation_key"))?;
+    if issuer.is_null() {
+        return None;
+    }
+    Some(AttestIssuer {
+        device_id: issuer
+            .get("device_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+    })
+}
+
+/// 是不是证明密钥相关的请求：铸 AK 本身（`KeyPurpose::AttestKey` = 64），
+/// 或者用一把 AK 签子钥（`attestation_key`）。
+///
+/// 注意 `AttestKey` 是 **64**（`VERIFY` 才是 8），写错会把普通签名请求当成
+/// 证明密钥 —— 那些请求就被拽到 keybox 层，而它们的 AK 在 B 那边铸的，
+/// 服务端自然找不到 session。
+///
+/// 两者必须走同一层 —— AK 铸在服务端 keybox、子钥却派给 B，B 那边找不到这把
+/// AK 的 session（`issuer key ... is not available on this device`），整笔就废了。
+fn is_attest_key_request(body: &Value) -> bool {
+    // AOSP KeyMint: ATTEST_KEY = 0x40。
+    const PURPOSE_ATTEST_KEY: i64 = 64;
+    let ctx = body.get("device_attest_context");
+    let keygen = ctx
+        .and_then(|c| c.get("purpose"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().any(|v| v.as_i64() == Some(PURPOSE_ATTEST_KEY)))
+        .unwrap_or(false);
+    let signing = ctx
+        .and_then(|c| c.get("attestation_key"))
+        .is_some_and(|v| !v.is_null());
+    keygen || signing
 }
 
 async fn run_a_side_task(
@@ -786,12 +888,29 @@ async fn run_a_side_task(
     // 保持空，由 `resolve_online_target("")` 按负载挑一台在线的 B。
     let body = crate::default_device::fill_in_body(crate::default_device::Chain::Keymint, body);
     let body = &body;
-    let device_id = body
+    let mut device_id = body
         .get("device_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
+    // 用一把已有 AK 签子钥：钉在那把 AK 出生的那台 B 上。服务端默认设备、负载均衡、
+    // 用户临时切的策略都不能把它改成另一台 —— 另一台没有这把私钥。
+    if let Some(issuer) = attestation_key_ref(body) {
+        if let Some(owner) = issuer.device_id {
+            if owner != device_id {
+                tracing::info!(
+                    "run_a_side_task: pin device to attestation key owner {owner} (requested {})",
+                    if device_id.is_empty() {
+                        "<any>"
+                    } else {
+                        &device_id
+                    }
+                );
+                device_id = owner.to_string();
+            }
+        }
+    }
     let ctx = body
         .get("device_attest_context")
         .cloned()
@@ -826,7 +945,7 @@ async fn run_a_side_task(
         }
         _ => format!("{ctx}"),
     };
-    tracing::info!(
+    tracing::debug!(
         "run_a_side_task: type={task_type} device={device_id} alias={} ctx=[{ctx_short}]",
         body.get("alias").and_then(|v| v.as_str()).unwrap_or("")
     );
@@ -1168,6 +1287,24 @@ pub async fn decrypt(
     run_a_side_task(
         &state,
         "decrypt",
+        &body,
+        state.auth.token_meta(token_from_headers(&headers)),
+    )
+    .await
+}
+
+/// POST /api/agree/ — ECDH agreement against a remote (B-side) key.
+pub async fn agree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
+        return *r;
+    }
+    run_a_side_task(
+        &state,
+        "agree",
         &body,
         state.auth.token_meta(token_from_headers(&headers)),
     )
@@ -2697,6 +2834,16 @@ pub async fn b_poll(
                 "another machine is already serving this device",
             );
         }
+    }
+
+    // 无名额限制时直接放行（默认 0）；有上限就用现场排名判定，不做任何占位标记。
+    if let Err(msg) = state
+        .store
+        .allow_poll(&q.device_id, crate::b_limit::get())
+        .await
+    {
+        tracing::info!("b_poll: 拒绝 {}：{msg}", q.device_id);
+        return json_err(StatusCode::FORBIDDEN, &msg);
     }
 
     let timeout_secs = q.timeout.unwrap_or(state.cfg.poll_timeout_secs);

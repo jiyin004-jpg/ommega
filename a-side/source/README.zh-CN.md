@@ -41,7 +41,8 @@ relay_server 转发到 B 端的真实硬件 TEE 执行。
 3. 把要接管的 App 加到 `/data/adb/ommega/ommegadata/target.txt`（一行一个包名；
    `!` = 强制生成，`?` = 强制打补丁）。KernelSU 下用 WebUI（`webroot/`）管它也成。
 
-4. 想让本地模式用你自己的密钥认证，就把模板里的 `keybox.xml` 换掉。
+4. 想让本地模式用你自己的密钥认证，就把模板里的 `keybox_tee.xml`（TEE 级别）
+   或 `keybox_strongbox.xml`（StrongBox 级别）换掉，两份各管一个级别。
 
 > **路径注意**：`/data/adb/` 只有 root 进得去，所以 keystore 进程（uid 1017）读不了
 > `/data/adb/ommega/*`。唯一的数据位置是 `/data/misc/keystore/ommega/`，在

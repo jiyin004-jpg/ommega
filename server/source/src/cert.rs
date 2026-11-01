@@ -123,6 +123,16 @@ pub struct AttestationParams {
     pub security_level: i64,
     /// Serial number for the leaf certificate. AOSP convention is 1.
     pub serial: i64,
+    /// `MODULE_HASH` (KeyMint tag 724) forwarded by the A-side: SHA-256 of the
+    /// device's APEX module-info bundle, taken from the same
+    /// `SetAdditionalAttestationInfo` the local software keybox path uses.
+    ///
+    /// AOSP's KeyMint (4.0+) writes it as `[724] EXPLICIT OCTET STRING` inside
+    /// the attestation extension.  Without it the relay-minted leaf omits the
+    /// tag while `getSupplementaryAttestationInfo(MODULE_HASH)` on the device
+    /// still returns the local bundle, which attestation verifiers report as
+    /// "MODULE_HASH omitted from attestation".
+    pub module_hash: Option<Vec<u8>>,
 }
 
 impl Default for AttestationParams {
@@ -155,6 +165,7 @@ impl Default for AttestationParams {
             keymaster_version: 300,
             security_level: 1,
             serial: 1,
+            module_hash: None,
         }
     }
 }
@@ -293,6 +304,11 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
             tags.push(*tag);
         }
     }
+    // MODULE_HASH (724): only when the A-side forwarded a non-empty digest, so
+    // older A-side builds keep producing byte-identical leaves.
+    if matches!(p.module_hash.as_deref(), Some(hash) if !hash.is_empty()) {
+        tags.push(724);
+    }
     tags.sort();
 
     w.write_sequence(|w| {
@@ -430,6 +446,15 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                     if let Some(v) = p.boot_patch_level {
                         w.next()
                             .write_tagged(yasna::Tag::context(719), |w| w.write_i64(v));
+                    }
+                }
+                724 => {
+                    // [724] EXPLICIT OCTET STRING, matching AOSP KeyMint's
+                    // `KM_TAG_MODULE_HASH` encoding.
+                    if let Some(hash) = p.module_hash.as_deref().filter(|h| !h.is_empty()) {
+                        w.next().write_tagged(yasna::Tag::context(724), |w| {
+                            w.write_bytes(hash);
+                        });
                     }
                 }
                 _ => {}
@@ -892,6 +917,76 @@ pub fn chain_rdn_shape(chain_pem: &str) -> RdnShape {
         }
     }
     RdnShape::Unknown
+}
+
+/// 链上各级证书标的级别，去重（保持出现顺序）。
+///
+/// 真机 keybox 整条链只会有一个值；出现两个就是拼出来的（比如 TEE 的中间 CA 配了
+/// StrongBox 的根），这种链自己就矛盾，不该发出去。没标（AOSP 软件链、自签链）返回空。
+///
+/// 级别写在哪个字段要按签发方分开看：
+///   - AOSP 自己签的 keybox 写在 `title`（2.5.4.12）里；
+///   - **Google RKP 签的写在 `O`（2.5.4.10）里**，DN 长这样：
+///     `CN=<16 hex>,O=TEE` / `CN=<16 hex>,O=StrongBox`。
+///
+/// 以前只认 `title`，RKP 那批链就全是“没标级别”，连带的后果是：级别不匹配
+/// 的 session 会被当成同一个级别复用（要 StrongBox 的请求拿回 TEE 链），兜底挑
+/// 身份时也拦不住 StrongBox 那份被 TEE 请求用上。
+/// `O` / `OU` 里只收本来就是级别名的值，避免把 `O=Google LLC` 当成级别。
+pub fn chain_security_levels(chain_pem: &str) -> Vec<String> {
+    let Ok(ders) = parse_chain_pem(chain_pem) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for der in ders.iter() {
+        let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+            continue;
+        };
+        for rdn in cert.subject().iter() {
+            for attr in rdn.iter() {
+                let oid = attr.attr_type().to_id_string();
+                // 2.5.4.12 = title，2.5.4.10 = O，2.5.4.11 = OU
+                let is_title = oid == "2.5.4.12";
+                if !is_title && oid != "2.5.4.10" && oid != "2.5.4.11" {
+                    continue;
+                }
+                let Ok(value) = attr.as_str() else {
+                    continue;
+                };
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                // title 以外的字段只有长得像级别名的才收。
+                if !is_title && level_from_title(value).is_none() {
+                    continue;
+                }
+                if !out.iter().any(|v| v.eq_ignore_ascii_case(value)) {
+                    out.push(value.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 整条链只标了一种级别时返回它（0/1/2）；没标或者标了两种都返回 `None`。
+pub fn chain_security_level(chain_pem: &str) -> Option<i64> {
+    let levels = chain_security_levels(chain_pem);
+    if levels.len() != 1 {
+        return None;
+    }
+    level_from_title(&levels[0])
+}
+
+/// `title` 的字面值 → KeyMint 级别。大小写、前后空格都不计较。
+fn level_from_title(title: &str) -> Option<i64> {
+    match title.trim().to_ascii_lowercase().as_str() {
+        "strongbox" => Some(2),
+        "tee" => Some(1),
+        "software" => Some(0),
+        _ => None,
+    }
 }
 
 fn sign_tbs(key: &KeyMaterial, tbs: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
@@ -2461,6 +2556,24 @@ mod tests {
         assert!(!RdnShape::Unknown.is_legacy());
     }
 
+    /// 链上标的级别（title 属性）→ KeyMint 数字，没标就是 None。
+    ///
+    /// 真机 keybox 的中间证书 subject 写 `title=TEE` / `title=StrongBox`，
+    /// 铸造时要拿它跟叶子里的 `attestationSecurityLevel` 对一遍。
+    #[test]
+    fn title_maps_to_the_keymint_level() {
+        assert_eq!(level_from_title("TEE"), Some(1));
+        assert_eq!(level_from_title(" StrongBox "), Some(2));
+        assert_eq!(level_from_title("software"), Some(0));
+        assert_eq!(level_from_title(""), None);
+        assert_eq!(level_from_title("Keymaster"), None);
+        // AOSP 的 Software 链靠 CN 认，subject 里没有 title，判不出级别。
+        assert_eq!(
+            chain_security_level(&format!("{MOCK_LEAF}{MOCK_ROOT}")),
+            None
+        );
+    }
+
     // -----------------------------------------------------------------
     // 质量门（identity_problem / chain_problem）的测试素材：几张现造的证书，
     // 全部活到 2026-10-27。前两张是一对由 mock 根签出来的链，模拟那些用生成器
@@ -3158,6 +3271,46 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         // A request without ID attestation must not grow the tags either.
         let der = build_attestation_extension_der(&AttestationParams::default());
         assert!(!der.windows(5).any(|w| w == b"nubia"));
+    }
+
+    /// MODULE_HASH (724) 必须由 A 端转发、B 端原样写进叶子：
+    /// `getSupplementaryAttestationInfo(MODULE_HASH)` 在设备上返回的是本机 APEX
+    /// module-info bundle 的摘要，叶子缺 724 时校验方会报
+    /// `MISSING_ATTESTATION_MODULE_HASH`。
+    #[test]
+    fn key_description_carries_forwarded_module_hash() {
+        /// DER 里是否出现 context-specific tag `n`（high-tag-number 形式）。
+        fn has_context_tag(der: &[u8], n: u64) -> bool {
+            assert!(n >= 31, "low tag numbers are not covered by this helper");
+            let hi = (((n >> 7) & 0x7f) | 0x80) as u8;
+            let lo = (n & 0x7f) as u8;
+            [0x9fu8, 0xbfu8].iter().any(|first| {
+                der.windows(3)
+                    .any(|w| w[0] == *first && w[1] == hi && w[2] == lo)
+            })
+        }
+
+        let hash = vec![0xA5u8; 32];
+        let with_hash = AttestationParams {
+            module_hash: Some(hash.clone()),
+            ..Default::default()
+        };
+        let der = build_attestation_extension_der(&with_hash);
+        assert!(
+            has_context_tag(&der, 724),
+            "MODULE_HASH (724) missing from the KeyDescription"
+        );
+        assert!(
+            der.windows(hash.len()).any(|w| w == hash.as_slice()),
+            "the forwarded module hash value is not present in the KeyDescription"
+        );
+
+        // 没转发时（老 A 端）不能凭空长出一个空 tag。
+        let der = build_attestation_extension_der(&AttestationParams::default());
+        assert!(
+            !has_context_tag(&der, 724),
+            "default params must not emit 724"
+        );
     }
 
     /// auth-bound key（`setUserAuthenticationRequired(true)`，framework 展开成 502 + 504 +

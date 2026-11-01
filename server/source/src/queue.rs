@@ -139,6 +139,9 @@ pub struct DeviceEntry {
     /// 还没收到 poll：按历史行为「任意 A 都能用」。
     pub token_pair_id: String,
     pub token_kind: String,
+    /// 占着 B 接入名额吗。`b_limit` 打开时只有 true 的设备会被派活；
+    /// 名额满了之后要么踢掉质量更差的、要么被拒，见 `Store::try_accept_device`。
+    pub accepted: bool,
 }
 
 /// B 端报上来的设备身份（键值都来自它自己的 `ro.product.*` / `ro.serialno`）。
@@ -181,6 +184,36 @@ impl DeviceIdentityReport {
 }
 
 impl DeviceEntry {
+    /// 设备质量分级（越高越优先占名额）。
+    ///
+    /// 判断依据是它自己出过的证（`boot`，由 `cert` 从叶子解析）和自检结果：
+    /// - 3 = 锁定 + 可信启动（`device_locked=true` 且 verified / self-signed）
+    /// - 2 = 锁定但启动状态不明，或还没出过证（质量未知，按中性算）
+    /// - 1 = 解锁的（能出链，只是链不好看）
+    /// - 0 = **自检失败**（`tee_error` 有值）：根本出不了链，占着名额也没用，
+    ///   排在解锁的后面，让能用的设备优先
+    pub fn seat_quality(&self) -> u8 {
+        // 出不了链的排最低：自检失败往往是 TA 卡住 / 未预制，占名额纯浪费。
+        if self.tee_error.is_some() {
+            return 0;
+        }
+        let Some(boot) = self.boot.as_ref() else {
+            return 2;
+        };
+        match boot.device_locked {
+            Some(true) => {
+                // 0 = verified, 1 = self-signed（自定义 key，也是可信链）
+                if matches!(boot.verified_boot_state, Some(0) | Some(1)) {
+                    3
+                } else {
+                    2
+                }
+            }
+            Some(false) => 1,
+            // 证里没带 locked 标记：当锁定但无法确认，别让它比真解锁的还差
+            None => 2,
+        }
+    }
     /// 这台是模块 relay（`Some(true)`）、手机 App（`Some(false)`）还是分不出来（`None`）。
     ///
     /// 心跳带了模块专属参数的一定是模块 relay；没带的看它出过的链 —— App 铸的链
@@ -592,6 +625,77 @@ impl TaskStore {
 
     /// Pop the next pending task matching this device, with long-poll semantics.
     /// Returns None after `timeout` elapsed with no match.
+    /// B 端连上来时问一句：按当前在线情况，这台排得上名额吗？
+    ///
+    /// **无状态实现**：不维护任何 `accepted` 占位标记，每次 poll 现场把在线设备
+    /// 排一遍，看本设备排在不在前 `max` 名里。之前用标记 + 清理 + 补位那套，
+    /// 三者互相打脸（掉线释放的名额被新人补上、老人回来又放行），实测一路涨到 217。
+    ///
+    /// 排序：固定的默认设备（`pinned`）优先，其次按「锁定+可信启动」的质量，
+    /// 同质量按最近活跃时间。掉线超过 120 秒的不参与排名，名额自然腾出来。
+    ///
+    /// 拒绝时**不更新**任何状态，所以被拒的设备 120 秒后自然掉出在线列表，
+    /// 面板上的"在线 B 端"也就不会虚高。
+    pub async fn allow_poll(&self, device_id: &str, max: usize) -> Result<(), String> {
+        if max == 0 {
+            // 只在第一次提醒（无限制是默认值，也可能说明配置文件没读上）
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::info!("b_limit: 未设置上限（max=0），全部放行");
+            });
+            return Ok(());
+        }
+        let (km, soter) = crate::default_device::get_all();
+        if (!km.is_empty() && device_id == km) || (!soter.is_empty() && device_id == soter) {
+            return Ok(());
+        }
+
+        let inner = self.inner.lock().await;
+        let now = Self::now_ms();
+        let online = |d: &DeviceEntry| now.saturating_sub(d.last_seen_ms) < 120_000;
+
+        // (device_id, 质量, 最近活跃, pinned)
+        let mut rank: Vec<(String, u8, u64, bool)> = inner
+            .devices
+            .iter()
+            .filter(|(_, d)| online(d))
+            .map(|(id, d)| {
+                let pinned = (!km.is_empty() && id == &km) || (!soter.is_empty() && id == &soter);
+                (id.clone(), d.seat_quality(), d.last_seen_ms, pinned)
+            })
+            .collect();
+
+        // 本设备可能还不在这张表里（首次 poll 要等 pop_for_b 才 insert）。
+        // 给它**最旧**的时间戳参与排名：之前这里用的是 `now`，排序按最近活跃降序，
+        // 结果新设备天然排第一、名次永远 < max，544 台全放行 ✓
+        if !rank.iter().any(|(id, _, _, _)| id == device_id) {
+            rank.push((device_id.to_string(), 1, 0, false));
+        }
+
+        rank.sort_by(|a, b| {
+            b.3.cmp(&a.3) // pinned 优先
+                .then(b.1.cmp(&a.1)) // 质量高的优先
+                .then(b.2.cmp(&a.2)) // 同等质量按最近活跃
+        });
+
+        let idx = rank
+            .iter()
+            .position(|(id, _, _, _)| id == device_id)
+            .unwrap_or(usize::MAX);
+        if idx < max {
+            return Ok(());
+        }
+        // 顺带把当前的真实在线数写进日志，方便对照面板
+        tracing::info!(
+            "b_limit: 拒绝 {device_id}（排名 {idx}，在线 {} 台，上限 {max}）",
+            rank.len()
+        );
+        Err(format!(
+            "B device limit reached ({max} online); this device ranks #{}",
+            idx + 1
+        ))
+    }
+
     pub async fn pop_for_b(
         &self,
         device_id: &str,
@@ -650,6 +754,7 @@ impl TaskStore {
                         known_version,
                         known_from_module,
                         known_identity,
+                        known_accepted,
                     ) = match inner.devices.get(device_id) {
                         Some(d) => (
                             d.boot.clone(),
@@ -664,6 +769,7 @@ impl TaskStore {
                             d.version.clone(),
                             d.from_module,
                             d.identity.clone(),
+                            d.accepted,
                         ),
                         None => (
                             None,
@@ -678,6 +784,7 @@ impl TaskStore {
                             None,
                             false,
                             DeviceIdentityReport::default(),
+                            false,
                         ),
                     };
                     let no_boot_yet = known_boot.is_none();
@@ -706,6 +813,9 @@ impl TaskStore {
                             // upsert 不碰它。
                             token_pair_id: String::new(),
                             token_kind: String::new(),
+                            // 名额由 try_accept_device 单独维护；心跳重建条目时保留上次的
+                            // 结论，否则每轮都会把已接入的设备变回「未接受」。
+                            accepted: known_accepted,
                         },
                     );
                     self.mark_online_sync(device_id, hb_now);
@@ -770,7 +880,11 @@ impl TaskStore {
                 return None;
             }
             // 版本号变了就是有新任务或新结果；兜底轮询只防「消息真丢了」。
-            let poll_interval = remaining.min(Duration::from_millis(100));
+            // 500ms 而不是 100ms：每个挂着长轮询的 B 都在这个 select 里循环，
+            // 300 台在线时 100ms 就是 3000 次/秒的定时器唤醒（watch 正常工作时
+            // 这些唤醒全是在确认「没变化」）。真的入队会通过 rx.changed() 即时唤醒，
+            // 兜底放宽到 500ms 不会影响派发时效。
+            let poll_interval = remaining.min(Duration::from_millis(500));
             tokio::select! {
                 _ = rx.changed() => {},
                 _ = tokio::time::sleep(poll_interval) => {},
@@ -1142,7 +1256,14 @@ impl TaskStore {
         // 把任务回收成 Pending 后，原设备的晚到结果依旧是有效结果，此时
         // assigned_device_id 已被清空，下面的归属校验自然跳过。
         {
-            let task = inner.tasks.get(task_id).expect("checked above");
+            // 上面刚查过，但这里不能用 expect：panic 会毒化整个状态锁，
+            // 等于服务停摆。真跑到这只能是锁内逻辑被改过，当重复回传幂等处理。
+            let Some(task) = inner.tasks.get(task_id) else {
+                tracing::warn!(
+                    "complete_task: task {task_id} vanished under the lock; ignoring report from {device_id}"
+                );
+                return Ok(());
+            };
             match task.status {
                 TaskStatus::Assigned | TaskStatus::Pending => {}
                 // 重复回传当幂等处理：结果已经在里面了，不动它，也不报错 ——

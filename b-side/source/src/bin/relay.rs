@@ -73,7 +73,13 @@ use ommegaclient_b::wakelock;
 /// 控制。之前用长轮询（15s→5s→1s）时，任务落在两轮之间就要等满一个周期，实测
 /// 端到端多出 1 秒以上的固定延迟；改成 120ms 短轮询后，最坏等 120ms。
 /// 短轮询的空响应只有几字节，服务端压力可以忽略。
-const POLL_TIMEOUT_SEC: u32 = 0;
+/// 长轮询秒数：0 = 短轮询（问一次就回，任务到达最多等一个轮询间隔 ~70ms）。
+/// 设成 5 之后 B 挂在服务端等，有任务立刻推回来，attested 路径能少 20~40ms ——
+/// T04 那个「远程/本地配对差」就卡在 120ms 线上，这点延迟很关键。
+///
+/// **不能超过 POLL_WALL_LIMIT（8s）**：超了 watchdog 会判「循环不往前转」直接退进程，
+/// service.sh 再拉起来，就变成 15s 一次的崩溃重起了。
+const POLL_TIMEOUT_SEC: u32 = 5;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
 /// 一轮 poll 最多允许的墙钟时间。刻意比上面的 READ_TIMEOUT_MS 早一步收网：那个
@@ -666,6 +672,16 @@ fn http_request(
     for (k, v) in headers {
         req = req.header(k, v);
     }
+    // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验（换机要解绑）。
+    // 以前只给 A 端加了这两个头，B 端一直没带 —— 所以 B 那边的私卡永远
+    // 停在「未绑定」。值只读一次（属性区是 mmap，但没必要每笔都读）。
+    let (dev_serial, dev_sn) = device_fingerprint();
+    if !dev_serial.is_empty() {
+        req = req.header("X-Device-Serial", dev_serial);
+    }
+    if !dev_sn.is_empty() {
+        req = req.header("X-Device-Sn", dev_sn);
+    }
     if let Some(b) = body {
         req = req.body(b.to_vec());
     }
@@ -988,6 +1004,14 @@ fn parse_attestation_key(value: Option<&Value>) -> Result<Option<tee_ops::Attest
         return Err(anyhow!("attestation_key.issuer_subject_name is empty"));
     }
     Ok(Some(tee_ops::AttestationKeyRef {
+        // AOSP 的 `AttestationKey.keyBlob`：有就用它直接签，不靠 alias 查 session。
+        key_blob: value
+            .get("key_blob")
+            .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            .map(b64_decode)
+            .transpose()
+            .with_context(|| "decode attestation_key.key_blob")?
+            .filter(|blob| !blob.is_empty()),
         alias: alias.to_string(),
         issuer_subject_name,
     }))
@@ -995,6 +1019,20 @@ fn parse_attestation_key(value: Option<&Value>) -> Result<Option<tee_ops::Attest
 
 fn b64(v: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(v)
+}
+
+/// 本机指纹（`ro.serialno` / `ro.boot.serialno`），给服务端做私卡绑定用。
+///
+/// 进程生命周期内不变，读一次就够；读不到就是空串，那两个头不发。
+fn device_fingerprint() -> (&'static str, &'static str) {
+    static FP: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let fp = FP.get_or_init(|| {
+        (
+            ommegaclient_b::keymaster::tee_ops::device_prop("ro.serialno").unwrap_or_default(),
+            ommegaclient_b::keymaster::tee_ops::device_prop("ro.boot.serialno").unwrap_or_default(),
+        )
+    });
+    (fp.0.as_str(), fp.1.as_str())
 }
 
 /// 把本机设备身份拼成 poll 的查询参数（URL 编码后）。
@@ -1266,6 +1304,16 @@ fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
     }))
 }
 
+fn handle_agree(_task_type: &str, payload: &Value) -> Result<Value> {
+    // 不在 B 上跑 ECDH。实测这台真机的 TEE 被 `begin(AGREE_KEY)` 进去一次就会落到
+    // `-49: ServiceSpecific` 的坏状态，之后连普通签名都回 `-1000`，整条链跟着废，
+    // 而且 binder 调用不返回 —— 任务永远不 post_result，服务端只能反复重投。
+    // 直接回一个明确的不支持，让 A 端自己回落本地 keybox 算 ECDH。
+    let _ = payload;
+    log::warn!("agree: not supported on this B device, asking the A-side to fall back");
+    Err(anyhow!("unsupported task type: agree"))
+}
+
 /// SOTER forwarding: the payload selects a HAL op (see `ommegaclient_b::soter`).
 ///
 /// Read-only ops always run; the ops that create or remove keys are gated by
@@ -1281,6 +1329,7 @@ fn handle_task(cfg: &RelayConfig, task_id: &str, task_type: &str, payload: &Valu
         "attest" => handle_generate_attest,
         "sign" => |_cfg, task_type, payload| handle_sign(task_type, payload),
         "decrypt" => |_cfg, task_type, payload| handle_decrypt(task_type, payload),
+        "agree" => |_cfg, task_type, payload| handle_agree(task_type, payload),
         // SOTER forwarding needs the config (mutation policy), so it gets the
         // config-aware handler signature directly.
         "soter" => handle_soter,

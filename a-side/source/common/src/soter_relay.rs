@@ -94,14 +94,11 @@ pub fn answers_with_session(op: &str) -> bool {
 // - `/data/misc/keystore/ommega/`：daemon 自己写的那份（它跑在 keystore uid 里，
 //   只有这个目录写得动），keystore 域里的 payload 读得到。
 
-/// 副本文件按顺序找，先读到的算。
-pub const CPU_ID_PATHS: [&str; 2] = [
-    "/data/misc/ommega/soter_cpu_id",
-    "/data/misc/keystore/ommega/soter_cpu_id",
-];
+/// 副本文件按顺序找，先读到的算（现在只有一个位置）。
+pub const CPU_ID_PATHS: [&str; 1] = ["/data/misc/ommega/soter_cpu_id"];
 
-/// daemon 写的那一份（它自己那个域；app 域那份由启动器镜像过去）。
-pub const CPU_ID_WRITE_PATH: &str = "/data/misc/keystore/ommega/soter_cpu_id";
+/// daemon 写的那一份。数据根已统一到 /data/misc/ommega，不再往 keystore 目录写副本。
+pub const CPU_ID_WRITE_PATH: &str = "/data/misc/ommega/soter_cpu_id";
 
 /// 环境变量覆盖（测试、临时探针用）。
 pub const CPU_ID_ENV: &str = "OMMEGA_SOTER_CPU_ID";

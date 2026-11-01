@@ -434,13 +434,16 @@ impl Fulfill {
     /// Serialize check -> generate -> publish for the alias, not globally.
     /// A cancelled HTTP waiter cannot cancel its spawn_blocking worker: retries
     /// must wait for that worker and reuse its key instead of replacing it.
-    /// Do not reject differing request snapshots (e.g. StrongBox -> TEE retry):
-    /// failures are not cached; after success the alias's key/chain is immutable
-    /// for the existing seven-day session lifetime. Attestation callers must
-    /// validate the cached leaf algorithm before returning it.
+    ///
+    /// 但缓存**只在本级别内复用**。`want_level` 是这次请求的
+    /// `attestation_security_level`（1 = TEE、2 = StrongBox）：缓存的链级别和它
+    /// 对不上就丢掉重建。以前完全不看级别，同一个 alias 先出 TEE 再请求 StrongBox
+    /// 会直接复用那条 TEE 链 —— App 要 StrongBox 却拿到 TEE，级别就串了（实测
+    /// level=2 请求回来 `O=TEE`）。
     fn session_or_generate(
         &self,
         alias: &str,
+        want_level: i64,
         generate: impl FnOnce() -> anyhow::Result<Session>,
     ) -> anyhow::Result<(Session, bool)> {
         let gate = {
@@ -456,10 +459,26 @@ impl Fulfill {
         };
         let _guard = crate::util::mu(&gate);
         if let Some(session) = self.get_session(alias) {
-            return Ok((session, false));
+            if Self::session_level_matches(&session.chain_pem, want_level) {
+                return Ok((session, false));
+            }
+            tracing::info!(
+                "session_or_generate: alias={alias} 缓存的链级别与请求级别 {want_level} 不符，重建"
+            );
+            // 先丢掉旧的：put_session 的规则是「先发布的赢」，不删就写不进去。
+            self.forget_session(alias);
         }
         let session = self.put_session(alias, generate()?);
         Ok((session, true))
+    }
+
+    /// 缓存的链和这次请求的级别对得上吗。
+    ///
+    /// 没标级别（软件链 / 自签链 / 老 keybox）按 TEE 算：这也是 AOSP 的语义，
+    /// 软件级证书不可能被当成 StrongBox。
+    fn session_level_matches(chain_pem: &str, want_level: i64) -> bool {
+        let cached_strongbox = cert::chain_security_level(chain_pem) == Some(2);
+        cached_strongbox == (want_level >= 2)
     }
 
     /// Algorithm string implied by an A-side attest context ("ec" | "rsa"),
@@ -531,6 +550,18 @@ impl Fulfill {
             }
             _ => None,
         }
+    }
+
+    /// 兜底：不看请求的 device id，按级别挑一条能用的身份。
+    ///
+    /// 跟 `identity_for` 最后那一步的区别就是多了一道级别过滤 —— TEE 请求不能
+    /// 拿 StrongBox 的链，不然链上标的级别和请求对不上。
+    fn identity_any_for_level(&self, want_strongbox: bool) -> Option<DeviceIdentity> {
+        self.db
+            .as_ref()?
+            .get_any_usable_identity_for_level(want_strongbox)
+            .ok()
+            .flatten()
     }
 
     /// 按设备 id 找一份存下的身份：先不挑算法（一台设备的 EC / RSA 两条算法本来就
@@ -708,6 +739,27 @@ impl Fulfill {
                 })
                 .collect();
         }
+        // MODULE_HASH (KeyMint tag 724): the A-side forwards the APEX module-info
+        // digest it already receives through `SetAdditionalAttestationInfo`.
+        // Emitting it keeps the minted leaf consistent with
+        // `getSupplementaryAttestationInfo(MODULE_HASH)` on the device.
+        p.module_hash = ctx
+            .get("module_hash")
+            .and_then(Value::as_str)
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .filter(|hash| !hash.is_empty());
+        match p.module_hash.as_deref() {
+            Some(h) if h.len() >= 4 => tracing::info!(
+                "attest: module_hash {} bytes, prefix {:02x}{:02x}{:02x}{:02x}",
+                h.len(),
+                h[0],
+                h[1],
+                h[2],
+                h[3]
+            ),
+            Some(h) => tracing::info!("attest: module_hash {} bytes", h.len()),
+            None => tracing::info!("attest: no module_hash forwarded"),
+        }
         // User-authentication / authorization-list entries ([tag, value] pairs,
         // tags 502..=509) — the policy the app asked for. Dropping them is what
         // makes a server-minted leaf claim `NO_AUTH_REQUIRED` for an auth-bound
@@ -779,18 +831,30 @@ impl Fulfill {
             .unwrap_or(p.attestation_version);
 
         // verified_boot_key / verified_boot_hash 应当是 32 字节。A 端没带、或者带过来的
-        // 解不出 32 字节时，不要发全 0（看着像没锁，而且所有机器都是同一串 0），按
-        // 「设备 + 当前年月日时」派生一个：同一小时里稳定，换小时才换。精确到分换得太勤，
-        // 同一轮会话里前后两笔就对不上。
-        let stamp = boot_value_stamp();
+        // 解不出 32 字节时，用「设备 + 固定串」派生一个：**不能带时间戳**。
+        //
+        // 以前是按「设备 + 当前小时」派生，结果同一台设备换个小时出的链哈希就变了，
+        // 跟设备上任何固定属性都对不上（Duck 的 Boot consistency 直接拿证书里的
+        // verifiedBootHash 比 ro.boot.vbmeta.digest，必 mismatch）。现在同一设备永远
+        // 得到同一个值；正常路径是 A 端带上伪装参数解出来的哈希，直接用它。
+        let stamp = "fixed";
         let vb_key = match b64("verified_boot_key") {
             Some(k) if k.len() == 32 => k,
-            _ => boot_value_seed(device_id, "bootkey", &stamp).to_vec(),
+            _ => boot_value_seed(device_id, "bootkey", stamp).to_vec(),
         };
         let vb_hash = match b64("verified_boot_hash") {
             Some(h) if h.len() == 32 => h,
-            _ => boot_value_seed(device_id, "boothash", &stamp).to_vec(),
+            _ => boot_value_seed(device_id, "boothash", stamp).to_vec(),
         };
+        // 排障：A 端到底报了什么。Boot consistency 那类问题全看这一行。
+        // 只打哈希前 12 字节 + 锁定/状态，不拼字段名列表（那只是这次排障临时加的，
+        // 每笔 attest 都 collect 一遍 vec 不划算）。
+        tracing::info!(
+            "parse_ctx: device={device_id} A 上报 hash={} locked={:?} state={:?}",
+            hex_prefix(&vb_hash, 12),
+            ctx.get("device_locked"),
+            ctx.get("verified_boot_state"),
+        );
         p.root_of_trust = Some(RootOfTrust {
             verified_boot_key: vb_key,
             device_locked: ctx
@@ -872,11 +936,22 @@ impl Fulfill {
         challenge: &[u8],
     ) -> anyhow::Result<(String, String)> {
         let params = self.parse_ctx(ctx, challenge, &identity.device_id);
+        // 一条链只能有一个级别标签。链里的 CA 是 TEE 就全 TEE，是 StrongBox 就全
+        // StrongBox；同时出现两种说明这份材料是拼的（比如 TEE 的中间 CA 配了
+        // StrongBox 的根），发出去就是一条自己矛盾的链。只留痕，不拦请求。
+        let tagged = cert::chain_security_levels(&identity.certificate_chain_pem);
+        if tagged.len() > 1 {
+            tracing::warn!(
+                "attest_and_cache: device={} alias={alias} 链上标了多个级别 {tagged:?}，这份身份是拼的",
+                identity.device_id
+            );
+        }
         // 调用方带了证明密钥（App AttestKey 委派）：若那把 key 就在本服务端
         // （serverbox 模式下的 session），就用它自己签发子证书；不在本端则交给
         // 下一层（真机 B），**不**改用身份自带的签发密钥冒充。
         let issuer = self.server_issuer(ctx)?;
-        let (session, generated) = self.session_or_generate(alias, || {
+        let want_level = params.security_level;
+        let (session, generated) = self.session_or_generate(alias, want_level, || {
             let (chain_pem, leaf_key_pem) = match &issuer {
                 Some((issuer_key_pem, issuer_chain_pem)) => cert::build_attested_chain_with_issuer(
                     identity,
@@ -1080,27 +1155,77 @@ impl Fulfill {
             .and_then(Value::as_i64)
             .unwrap_or(1);
         let pinned = crate::identity_policy::device_for_level(level);
-        let lookup_id = match pinned.as_deref() {
-            Some(id) => {
-                tracing::info!(
-                    "server_keybox: level={level} 按控制台指定用身份 {id}（请求 device={device_id}）"
+        let identity = if level >= 2 {
+            // StrongBox 只认控制台钉死的那份。没钉、或钉的那份不在库里，就报错——
+            // 不能退到 `identity_for` 的「随便一份能用身份」：那个池子里放的是源采集和
+            // 真机 TEE 的材料，链上标的是 TEE / 软件，拿到 level=2 的请求上就是级别串了。
+            let Some(id) = pinned.as_deref() else {
+                tracing::warn!(
+                    "server_keybox: level=2 请求没有钉死 StrongBox 身份，拒绝出链（请求 device={device_id}）"
                 );
-                id
-            }
-            None => device_id,
-        };
-        let identity = match self.identity_for(
-            lookup_id,
-            &algorithm,
-            prefer_slot && pinned.is_none(),
-        ) {
-            Some(id) => id,
-            None => {
                 return Some(json!({
-                    "error": format!(
-                        "server_keybox: no stored server identity for device {lookup_id} (algorithm {algorithm})"
-                    )
+                    "error": "server_keybox: strongbox identity is not pinned in the console",
+                    "relay_error_kind": "strongbox_identity_unpinned",
                 }));
+            };
+            tracing::info!(
+                "server_keybox: level=2 按控制台指定用 StrongBox 身份 {id}（请求 device={device_id}）"
+            );
+            match self.identity_for_id(id, &algorithm) {
+                Some(identity) => identity,
+                None => {
+                    return Some(json!({
+                        "error": format!(
+                            "server_keybox: no stored strongbox identity for {id} (algorithm {algorithm})"
+                        ),
+                        "relay_error_kind": "strongbox_identity_missing",
+                    }));
+                }
+            }
+        } else {
+            let lookup_id = match pinned.as_deref() {
+                Some(id) => {
+                    tracing::info!(
+                        "server_keybox: level={level} 按控制台指定用身份 {id}（请求 device={device_id}）"
+                    );
+                    id
+                }
+                None => device_id,
+            };
+            let found = self.identity_for(lookup_id, &algorithm, prefer_slot && pinned.is_none());
+            // 兜底那一步（`get_any_usable_identity`）以前不看级别：库里同时有 TEE 和
+            // StrongBox 两份时，TEE 请求会拿到 StrongBox 的链，级别就串了。这里拦一道：
+            // 拿到的是 StrongBox 就不用它，换一份同级别（无标 / TEE）的；换不到就报错。
+            let wrong_level = found
+                .as_ref()
+                .map(|i| cert::chain_security_level(&i.certificate_chain_pem) == Some(2))
+                .unwrap_or(false);
+            if wrong_level {
+                tracing::warn!(
+                    "server_keybox: level={level} 挑中的身份是 StrongBox 级别，改挑一份 TEE 的（请求 device={device_id}）"
+                );
+                match self.identity_any_for_level(false) {
+                    Some(alt) => alt,
+                    None => {
+                        return Some(json!({
+                            "error": format!(
+                                "server_keybox: level={level} 需要 TEE 身份，但库里没有同级别的（请求 device={lookup_id}）"
+                            ),
+                            "relay_error_kind": "tee_identity_missing",
+                        }));
+                    }
+                }
+            } else {
+                match found {
+                    Some(identity) => identity,
+                    None => {
+                        return Some(json!({
+                            "error": format!(
+                                "server_keybox: no stored server identity for device {lookup_id} (algorithm {algorithm})"
+                            )
+                        }));
+                    }
+                }
             }
         };
         self.attest_from_identity(body, &identity, "server_keybox")
@@ -1249,6 +1374,44 @@ impl Fulfill {
         }))
     }
 
+    /// ECDH against the session's leaf key. `data` is the peer public key in
+    /// X.509 SubjectPublicKeyInfo DER; the result is the raw shared secret (the
+    /// x coordinate), matching what KeyMint returns from finish(AGREE_KEY).
+    pub fn try_handle_agree(&self, _device_id: &str, body: &Value) -> Option<Value> {
+        let alias = body
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // 没 session 就是本层不管，交给下一层。
+        let s = self.get_session(&alias)?;
+        let Some(data) = body
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        else {
+            return Some(json!({ "error": "server_keybox agree: missing or bad base64 data" }));
+        };
+        let key = match s.leaf_key() {
+            Ok(key) => key,
+            Err(e) => {
+                return Some(json!({
+                    "error": format!("server_keybox agree: unusable leaf key: {e}")
+                }))
+            }
+        };
+        match ecdh_shared_secret(&key, &data) {
+            Ok(secret) => Some(json!({
+                "secret": base64::engine::general_purpose::STANDARD.encode(secret),
+                "source": "server_keybox",
+            })),
+            Err(e) => {
+                tracing::warn!("try_handle_agree: alias={alias} failed: {e:#}");
+                Some(json!({ "error": format!("server_keybox agree failed: {e:#}") }))
+            }
+        }
+    }
+
     pub fn try_handle_b_upload_keybox_identity(
         &self,
         device_id: &str,
@@ -1360,6 +1523,27 @@ impl std::fmt::Debug for LeafKey {
             LeafKey::Ec(_) => f.write_str("LeafKey::Ec(..)"),
             LeafKey::Rsa(_) => f.write_str("LeafKey::Rsa(..)"),
         }
+    }
+}
+
+fn ecdh_shared_secret(key: &LeafKey, peer_spki: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match key {
+        LeafKey::Ec(cert::EcKey::P256(sk)) => {
+            use p256::pkcs8::DecodePublicKey;
+            let peer = p256::PublicKey::from_public_key_der(peer_spki)
+                .map_err(|e| anyhow::anyhow!("bad P-256 peer key: {e}"))?;
+            let shared = p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), peer.as_affine());
+            Ok(shared.raw_secret_bytes().to_vec())
+        }
+        LeafKey::Ec(cert::EcKey::P384(sk)) => {
+            use p384::pkcs8::DecodePublicKey;
+            let peer = p384::PublicKey::from_public_key_der(peer_spki)
+                .map_err(|e| anyhow::anyhow!("bad P-384 peer key: {e}"))?;
+            let shared = p384::ecdh::diffie_hellman(sk.to_nonzero_scalar(), peer.as_affine());
+            Ok(shared.raw_secret_bytes().to_vec())
+        }
+        LeafKey::Ec(_) => anyhow::bail!("ECDH is only wired for P-256/P-384 identities"),
+        LeafKey::Rsa(_) => anyhow::bail!("ECDH needs an EC key, this identity is RSA"),
     }
 }
 
@@ -1478,7 +1662,10 @@ fn sign_rsa_pkcs1(
         LeafDigest::Sha384 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha384>(), hashed),
         LeafDigest::Sha512 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha512>(), hashed),
         // PKCS#1 v1.5 的 DigestInfo 必须标一个摘要；真机也不会用 NONE 走这条。
-        LeafDigest::None => rk.sign(Pkcs1v15Sign::new::<Sha256>(), hashed),
+        // DIGEST=NONE 的 PKCS#1 签名是「type-1 填充 + 裸模幂」，不能套任何 DigestInfo。
+        // 之前这里用 `new::<Sha256>()`，签出来的是「SHA-256 DigestInfo || data」，
+        // Java 的 NONEwithRSA 验签自然过不了（aprobe C03）。
+        LeafDigest::None => rk.sign(Pkcs1v15Sign::new_unprefixed(), hashed),
     }?;
     Ok(sig)
 }
@@ -1512,10 +1699,14 @@ fn decrypt_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<V
     }
     if up.contains("NOPADDING") {
         // 原始 RSA：m = c^d mod n，按模长补零输出。
+        // c 必须严格小于 n，否则是非法代表（A 端已经预拦，这里再兵一道）。
         use rsa::traits::{PrivateKeyParts, PublicKeyParts};
         let n = rk.n();
         let d = rk.d();
         let c = rsa::BigUint::from_bytes_be(data);
+        if &c >= n {
+            anyhow::bail!("ciphertext representative out of range");
+        }
         let m = c.modpow(d, n);
         let mut out = vec![0u8; rk.size()];
         let bytes = m.to_bytes_be();
@@ -1585,17 +1776,20 @@ fn decrypt_oaep(
     }
 }
 
-/// 「年月日时」时间戳，给合成的 boot 值当种子用。
-///
-/// 到小时为止：分/秒级会让同一轮会话里前后两笔的 boot key 不一样，看着更像假的。
-fn boot_value_stamp() -> String {
-    chrono::Utc::now().format("%Y%m%d%H").to_string()
+/// 把前 `n` 字节打成 hex，排障日志用。
+fn hex_prefix(bytes: &[u8], n: usize) -> String {
+    bytes
+        .iter()
+        .take(n)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
-/// 按 (用途, 设备, 时间戳) 派生一个 32 字节值。
+/// 按 (用途, 设备, 固定串) 派生一个 32 字节值。
 ///
-/// 同一台设备、同一个小时内结果相同；换小时或换设备都会变。`kind` 把 boot key 和
-/// boot hash 分开，避免两者变成同一串。
+/// 同一台设备永远得到同一个值（以前带小时时间戳，导致隔小时出的链哈希就变了，
+/// 跟设备上任何固定属性都对不上）。`kind` 把 boot key 和 boot hash 分开，
+/// 避免两者变成同一串。
 fn boot_value_seed(device_id: &str, kind: &str, stamp: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1654,7 +1848,7 @@ mod tests {
             let worker_calls = &calls;
             let late = scope.spawn(move || {
                 worker_f
-                    .session_or_generate("same", || {
+                    .session_or_generate("same", 1, || {
                         worker_calls.fetch_add(1, Ordering::SeqCst);
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
@@ -1665,7 +1859,7 @@ mod tests {
             });
             entered_rx.recv().unwrap();
             let retry = scope.spawn(|| {
-                f.session_or_generate("same", || {
+                f.session_or_generate("same", 1, || {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(session("replacement"))
                 })
@@ -1674,7 +1868,7 @@ mod tests {
             });
             scope.spawn(|| {
                 let s = f
-                    .session_or_generate("other", || Ok(session("independent")))
+                    .session_or_generate("other", 1, || Ok(session("independent")))
                     .unwrap()
                     .0;
                 other_tx.send(s).unwrap();
@@ -1699,14 +1893,14 @@ mod tests {
     fn failed_snapshot_allows_demotion_but_success_cannot_be_replaced() {
         let f = fulfill();
         assert!(f
-            .session_or_generate("alias", || anyhow::bail!("StrongBox failed"))
+            .session_or_generate("alias", 1, || anyhow::bail!("StrongBox failed"))
             .is_err());
         let (tee, generated) = f
-            .session_or_generate("alias", || Ok(session("TEE")))
+            .session_or_generate("alias", 1, || Ok(session("TEE")))
             .unwrap();
         assert!(generated);
         let (retry, generated) = f
-            .session_or_generate("alias", || panic!("must reuse success"))
+            .session_or_generate("alias", 1, || panic!("must reuse success"))
             .unwrap();
         assert!(!generated);
         assert_eq!(retry.chain_pem, tee.chain_pem);
@@ -1791,7 +1985,7 @@ mod tests {
             .sessions
             .insert("alias".into(), old.clone());
         let (reused, generated) = f
-            .session_or_generate("alias", || panic!("loaded session must be reused"))
+            .session_or_generate("alias", 1, || panic!("loaded session must be reused"))
             .unwrap();
         assert!(!generated);
         assert_eq!(reused.created_epoch_ms, old.created_epoch_ms);
@@ -1807,12 +2001,7 @@ mod tests {
             created_at: String::new(),
         };
         let (chain, fingerprint) = f
-            .attest_and_cache(
-                &identity,
-                "alias",
-                &json!({"attestation_security_level": 2}),
-                b"different",
-            )
+            .attest_and_cache(&identity, "alias", &json!({}), b"different")
             .unwrap();
         assert_eq!(chain, old.chain_pem);
         assert_eq!(
@@ -1827,10 +2016,43 @@ mod tests {
             .used_epoch_ms =
             Utc::now().timestamp_millis() as u64 - SESSION_TTL.as_millis() as u64 - 1;
         let (fresh, generated) = f
-            .session_or_generate("alias", || Ok(session("fresh")))
+            .session_or_generate("alias", 1, || Ok(session("fresh")))
             .unwrap();
         assert!(generated);
         assert_eq!(fresh.leaf_key_pem, "fresh");
+    }
+
+    /// 同一个 alias 换了安全级别就不能再复用：以前不看级别，App 要 StrongBox
+    /// 却拿到缓存的 TEE 链（实测 level=2 请求回来 `O=TEE`），级别就串了。
+    #[test]
+    fn cached_session_is_rebuilt_when_the_level_changes() {
+        let f = fulfill();
+        // 用真实链：自签链没标级别，按 TEE 算（跟 AOSP 语义一致）。
+        let material = cert::generate_self_signed("ec").unwrap();
+        let tee_chain = material.certificate_chain_pem.clone();
+        let mut tee = session(&material.private_key_pem);
+        tee.chain_pem = tee_chain.clone();
+        crate::util::mu(&f.inner)
+            .sessions
+            .insert("level-alias".into(), tee.clone());
+
+        // 同级别：复用，不重新生成。
+        let (again, generated) = f
+            .session_or_generate("level-alias", 1, || panic!("same level must reuse"))
+            .unwrap();
+        assert!(!generated);
+        assert_eq!(again.leaf_key_pem, tee.leaf_key_pem);
+
+        // 换成 StrongBox：必须重建。
+        let (sb, generated) = f
+            .session_or_generate("level-alias", 2, || Ok(session("sb-new")))
+            .unwrap();
+        assert!(generated, "级别变了就不能再复用缓存");
+        assert_eq!(sb.leaf_key_pem, "sb-new");
+
+        // 级别判定本身：没标级别的链只能算 TEE。
+        assert!(Fulfill::session_level_matches(&tee_chain, 1));
+        assert!(!Fulfill::session_level_matches(&tee_chain, 2));
     }
 
     /// 热缓存里没有的会话得回库查出来，而且用一次就把「最后使用」顶到当下。

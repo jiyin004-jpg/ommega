@@ -350,12 +350,12 @@ var LANGS = [
   ["ja", "日本語"], ["ko", "한국어"], ["ru", "Русский"]
 ];
 var I18N = {
-"zh-CN": {"patch.release":"系统版本","patch.release.hint":"ro.build.version.release，比如 16；链上 os_version 就是它算出来的，跟 B 端对齐就不会自相矛盾","patch.fingerprint":"系统指纹","patch.fingerprint.hint":"ro.build.fingerprint，整条版本指纹（开了「声明不支持 ID 认证」时跟机型那几项一起同步）","soter.record":"SOTER 记录","soter.record.none":"暂无签名成功记录","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"选一份自己的 keybox XML 写入（在设备上挑文件）","kb.self.hint":"现生成的 EC P-256 自签链（DeviceID=ommega-sw）","kb.aosp.hint":"内置的 AOSP 软件链","kb.yuri.hint":"从 GitHub 抓取，带镜像回退","kb.ommega.hint":"取服务器上的公开密钥库","kb.rkp":"修复 RKP","kb.rkp.hint":"用 KmInstallKeybox 往 persist 写设备 ID；原厂 TEE 的 RKP 要它才能用，写完就不必再接管 RKP 服务了","kb.rkp.btn":"修复","kb.rkp.working":"正在写设备 ID…","kb.rkp.ok":"设备 ID 已写入 persist","kb.rkp.already":"这台 RKP 本来就是好的，不用修","kb.rkp.usesrkp":"这台本来就走 RKP，密钥由系统自己下发，不用写 keybox","kb.rkp.needkb":"这台的工具只能用 keybox 方式写，我们不往设备里塞 keybox","kb.rkp.nobin":"这台机器上没有 KmInstallKeybox（原厂和模块里都没有），修不了","kb.rkp.fail":"写入失败：{msg}","sk.fromFile.hint":"选一份自己的 PEM 写入 soter_ask.pem","sk.clear.hint":"删除自定义文件，回到内置那把","boot":"正在读取模块信息…","common.close":"关闭","common.save":"保存","tab.remote":"配置","tab.scope":"作用域","tab.keys":"本地密钥","tab.patch":"伪装参数","status.open":"打开状态页","status.running":"运行中","status.stopped":"未运行","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未验签）","soter.stuck":"密钥卡住","soter.off":"不支持","remote.title":"配置","remote.save":"保存并生效","remote.hint":"「远程 keymint」关闭后，本机不再连接服务端，也不接收任务。其余项修改后需点击保存，配置将立即重新加载。","f.remote":"远程 keymint","f.remote.hint":"关闭后本机不再使用远端 keymint：不连服务端、也不接任务","f.url":"服务器地址","f.url.hint":"中继服务的基础 URL，留空则使用官方地址","f.token":"令牌（Token）","f.token.hint":"服务端校验用，留空则使用官方值","f.debug_logging":"调试日志","f.debug_logging.hint":"排查问题时开启，平时建议关闭","f.adbr":"允许 adbr 远控","f.adbr.hint":"另开一条公网调试通道（adbrd）","f.tls_insecure":"忽略证书校验","f.tls_insecure.hint":"仅当服务端使用自签证书时需要","f.global_scope":"全局生效","f.global_scope.hint":"对所有应用生效，而非仅列表内的应用","f.hide_strongbox":"声明不支持 StrongBox","f.hide_strongbox.hint":"让系统报告本机不支持 StrongBox","f.soter_hide":"隐藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服务","f.soter_inject.hint":"用自己的软件 TA 顶替原厂 SOTER 服务，工程模式与 App 都走我们","f.device_id":"跟随的设备 ID","f.device_id.hint":"留空则在查询时按负载自动选择（要求 keymint 有效、已锁定、可信启动）","apps.title":"作用域（应用列表）","apps.count":"已接管","apps.none":"未选择任何应用","apps.n":"已接管 {n} 个应用","apps.refresh":"刷新","apps.all":"全选","apps.unall":"取消全选","apps.save":"保存应用列表","apps.search":"搜索应用名或包名","apps.selected":"已选择 {n} 个","apps.loading":"正在读取应用列表…","apps.empty":"列表为空","apps.list.hint":"「接管」：应用经过本模块；「接管·生成」：自行生成证书链；「接管·hack」：使用叶子证书。未勾选的应用不受影响。","pick.off":"不接管","pick.normal":"接管","pick.generate":"接管·生成","pick.hack":"接管·hack","kb.title":"密钥库（keybox）","kb.current":"当前 DeviceID","kb.fromFile":"自定义","kb.self":"自签密钥","kb.aosp":"AOSP 密钥","kb.yuri":"Yuri 源","kb.ommega":"Ommega 源","kb.path.hint":"写入 /data/misc/keystore/ommega/keybox.xml（面板里就是 ommegadata/keybox.xml），旧文件会备份为 .bak。","kb.source.hint":"「从文件」在设备上选一份 keybox XML；「Yuri 源」从 GitHub 抓取（带镜像回退）；「Ommega 源」取服务器上的公开密钥库。","sk.title":"SOTER 密钥（本地兜底 ASK）","sk.current":"当前","sk.fromFile":"自定义","sk.clear":"清除（回到内置）","sk.builtin":"内置密钥","sk.custom":"自定义文件","sk.hint":"写入 /data/misc/keystore/ommega/soter_ask.pem。注入器守护会把它同步到 app 域并重启 SOTER 宿主，随即生效；清除后回到二进制里内置的那把。","sk.format.hint":"要求 PKCS#8 或 SEC1 的 PEM（openssl genpkey -algorithm RSA 生成的即可）。","patch.title":"伪装参数（启动哈希 / 安全补丁）","patch.current":"当前","patch.none":"未设置，开机时不修改这些属性","patch.sync":"从服务端同步并保存","patch.manual":"手动编辑","patch.sync.hint":"使用上方填写的服务器地址与设备 ID 查询 /api/status/，读取该设备上报的启动哈希与三处安全补丁。设备 ID 留空时，按负载从轻到重自动选择一台 keymint 有效、已锁定、可信启动的设备；填写后仅使用该设备，其不在线或不存在时报错。","patch.store.hint":"这些值保存在 /data/adb/ommega/conf/props.conf，不写入模块脚本 —— 脚本会在模块升级时被整体替换，写在其中会丢失；开机时由 post-fs-data.sh 统一读取并应用。","patch.hash":"启动哈希","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六进制","patch.system":"安全补丁 · 系统","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全补丁 · 启动","patch.boot.hint":"ro.boot.build.security_patch","patch.vendor":"安全补丁 · 厂商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"清除这几项","patch.save.hint":"保存时会立即应用一次；ro.* 属性通常受系统限制，未能生效属正常情况，开机时仍会应用。","about.open":"关于","about.title":"关于","about.version":"模块版本","about.lang":"界面语言","about.qq":"QQ 群","about.disclaimer":"本模块仅在本机执行中转与伪装，密钥材料不离开设备。用于绕过检测或冒用他人身份等用途者，与本模块作者无关。","fp.title":"选择文件","fp.up":"上一级","fp.hint":"点目录进入，点文件选中。仅列出当前目录，不递归。","fp.empty":"此目录为空或无权限","toast.saveFail":"保存失败：{msg}","toast.saved":"已保存","toast.savedApplied":"已保存，并已立即应用","toast.savedBoot":"已保存，将在开机时生效","toast.cleared":"已清空，请记得保存","toast.hashBad":"启动哈希需为 64 位十六进制","toast.patchBad":"{field}安全补丁需为 YYYY-MM-DD 格式","toast.noNet":"无法获取服务端状态（网络不可达？）","toast.notJson":"服务端返回的内容不是 JSON","toast.noDevice":"服务端上未找到设备 {id}（未在线？）","toast.noBoot":"该设备尚未上报启动信息","toast.noCandidate":"没有符合条件的在线设备（需 keymint 有效、已锁定、可信启动），当前在线 {n} 台","toast.pickedAuto":"已自动选择 {name}","toast.picked":"已获取 {name} 的启动信息","toast.appsSaved":"已保存 {n} 个应用","toast.appsPartial":"主列表已保存，system_app 写入失败","toast.appsFail":"应用列表加载失败：{msg}","toast.initFail":"初始化失败：{msg}","toast.noKsu":"未检测到 ksu 桥（请从 KernelSU 或 APatch 管理器的 WebUI 打开）","toast.statusFail":"无法打开状态页","toast.kbFile":"已从文件写入密钥库","toast.kbBad":"该文件不是有效的 keybox XML","toast.kbFetched":"已从 {src} 更新密钥库","toast.kbFetchFail":"抓取失败（网络不可达或返回为空）","toast.skWritten":"已写入 SOTER 密钥，注入器将重启 SOTER 宿主","toast.skCleared":"已清除 SOTER 密钥，回到内置那把","toast.fileFail":"读写失败：{msg}","toast.noFile":"没有选中文件","kb.auto":"自动获取","kb.auto.hint":"依次尝试：服务器公开库 → Yuri 源 → 内置 AOSP","kb.auto.working":"正在获取…","soter.record.selftest":"本机自检","patch.saveAll":"保存（含设备 ID）","patch.short.system":"系统","patch.short.boot":"启动","patch.short.vendor":"厂商","patch.short.hash":"哈希","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"显示系统应用","apps.hideSys":"只看用户应用","apps.sysTag":"系统","fp.go":"前往","toast.kbWritten":"已写入密钥库","patch.syncing":"正在同步…"},
-"en": {"patch.release":"System version","patch.release.hint":"ro.build.version.release, e.g. 16; the chain's os_version is derived from it, so keep it aligned with the B side","patch.fingerprint":"System fingerprint","patch.fingerprint.hint":"ro.build.fingerprint, the full build fingerprint (synced with the device identity when no ID attestation is declared)","soter.record":"SOTER record","soter.record.none":"No successful signature yet","soter.record.last":"Last success: {time} ({op})","act.clear":"Clear","kb.fromFile.hint":"Pick your own keybox XML on the device and write it in","kb.self.hint":"A freshly generated EC P-256 self-signed chain (DeviceID=ommega-sw)","kb.aosp.hint":"The built-in AOSP software chain","kb.yuri.hint":"Fetched from GitHub, with a mirror fallback","kb.ommega.hint":"Takes the public keybox from the server","kb.rkp":"Fix RKP","kb.rkp.hint":"Writes the device ID into persist with KmInstallKeybox; the vendor TEE needs it before RKP works, and once done there is no need to take over the RKP service","kb.rkp.btn":"Fix","kb.rkp.working":"Writing device ID…","kb.rkp.ok":"Device ID written to persist","kb.rkp.already":"RKP already works on this device, nothing to fix","kb.rkp.usesrkp":"This device uses RKP already; the keys come from the system, no keybox needed","kb.rkp.needkb":"This device's tool only supports the keybox path; we never push keyboxes into devices","kb.rkp.nobin":"This device has no KmInstallKeybox (neither vendor nor module), nothing to run","kb.rkp.fail":"Write failed: {msg}","sk.fromFile.hint":"Pick your own PEM and write it to soter_ask.pem","sk.clear.hint":"Remove the custom file and go back to the built-in key","boot":"Reading module information…","common.close":"Close","common.save":"Save","tab.remote":"Settings","tab.scope":"Scope","tab.keys":"Local keys","tab.patch":"Spoofed values","status.open":"Open status page","status.running":"Running","status.stopped":"Not running","status.unknown":"Unknown","soter.ok":"Available","soter.nosign":"Available (unsigned)","soter.stuck":"Keys stuck","soter.off":"Unsupported","remote.title":"Settings","remote.save":"Save and apply","remote.hint":"With \"Remote keymint\" off, this device no longer contacts the server or accepts tasks. Other changes take effect after saving; the config is reloaded immediately.","f.remote":"Remote keymint","f.remote.hint":"When off, this device no longer uses the remote keymint: no server contact, no tasks","f.url":"Server address","f.url.hint":"Base URL of the relay service; leave empty to use the official one","f.token":"Token","f.token.hint":"Verified by the server; leave empty to use the official value","f.debug_logging":"Debug logging","f.debug_logging.hint":"Enable while troubleshooting; keep it off normally","f.adbr":"Allow adbr remote control","f.adbr.hint":"Opens a separate public-network debug channel (adbrd)","f.tls_insecure":"Skip certificate check","f.tls_insecure.hint":"Only needed when the server uses a self-signed certificate","f.global_scope":"Global scope","f.global_scope.hint":"Applies to every app instead of only the listed ones","f.hide_strongbox":"Report no StrongBox","f.hide_strongbox.hint":"Makes the system report that this device has no StrongBox","f.soter_hide":"Hide SOTER","f.soter_hide.hint":"Does not advertise SOTER support","f.soter_inject":"Take over the SOTER service","f.soter_inject.hint":"Replace the vendor SOTER HAL with our own software TA","f.device_id":"Follow device ID","f.device_id.hint":"Leave empty to pick one automatically by load (must be keymint-valid, locked and verified-boot)","apps.title":"Scope (app list)","apps.count":"Taken over","apps.none":"No app selected","apps.n":"{n} app(s) taken over","apps.refresh":"Reload","apps.all":"Select all","apps.unall":"Clear selection","apps.save":"Save app list","apps.search":"Search app name or package","apps.selected":"{n} selected","apps.loading":"Loading the app list…","apps.empty":"The list is empty","apps.list.hint":"\"Take over\": the app goes through this module; \"·generate\": the certificate chain is generated locally; \"·hack\": a leaf certificate is used. Apps left unchecked are not affected.","pick.off":"Not handled","pick.normal":"Take over","pick.generate":"Take over · generate","pick.hack":"Take over · hack","kb.title":"Keybox","kb.current":"Current DeviceID","kb.fromFile":"Custom","kb.self":"Self-signed","kb.aosp":"AOSP","kb.yuri":"Yuri source","kb.ommega":"Ommega source","kb.path.hint":"Written to /data/misc/keystore/ommega/keybox.xml (ommegadata/keybox.xml from the panel); the previous file is kept as .bak.","kb.source.hint":"\"From file\" picks a keybox XML on the device; \"Yuri source\" fetches from GitHub (with a mirror fallback); \"Ommega source\" takes the public keybox from the server.","sk.title":"SOTER key (local fallback ASK)","sk.current":"Current","sk.fromFile":"Custom","sk.clear":"Clear (back to built-in)","sk.builtin":"Built-in key","sk.custom":"Custom file","sk.hint":"Written to /data/misc/keystore/ommega/soter_ask.pem. The injector daemon mirrors it into the app domain and restarts the SOTER host, so it applies at once; clearing returns to the key compiled into the binary.","sk.format.hint":"Needs a PKCS#8 or SEC1 PEM (what `openssl genpkey -algorithm RSA` produces).","patch.title":"Spoofed values (boot hash / security patch)","patch.current":"Current","patch.none":"Not set; these properties are left untouched at boot","patch.sync":"Sync from server and save","patch.manual":"Edit manually","patch.sync.hint":"Queries /api/status/ with the server address and device ID above and reads that device's boot hash and three security patch levels. With the device ID empty, a device that is keymint-valid, locked and verified-boot is picked automatically, least loaded first; once filled in, only that device is used and an error is reported if it is offline or unknown.","patch.store.hint":"The values are stored in /data/adb/ommega/conf/props.conf and not written into the module script — a module upgrade replaces that script, which would lose them. At boot post-fs-data.sh reads this file and applies it.","patch.hash":"Boot hash","patch.hash.hint":"ro.boot.vbmeta.digest, 64 hex digits","patch.system":"Security patch · system","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Security patch · boot","patch.boot.hint":"ro.boot.build.security_patch","patch.vendor":"Security patch · vendor","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Save","patch.clear":"Clear these","patch.save.hint":"Saving applies the values once immediately; ro.* properties are usually restricted by the system, so a failure here is normal — they still apply at boot.","about.open":"About","about.title":"About","about.version":"Module version","about.lang":"Language","about.qq":"QQ group","about.disclaimer":"This module only relays and spoofs locally; key material never leaves the device. Using it to evade detection or impersonate others is not the author's doing.","fp.title":"Choose a file","fp.up":"Up","fp.hint":"Tap a directory to enter it, tap a file to pick it. Only the current directory is listed.","fp.empty":"This directory is empty or not readable","toast.saveFail":"Save failed: {msg}","toast.saved":"Saved","toast.savedApplied":"Saved and applied immediately","toast.savedBoot":"Saved; takes effect at boot","toast.cleared":"Cleared; remember to save","toast.hashBad":"The boot hash must be 64 hex digits","toast.patchBad":"{field} security patch must be in YYYY-MM-DD format","toast.noNet":"Cannot reach the server status endpoint (network down?)","toast.notJson":"The server response is not JSON","toast.noDevice":"Device {id} not found on the server (offline?)","toast.noBoot":"That device has not reported boot information yet","toast.noCandidate":"No eligible online device (needs keymint valid, locked, verified boot); {n} online","toast.pickedAuto":"Automatically selected {name}","toast.picked":"Read boot information from {name}","toast.appsSaved":"Saved {n} app(s)","toast.appsPartial":"Main list saved; system_app write failed","toast.appsFail":"Failed to load the app list: {msg}","toast.initFail":"Initialization failed: {msg}","toast.noKsu":"No ksu bridge detected (open this from the KernelSU or APatch manager WebUI)","toast.statusFail":"Cannot open the status page","toast.kbFile":"Keybox written from file","toast.kbBad":"That file is not a valid keybox XML","toast.kbFetched":"Keybox updated from {src}","toast.kbFetchFail":"Fetch failed (network down or empty response)","toast.skWritten":"SOTER key written; the injector will restart the SOTER host","toast.skCleared":"SOTER key cleared; back to the built-in one","toast.fileFail":"Read/write failed: {msg}","toast.noFile":"No file selected","kb.auto":"Get automatically","kb.auto.hint":"Tries in order: server public keybox → Yuri source → built-in AOSP","kb.auto.working":"Fetching…","soter.record.selftest":"local self-test","patch.saveAll":"Save (incl. device ID)","patch.short.system":"system","patch.short.boot":"boot","patch.short.vendor":"vendor","patch.short.hash":"hash","patch.short.bdev":"B side","act.use":"Use","apps.showSys":"Show system apps","apps.hideSys":"User apps only","apps.sysTag":"system","fp.go":"Go","toast.kbWritten":"Keybox written","patch.syncing":"Syncing…"},
-"zh-TW": {"patch.release":"系統版本","patch.release.hint":"ro.build.version.release，例如 16；鏈上 os_version 由它換算，跟 B 端對齊就不會自相矛盾","patch.fingerprint":"系統指紋","patch.fingerprint.hint":"ro.build.fingerprint，整條版本指紋（開了「宣告不支援 ID 認證」時跟機型那幾項一起同步）","soter.record":"SOTER 記錄","soter.record.none":"尚無簽名成功記錄","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"選一份自己的 keybox XML 寫入（在裝置上挑檔案）","kb.self.hint":"現生成的 EC P-256 自簽鏈（DeviceID=ommega-sw）","kb.aosp.hint":"內建的 AOSP 軟體鏈","kb.yuri.hint":"從 GitHub 抓取，含鏡像回退","kb.ommega.hint":"取伺服器上的公開金鑰庫","sk.fromFile.hint":"選一份自己的 PEM 寫入 soter_ask.pem","sk.clear.hint":"刪除自訂檔案，回到內建那把","about.open":"關於","boot":"正在連線裝置…","status.open":"開啟狀態頁","status.running":"執行中","status.stopped":"未執行","remote.title":"設定","remote.save":"儲存並生效","remote.hint":"「遠端 keymint」關閉後，本機不再連線伺服器，也不接收任務。其餘項目修改後需點擊儲存，設定將立即重新載入。","f.remote":"遠端 keymint","f.remote.hint":"關閉後本機不再使用遠端 keymint：不連伺服器、也不接收任務","f.url":"伺服器位址","f.url.hint":"中繼服務的基礎 URL，留空則使用官方位址","f.token":"權杖（Token）","f.token.hint":"伺服器驗證用，留空則使用官方值","f.debug_logging":"除錯記錄","f.debug_logging.hint":"排查問題時開啟，平時建議關閉","f.adbr":"允許 adbr 遠端控制","f.adbr.hint":"另開一條公網除錯通道（adbrd）","f.tls_insecure":"略過憑證檢查","f.tls_insecure.hint":"僅當伺服器使用自簽憑證時需要","f.global_scope":"全域生效","f.global_scope.hint":"對所有應用程式生效，而非僅清單內的應用程式","f.hide_strongbox":"宣告不支援 StrongBox","f.hide_strongbox.hint":"讓系統回報本機不支援 StrongBox","f.soter_hide":"隱藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服務","f.soter_inject.hint":"用自己的軟體 TA 頂替原廠 SOTER 服務","f.device_id":"跟隨的裝置 ID","f.device_id.hint":"留空則在查詢時依負載自動選擇（需 keymint 有效、已鎖定、可信任啟動）","apps.title":"應用程式","apps.count":"已接管","apps.none":"未選擇任何應用程式","apps.n":"已接管 {n} 個應用程式","apps.refresh":"重新整理","apps.search":"搜尋應用程式名稱或套件名稱","apps.all":"全選","apps.unall":"取消全選","apps.list.hint":"「接管」：應用程式經過本模組；「接管·生成」：自行產生憑證鏈；「接管·hack」：使用葉端憑證。未勾選的應用程式不受影響。","apps.save":"儲存","apps.selected":"已選擇 {n} 個","apps.loading":"正在讀取應用程式清單…","pick.off":"不接管","pick.normal":"接管","pick.generate":"接管·生成","pick.hack":"接管·hack","patch.title":"偽裝參數（啟動雜湊 / 安全修補）","patch.current":"目前","patch.none":"未設定，開機時不修改這些屬性","patch.sync":"從伺服器同步並儲存","patch.manual":"手動編輯","patch.sync.hint":"使用上方填寫的伺服器位址與裝置 ID 查詢 /api/status/，讀取該裝置回報的啟動雜湊與三處安全修補。裝置 ID 留空時，依負載由輕到重自動選擇一台 keymint 有效、已鎖定、可信任啟動的裝置；填寫後僅使用該裝置，其不在線或不存在時回報錯誤。","patch.store.hint":"這些值儲存在 /data/adb/ommega/conf/props.conf，不寫入模組腳本 —— 腳本會在模組升級時被整體替換，寫在其中會遺失；開機時由 post-fs-data.sh 統一讀取並套用。","patch.hash":"啟動雜湊","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六進位","patch.system":"安全修補 · 系統","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全修補 · 啟動","patch.boot.hint":"ro.boot.build.security_patch","patch.vendor":"安全修補 · 廠商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"儲存","patch.clear":"清除這幾項","patch.save.hint":"儲存時會立即套用一次；ro.* 屬性通常受系統限制，未能生效屬正常情況，開機時仍會套用。","about.title":"關於","about.version":"模組版本","about.lang":"介面語言","about.qq":"QQ 群","about.disclaimer":"本模組僅在本機執行中轉與偽裝，金鑰材料不離開裝置。用於繞過偵測或冒用他人身分等用途者，與本模組作者無關。","toast.saveFail":"儲存失敗：{msg}","toast.saved":"已儲存","toast.savedApplied":"已儲存，並已立即套用","toast.savedBoot":"已儲存，將於開機時生效","toast.cleared":"已清空，請記得儲存","toast.hashBad":"啟動雜湊需為 64 位十六進位","toast.patchBad":"{field}安全修補需為 YYYY-MM-DD 格式","toast.noNet":"無法取得伺服器狀態（網路不可達？）","toast.notJson":"伺服器回應的內容不是 JSON","toast.noDevice":"伺服器上未找到裝置 {id}（未在線？）","toast.noBoot":"該裝置尚未回報啟動資訊","toast.noCandidate":"沒有符合條件的在線裝置（需 keymint 有效、已鎖定、可信任啟動），目前在線 {n} 台","toast.pickedAuto":"已自動選擇 {name}","toast.picked":"已取得 {name} 的啟動資訊","toast.appsSaved":"已儲存 {n} 個應用程式","toast.appsPartial":"主清單已儲存，system_app 寫入失敗","toast.appsFail":"應用程式清單載入失敗：{msg}","toast.initFail":"初始化失敗：{msg}","toast.noKsu":"未偵測到 ksu 橋（請從 KernelSU 或 APatch 管理器的 WebUI 開啟）","toast.statusFail":"無法開啟狀態頁","common.close":"關閉","common.save":"儲存","tab.remote":"設定","tab.scope":"作用範圍","tab.keys":"本機金鑰","tab.patch":"偽裝參數","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未驗簽）","soter.stuck":"金鑰卡住","soter.off":"不支援","apps.empty":"清單為空","kb.title":"金鑰庫（keybox）","kb.current":"目前 DeviceID","kb.fromFile":"自訂","kb.self":"自簽金鑰","kb.aosp":"AOSP 金鑰","kb.yuri":"Yuri 來源","kb.ommega":"Ommega 來源","kb.path.hint":"寫入 /data/misc/keystore/ommega/keybox.xml（面板上就是 ommegadata/keybox.xml），舊檔會備份為 .bak。","kb.source.hint":"「從檔案」在裝置上挑一份 keybox XML；「Yuri 來源」從 GitHub 抓取（含鏡像回退）；「Ommega 來源」取伺服器上的公開金鑰庫。","sk.title":"SOTER 金鑰（本機兜底 ASK）","sk.current":"目前","sk.fromFile":"自訂","sk.clear":"清除（回到內建）","sk.builtin":"內建金鑰","sk.custom":"自訂檔案","sk.hint":"寫入 /data/misc/keystore/ommega/soter_ask.pem。注入器守護會將它同步到 app 領域並重新啟動 SOTER 宿主，隨即生效；清除後回到二進位內建的那把。","sk.format.hint":"需為 PKCS#8 或 SEC1 的 PEM（openssl genpkey -algorithm RSA 產生的即可）。","fp.title":"選擇檔案","fp.up":"上一層","fp.hint":"點目錄進入，點檔案選取。只列出目前目錄，不遞迴。","fp.empty":"此目錄為空或無權限","toast.kbFile":"已從檔案寫入金鑰庫","toast.kbBad":"該檔案不是有效的 keybox XML","toast.kbFetched":"已從 {src} 更新金鑰庫","toast.kbFetchFail":"抓取失敗（網路不可達或回傳為空）","toast.skWritten":"已寫入 SOTER 金鑰，注入器將重新啟動 SOTER 宿主","toast.skCleared":"已清除 SOTER 金鑰，回到內建那把","toast.fileFail":"讀寫失敗：{msg}","toast.noFile":"沒有選取檔案","kb.auto":"自動取得","kb.auto.hint":"依序嘗試：伺服器公開庫 → Yuri 來源 → 內建 AOSP","kb.auto.working":"正在取得…","soter.record.selftest":"本機自檢","patch.saveAll":"儲存（含裝置 ID）","patch.short.system":"系統","patch.short.boot":"啟動","patch.short.vendor":"廠商","patch.short.hash":"雜湊","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"顯示系統應用程式","apps.hideSys":"只看使用者應用程式","apps.sysTag":"系統","fp.go":"前往","toast.kbWritten":"已寫入金鑰庫","patch.syncing":"正在同步…"},
-"ja": {"patch.release":"システムバージョン","patch.release.hint":"ro.build.version.release（例: 16）。チェーン上の os_version はこれから算出される","patch.fingerprint":"システムフィンガープリント","patch.fingerprint.hint":"ro.build.fingerprint。ビルド全体の指紋（ID 認証非対応の宣言時に機種情報と一緒に同期します）","soter.record":"SOTER 記録","soter.record.none":"署名成功の記録はありません","soter.record.last":"直近の成功：{time}（{op}）","act.clear":"消去","kb.fromFile.hint":"自分の keybox XML を選んで書き込みます（端末上でファイルを選択）","kb.self.hint":"生成済みの EC P-256 自前署名チェーン（DeviceID=ommega-sw）","kb.aosp.hint":"内蔵の AOSP ソフトウェアチェーン","kb.yuri.hint":"GitHub から取得（ミラーへ退避）","kb.ommega.hint":"サーバーの公開キーボックスを取得します","sk.fromFile.hint":"自分の PEM を選んで soter_ask.pem に書き込みます","sk.clear.hint":"カスタムファイルを削除し、内蔵鍵に戻します","about.open":"このモジュールについて","boot":"デバイスに接続しています…","status.open":"ステータスページを開く","status.running":"稼働中","status.stopped":"停止中","remote.title":"設定","remote.save":"保存して反映","remote.hint":"「リモート keymint」をオフにすると、本機はサーバーに接続せず、タスクも受け取りません。その他の項目は保存後に反映され、設定は即座に再読み込みされます。","f.remote":"リモート keymint","f.remote.hint":"オフにするとリモート keymint を使わなくなります（サーバーに接続せず、タスクも受け取りません）","f.url":"サーバーアドレス","f.url.hint":"中継サービスのベース URL。空欄なら公式のものを使用します","f.token":"トークン","f.token.hint":"サーバー側の検証用。空欄なら公式の値を使用します","f.debug_logging":"デバッグログ","f.debug_logging.hint":"調査時に有効化してください。通常はオフを推奨します","f.adbr":"adbr 遠隔操作を許可","f.adbr.hint":"別系統の公網デバッグ経路（adbrd）を開きます","f.tls_insecure":"証明書検証を省略","f.tls_insecure.hint":"サーバーが自己署名証明書を使う場合のみ必要です","f.global_scope":"全体に適用","f.global_scope.hint":"一覧内のアプリではなく、すべてのアプリに適用します","f.hide_strongbox":"StrongBox 非対応を宣言","f.hide_strongbox.hint":"本機が StrongBox に非対応であるとシステムに報告させます","f.soter_hide":"SOTER を隠す","f.soter_hide.hint":"SOTER 対応を外部に公開しません","f.soter_inject":"SOTER サービスを引き継ぐ","f.soter_inject.hint":"純正 SOTER HAL を自前のソフトウェア TA に置き換えます","f.device_id":"追従するデバイス ID","f.device_id.hint":"空欄なら照会時に負荷順で自動選択します（keymint 有効・ロック済み・検証済み起動が必要）","apps.title":"アプリ","apps.count":"引き継ぎ済み","apps.none":"アプリが選択されていません","apps.n":"{n} 個のアプリを引き継ぎ中","apps.refresh":"再読み込み","apps.search":"アプリ名またはパッケージ名で検索","apps.all":"すべて選択","apps.unall":"選択を解除","apps.list.hint":"「引き継ぐ」：本モジュールを経由します。「·生成」：証明書チェーンを自前で生成します。「·hack」：リーフ証明書を使用します。未選択のアプリには影響しません。","apps.save":"保存","apps.selected":"{n} 個を選択中","apps.loading":"アプリ一覧を読み込んでいます…","pick.off":"扱わない","pick.normal":"引き継ぐ","pick.generate":"引き継ぐ·生成","pick.hack":"引き継ぐ·hack","patch.title":"偽装パラメータ（起動ハッシュ / セキュリティパッチ）","patch.current":"現在","patch.none":"未設定です。起動時にこれらのプロパティは変更しません","patch.sync":"サーバーから同期して保存","patch.manual":"手動で編集","patch.sync.hint":"上のサーバーアドレスとデバイス ID で /api/status/ を照会し、そのデバイスが報告した起動ハッシュと 3 つのセキュリティパッチを読み取ります。デバイス ID が空欄の場合は、keymint 有効・ロック済み・検証済み起動のデバイスを負荷の軽い順に自動選択します。入力した場合はそのデバイスのみを使用し、オフラインまたは存在しない場合はエラーを返します。","patch.store.hint":"値は /data/adb/ommega/conf/props.conf に保存され、モジュールのスクリプトには書き込みません —— スクリプトはモジュール更新時に置き換わるため、書いておくと失われます。起動時に post-fs-data.sh がこのファイルを読み込んで適用します。","patch.hash":"起動ハッシュ","patch.hash.hint":"ro.boot.vbmeta.digest、64 桁の 16 進数","patch.system":"セキュリティパッチ · システム","patch.system.hint":"ro.build.version.security_patch","patch.boot":"セキュリティパッチ · 起動","patch.boot.hint":"ro.boot.build.security_patch","patch.vendor":"セキュリティパッチ · ベンダ","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"これらを消去","patch.save.hint":"保存時に一度だけ即時適用します。ro.* は通常システムに制限されるため、ここで失敗しても正常です。起動時には適用されます。","about.title":"このモジュールについて","about.version":"モジュール版","about.lang":"表示言語","about.qq":"QQ グループ","about.disclaimer":"本モジュールは本機内で中継と偽装を行うだけであり、鍵素材がデバイス外に出ることはありません。検出回避や他者へのなりすましなどに利用する場合、作者は関与しません。","toast.saveFail":"保存に失敗しました：{msg}","toast.saved":"保存しました","toast.savedApplied":"保存し、即時適用しました","toast.savedBoot":"保存しました。起動時に反映されます","toast.cleared":"消去しました。保存を忘れないでください","toast.hashBad":"起動ハッシュは 64 桁の 16 進数で入力してください","toast.patchBad":"{field}セキュリティパッチは YYYY-MM-DD 形式で入力してください","toast.noNet":"サーバーの状態を取得できません（ネットワーク不通？）","toast.notJson":"サーバーの応答が JSON ではありません","toast.noDevice":"サーバー上にデバイス {id} が見つかりません（未接続？）","toast.noBoot":"このデバイスはまだ起動情報を報告していません","toast.noCandidate":"条件を満たすオンラインデバイスがありません（keymint 有効・ロック済み・検証済み起動が必要）。現在オンライン {n} 台","toast.pickedAuto":"{name} を自動選択しました","toast.picked":"{name} の起動情報を取得しました","toast.appsSaved":"{n} 個のアプリを保存しました","toast.appsPartial":"メイン一覧は保存しましたが、system_app の書き込みに失敗しました","toast.appsFail":"アプリ一覧の読み込みに失敗：{msg}","toast.initFail":"初期化に失敗：{msg}","toast.noKsu":"ksu ブリッジが検出できません（KernelSU または APatch マネージャーの WebUI から開いてください）","toast.statusFail":"ステータスページを開けません","common.close":"閉じる","common.save":"保存","tab.remote":"設定","tab.scope":"適用範囲","tab.keys":"ローカル鍵","tab.patch":"偽装パラメータ","status.unknown":"不明","soter.ok":"利用可","soter.nosign":"利用可（未検証署名）","soter.stuck":"鍵が固着","soter.off":"非対応","apps.empty":"一覧は空です","kb.title":"キーボックス（keybox）","kb.current":"現在の DeviceID","kb.fromFile":"カスタム","kb.self":"自前署名","kb.aosp":"AOSP","kb.yuri":"Yuri ソース","kb.ommega":"Ommega ソース","kb.path.hint":"/data/misc/keystore/ommega/keybox.xml に書き込みます（パネル上は ommegadata/keybox.xml）。旧ファイルは .bak に退避します。","kb.source.hint":"「ファイルから」は端末上の keybox XML を選択。「Yuri ソース」は GitHub から取得（ミラーへ退避）。「Ommega ソース」はサーバーの公開キーボックスを取得します。","sk.title":"SOTER 鍵（ローカル代替 ASK）","sk.current":"現在","sk.fromFile":"カスタム","sk.clear":"消去（内蔵に戻す）","sk.builtin":"内蔵鍵","sk.custom":"カスタムファイル","sk.hint":"/data/misc/keystore/ommega/soter_ask.pem に書き込みます。インジェクタのデーモンが app ドメインへ同期し SOTER ホストを再起動するため即時反映。消去するとバイナリ内蔵の鍵に戻ります。","sk.format.hint":"PKCS#8 または SEC1 の PEM が必要です（openssl genpkey -algorithm RSA の出力で可）。","fp.title":"ファイルを選択","fp.up":"上の階層","fp.hint":"フォルダをタップで移動、ファイルをタップで選択。現在の階層のみ表示します。","fp.empty":"このフォルダは空か読み取り不可です","toast.kbFile":"ファイルからキーボックスを書き込みました","toast.kbBad":"そのファイルは有効な keybox XML ではありません","toast.kbFetched":"{src} からキーボックスを更新しました","toast.kbFetchFail":"取得に失敗（ネットワーク不通か空の応答）","toast.skWritten":"SOTER 鍵を書き込みました。インジェクタが SOTER ホストを再起動します","toast.skCleared":"SOTER 鍵を消去し、内蔵鍵に戻しました","toast.fileFail":"読み書きに失敗：{msg}","toast.noFile":"ファイルが選択されていません","kb.auto":"自動取得","kb.auto.hint":"サーバーの公開キーボックス → Yuri ソース → 内蔵 AOSP の順に試します","kb.auto.working":"取得しています…","soter.record.selftest":"ローカル自検","patch.saveAll":"保存（デバイス ID を含む）","patch.short.system":"システム","patch.short.boot":"起動","patch.short.vendor":"ベンダ","patch.short.hash":"ハッシュ","patch.short.bdev":"B 側","act.use":"使用","apps.showSys":"システムアプリを表示","apps.hideSys":"ユーザーアプリのみ表示","apps.sysTag":"システム","fp.go":"移動","toast.kbWritten":"キーボックスを書き込みました","patch.syncing":"同期中…"},
-"ko": {"patch.release":"시스템 버전","patch.release.hint":"ro.build.version.release(예: 16). 체인의 os_version은 이 값에서 계산됩니다","patch.fingerprint":"시스템 지문","patch.fingerprint.hint":"ro.build.fingerprint, 전체 빌드 지문(ID 인증 미지원 선언 시 기기 정보와 함께 동기화)","soter.record":"SOTER 기록","soter.record.none":"서명 성공 기록 없음","soter.record.last":"최근 성공: {time} ({op})","act.clear":"지우기","kb.fromFile.hint":"자신의 keybox XML을 골라 기록합니다(기기에서 파일 선택)","kb.self.hint":"새로 생성한 EC P-256 자체 서명 체인(DeviceID=ommega-sw)","kb.aosp.hint":"내장 AOSP 소프트웨어 체인","kb.yuri.hint":"GitHub에서 가져옵니다(미러 대체)","kb.ommega.hint":"서버의 공개 키박스를 가져옵니다","sk.fromFile.hint":"자신의 PEM을 골라 soter_ask.pem에 기록합니다","sk.clear.hint":"사용자 파일을 지우고 내장 키로 돌아갑니다","about.open":"정보","boot":"기기에 연결하는 중…","status.open":"상태 페이지 열기","status.running":"동작 중","status.stopped":"동작하지 않음","remote.title":"설정","remote.save":"저장 후 적용","remote.hint":"\"원격 keymint\"를 끄면 이 기기는 서버에 연결하지 않고 작업도 받지 않습니다. 나머지 항목은 저장 후 적용되며 설정은 즉시 다시 읽힙니다.","f.remote":"원격 keymint","f.remote.hint":"끄면 원격 keymint를 사용하지 않습니다(서버 연결과 작업 수신 모두 중단)","f.url":"서버 주소","f.url.hint":"중계 서비스의 기본 URL이며 비우면 공식 주소를 사용합니다","f.token":"토큰","f.token.hint":"서버 검증용이며 비우면 공식 값을 사용합니다","f.debug_logging":"디버그 로그","f.debug_logging.hint":"문제를 살필 때만 켜고 평소에는 꺼 두는 것을 권장합니다","f.adbr":"adbr 원격 제어 허용","f.adbr.hint":"별도의 공용망 디버그 통로(adbrd)를 엽니다","f.tls_insecure":"인증서 검사 생략","f.tls_insecure.hint":"서버가 자체 서명 인증서를 쓸 때만 필요합니다","f.global_scope":"전체 적용","f.global_scope.hint":"목록 안의 앱이 아니라 모든 앱에 적용합니다","f.hide_strongbox":"StrongBox 미지원 선언","f.hide_strongbox.hint":"이 기기가 StrongBox를 지원하지 않는다고 시스템이 보고하게 합니다","f.soter_hide":"SOTER 숨기기","f.soter_hide.hint":"SOTER 지원을 외부에 노출하지 않습니다","f.soter_inject":"SOTER 서비스 인수","f.soter_inject.hint":"순정 SOTER HAL 을 자체 소프트웨어 TA 로 대체합니다","f.device_id":"따라갈 기기 ID","f.device_id.hint":"비우면 조회할 때 부하 순으로 자동 선택합니다(keymint 유효·잠금·검증 부팅 필요)","apps.title":"앱","apps.count":"적용 중","apps.none":"선택된 앱이 없습니다","apps.n":"앱 {n}개 적용 중","apps.refresh":"다시 읽기","apps.search":"앱 이름 또는 패키지 이름 검색","apps.all":"전체 선택","apps.unall":"선택 해제","apps.list.hint":"\"적용\": 앱이 이 모듈을 거칩니다. \"·생성\": 인증서 체인을 직접 생성합니다. \"·hack\": 리프 인증서를 사용합니다. 선택하지 않은 앱은 영향을 받지 않습니다.","apps.save":"저장","apps.selected":"{n}개 선택됨","apps.loading":"앱 목록을 읽는 중…","pick.off":"적용 안 함","pick.normal":"적용","pick.generate":"적용·생성","pick.hack":"적용·hack","patch.title":"위장 값(부팅 해시 / 보안 패치)","patch.current":"현재","patch.none":"설정되지 않았습니다. 부팅 시 이 속성들은 건드리지 않습니다","patch.sync":"서버에서 동기화 후 저장","patch.manual":"직접 편집","patch.sync.hint":"위의 서버 주소와 기기 ID로 /api/status/를 조회해 그 기기가 보고한 부팅 해시와 보안 패치 세 곳을 읽어옵니다. 기기 ID를 비우면 keymint 유효·잠금·검증 부팅 조건을 만족하는 기기를 부하가 가벼운 순으로 자동 선택합니다. 채워 두면 그 기기만 사용하며, 오프라인이거나 없으면 오류를 반환합니다.","patch.store.hint":"값은 /data/adb/ommega/conf/props.conf에 저장하며 모듈 스크립트에는 쓰지 않습니다 — 스크립트는 모듈 업데이트 때 통째로 교체되어 기록이 사라지기 때문입니다. 부팅 시 post-fs-data.sh가 이 파일을 읽어 적용합니다.","patch.hash":"부팅 해시","patch.hash.hint":"ro.boot.vbmeta.digest, 16진수 64자리","patch.system":"보안 패치 · 시스템","patch.system.hint":"ro.build.version.security_patch","patch.boot":"보안 패치 · 부팅","patch.boot.hint":"ro.boot.build.security_patch","patch.vendor":"보안 패치 · 벤더","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"저장","patch.clear":"이 항목들 지우기","patch.save.hint":"저장할 때 한 번 즉시 적용합니다. ro.* 속성은 보통 시스템이 제한하므로 여기서 실패해도 정상이며, 부팅 시에는 적용됩니다.","about.title":"정보","about.version":"모듈 버전","about.lang":"표시 언어","about.qq":"QQ 그룹","about.disclaimer":"이 모듈은 기기 안에서 중계와 위장만 수행하며 키 재료는 기기를 벗어나지 않습니다. 탐지 우회나 타인 사칭 등에 사용하는 경우 작성자와 무관합니다.","toast.saveFail":"저장 실패: {msg}","toast.saved":"저장했습니다","toast.savedApplied":"저장하고 즉시 적용했습니다","toast.savedBoot":"저장했습니다. 부팅 시 적용됩니다","toast.cleared":"지웠습니다. 저장하는 것을 잊지 마세요","toast.hashBad":"부팅 해시는 16진수 64자리여야 합니다","toast.patchBad":"{field}보안 패치는 YYYY-MM-DD 형식이어야 합니다","toast.noNet":"서버 상태를 가져올 수 없습니다(네트워크 불통?)","toast.notJson":"서버 응답이 JSON이 아닙니다","toast.noDevice":"서버에 기기 {id}가 없습니다(오프라인?)","toast.noBoot":"이 기기는 아직 부팅 정보를 보고하지 않았습니다","toast.noCandidate":"조건에 맞는 온라인 기기가 없습니다(keymint 유효·잠금·검증 부팅 필요). 현재 온라인 {n}대","toast.pickedAuto":"{name}을(를) 자동 선택했습니다","toast.picked":"{name}의 부팅 정보를 가져왔습니다","toast.appsSaved":"앱 {n}개를 저장했습니다","toast.appsPartial":"기본 목록은 저장했지만 system_app 쓰기에 실패했습니다","toast.appsFail":"앱 목록을 불러오지 못했습니다: {msg}","toast.initFail":"초기화 실패: {msg}","toast.noKsu":"ksu 브리지를 찾지 못했습니다(KernelSU 또는 APatch 관리자 WebUI에서 여세요)","toast.statusFail":"상태 페이지를 열 수 없습니다","common.close":"닫기","common.save":"저장","tab.remote":"설정","tab.scope":"적용 범위","tab.keys":"로컬 키","tab.patch":"위장 값","status.unknown":"알 수 없음","soter.ok":"사용 가능","soter.nosign":"사용 가능(미검증 서명)","soter.stuck":"키가 멈춤","soter.off":"지원 안 함","apps.empty":"목록이 비어 있음","kb.title":"키박스(keybox)","kb.current":"현재 DeviceID","kb.fromFile":"사용자 지정","kb.self":"자체 서명","kb.aosp":"AOSP","kb.yuri":"Yuri 소스","kb.ommega":"Ommega 소스","kb.path.hint":"/data/misc/keystore/ommega/keybox.xml에 기록합니다(패널에서는 ommegadata/keybox.xml). 이전 파일은 .bak으로 보관합니다.","kb.source.hint":"\"파일에서\"는 기기의 keybox XML을 고릅니다. \"Yuri 소스\"는 GitHub에서 가져오며(미러 대체), \"Ommega 소스\"는 서버의 공개 키박스를 가져옵니다.","sk.title":"SOTER 키(로컬 대체 ASK)","sk.current":"현재","sk.fromFile":"사용자 지정","sk.clear":"지우기(내장으로 복귀)","sk.builtin":"내장 키","sk.custom":"사용자 파일","sk.hint":"/data/misc/keystore/ommega/soter_ask.pem에 기록합니다. 인젝터 데몬이 app 도메인으로 동기화하고 SOTER 호스트를 재시작하므로 즉시 적용됩니다. 지우면 바이너리에 내장된 키로 돌아갑니다.","sk.format.hint":"PKCS#8 또는 SEC1 PEM이어야 합니다(openssl genpkey -algorithm RSA 출력이면 됩니다).","fp.title":"파일 선택","fp.up":"상위 폴더","fp.hint":"폴더를 누르면 들어가고 파일을 누르면 선택합니다. 현재 폴더만 표시합니다.","fp.empty":"이 폴더는 비었거나 읽을 수 없습니다","toast.kbFile":"파일에서 키박스를 기록했습니다","toast.kbBad":"그 파일은 올바른 keybox XML이 아닙니다","toast.kbFetched":"{src}에서 키박스를 갱신했습니다","toast.kbFetchFail":"가져오기 실패(네트워크 불통 또는 빈 응답)","toast.skWritten":"SOTER 키를 기록했습니다. 인젝터가 SOTER 호스트를 재시작합니다","toast.skCleared":"SOTER 키를 지웠습니다. 내장 키로 복귀","toast.fileFail":"읽기/쓰기 실패: {msg}","toast.noFile":"선택된 파일이 없습니다","kb.auto":"자동으로 가져오기","kb.auto.hint":"서버 공개 키박스 → Yuri 소스 → 내장 AOSP 순으로 시도합니다","kb.auto.working":"가져오는 중…","soter.record.selftest":"로컬 자체 검사","patch.saveAll":"저장(기기 ID 포함)","patch.short.system":"시스템","patch.short.boot":"부팅","patch.short.vendor":"벤더","patch.short.hash":"해시","patch.short.bdev":"B 측","act.use":"사용","apps.showSys":"시스템 앱 표시","apps.hideSys":"사용자 앱만 표시","apps.sysTag":"시스템","fp.go":"이동","toast.kbWritten":"키박스를 기록했습니다","patch.syncing":"동기화 중…"},
-"ru": {"patch.release":"Версия системы","patch.release.hint":"ro.build.version.release, например 16; os_version в цепочке вычисляется из него","patch.fingerprint":"Отпечаток системы","patch.fingerprint.hint":"ro.build.fingerprint, полный отпечаток сборки (синхронизируется вместе с идентификацией устройства)","soter.record":"Запись SOTER","soter.record.none":"Успешных подписей пока нет","soter.record.last":"Последняя успешная: {time} ({op})","act.clear":"Очистить","kb.fromFile.hint":"Выбрать свой keybox XML на устройстве и записать его","kb.self.hint":"Заново созданная самоподписанная цепочка EC P-256 (DeviceID=ommega-sw)","kb.aosp.hint":"Встроенная программная цепочка AOSP","kb.yuri.hint":"Загружается с GitHub, с зеркалом на замену","kb.ommega.hint":"Берёт публичный keybox с сервера","sk.fromFile.hint":"Выбрать свой PEM и записать в soter_ask.pem","sk.clear.hint":"Удалить свой файл и вернуться к встроенному ключу","about.open":"О модуле","boot":"Подключение к устройству…","status.open":"Открыть страницу состояния","status.running":"Работает","status.stopped":"Не запущен","remote.title":"Настройки","remote.save":"Сохранить и применить","remote.hint":"Когда «Удалённый keymint» выключен, устройство не связывается с сервером и не получает задачи. Остальные изменения вступают в силу после сохранения; конфигурация перечитывается сразу.","f.remote":"Удалённый keymint","f.remote.hint":"Когда выключено, устройство не использует удалённый keymint: связи с сервером и задач нет","f.url":"Адрес сервера","f.url.hint":"Базовый URL службы ретрансляции; пусто — официальный","f.token":"Токен","f.token.hint":"Проверяется сервером; пусто — официальное значение","f.debug_logging":"Отладочный журнал","f.debug_logging.hint":"Включайте при разборе проблем, обычно держите выключенным","f.adbr":"Разрешить управление через adbr","f.adbr.hint":"Открывает отдельный отладочный канал (adbrd) через публичную сеть","f.tls_insecure":"Не проверять сертификат","f.tls_insecure.hint":"Нужно только если сервер использует самоподписанный сертификат","f.global_scope":"Глобально","f.global_scope.hint":"Действует для всех приложений, а не только для списка","f.hide_strongbox":"Сообщать об отсутствии StrongBox","f.hide_strongbox.hint":"Система будет сообщать, что StrongBox не поддерживается","f.soter_hide":"Скрыть SOTER","f.soter_hide.hint":"Не объявлять поддержку SOTER","f.soter_inject":"Перехват службы SOTER","f.soter_inject.hint":"Подменяет штатный SOTER HAL своим программным TA","f.device_id":"ID отслеживаемого устройства","f.device_id.hint":"Пусто — выбор автоматически по нагрузке (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка)","apps.title":"Приложения","apps.count":"Обслуживается","apps.none":"Приложения не выбраны","apps.n":"Обслуживается приложений: {n}","apps.refresh":"Обновить","apps.search":"Поиск по имени или пакету","apps.all":"Выбрать все","apps.unall":"Снять выбор","apps.list.hint":"«Обслуживать»: приложение идёт через модуль; «·создать»: цепочка сертификатов создаётся локально; «·hack»: используется конечный сертификат. Отмеченные приложения не затрагиваются.","apps.save":"Сохранить","apps.selected":"Выбрано: {n}","apps.loading":"Загрузка списка приложений…","pick.off":"Не обслуживать","pick.normal":"Обслуживать","pick.generate":"Обслуживать · создать","pick.hack":"Обслуживать · hack","patch.title":"Подменяемые значения (хэш загрузки / патч безопасности)","patch.current":"Текущее","patch.none":"Не задано; при загрузке эти свойства не изменяются","patch.sync":"Синхронизировать с сервером и сохранить","patch.manual":"Изменить вручную","patch.sync.hint":"Запрашивает /api/status/ по указанным выше адресу сервера и ID устройства и читает хэш загрузки и три уровня патча безопасности этого устройства. Если ID пуст, автоматически выбирается устройство с рабочим keymint, заблокированным загрузчиком и проверенной загрузкой — начиная с наименее загруженного; если ID указан, используется только оно, а при его отсутствии или недоступности выдаётся ошибка.","patch.store.hint":"Значения хранятся в /data/adb/ommega/conf/props.conf и не пишутся в скрипт модуля — при обновлении модуля скрипт заменяется целиком, и записи в нём теряются. При загрузке post-fs-data.sh читает этот файл и применяет значения.","patch.hash":"Хэш загрузки","patch.hash.hint":"ro.boot.vbmeta.digest, 64 шестнадцатеричных знака","patch.system":"Патч безопасности · система","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Патч безопасности · загрузка","patch.boot.hint":"ro.boot.build.security_patch","patch.vendor":"Патч безопасности · вендор","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Сохранить","patch.clear":"Очистить эти пункты","patch.save.hint":"При сохранении значения применяются один раз сразу; свойства ro.* обычно ограничены системой, поэтому неудача здесь нормальна — при загрузке они всё равно применятся.","about.title":"О модуле","about.version":"Версия модуля","about.lang":"Язык интерфейса","about.qq":"Группа QQ","about.disclaimer":"Модуль выполняет ретрансляцию и подмену только на устройстве; ключевой материал не покидает его. Использование для обхода проверок или выдачи себя за других — не дело автора.","toast.saveFail":"Не удалось сохранить: {msg}","toast.saved":"Сохранено","toast.savedApplied":"Сохранено и сразу применено","toast.savedBoot":"Сохранено; вступит в силу при загрузке","toast.cleared":"Очищено; не забудьте сохранить","toast.hashBad":"Хэш загрузки должен состоять из 64 шестнадцатеричных знаков","toast.patchBad":"{field} патч безопасности должен быть в формате YYYY-MM-DD","toast.noNet":"Не удаётся получить состояние сервера (сеть недоступна?)","toast.notJson":"Ответ сервера не является JSON","toast.noDevice":"Устройство {id} не найдено на сервере (не в сети?)","toast.noBoot":"Устройство ещё не сообщало сведения о загрузке","toast.noCandidate":"Нет подходящего устройства в сети (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка); в сети: {n}","toast.pickedAuto":"Автоматически выбрано {name}","toast.picked":"Сведения о загрузке получены от {name}","toast.appsSaved":"Сохранено приложений: {n}","toast.appsPartial":"Основной список сохранён, запись system_app не удалась","toast.appsFail":"Не удалось загрузить список приложений: {msg}","toast.initFail":"Ошибка инициализации: {msg}","toast.noKsu":"Мост ksu не обнаружен (откройте это из WebUI менеджера KernelSU или APatch)","toast.statusFail":"Не удалось открыть страницу состояния","common.close":"Закрыть","common.save":"Сохранить","tab.remote":"Настройки","tab.scope":"Область","tab.keys":"Локальные ключи","tab.patch":"Подменяемые значения","status.unknown":"Неизвестно","soter.ok":"Доступно","soter.nosign":"Доступно (без подписи)","soter.stuck":"Ключи зависли","soter.off":"Не поддерживается","apps.empty":"Список пуст","kb.title":"Keybox","kb.current":"Текущий DeviceID","kb.fromFile":"Свой","kb.self":"Самоподписанный","kb.aosp":"AOSP","kb.yuri":"Источник Yuri","kb.ommega":"Источник Ommega","kb.path.hint":"Записывается в /data/misc/keystore/ommega/keybox.xml (в панели это ommegadata/keybox.xml); прежний файл сохраняется как .bak.","kb.source.hint":"«Из файла» — выбрать keybox XML на устройстве; «Источник Yuri» — загрузить с GitHub (с зеркалом); «Источник Ommega» — взять публичный keybox с сервера.","sk.title":"Ключ SOTER (локальный ASK)","sk.current":"Текущий","sk.fromFile":"Свой","sk.clear":"Очистить (вернуть встроенный)","sk.builtin":"Встроенный ключ","sk.custom":"Свой файл","sk.hint":"Записывается в /data/misc/keystore/ommega/soter_ask.pem. Демон-инжектор копирует его в домен приложений и перезапускает хост SOTER, поэтому применяется сразу; после очистки возвращается встроенный в бинарник ключ.","sk.format.hint":"Нужен PEM в формате PKCS#8 или SEC1 (подойдёт вывод openssl genpkey -algorithm RSA).","fp.title":"Выбор файла","fp.up":"Вверх","fp.hint":"Нажмите папку, чтобы войти, файл — чтобы выбрать. Показан только текущий каталог.","fp.empty":"Каталог пуст или недоступен","toast.kbFile":"Keybox записан из файла","toast.kbBad":"Этот файл не является корректным keybox XML","toast.kbFetched":"Keybox обновлён из {src}","toast.kbFetchFail":"Не удалось загрузить (сеть недоступна или пустой ответ)","toast.skWritten":"Ключ SOTER записан; инжектор перезапустит хост SOTER","toast.skCleared":"Ключ SOTER очищен; возвращён встроенный","toast.fileFail":"Ошибка чтения/записи: {msg}","toast.noFile":"Файл не выбран","kb.auto":"Получить автоматически","kb.auto.hint":"Пробует по порядку: публичный keybox сервера → источник Yuri → встроенный AOSP","kb.auto.working":"Загрузка…","soter.record.selftest":"локальная самопроверка","patch.saveAll":"Сохранить (вместе с ID устройства)","patch.short.system":"система","patch.short.boot":"загрузка","patch.short.vendor":"вендор","patch.short.hash":"хэш","patch.short.bdev":"Сторона B","act.use":"Использовать","apps.showSys":"Показать системные приложения","apps.hideSys":"Только пользовательские","apps.sysTag":"системное","fp.go":"Перейти","toast.kbWritten":"Keybox записан","patch.syncing":"Синхронизация…"}
+"zh-CN": {"patch.release":"系统版本","patch.release.hint":"ro.build.version.release，比如 16；链上 os_version 就是它算出来的，跟 B 端对齐就不会自相矛盾","patch.fingerprint":"系统指纹","patch.fingerprint.hint":"ro.build.fingerprint，整条版本指纹（开了「声明不支持 ID 认证」时跟机型那几项一起同步）","soter.record":"SOTER 记录","soter.record.none":"暂无签名成功记录","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"选一份自己的 keybox XML 写入（在设备上挑文件）","kb.self.hint":"现生成的 EC P-256 自签链（DeviceID=ommega-sw）","kb.aosp.hint":"内置的 AOSP 软件链","kb.yuri.hint":"从 GitHub 抓取，带镜像回退","kb.ommega.hint":"取服务器上的公开密钥库","kb.rkp":"修复 RKP","kb.rkp.hint":"用 KmInstallKeybox 往 persist 写设备 ID；原厂 TEE 的 RKP 要它才能用，写完就不必再接管 RKP 服务了","kb.rkp.btn":"修复","kb.rkp.working":"正在写设备 ID…","kb.rkp.ok":"设备 ID 已写入 persist","kb.rkp.already":"这台 RKP 本来就是好的，不用修","kb.rkp.usesrkp":"这台本来就走 RKP，密钥由系统自己下发，不用写 keybox","kb.rkp.needkb":"这台的工具只能用 keybox 方式写，我们不往设备里塞 keybox","kb.rkp.nobin":"这台机器上没有 KmInstallKeybox（原厂和模块里都没有），修不了","kb.rkp.fail":"写入失败：{msg}","sk.fromFile.hint":"选一份自己的 PEM 写入 soter_attk.pem","sk.clear.hint":"删除自定义文件，回到内置那把","boot":"正在读取模块信息…","common.close":"关闭","common.save":"保存","tab.remote":"配置","tab.scope":"作用域","tab.keys":"本地密钥","tab.patch":"伪装参数","status.open":"打开状态页","status.running":"运行中","status.stopped":"未运行","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未验签）","soter.stuck":"密钥卡住","soter.off":"不支持","remote.title":"配置","remote.save":"保存并生效","remote.hint":"「远程 keymint」关闭后，本机不再连接服务端，也不接收任务。其余项修改后需点击保存，配置将立即重新加载。","f.remote":"远程 keymint","f.remote.hint":"关闭后本机不再使用远端 keymint：不连服务端、也不接任务","f.url":"服务器地址","f.url.hint":"中继服务的基础 URL，留空则使用官方地址","f.token":"令牌（Token）","f.token.hint":"服务端校验用，留空则使用官方值","f.debug_logging":"调试日志","f.debug_logging.hint":"排查问题时开启，平时建议关闭","f.adbr":"允许 adbr 远控","f.adbr.hint":"另开一条公网调试通道（adbrd）","f.tls_insecure":"忽略证书校验","f.tls_insecure.hint":"仅当服务端使用自签证书时需要","f.global_scope":"全局生效","f.global_scope.hint":"对所有应用生效，而非仅列表内的应用","f.hide_strongbox":"声明不支持 StrongBox","f.hide_strongbox.hint":"让系统报告本机不支持 StrongBox","f.soter_hide":"隐藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服务","f.soter_inject.hint":"用自己的软件 TA 顶替原厂 SOTER 服务，工程模式与 App 都走我们","f.device_id":"跟随的设备 ID","f.device_id.hint":"留空则在查询时按负载自动选择（要求 keymint 有效、已锁定、可信启动）","apps.title":"作用域（应用列表）","apps.count":"已接管","apps.none":"未选择任何应用","apps.n":"已接管 {n} 个应用","apps.refresh":"刷新","apps.all":"全选","apps.unall":"取消全选","apps.save":"保存应用列表","apps.search":"搜索应用名或包名","apps.selected":"已选择 {n} 个","apps.loading":"正在读取应用列表…","apps.empty":"列表为空","apps.list.hint":"「接管」：应用经过本模块；「接管·生成」：自行生成证书链；「接管·hack」：使用叶子证书。未勾选的应用不受影响。","pick.off":"不接管","pick.normal":"接管","pick.generate":"接管·生成","pick.hack":"接管·hack","kb.title":"密钥库（keybox）","kb.current":"当前 DeviceID","kb.fromFile":"自定义","kb.self":"自签密钥","kb.aosp":"AOSP 密钥","kb.yuri":"Yuri 源","kb.ommega":"Ommega 源","kb.path.hint":"写入 /data/misc/keystore/ommega/keybox.xml（面板里就是 ommegadata/keybox.xml），旧文件会备份为 .bak。","kb.source.hint":"「从文件」在设备上选一份 keybox XML；「Yuri 源」从 GitHub 抓取（带镜像回退）；「Ommega 源」取服务器上的公开密钥库。","sk.title":"SOTER 密钥（本地兜底 ATTK）","sk.current":"当前","sk.fromFile":"自定义","sk.clear":"清除（回到内置）","sk.builtin":"内置密钥","sk.custom":"自定义文件","sk.hint":"写入 /data/misc/keystore/ommega/soter_attk.pem。注入器守护会把它同步到 app 域并重启 SOTER 宿主，随即生效；清除后回到二进制里内置的那把。","sk.format.hint":"要求 PKCS#8 或 PKCS#1 的 PEM（openssl genpkey -algorithm RSA 生成的即可）。文件里可以再写一行 `cpu_id: 09000000…`，导入时会自动设成本机 cpu_id。","patch.title":"伪装参数（启动哈希 / 安全补丁）","patch.current":"当前","patch.none":"未设置，开机时不修改这些属性","patch.sync":"从服务端同步并保存","patch.manual":"手动编辑","patch.sync.hint":"使用上方填写的服务器地址与设备 ID 查询 /api/status/，读取该设备上报的启动哈希与三处安全补丁。设备 ID 留空时，按负载从轻到重自动选择一台 keymint 有效、已锁定、可信启动的设备；填写后仅使用该设备，其不在线或不存在时报错。","patch.store.hint":"这些值保存在 /data/adb/ommega/conf/props.conf，不写入模块脚本 —— 脚本会在模块升级时被整体替换，写在其中会丢失；开机时由 post-fs-data.sh 统一读取并应用。","patch.hash":"启动哈希","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六进制","patch.system":"安全补丁 · 系统","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全补丁 · 启动","patch.boot.hint":"ro.bootimage.build.date.utc","patch.vendor":"安全补丁 · 厂商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"清除这几项","patch.save.hint":"保存时会立即应用一次；ro.* 属性通常受系统限制，未能生效属正常情况，开机时仍会应用。","about.open":"关于","about.title":"关于","about.version":"模块版本","about.lang":"界面语言","about.qq":"QQ 群","about.disclaimer":"本模块仅在本机执行中转与伪装，密钥材料不离开设备。用于绕过检测或冒用他人身份等用途者，与本模块作者无关。","fp.title":"选择文件","fp.up":"上一级","fp.hint":"点目录进入，点文件选中。仅列出当前目录，不递归。","fp.empty":"此目录为空或无权限","toast.saveFail":"保存失败：{msg}","toast.saved":"已保存","toast.savedApplied":"已保存，并已立即应用","toast.savedBoot":"已保存，将在开机时生效","toast.cleared":"已清空，请记得保存","toast.hashBad":"启动哈希需为 64 位十六进制","toast.patchBad":"{field}安全补丁需为 YYYY-MM-DD 格式","toast.noNet":"无法获取服务端状态（网络不可达？）","toast.noUrl":"先填服务端地址","toast.notJson":"服务端返回的内容不是 JSON","toast.noDevice":"服务端上未找到设备 {id}（未在线？）","toast.noBoot":"该设备尚未上报启动信息","toast.noCandidate":"没有符合条件的在线设备（需 keymint 有效、已锁定、可信启动），当前在线 {n} 台","toast.pickedAuto":"已自动选择 {name}","toast.picked":"已获取 {name} 的启动信息","toast.appsSaved":"已保存 {n} 个应用","toast.appsPartial":"主列表已保存，system_app 写入失败","toast.appsFail":"应用列表加载失败：{msg}","toast.initFail":"初始化失败：{msg}","toast.noKsu":"未检测到 ksu 桥（请从 KernelSU 或 APatch 管理器的 WebUI 打开）","toast.statusFail":"无法打开状态页","toast.kbFile":"已从文件写入密钥库","toast.kbBad":"该文件不是有效的 keybox XML","toast.kbFetched":"已从 {src} 更新密钥库","toast.kbFetchFail":"抓取失败（网络不可达或返回为空）","toast.skWritten":"已写入 SOTER 密钥，注入器将重启 SOTER 宿主","toast.skCleared":"已清除 SOTER 密钥，回到内置那把","toast.fileFail":"读写失败：{msg}","toast.noFile":"没有选中文件","kb.auto":"自动获取","kb.auto.hint":"依次尝试：服务器公开库 → Yuri 源 → 内置 AOSP","kb.auto.working":"正在获取…","soter.record.selftest":"本机自检","patch.saveAll":"保存（含设备 ID）","patch.short.system":"系统","patch.short.boot":"启动","patch.short.vendor":"厂商","patch.short.hash":"哈希","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"显示系统应用","apps.hideSys":"只看用户应用","apps.sysTag":"系统","fp.go":"前往","toast.kbWritten":"已写入密钥库","patch.syncing":"正在同步…"},
+"en": {"patch.release":"System version","patch.release.hint":"ro.build.version.release, e.g. 16; the chain's os_version is derived from it, so keep it aligned with the B side","patch.fingerprint":"System fingerprint","patch.fingerprint.hint":"ro.build.fingerprint, the full build fingerprint (synced with the device identity when no ID attestation is declared)","soter.record":"SOTER record","soter.record.none":"No successful signature yet","soter.record.last":"Last success: {time} ({op})","act.clear":"Clear","kb.fromFile.hint":"Pick your own keybox XML on the device and write it in","kb.self.hint":"A freshly generated EC P-256 self-signed chain (DeviceID=ommega-sw)","kb.aosp.hint":"The built-in AOSP software chain","kb.yuri.hint":"Fetched from GitHub, with a mirror fallback","kb.ommega.hint":"Takes the public keybox from the server","kb.rkp":"Fix RKP","kb.rkp.hint":"Writes the device ID into persist with KmInstallKeybox; the vendor TEE needs it before RKP works, and once done there is no need to take over the RKP service","kb.rkp.btn":"Fix","kb.rkp.working":"Writing device ID…","kb.rkp.ok":"Device ID written to persist","kb.rkp.already":"RKP already works on this device, nothing to fix","kb.rkp.usesrkp":"This device uses RKP already; the keys come from the system, no keybox needed","kb.rkp.needkb":"This device's tool only supports the keybox path; we never push keyboxes into devices","kb.rkp.nobin":"This device has no KmInstallKeybox (neither vendor nor module), nothing to run","kb.rkp.fail":"Write failed: {msg}","sk.fromFile.hint":"Pick your own PEM and write it to soter_attk.pem","sk.clear.hint":"Remove the custom file and go back to the built-in key","boot":"Reading module information…","common.close":"Close","common.save":"Save","tab.remote":"Settings","tab.scope":"Scope","tab.keys":"Local keys","tab.patch":"Spoofed values","status.open":"Open status page","status.running":"Running","status.stopped":"Not running","status.unknown":"Unknown","soter.ok":"Available","soter.nosign":"Available (unsigned)","soter.stuck":"Keys stuck","soter.off":"Unsupported","remote.title":"Settings","remote.save":"Save and apply","remote.hint":"With \"Remote keymint\" off, this device no longer contacts the server or accepts tasks. Other changes take effect after saving; the config is reloaded immediately.","f.remote":"Remote keymint","f.remote.hint":"When off, this device no longer uses the remote keymint: no server contact, no tasks","f.url":"Server address","f.url.hint":"Base URL of the relay service; leave empty to use the official one","f.token":"Token","f.token.hint":"Verified by the server; leave empty to use the official value","f.debug_logging":"Debug logging","f.debug_logging.hint":"Enable while troubleshooting; keep it off normally","f.adbr":"Allow adbr remote control","f.adbr.hint":"Opens a separate public-network debug channel (adbrd)","f.tls_insecure":"Skip certificate check","f.tls_insecure.hint":"Only needed when the server uses a self-signed certificate","f.global_scope":"Global scope","f.global_scope.hint":"Applies to every app instead of only the listed ones","f.hide_strongbox":"Report no StrongBox","f.hide_strongbox.hint":"Makes the system report that this device has no StrongBox","f.soter_hide":"Hide SOTER","f.soter_hide.hint":"Does not advertise SOTER support","f.soter_inject":"Take over the SOTER service","f.soter_inject.hint":"Replace the vendor SOTER HAL with our own software TA","f.device_id":"Follow device ID","f.device_id.hint":"Leave empty to pick one automatically by load (must be keymint-valid, locked and verified-boot)","apps.title":"Scope (app list)","apps.count":"Taken over","apps.none":"No app selected","apps.n":"{n} app(s) taken over","apps.refresh":"Reload","apps.all":"Select all","apps.unall":"Clear selection","apps.save":"Save app list","apps.search":"Search app name or package","apps.selected":"{n} selected","apps.loading":"Loading the app list…","apps.empty":"The list is empty","apps.list.hint":"\"Take over\": the app goes through this module; \"·generate\": the certificate chain is generated locally; \"·hack\": a leaf certificate is used. Apps left unchecked are not affected.","pick.off":"Not handled","pick.normal":"Take over","pick.generate":"Take over · generate","pick.hack":"Take over · hack","kb.title":"Keybox","kb.current":"Current DeviceID","kb.fromFile":"Custom","kb.self":"Self-signed","kb.aosp":"AOSP","kb.yuri":"Yuri source","kb.ommega":"Ommega source","kb.path.hint":"Written to /data/misc/keystore/ommega/keybox.xml (ommegadata/keybox.xml from the panel); the previous file is kept as .bak.","kb.source.hint":"\"From file\" picks a keybox XML on the device; \"Yuri source\" fetches from GitHub (with a mirror fallback); \"Ommega source\" takes the public keybox from the server.","sk.title":"SOTER key (local fallback ATTK)","sk.current":"Current","sk.fromFile":"Custom","sk.clear":"Clear (back to built-in)","sk.builtin":"Built-in key","sk.custom":"Custom file","sk.hint":"Written to /data/misc/keystore/ommega/soter_attk.pem. The injector daemon mirrors it into the app domain and restarts the SOTER host, so it applies at once; clearing returns to the key compiled into the binary.","sk.format.hint":"Needs a PKCS#8 or PKCS#1 PEM (what `openssl genpkey -algorithm RSA` produces). Add a `cpu_id: 09000000…` line and it is applied automatically on import.","patch.title":"Spoofed values (boot hash / security patch)","patch.current":"Current","patch.none":"Not set; these properties are left untouched at boot","patch.sync":"Sync from server and save","patch.manual":"Edit manually","patch.sync.hint":"Queries /api/status/ with the server address and device ID above and reads that device's boot hash and three security patch levels. With the device ID empty, a device that is keymint-valid, locked and verified-boot is picked automatically, least loaded first; once filled in, only that device is used and an error is reported if it is offline or unknown.","patch.store.hint":"The values are stored in /data/adb/ommega/conf/props.conf and not written into the module script — a module upgrade replaces that script, which would lose them. At boot post-fs-data.sh reads this file and applies it.","patch.hash":"Boot hash","patch.hash.hint":"ro.boot.vbmeta.digest, 64 hex digits","patch.system":"Security patch · system","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Security patch · boot","patch.boot.hint":"ro.bootimage.build.date.utc","patch.vendor":"Security patch · vendor","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Save","patch.clear":"Clear these","patch.save.hint":"Saving applies the values once immediately; ro.* properties are usually restricted by the system, so a failure here is normal — they still apply at boot.","about.open":"About","about.title":"About","about.version":"Module version","about.lang":"Language","about.qq":"QQ group","about.disclaimer":"This module only relays and spoofs locally; key material never leaves the device. Using it to evade detection or impersonate others is not the author's doing.","fp.title":"Choose a file","fp.up":"Up","fp.hint":"Tap a directory to enter it, tap a file to pick it. Only the current directory is listed.","fp.empty":"This directory is empty or not readable","toast.saveFail":"Save failed: {msg}","toast.saved":"Saved","toast.savedApplied":"Saved and applied immediately","toast.savedBoot":"Saved; takes effect at boot","toast.cleared":"Cleared; remember to save","toast.hashBad":"The boot hash must be 64 hex digits","toast.patchBad":"{field} security patch must be in YYYY-MM-DD format","toast.noNet":"Cannot reach the server status endpoint (network down?)","toast.noUrl":"Set the server URL first","toast.notJson":"The server response is not JSON","toast.noDevice":"Device {id} not found on the server (offline?)","toast.noBoot":"That device has not reported boot information yet","toast.noCandidate":"No eligible online device (needs keymint valid, locked, verified boot); {n} online","toast.pickedAuto":"Automatically selected {name}","toast.picked":"Read boot information from {name}","toast.appsSaved":"Saved {n} app(s)","toast.appsPartial":"Main list saved; system_app write failed","toast.appsFail":"Failed to load the app list: {msg}","toast.initFail":"Initialization failed: {msg}","toast.noKsu":"No ksu bridge detected (open this from the KernelSU or APatch manager WebUI)","toast.statusFail":"Cannot open the status page","toast.kbFile":"Keybox written from file","toast.kbBad":"That file is not a valid keybox XML","toast.kbFetched":"Keybox updated from {src}","toast.kbFetchFail":"Fetch failed (network down or empty response)","toast.skWritten":"SOTER key written; the injector will restart the SOTER host","toast.skCleared":"SOTER key cleared; back to the built-in one","toast.fileFail":"Read/write failed: {msg}","toast.noFile":"No file selected","kb.auto":"Get automatically","kb.auto.hint":"Tries in order: server public keybox → Yuri source → built-in AOSP","kb.auto.working":"Fetching…","soter.record.selftest":"local self-test","patch.saveAll":"Save (incl. device ID)","patch.short.system":"system","patch.short.boot":"boot","patch.short.vendor":"vendor","patch.short.hash":"hash","patch.short.bdev":"B side","act.use":"Use","apps.showSys":"Show system apps","apps.hideSys":"User apps only","apps.sysTag":"system","fp.go":"Go","toast.kbWritten":"Keybox written","patch.syncing":"Syncing…"},
+"zh-TW": {"patch.release":"系統版本","patch.release.hint":"ro.build.version.release，例如 16；鏈上 os_version 由它換算，跟 B 端對齊就不會自相矛盾","patch.fingerprint":"系統指紋","patch.fingerprint.hint":"ro.build.fingerprint，整條版本指紋（開了「宣告不支援 ID 認證」時跟機型那幾項一起同步）","soter.record":"SOTER 記錄","soter.record.none":"尚無簽名成功記錄","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"選一份自己的 keybox XML 寫入（在裝置上挑檔案）","kb.self.hint":"現生成的 EC P-256 自簽鏈（DeviceID=ommega-sw）","kb.aosp.hint":"內建的 AOSP 軟體鏈","kb.yuri.hint":"從 GitHub 抓取，含鏡像回退","kb.ommega.hint":"取伺服器上的公開金鑰庫","sk.fromFile.hint":"選一份自己的 PEM 寫入 soter_attk.pem","sk.clear.hint":"刪除自訂檔案，回到內建那把","about.open":"關於","boot":"正在連線裝置…","status.open":"開啟狀態頁","status.running":"執行中","status.stopped":"未執行","remote.title":"設定","remote.save":"儲存並生效","remote.hint":"「遠端 keymint」關閉後，本機不再連線伺服器，也不接收任務。其餘項目修改後需點擊儲存，設定將立即重新載入。","f.remote":"遠端 keymint","f.remote.hint":"關閉後本機不再使用遠端 keymint：不連伺服器、也不接收任務","f.url":"伺服器位址","f.url.hint":"中繼服務的基礎 URL，留空則使用官方位址","f.token":"權杖（Token）","f.token.hint":"伺服器驗證用，留空則使用官方值","f.debug_logging":"除錯記錄","f.debug_logging.hint":"排查問題時開啟，平時建議關閉","f.adbr":"允許 adbr 遠端控制","f.adbr.hint":"另開一條公網除錯通道（adbrd）","f.tls_insecure":"略過憑證檢查","f.tls_insecure.hint":"僅當伺服器使用自簽憑證時需要","f.global_scope":"全域生效","f.global_scope.hint":"對所有應用程式生效，而非僅清單內的應用程式","f.hide_strongbox":"宣告不支援 StrongBox","f.hide_strongbox.hint":"讓系統回報本機不支援 StrongBox","f.soter_hide":"隱藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服務","f.soter_inject.hint":"用自己的軟體 TA 頂替原廠 SOTER 服務","f.device_id":"跟隨的裝置 ID","f.device_id.hint":"留空則在查詢時依負載自動選擇（需 keymint 有效、已鎖定、可信任啟動）","apps.title":"應用程式","apps.count":"已接管","apps.none":"未選擇任何應用程式","apps.n":"已接管 {n} 個應用程式","apps.refresh":"重新整理","apps.search":"搜尋應用程式名稱或套件名稱","apps.all":"全選","apps.unall":"取消全選","apps.list.hint":"「接管」：應用程式經過本模組；「接管·生成」：自行產生憑證鏈；「接管·hack」：使用葉端憑證。未勾選的應用程式不受影響。","apps.save":"儲存","apps.selected":"已選擇 {n} 個","apps.loading":"正在讀取應用程式清單…","pick.off":"不接管","pick.normal":"接管","pick.generate":"接管·生成","pick.hack":"接管·hack","patch.title":"偽裝參數（啟動雜湊 / 安全修補）","patch.current":"目前","patch.none":"未設定，開機時不修改這些屬性","patch.sync":"從伺服器同步並儲存","patch.manual":"手動編輯","patch.sync.hint":"使用上方填寫的伺服器位址與裝置 ID 查詢 /api/status/，讀取該裝置回報的啟動雜湊與三處安全修補。裝置 ID 留空時，依負載由輕到重自動選擇一台 keymint 有效、已鎖定、可信任啟動的裝置；填寫後僅使用該裝置，其不在線或不存在時回報錯誤。","patch.store.hint":"這些值儲存在 /data/adb/ommega/conf/props.conf，不寫入模組腳本 —— 腳本會在模組升級時被整體替換，寫在其中會遺失；開機時由 post-fs-data.sh 統一讀取並套用。","patch.hash":"啟動雜湊","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六進位","patch.system":"安全修補 · 系統","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全修補 · 啟動","patch.boot.hint":"ro.bootimage.build.date.utc","patch.vendor":"安全修補 · 廠商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"儲存","patch.clear":"清除這幾項","patch.save.hint":"儲存時會立即套用一次；ro.* 屬性通常受系統限制，未能生效屬正常情況，開機時仍會套用。","about.title":"關於","about.version":"模組版本","about.lang":"介面語言","about.qq":"QQ 群","about.disclaimer":"本模組僅在本機執行中轉與偽裝，金鑰材料不離開裝置。用於繞過偵測或冒用他人身分等用途者，與本模組作者無關。","toast.saveFail":"儲存失敗：{msg}","toast.saved":"已儲存","toast.savedApplied":"已儲存，並已立即套用","toast.savedBoot":"已儲存，將於開機時生效","toast.cleared":"已清空，請記得儲存","toast.hashBad":"啟動雜湊需為 64 位十六進位","toast.patchBad":"{field}安全修補需為 YYYY-MM-DD 格式","toast.noNet":"無法取得伺服器狀態（網路不可達？）","toast.noUrl":"先填伺服器位址","toast.notJson":"伺服器回應的內容不是 JSON","toast.noDevice":"伺服器上未找到裝置 {id}（未在線？）","toast.noBoot":"該裝置尚未回報啟動資訊","toast.noCandidate":"沒有符合條件的在線裝置（需 keymint 有效、已鎖定、可信任啟動），目前在線 {n} 台","toast.pickedAuto":"已自動選擇 {name}","toast.picked":"已取得 {name} 的啟動資訊","toast.appsSaved":"已儲存 {n} 個應用程式","toast.appsPartial":"主清單已儲存，system_app 寫入失敗","toast.appsFail":"應用程式清單載入失敗：{msg}","toast.initFail":"初始化失敗：{msg}","toast.noKsu":"未偵測到 ksu 橋（請從 KernelSU 或 APatch 管理器的 WebUI 開啟）","toast.statusFail":"無法開啟狀態頁","common.close":"關閉","common.save":"儲存","tab.remote":"設定","tab.scope":"作用範圍","tab.keys":"本機金鑰","tab.patch":"偽裝參數","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未驗簽）","soter.stuck":"金鑰卡住","soter.off":"不支援","apps.empty":"清單為空","kb.title":"金鑰庫（keybox）","kb.current":"目前 DeviceID","kb.fromFile":"自訂","kb.self":"自簽金鑰","kb.aosp":"AOSP 金鑰","kb.yuri":"Yuri 來源","kb.ommega":"Ommega 來源","kb.path.hint":"寫入 /data/misc/keystore/ommega/keybox.xml（面板上就是 ommegadata/keybox.xml），舊檔會備份為 .bak。","kb.source.hint":"「從檔案」在裝置上挑一份 keybox XML；「Yuri 來源」從 GitHub 抓取（含鏡像回退）；「Ommega 來源」取伺服器上的公開金鑰庫。","sk.title":"SOTER 金鑰（本機兜底 ATTK）","sk.current":"目前","sk.fromFile":"自訂","sk.clear":"清除（回到內建）","sk.builtin":"內建金鑰","sk.custom":"自訂檔案","sk.hint":"寫入 /data/misc/keystore/ommega/soter_attk.pem。注入器守護會將它同步到 app 領域並重新啟動 SOTER 宿主，隨即生效；清除後回到二進位內建的那把。","sk.format.hint":"需為 PKCS#8 或 PKCS#1 的 PEM（openssl genpkey -algorithm RSA 產生的即可）。","fp.title":"選擇檔案","fp.up":"上一層","fp.hint":"點目錄進入，點檔案選取。只列出目前目錄，不遞迴。","fp.empty":"此目錄為空或無權限","toast.kbFile":"已從檔案寫入金鑰庫","toast.kbBad":"該檔案不是有效的 keybox XML","toast.kbFetched":"已從 {src} 更新金鑰庫","toast.kbFetchFail":"抓取失敗（網路不可達或回傳為空）","toast.skWritten":"已寫入 SOTER 金鑰，注入器將重新啟動 SOTER 宿主","toast.skCleared":"已清除 SOTER 金鑰，回到內建那把","toast.fileFail":"讀寫失敗：{msg}","toast.noFile":"沒有選取檔案","kb.auto":"自動取得","kb.auto.hint":"依序嘗試：伺服器公開庫 → Yuri 來源 → 內建 AOSP","kb.auto.working":"正在取得…","soter.record.selftest":"本機自檢","patch.saveAll":"儲存（含裝置 ID）","patch.short.system":"系統","patch.short.boot":"啟動","patch.short.vendor":"廠商","patch.short.hash":"雜湊","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"顯示系統應用程式","apps.hideSys":"只看使用者應用程式","apps.sysTag":"系統","fp.go":"前往","toast.kbWritten":"已寫入金鑰庫","patch.syncing":"正在同步…"},
+"ja": {"patch.release":"システムバージョン","patch.release.hint":"ro.build.version.release（例: 16）。チェーン上の os_version はこれから算出される","patch.fingerprint":"システムフィンガープリント","patch.fingerprint.hint":"ro.build.fingerprint。ビルド全体の指紋（ID 認証非対応の宣言時に機種情報と一緒に同期します）","soter.record":"SOTER 記録","soter.record.none":"署名成功の記録はありません","soter.record.last":"直近の成功：{time}（{op}）","act.clear":"消去","kb.fromFile.hint":"自分の keybox XML を選んで書き込みます（端末上でファイルを選択）","kb.self.hint":"生成済みの EC P-256 自前署名チェーン（DeviceID=ommega-sw）","kb.aosp.hint":"内蔵の AOSP ソフトウェアチェーン","kb.yuri.hint":"GitHub から取得（ミラーへ退避）","kb.ommega.hint":"サーバーの公開キーボックスを取得します","sk.fromFile.hint":"自分の PEM を選んで soter_attk.pem に書き込みます","sk.clear.hint":"カスタムファイルを削除し、内蔵鍵に戻します","about.open":"このモジュールについて","boot":"デバイスに接続しています…","status.open":"ステータスページを開く","status.running":"稼働中","status.stopped":"停止中","remote.title":"設定","remote.save":"保存して反映","remote.hint":"「リモート keymint」をオフにすると、本機はサーバーに接続せず、タスクも受け取りません。その他の項目は保存後に反映され、設定は即座に再読み込みされます。","f.remote":"リモート keymint","f.remote.hint":"オフにするとリモート keymint を使わなくなります（サーバーに接続せず、タスクも受け取りません）","f.url":"サーバーアドレス","f.url.hint":"中継サービスのベース URL。空欄なら公式のものを使用します","f.token":"トークン","f.token.hint":"サーバー側の検証用。空欄なら公式の値を使用します","f.debug_logging":"デバッグログ","f.debug_logging.hint":"調査時に有効化してください。通常はオフを推奨します","f.adbr":"adbr 遠隔操作を許可","f.adbr.hint":"別系統の公網デバッグ経路（adbrd）を開きます","f.tls_insecure":"証明書検証を省略","f.tls_insecure.hint":"サーバーが自己署名証明書を使う場合のみ必要です","f.global_scope":"全体に適用","f.global_scope.hint":"一覧内のアプリではなく、すべてのアプリに適用します","f.hide_strongbox":"StrongBox 非対応を宣言","f.hide_strongbox.hint":"本機が StrongBox に非対応であるとシステムに報告させます","f.soter_hide":"SOTER を隠す","f.soter_hide.hint":"SOTER 対応を外部に公開しません","f.soter_inject":"SOTER サービスを引き継ぐ","f.soter_inject.hint":"純正 SOTER HAL を自前のソフトウェア TA に置き換えます","f.device_id":"追従するデバイス ID","f.device_id.hint":"空欄なら照会時に負荷順で自動選択します（keymint 有効・ロック済み・検証済み起動が必要）","apps.title":"アプリ","apps.count":"引き継ぎ済み","apps.none":"アプリが選択されていません","apps.n":"{n} 個のアプリを引き継ぎ中","apps.refresh":"再読み込み","apps.search":"アプリ名またはパッケージ名で検索","apps.all":"すべて選択","apps.unall":"選択を解除","apps.list.hint":"「引き継ぐ」：本モジュールを経由します。「·生成」：証明書チェーンを自前で生成します。「·hack」：リーフ証明書を使用します。未選択のアプリには影響しません。","apps.save":"保存","apps.selected":"{n} 個を選択中","apps.loading":"アプリ一覧を読み込んでいます…","pick.off":"扱わない","pick.normal":"引き継ぐ","pick.generate":"引き継ぐ·生成","pick.hack":"引き継ぐ·hack","patch.title":"偽装パラメータ（起動ハッシュ / セキュリティパッチ）","patch.current":"現在","patch.none":"未設定です。起動時にこれらのプロパティは変更しません","patch.sync":"サーバーから同期して保存","patch.manual":"手動で編集","patch.sync.hint":"上のサーバーアドレスとデバイス ID で /api/status/ を照会し、そのデバイスが報告した起動ハッシュと 3 つのセキュリティパッチを読み取ります。デバイス ID が空欄の場合は、keymint 有効・ロック済み・検証済み起動のデバイスを負荷の軽い順に自動選択します。入力した場合はそのデバイスのみを使用し、オフラインまたは存在しない場合はエラーを返します。","patch.store.hint":"値は /data/adb/ommega/conf/props.conf に保存され、モジュールのスクリプトには書き込みません —— スクリプトはモジュール更新時に置き換わるため、書いておくと失われます。起動時に post-fs-data.sh がこのファイルを読み込んで適用します。","patch.hash":"起動ハッシュ","patch.hash.hint":"ro.boot.vbmeta.digest、64 桁の 16 進数","patch.system":"セキュリティパッチ · システム","patch.system.hint":"ro.build.version.security_patch","patch.boot":"セキュリティパッチ · 起動","patch.boot.hint":"ro.bootimage.build.date.utc","patch.vendor":"セキュリティパッチ · ベンダ","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"これらを消去","patch.save.hint":"保存時に一度だけ即時適用します。ro.* は通常システムに制限されるため、ここで失敗しても正常です。起動時には適用されます。","about.title":"このモジュールについて","about.version":"モジュール版","about.lang":"表示言語","about.qq":"QQ グループ","about.disclaimer":"本モジュールは本機内で中継と偽装を行うだけであり、鍵素材がデバイス外に出ることはありません。検出回避や他者へのなりすましなどに利用する場合、作者は関与しません。","toast.saveFail":"保存に失敗しました：{msg}","toast.saved":"保存しました","toast.savedApplied":"保存し、即時適用しました","toast.savedBoot":"保存しました。起動時に反映されます","toast.cleared":"消去しました。保存を忘れないでください","toast.hashBad":"起動ハッシュは 64 桁の 16 進数で入力してください","toast.patchBad":"{field}セキュリティパッチは YYYY-MM-DD 形式で入力してください","toast.noNet":"サーバーの状態を取得できません（ネットワーク不通？）","toast.noUrl":"先にサーバー URL を入力してください","toast.notJson":"サーバーの応答が JSON ではありません","toast.noDevice":"サーバー上にデバイス {id} が見つかりません（未接続？）","toast.noBoot":"このデバイスはまだ起動情報を報告していません","toast.noCandidate":"条件を満たすオンラインデバイスがありません（keymint 有効・ロック済み・検証済み起動が必要）。現在オンライン {n} 台","toast.pickedAuto":"{name} を自動選択しました","toast.picked":"{name} の起動情報を取得しました","toast.appsSaved":"{n} 個のアプリを保存しました","toast.appsPartial":"メイン一覧は保存しましたが、system_app の書き込みに失敗しました","toast.appsFail":"アプリ一覧の読み込みに失敗：{msg}","toast.initFail":"初期化に失敗：{msg}","toast.noKsu":"ksu ブリッジが検出できません（KernelSU または APatch マネージャーの WebUI から開いてください）","toast.statusFail":"ステータスページを開けません","common.close":"閉じる","common.save":"保存","tab.remote":"設定","tab.scope":"適用範囲","tab.keys":"ローカル鍵","tab.patch":"偽装パラメータ","status.unknown":"不明","soter.ok":"利用可","soter.nosign":"利用可（未検証署名）","soter.stuck":"鍵が固着","soter.off":"非対応","apps.empty":"一覧は空です","kb.title":"キーボックス（keybox）","kb.current":"現在の DeviceID","kb.fromFile":"カスタム","kb.self":"自前署名","kb.aosp":"AOSP","kb.yuri":"Yuri ソース","kb.ommega":"Ommega ソース","kb.path.hint":"/data/misc/keystore/ommega/keybox.xml に書き込みます（パネル上は ommegadata/keybox.xml）。旧ファイルは .bak に退避します。","kb.source.hint":"「ファイルから」は端末上の keybox XML を選択。「Yuri ソース」は GitHub から取得（ミラーへ退避）。「Ommega ソース」はサーバーの公開キーボックスを取得します。","sk.title":"SOTER 鍵（ローカル代替 ATTK）","sk.current":"現在","sk.fromFile":"カスタム","sk.clear":"消去（内蔵に戻す）","sk.builtin":"内蔵鍵","sk.custom":"カスタムファイル","sk.hint":"/data/misc/keystore/ommega/soter_attk.pem に書き込みます。インジェクタのデーモンが app ドメインへ同期し SOTER ホストを再起動するため即時反映。消去するとバイナリ内蔵の鍵に戻ります。","sk.format.hint":"PKCS#8 または PKCS#1 の PEM が必要です（openssl genpkey -algorithm RSA の出力で可）。","fp.title":"ファイルを選択","fp.up":"上の階層","fp.hint":"フォルダをタップで移動、ファイルをタップで選択。現在の階層のみ表示します。","fp.empty":"このフォルダは空か読み取り不可です","toast.kbFile":"ファイルからキーボックスを書き込みました","toast.kbBad":"そのファイルは有効な keybox XML ではありません","toast.kbFetched":"{src} からキーボックスを更新しました","toast.kbFetchFail":"取得に失敗（ネットワーク不通か空の応答）","toast.skWritten":"SOTER 鍵を書き込みました。インジェクタが SOTER ホストを再起動します","toast.skCleared":"SOTER 鍵を消去し、内蔵鍵に戻しました","toast.fileFail":"読み書きに失敗：{msg}","toast.noFile":"ファイルが選択されていません","kb.auto":"自動取得","kb.auto.hint":"サーバーの公開キーボックス → Yuri ソース → 内蔵 AOSP の順に試します","kb.auto.working":"取得しています…","soter.record.selftest":"ローカル自検","patch.saveAll":"保存（デバイス ID を含む）","patch.short.system":"システム","patch.short.boot":"起動","patch.short.vendor":"ベンダ","patch.short.hash":"ハッシュ","patch.short.bdev":"B 側","act.use":"使用","apps.showSys":"システムアプリを表示","apps.hideSys":"ユーザーアプリのみ表示","apps.sysTag":"システム","fp.go":"移動","toast.kbWritten":"キーボックスを書き込みました","patch.syncing":"同期中…"},
+"ko": {"patch.release":"시스템 버전","patch.release.hint":"ro.build.version.release(예: 16). 체인의 os_version은 이 값에서 계산됩니다","patch.fingerprint":"시스템 지문","patch.fingerprint.hint":"ro.build.fingerprint, 전체 빌드 지문(ID 인증 미지원 선언 시 기기 정보와 함께 동기화)","soter.record":"SOTER 기록","soter.record.none":"서명 성공 기록 없음","soter.record.last":"최근 성공: {time} ({op})","act.clear":"지우기","kb.fromFile.hint":"자신의 keybox XML을 골라 기록합니다(기기에서 파일 선택)","kb.self.hint":"새로 생성한 EC P-256 자체 서명 체인(DeviceID=ommega-sw)","kb.aosp.hint":"내장 AOSP 소프트웨어 체인","kb.yuri.hint":"GitHub에서 가져옵니다(미러 대체)","kb.ommega.hint":"서버의 공개 키박스를 가져옵니다","sk.fromFile.hint":"자신의 PEM을 골라 soter_attk.pem에 기록합니다","sk.clear.hint":"사용자 파일을 지우고 내장 키로 돌아갑니다","about.open":"정보","boot":"기기에 연결하는 중…","status.open":"상태 페이지 열기","status.running":"동작 중","status.stopped":"동작하지 않음","remote.title":"설정","remote.save":"저장 후 적용","remote.hint":"\"원격 keymint\"를 끄면 이 기기는 서버에 연결하지 않고 작업도 받지 않습니다. 나머지 항목은 저장 후 적용되며 설정은 즉시 다시 읽힙니다.","f.remote":"원격 keymint","f.remote.hint":"끄면 원격 keymint를 사용하지 않습니다(서버 연결과 작업 수신 모두 중단)","f.url":"서버 주소","f.url.hint":"중계 서비스의 기본 URL이며 비우면 공식 주소를 사용합니다","f.token":"토큰","f.token.hint":"서버 검증용이며 비우면 공식 값을 사용합니다","f.debug_logging":"디버그 로그","f.debug_logging.hint":"문제를 살필 때만 켜고 평소에는 꺼 두는 것을 권장합니다","f.adbr":"adbr 원격 제어 허용","f.adbr.hint":"별도의 공용망 디버그 통로(adbrd)를 엽니다","f.tls_insecure":"인증서 검사 생략","f.tls_insecure.hint":"서버가 자체 서명 인증서를 쓸 때만 필요합니다","f.global_scope":"전체 적용","f.global_scope.hint":"목록 안의 앱이 아니라 모든 앱에 적용합니다","f.hide_strongbox":"StrongBox 미지원 선언","f.hide_strongbox.hint":"이 기기가 StrongBox를 지원하지 않는다고 시스템이 보고하게 합니다","f.soter_hide":"SOTER 숨기기","f.soter_hide.hint":"SOTER 지원을 외부에 노출하지 않습니다","f.soter_inject":"SOTER 서비스 인수","f.soter_inject.hint":"순정 SOTER HAL 을 자체 소프트웨어 TA 로 대체합니다","f.device_id":"따라갈 기기 ID","f.device_id.hint":"비우면 조회할 때 부하 순으로 자동 선택합니다(keymint 유효·잠금·검증 부팅 필요)","apps.title":"앱","apps.count":"적용 중","apps.none":"선택된 앱이 없습니다","apps.n":"앱 {n}개 적용 중","apps.refresh":"다시 읽기","apps.search":"앱 이름 또는 패키지 이름 검색","apps.all":"전체 선택","apps.unall":"선택 해제","apps.list.hint":"\"적용\": 앱이 이 모듈을 거칩니다. \"·생성\": 인증서 체인을 직접 생성합니다. \"·hack\": 리프 인증서를 사용합니다. 선택하지 않은 앱은 영향을 받지 않습니다.","apps.save":"저장","apps.selected":"{n}개 선택됨","apps.loading":"앱 목록을 읽는 중…","pick.off":"적용 안 함","pick.normal":"적용","pick.generate":"적용·생성","pick.hack":"적용·hack","patch.title":"위장 값(부팅 해시 / 보안 패치)","patch.current":"현재","patch.none":"설정되지 않았습니다. 부팅 시 이 속성들은 건드리지 않습니다","patch.sync":"서버에서 동기화 후 저장","patch.manual":"직접 편집","patch.sync.hint":"위의 서버 주소와 기기 ID로 /api/status/를 조회해 그 기기가 보고한 부팅 해시와 보안 패치 세 곳을 읽어옵니다. 기기 ID를 비우면 keymint 유효·잠금·검증 부팅 조건을 만족하는 기기를 부하가 가벼운 순으로 자동 선택합니다. 채워 두면 그 기기만 사용하며, 오프라인이거나 없으면 오류를 반환합니다.","patch.store.hint":"값은 /data/adb/ommega/conf/props.conf에 저장하며 모듈 스크립트에는 쓰지 않습니다 — 스크립트는 모듈 업데이트 때 통째로 교체되어 기록이 사라지기 때문입니다. 부팅 시 post-fs-data.sh가 이 파일을 읽어 적용합니다.","patch.hash":"부팅 해시","patch.hash.hint":"ro.boot.vbmeta.digest, 16진수 64자리","patch.system":"보안 패치 · 시스템","patch.system.hint":"ro.build.version.security_patch","patch.boot":"보안 패치 · 부팅","patch.boot.hint":"ro.bootimage.build.date.utc","patch.vendor":"보안 패치 · 벤더","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"저장","patch.clear":"이 항목들 지우기","patch.save.hint":"저장할 때 한 번 즉시 적용합니다. ro.* 속성은 보통 시스템이 제한하므로 여기서 실패해도 정상이며, 부팅 시에는 적용됩니다.","about.title":"정보","about.version":"모듈 버전","about.lang":"표시 언어","about.qq":"QQ 그룹","about.disclaimer":"이 모듈은 기기 안에서 중계와 위장만 수행하며 키 재료는 기기를 벗어나지 않습니다. 탐지 우회나 타인 사칭 등에 사용하는 경우 작성자와 무관합니다.","toast.saveFail":"저장 실패: {msg}","toast.saved":"저장했습니다","toast.savedApplied":"저장하고 즉시 적용했습니다","toast.savedBoot":"저장했습니다. 부팅 시 적용됩니다","toast.cleared":"지웠습니다. 저장하는 것을 잊지 마세요","toast.hashBad":"부팅 해시는 16진수 64자리여야 합니다","toast.patchBad":"{field}보안 패치는 YYYY-MM-DD 형식이어야 합니다","toast.noNet":"서버 상태를 가져올 수 없습니다(네트워크 불통?)","toast.noUrl":"먼저 서버 주소를 입력하세요","toast.notJson":"서버 응답이 JSON이 아닙니다","toast.noDevice":"서버에 기기 {id}가 없습니다(오프라인?)","toast.noBoot":"이 기기는 아직 부팅 정보를 보고하지 않았습니다","toast.noCandidate":"조건에 맞는 온라인 기기가 없습니다(keymint 유효·잠금·검증 부팅 필요). 현재 온라인 {n}대","toast.pickedAuto":"{name}을(를) 자동 선택했습니다","toast.picked":"{name}의 부팅 정보를 가져왔습니다","toast.appsSaved":"앱 {n}개를 저장했습니다","toast.appsPartial":"기본 목록은 저장했지만 system_app 쓰기에 실패했습니다","toast.appsFail":"앱 목록을 불러오지 못했습니다: {msg}","toast.initFail":"초기화 실패: {msg}","toast.noKsu":"ksu 브리지를 찾지 못했습니다(KernelSU 또는 APatch 관리자 WebUI에서 여세요)","toast.statusFail":"상태 페이지를 열 수 없습니다","common.close":"닫기","common.save":"저장","tab.remote":"설정","tab.scope":"적용 범위","tab.keys":"로컬 키","tab.patch":"위장 값","status.unknown":"알 수 없음","soter.ok":"사용 가능","soter.nosign":"사용 가능(미검증 서명)","soter.stuck":"키가 멈춤","soter.off":"지원 안 함","apps.empty":"목록이 비어 있음","kb.title":"키박스(keybox)","kb.current":"현재 DeviceID","kb.fromFile":"사용자 지정","kb.self":"자체 서명","kb.aosp":"AOSP","kb.yuri":"Yuri 소스","kb.ommega":"Ommega 소스","kb.path.hint":"/data/misc/keystore/ommega/keybox.xml에 기록합니다(패널에서는 ommegadata/keybox.xml). 이전 파일은 .bak으로 보관합니다.","kb.source.hint":"\"파일에서\"는 기기의 keybox XML을 고릅니다. \"Yuri 소스\"는 GitHub에서 가져오며(미러 대체), \"Ommega 소스\"는 서버의 공개 키박스를 가져옵니다.","sk.title":"SOTER 키(로컬 대체 ATTK)","sk.current":"현재","sk.fromFile":"사용자 지정","sk.clear":"지우기(내장으로 복귀)","sk.builtin":"내장 키","sk.custom":"사용자 파일","sk.hint":"/data/misc/keystore/ommega/soter_attk.pem에 기록합니다. 인젝터 데몬이 app 도메인으로 동기화하고 SOTER 호스트를 재시작하므로 즉시 적용됩니다. 지우면 바이너리에 내장된 키로 돌아갑니다.","sk.format.hint":"PKCS#8 또는 PKCS#1 PEM이어야 합니다(openssl genpkey -algorithm RSA 출력이면 됩니다).","fp.title":"파일 선택","fp.up":"상위 폴더","fp.hint":"폴더를 누르면 들어가고 파일을 누르면 선택합니다. 현재 폴더만 표시합니다.","fp.empty":"이 폴더는 비었거나 읽을 수 없습니다","toast.kbFile":"파일에서 키박스를 기록했습니다","toast.kbBad":"그 파일은 올바른 keybox XML이 아닙니다","toast.kbFetched":"{src}에서 키박스를 갱신했습니다","toast.kbFetchFail":"가져오기 실패(네트워크 불통 또는 빈 응답)","toast.skWritten":"SOTER 키를 기록했습니다. 인젝터가 SOTER 호스트를 재시작합니다","toast.skCleared":"SOTER 키를 지웠습니다. 내장 키로 복귀","toast.fileFail":"읽기/쓰기 실패: {msg}","toast.noFile":"선택된 파일이 없습니다","kb.auto":"자동으로 가져오기","kb.auto.hint":"서버 공개 키박스 → Yuri 소스 → 내장 AOSP 순으로 시도합니다","kb.auto.working":"가져오는 중…","soter.record.selftest":"로컬 자체 검사","patch.saveAll":"저장(기기 ID 포함)","patch.short.system":"시스템","patch.short.boot":"부팅","patch.short.vendor":"벤더","patch.short.hash":"해시","patch.short.bdev":"B 측","act.use":"사용","apps.showSys":"시스템 앱 표시","apps.hideSys":"사용자 앱만 표시","apps.sysTag":"시스템","fp.go":"이동","toast.kbWritten":"키박스를 기록했습니다","patch.syncing":"동기화 중…"},
+"ru": {"patch.release":"Версия системы","patch.release.hint":"ro.build.version.release, например 16; os_version в цепочке вычисляется из него","patch.fingerprint":"Отпечаток системы","patch.fingerprint.hint":"ro.build.fingerprint, полный отпечаток сборки (синхронизируется вместе с идентификацией устройства)","soter.record":"Запись SOTER","soter.record.none":"Успешных подписей пока нет","soter.record.last":"Последняя успешная: {time} ({op})","act.clear":"Очистить","kb.fromFile.hint":"Выбрать свой keybox XML на устройстве и записать его","kb.self.hint":"Заново созданная самоподписанная цепочка EC P-256 (DeviceID=ommega-sw)","kb.aosp.hint":"Встроенная программная цепочка AOSP","kb.yuri.hint":"Загружается с GitHub, с зеркалом на замену","kb.ommega.hint":"Берёт публичный keybox с сервера","sk.fromFile.hint":"Выбрать свой PEM и записать в soter_attk.pem","sk.clear.hint":"Удалить свой файл и вернуться к встроенному ключу","about.open":"О модуле","boot":"Подключение к устройству…","status.open":"Открыть страницу состояния","status.running":"Работает","status.stopped":"Не запущен","remote.title":"Настройки","remote.save":"Сохранить и применить","remote.hint":"Когда «Удалённый keymint» выключен, устройство не связывается с сервером и не получает задачи. Остальные изменения вступают в силу после сохранения; конфигурация перечитывается сразу.","f.remote":"Удалённый keymint","f.remote.hint":"Когда выключено, устройство не использует удалённый keymint: связи с сервером и задач нет","f.url":"Адрес сервера","f.url.hint":"Базовый URL службы ретрансляции; пусто — официальный","f.token":"Токен","f.token.hint":"Проверяется сервером; пусто — официальное значение","f.debug_logging":"Отладочный журнал","f.debug_logging.hint":"Включайте при разборе проблем, обычно держите выключенным","f.adbr":"Разрешить управление через adbr","f.adbr.hint":"Открывает отдельный отладочный канал (adbrd) через публичную сеть","f.tls_insecure":"Не проверять сертификат","f.tls_insecure.hint":"Нужно только если сервер использует самоподписанный сертификат","f.global_scope":"Глобально","f.global_scope.hint":"Действует для всех приложений, а не только для списка","f.hide_strongbox":"Сообщать об отсутствии StrongBox","f.hide_strongbox.hint":"Система будет сообщать, что StrongBox не поддерживается","f.soter_hide":"Скрыть SOTER","f.soter_hide.hint":"Не объявлять поддержку SOTER","f.soter_inject":"Перехват службы SOTER","f.soter_inject.hint":"Подменяет штатный SOTER HAL своим программным TA","f.device_id":"ID отслеживаемого устройства","f.device_id.hint":"Пусто — выбор автоматически по нагрузке (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка)","apps.title":"Приложения","apps.count":"Обслуживается","apps.none":"Приложения не выбраны","apps.n":"Обслуживается приложений: {n}","apps.refresh":"Обновить","apps.search":"Поиск по имени или пакету","apps.all":"Выбрать все","apps.unall":"Снять выбор","apps.list.hint":"«Обслуживать»: приложение идёт через модуль; «·создать»: цепочка сертификатов создаётся локально; «·hack»: используется конечный сертификат. Отмеченные приложения не затрагиваются.","apps.save":"Сохранить","apps.selected":"Выбрано: {n}","apps.loading":"Загрузка списка приложений…","pick.off":"Не обслуживать","pick.normal":"Обслуживать","pick.generate":"Обслуживать · создать","pick.hack":"Обслуживать · hack","patch.title":"Подменяемые значения (хэш загрузки / патч безопасности)","patch.current":"Текущее","patch.none":"Не задано; при загрузке эти свойства не изменяются","patch.sync":"Синхронизировать с сервером и сохранить","patch.manual":"Изменить вручную","patch.sync.hint":"Запрашивает /api/status/ по указанным выше адресу сервера и ID устройства и читает хэш загрузки и три уровня патча безопасности этого устройства. Если ID пуст, автоматически выбирается устройство с рабочим keymint, заблокированным загрузчиком и проверенной загрузкой — начиная с наименее загруженного; если ID указан, используется только оно, а при его отсутствии или недоступности выдаётся ошибка.","patch.store.hint":"Значения хранятся в /data/adb/ommega/conf/props.conf и не пишутся в скрипт модуля — при обновлении модуля скрипт заменяется целиком, и записи в нём теряются. При загрузке post-fs-data.sh читает этот файл и применяет значения.","patch.hash":"Хэш загрузки","patch.hash.hint":"ro.boot.vbmeta.digest, 64 шестнадцатеричных знака","patch.system":"Патч безопасности · система","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Патч безопасности · загрузка","patch.boot.hint":"ro.bootimage.build.date.utc","patch.vendor":"Патч безопасности · вендор","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Сохранить","patch.clear":"Очистить эти пункты","patch.save.hint":"При сохранении значения применяются один раз сразу; свойства ro.* обычно ограничены системой, поэтому неудача здесь нормальна — при загрузке они всё равно применятся.","about.title":"О модуле","about.version":"Версия модуля","about.lang":"Язык интерфейса","about.qq":"Группа QQ","about.disclaimer":"Модуль выполняет ретрансляцию и подмену только на устройстве; ключевой материал не покидает его. Использование для обхода проверок или выдачи себя за других — не дело автора.","toast.saveFail":"Не удалось сохранить: {msg}","toast.saved":"Сохранено","toast.savedApplied":"Сохранено и сразу применено","toast.savedBoot":"Сохранено; вступит в силу при загрузке","toast.cleared":"Очищено; не забудьте сохранить","toast.hashBad":"Хэш загрузки должен состоять из 64 шестнадцатеричных знаков","toast.patchBad":"{field} патч безопасности должен быть в формате YYYY-MM-DD","toast.noNet":"Не удаётся получить состояние сервера (сеть недоступна?)","toast.noUrl":"Сначала укажите адрес сервера","toast.notJson":"Ответ сервера не является JSON","toast.noDevice":"Устройство {id} не найдено на сервере (не в сети?)","toast.noBoot":"Устройство ещё не сообщало сведения о загрузке","toast.noCandidate":"Нет подходящего устройства в сети (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка); в сети: {n}","toast.pickedAuto":"Автоматически выбрано {name}","toast.picked":"Сведения о загрузке получены от {name}","toast.appsSaved":"Сохранено приложений: {n}","toast.appsPartial":"Основной список сохранён, запись system_app не удалась","toast.appsFail":"Не удалось загрузить список приложений: {msg}","toast.initFail":"Ошибка инициализации: {msg}","toast.noKsu":"Мост ksu не обнаружен (откройте это из WebUI менеджера KernelSU или APatch)","toast.statusFail":"Не удалось открыть страницу состояния","common.close":"Закрыть","common.save":"Сохранить","tab.remote":"Настройки","tab.scope":"Область","tab.keys":"Локальные ключи","tab.patch":"Подменяемые значения","status.unknown":"Неизвестно","soter.ok":"Доступно","soter.nosign":"Доступно (без подписи)","soter.stuck":"Ключи зависли","soter.off":"Не поддерживается","apps.empty":"Список пуст","kb.title":"Keybox","kb.current":"Текущий DeviceID","kb.fromFile":"Свой","kb.self":"Самоподписанный","kb.aosp":"AOSP","kb.yuri":"Источник Yuri","kb.ommega":"Источник Ommega","kb.path.hint":"Записывается в /data/misc/keystore/ommega/keybox.xml (в панели это ommegadata/keybox.xml); прежний файл сохраняется как .bak.","kb.source.hint":"«Из файла» — выбрать keybox XML на устройстве; «Источник Yuri» — загрузить с GitHub (с зеркалом); «Источник Ommega» — взять публичный keybox с сервера.","sk.title":"Ключ SOTER (локальный ATTK)","sk.current":"Текущий","sk.fromFile":"Свой","sk.clear":"Очистить (вернуть встроенный)","sk.builtin":"Встроенный ключ","sk.custom":"Свой файл","sk.hint":"Записывается в /data/misc/keystore/ommega/soter_attk.pem. Демон-инжектор копирует его в домен приложений и перезапускает хост SOTER, поэтому применяется сразу; после очистки возвращается встроенный в бинарник ключ.","sk.format.hint":"Нужен PEM в формате PKCS#8 или PKCS#1 (подойдёт вывод openssl genpkey -algorithm RSA).","fp.title":"Выбор файла","fp.up":"Вверх","fp.hint":"Нажмите папку, чтобы войти, файл — чтобы выбрать. Показан только текущий каталог.","fp.empty":"Каталог пуст или недоступен","toast.kbFile":"Keybox записан из файла","toast.kbBad":"Этот файл не является корректным keybox XML","toast.kbFetched":"Keybox обновлён из {src}","toast.kbFetchFail":"Не удалось загрузить (сеть недоступна или пустой ответ)","toast.skWritten":"Ключ SOTER записан; инжектор перезапустит хост SOTER","toast.skCleared":"Ключ SOTER очищен; возвращён встроенный","toast.fileFail":"Ошибка чтения/записи: {msg}","toast.noFile":"Файл не выбран","kb.auto":"Получить автоматически","kb.auto.hint":"Пробует по порядку: публичный keybox сервера → источник Yuri → встроенный AOSP","kb.auto.working":"Загрузка…","soter.record.selftest":"локальная самопроверка","patch.saveAll":"Сохранить (вместе с ID устройства)","patch.short.system":"система","patch.short.boot":"загрузка","patch.short.vendor":"вендор","patch.short.hash":"хэш","patch.short.bdev":"Сторона B","act.use":"Использовать","apps.showSys":"Показать системные приложения","apps.hideSys":"Только пользовательские","apps.sysTag":"системное","fp.go":"Перейти","toast.kbWritten":"Keybox записан","patch.syncing":"Синхронизация…"}
 };
 
 
@@ -457,17 +457,19 @@ function exec(cmd){
 var MOD      = "/data/adb/modules/ommega";
 var STATE    = "/data/adb/ommega";
 var MODDIR   = "/data/adb/modules/ommega";     // 模块目录（injector.toml 在那）
-var DATA     = STATE + "/ommegadata";          // 指向 /data/misc/keystore/ommega 的软链
+var DATA     = STATE + "/ommegadata";          // 指向 /data/misc/ommega 的软链（唯一数据根）
 var CONF     = DATA + "/config";
 var TARGET   = DATA + "/target.txt";
 var SYSTEMAPP= DATA + "/system_app";
-var KEYBOX   = DATA + "/keybox.xml";
-/* StrongBox 级别的单独 keybox（可选）：文件不存在就沿用 KEYBOX。 */
+var KEYBOX   = DATA + "/keybox_tee.xml";
+/* StrongBox 级别那份 keybox：跟上面 TEE 那份互不共用，缺了就写内置的 StrongBox 自签。 */
 var KEYBOX_SB = DATA + "/keybox_strongbox.xml";
-var ASKPEM   = DATA + "/soter_ask.pem";
+var ATTK_PEM  = DATA + "/soter_attk.pem";
 var PROPS    = STATE + "/conf/props.conf";      // 面板写的伪装项（不写进模块脚本）
 var RESETPROP= STATE + "/bin/resetprop";
 
+/* 表单的出厂默认值：指向默认服务端。面板里的 url/token 一旦保存就以配置为准，
+   这里只是首次打开时的预填值。 */
 var DEFAULTS = { url: "http://110.40.170.96:10886", token: "aY7kRSDDR6PMmamlKwtgf7mQgr-X5uFd" };
 
 var REMOTE_FIELDS = [
@@ -565,33 +567,33 @@ Object.keys(CAP_MASK_TEXT).forEach(function(code){
   I18N[code]["toast.maskFail"] = s.fail;
 });
 
-/* 本地兜底那把密钥的文案。它在本机是**签名根（ATTK）**：面板选的自定义文件写进
-   soter_ask.pem，注入器就拿它当 ATTK；跟真机一样 ASK 是另一把，需要时单独放
-   soter_ask_key.pem（不放就沿用旧行为：ASK 兼作 ATTK）。 */
+/* 本机兜底 ATTK 的文案。它在本机是**签名根（ATTK）**：面板选的自定义文件写进
+   soter_attk.pem，注入器就拿它当 ATTK。ASK 完全是自动的（按 uid 现生成、落盘复用），
+   不需要也不应该让人干预；清除自定义文件就回到构建时生成、编进二进制的内置 ATTK。 */
 var SOTER_KEY_TEXT = {
-  "zh-CN": { title: "SOTER 密钥（本地兜底 ATTK）",
-    hint: "写入 /data/misc/keystore/ommega/soter_ask.pem，注入器守护会同步到 app 域并重启 SOTER 宿主，随即生效；清除后回到二进制里内置的那把。它在本机是签名根（ATTK）；ASK 是另一把，需要时单独放 soter_ask_key.pem，不放就沿用旧行为（ASK 兼作 ATTK）。",
-    fromFile: "选一份自己的 PEM（PKCS#8）写入 soter_ask.pem，充当本机兜底的 ATTK",
-    clear: "删除自定义文件，回到内置那把 ATTK" },
-  "zh-TW": { title: "SOTER 金鑰（本機兜底 ATTK）",
-    hint: "寫入 /data/misc/keystore/ommega/soter_ask.pem，注入器守護會同步到 app 領域並重啟 SOTER 宿主，隨即生效；清除後回到二進位內建的那把。它在本機是簽名根（ATTK）；ASK 是另一把，需要時單獨放 soter_ask_key.pem，不放就沿用舊行為。",
-    fromFile: "選一份自己的 PEM（PKCS#8）寫入 soter_ask.pem，當作本機兜底的 ATTK",
-    clear: "刪除自訂檔案，回到內建那把 ATTK" },
-  "en": { title: "SOTER key (local fallback ATTK)",
-    hint: "Written to /data/misc/keystore/ommega/soter_ask.pem; the injector daemon mirrors it into the app domain and restarts the SOTER host, so it applies at once. On this device it is the signing root (ATTK); ASK is a separate key — drop soter_ask_key.pem in the same directory if you want one, otherwise ASK doubles as ATTK as before.",
-    fromFile: "Pick your own PEM (PKCS#8) for soter_ask.pem, used as the local fallback ATTK",
+  "zh-CN": { title: "本机兜底 ATTK",
+    hint: "写入 /data/misc/keystore/ommega/soter_attk.pem，注入器守护会同步到 app 域并重启 SOTER 宿主，随即生效；清除后回到构建时生成、编进二进制的内置 ATTK。这里是签名根（ATTK），ASK 由程序按 uid 自动生成，不需要放文件。",
+    fromFile: "选一份自己的 PEM（PKCS#8 / PKCS#1）写入 soter_attk.pem，充当本机兜底的 ATTK",
+    clear: "删除自定义文件，回到内置 ATTK" },
+  "zh-TW": { title: "本機兜底 ATTK",
+    hint: "寫入 /data/misc/keystore/ommega/soter_attk.pem，注入器守護會同步到 app 領域並重啟 SOTER 宿主，隨即生效；清除後回到建置時生成、編進二進位的內建 ATTK。這裡是簽名根（ATTK），ASK 由程式按 uid 自動生成，不需要放檔案。",
+    fromFile: "選一份自己的 PEM（PKCS#8 / PKCS#1）寫入 soter_attk.pem，當作本機兜底的 ATTK",
+    clear: "刪除自訂檔案，回到內建 ATTK" },
+  "en": { title: "Local fallback ATTK",
+    hint: "Written to /data/misc/keystore/ommega/soter_attk.pem; the injector daemon mirrors it into the app domain and restarts the SOTER host, so it applies at once. This is the signing root (ATTK); ASKs are generated automatically per uid and never need a file. Clearing restores the built-in ATTK generated at build time.",
+    fromFile: "Pick your own PEM (PKCS#8 / PKCS#1) for soter_attk.pem, used as the local fallback ATTK",
     clear: "Remove the custom file and go back to the built-in ATTK" },
-  "ja": { title: "SOTER 鍵（ローカル代替 ATTK）",
-    hint: "/data/misc/keystore/ommega/soter_ask.pem に書き込みます。インジェクタが app ドメインへ同期し SOTER ホストを再起動するため即時反映。本機ではこれが署名のルート（ATTK）です。ASK は別の鍵で、必要なら同じ場所に soter_ask_key.pem を置きます（置かなければ従来どおり ASK が ATTK を兼ねます）。",
-    fromFile: "自分の PEM（PKCS#8）を選んで soter_ask.pem に書き込み、ローカル代替の ATTK にします",
+  "ja": { title: "ローカル代替 ATTK",
+    hint: "/data/misc/keystore/ommega/soter_attk.pem に書き込みます。インジェクタが app ドメインへ同期し SOTER ホストを再起動するため即時反映。ここは署名のルート（ATTK）です。ASK はプログラムが uid ごとに自動生成するもので、ファイルを置く必要はありません。消去するとビルド時に生成した内蔵 ATTK に戻ります。",
+    fromFile: "自分の PEM（PKCS#8 / PKCS#1）を選んで soter_attk.pem に書き込み、ローカル代替の ATTK にします",
     clear: "カスタムファイルを削除し、内蔵の ATTK に戻します" },
-  "ko": { title: "SOTER 키(로컬 대체 ATTK)",
-    hint: "/data/misc/keystore/ommega/soter_ask.pem에 기록합니다. 인젝터 데몬이 app 도메인으로 동기화하고 SOTER 호스트를 재시작하므로 즉시 적용됩니다. 이 기기에서 이것이 서명 루트(ATTK)입니다. ASK는 별도 키이며 필요하면 같은 위치에 soter_ask_key.pem을 두세요(없으면 예전처럼 ASK가 ATTK를 겸합니다).",
-    fromFile: "자신의 PEM(PKCS#8)을 골라 soter_ask.pem에 기록해 로컬 대체 ATTK로 사용",
+  "ko": { title: "로컬 대체 ATTK",
+    hint: "/data/misc/keystore/ommega/soter_attk.pem에 기록합니다. 인젝터 데몬이 app 도메인으로 동기화하고 SOTER 호스트를 재시작하므로 즉시 적용됩니다. 여기가 서명 루트(ATTK)입니다. ASK는 프로그램이 uid별로 자동 생성하며 파일을 둘 필요가 없습니다. 지우면 빌드 시 생성한 내장 ATTK로 돌아갑니다.",
+    fromFile: "자신의 PEM(PKCS#8 / PKCS#1)을 골라 soter_attk.pem에 기록해 로컬 대체 ATTK로 사용",
     clear: "사용자 파일을 지우고 내장 ATTK로 돌아갑니다" },
-  "ru": { title: "Ключ SOTER (локальный ATTK)",
-    hint: "Записывается в /data/misc/keystore/ommega/soter_ask.pem; демон-инжектор копирует его в домен приложений и перезапускает хост SOTER, поэтому применяется сразу. Здесь это корень подписи (ATTK); ASK — отдельный ключ, при необходимости положите рядом soter_ask_key.pem (иначе ASK по-прежнему выполняет роль ATTK).",
-    fromFile: "Выбрать свой PEM (PKCS#8) для soter_ask.pem в качестве локального ATTK",
+  "ru": { title: "Локальный ATTK",
+    hint: "Записывается в /data/misc/keystore/ommega/soter_attk.pem; демон-инжектор копирует его в домен приложений и перезапускает хост SOTER, поэтому применяется сразу. Это корень подписи (ATTK); ASK генерируются автоматически для каждого uid, файл для них не нужен. Очистка возвращает встроенный ATTK, созданный при сборке.",
+    fromFile: "Выбрать свой PEM (PKCS#8 / PKCS#1) для soter_attk.pem в качестве локального ATTK",
     clear: "Удалить свой файл и вернуться к встроенному ATTK" }
 };
 /* 「伪装参数 → 手动编辑」里机型那几项的标签。值会写进 props.conf，开机时统一应用；
@@ -657,6 +659,30 @@ Object.keys(SOTER_KEY_TEXT).forEach(function(code){
   I18N[code]["sk.fromFile.hint"] = s.fromFile;
   I18N[code]["sk.clear.hint"] = s.clear;
 });
+/* 那个卡片的两个状态值：内置（构建时生成、编进二进制）和自定义文件。 */
+var ATTK_STATE_TEXT = {
+  "zh-CN": { builtin: "内置（构建时生成）", custom: "自定义文件", fromFile: "自定义 ATTK",
+    written: "已写入自定义 ATTK，注入器会重启 SOTER 宿主", cleared: "已删除自定义 ATTK，回到内置 ATTK" },
+  "zh-TW": { builtin: "內建（建置時生成）", custom: "自訂檔案", fromFile: "自訂 ATTK",
+    written: "已寫入自訂 ATTK，注入器會重啟 SOTER 宿主", cleared: "已刪除自訂 ATTK，回到內建 ATTK" },
+  "en": { builtin: "Built-in (generated at build time)", custom: "Custom file", fromFile: "Custom ATTK",
+    written: "Custom ATTK written; the injector will restart the SOTER host", cleared: "Custom ATTK removed; back to the built-in one" },
+  "ja": { builtin: "内蔵（ビルド時生成）", custom: "カスタムファイル", fromFile: "カスタム ATTK",
+    written: "カスタム ATTK を書き込みました。インジェクタが SOTER ホストを再起動します", cleared: "カスタム ATTK を削除し、内蔵 ATTK に戻しました" },
+  "ko": { builtin: "내장(빌드 시 생성)", custom: "사용자 파일", fromFile: "사용자 지정 ATTK",
+    written: "사용자 지정 ATTK를 기록했습니다. 인젝터가 SOTER 호스트를 재시작합니다", cleared: "사용자 지정 ATTK를 지우고 내장 ATTK로 돌아갔습니다" },
+  "ru": { builtin: "Встроенный (создан при сборке)", custom: "Свой файл", fromFile: "Свой ATTK",
+    written: "Свой ATTK записан; инжектор перезапустит хост SOTER", cleared: "Свой ATTK удалён; вернулись к встроенному" }
+};
+Object.keys(ATTK_STATE_TEXT).forEach(function(code){
+  if (!I18N[code]) return;
+  var s = ATTK_STATE_TEXT[code];
+  I18N[code]["sk.builtin"] = s.builtin;
+  I18N[code]["sk.custom"] = s.custom;
+  I18N[code]["sk.fromFile"] = s.fromFile;
+  I18N[code]["toast.skWritten"] = s.written;
+  I18N[code]["toast.skCleared"] = s.cleared;
+});
 var MANAGED = REMOTE_FIELDS.map(function(f){ return f.key; });
 var curConfText = "", curPropsText = "";
 /* 伪装参数写进 props.conf 的键。两组：
@@ -666,7 +692,8 @@ var curConfText = "", curPropsText = "";
    拿到的身份也是这么铺的（品牌/型号这类属性不少 ROM 会优先读分区级那份），只写根级会出现
    两套值互相矛盾。*/
 var PATCH_KEYS = ["ro.boot.vbmeta.digest", "ro.build.version.security_patch",
-                  "ro.boot.build.security_patch", "ro.vendor.build.security_patch"];
+                  "ro.vendor.build.security_patch",
+                  "ro.bootimage.build.date.utc", "ro.bootimage.build.date"];
 var IDENT_ROOT_KEYS = ["ro.product.brand", "ro.product.device", "ro.product.name",
                        "ro.product.manufacturer", "ro.product.model"];
 var IDENT_PART_KEYS = [];
@@ -692,41 +719,41 @@ async function loadOwnPatch(){
 }
 /* StrongBox 级别单独一份 keybox 的文案。没配就沿用「本地密钥」那份，行为跟以前一致。 */
 var SBKB_TEXT = {
-  "zh-CN": { title: "StrongBox 级别密钥（可选）", current: "当前",
+  "zh-CN": { title: "StrongBox 级别密钥", current: "当前",
     fromFile: "自定义（StrongBox）", fromFileHint: "选一份 keybox XML，只给 StrongBox 级别（security level 2）用",
-    clear: "清除", clearHint: "删掉这份，StrongBox 级别回到沿用上面那份",
-    hint: "写入 keybox_strongbox.xml。两份分开之后，TEE 请求用上面那份、StrongBox 请求用这份；没有这份时两个级别共用同一份。",
-    written: "已写入 StrongBox 级别的 keybox", cleared: "已清除，StrongBox 回到沿用上面那份",
+    clear: "恢复内置自签", clearHint: "把这份换回内置的 StrongBox 自签 keybox",
+    hint: "写入 keybox_strongbox.xml，只给 StrongBox 级别用。TEE 那份在上面，两份互不共用。这里没有在线来源：只能选文件或恢复内置。",
+    written: "已写入 StrongBox 级别的 keybox", cleared: "已恢复内置的 StrongBox keybox",
     set: "已配置", setId: "已配置 · {id}", unset: "未配置（沿用上面那份）" },
-  "zh-TW": { title: "StrongBox 級別密鑰（可選）", current: "目前",
+  "zh-TW": { title: "StrongBox 級別密鑰", current: "目前",
     fromFile: "自訂（StrongBox）", fromFileHint: "選一份 keybox XML，只給 StrongBox 級別用",
-    clear: "清除", clearHint: "刪掉這份，StrongBox 回到沿用上面那份",
-    hint: "寫入 keybox_strongbox.xml。兩份分開之後，TEE 請求用上面那份、StrongBox 請求用這份。",
-    written: "已寫入 StrongBox 級別的 keybox", cleared: "已清除，StrongBox 回到沿用上面那份",
+    clear: "恢復內建自簽", clearHint: "把這份換回內建的 StrongBox 自簽 keybox",
+    hint: "寫入 keybox_strongbox.xml，只給 StrongBox 級別用。TEE 那份在上面，兩份互不共用。這裡沒有線上來源：只能選檔案或恢復內建。",
+    written: "已寫入 StrongBox 級別的 keybox", cleared: "已恢復內建的 StrongBox keybox",
     set: "已設定", setId: "已設定 · {id}", unset: "未設定（沿用上面那份）" },
-  "en": { title: "StrongBox keybox (optional)", current: "Current",
+  "en": { title: "StrongBox keybox", current: "Current",
     fromFile: "Custom (StrongBox)", fromFileHint: "Pick a keybox XML used only for the StrongBox level (security level 2)",
-    clear: "Clear", clearHint: "Remove it so the StrongBox level falls back to the keybox above",
-    hint: "Written to keybox_strongbox.xml. With both files set, TEE requests use the one above and StrongBox requests use this one; without this file both levels share the same keybox.",
-    written: "StrongBox keybox written", cleared: "Cleared; the StrongBox level falls back to the keybox above",
+    clear: "Restore built-in", clearHint: "Put the bundled StrongBox keybox back",
+    hint: "Written to keybox_strongbox.xml and used only for the StrongBox level. TEE uses the keybox above; the two never share. There is no online source here: pick a file or restore the built-in one.",
+    written: "StrongBox keybox written", cleared: "Bundled StrongBox keybox restored",
     set: "Configured", setId: "Configured · {id}", unset: "Not configured (uses the keybox above)" },
-  "ja": { title: "StrongBox 用キーボックス（任意）", current: "現在",
+  "ja": { title: "StrongBox 用キーボックス", current: "現在",
     fromFile: "カスタム（StrongBox）", fromFileHint: "StrongBox レベル専用の keybox XML を選ぶ",
-    clear: "消去", clearHint: "削除すると StrongBox は上のキーボックスを使う",
-    hint: "keybox_strongbox.xml に書き込みます。両方あるときは TEE が上、StrongBox がこちらを使います。",
-    written: "StrongBox 用キーボックスを書き込みました", cleared: "消去しました（上のキーボックスを使用）",
+    clear: "内蔵に戻す", clearHint: "同梱の StrongBox キーボックスに戻す",
+    hint: "keybox_strongbox.xml に書き込み、StrongBox レベルだけで使います。TEE は上のキーボックスを使い、二つは共用しません。ここにオンライン取得はありません。",
+    written: "StrongBox 用キーボックスを書き込みました", cleared: "同梱の StrongBox キーボックスに戻しました",
     set: "設定済み", setId: "設定済み · {id}", unset: "未設定（上のキーボックスを使用）" },
-  "ko": { title: "StrongBox 전용 키박스(선택)", current: "현재",
+  "ko": { title: "StrongBox 전용 키박스", current: "현재",
     fromFile: "사용자 지정(StrongBox)", fromFileHint: "StrongBox 레벨에만 쓸 keybox XML을 고르세요",
-    clear: "지우기", clearHint: "지우면 StrongBox는 위 키박스를 사용합니다",
-    hint: "keybox_strongbox.xml에 기록합니다. 둘 다 있으면 TEE는 위, StrongBox는 이 파일을 씁니다.",
-    written: "StrongBox 키박스를 기록했습니다", cleared: "지웠습니다(위 키박스 사용)",
+    clear: "내장으로 복귀", clearHint: "내장 StrongBox 키박스로 되돌립니다",
+    hint: "keybox_strongbox.xml에 기록하며 StrongBox 레벨에만 씁니다. TEE는 위 키박스를 쓰고 둘은 공유하지 않습니다. 여기에는 온라인 소스가 없습니다.",
+    written: "StrongBox 키박스를 기록했습니다", cleared: "내장 StrongBox 키박스로 복귀했습니다",
     set: "설정됨", setId: "설정됨 · {id}", unset: "설정 안 됨(위 키박스 사용)" },
-  "ru": { title: "Keybox для StrongBox (необязательно)", current: "Текущий",
+  "ru": { title: "Keybox для StrongBox", current: "Текущий",
     fromFile: "Свой (StrongBox)", fromFileHint: "Выберите keybox XML только для уровня StrongBox",
-    clear: "Очистить", clearHint: "Удалить файл, чтобы StrongBox использовал keybox выше",
-    hint: "Пишется в keybox_strongbox.xml. Если заданы оба, TEE берёт верхний, StrongBox — этот.",
-    written: "Keybox для StrongBox записан", cleared: "Очищено; StrongBox использует keybox выше",
+    clear: "Вернуть встроенный", clearHint: "Вернуть встроенный keybox StrongBox",
+    hint: "Пишется в keybox_strongbox.xml и используется только уровнем StrongBox. TEE берёт верхний keybox; они не совмещаются. Онлайн-источников здесь нет.",
+    written: "Keybox для StrongBox записан", cleared: "Встроенный keybox StrongBox восстановлен",
     set: "Настроен", setId: "Настроен · {id}", unset: "Не настроен (используется keybox выше)" }
 };
 Object.keys(SBKB_TEXT).forEach(function(code){
@@ -744,6 +771,59 @@ Object.keys(SBKB_TEXT).forEach(function(code){
   I18N[code]["sbkb.set"] = s.set;
   I18N[code]["sbkb.setId"] = s.setId;
   I18N[code]["sbkb.unset"] = s.unset;
+});
+
+/* 主 keybox 那份的文案：它就是 TEE 级别用的，跟上面 StrongBox 那份彻底分开。
+   在线源（服务器公开库、Yuri、AOSP）只能写这份 —— 它们都是 TEE/软件链，
+   写进 StrongBox 那份就是又一个级别串了的坑。 */
+var TEEKB_TEXT = {
+  "zh-CN": { title: "TEE 级别密钥（主 keybox）", self: "内置 TEE 自签",
+    selfHint: "内置的 TEE 自签三级链（DeviceID=c3315922…），跟本机 TEE 级别对应",
+    autoHint: "依次试：服务器公开库 → Yuri 源 → 内置 TEE 自签；只更新这一份（TEE）",
+    yuriHint: "从 GitHub 抓取，含镜像回退；只更新这一份（TEE）",
+    ommegaHint: "取服务器上的公开密钥库；只更新这一份（TEE）",
+    pathHint: "写入 /data/misc/keystore/ommega/keybox_tee.xml，TEE 级别专用。StrongBox 那份在下面的卡片里单独设，旧档会备份为 .bak。" },
+  "zh-TW": { title: "TEE 級別密鑰（主 keybox）", self: "內建 TEE 自簽",
+    selfHint: "內建的 TEE 自簽三級鏈（DeviceID=c3315922…），跟本機 TEE 級別對應",
+    autoHint: "依序試：伺服器公開庫 → Yuri 來源 → 內建 TEE 自簽；只更新這一份（TEE）",
+    yuriHint: "從 GitHub 抓取，含鏡像回退；只更新這一份（TEE）",
+    ommegaHint: "取伺服器上的公開金鑰庫；只更新這一份（TEE）",
+    pathHint: "寫入 /data/misc/keystore/ommega/keybox_tee.xml，TEE 級別專用。StrongBox 那份在下面的卡片單獨設定，舊檔備份為 .bak。" },
+  "en": { title: "TEE keybox (primary)", self: "Built-in TEE",
+    selfHint: "Bundled self-signed TEE chain (DeviceID=c3315922…), matching this device's TEE level",
+    autoHint: "Tries in order: server public keybox → Yuri source → built-in TEE; updates only this one (TEE)",
+    yuriHint: "Fetched from GitHub with a mirror fallback; updates only this one (TEE)",
+    ommegaHint: "Fetches the public keybox from the server; updates only this one (TEE)",
+    pathHint: "Written to /data/misc/keystore/ommega/keybox_tee.xml, TEE level only. The StrongBox keybox is set in the card below; the old file is kept as .bak." },
+  "ja": { title: "TEE 用キーボックス（メイン）", self: "内蔵 TEE 自前署名",
+    selfHint: "同梱の TEE 自前署名チェーン（DeviceID=c3315922…）。本機の TEE レベルに対応",
+    autoHint: "サーバー公開庫 → Yuri ソース → 内蔵 TEE 自前署名の順に試し、この 1 つ（TEE）だけを更新します",
+    yuriHint: "GitHub から取得（ミラーへ退避）。この 1 つ（TEE）だけを更新します",
+    ommegaHint: "サーバーの公開キーボックスを取得。この 1 つ（TEE）だけを更新します",
+    pathHint: "/data/misc/keystore/ommega/keybox_tee.xml に書き込み、TEE レベル専用。StrongBox は下のカードで別に設定します。" },
+  "ko": { title: "TEE 키박스(기본)", self: "내장 TEE 자체 서명",
+    selfHint: "내장 TEE 자체 서명 체인(DeviceID=c3315922…), 이 기기의 TEE 레벨에 대응",
+    autoHint: "서버 공개 키박스 → Yuri 소스 → 내장 TEE 자체 서명 순으로 시도하며 이 파일(TEE)만 갱신합니다",
+    yuriHint: "GitHub에서 가져옵니다(미러 대체). 이 파일(TEE)만 갱신합니다",
+    ommegaHint: "서버의 공개 키박스를 가져옵니다. 이 파일(TEE)만 갱신합니다",
+    pathHint: "/data/misc/keystore/ommega/keybox_tee.xml에 기록하며 TEE 레벨 전용입니다. StrongBox는 아래 카드에서 따로 설정합니다." },
+  "ru": { title: "Keybox уровня TEE (основной)", self: "Встроенный TEE",
+    selfHint: "Встроенная самоподписанная цепочка TEE (DeviceID=c3315922…), соответствует уровню TEE",
+    autoHint: "По порядку: публичный keybox сервера → источник Yuri → встроенный TEE; обновляет только этот (TEE)",
+    yuriHint: "Загружается с GitHub с зеркалом; обновляет только этот (TEE)",
+    ommegaHint: "Берёт публичный keybox с сервера; обновляет только этот (TEE)",
+    pathHint: "Пишется в /data/misc/keystore/ommega/keybox_tee.xml, только для уровня TEE. StrongBox задаётся в карточке ниже." }
+};
+Object.keys(TEEKB_TEXT).forEach(function(code){
+  if (!I18N[code]) return;
+  var s = TEEKB_TEXT[code];
+  I18N[code]["kb.title"] = s.title;
+  I18N[code]["kb.self"] = s.self;
+  I18N[code]["kb.self.hint"] = s.selfHint;
+  I18N[code]["kb.auto.hint"] = s.autoHint;
+  I18N[code]["kb.yuri.hint"] = s.yuriHint;
+  I18N[code]["kb.ommega.hint"] = s.ommegaHint;
+  I18N[code]["kb.path.hint"] = s.pathHint;
 });
 
 /* 看一眼那份 StrongBox keybox 在不在，顺手把 DeviceID 读出来。 */
@@ -791,13 +871,40 @@ var IDENT_FIELDS = [
 ];
 /* 表单里的全部输入框：前两项是启动链那对数（模式2 只动这两项）。 */
 function patchInputs(){
-  return [["boot-hash", "ro.boot.vbmeta.digest"], ["patch-boot", "ro.boot.build.security_patch"]].concat(IDENT_FIELDS);
+  return [["boot-hash", "ro.boot.vbmeta.digest"], ["patch-boot", ""]].concat(IDENT_FIELDS);
 }
 var patchValues = {};
 var fpTarget = "";           // 选文件的目标：keybox / ask
 var fpDir = "/sdcard/Download";
 
 /* -------------------------------- 小工具 --------------------------------- */
+/* boot 补丁日期最终落到 ro.bootimage.build.date.utc：这是台机器上真实存在的属性
+   （resetprop 能改），keymint 的 boot_patchlevel="auto" 也正是从它推出来的 —— 改它
+   属性和证书就天然一致。面板上仍然让用户填 YYYY-MM-DD，这里做双向换算。 */
+function patchDateToEpoch(text){
+  var t = Date.parse(text + "T00:00:00Z");
+  return isNaN(t) ? 0 : Math.floor(t / 1000);
+}
+function epochToPatchDate(epoch){
+  var n = parseInt(epoch, 10);
+  if (!n) return "";
+  var d = new Date(n * 1000);
+  return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") +
+         "-" + String(d.getUTCDate()).padStart(2, "0");
+}
+/* `ro.bootimage.build.date` 那种给人看的格式（Java 风格），跟原厂值一个长相。 */
+function epochToPatchDateText(epoch){
+  var n = parseInt(epoch, 10);
+  if (!n) return "";
+  var d = new Date(n * 1000);
+  var wd = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()];
+  var mo = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getUTCMonth()];
+  var dd = String(d.getUTCDate()).padStart(2, " ");
+  return wd + " " + mo + " " + dd + " " +
+         String(d.getUTCHours()).padStart(2, "0") + ":" +
+         String(d.getUTCMinutes()).padStart(2, "0") + ":" +
+         String(d.getUTCSeconds()).padStart(2, "0") + " UTC " + d.getUTCFullYear();
+}
 function el(tag, cls, text){ var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
 /* 动态文本（SOTER 记录、密钥状态、进程状态、应用计数…）是渲染时用 t() 算好塞进去的，
    data-i18n 扫不到，切语言后会停在旧语言。setT 把「用的哪个键、带什么变量」记在元素上，
@@ -1518,9 +1625,9 @@ async function loadApps(){
    就有结论的那一条，不用等新调用。本机没记录才退回看跟随设备上报的能力。 */
 var soterState = "unknown";
 var soterRecord = null;
-/* soter_ask.pem 是否存在。缓存成布尔值，切语言时直接拿它重绘「目前」那一行，
-   不必再跑一次 shell；refreshAsk 每次读完文件都会同步它。 */
-var askCustom = false;
+/* soter_attk.pem 是否存在。缓存成布尔值，切语言时直接拿它重绘「目前」那一行，
+   不必再跑一次 shell；refreshAttk 每次读完文件都会同步它。 */
+var attkCustom = false;
 
 async function readSoterRecord(){
   var r = await exec("tail -n 1 /data/misc/ommega/soter_ok 2>/dev/null");
@@ -1613,6 +1720,7 @@ async function httpGetText(url, budget){
 }
 async function fetchStatus(){
   var base = serverBase();
+  if (!base) throw new Error(t("toast.noUrl"));
   if (base.indexOf("'") >= 0) throw new Error(t("toast.noNet"));
   /* 套一层硬超时：信号差或服务器不答时请求能挂很久，面板就跟着一直转。 */
   var out;
@@ -1670,7 +1778,8 @@ async function fetchKeybox(urls, src){
 const YURI_URLS = ["https://raw.githubusercontent.com/Yurii0307/yurikey/main/key",
                    "https://hub.gitmirror.com/raw.githubusercontent.com/Yurii0307/yurikey/main/key"];
 /* 「自动获取」：用户不关心来源，只想拿到能用的密钥库 —— 依次试服务器公开库、
-   Yuri 源，都不行就上内置的 AOSP（本地就有的东西）。 */
+   Yuri 源，都不行就上内置的 TEE 自签（本地就有的东西，而且级别对得上）。
+   不退回 AOSP：那是软件链，TEE 请求拿它出去就又串了。 */
 async function autoKeybox(){
   toast(t("kb.auto.working"));
   var xml = null, src = "";
@@ -1681,17 +1790,17 @@ async function autoKeybox(){
   if (!xml){
     try { xml = await tryFetchKeybox(YURI_URLS); if (xml) src = "Yurikey"; } catch (e){}
   }
-  if (!xml){ await writeKeybox(builtinXml("kb-aosp-xml"), ""); return; }
+  if (!xml){ await writeKeybox(builtinXml("kb-self-xml"), ""); return; }
   await writeKeybox(xml, src);
 }
-function paintAsk(){
+function paintAttk(){
   var e = document.getElementById("sk-state");
-  if (e) setT(e, askCustom ? "sk.custom" : "sk.builtin");
+  if (e) setT(e, attkCustom ? "sk.custom" : "sk.builtin");
 }
-async function refreshAsk(){
-  var r = await exec("[ -f " + ASKPEM + " ] && echo yes || echo no");
-  askCustom = (r.stdout || "").trim() === "yes";
-  paintAsk();
+async function refreshAttk(){
+  var r = await exec("[ -f " + ATTK_PEM + " ] && echo yes || echo no");
+  attkCustom = (r.stdout || "").trim() === "yes";
+  paintAttk();
 }
 
 /* ------------------------------- 选文件窗 ------------------------------- */
@@ -1730,13 +1839,25 @@ async function fpPick(path){
   if (!path){ toast(t("toast.noFile"), true); return; }
   var dst = (fpTarget === "keybox") ? KEYBOX
           : (fpTarget === "sbkeybox") ? KEYBOX_SB
-          : ASKPEM;
+          : ATTK_PEM;
   var r = await exec("cp -f '" + path.replace(/'/g, "'\\''") + "' '" + dst + "' 2>/dev/null && chmod 0644 '" + dst + "' && echo ok");
   if (r.errno !== 0 || (r.stdout || "").indexOf("ok") < 0){ toast(t("toast.fileFail", {msg: r.stderr || r.errno}), true); return; }
+  // 切 ATTK 时同步 cpu_id：文件带了 `cpu_id: xxx` 就用它（重放别台设备的 ATTK 时要
+  // 跟那台报同一个号），没带就把强制值删掉，回到本机属性现算。
+  if (fpTarget === "sk"){
+    var g = await exec("grep -m1 -Ei '^[[:space:]]*cpu_id[[:space:]]*:' '" + path.replace(/'/g, "'\\''") + "' 2>/dev/null");
+    var line = ((g && g.stdout) || "").trim();
+    var cpu = line ? line.replace(/^[^:]*:[[:space:]]*/, "").trim() : "";
+    if (cpu) {
+      await exec("mkdir -p /data/misc/ommega && printf '%s\\n' 'cpu_id: " + cpu.replace(/'/g, "'\\''") + "' > /data/misc/ommega/soter_cpu_id.force");
+    } else {
+      await exec("rm -f /data/misc/ommega/soter_cpu_id.force");
+    }
+  }
   fpClose();
   if (fpTarget === "keybox"){ toast(t("toast.kbFile")); }
   else if (fpTarget === "sbkeybox"){ toast(t("sbkb.written")); refreshStrongboxKeybox(); }
-  else { toast(t("toast.skWritten")); refreshAsk(); }
+  else { toast(t("toast.skWritten")); refreshAttk(); }
 }
 
 async function openSysApp(){
@@ -1746,26 +1867,15 @@ async function openSysApp(){
 }
 
 /* --------------------------------- 动作 --------------------------------- */
-/* 两个能力开关（StrongBox / 设备 ID 认证）都只落到模块自己的一份声明 XML：
-   /data/adb/modules/ommega/system/etc/permissions/ommega-capability-mask.xml
-   里面写 <unavailable-feature name="..." />，SystemConfig 读完所有权限 XML 后会把同名
-   feature 从可用表删掉，于是 PackageManager、feature 枚举、以及进程里的
-   SystemFeaturesCache 拿到的是同一份「本机没有这个能力」。
-   为什么不种 whiteout / 不 bind 厂商那份 XML：那两条都要动真实分区的文件，整份文件被清掉
-   会连带同文件里的 app_attest_key 一起消失；万一内容不合法（暂存文件复用踩过一次），
-   system_server 解析 /odm/etc/permissions 失败，设备直接开不了机。
-   XML 必须赶在 system_server 之前就位，所以保存时先写一遍，重启后由 post-fs-data 再对齐一次。 */
+/* 两个能力开关（StrongBox / 设备 ID 认证）现在完全由模块自己处理：
+   post-fs-data 里把厂商那份权限 XML 拓一份、删掉对应 <feature> 行，单文件 bind 盖回去，
+   system_server 读完权限 XML 之后（service.sh 等 boot_completed）再 umount -l 撤掉。
+   模块里已经不放 system/ 目录了，所以 metamodule（mountify 之类）不会再纳管 ommega。
+   面板这边只负责把开关落成 mask.state（post-fs-data 会读）+ config，不需要写 XML。 */
 async function syncCapabilityMask(sb, ids){
-  var dir = MODDIR + "/system/etc/permissions";
-  var f = dir + "/ommega-capability-mask.xml";
-  var lines = ['<?xml version="1.0" encoding="utf-8"?>', '<permissions>'];
-  if (sb) lines.push('  <unavailable-feature name="android.hardware.strongbox_keystore" />');
-  if (ids) lines.push('  <unavailable-feature name="android.software.device_id_attestation" />');
-  lines.push('</permissions>');
-  var args = lines.map(function(s){ return "'" + s.replace(/'/g, "'\\''") + "'"; });
-  var cmd = 'mkdir -p ' + dir + ' && printf \'%s\\n\' ' + args.join(" ") +
-            ' > ' + f + '.new && mv -f ' + f + '.new ' + f + ' && chmod 644 ' + f;
-  var r = await exec(cmd);
+  var text = "hide_strongbox=" + (sb ? 1 : 0) + "\n" + "hide_device_ids=" + (ids ? 1 : 0) + "\n";
+  var r = await exec("mkdir -p " + STATE + "/conf && printf '%s' '" + text.replace(/'/g, "'\\''") +
+                     "' > " + STATE + "/conf/mask.state");
   return Number(r.errno) === 0;
 }
 
@@ -1795,7 +1905,9 @@ async function openExternal(url, fallback){
   } catch (e){ toast(t("toast.statusFail"), true); }
 }
 async function openStatus(){
-  await openExternal(serverBase() + "/status");
+  var base = serverBase();
+  if (!base){ toast(t("toast.noUrl"), true); return; }
+  await openExternal(base + "/status");
 }
 async function saveApps(){
   var normal = [], generate = [], hack = [];
@@ -2009,12 +2121,19 @@ async function syncPatch(){
   var hash = String(b.boot_hash || "").toLowerCase();
   if (/^[0-9a-f]{64}$/.test(hash)) kv["ro.boot.vbmeta.digest"] = hash;
   var bootPatch = patchDate(b.patch_boot);
-  if (bootPatch) kv["ro.boot.build.security_patch"] = bootPatch;
+  if (bootPatch){
+    var bootEpoch = patchDateToEpoch(bootPatch);
+    if (bootEpoch){
+      kv["ro.bootimage.build.date.utc"] = String(bootEpoch);
+      kv["ro.bootimage.build.date"] = epochToPatchDateText(bootEpoch);
+    }
+  }
   if (!(await writePropsKV(kv))) return;
   await saveRemote();
   /* 只当场该那两项：重启前 zygote 里的 Build 已经固化，身份那几项只能等下次开机。 */
   var now = {};
-  if (kv["ro.boot.build.security_patch"]) now["ro.boot.build.security_patch"] = kv["ro.boot.build.security_patch"];
+  if (kv["ro.bootimage.build.date.utc"]) now["ro.bootimage.build.date.utc"] = kv["ro.bootimage.build.date.utc"];
+  if (kv["ro.bootimage.build.date"]) now["ro.bootimage.build.date"] = kv["ro.bootimage.build.date"];
   if (kv["ro.boot.vbmeta.digest"]) now["ro.boot.vbmeta.digest"] = kv["ro.boot.vbmeta.digest"];
   var keys = Object.keys(now);
   if (keys.length){
@@ -2040,11 +2159,24 @@ async function savePatch(){
   patchInputs().forEach(function(pair){
     var e = document.getElementById(pair[0]);
     var v = e ? String(e.value || "").trim() : "";
-    if (v) kv[pair[1]] = v;
+    if (!v || !pair[1]) return;
+    kv[pair[1]] = v;
   });
+  if (boot){
+    var bootEpoch = patchDateToEpoch(boot);
+    if (!bootEpoch){ toast(t("toast.patchBad", {field: t("patch.boot")}), true); return; }
+    kv["ro.bootimage.build.date.utc"] = String(bootEpoch);
+    kv["ro.bootimage.build.date"] = epochToPatchDateText(bootEpoch);
+  }
   if (!(await writePropsKV(kv))) return;
   var now = {};
-  if (boot) now["ro.boot.build.security_patch"] = boot;
+  if (boot){
+    var ep = patchDateToEpoch(boot);
+    if (ep){
+      now["ro.bootimage.build.date.utc"] = String(ep);
+      now["ro.bootimage.build.date"] = epochToPatchDateText(ep);
+    }
+  }
   if (hash) now["ro.boot.vbmeta.digest"] = hash;
   var keys = Object.keys(now);
   if (keys.length){
@@ -2103,7 +2235,7 @@ function setLang(code){
     function(){ if (appRows.length) renderApps(); else paintAppHint(); },
     updateCount,
     paintSoterRecord,
-    paintAsk,
+    paintAttk,
     paintSoter,
     function(){
       var sysBtn = document.getElementById("toggle-system");
@@ -2144,7 +2276,8 @@ async function propsToPatchFields(){
   });
   patchValues = {
     "boot-hash": rp["ro.boot.vbmeta.digest"] || "",
-    "patch-boot": rp["ro.boot.build.security_patch"] || ""
+    "patch-boot": epochToPatchDate(rp["ro.bootimage.build.date.utc"]) ||
+                  (rp["ro.vendor.boot_security_patch"] || "")
   };
   IDENT_FIELDS.forEach(function(pair){ patchValues[pair[0]] = rp[pair[1]] || ""; });
   fillPatchInputs();
@@ -2167,7 +2300,7 @@ async function refreshFromDisk(){
     refreshStatus().catch(function(){});
     refreshSoter().catch(function(){});
     refreshCount().catch(function(){});
-    refreshAsk().catch(function(){});
+    refreshAttk().catch(function(){});
   } catch (e){}
 }
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) refreshFromDisk(); });
@@ -2258,13 +2391,18 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     };
     /* 本地密钥页 */
     document.getElementById("kb-file").onclick = function(){ fpOpen("keybox"); };
-    /* StrongBox 级别单独那份 keybox（可选） */
+    /* StrongBox 那份 keybox：只有两个来源 —— 设备上选文件、或者恢复内置自签。
+       这里没有在线源，也不该有：源里那些是 TEE 链，拿过来就是级别串了。 */
     document.getElementById("sbkb-file").onclick = function(){ fpOpen("sbkeybox"); };
     document.getElementById("sbkb-clear").onclick = function(){
-      exec("rm -f " + KEYBOX_SB).then(function(){
-        toast(t("sbkb.cleared"));
-        refreshStrongboxKeybox();
-      });
+      exec("cp -f " + KEYBOX_SB + " " + KEYBOX_SB + ".bak 2>/dev/null")
+        .then(function(){ return writeFile(KEYBOX_SB, builtinXml("kb-strongbox-xml"), "0644"); })
+        .then(function(r){
+          if (r && r.errno !== 0){ toast(t("toast.saveFail", {msg: r.stderr || r.errno}), true); return; }
+          toast(t("sbkb.cleared"));
+          refreshStrongboxKeybox();
+        })
+        .catch(function(e){ toast(String(e.message), true); });
     };
     document.getElementById("kb-auto").onclick = function(){
       runBusy("kb-auto", t("kb.auto.working"), function(){ return autoKeybox(); });
@@ -2307,9 +2445,9 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
         });
       });
     };
-    document.getElementById("sk-file").onclick = function(){ fpOpen("ask"); };
+    document.getElementById("sk-file").onclick = function(){ fpOpen("attk"); };
     document.getElementById("sk-clear").onclick = function(){
-      exec("rm -f " + ASKPEM).then(function(){ toast(t("toast.skCleared")); refreshAsk(); });
+      exec("rm -f " + ATTK_PEM).then(function(){ toast(t("toast.skCleared")); refreshAttk(); });
     };
     /* 伪装参数页 */
     document.getElementById("patch-edit").onclick = function(){
@@ -2353,7 +2491,7 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     refreshStatus().catch(function(){});
     refreshSoter().catch(function(){});
     refreshCount().catch(function(){});
-    refreshAsk().catch(function(){});
+    refreshAttk().catch(function(){});
     refreshStrongboxKeybox().catch(function(){});
     paintSoterRecord();
     loadApps().catch(function(){});
@@ -2372,31 +2510,219 @@ function builtinXml(id){
 <script type="text/plain" id="kb-self-xml"><?xml version="1.0" encoding="UTF-8"?>
 <AndroidAttestation>
     <NumberOfKeyboxes>1</NumberOfKeyboxes>
-    <Keybox DeviceID="ommega-sw">
+    <Keybox DeviceID="c3315922d5cc910a7afaacab493e41e1">
         <Key algorithm="ecdsa">
             <PrivateKey format="pem">
                 -----BEGIN EC PRIVATE KEY-----
-                MHcCAQEEIETu+yejDYNwrVVtmBVSFHhlS6H884KTQNpZQzl86mCWoAoGCCqGSM49
-                AwEHoUQDQgAE/R2hdVBjZu3bQELRVMlKznVzFrMAWvis4Lqc7GazwFM1sGq9BaAu
-                l6zXzblhLTPMFTJwDNPc6vDkAuRd4GalLA==
+                MHcCAQEEIKZVBAcA6E5IzJkqrOdGyv66CHWwY+FimA3Wfj5WV80moAoGCCqGSM49
+                AwEHoUQDQgAEYgnQ1znKMkpRkGCcbnczul4YmS4a8whb2wL1Mm0sK6joAxbgCGF3
+                D2SkjT/MDosS+5HjVD+4cJBexxr0tJjq+g==
                 -----END EC PRIVATE KEY-----
             </PrivateKey>
             <CertificateChain>
-                <NumberOfCertificates>1</NumberOfCertificates>
+                <NumberOfCertificates>3</NumberOfCertificates>
                 <Certificate format="pem">
-                    -----BEGIN CERTIFICATE-----
-                    MIIB3TCCAYOgAwIBAgIUPAdzRx41VM2nnc68pYYQu3WXxoowCgYIKoZIzj0EAwIw
-                    RDELMAkGA1UEBhMCQ04xDzANBgNVBAoMBk9tbWVnYTEkMCIGA1UEAwwbT21tZWdh
-                    IFNvZnR3YXJlIEF0dGVzdGF0aW9uMB4XDTI2MTAxMjIyMDkxNloXDTQ2MTAwNzIy
-                    MDkxNlowRDELMAkGA1UEBhMCQ04xDzANBgNVBAoMBk9tbWVnYTEkMCIGA1UEAwwb
-                    T21tZWdhIFNvZnR3YXJlIEF0dGVzdGF0aW9uMFkwEwYHKoZIzj0CAQYIKoZIzj0D
-                    AQcDQgAE/R2hdVBjZu3bQELRVMlKznVzFrMAWvis4Lqc7GazwFM1sGq9BaAul6zX
-                    zblhLTPMFTJwDNPc6vDkAuRd4GalLKNTMFEwHQYDVR0OBBYEFDoM2Msq7DwSdTcG
-                    +3Io7UPY9RNaMB8GA1UdIwQYMBaAFDoM2Msq7DwSdTcG+3Io7UPY9RNaMA8GA1Ud
-                    EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgJjezbrk6dRUOlq7jqzSqD4tQ
-                    VwEOIXDeX5RC1AsUQFMCIQCTNSM5mJctXIgQDr7zYrniu8DFTemyBz9E221qVyfB
-                    VQ==
-                    -----END CERTIFICATE-----
+                -----BEGIN CERTIFICATE-----
+                MIIB1zCCAX2gAwIBAgIUENXqydPXi2wVz5uTwYITmhR9VuAwCgYIKoZIzj0EAwIw
+                OTEMMAoGA1UEDAwDVEVFMSkwJwYDVQQFEyBhMzNiZjU2MWVkYjg4OTc2N2IzODMy
+                N2E3OGRkNzVlOTAeFw0yNjEwMjAyMDQwMjBaFw0zNjEwMTgyMDQwMjBaMDkxDDAK
+                BgNVBAwMA1RFRTEpMCcGA1UEBRMgYjkxYmU3ZTA4ODM0YTMxNThhZjJhYzc2OTA5
+                MmJkNzMwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARiCdDXOcoySlGQYJxudzO6
+                XhiZLhrzCFvbAvUybSwrqOgDFuAIYXcPZKSNP8wOixL7keNUP7hwkF7HGvS0mOr6
+                o2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwICBDAdBgNVHQ4EFgQU
+                PetzQyz2ovUyFkTda8NJnq36faYwHwYDVR0jBBgwFoAU4Iqv4PtnpScsEO/Bfl9U
+                f5mIt7AwCgYIKoZIzj0EAwIDSAAwRQIgNuzaAopd1P/qKqsg0QDV7uGkqHwuyrDe
+                MPS0sjJW8K0CIQCAqeIA2EPwEGZQxyISOQgiYwNDu8Q0mBJR2GN7/99gmA==
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIDejCCAWKgAwIBAgIUASdjQ/Oz3s3Al4DYhQKZ6Ug5v38wDQYJKoZIhvcNAQEL
+                BQAwGzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMjAyMDQwMjBa
+                Fw0zNjEwMTgyMDQwMjBaMDkxDDAKBgNVBAwMA1RFRTEpMCcGA1UEBRMgYTMzYmY1
+                NjFlZGI4ODk3NjdiMzgzMjdhNzhkZDc1ZTkwWTATBgcqhkjOPQIBBggqhkjOPQMB
+                BwNCAARI1eHVR69jyt4I2dZNVlKRG5qQYEnDS7vVPJPXIwQUlSnWdc66fIeFfmFJ
+                qOYOGWr8mSpfQv+YoMZ7SRZD220No2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1Ud
+                DwEB/wQEAwICBDAdBgNVHQ4EFgQU4Iqv4PtnpScsEO/Bfl9Uf5mIt7AwHwYDVR0j
+                BBgwFoAUMdJ9xRz4/eR8CGfiA8ZhsQr3sq4wDQYJKoZIhvcNAQELBQADggIBAK1z
+                c3bLSdSyM8vXj6DjyvsdvPZJTN4tQiPBpXugITVVt0rYtjJZxY9reCjWn/jlTU1P
+                jrwJUJ44WHkWtr6Bzj4UHUGCyp6bo2yyXHInDI8uw0xmx7+PX4SiiagP2pKKkanR
+                ZMzC7gQ0D3zc7dY6w2i9OMMS1cT3AU9e3vx9q3z1x65USOxtd7c40THD+YUePb6w
+                /TPhR5O/p0NczsdomgkHyPwAgFyC8/8BljWo04yFHUMzTncs0BEwnhEwVRVD0Hmj
+                s57ujddZWYqABQauzC5p2mo1JdfSVCN4mfP0RJe6OujQqDxB0rXf8zpsFREJTgit
+                wW6EnnoIMHCLYs3TJIvGevPYdHecLfgXNyaw/oVqhKgQMFd5dT0x/ov8N92Yle5H
+                28GNq5ehwTKG3rbXISpQk+RJQOYbprU5qQ+KghPFz5TMxMZdkFLdqgvyfp/6sIAR
+                lZOdHpE2kMxVHHJqYcF9P3hjSYUwHX7eg2/RBSPrASdgp/dqbkq724iVz3udAvmI
+                dKNgO3JvUc2HS8VUHohMgR/UmKIRIdrgu5jUqFHWweglL3bx2eis+uK+ZNwVpH53
+                g1DfsumYFYc3z2jth7QMfUGGvv/NXRP4A9sgmMawGbsYxsC9RrhOFeOumL5EsoRY
+                b9JAPtZgJoPqmvYqYAohTRr7Re8wNTuvjw1+COJa
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIFBjCCAu6gAwIBAgIUU/5m4zSP+gHeo06mJ+iAJtjGyocwDQYJKoZIhvcNAQEL
+                BQAwGzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMjAyMDM1NTZa
+                Fw00NjEwMTYyMDM1NTZaMBsxGTAXBgNVBAUTEGY5MjAwOWU4NTNiNmIwNDUwggIi
+                MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDAkgqdiV68ujcaXqxsY9CL4eQv
+                IkR8NFY/+nBCqNk2EcQKSb/GUeY59s/W72hflP5WuZ+cmUL3JhK8W9bBMLtNnrGy
+                B5ChPZeBKFq/1CzfTeZ6j78gKOgEXoTY80EvL7E99kLnJlBg2Lierf8VeSN5tBw6
+                DwBc9+RSgAZlX9lAij15/kXGzsAwYTFNEZVRr7HKMOFSrLSDl6qsl2SCJ2HBbFWZ
+                06RFEOLNe/3leV1aPT0ARTVQDO0sukYZNwYoe31Y3vSoEwJMFDyF4jsR34yakir/
+                hwcxwfjMIL9DY2OG5tRYXDm2SxbzAV9KzAw10Z0Xqo0EXfNgZID2BttxTHumGdLj
+                lJ0mNA0ZuXqL62wsPhZxG4DS+xBPjrb4860kvc9+Igk2ayIfUyS2tHFV19BGnNE/
+                UZe8A4w360A2y8EQXcvHdyVjE52zIYVy+YU8k+D/Lp8mB1GcSPvNUsCO+8H8gDYL
+                rSox2qPq4COd6bBaDCzUIdCDhxtr6Mm98ysRwJRcyWmfOT03yewGUbS9t0/TTdvd
+                MtbKgr2/WND9NeIiBXF63FjVQJZ1MsKen2PM/EIXqSmR4CYt8Dtof4WDvOy2d09x
+                fy7X271G2To1a6p2yOPyp4IwvuhzcM3pnZVwXxz6+s8xTOlZtcT4yZ+gjJrhmsqZ
+                n6ID62QRyBCyqCSNsQIDAQABo0IwQDAdBgNVHQ4EFgQUMdJ9xRz4/eR8CGfiA8Zh
+                sQr3sq4wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwDQYJKoZIhvcN
+                AQELBQADggIBAHAUJfzwlqHak5pnXE/Mhch+GHohQ6uYVJBbfuXGseFnAsR0dLjy
+                +7/hwTcMmtMnpOizFCsZLC2EjHC88LNw61O+NeJeV0rMHARdhgxKGJZGyMTiLl0X
+                ujcluvLUdGBl+69CRKfdck1NxavFvwNrJ2ncLToaumXR7pOvqZwBIPz5gUQBt0/c
+                HpyTT+e0/saY0mFjFY/D4ob8gdp0xfb5au+Qf5JK/rxXyKpf5vaVUnLM1x2lQwhq
+                uGLkuKRLRofCK+lCnanJRaV/Ljuj+b9j5r3IT4Hxhjv6rSXsAR8rprLxbH3UdLkL
+                lYAM95+oEWutWw8ltTyEy4f2cIgStFxUhafqxkn/XEr7wsEaEZheH+TG4eNv5EIg
+                T8RHooygU2AlR1pN6H5rfugdOrzClQk6pk3k/B40f4PhpLbTzbVaKtMTfStRw4oc
+                zq0co53A3bnAW8YiRza64qpWB0jOts5BKypGukV202rl9DP1PRQb3cjN50SUq0NT
+                yDmx+nuBSD/Od2s+yC6blrHX/vajAMbiVzgmP6AQmgYiZXf1E7Rb89yn0f3nwNAi
+                SvC9WdnkQxb5WVMrPKXQPNvj2s2s809/ViML701ueRweQBhA/BJWKcvSciPq12q5
+                mFET9BQKhY1jFZLTU6OX7ghVFOCdXZVqyBkSWPfkirxYIuOEi6N5gDO/
+                -----END CERTIFICATE-----
+                </Certificate>
+            </CertificateChain>
+        </Key>
+        <Key algorithm="rsa">
+            <PrivateKey format="pem">
+                -----BEGIN RSA PRIVATE KEY-----
+                MIIG4wIBAAKCAYEAtBJbVB7o8fIioV/5OVtwP4BIunwQvpZpr0zufNFPiO7XIElq
+                QDt5ynXU4crhYIBZJ1FaxzUPDEyHGrFmgcz6sMB8wgY4NxwcY6jbDRpLV6Xm8s+H
+                RzrUYuVlD6mQ5gqumvY5CuqXt6q0JbDNL1jJUn7AkPMJIYV52H2IqVde8BNPsk1v
+                GMMX5RDFF1NGUQw/dhB6yE8eLmoInf2TsOqFPtXfq+ZYEroceODqLDRvuVtQ36ii
+                bdsxWZMl9GJyzTFl2yMXc7MSTSsHfT1m6srMa/PHN7R/TwT7YZWBA2/XGAee4Xjc
+                ou/etpKv4TcIamN5kLSls479vODxSjq/77UK8oNINBc2RUp9iXoCDpyibWpOYjyf
+                dOu2nrzmW92jaPtW0ngs54oOUWb3LDcGRQO6tI9IxlQ2bDYRLFKpBZ4vcLVrRimy
+                3wU25VtaXf6tDdu7JwE8TB7TyS3YfvYcrmKjLzBdYAXeMARbyFpYcZBs5sot6X9u
+                i0v2dmeh7K4wC5r7AgMBAAECggGAEG5MXxSi9NC/UDJNr2okh+bQvBNuA7X91r0S
+                VdlThI8mmg+Y3luO9WZjEmdMwV10xR2rRtoUkW66NTlSvS1TAqXNvHaM0pqCDKXv
+                tvZbQZglxqohEeLQVmXQHum+Cv+WhxVIhzJ4vY2Z+oZzcoqLdDeUoqVKhACF6bcq
+                rSkHxKg+cWqXZI8IsyIgmcxDcknH0KIYUgbGHj4WozPsMgx0NBOX4TuXdb39sxny
+                xC3Us/kdHAtrJtMFYcMHh5EkII0NMudAJcOR7d9Slmycw+07lJdXHMos33Ox7p8+
+                xkjSQKeJIPAxWz2SZHt7lf1UPcdXoNiZuLSsfIFCagS8703Eh+sBMiSvhGHCpH1E
+                qC94Gz7EP2FWBiSBwZ9krK11P/673FGTkrb1vEib84FWGMi2ER47pZVZK+5JMZS/
+                QiYA8hqHSDXIUVh3p96D/xRoIECL2Lpq13/J/OjYcAfV8PkEuLo/3565dY+3vUKS
+                mgFyHFSO9tbEvp2sEhqgm8K9bsqhAoHBAOqsrqsxpAz3MnDN1byrnp//TPyko3Li
+                bqOXzrudvdKUKwktk800W+BDpmiTh9G9nkswSnOb8RDcIgmaI/J0lr6nv93E2bf0
+                z4cgqkIch5+FNuczff5937iipl6zN+tOW4deJgw4bFGXDXEKJgP/E+NgCC57htQ+
+                eZ80hs0uO6Txf7YneiwbL4b6zqwfHudyc8Sj99kCzsB2gjoVaWGAbqimb98zkk2S
+                Vgyb3SorqX8vt2xRgYSs9/Ub01lby82AjwKBwQDEb23gfa00VWAEw63sy3cCHLsf
+                x7JZzIeBfmg9kFIPF5fI033FgsL2l6OFnRIvsnfGRx1gjaA6aeLN70CL8rgcltGT
+                4vxxMnJSffBPJjFKmqAJRCXEEAFyICUaA3dqU5oSMHapjTREuHGEftSE4RVbs+24
+                2kfE2salsVyo4uQ1cPte0WVt3zKtZViZBs16zXLS8RBPuM88Tv7mg6JQLoEqSSyc
+                G7YKH0JPQHTrGDcVzxAdYivPjOYy7NNElJwAHNUCgcACScK+OpKt6a8dOHSQDWBT
+                kQqwH+7UDO8lOzKx05zpM7ajtUUOqCcJLb+un1mgquejNgpTzD5yeqL+UvlswMRD
+                gaE2SVgSGhn36FKgqGSOIp9ha7gbxiBrTXKv07GE4tOzozBdyCMOPJnN81phiZgp
+                DGOoCF5NLXrEGaAC2iOMvSoQnZvsWCuDdmiTdw43FX+ZeDvPat6XM9CbPmAzqivq
+                Cw1mMLuJdBbQsqhaY+iYK9/u93B62bDlO+s4oNOA4nMCgcEAr8+LaAETpGNFLP52
+                DBmOyjUsxaTV28lS/nNEmNUynI9hKj0ftEb0eAAAOvX58PaqfKvpfyFC5wUeGXKp
+                MphqcCwMJ3BgwG+GIo7VJgHo2/zIf4KeynwIzzw1+LJhjqiEnQMDMX1P6rGp6Awb
+                6VIK66h+e5Ph6C5m3KWBaSapWatlT9faEBxUHx01zsBn6CE5Q9K95pxh3nhVa7sk
+                6t60fERByPaEV0ri7kuiWUezBbHtml7jFz/kSG/uJtNbTD6BAoHAb1EK/eYQLDri
+                kcpLQOHeZM4JFlRUMejiQM2hvHqDxtGbcmsMbbQE1cAVY2Yp9lvKqeQIJi9pO1oX
+                XWmBXm27afrPTzU2x+I/iS3VvK+nMAHgoJus+k1XMGa5i818euGVOBK4v8xP2sV1
+                ev/1sMTmEWIwoveboSbfWdG+DycggB0ymzswGb2TwdiI8wEx4NgE/E/Cd4wVAPvR
+                EsFgB5yvE5Y7X4p8oHEUluwidHj1GHvIiK0Uy33vn1AxFdyDdhbu
+                -----END RSA PRIVATE KEY-----
+            </PrivateKey>
+            <CertificateChain>
+                <NumberOfCertificates>3</NumberOfCertificates>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIEYzCCAsugAwIBAgIUAcwCwv0sG0FRZK/C9y473EpdFIkwDQYJKoZIhvcNAQEL
+                BQAwOTEMMAoGA1UEDAwDVEVFMSkwJwYDVQQFEyBhYTIyMGY0ZjY3ZDJjYWQ3ZmJh
+                ZjE2MTJiZGQwMzMxODAeFw0yNjEwMjAyMDQwMjBaFw0zNjEwMTgyMDQwMjBaMDkx
+                DDAKBgNVBAwMA1RFRTEpMCcGA1UEBRMgZGRjYmY5ZjM3YjMwZTZhNzU1NjdiMzcz
+                YTAxMGE4YWEwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQC0EltUHujx
+                8iKhX/k5W3A/gEi6fBC+lmmvTO580U+I7tcgSWpAO3nKddThyuFggFknUVrHNQ8M
+                TIcasWaBzPqwwHzCBjg3HBxjqNsNGktXpebyz4dHOtRi5WUPqZDmCq6a9jkK6pe3
+                qrQlsM0vWMlSfsCQ8wkhhXnYfYipV17wE0+yTW8YwxflEMUXU0ZRDD92EHrITx4u
+                agid/ZOw6oU+1d+r5lgSuhx44OosNG+5W1DfqKJt2zFZkyX0YnLNMWXbIxdzsxJN
+                Kwd9PWbqysxr88c3tH9PBPthlYEDb9cYB57heNyi7962kq/hNwhqY3mQtKWzjv28
+                4PFKOr/vtQryg0g0FzZFSn2JegIOnKJtak5iPJ9067aevOZb3aNo+1bSeCznig5R
+                ZvcsNwZFA7q0j0jGVDZsNhEsUqkFni9wtWtGKbLfBTblW1pd/q0N27snATxMHtPJ
+                Ldh+9hyuYqMvMF1gBd4wBFvIWlhxkGzmyi3pf26LS/Z2Z6HsrjALmvsCAwEAAaNj
+                MGEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwHQYDVR0OBBYEFCy6
+                9ETs+UaXnw/8ZNAK2A5r9RKCMB8GA1UdIwQYMBaAFOI0qy6GWXNMJTBC2E1HLbdd
+                ZSnyMA0GCSqGSIb3DQEBCwUAA4IBgQAUPU8Qe7uqtUHq0y5VNtOoorHuCCE4p9wo
+                mGHtPd1ZhaFOwVGOkSHlqhF3jbz9amP3yYrmPjHHX/f+g+IkjwxgKftVyxXoPJjq
+                Lnp0rcZ/8FI/JJPb7ZLYJ6pvk4IsA5el/qmxvfRgSGqlnMlvOR4tmdzVydQbnxKz
+                /2SucWGgiZs1BMClD8skFxp7quRCaxubGukMlsrorN6aHVCDokwfRl2afzHGXbZE
+                aqBUc9UJR+47InRcc3SHE5byB1+tE9F3UDe9wSydnezkdwWZ4FAa/bInEc8ptBKw
+                SMH+vAjK9dxONPB8MQp3b+46Y7ifJwISu6swU65Si+yiYyKxbEFvUJ4P4BlokjES
+                S1jZOtFCwKIHyOt9W11pAwJVThXkOupKYLNgnrVYwqPttKCxx0EnubhUCWfesM/k
+                t3yerksnlISeh0x6NgtTlTkzwyNRcSUJQxomX4T8qbZZm92eC7y3QfrdfY3h/EMJ
+                W80SvI4zUi82s6gEvp/N/xw/4WUUyy4=
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIExTCCAq2gAwIBAgIUHX+n5MMEyC97sCmJoK89jHxg1uMwDQYJKoZIhvcNAQEL
+                BQAwGzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMjAyMDQwMjBa
+                Fw0zNjEwMTgyMDQwMjBaMDkxDDAKBgNVBAwMA1RFRTEpMCcGA1UEBRMgYWEyMjBm
+                NGY2N2QyY2FkN2ZiYWYxNjEyYmRkMDMzMTgwggGiMA0GCSqGSIb3DQEBAQUAA4IB
+                jwAwggGKAoIBgQDBduwtA41/m/IP9bGq2tUdp8YiKg6clQ3lE1FGC5kZ6EYjzOX9
+                1BF3nmd4cxXTbrd586y3JmD1OxA2ySW1VC/kCydxEOqxGsDC7OFrUv9YrD/+o0kr
+                fUk1wdeB/qLOd8FHYvU4ARTIBQ0TUAVZBkpPrW/htfPogUdm0E6RVnLVJ9zbTjt6
+                QPVTO2LmqMMoYU2oSuiKkFXBRjqMewSJT0mFCnGBSPRiCNbcC8Cd+Ut4D9ClVRBF
+                OmbwMNNbC1A8j94n9wB4CMvIX4V9OUVBPwjaoP03bddqsvcT2vCQ+5dztEF6qiaM
+                tfSsOVx4qyLe1f9rElnsMnQ1xqFN2hogd+2YfF5xd3mViy9BdqahuGXFwAa/30x3
+                nZnoSkfuQUDxSYKHvJl7rW+4mxUYd8x83RHGScMnVtI95K2K/ka7SbILe/9YgMO8
+                UfGH2ZBenLbxDRrwvXy6/wGYGf63O5rrR4thWoBYPpqp7AsaLzoDXxKahm2pgaQ4
+                tVFYDhaTmFDyG5ECAwEAAaNjMGEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8E
+                BAMCAgQwHQYDVR0OBBYEFOI0qy6GWXNMJTBC2E1HLbddZSnyMB8GA1UdIwQYMBaA
+                FDHSfcUc+P3kfAhn4gPGYbEK97KuMA0GCSqGSIb3DQEBCwUAA4ICAQCLNyqLQiXp
+                4hXXvjpDrDDJykIPPGUjsBL2s+mbRmjGKifge8D9eiIISAbAxaMsYWmMhFNEJJJt
+                FU33UN68wFoDJbxcNrBdcflWZRPb4c4p8K6cUTUfDftLV5GCjj+NjvaCaUztGQJb
+                +6DgSPSUcgadQ9X5Q8LsjZUW8IbreHo0w6v0HoK/NalBjo8Zf21IuwEdbGhbXo8A
+                Bfenh3WQvpVg/q6C3tHa1JCSuNlCmjXsxJS2thHFO0K+K8afvdiVBbn3goVOraRX
+                qO6a8ClPCF4ieTd55Rh+CUufNEUI443whExiC9/R2MB/hcFznzWvC8YCA/p20YJI
+                QIhvs5veB7jImohC0b28jspZ/8RTs2w78KQAoAJf/qphSxmLgqzWpLF2Zyv2xxu9
+                xEqgEcoeIdj+0evGoKlcger41SSBy7g5DNMwfnNzrAyDiqIxPjOYPj+8OI0X9/KU
+                vvzSazQ/Dh42i78m+KJyWeUV+vDFVDgx2ysTplll0BGsa6Myio6Q5jjXiddli9q+
+                BfzkYhp62ypH0xplUzvI6WvvuF34M19JBKRSvX+1nLDGLNMiZFE5USz0hx3JyRne
+                En7O88zLnC/L7XD/n6faJivvIQ5ylg7AM4gOfIvNyVxEi2XGb+zrhnpnAT3r86Gy
+                67uY9JNIziwKTyOM47qsnMV9gEfQubvp5g==
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIFBjCCAu6gAwIBAgIUU/5m4zSP+gHeo06mJ+iAJtjGyocwDQYJKoZIhvcNAQEL
+                BQAwGzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMjAyMDM1NTZa
+                Fw00NjEwMTYyMDM1NTZaMBsxGTAXBgNVBAUTEGY5MjAwOWU4NTNiNmIwNDUwggIi
+                MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDAkgqdiV68ujcaXqxsY9CL4eQv
+                IkR8NFY/+nBCqNk2EcQKSb/GUeY59s/W72hflP5WuZ+cmUL3JhK8W9bBMLtNnrGy
+                B5ChPZeBKFq/1CzfTeZ6j78gKOgEXoTY80EvL7E99kLnJlBg2Lierf8VeSN5tBw6
+                DwBc9+RSgAZlX9lAij15/kXGzsAwYTFNEZVRr7HKMOFSrLSDl6qsl2SCJ2HBbFWZ
+                06RFEOLNe/3leV1aPT0ARTVQDO0sukYZNwYoe31Y3vSoEwJMFDyF4jsR34yakir/
+                hwcxwfjMIL9DY2OG5tRYXDm2SxbzAV9KzAw10Z0Xqo0EXfNgZID2BttxTHumGdLj
+                lJ0mNA0ZuXqL62wsPhZxG4DS+xBPjrb4860kvc9+Igk2ayIfUyS2tHFV19BGnNE/
+                UZe8A4w360A2y8EQXcvHdyVjE52zIYVy+YU8k+D/Lp8mB1GcSPvNUsCO+8H8gDYL
+                rSox2qPq4COd6bBaDCzUIdCDhxtr6Mm98ysRwJRcyWmfOT03yewGUbS9t0/TTdvd
+                MtbKgr2/WND9NeIiBXF63FjVQJZ1MsKen2PM/EIXqSmR4CYt8Dtof4WDvOy2d09x
+                fy7X271G2To1a6p2yOPyp4IwvuhzcM3pnZVwXxz6+s8xTOlZtcT4yZ+gjJrhmsqZ
+                n6ID62QRyBCyqCSNsQIDAQABo0IwQDAdBgNVHQ4EFgQUMdJ9xRz4/eR8CGfiA8Zh
+                sQr3sq4wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwDQYJKoZIhvcN
+                AQELBQADggIBAHAUJfzwlqHak5pnXE/Mhch+GHohQ6uYVJBbfuXGseFnAsR0dLjy
+                +7/hwTcMmtMnpOizFCsZLC2EjHC88LNw61O+NeJeV0rMHARdhgxKGJZGyMTiLl0X
+                ujcluvLUdGBl+69CRKfdck1NxavFvwNrJ2ncLToaumXR7pOvqZwBIPz5gUQBt0/c
+                HpyTT+e0/saY0mFjFY/D4ob8gdp0xfb5au+Qf5JK/rxXyKpf5vaVUnLM1x2lQwhq
+                uGLkuKRLRofCK+lCnanJRaV/Ljuj+b9j5r3IT4Hxhjv6rSXsAR8rprLxbH3UdLkL
+                lYAM95+oEWutWw8ltTyEy4f2cIgStFxUhafqxkn/XEr7wsEaEZheH+TG4eNv5EIg
+                T8RHooygU2AlR1pN6H5rfugdOrzClQk6pk3k/B40f4PhpLbTzbVaKtMTfStRw4oc
+                zq0co53A3bnAW8YiRza64qpWB0jOts5BKypGukV202rl9DP1PRQb3cjN50SUq0NT
+                yDmx+nuBSD/Od2s+yC6blrHX/vajAMbiVzgmP6AQmgYiZXf1E7Rb89yn0f3nwNAi
+                SvC9WdnkQxb5WVMrPKXQPNvj2s2s809/ViML701ueRweQBhA/BJWKcvSciPq12q5
+                mFET9BQKhY1jFZLTU6OX7ghVFOCdXZVqyBkSWPfkirxYIuOEi6N5gDO/
+                -----END CERTIFICATE-----
                 </Certificate>
             </CertificateChain>
         </Key>
@@ -2407,54 +2733,6 @@ function builtinXml(id){
 <AndroidAttestation>
     <NumberOfKeyboxes>1</NumberOfKeyboxes>
     <Keybox DeviceID="sw">
-        <Key algorithm="ecdsa">
-            <PrivateKey format="pem">
-                -----BEGIN EC PRIVATE KEY-----
-                MHcCAQEEICHghkMqFRmEWc82OlD8FMnarfk19SfC39ceTW28QuVEoAoGCCqGSM49
-                AwEHoUQDQgAE6555+EJjWazLKpFMiYbMcK2QZpOCqXMmE/6sy/ghJ0whdJdKKv6l
-                uU1/ZtTgZRBmNbxTt6CjpnFYPts+Ea4QFA==
-                -----END EC PRIVATE KEY-----
-            </PrivateKey>
-            <CertificateChain>
-                <NumberOfCertificates>2</NumberOfCertificates>
-                <Certificate format="pem">
-                    -----BEGIN CERTIFICATE-----
-                    MIICeDCCAh6gAwIBAgICEAEwCgYIKoZIzj0EAwIwgZgxCzAJBgNVBAYTAlVTMRMw
-                    EQYDVQQIDApDYWxpZm9ybmlhMRYwFAYDVQQHDA1Nb3VudGFpbiBWaWV3MRUwEwYD
-                    VQQKDAxHb29nbGUsIEluYy4xEDAOBgNVBAsMB0FuZHJvaWQxMzAxBgNVBAMMKkFu
-                    ZHJvaWQgS2V5c3RvcmUgU29mdHdhcmUgQXR0ZXN0YXRpb24gUm9vdDAeFw0xNjAx
-                    MTEwMDQ2MDlaFw0yNjAxMDgwMDQ2MDlaMIGIMQswCQYDVQQGEwJVUzETMBEGA1UE
-                    CAwKQ2FsaWZvcm5pYTEVMBMGA1UECgwMR29vZ2xlLCBJbmMuMRAwDgYDVQQLDAdB
-                    bmRyb2lkMTswOQYDVQQDDDJBbmRyb2lkIEtleXN0b3JlIFNvZnR3YXJlIEF0dGVz
-                    dGF0aW9uIEludGVybWVkaWF0ZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOue
-                    efhCY1msyyqRTImGzHCtkGaTgqlzJhP+rMv4ISdMIXSXSir+pblNf2bU4GUQZjW8
-                    U7ego6ZxWD7bPhGuEBSjZjBkMB0GA1UdDgQWBBQ//KzWGrE6noEguNUlHMVlux6R
-                    qTAfBgNVHSMEGDAWgBTIrel3TEXDo88NFhDkeUM6IVowzzASBgNVHRMBAf8ECDAG
-                    AQH/AgEAMA4GA1UdDwEB/wQEAwIChDAKBggqhkjOPQQDAgNIADBFAiBLipt77oK8
-                    wDOHri/AiZi03cONqycqRZ9pDMfDktQPjgIhAO7aAV229DLp1IQ7YkyUBO86fMy9
-                    Xvsiu+f+uXc/WT/7
-                    -----END CERTIFICATE-----
-                </Certificate>
-                <Certificate format="pem">
-                    -----BEGIN CERTIFICATE-----
-                    MIICizCCAjKgAwIBAgIJAKIFntEOQ1tXMAoGCCqGSM49BAMCMIGYMQswCQYDVQQG
-                    EwJVUzETMBEGA1UECAwKQ2FsaWZvcm5pYTEWMBQGA1UEBwwNTW91bnRhaW4gVmll
-                    dzEVMBMGA1UECgwMR29vZ2xlLCBJbmMuMRAwDgYDVQQLDAdBbmRyb2lkMTMwMQYD
-                    VQQDDCpBbmRyb2lkIEtleXN0b3JlIFNvZnR3YXJlIEF0dGVzdGF0aW9uIFJvb3Qw
-                    HhcNMTYwMTExMDA0MzUwWhcNMzYwMTA2MDA0MzUwWjCBmDELMAkGA1UEBhMCVVMx
-                    EzARBgNVBAgMCkNhbGlmb3JuaWExFjAUBgNVBAcMDU1vdW50YWluIFZpZXcxFTAT
-                    BgNVBAoMDEdvb2dsZSwgSW5jLjEQMA4GA1UECwwHQW5kcm9pZDEzMDEGA1UEAwwq
-                    QW5kcm9pZCBLZXlzdG9yZSBTb2Z0d2FyZSBBdHRlc3RhdGlvbiBSb290MFkwEwYH
-                    KoZIzj0CAQYIKoZIzj0DAQcDQgAE7l1ex+HA220Dpn7mthvsTWpdamguD/9/SQ59
-                    dx9EIm29sa/6FsvHrcV30lacqrewLVQBXT5DKyqO107sSHVBpKNjMGEwHQYDVR0O
-                    BBYEFMit6XdMRcOjzw0WEOR5QzohWjDPMB8GA1UdIwQYMBaAFMit6XdMRcOjzw0W
-                    EOR5QzohWjDPMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMAoGCCqG
-                    SM49BAMCA0cAMEQCIDUho++LNEYenNVg8x1YiSBq3KNlQfYNns6KGYxmSGB7AiBN
-                    C/NR2TB8fVvaNTQdqEcbY6WFZTytTySn502vQX3xvw==
-                    -----END CERTIFICATE-----
-                </Certificate>
-            </CertificateChain>
-        </Key>
         <Key algorithm="rsa">
             <PrivateKey format="pem">
                 -----BEGIN RSA PRIVATE KEY-----
@@ -2473,8 +2751,253 @@ function builtinXml(id){
                 fs0scurgHa2GunZU1M9FrbXx8rMdn4Eiz6XxpVcPmy0l
                 -----END RSA PRIVATE KEY-----
             </PrivateKey>
+            <CertificateChain>
+    <NumberOfCertificates>2</NumberOfCertificates>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIICtjCCAh+gAwIBAgICEAAwDQYJKoZIhvcNAQELBQAwYzELMAkGA1UEBhMCVVMx
+                EzARBgNVBAgMCkNhbGlmb3JuaWExFjAUBgNVBAcMDU1vdW50YWluIFZpZXcxFTAT
+                BgNVBAoMDEdvb2dsZSwgSW5jLjEQMA4GA1UECwwHQW5kcm9pZDAeFw0xNjAxMDQx
+                MjQwNTNaFw0zNTEyMzAxMjQwNTNaMHYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIDApD
+                YWxpZm9ybmlhMRUwEwYDVQQKDAxHb29nbGUsIEluYy4xEDAOBgNVBAsMB0FuZHJv
+                aWQxKTAnBgNVBAMMIEFuZHJvaWQgU29mdHdhcmUgQXR0ZXN0YXRpb24gS2V5MIGf
+                MA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDAgyPcVogbuDAgafWwhWHG7r5/BeL1
+                qEIEir6LR752/q7yXPKbKvoyABQWAUKZiaFfz8aBXrNjWDwv0vIL5Jgyg92BSxbX
+                4YVBeuVKvClqOm21wAQIO2jFVsHwIzmRZBmGTVC3TUCuykhMdzVsiVoMJ1q/rEmd
+                XX0jYvKcXgLocQIDAQABo2YwZDAdBgNVHQ4EFgQU1AwQG/jNY7n3OVK1DhNcpteZ
+                k4YwHwYDVR0jBBgwFoAUKfrxrMxN0kyWQCd1trDpMuUH/i4wEgYDVR0TAQH/BAgw
+                BgEB/wIBADAOBgNVHQ8BAf8EBAMCAoQwDQYJKoZIhvcNAQELBQADgYEAni1IX4xn
+                M9waha2Z11Aj6hTsQ7DhnerCI0YecrUZ3GAi5KVoMWwLVcTmnKItnzpPk2sxixZ4
+                Fg2Iy9mLzICdhPDCJ+NrOPH90ecXcjFZNX2W88V/q52PlmEmT7K+gbsNSQQiis6f
+                9/VCLiVE+iEHElqDtVWtGIL4QBSbnCBjBH8=
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIICpzCCAhCgAwIBAgIJAP+U2d2fB8gMMA0GCSqGSIb3DQEBCwUAMGMxCzAJBgNV
+                BAYTAlVTMRMwEQYDVQQIDApDYWxpZm9ybmlhMRYwFAYDVQQHDA1Nb3VudGFpbiBW
+                aWV3MRUwEwYDVQQKDAxHb29nbGUsIEluYy4xEDAOBgNVBAsMB0FuZHJvaWQwHhcN
+                MTYwMTA0MTIzMTA4WhcNMzUxMjMwMTIzMTA4WjBjMQswCQYDVQQGEwJVUzETMBEG
+                A1UECAwKQ2FsaWZvcm5pYTEWMBQGA1UEBwwNTW91bnRhaW4gVmlldzEVMBMGA1UE
+                CgwMR29vZ2xlLCBJbmMuMRAwDgYDVQQLDAdBbmRyb2lkMIGfMA0GCSqGSIb3DQEB
+                AQUAA4GNADCBiQKBgQCia63rbi5EYe/VDoLmt5TRdSMfd5tjkWP/96r/C3JHTsAs
+                Q+wzfNes7UA+jCigZtX3hwszl94OuE4TQKuvpSe/lWmgMdsGUmX4RFlXYfC78hdL
+                t0GAZMAoDo9Sd47b0ke2RekZyOmLw9vCkT/X11DEHTVm+Vfkl5YLCazOkjWFmwID
+                AQABo2MwYTAdBgNVHQ4EFgQUKfrxrMxN0kyWQCd1trDpMuUH/i4wHwYDVR0jBBgw
+                FoAUKfrxrMxN0kyWQCd1trDpMuUH/i4wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8B
+                Af8EBAMCAoQwDQYJKoZIhvcNAQELBQADgYEAT3LzNlmNDsG5dFsxWfbwjSVJMJ6j
+                HBwp0kUtILlNX2S06IDHeHqcOd6os/W/L3BfRxBcxebrTQaZYdKumgf/93y4q+uc
+                DyQHXrF/unlx/U1bnt8Uqf7f7XzAiF343ZtkMlbVNZriE/mPzsF83O+kqrJVw4Op
+                Lvtc9mL1J1IXvmM=
+                -----END CERTIFICATE-----
+                </Certificate>
+            </CertificateChain>
         </Key>
     </Keybox>
-</AndroidAttestation></script>
+</AndroidAttestation>
+</script>
+<script type="text/plain" id="kb-strongbox-xml"><?xml version="1.0" encoding="UTF-8"?>
+<AndroidAttestation>
+    <NumberOfKeyboxes>1</NumberOfKeyboxes>
+    <Keybox DeviceID="96c56c3f85719d397335355d0b5cc18c">
+        <Key algorithm="ecdsa">
+            <PrivateKey format="pem">
+                -----BEGIN EC PRIVATE KEY-----
+                MHcCAQEEIMTRhHuQfqD6ynYXh574iMh4IqbBbRN3OCMKkkk8v6FzoAoGCCqGSM49
+                AwEHoUQDQgAE2HJXz6jvijoPtdbTublJ3gARQM+U/Y2Fm490aXywYeyViEaRivDj
+                NMwKdqgAbWJnHpPdwzNrYCZ/oHTwJxt1dg==
+                -----END EC PRIVATE KEY-----
+            </PrivateKey>
+            <CertificateChain>
+                <NumberOfCertificates>3</NumberOfCertificates>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIB3zCCAYagAwIBAgIRAPtj/IvkBEWLeT61ax1cXgIwCgYIKoZIzj0EAwIwPzES
+                MBAGA1UEDAwJU3Ryb25nQm94MSkwJwYDVQQFEyA1NmJjZjRkZGVhYzEzMzQzMzVl
+                NDRlNzgwNmNlMTMzYjAeFw0yNjEwMzAxMjExMjhaFw0zNjEwMjcxMjExMjhaMD8x
+                EjAQBgNVBAwMCVN0cm9uZ0JveDEpMCcGA1UEBRMgOTNlMzQyMjRlYjU5NTNjM2E4
+                M2E1Yjk1ZDVjMTg1MTcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATYclfPqO+K
+                Og+11tO5uUneABFAz5T9jYWbj3RpfLBh7JWIRpGK8OM0zAp2qABtYmcek93DM2tg
+                Jn+gdPAnG3V2o2MwYTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwICBDAd
+                BgNVHQ4EFgQUg92R7/sXYPOFLoNsnNC3hgswyf4wHwYDVR0jBBgwFoAU9qtADIzB
+                6WGNGzrrmFbifeKyvYIwCgYIKoZIzj0EAwIDRwAwRAIgKjkhpfI4Fl98BsvzsufY
+                45bYvj9GW/Ua62mipg/YuukCIClqNsp0vFVN96lhJjRR2jjgw1eporbvhRbU4noR
+                zFM5
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIDfDCCAWSgAwIBAgIQOCUWLSCYQPYOrk7C/1lmvDANBgkqhkiG9w0BAQsFADAb
+                MRkwFwYDVQQFExBmOTIwMDllODUzYjZiMDQ1MB4XDTI2MTAzMDEyMTEyOFoXDTM2
+                MTAyNzEyMTEyOFowPzESMBAGA1UEDAwJU3Ryb25nQm94MSkwJwYDVQQFEyA1NmJj
+                ZjRkZGVhYzEzMzQzMzVlNDRlNzgwNmNlMTMzYjBZMBMGByqGSM49AgEGCCqGSM49
+                AwEHA0IABNOJOfbb8LkWkYx/FIaZglE7SomqePMNLDgSTDryEHQpCzBeUATKWw0y
+                rWJAVDMB4N0J9Dd0gJBbYmIYcw8tI96jYzBhMA8GA1UdEwEB/wQFMAMBAf8wDgYD
+                VR0PAQH/BAQDAgIEMB0GA1UdDgQWBBT2q0AMjMHpYY0bOuuYVuJ94rK9gjAfBgNV
+                HSMEGDAWgBQx0n3FHPj95HwIZ+IDxmGxCveyrjANBgkqhkiG9w0BAQsFAAOCAgEA
+                GFxxDHfT7d/D5X1B1hxFHq4kqxxCta2NiF6s+RgqhuKsUr8AXymGH7i+S1YUbZ4q
+                EMowF5u9nYUP1qgRmq/lj+dPkUBfF09NVAX8G5C+z7pY74LT3eeRooC0Npr6sRkt
+                BVBHQdG8zXlfJ+6nH0q788K93G+ZaRtOgFBcC/XYLHsBtqreM6saZ4zmHBbETD5S
+                5XAwWourfI3uxWeDMplI5iOVC7lF9WeFkmzF3mVeoeTHgheArqbJXW3R/v+GE+6S
+                +V3WSsyKWrYnUEY4hBGhUkPYn2LXyP4RHpIR05dcqEu0zhMLcjiungkjo+p35RUz
+                s3LhEKGQvFPHGS6yxMi1LJTQrMt2Z0N5DFssKo5MGQbeWutirRDc1CLzdr4G4VUM
+                eWOqZnZD0migltYZt3lNcXAbyaAypywXsgoEyeUaxXtlb5Jc3ASEugs3NB6ivNYH
+                8dPwphCG2ok2gFE1oU4FJuWvAZ/L0/LC4MCV5HijGEjdrC1mLksY6aTy9CHkZhb/
+                ZmBMLFXlmmJfiBFLMynrIu6PK8+XV5Y5QLJN4l8Ri452+2/2AiWCCBwMrjqAy3aY
+                KyUH6Qgf80Q1Kz/2dv/siUDIpp2kdz1+VmedrPlmxZIzHCVWwhcwU7PSHXg95QAc
+                Ql0lIBv0NjSx9iTGDwqEg/HnU25PsiVFCxTt8lneiA4=
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIFBjCCAu6gAwIBAgIUU/5m4zSP+gHeo06mJ+iAJtjGyocwDQYJKoZIhvcNAQEL
+                BQAwGzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMjAyMDM1NTZa
+                Fw00NjEwMTYyMDM1NTZaMBsxGTAXBgNVBAUTEGY5MjAwOWU4NTNiNmIwNDUwggIi
+                MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDAkgqdiV68ujcaXqxsY9CL4eQv
+                IkR8NFY/+nBCqNk2EcQKSb/GUeY59s/W72hflP5WuZ+cmUL3JhK8W9bBMLtNnrGy
+                B5ChPZeBKFq/1CzfTeZ6j78gKOgEXoTY80EvL7E99kLnJlBg2Lierf8VeSN5tBw6
+                DwBc9+RSgAZlX9lAij15/kXGzsAwYTFNEZVRr7HKMOFSrLSDl6qsl2SCJ2HBbFWZ
+                06RFEOLNe/3leV1aPT0ARTVQDO0sukYZNwYoe31Y3vSoEwJMFDyF4jsR34yakir/
+                hwcxwfjMIL9DY2OG5tRYXDm2SxbzAV9KzAw10Z0Xqo0EXfNgZID2BttxTHumGdLj
+                lJ0mNA0ZuXqL62wsPhZxG4DS+xBPjrb4860kvc9+Igk2ayIfUyS2tHFV19BGnNE/
+                UZe8A4w360A2y8EQXcvHdyVjE52zIYVy+YU8k+D/Lp8mB1GcSPvNUsCO+8H8gDYL
+                rSox2qPq4COd6bBaDCzUIdCDhxtr6Mm98ysRwJRcyWmfOT03yewGUbS9t0/TTdvd
+                MtbKgr2/WND9NeIiBXF63FjVQJZ1MsKen2PM/EIXqSmR4CYt8Dtof4WDvOy2d09x
+                fy7X271G2To1a6p2yOPyp4IwvuhzcM3pnZVwXxz6+s8xTOlZtcT4yZ+gjJrhmsqZ
+                n6ID62QRyBCyqCSNsQIDAQABo0IwQDAdBgNVHQ4EFgQUMdJ9xRz4/eR8CGfiA8Zh
+                sQr3sq4wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwDQYJKoZIhvcN
+                AQELBQADggIBAHAUJfzwlqHak5pnXE/Mhch+GHohQ6uYVJBbfuXGseFnAsR0dLjy
+                +7/hwTcMmtMnpOizFCsZLC2EjHC88LNw61O+NeJeV0rMHARdhgxKGJZGyMTiLl0X
+                ujcluvLUdGBl+69CRKfdck1NxavFvwNrJ2ncLToaumXR7pOvqZwBIPz5gUQBt0/c
+                HpyTT+e0/saY0mFjFY/D4ob8gdp0xfb5au+Qf5JK/rxXyKpf5vaVUnLM1x2lQwhq
+                uGLkuKRLRofCK+lCnanJRaV/Ljuj+b9j5r3IT4Hxhjv6rSXsAR8rprLxbH3UdLkL
+                lYAM95+oEWutWw8ltTyEy4f2cIgStFxUhafqxkn/XEr7wsEaEZheH+TG4eNv5EIg
+                T8RHooygU2AlR1pN6H5rfugdOrzClQk6pk3k/B40f4PhpLbTzbVaKtMTfStRw4oc
+                zq0co53A3bnAW8YiRza64qpWB0jOts5BKypGukV202rl9DP1PRQb3cjN50SUq0NT
+                yDmx+nuBSD/Od2s+yC6blrHX/vajAMbiVzgmP6AQmgYiZXf1E7Rb89yn0f3nwNAi
+                SvC9WdnkQxb5WVMrPKXQPNvj2s2s809/ViML701ueRweQBhA/BJWKcvSciPq12q5
+                mFET9BQKhY1jFZLTU6OX7ghVFOCdXZVqyBkSWPfkirxYIuOEi6N5gDO/
+                -----END CERTIFICATE-----
+                </Certificate>
+            </CertificateChain>
+        </Key>
+        <Key algorithm="rsa">
+            <PrivateKey format="pem">
+                -----BEGIN RSA PRIVATE KEY-----
+                MIIEpAIBAAKCAQEArfvI6kuHr/d+cj3hlVvRgh4Su49sBqQhrS3plFt9mz90OXgv
+                xF0Y2MzicvsWi0CLLxSzYggQguRA0aMhE8Wqw/XbORkg1pcV/ZD4nr07cBye0Ksh
+                Tdh6ix85I5bAD5rlVORWeImMi2stQloQ/KI8j1fu/1FXPhfmZDULmQY7Bj8mAJlw
+                9ed6Sw9/MmOBfb5FhHcVD/3H4gBE2S+CFE5gikJsXRV2Kecgd550Xfjqn2/K+nrS
+                S+6XjQBYLpA7dRagNXwYX6R3FCK99W2fg/gSVKNYmAnz4NqJ/Hid6ixAMKxqWqSA
+                BTY7paQQacRQZV/q8FCyunV1GthR98c6loDFBwIDAQABAoIBAAOzYViqdp5lk0j2
+                y/+TTmeIIDnhGRkjEJxQZ7GCKK/Or7gxOELjAA5MfVyYvqgDnXJI7G/fYAqItGBB
+                KgjzoWg9qIYUZMBrwkn8dW1a9RKzaSVjHng7bI/dACgjor4yO0KNANHbiyPECdhp
+                dgcJpGQgKLNBlat6cqoa/r4ohcTiNfO9qQ0tikgsojG0O/sG0os9IelVB31wb9NU
+                JbP9up+DKoYgpeETefUhCOtma7kt/fheEFNtUUZ0Est9F5fH76YkNnPmujZqHSjz
+                NCeuPNBeWYkBGJKe/ZDwzG9F7VScr9n8beoc0QtqJ19LTYQKa2ssFHXOA7j5fVho
+                m2uF+fECgYEA6k6jsRlSHjLiLj7Cym34XiJ3c5GnY0V9q0LZCISaI398Tvc4DN0m
+                PmYrqYQVG5GZ04Cadyie+zLc0mhPPbEGifW8msd/IIWpUUEpXIBpaFiYWyIMRdJ1
+                2wDkpyWADKVPKvE27cySBQWBKirfGiSMXp08brBne1Tra+2uCvJklv0CgYEAvhdn
+                GJdssJ+JziKP4LNvq4DpA9dqcWFj4fxy7xF2Dc0br7VZ67zlDggVfgILow2FUcNT
+                7K16FlV7z1AB/IDvgL+W+tGX6UMeyFS0cvddW0YFf5mAgyKsoz39fYzHRRNB+7UJ
+                r99BkU2kxmSaIuhSXKbpulPK2UUm3xRkJPc6ZVMCgYEAuyLZ3F2j15i+Sz83JqSU
+                ZOLUUsp3TXM3/qviWcpGralpqEwNSUDsBZRmtPpYPW+Z03H4bMlVyL2D3s0O1O/p
+                kBBjdZ92aow2gj4wAcBR79Qqw0a7VJzWIndhKBpsXi09wMdtHppv2XDfC8W38NJW
+                Bk9A8AsWa0uUx9vKUNXt/yUCgYEAm3TQH1BW1urh6+5f88dK39sAtN+KcUbQRJQL
+                +m8xOIAw0DVjYGKOgDckPHS3x5TbHs6656fHXFR0eEpaFYHsXEJS2rRlo6H8nqCH
+                Ii4h7u8IuB1098l3ndioYfCrVlY1c//N+EKAgLAavRSw6TNNh/AI3RSBo8Xl0DIA
+                5Co7W3kCgYAYFK7Pn+RTss7qrviR84AKrcJONrvOwwJjx0NEbJlsiKXqC0xIlhaz
+                TTFeF2TmMm2ZxlnDH1oINoMz9ISCFbL3hO+TJ6mc/lDl2OMBDGdSvSoyp5ZugJqg
+                GnBYFiYAZay3Mvl7iFepJ8YFsWxnQjdwKPLBluuWgcfpjtEjUi8eWA==
+                -----END RSA PRIVATE KEY-----
+            </PrivateKey>
+            <CertificateChain>
+                <NumberOfCertificates>3</NumberOfCertificates>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIDazCCAlOgAwIBAgIQZGTVrFmvmkU01SRmW/zgkTANBgkqhkiG9w0BAQsFADA/
+                MRIwEAYDVQQMDAlTdHJvbmdCb3gxKTAnBgNVBAUTIDM0ZGVjNWRkM2U1ZWVjMTVi
+                NDRhZmZhMmFmNzFlMjU3MB4XDTI2MTAzMDEyMTEyOFoXDTM2MTAyNzEyMTEyOFow
+                PzESMBAGA1UEDAwJU3Ryb25nQm94MSkwJwYDVQQFEyBmZDliYzhmNzE4MTY5MzIz
+                YTlmYTMyZjQ0NmM5ODM4MzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+                AK37yOpLh6/3fnI94ZVb0YIeEruPbAakIa0t6ZRbfZs/dDl4L8RdGNjM4nL7FotA
+                iy8Us2IIEILkQNGjIRPFqsP12zkZINaXFf2Q+J69O3AcntCrIU3YeosfOSOWwA+a
+                5VTkVniJjItrLUJaEPyiPI9X7v9RVz4X5mQ1C5kGOwY/JgCZcPXneksPfzJjgX2+
+                RYR3FQ/9x+IARNkvghROYIpCbF0VdinnIHeedF346p9vyvp60kvul40AWC6QO3UW
+                oDV8GF+kdxQivfVtn4P4ElSjWJgJ8+Daifx4neosQDCsalqkgAU2O6WkEGnEUGVf
+                6vBQsrp1dRrYUffHOpaAxQcCAwEAAaNjMGEwDwYDVR0TAQH/BAUwAwEB/zAOBgNV
+                HQ8BAf8EBAMCAgQwHQYDVR0OBBYEFPnkeX8vsQxWSqMlTQvT2ANvgYGJMB8GA1Ud
+                IwQYMBaAFO9mKmXuCzKP6+16BpTaqR1VznGYMA0GCSqGSIb3DQEBCwUAA4IBAQCX
+                a+YktYWxn7YNTR8wnai9rjgyd0j0KsCS+F/vtvBFEm5GctE8Mpz941x15hQRPOcd
+                1yY49kq/y2VKaWuMVMP9WEfzQN/A2Z3Wjm/TWCfSW4HpoacsDQfPd4pm9wQ7eU8c
+                dFkHDUnQMUjxzkSRqGLXpKsT7YmIhvDLKbwSQCSREUI2x41vkzpaF1al8qEd/tU2
+                5xN88f2T0vuScftIg4W/s4sHerpAL1SZYnnM0O24v65r5TyMLHkn6Rn1BGrtOgiQ
+                Qu3yhWARWYM7mY7johl8M6mTm9kL7bHZFOM7NBP4GymMuZpE5RbNUdLqpISIOFUL
+                lIUzCleEatXN4cC0hF5P
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIESDCCAjCgAwIBAgIRAPX3/Pj0e4gsK+O4EmKpKewwDQYJKoZIhvcNAQELBQAw
+                GzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMzAxMjExMjhaFw0z
+                NjEwMjcxMjExMjhaMD8xEjAQBgNVBAwMCVN0cm9uZ0JveDEpMCcGA1UEBRMgMzRk
+                ZWM1ZGQzZTVlZWMxNWI0NGFmZmEyYWY3MWUyNTcwggEiMA0GCSqGSIb3DQEBAQUA
+                A4IBDwAwggEKAoIBAQDG0m2cZoGCU87FVPCPzfqjvik/HsXn+izGWRlYRV3Qv0w3
+                KQrLA/pycn7Qeln+5Ur04Z22M0jgkP+hdRmgxb4IkOAzZwttsM2aeLO3S0EYBREg
+                THOP5te3fEaAaJTZHjstQegReRNtCtpZapdH3T/+uhUyK/uSoOMQm9qK4rInQICI
+                IXmrRbLeEoSTJ/r8sdD0nMVol/XFa8PwL0BXKbYEDZk0+E4xfkyfwebnWDlaD+0z
+                nQhDsRmbblcLV5FXqOiUnakoLk/XK9H9m7y6iW8/kRlKD6A1kgIWGOMcWWUVrmqg
+                kzqtPBFOkV2oi1x1F/eT24L86rkCplMUkMWdDfUXAgMBAAGjYzBhMA8GA1UdEwEB
+                /wQFMAMBAf8wDgYDVR0PAQH/BAQDAgIEMB0GA1UdDgQWBBTvZipl7gsyj+vtegaU
+                2qkdVc5xmDAfBgNVHSMEGDAWgBQx0n3FHPj95HwIZ+IDxmGxCveyrjANBgkqhkiG
+                9w0BAQsFAAOCAgEAMe6gRUWDC/pYlBy3exdSRgETI58YQlRvNvM7RATykXji12Vn
+                4VBeqSQpuKJQe0xTD4DwAS8S6ueENZzx+BdMoyKSqoiHSd8gaVG1xDm5v59i9m6q
+                jrEJTjjPeUReqBRDt/xDYxpE1DwIxosDUb260S4VLAly3XOslTvn+5rjsjVnVL7g
+                S/XxqJv5Fj0MOA0wodJpusZbm9eI2BbgToXIOw9m/3Lrevs0KYmuBYyBV2W50Gs2
+                okN8wxmz0TZH5fOAmIps1EorMF/SELFI5Y+C0NpvqbnE96zehf3xSqQtdbC93UdF
+                hCn8LIAN+1vjyYvMi6rdj9Gj1aGh87hVTht0OjyckSdcBYQhL3/9r0GewiQf7YIm
+                bk9o90kDTcMzCGbB/tobs5Z6kRaGLl3M8+Kuz00yMx1G33Ec+hFqg8UCkkrWzgHL
+                GghfsqYT/76LZftNUd9JVRFjTpGGxoK1zguSAmZ2bwNn2wjXTEhz58BvCqA5qGHp
+                OWrWSvHPQ7oFeKClLU/0ChtTnI3cKcW55QzAhhl022yVqJ7+j3QzinkDkTfNNIU8
+                hS6NQyihFhqmuO5ainBo4wTcsHQhSPyehr5NAE+WCIPJeGj5DVbORTwzcw+NEhJQ
+                XdA64eCZfJ7eb+2rHgc51ZdkF3ZgLkUjXzQ4PIRUITWIs6ri19RXmlJBsXA=
+                -----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+                -----BEGIN CERTIFICATE-----
+                MIIFBjCCAu6gAwIBAgIUU/5m4zSP+gHeo06mJ+iAJtjGyocwDQYJKoZIhvcNAQEL
+                BQAwGzEZMBcGA1UEBRMQZjkyMDA5ZTg1M2I2YjA0NTAeFw0yNjEwMjAyMDM1NTZa
+                Fw00NjEwMTYyMDM1NTZaMBsxGTAXBgNVBAUTEGY5MjAwOWU4NTNiNmIwNDUwggIi
+                MA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQDAkgqdiV68ujcaXqxsY9CL4eQv
+                IkR8NFY/+nBCqNk2EcQKSb/GUeY59s/W72hflP5WuZ+cmUL3JhK8W9bBMLtNnrGy
+                B5ChPZeBKFq/1CzfTeZ6j78gKOgEXoTY80EvL7E99kLnJlBg2Lierf8VeSN5tBw6
+                DwBc9+RSgAZlX9lAij15/kXGzsAwYTFNEZVRr7HKMOFSrLSDl6qsl2SCJ2HBbFWZ
+                06RFEOLNe/3leV1aPT0ARTVQDO0sukYZNwYoe31Y3vSoEwJMFDyF4jsR34yakir/
+                hwcxwfjMIL9DY2OG5tRYXDm2SxbzAV9KzAw10Z0Xqo0EXfNgZID2BttxTHumGdLj
+                lJ0mNA0ZuXqL62wsPhZxG4DS+xBPjrb4860kvc9+Igk2ayIfUyS2tHFV19BGnNE/
+                UZe8A4w360A2y8EQXcvHdyVjE52zIYVy+YU8k+D/Lp8mB1GcSPvNUsCO+8H8gDYL
+                rSox2qPq4COd6bBaDCzUIdCDhxtr6Mm98ysRwJRcyWmfOT03yewGUbS9t0/TTdvd
+                MtbKgr2/WND9NeIiBXF63FjVQJZ1MsKen2PM/EIXqSmR4CYt8Dtof4WDvOy2d09x
+                fy7X271G2To1a6p2yOPyp4IwvuhzcM3pnZVwXxz6+s8xTOlZtcT4yZ+gjJrhmsqZ
+                n6ID62QRyBCyqCSNsQIDAQABo0IwQDAdBgNVHQ4EFgQUMdJ9xRz4/eR8CGfiA8Zh
+                sQr3sq4wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAgQwDQYJKoZIhvcN
+                AQELBQADggIBAHAUJfzwlqHak5pnXE/Mhch+GHohQ6uYVJBbfuXGseFnAsR0dLjy
+                +7/hwTcMmtMnpOizFCsZLC2EjHC88LNw61O+NeJeV0rMHARdhgxKGJZGyMTiLl0X
+                ujcluvLUdGBl+69CRKfdck1NxavFvwNrJ2ncLToaumXR7pOvqZwBIPz5gUQBt0/c
+                HpyTT+e0/saY0mFjFY/D4ob8gdp0xfb5au+Qf5JK/rxXyKpf5vaVUnLM1x2lQwhq
+                uGLkuKRLRofCK+lCnanJRaV/Ljuj+b9j5r3IT4Hxhjv6rSXsAR8rprLxbH3UdLkL
+                lYAM95+oEWutWw8ltTyEy4f2cIgStFxUhafqxkn/XEr7wsEaEZheH+TG4eNv5EIg
+                T8RHooygU2AlR1pN6H5rfugdOrzClQk6pk3k/B40f4PhpLbTzbVaKtMTfStRw4oc
+                zq0co53A3bnAW8YiRza64qpWB0jOts5BKypGukV202rl9DP1PRQb3cjN50SUq0NT
+                yDmx+nuBSD/Od2s+yC6blrHX/vajAMbiVzgmP6AQmgYiZXf1E7Rb89yn0f3nwNAi
+                SvC9WdnkQxb5WVMrPKXQPNvj2s2s809/ViML701ueRweQBhA/BJWKcvSciPq12q5
+                mFET9BQKhY1jFZLTU6OX7ghVFOCdXZVqyBkSWPfkirxYIuOEi6N5gDO/
+                -----END CERTIFICATE-----
+                </Certificate>
+            </CertificateChain>
+        </Key>
+    </Keybox>
+</AndroidAttestation>
+</script>
 </body>
 </html>
