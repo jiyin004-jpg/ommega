@@ -77,7 +77,6 @@ RESETPROP_TARGET_DIR = TARGET_ROOT / "resetprop"
 
 REQUIRED_TEMPLATE_FILES = (
     "customize.sh",
-    "daemon",
     "daemon-injector",
     "injector.toml",
     "layout.sh",
@@ -95,7 +94,6 @@ MODULE_TEXT_FILES = (
     "README.md",
     "adbr-daemon.sh",
     "customize.sh",
-    "daemon",
     "daemon-injector",
     "injector.toml",
     "keybox_tee.xml",

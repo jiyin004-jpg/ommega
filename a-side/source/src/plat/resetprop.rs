@@ -54,25 +54,11 @@ impl PhoneIdentifierKind {
     }
 }
 
-/// 只用模块自己带的那两份，**不信任管理器提供的 resetprop**。
+/// 模块自带的那份 resetprop（`vendor/resetprop-rs` 编译出来的）。
 ///
-/// 以前这里还列了 `/system_ext/bin/resetprop`、`/data/adb/ksu/bin/resetprop`、
-/// `/data/adb/ksud` 做兼底。问题是那几份的行为不统一（有的会改属性区直接写、
-/// 有的只发 socket），读出来的值到底反映的是哪个时刻说不清。证书里的值必须和
-/// 检测器 `getprop` 看到的完全一致，所以只认我们自己编译的那份。
-///
-/// 两个路径都列上：`bin/` 是 `layout.sh` 搬过去的运行位置，`libs/<abi>/` 是安装
-/// 包里那份（还没搬、或者被手动清掉时也能跑）。
-const RESETPROP_FALLBACKS: &[(&str, Option<&str>)] = &[
-    ("/data/adb/ommega/bin/resetprop", None),
-    ("/data/adb/modules/ommega/libs/arm64-v8a/resetprop", None),
-    ("/data/adb/modules/ommega/libs/armeabi-v7a/resetprop", None),
-    ("/data/adb/modules/ommega/libs/x86_64/resetprop", None),
-    ("/data/adb/modules/ommega/libs/x86/resetprop", None),
-];
-
-/// 模块自己带的那份（实现是 vendor/ 里的 resetprop-rs，安装时
-/// customize.sh 把与设备 ABI 匹配的那份拷进 libs/，`layout.sh` 再搬到 bin/）。
+/// 只认这一个路径：`customize.sh` 把与设备 ABI 匹配的那份装进 `libs/`，
+/// `layout.sh` 再搬到 `bin/`。管理器的 resetprop 行为不统一（有的直接写属性区、
+/// 有的只发 socket），读出来的值到底反映哪个时刻说不清，一律不用。
 const RESETPROP_BUNDLED: &str = "/data/adb/ommega/bin/resetprop";
 
 #[derive(Clone)]
@@ -253,39 +239,19 @@ fn read_property_via_resetprop(name: &str) -> Option<String> {
     None
 }
 
-/// 所有可用的 resetprop，按优先级排。
+/// 所有可用的 resetprop（现在只有一个）。
 ///
-/// 只列模块自己带的（`bin/` 和 `libs/<abi>/` 两个位置都试），**不搜 PATH**：
-/// PATH 里命中的是管理器那份，行为跟我们的实现不一致，证书里的值必须来自
-/// 和检测器同一个真相源。
-///
-/// 为什么是个列表而不直接写死一个路径：调用方可能是 keystore 里的 forked helper，
-/// 而 keystore 域未必有权限 exec `/data/adb` 下的文件（域的转换归 SELinux 管，
-/// `sepolicy.rule` 里只给 keystore 放开了 `system_file`）—— 这时第一个 exec 不通，
-/// 会顺着往下试。
+/// 调用方拿到的是列表是为了「第一个 exec 不通就试下一个」，但那属于历史遗留的
+/// 多路径兜底；只认模块自己那份之后，这里就是一个元素。
 pub fn resetprop_candidates() -> Vec<ResetpropCommand> {
-    let mut out = Vec::new();
-
     if Path::new(RESETPROP_BUNDLED).exists() {
-        out.push(ResetpropCommand {
+        vec![ResetpropCommand {
             program: RESETPROP_BUNDLED.to_string(),
             prepend_arg: None,
-        });
+        }]
+    } else {
+        Vec::new()
     }
-
-    for (program, prepend_arg) in RESETPROP_FALLBACKS {
-        if *program == RESETPROP_BUNDLED {
-            continue;
-        }
-        if Path::new(program).exists() {
-            out.push(ResetpropCommand {
-                program: program.to_string(),
-                prepend_arg: prepend_arg.map(str::to_string),
-            });
-        }
-    }
-
-    out
 }
 
 fn execute_write_and_verify(command: &ResetpropCommand, property: &str, value: &str) -> Result<()> {

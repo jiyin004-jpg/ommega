@@ -9,8 +9,7 @@ PROP_FILE="$MODDIR/module.prop"
 
 # 注入器的调度者：优先用 Rust 的 inject-watchdog（stat 轮询，文件变了才跑一轮），
 # 二进制不存在时退回老的自循环 shell。两者 cmdline 不一样，所以外部存活检查也得跟着走。
-INJECTOR_CMD=$MODDIR/daemon-injector
-[ -x "$BIN_DIR/inject-watchdog" ] && INJECTOR_CMD=$BIN_DIR/inject-watchdog
+INJECTOR_CMD=$BIN_DIR/inject-watchdog
 
 mkdir -p "$STATE_DIR"
 
@@ -56,6 +55,8 @@ pid_matches_script() {
   echo "$cmdline" | grep -F "$script" >/dev/null 2>&1
 }
 
+# 启动一个**ELF**守护（`inject-watchdog`）并按 pidfile 守着。
+# keymint 那个不用它了，见下面的 start_keymint_daemon。
 start_daemon() {
   script=$1
   pidfile=$2
@@ -68,11 +69,7 @@ start_daemon() {
     rm -f "$pidfile"
   fi
 
-  # inject-watchdog 是 ELF 二进制，不能套 sh；其余仍是 shell 脚本。
-  case "$script" in
-    */inject-watchdog) "$script" & ;;
-    *) sh "$script" & ;;
-  esac
+  "$script" &
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
@@ -116,17 +113,16 @@ ensure_sepolicy() {
 # restart where the old watchdog died but its children survived). Only
 # module-owned paths are matched; the system keymint HAL is never touched.
 kill_all() {
-  pkill -9 -f 'modules/ommega/daemon' 2>/dev/null
-  pkill -9 -f 'modules/ommega/libs' 2>/dev/null
   pkill -9 -f "$BIN_DIR/keymint" 2>/dev/null
+  pkill -9 -f "$BIN_DIR/inject-watchdog" 2>/dev/null
   pkill -9 -f "$BIN_DIR/ommega-inject" 2>/dev/null
   sleep 1
 }
 
-# keymint 守护：优先用 Rust 版（`keymint --daemon`），二进制缺失时回落 shell 脚本。
+# keymint 守护：`keymint --daemon`（Rust）。唯一入口，没有 shell 回落版。
 #
-# 装 Rust 版就是为了干掉每 10 秒那十几次 fork（grep/sed/getprop/resetprop），
-# shell 版实测光它自己就吃 4.9% CPU。两者行为一致，回退只是保底。
+# 以前这里是 371 行的 shell 脚本，每 10 秒十几次 fork（grep/sed/getprop/resetprop），
+# 实测光它自己就吃 4.9% CPU；现在同一份逻辑在 Rust 里，实测 60 秒 0 jiffies。
 start_keymint_daemon() {
   pidfile=$RUN_DIR/keymint-daemon.pid
 
@@ -138,12 +134,14 @@ start_keymint_daemon() {
     rm -f "$pidfile"
   fi
 
-  if [ -x "$BIN_DIR/keymint" ]; then
-    "$BIN_DIR/keymint" --daemon &
-  else
-    sh "$MODDIR/daemon" &
+  "$BIN_DIR/keymint" --daemon &
+  pid=$!
+  echo $pid > "$pidfile"
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "--daemon"; then
+    rm -f "$pidfile"
+    return 1
   fi
-  echo "$!" > "$pidfile"
   return 0
 }
 

@@ -23,7 +23,6 @@ use crate::plat::resetprop;
 const STATE_DIR: &str = "/data/adb/ommega";
 const RUN_DIR: &str = "/data/adb/ommega/run";
 const BIN_DIR: &str = "/data/adb/ommega/bin";
-const MODDIR: &str = "/data/adb/modules/ommega";
 
 const CONF_PATH: &str = "/data/misc/keystore/ommega/config";
 const LOG_FILE: &str = "/data/misc/keystore/ommega/logs/daemon.log";
@@ -223,49 +222,11 @@ fn holder_is_daemon(pid: u32) -> bool {
 // keymint 生命周期
 // ---------------------------------------------------------------------------
 
-fn device_abi() -> String {
-    let abi = resetprop::read_string_property("ro.product.cpu.abi").unwrap_or_default();
-    if abi.starts_with("arm64") || abi.starts_with("aarch64") {
-        "arm64-v8a".to_string()
-    } else if abi.starts_with("armeabi") || abi.starts_with("armv7") {
-        "armeabi-v7a".to_string()
-    } else if abi.starts_with("x86_64") {
-        "x86_64".to_string()
-    } else if abi.starts_with("x86") || abi.starts_with("i686") || abi.starts_with("i386") {
-        "x86".to_string()
-    } else {
-        String::new()
-    }
-}
-
+/// keymint 就在 `bin/` 下一处 —— `layout.sh` 会把打包的 `libs/<abi>/keymint`
+/// 搬过来，所以不需要再按 ABI 去找别的副本。
 fn find_keymint() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from(BIN_DIR).join("keymint"),
-        PathBuf::from(MODDIR).join("keymint"),
-    ];
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    let abi = device_abi();
-    if !abi.is_empty() {
-        let packaged = PathBuf::from(MODDIR)
-            .join("libs")
-            .join(&abi)
-            .join("keymint");
-        if packaged.is_file() {
-            return Some(packaged);
-        }
-    }
-    // getprop 读不到 ABI：按顺序试所有打包的 ABI，总比什么都没有强。
-    for abi in ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"] {
-        let packaged = PathBuf::from(MODDIR).join("libs").join(abi).join("keymint");
-        if packaged.is_file() {
-            return Some(packaged);
-        }
-    }
-    None
+    let path = PathBuf::from(BIN_DIR).join("keymint");
+    path.is_file().then_some(path)
 }
 
 /// 杀掉所有跑着 `target` 的残留实例（只匹配这个确切路径，不碰系统 HAL）。

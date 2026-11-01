@@ -77,7 +77,6 @@ extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'sepolicy.rule'   "$MODPATH"
-extract "$ZIPFILE" 'daemon'          "$MODPATH"
 extract "$ZIPFILE" 'daemon-injector' "$MODPATH"
 extract "$ZIPFILE" 'injector.toml'   "$MODPATH"
 extract "$ZIPFILE" 'keybox_tee.xml'  "$MODPATH"
@@ -87,7 +86,7 @@ extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
 extract "$ZIPFILE" 'kmod-loader.sh'  "$MODPATH"
 extract "$ZIPFILE" 'adbr-daemon.sh'  "$MODPATH"
 extract "$ZIPFILE" 'soterta.sh'      "$MODPATH"
-chmod 755 "$MODPATH/daemon" "$MODPATH/daemon-injector" \
+chmod 755 "$MODPATH/daemon-injector" \
   "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" "$MODPATH/uninstall.sh" \
   "$MODPATH/kmod-loader.sh" "$MODPATH/adbr-daemon.sh" "$MODPATH/soterta.sh"
 
