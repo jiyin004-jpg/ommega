@@ -2,6 +2,8 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -97,17 +99,54 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
     parse_hex_32(raw.trim()).ok()
 }
 
-/// 当前 RootOfTrust：key / hash 读**当刻属性**，锁定与验证状态固定「已锁定 + 已验证」。
+/// 出证路径上 key / hash 的短缓存：一次出证要读两个属性，各 fork 一个进程（实测
+/// 单次 22ms）。而 attest 往往是连着来几笔（generateKey 一笔、getKeyEntry 一笔、
+/// 再换算法一笔），2 秒内复用同一份读结果就够了。
 ///
-/// 顺序：实时读属性 → daemon 启动时读好的环境变量（兜底）→ 全零。
+/// 只缓存**成功**的结果：读失败不缓存，下一次直接重试（不会把一次性的权限问题
+/// 锁死两秒）。
+const ROT_CACHE_TTL: Duration = Duration::from_secs(2);
+
+fn cached_hex_property(name: &'static str) -> Option<[u8; 32]> {
+    type Slot = Mutex<Option<(Instant, [u8; 32])>>;
+    static KEY_CACHE: OnceLock<Slot> = OnceLock::new();
+    static HASH_CACHE: OnceLock<Slot> = OnceLock::new();
+
+    let cell = if name == VBMETA_KEY_PROP {
+        KEY_CACHE.get_or_init(|| Mutex::new(None))
+    } else {
+        HASH_CACHE.get_or_init(|| Mutex::new(None))
+    };
+
+    if let Ok(guard) = cell.lock() {
+        if let Some((at, value)) = guard.as_ref() {
+            if at.elapsed() < ROT_CACHE_TTL {
+                return Some(*value);
+            }
+        }
+    }
+
+    let value = read_hex_property(name)?;
+    if let Ok(mut guard) = cell.lock() {
+        *guard = Some((Instant::now(), value));
+    }
+    Some(value)
+}
+
+/// 当前 RootOfTrust：key / hash 读**当刻属性**（2 秒内复用），锁定与验证状态固定
+/// 「已锁定 + 已验证」。
+///
+/// 顺序：读属性（带短缓存）→ daemon 启动时读好的环境变量（兜底）→ 全零。
 /// **不能反过来**：env 是开机快照，运行中 daemon 会把 B 的属性同步过来（physical
-/// 模式），快照就是旧的 —— 证书和 `getprop` 一对就是 mismatch。代价是每笔出证
-/// 两次 exec（`resetprop` 读属性），相比出证本身的网络开销可以忽略。
+/// 模式），快照就是旧的 —— 证书和 `getprop` 一对就是 mismatch。
+///
+/// 代价：缓存过期后的第一笔出证要 fork 两次（约 40ms）；连着来的几笔零开销。
+/// 属性真变了（daemon 同步了 B 的值）最多晚 2 秒被发现，可接受。
 pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
-    let key = read_hex_property(VBMETA_KEY_PROP)
+    let key = cached_hex_property(VBMETA_KEY_PROP)
         .or_else(boot_key_from_env)
         .unwrap_or([0u8; 32]);
-    let hash = read_hex_property(VBMETA_HASH_PROP)
+    let hash = cached_hex_property(VBMETA_HASH_PROP)
         .or_else(boot_hash_from_env)
         .unwrap_or([0u8; 32]);
     (key, hash, true, 0)
