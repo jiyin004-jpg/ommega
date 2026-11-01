@@ -213,13 +213,17 @@ fn resolve_vb_hash(spec: &TrustValueSpec) -> ResolvedField {
 }
 
 /// daemon 通过环境变量传进来的 verified-boot hash（`OMMEGA_BOOT_HASH`）。
-fn boot_hash_from_env() -> Option<[u8; 32]> {
+///
+/// 为什么需要它：keymint 进程里 `rsproperties` 读属性区不可靠（读不到时不报错，
+/// 静默退回「从原机 vbmeta 分区算出来的值」），而 daemon 是 shell 域，
+/// `getprop` 拿到的一定是检测器也能看到的那一份。开机解析 config 和出证上报都用它。
+pub(crate) fn boot_hash_from_env() -> Option<[u8; 32]> {
     let raw = std::env::var("OMMEGA_BOOT_HASH").ok()?;
     parse_hex_32(raw.trim()).ok()
 }
 
 /// 同理，vbmeta 公钥摘要。
-fn boot_key_from_env() -> Option<[u8; 32]> {
+pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
     let raw = std::env::var("OMMEGA_BOOT_KEY").ok()?;
     parse_hex_32(raw.trim()).ok()
 }

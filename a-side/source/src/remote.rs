@@ -1138,7 +1138,7 @@ impl RemoteRelay {
     /// 不用 config 开头：config 是解析一次的快照，而远程出证时证书必须跟当前属性
     /// 一致，否则检测器拿两边一比就是 mismatch。
     fn runtime_vb_hash() -> [u8; 32] {
-        boot_hash_from_env()
+        crate::plat::vbmeta::boot_hash_from_env()
             .or_else(|| {
                 crate::plat::resetprop::read_string_property("ro.boot.vbmeta.digest")
                     .as_deref()
@@ -1149,7 +1149,7 @@ impl RemoteRelay {
 
     /// 同上，vbmeta 公钥摘要。
     fn runtime_vb_key() -> [u8; 32] {
-        boot_key_from_env()
+        crate::plat::vbmeta::boot_key_from_env()
             .or_else(|| {
                 crate::plat::resetprop::read_string_property("ro.boot.vbmeta.public_key_digest")
                     .as_deref()
@@ -1221,20 +1221,6 @@ fn base64_encode(data: &[u8]) -> String {
 fn parse_hex32(value: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(value.trim()).ok()?;
     bytes.try_into().ok()
-}
-
-/// daemon 启动 keymint 时用 `getprop` 读好的 verified-boot hash。
-///
-/// keymint 自己读属性不可靠（读不到时静默退回分区值），而 daemon 是 shell 域，
-/// `getprop` 拿到的一定是检测器也能看到的那一份。
-fn boot_hash_from_env() -> Option<[u8; 32]> {
-    let raw = std::env::var("OMMEGA_BOOT_HASH").ok()?;
-    parse_hex32(raw.trim())
-}
-
-fn boot_key_from_env() -> Option<[u8; 32]> {
-    let raw = std::env::var("OMMEGA_BOOT_KEY").ok()?;
-    parse_hex32(raw.trim())
 }
 
 /// Convert a "YYYY-MM-DD" patch level string to the YYYYMM integer the relay

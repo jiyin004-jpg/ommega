@@ -847,14 +847,13 @@ impl Fulfill {
             _ => boot_value_seed(device_id, "boothash", stamp).to_vec(),
         };
         // 排障：A 端到底报了什么。Boot consistency 那类问题全看这一行。
+        // 只打哈希前 12 字节 + 锁定/状态，不拼字段名列表（那只是这次排障临时加的，
+        // 每笔 attest 都 collect 一遍 vec 不划算）。
         tracing::info!(
-            "parse_ctx: device={device_id} A 上报 hash={} locked={:?} state={:?} keys={:?}",
+            "parse_ctx: device={device_id} A 上报 hash={} locked={:?} state={:?}",
             hex_prefix(&vb_hash, 12),
             ctx.get("device_locked"),
             ctx.get("verified_boot_state"),
-            ctx.as_object()
-                .map(|o| o.keys().cloned().collect::<Vec<String>>())
-                .unwrap_or_default(),
         );
         p.root_of_trust = Some(RootOfTrust {
             verified_boot_key: vb_key,
