@@ -492,10 +492,14 @@ EARLY_POLL_SECONDS=90
 started_at=$(date +%s 2>/dev/null || echo 0)
 # 主循环的拍数：前台那个活代价比读文件大，没必要每拍都干（见 sync_foreground）。
 tick=0
-# 前台应用多久采一次（拍数）。5 秒一拍 × 12 = 约 60 秒；daemon 那边认 90 秒内的。
-# `dumpsys window` 单次代价是几百毫秒，以前每 10 秒跑一次（×2）就是在持续白烧 CPU：
-# 它只是最后一道兜底（uid_packages 表 + appId 回退在前面），没必要这么密。
-FOREGROUND_EVERY=12
+# 前台应用多久采一次（拍数）。5 秒一拍 × 2 = 约 10 秒；daemon 那边认 20 秒内的。
+# 为什么不更慢：这条兜底的意义就是「现在是谁在调」，切个 App 就对不上，
+# 分钟级更是完全没用。为什么不更快：`dumpsys window` 单次几百毫秒，
+# 每 5 秒一次就是持续烧 CPU。10 秒是两边都还能接受的位置。
+#
+# （试过改成「keymint 用到时现问」：行不通——keymint 跑在 keystore 域，
+#   exec dumpsys 会被 SELinux 挡；`am monitor` 只报崩溃/ANR，不报前台切换。）
+FOREGROUND_EVERY=2
 tick_sleep() {
   ticks=$((ticks + 1))
   # --once：跑完一轮就退出（调试用）。
