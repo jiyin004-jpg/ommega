@@ -4,4 +4,4 @@
 
 ## 1.7.13
 
-- Follows the main release; no functional changes.
+- Turning the adbr debug channel off now also removes the 5555 listener, the manually started adbd and the USB debugging switch, so no debug entry is left behind.
