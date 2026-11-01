@@ -1,7 +1,0 @@
-{
-    "title": "Ommega",
-    "icon": "icon.png",
-    "windowResize": false,
-    "exitConfirm": false,
-    "backInterceptor": "javascript"
-}

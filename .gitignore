@@ -70,3 +70,9 @@ server/run-dev/
 
 # 发版打包产物（几十 MB 的 zip），不进版本库
 .release-history/
+
+# ===== 临时调试残留（打包暂存、检测器工程副本、一次性脚本）=====
+# 这些曾经被提交进去，结果改了半天 template/ 却发现发出去的包里
+# daemon-injector 和 sepolicy.rule 还是旧的。统一挡住。
+/.tmp-*/
+/.tmp-*

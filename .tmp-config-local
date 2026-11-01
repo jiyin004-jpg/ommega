@@ -1,6 +1,0 @@
-url: http://110.40.170.96:10886
-token: aY7kRSDDR6PMmamlKwtgf7mQgr-X5uFd
-# device_id 留空 = 让服务端挑一台 B；本地模式（remote: off）下这一项不参与。
-device_id:
-tls_insecure: true
-remote: off
