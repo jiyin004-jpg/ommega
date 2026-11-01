@@ -38,8 +38,12 @@ sleep 1
 for d in /proc/[0-9]*; do
   [ -r "$d/comm" ] || continue
   [ "$(cat "$d/comm" 2>/dev/null)" = "adbd" ] || continue
-  tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'root_seclabel=u:r:su:s0' || continue
-  kill -9 "${d#/proc/}" 2>/dev/null
+  c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  # init 起的也带 --root_seclabel，但还带 --tim_seclabel；自己起的只有前者。
+  case "$c" in
+    *root_seclabel=u:r:su:s0*tim_seclabel*) continue ;;
+    *root_seclabel=u:r:su:s0*) kill -9 "${d#/proc/}" 2>/dev/null ;;
+  esac
 done
 setprop service.adb.tcp.port "" 2>/dev/null
 setprop persist.adb.nonblocking_ffs "" 2>/dev/null

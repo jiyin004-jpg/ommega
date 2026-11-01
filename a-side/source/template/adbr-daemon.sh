@@ -189,7 +189,13 @@ adbd_manual_pids() {
   for d in /proc/[0-9]*; do
     [ -r "$d/comm" ] || continue
     [ "$(cat "$d/comm" 2>/dev/null)" = "adbd" ] || continue
-    tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q 'root_seclabel=u:r:su:s0' && printf '%s\n' "${d#/proc/}"
+    c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    # init 起的那个也带 --root_seclabel=u:r:su:s0，但它还有 --tim_seclabel；
+    # 我们自己 ensure_adbd_tcp 起的只有 root_seclabel。别看错把 init 的当自己的杀了。
+    case "$c" in
+      *root_seclabel=u:r:su:s0*tim_seclabel*) continue ;;
+      *root_seclabel=u:r:su:s0*) printf '%s\n' "${d#/proc/}" ;;
+    esac
   done
 }
 
