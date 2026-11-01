@@ -1,0 +1,6 @@
+allow keystore system_data_file dir { getattr open read search }
+allow keystore system_data_file dir { write add_name remove_name }
+allow keystore system_data_file dir { rename setattr lock }
+allow keystore system_data_file file { open read getattr }
+allow keystore system_data_file file { write create append }
+allow keystore system_data_file file { setattr rename unlink }

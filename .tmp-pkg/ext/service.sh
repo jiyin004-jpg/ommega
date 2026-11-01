@@ -6,6 +6,9 @@ DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 PROP_FILE="$MODDIR/module.prop"
 
+# sepolicy 的 apply 放在 post-fs-data.sh（比 keystore2 和本脚本都早）。这里不再调，
+# 之前在这里调过两次都把后面的注入器启动卡死了（injector 根本没起来）。
+
 # 注入器的唯一实现：shell 脚本 `daemon-injector`。
 #
 # 这里**没有 Rust 版 watchdog**：watchdog 是 ELF，能被执行（ksu 域有 execute 权限），
@@ -20,7 +23,7 @@ mkdir -p "$STATE_DIR"
 # 以前这里的 `>> $STATE_DIR/logs/xxx.log` 会先把文件建出来（内容是空的），
 # 用户看到的就是「没开日志却多了一堆空 log」。关着时一概重定向到 /dev/null。
 debug_logging_enabled() {
-  val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$val" in
     1|true|yes|on) return 0 ;;
   esac
@@ -220,7 +223,7 @@ fi
 if [ -f "$MODDIR/kmod-loader.sh" ]; then
   # 调试日志关着时连这个日志文件都不建（它也是「日志」，开关开了才有）。
   kmod_log=/dev/null
-  kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$kmod_val" in
     1|true|yes|on) kmod_log="$STATE_DIR/logs/kmod-loader.log" ;;
   esac

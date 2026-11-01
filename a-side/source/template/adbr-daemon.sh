@@ -2,7 +2,7 @@
 
 # adbrd 监管脚本 —— A / B 两端共用同一份，用参数选读哪份配置：
 #
-#   sh adbr-daemon.sh --a   A 端：/data/misc/keystore/ommega/config 里的 `adbr:`
+#   sh adbr-daemon.sh --a   A 端：/data/misc/ommega/config 里的 `adbr:`
 #   sh adbr-daemon.sh --b   B 端：/data/adb/ommega-b/conf/relay.conf 里的 OMMEGA_RELAY_ABDR_ENABLED
 #
 # 设备被公网远控这件事必须由用户显式点头，所以这里只认配置里的开关，不开就不跑：
@@ -38,7 +38,7 @@ LOG="$STATE_DIR/logs/adbr.log"
 LOCK_DIR="$RUN_DIR/adbr-daemon.lock"
 
 if [ "$MODE" = "a" ]; then
-  CONF=/data/misc/keystore/ommega/config
+  CONF=/data/misc/ommega/config
 else
   CONF="$CONF_DIR/relay.conf"
 fi

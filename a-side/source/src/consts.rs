@@ -27,7 +27,7 @@ pub const RPC_PEER_STATE: &str = "/data/misc/keystore/ommega/rpc.peers";
 ///
 /// 写在 keystore 状态目录里（0700 keystore）：TA 跑在 keystore2 进程内，只有这个
 /// 目录可写。
-pub const REMOTE_IDENTITY_STATE: &str = "/data/misc/keystore/ommega/remote_identity";
+pub const REMOTE_IDENTITY_STATE: &str = "/data/misc/ommega/remote_identity";
 
 /// Second RPC rendezvous point, on the abstract unix namespace.
 ///

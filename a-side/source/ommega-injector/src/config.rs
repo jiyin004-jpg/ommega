@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/keystore/ommega/injector.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
 /// 同一份配置的副本，由 `daemon-injector` 抄过来。
 ///
 /// 为什么要有它：SOTER 宿主是 uid 1000 的 system_app，keystore 那个 `0770` 目录在有些 ROM 上
@@ -30,12 +30,12 @@ pub const FALLBACK_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
 /// This is the single data location: the webroot UI writes it through the
 /// `/data/adb/ommega/ommegadata` symlink (which points here), and the injected
 /// payload (keystore2, uid 1017) reads the same file.  There is no copy.
-const CLIENTA_TARGET_PATH: &str = "/data/misc/keystore/ommega/target.txt";
+const CLIENTA_TARGET_PATH: &str = "/data/misc/ommega/target.txt";
 /// Legacy A-side flat config (same directory as `target.txt`, written by the
 /// webroot UI and read by the keymint daemon).  The injector only looks at one
 /// key here: `global_scope`.  Everything else in that file belongs to the
 /// daemon's own parser (`crate::config` on the keymint side).
-const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
+const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
 /// 日志开关的副本，由 daemon-injector 按真配置写好：`log_flag: 1` / `log_flag: 0`。
 ///
 /// 位置挑在 `/data/misc` 下面是有讲究的：SOTER 宿主是 uid 1000 的 system_app，

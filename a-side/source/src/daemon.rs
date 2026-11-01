@@ -24,9 +24,9 @@ const STATE_DIR: &str = "/data/adb/ommega";
 const RUN_DIR: &str = "/data/adb/ommega/run";
 const MODDIR: &str = "/data/adb/modules/ommega";
 
-const CONF_PATH: &str = "/data/misc/keystore/ommega/config";
-const LOG_FILE: &str = "/data/misc/keystore/ommega/logs/daemon.log";
-const REMOTE_IDENTITY: &str = "/data/misc/keystore/ommega/remote_identity";
+const CONF_PATH: &str = "/data/misc/ommega/config";
+const LOG_FILE: &str = "/data/misc/ommega/logs/daemon.log";
+const REMOTE_IDENTITY: &str = "/data/misc/ommega/remote_identity";
 const REMOTE_IDENTITY_APPLIED: &str = "/data/adb/ommega/conf/remote_identity.applied";
 const REMOTE_IDENTITY_UPDATED: &str = "/data/adb/ommega/conf/remote_identity.updated";
 const PROPS_CONF: &str = "/data/adb/ommega/conf/props.conf";

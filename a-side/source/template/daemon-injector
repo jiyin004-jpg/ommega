@@ -14,7 +14,7 @@ RESTART_ALL_FILE=$RUN_DIR/restart.all
 # A 端平铺 config（WebUI 写的），只有 soter_inject 这个键是本脚本读的：
 # 关着（键不在、或写了 0/false）就完全不碰 SOTER 宿主——不起服务、不注入；
 # 开着才 `am start-service` 把它拉起来再注进去。
-CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
+CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
 # 日志开关的副本：payload 有可能落进读不到上面那个配置的域（SOTER 宿主是 uid 1000），
 # 它按这个文件决定写不写日志。内容只有 `log_flag: 0|1` 一行，别往里放别的。
 # 放 /data/misc 下面是因为宿主（system_app）连 /data/adb（0700 root）都进不去，
@@ -22,13 +22,13 @@ CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
 LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/ommega/log_flag}
 # root 侧写给 daemon 的「uid → 包名」表（它就从系统自己的 packages.list 抄）。
 # 放 keystore 那个目录里是因为 daemon 就跑在 keystore uid，那个目录它读得到。
-UID_PACKAGES_OUT=/data/misc/keystore/ommega/uid_packages
+UID_PACKAGES_OUT=/data/misc/ommega/uid_packages
 PACKAGES_LIST=/data/system/packages.list
 # daemon 拿去做最后一道兜底的「当前前台应用」（它跑在 keystore uid，只读得到这个目录）。
-FOREGROUND_OUT=/data/misc/keystore/ommega/foreground
+FOREGROUND_OUT=/data/misc/ommega/foreground
 # 载荷（跑在 SOTER 宿主，system_app 域）读不到 keystore 那个 0770 目录，得给它一份
 # 读得到的配置副本 —— 那台小米就是这么在宿主里自我禁用的（injector.toml Permission denied）。
-INJECTOR_TOML=/data/misc/keystore/ommega/injector.toml
+INJECTOR_TOML=/data/misc/ommega/injector.toml
 INJECTOR_TOML_COPY=/data/misc/ommega/injector.toml
 # 载荷（宿主域）自己翻包名要用的两份副本：表 `uid package` 和前台应用。
 # 原理同 injector.toml —— keystore 那个 0770 目录宿主进不去，得给一份读得到的。
@@ -36,7 +36,7 @@ UID_PACKAGES_COPY=/data/misc/ommega/uid_packages
 FOREGROUND_COPY=/data/misc/ommega/foreground
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
-LOG_DIR=/data/misc/keystore/ommega/logs
+LOG_DIR=/data/misc/ommega/logs
 LOG_FILE=$LOG_DIR/daemon-injector.log
 # app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
 # 得给它一个自己写得动的位置，权限开到 system 组。
@@ -54,7 +54,7 @@ SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
 # daemon 判出「SOTER 宿主哑了」时写的标记。它跑在 keystore uid，只写得动自己那个目录
 # （`src/soter_host_health.rs`）；写一行原因，这里读走、删掉，再把宿主换成新实例。
-SOTER_STUCK_FILE=/data/misc/keystore/ommega/soter_host_stuck
+SOTER_STUCK_FILE=/data/misc/ommega/soter_host_stuck
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
@@ -559,7 +559,7 @@ trap 'release_lock' EXIT INT TERM HUP
 
 while true; do
   # Config and target list live in the single data location
-  # (/data/misc/keystore/ommega/); the webroot UI writes them through the
+  # (/data/misc/ommega/); the webroot UI writes them through the
   # ommegadata symlink, so no copy/sync is needed here.
 
   LOG_ON=0

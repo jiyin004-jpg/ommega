@@ -26,7 +26,7 @@ use super::*;
 
 /// Keystore-private directory that the payload (uid `keystore`) can write even while the
 /// device is locked; see the module docs for the choice.
-pub(super) const DEFAULT_STATE_PATH: &str = "/data/misc/keystore/ommega/unlock.state";
+pub(super) const DEFAULT_STATE_PATH: &str = "/data/misc/ommega/unlock.state";
 const STATE_PATH_ENV: &str = "OMMEGA_UNLOCK_STATE";
 const DISABLED: &str = "off";
 const STATE_VERSION: u32 = 1;

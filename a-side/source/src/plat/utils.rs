@@ -221,7 +221,7 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
 /// 为什么要多这条：AAID 服务在分身/空间/多用户那些 uid 上会回空或直接报错，那些机器就永远
 /// 翻不出包名、只能退回按别名/槽位猜。这张表是 root 直接从系统自己的 `packages.list` 抄的，
 /// 不依赖那个服务、也不靠 appId 猜（分身那些 999xxxxx 在 `packages.list` 里本来就有行）。
-const UID_PACKAGES_PATH: &str = "/data/misc/keystore/ommega/uid_packages";
+const UID_PACKAGES_PATH: &str = "/data/misc/ommega/uid_packages";
 
 /// 表的内容 + 什么时候读的。文件不大（几百行），一分钟重读一次就够。
 static UID_PACKAGES: std::sync::Mutex<
@@ -269,7 +269,7 @@ fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
 /// 它是最后一道兜底：前面三层（内核 uid、root 侧表、appId 回退）都拿不到包名时才用它。
 /// 它比前三层弱 —— 前台是谁不等于谁在调 SOTER（支付流程可能在子进程/后台）—— 所以还带
 /// 新鲜度阀（文件超过这个秒数就不用）和配置开关（root 侧得不写，它就不存在）。
-const FOREGROUND_PATH: &str = "/data/misc/keystore/ommega/foreground";
+const FOREGROUND_PATH: &str = "/data/misc/ommega/foreground";
 
 /// 前台信息算多新鲜才能用。要比写侧的间隔大（写侧 `FOREGROUND_EVERY=2` × 5 秒 ≈ 10 秒），
 /// 否则大部分时候都是“过期的没有”——那就等于这一道不存在。

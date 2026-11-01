@@ -4,12 +4,12 @@
 # Runs automatically when the module is removed via a root manager
 # (KernelSU / Magisk / APatch). Removes every runtime artifact the A-side
 # creates so an uninstall leaves no residue: daemon processes, the whole
-# /data/misc/keystore/ommega tree, A-side files under the shared
+# /data/misc/ommega tree, A-side files under the shared
 # /data/adb/ommega state dir, and WebUI temp files.
 
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
-OMMEGA_DIR=/data/misc/keystore/ommega
+OMMEGA_DIR=/data/misc/ommega
 
 # ---------------------------------------------------------------------------
 # 1. Stop runtime processes
@@ -67,7 +67,7 @@ rm -rf "$OMMEGA_DIR"
 #    /data/adb/ommega is shared with the B-side module (ommega-b), so we
 #    only touch A-side-owned entries and leave relay/relay.conf/logs intact.
 # ---------------------------------------------------------------------------
-rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/keystore/ommega
+rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/ommega
 rm -f "$STATE_DIR/keymint"             # hot-update binary
 rm -f "$STATE_DIR/ommega-inject"       # hot-update binary
 rm -f "$STATE_DIR/injector"            # legacy hot-update binary

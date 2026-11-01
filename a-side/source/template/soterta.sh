@@ -9,7 +9,7 @@
 #   soterta.sh             converge 一次（service.sh 每轮调）
 #   soterta.sh status      打一行状态
 #
-# 开关在 /data/misc/keystore/ommega/config 的 `soter_inject`（1/0），WebUI 写。
+# 开关在 /data/misc/ommega/config 的 `soter_inject`（1/0），WebUI 写。
 # 关掉就是「原厂 HAL 回来」：杀我们的守护、ctl.start vendor.soter。
 #
 # 为什么不用注入：soterserver 在这个机型上是 platform_app 域 + 它的 libbinder 带共享
@@ -23,7 +23,7 @@ CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-CONF=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
+CONF=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
 PIDFILE=$RUN_DIR/soterta.pid
 KICKED_FILE=$RUN_DIR/soterta.host.kicked
 # 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。

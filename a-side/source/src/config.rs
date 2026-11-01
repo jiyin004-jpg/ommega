@@ -21,7 +21,7 @@ pub static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 static CONFIG_WATCHER_STARTED: OnceLock<()> = OnceLock::new();
 static CONFIG_FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-const CONFIG_PATH: &str = "/data/misc/keystore/ommega/config.toml";
+const CONFIG_PATH: &str = "/data/misc/ommega/config.toml";
 /// Legacy A-side (client-a) flat `key: value` config. When present, the remote
 /// relay settings in this file override the `[remote]` table in `config.toml`,
 /// matching how the old A-side module was configured on-device.
@@ -29,7 +29,7 @@ const CONFIG_PATH: &str = "/data/misc/keystore/ommega/config.toml";
 /// This is the single data location: the webroot UI writes it through the
 /// `/data/adb/ommega/ommegadata` symlink (which points here), so both the UI
 /// and the keystore process (uid 1017) see the same file.  There is no copy.
-const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
+const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
 const CONFIG_VERSION_V1: u32 = 1;
 const CURRENT_CONFIG_VERSION: u32 = 2;
 

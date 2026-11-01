@@ -63,13 +63,9 @@ const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
 /// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM，`openssl genpkey` / `openssl genrsa` 的都行）。
 /// 存在且解析得过就用它，跟 keybox 一个路子：丢文件进去、重启 SOTER 宿主就生效。
 ///
-/// 两个位置对应两个域，谁在哪个域里读得到就认谁：
-/// - `/data/misc/ommega/`：payload 落进 app 域（SOTER 宿主是 uid 1000）时读得到；
-/// - `/data/misc/keystore/ommega/`：跟真配置同一个目录，keystore 域读得到。
-const ATTK_FILE_PATHS: [&str; 2] = [
-    "/data/misc/ommega/soter_attk.pem",
-    "/data/misc/keystore/ommega/soter_attk.pem",
-];
+/// 唯一位置是 `/data/misc/ommega/`：它的 context 是 `system_data_file`，
+/// app 域（SOTER 宿主是 uid 1000）和 keystore 域都读得到，不需要在两个目录各存一份。
+const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
@@ -232,7 +228,7 @@ fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key,
     if let Some(path) = from_env {
         candidates.push(path);
     }
-    candidates.extend(ATTK_FILE_PATHS.iter().map(std::path::PathBuf::from));
+    candidates.extend([std::path::PathBuf::from(ATTK_FILE_PATH)]);
 
     for path in candidates {
         let Ok(pem) = std::fs::read_to_string(&path) else {
@@ -256,12 +252,9 @@ fn load_attk_key() -> Option<(Key, String)> {
     load_attk_key_with(None)
 }
 
-/// 旧版按 uid 散落的 ASK 文件位置（读到就迁进 store，然后把旧文件删掉）。
-fn legacy_ask_file_paths(uid: i32) -> [String; 2] {
-    [
-        format!("/data/misc/keystore/ommega/soter_ask_{uid}.pem"),
-        format!("/data/misc/ommega/soter_ask_{uid}.pem"),
-    ]
+/// 旧版按 uid 散落的 ASK 文件（读到就迁进 store，然后把旧文件删掉）。
+fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
+    [format!("/data/misc/ommega/soter_ask_{uid}.pem")]
 }
 
 /// 所有 uid 的 ASK 和 AuthKey 存在这一个文件里，不要按 uid/alias 散成一堆 pem。
@@ -271,11 +264,8 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 2] {
 /// { "asks": { "10496": "<pem>" }, "authkeys": { "10496|SoterAuthKey": "<pem>" } }
 /// ```
 ///
-/// 旧版只有一层（`{ "10496": "<pem>" }`），读的时候当成 `asks` 处理。
-const ASK_STORE_PATHS: [&str; 2] = [
-    "/data/misc/keystore/ommega/soter_asks.json",
-    "/data/misc/ommega/soter_asks.json",
-];
+/// 位置唯一：`/data/misc/ommega/`（`system_data_file`，app 域和 keystore 域都读得到）。
+const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
 const ASK_SECTION: &str = "asks";
 const AUTH_SECTION: &str = "authkeys";
 
@@ -283,42 +273,42 @@ const AUTH_SECTION: &str = "authkeys";
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
-    for path in ASK_STORE_PATHS {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(serde_json::Value::Object(mut map)) => {
-                // 旧版扁平格式：顶层全是 uid，整个当成 asks。
-                let flat = !map.is_empty() && map.keys().all(|key| key.parse::<i32>().is_ok());
-                if flat {
-                    let mut wrapped = serde_json::Map::new();
-                    wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
-                    return wrapped;
-                }
-                map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION);
-                return map;
+    let path = ASK_STORE_PATH;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return serde_json::Map::new();
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            // 旧版扁平格式：顶层全是 uid，整个当成 asks。
+            let flat = !map.is_empty() && map.keys().all(|key| key.parse::<i32>().is_ok());
+            if flat {
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
+                return wrapped;
             }
-            _ => log::warn!("soter local ask store at {path} is not a json object; ignoring it"),
+            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION);
+            map
+        }
+        _ => {
+            log::warn!("soter local ask store at {path} is not a json object; ignoring it");
+            serde_json::Map::new()
         }
     }
-    serde_json::Map::new()
 }
 
 fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     let text = serde_json::to_string_pretty(map).ok()?;
-    for path in ASK_STORE_PATHS {
-        if let Some(dir) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        // 写临时文件再 rename：中途掉电也不会留个半个 json。
-        let tmp = format!("{path}.tmp");
-        if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-            return Some(path.to_string());
-        }
-        let _ = std::fs::remove_file(&tmp);
-        log::warn!("soter local cannot write the ask store at {path}");
+    let path = ASK_STORE_PATH;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    // 写临时文件再 rename：中途掉电也不会留个半个 json。
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return Some(path.to_string());
+    }
+    let _ = std::fs::remove_file(&tmp);
+    log::warn!("soter local cannot write the ask store at {path}");
     None
 }
 
@@ -384,14 +374,9 @@ fn forget_uid_keys(uid: i32) {
 static ATTK_STAMP: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
 
 fn attk_stamp() -> Option<std::time::SystemTime> {
-    ATTK_FILE_PATHS
-        .iter()
-        .filter_map(|path| {
-            std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok()
-        })
-        .max()
+    std::fs::metadata(ATTK_FILE_PATH)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 /// 当前生效的 ATTK。文件没变就吃缓存，变了就现读 —— 换 key 不用重启 payload。

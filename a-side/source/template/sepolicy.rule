@@ -48,6 +48,23 @@ allow { system_app platform_app priv_app } system_app_data_file file { open read
 
 allow crash_dump keystore process *
 
+# 数据根放到了 /data/misc/ommega（system_data_file）：SOTER 宿主（system_app 等）在上面
+# 已经放行，但没有给 keystore 域 —— 只放了 system_file（dlopen payload）。
+# keymint 和 daemon 都在 keystore 域，要读写这里的 config / keybox 之外的共享数据
+# （config、remote_identity、logs、injector.toml），所以补这两条。
+#
+# 代价要说清楚：keystore 域能读写 system_data_file，等于把这块数据对高价值目标打开。
+# 换来的是「一份数据一个位置」，不再有 keystore / misc 两份副本各自漂移。
+#
+# 必须拆成多条短规则：ksud 的解析器对**每行的权限列表**也有上限（跟名字列表一样 5 个），
+# 一条写 10 个权限整行会被默默丢弃 —— 之前就是这么踩的，avc 一直刷但规则文件看着是对的。
+allow keystore system_data_file dir { getattr open read search }
+allow keystore system_data_file dir { write add_name remove_name }
+allow keystore system_data_file dir { rename setattr lock }
+allow keystore system_data_file file { open read getattr }
+allow keystore system_data_file file { write create append }
+allow keystore system_data_file file { setattr rename unlink }
+
 # SOTER HAL 服务进程本身也是注入目标（宿主不在时，`service call` 那种直连只有注进
 # HAL 才看得见）。它跟宿主一样要收 payload、连 RPC socket、写日志，所以上面那组
 # 一条不落再来两份，只是域换成 HAL 的几种叫法。

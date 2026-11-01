@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use log::LevelFilter;
 
-const DEFAULT_LOG_PATH: &str = "/data/misc/keystore/ommega/logs/keymint.log";
+const DEFAULT_LOG_PATH: &str = "/data/misc/ommega/logs/keymint.log";
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();

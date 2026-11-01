@@ -187,7 +187,7 @@ fi
 # 跟着消失；漏挂或内容不合法时 system_server 读 /odm/etc/permissions 直接失败，
 # 设备开不了机（2026-10-28 在 peridot 上实测过）。
 STRONGBOX_HIDDEN=false
-CLIENTA_CONF=/data/misc/keystore/ommega/config
+CLIENTA_CONF=/data/misc/ommega/config
 # 装的时候看一眼：这台机器有没有 StrongBox。有就把它写成配置里的默认值，
 # 且**只在配置里没有这一项时写**——用户之前改过什么，之后面板上改了什么，
 # 一律以配置文件为准，安装不再插手，也没有任何开机时自动覆盖。
@@ -269,5 +269,75 @@ rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.a
 rm -f "$CONFIG_DIR/injector" "$CONFIG_DIR/keymint" "$CONFIG_DIR/ommega-inject" 2>/dev/null
 
 if [ ! -e "$CONFIG_DIR/ommegadata" ] && [ ! -L "$CONFIG_DIR/ommegadata" ]; then
-  ln -s /data/misc/keystore/ommega "$CONFIG_DIR/ommegadata"
+  ln -s /data/misc/ommega "$CONFIG_DIR/ommegadata"
 fi
+
+# 数据根搬家：以前 keystore 域和 app 域各存一份（config、remote_identity、日志、
+# soter_*、uid_packages、foreground…），现在统一到 /data/misc/ommega（system_data_file，
+# 两边都读得到）。这里把旧位置的数据搬过来一次，keystore 目录只留密钥材料和 rpc.sock。
+KS_ROOT=/data/misc/keystore/ommega
+DATA_ROOT=/data/misc/ommega
+mkdir -p "$DATA_ROOT/logs" 2>/dev/null
+# 组 system 可写：keystore 域（gid system）要往这里写 remote_identity / config；
+# other 保留 x + 文件本身 0644，app 域（other）按已知路径读得到。
+chmod 0771 "$DATA_ROOT" 2>/dev/null
+chmod 0777 "$DATA_ROOT/logs" 2>/dev/null
+for f in config.toml config remote_identity soter_cpu_id uid_packages foreground \
+         soter_attk.pem soter_asks.json injector.toml target.txt unlock.state \
+         remote_identity.applied remote_identity.updated; do
+  [ -f "$KS_ROOT/$f" ] || continue
+  if [ -e "$DATA_ROOT/$f" ]; then
+    # 新位置已有（已经是权威副本），旧的那份直接删掉。
+    rm -f "$KS_ROOT/$f" 2>/dev/null
+  elif cp -f "$KS_ROOT/$f" "$DATA_ROOT/$f" 2>/dev/null; then
+    # 先复制、确认落地了再删源。直接 mv + rm 会在跨目录权限不够时丢掉数据。
+    rm -f "$KS_ROOT/$f" 2>/dev/null
+  fi
+done
+for f in "$KS_ROOT"/logs/*; do
+  [ -f "$f" ] || continue
+  if [ -e "$DATA_ROOT/logs/${f##*/}" ]; then
+    rm -f "$f" 2>/dev/null
+  elif cp -f "$f" "$DATA_ROOT/logs/" 2>/dev/null; then
+    rm -f "$f" 2>/dev/null
+  fi
+done
+# 面板保存的平铺配置。装完就该有一份默认值：没有它 injector 只能用内置默认，
+# 面板打开也是空的。只在缺的时候写，不覆盖用户改过。
+if [ ! -f "$DATA_ROOT/config" ]; then
+  cat > "$DATA_ROOT/config" <<'OMMEGA_CONF'
+url: http://110.40.170.96:10886
+token: aY7kRSDDR6PMmamlKwtgf7mQgr-X5uFd
+device_id:
+tls_insecure: true
+remote: off
+OMMEGA_CONF
+fi
+chmod 0644 "$DATA_ROOT/config" 2>/dev/null
+
+# injector.toml 必须 0644：注入到 SOTER 宿主（uid 1000 / system_app）的 payload 要读它。
+# 它是 0600 keystore:keystore 的时候，keystore2 那边读得到、SOTER 宿主读不到，
+# 普通认证就不出链（以前靠 /data/misc/ommega 那份 fallback 副本搭着，那份副本已经不存在了）。
+if [ -f "$DATA_ROOT/injector.toml" ]; then
+  chmod 0644 "$DATA_ROOT/injector.toml" 2>/dev/null
+fi
+# 同理：ATTK、ASK、cpu_id、包名表都是 app 域要读的。
+for f in soter_attk.pem soter_asks.json soter_cpu_id uid_packages foreground target.txt log_flag; do
+  [ -f "$DATA_ROOT/$f" ] && chmod 0644 "$DATA_ROOT/$f" 2>/dev/null
+done
+#
+# keybox 的解压落在模块目录，这里把它们种到密钥根：`ensure_keybox_file` 只管 TEE 那份，
+# StrongBox 那份以前没人种，StrongBox 出证就一直缺 keybox。
+# 同时把上一版误放进数据根的密钥材料清掉（数据根是共享目录，不能放密钥）。
+KS_ROOT=/data/misc/keystore/ommega
+mkdir -p "$KS_ROOT" 2>/dev/null
+for f in keybox_tee.xml keybox_strongbox.xml; do
+  [ -f "$MODPATH/$f" ] || continue
+  if [ ! -e "$KS_ROOT/$f" ]; then
+    cp -f "$MODPATH/$f" "$KS_ROOT/$f" 2>/dev/null
+  fi
+  chmod 0600 "$KS_ROOT/$f" 2>/dev/null
+  chown keystore:keystore "$KS_ROOT/$f" 2>/dev/null
+done
+rm -f "$DATA_ROOT/keybox_tee.xml" "$DATA_ROOT/keybox_strongbox.xml" 2>/dev/null
+rm -rf "$DATA_ROOT/data" 2>/dev/null
