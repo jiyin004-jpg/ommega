@@ -193,14 +193,24 @@ fi
 # 设备开不了机（2026-10-28 在 peridot 上实测过）。
 STRONGBOX_HIDDEN=false
 CLIENTA_CONF=/data/misc/ommega/config
-# 装的时候不再看这台机器有没有 StrongBox，也不再自动往配置里写开关。
+# 装的时候判断一次，把结论写成面板配置里的初值，之后就只由面板改：
 #
-# 以前是「硬件声明了 StrongBox 就默认藏」，理由是“不藏的话检测器会去试 StrongBox 那条路”。
-# 那条理由站不住：模块包里的 keybox_strongbox.xml 是必带的（缺了安装直接失败），StrongBox
-# 这条路我们自己服务得了，藏掉声明反而是自相矛盾——声明被摧掉、请求却照样成功，拿
+#   - 系统声明了 StrongBox、模块也带着 keybox_strongbox.xml（包内必带）→ 我们服务得了，
+#     不藏：请求会成功，声明也向上层报有，两边一致。
+#   - 系统没声明 → 本来就没有，藏不藏一样，也不藏。
+#
+# 所以初值就是 0（不遮）。以前写 1 是自相矛盾：声明被摘掉、请求却照样成功，拿
 # 「feature=false 但 request=ok」一对就命中（2026-11-01 在 peridot 上实测，探针 S01 红）。
 #
-# 现在只认配置：用户/面板显式写 1/true/on 才遮，默认不插手。
+# 写在配置里而不是脚本里硬编码：这一项在面板上能看、能改，往后一切以面板为准，
+# 开机只读面板存下的值（config 或 conf/mask.state），不再自己判断。
+if ! grep -qiE '^[[:space:]]*(hide_strongbox|no_strongbox|hide_strongbox_keystore)[[:space:]]*:' "$CLIENTA_CONF" 2>/dev/null; then
+  if [ -f "$MODPATH/keybox_strongbox.xml" ]; then
+    mkdir -p "$(dirname "$CLIENTA_CONF")" 2>/dev/null || true
+    [ -f "$CLIENTA_CONF" ] || : > "$CLIENTA_CONF" 2>/dev/null || true
+    printf 'hide_strongbox: 0\n' >> "$CLIENTA_CONF" 2>/dev/null || true
+  fi
+fi
 if [ -f "$CLIENTA_CONF" ]; then
   hide_val=$(grep -iE '^[[:space:]]*(hide_strongbox|no_strongbox|hide_strongbox_keystore)[[:space:]]*:' "$CLIENTA_CONF" 2>/dev/null | head -n 1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
   case "$hide_val" in
