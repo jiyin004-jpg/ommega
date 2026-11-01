@@ -882,10 +882,11 @@ impl RemoteRelay {
         // 两边口径一致，检测器拿证书和 `ro.boot.flash.locked`、
         // `ro.boot.verifiedbootstate` 去比不会出现矛盾。
         //
-        // hash 不取 `config().trust` 那份启动快照：daemon 会在运行时改
-        // `ro.boot.vbmeta.digest`，必须实时读，否则证书和属性对不上。
-        let vb_key = Self::runtime_vb_key();
-        let vb_hash = Self::runtime_vb_hash();
+        // RootOfTrust：key / hash 取**当刻属性**（daemon 传进来的环境变量优先，
+        // 其次自己读），锁定与验证状态固定「已锁定 + 已验证」（不在代码里分两处写）。
+        // 这套值早先来自 `[trust]` 配置的开机快照，属性一变就和证书对不上。
+        let (vb_key, vb_hash, device_locked, verified_boot_state) =
+            crate::plat::vbmeta::runtime_root_of_trust();
         ctx.insert(
             "verified_boot_key".to_string(),
             Value::String(base64_encode(&vb_key)),
@@ -894,8 +895,11 @@ impl RemoteRelay {
             "verified_boot_hash".to_string(),
             Value::String(base64_encode(&vb_hash)),
         );
-        ctx.insert("device_locked".to_string(), Value::Bool(true));
-        ctx.insert("verified_boot_state".to_string(), Value::from(0));
+        ctx.insert("device_locked".to_string(), Value::Bool(device_locked));
+        ctx.insert(
+            "verified_boot_state".to_string(),
+            Value::from(verified_boot_state),
+        );
         ctx.insert(
             "creation_datetime_ms".to_string(),
             Value::from(Self::now_ms()),
@@ -1121,43 +1125,6 @@ impl RemoteRelay {
             .unwrap_or(0)
     }
 
-    /// Resolved verified-boot key/hash from `config().trust` (32 bytes each).
-    /// Falls back to zeros if the config lock is unavailable (never fatal).
-    fn verified_boot_values() -> ([u8; 32], [u8; 32]) {
-        match config::config().read() {
-            Ok(g) => (g.trust.vb_key, g.trust.vb_hash),
-            Err(_) => ([0u8; 32], [0u8; 32]),
-        }
-    }
-
-    /// 证书里要声明的 vbmeta digest：以 **daemon 开机读到的属性值**为准。
-    ///
-    /// 优先级：`OMMEGA_BOOT_HASH`（daemon 用 getprop 读好传进来的，就是检测器
-    /// 看到的那一份）→ 自己读属性 → config 快照。
-    ///
-    /// 不用 config 开头：config 是解析一次的快照，而远程出证时证书必须跟当前属性
-    /// 一致，否则检测器拿两边一比就是 mismatch。
-    fn runtime_vb_hash() -> [u8; 32] {
-        crate::plat::vbmeta::boot_hash_from_env()
-            .or_else(|| {
-                crate::plat::resetprop::read_string_property("ro.boot.vbmeta.digest")
-                    .as_deref()
-                    .and_then(parse_hex32)
-            })
-            .unwrap_or(Self::verified_boot_values().1)
-    }
-
-    /// 同上，vbmeta 公钥摘要。
-    fn runtime_vb_key() -> [u8; 32] {
-        crate::plat::vbmeta::boot_key_from_env()
-            .or_else(|| {
-                crate::plat::resetprop::read_string_property("ro.boot.vbmeta.public_key_digest")
-                    .as_deref()
-                    .and_then(parse_hex32)
-            })
-            .unwrap_or(Self::verified_boot_values().0)
-    }
-
     /// Forward a sign request for a remote key.
     pub fn sign(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
         let body = json!({
@@ -1215,12 +1182,6 @@ impl RemoteRelay {
 
 fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-/// 64 个 hex 字符 → 32 字节；长度或字符不对就当没读到。
-fn parse_hex32(value: &str) -> Option<[u8; 32]> {
-    let bytes = hex::decode(value.trim()).ok()?;
-    bytes.try_into().ok()
 }
 
 /// Convert a "YYYY-MM-DD" patch level string to the YYYYMM integer the relay

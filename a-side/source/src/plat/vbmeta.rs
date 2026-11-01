@@ -2,44 +2,26 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::mpsc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use kmr_common::crypto::{Rng, Sha256};
-use kmr_crypto_ommega::{rng::OmmegaRng, sha256::OmmegaSha256};
-use rsbinder::Strong;
 
 use crate::{
-    android::{
-        hardware::security::keymint::{
-            Algorithm::Algorithm, Digest::Digest, EcCurve::EcCurve, KeyParameter::KeyParameter,
-            KeyParameterValue::KeyParameterValue, KeyPurpose::KeyPurpose,
-            SecurityLevel::SecurityLevel, Tag::Tag,
-        },
-        system::keystore2::{
-            Domain::Domain, IKeystoreSecurityLevel::IKeystoreSecurityLevel,
-            KeyDescriptor::KeyDescriptor, KeyMetadata::KeyMetadata,
-        },
-    },
-    config::{
-        ConfigFile, OsVersionSpec, RawTrustConfig, ResolvedTrust, TrustValueSource, TrustValueSpec,
-    },
-    plat::{attestation, resetprop, utils::get_keystore_service},
+    config::{ConfigFile, OsVersionSpec, RawTrustConfig, ResolvedTrust},
+    plat::resetprop,
 };
 
 const SECURITY_PATCH_PROP: &str = "ro.build.version.security_patch";
 const SECURITY_PATCH_FALLBACK: &str = "2025-06-05";
 const VENDOR_PATCH_PROP: &str = "ro.vendor.build.security_patch";
 const BOOT_PATCH_PROP: &str = "ro.vendor.boot_security_patch";
+
 /// 面板「伪装参数」曾经写的那个名字（部分 ROM 用这个）。与上面等价。
 const BOOT_PATCH_ALT_PROP: &str = "ro.boot.build.security_patch";
 /// AProbe 的 A13 查的就是这个名字（`boot.image`，不是 `boot.build`）。
 const BOOT_PATCH_APROBE_PROP: &str = "ro.boot.image.build.security_patch";
 const VBMETA_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
 const VBMETA_HASH_PROP: &str = "ro.boot.vbmeta.digest";
-const ORIGINAL_HASH_TIMEOUT: Duration = Duration::from_secs(5);
 const AVB_HEADER_SIZE: usize = 256;
 const AVB_FOOTER_SIZE: usize = 64;
 const AVB_MAX_VBMETA_SIZE: usize = 64 * 1024;
@@ -64,12 +46,6 @@ const BUILD_PROP_PATHS: &[&str] = &[
     "/default.prop",
 ];
 
-#[derive(Clone)]
-struct ResolvedField {
-    value: [u8; 32],
-    source: TrustValueSource,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedPatchLevels {
     pub security_patch: String,
@@ -81,39 +57,11 @@ pub(crate) struct ResolvedPatchLevels {
 }
 
 pub fn bootstrap_vbmeta(config_file: &ConfigFile) -> Result<ResolvedTrust> {
-    let slot_suffix = resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
     let patches = resolve_patch_levels(&config_file.trust)?;
     let os_version = match config_file.trust.os_version {
         OsVersionSpec::Auto => kmr_common::android_version::android_major_version().unwrap_or(16),
         OsVersionSpec::Fixed(value) => value,
     };
-
-    let vb_key = resolve_vb_key(
-        &config_file.trust.vb_key,
-        config_file.trust.device_locked,
-        &slot_suffix,
-    );
-    let vb_hash = resolve_vb_hash(&config_file.trust.vb_hash);
-
-    sync_sysprops_if_needed(&vb_key, &vb_hash)?;
-    if patches.write_security_patch {
-        write_security_patch_with_rollback(
-            resetprop::direct_write_and_verify_property,
-            resetprop::read_string_property,
-            &patches.security_patch,
-            patches.observed_security_patch.as_deref(),
-        )?;
-    }
-
-    let vb_key_hex = hex::encode(vb_key.value);
-    let vb_hash_hex = hex::encode(vb_hash.value);
-    log::info!(
-        "Resolved vbmeta trust: vb_key={} source={} vb_hash={} source={}",
-        vb_key_hex,
-        vb_key.source,
-        vb_hash_hex,
-        vb_hash.source
-    );
 
     Ok(ResolvedTrust {
         os_version,
@@ -121,12 +69,6 @@ pub fn bootstrap_vbmeta(config_file: &ConfigFile) -> Result<ResolvedTrust> {
         os_patchlevel: patches.os_patchlevel,
         vendor_patchlevel: patches.vendor_patchlevel,
         boot_patchlevel: patches.boot_patchlevel,
-        vb_key: vb_key.value,
-        vb_hash: vb_hash.value,
-        vb_key_source: vb_key.source,
-        vb_hash_source: vb_hash.source,
-        verified_boot_state: config_file.trust.verified_boot_state,
-        device_locked: config_file.trust.device_locked,
     })
 }
 
@@ -137,79 +79,6 @@ pub(crate) fn write_runtime_security_patch(desired: &str, previous: Option<&str>
         desired,
         previous,
     )
-}
-
-fn resolve_vb_key(spec: &TrustValueSpec, device_locked: bool, slot_suffix: &str) -> ResolvedField {
-    match spec {
-        TrustValueSpec::Hex(value) => ResolvedField {
-            value: *value,
-            source: TrustValueSource::ExplicitHex,
-        },
-        TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
-        TrustValueSpec::Auto => {
-            if let Some(value) = boot_key_from_env() {
-                return ResolvedField {
-                    value,
-                    source: TrustValueSource::Property,
-                };
-            }
-            if let Some(value) = read_hex_property(VBMETA_KEY_PROP) {
-                return ResolvedField {
-                    value,
-                    source: TrustValueSource::Property,
-                };
-            }
-
-            match compute_vbmeta_public_key_digest(slot_suffix, device_locked) {
-                Ok(value) => ResolvedField {
-                    value,
-                    source: TrustValueSource::Computed,
-                },
-                Err(error) => {
-                    log::warn!("computed vbmeta public key digest unavailable: {error:#}");
-                    random_field(TrustValueSource::RandomFallback)
-                }
-            }
-        }
-    }
-}
-
-fn resolve_vb_hash(spec: &TrustValueSpec) -> ResolvedField {
-    match spec {
-        TrustValueSpec::Hex(value) => ResolvedField {
-            value: *value,
-            source: TrustValueSource::ExplicitHex,
-        },
-        TrustValueSpec::Random => random_field(TrustValueSource::RandomExplicit),
-        TrustValueSpec::Auto => {
-            // 环境变量优先：daemon 启动本进程时用 `getprop` 读好的那一份，就是
-            // 检测器能看到的 `ro.boot.vbmeta.digest`。keymint 自己读属性不可靠
-            // （读不到就静默退回「原机分区算出来的值」），那样子证书和属性就对不上。
-            if let Some(value) = boot_hash_from_env() {
-                return ResolvedField {
-                    value,
-                    source: TrustValueSource::Property,
-                };
-            }
-            if let Some(value) = read_hex_property(VBMETA_HASH_PROP) {
-                return ResolvedField {
-                    value,
-                    source: TrustValueSource::Property,
-                };
-            }
-
-            match probe_original_verified_boot_hash_with_timeout(ORIGINAL_HASH_TIMEOUT) {
-                Ok(value) => ResolvedField {
-                    value,
-                    source: TrustValueSource::Original,
-                },
-                Err(error) => {
-                    log::warn!("original verified boot hash unavailable: {error:#}");
-                    random_field(TrustValueSource::RandomFallback)
-                }
-            }
-        }
-    }
 }
 
 /// daemon 通过环境变量传进来的 verified-boot hash（`OMMEGA_BOOT_HASH`）。
@@ -228,11 +97,21 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
     parse_hex_32(raw.trim()).ok()
 }
 
-fn random_field(source: TrustValueSource) -> ResolvedField {
-    let mut rng = OmmegaRng {};
-    let mut value = [0u8; 32];
-    rng.fill_bytes(&mut value);
-    ResolvedField { value, source }
+/// 当前 RootOfTrust：key / hash 取**当刻属性**，锁定与验证状态固定为「已锁定 + 已验证」。
+///
+/// 等级策略是固定的：对外一律声明锁定、已验证，不跟设备真实状态走。只有 key / hash
+/// 需要跟设备对齐 —— 它们从属性实时读（daemon 传进来的环境变量优先），所以证书和
+/// `getprop` 看到的永远是同一个值。
+///
+/// 以前这套值来自 `[trust]` 配置里的一份开机快照，属性一变两边就分叉。
+pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
+    let key = boot_key_from_env()
+        .or_else(|| read_hex_property(VBMETA_KEY_PROP))
+        .unwrap_or([0u8; 32]);
+    let hash = boot_hash_from_env()
+        .or_else(|| read_hex_property(VBMETA_HASH_PROP))
+        .unwrap_or([0u8; 32]);
+    (key, hash, true, 0)
 }
 
 pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPatchLevels> {
@@ -497,20 +376,6 @@ fn current_year_month() -> Result<(i32, u32)> {
     }
 }
 
-fn sync_sysprops_if_needed(vb_key: &ResolvedField, vb_hash: &ResolvedField) -> Result<()> {
-    if vb_key.source.needs_sysprop_write() {
-        let value = hex::encode(vb_key.value);
-        resetprop::direct_write_and_verify_property(VBMETA_KEY_PROP, &value)?;
-    }
-
-    if vb_hash.source.needs_sysprop_write() {
-        let value = hex::encode(vb_hash.value);
-        resetprop::direct_write_and_verify_property(VBMETA_HASH_PROP, &value)?;
-    }
-
-    Ok(())
-}
-
 fn read_hex_property(name: &str) -> Option<[u8; 32]> {
     let value = resetprop::read_string_property(name)?;
     parse_hex_32(&value)
@@ -525,18 +390,6 @@ fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
     decoded
         .try_into()
         .map_err(|decoded: Vec<u8>| anyhow!("hex value must be 32 bytes, got {}", decoded.len()))
-}
-
-impl TrustValueSource {
-    fn needs_sysprop_write(self) -> bool {
-        matches!(
-            self,
-            TrustValueSource::Computed
-                | TrustValueSource::Original
-                | TrustValueSource::RandomExplicit
-                | TrustValueSource::RandomFallback
-        )
-    }
 }
 
 fn read_abl_boot_patchlevel() -> Result<String> {
@@ -745,17 +598,6 @@ fn validated_vbmeta_size(header: &[u8]) -> Result<usize> {
     Ok(total_size)
 }
 
-fn compute_vbmeta_public_key_digest(slot_suffix: &str, device_locked: bool) -> Result<[u8; 32]> {
-    if !device_locked {
-        return Ok([0u8; 32]);
-    }
-
-    let path = find_top_level_vbmeta_path(slot_suffix)?;
-    let vbmeta_bytes = load_vbmeta_blob(&path)
-        .with_context(|| format!("failed to read vbmeta image {}", path.display()))?;
-    compute_vbmeta_public_key_digest_from_bytes(&vbmeta_bytes)
-}
-
 fn find_top_level_vbmeta_path(slot_suffix: &str) -> Result<PathBuf> {
     find_avb_partition_path(slot_suffix, "vbmeta")
 }
@@ -868,42 +710,6 @@ fn load_vbmeta_blob_at(
     Ok(blob)
 }
 
-fn compute_vbmeta_public_key_digest_from_bytes(vbmeta_bytes: &[u8]) -> Result<[u8; 32]> {
-    if vbmeta_bytes.len() < AVB_HEADER_SIZE {
-        bail!("vbmeta blob too small");
-    }
-    if &vbmeta_bytes[..4] != b"AVB0" {
-        bail!("vbmeta blob missing AVB0 magic");
-    }
-
-    let auth_block_size = be_u64(&vbmeta_bytes[12..20])?;
-    let public_key_offset = be_u64(&vbmeta_bytes[64..72])?;
-    let public_key_size = be_u64(&vbmeta_bytes[72..80])?;
-    if public_key_size == 0 {
-        bail!("vbmeta public key size is zero");
-    }
-
-    let key_start = AVB_HEADER_SIZE
-        .checked_add(auth_block_size)
-        .and_then(|value| value.checked_add(public_key_offset))
-        .ok_or_else(|| anyhow!("vbmeta public key start overflow"))?;
-    let key_end = key_start
-        .checked_add(public_key_size)
-        .ok_or_else(|| anyhow!("vbmeta public key end overflow"))?;
-    if key_end > vbmeta_bytes.len() {
-        bail!(
-            "vbmeta public key range [{}..{}) exceeds blob length {}",
-            key_start,
-            key_end,
-            vbmeta_bytes.len()
-        );
-    }
-
-    OmmegaSha256 {}
-        .hash(&vbmeta_bytes[key_start..key_end])
-        .map_err(|error| anyhow!("failed to hash vbmeta public key: {error:?}"))
-}
-
 fn be_u64(bytes: &[u8]) -> Result<usize> {
     let array: [u8; 8] = bytes
         .try_into()
@@ -925,104 +731,6 @@ fn le_u32(bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(array))
 }
 
-fn probe_original_verified_boot_hash_with_timeout(timeout: Duration) -> Result<[u8; 32]> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result =
-            probe_original_verified_boot_hash_inner().map_err(|error| format!("{error:#}"));
-        let _ = sender.send(result);
-    });
-
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(anyhow!(error)),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err(anyhow!("timed out while probing system verified boot hash"))
-        }
-        Err(error) => Err(anyhow!("system verified boot hash probe failed: {error}")),
-    }
-}
-
-fn probe_original_verified_boot_hash_inner() -> Result<[u8; 32]> {
-    let service = get_keystore_service().context("failed to connect to system keystore")?;
-    let tee = service
-        .getSecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT)
-        .context("failed to get system TEE security level")?;
-
-    if let Ok(metadata) = generate_blob_attested_key(&tee) {
-        return extract_verified_boot_hash_from_metadata(&metadata);
-    }
-
-    let alias = format!(
-        "ommega-vbhash-probe-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    let descriptor = app_descriptor(&alias);
-    let result = tee.generateKey(&descriptor, None, &attested_ec_params(), 0, &[]);
-    let metadata = result.context("fallback APP attestation key generation failed")?;
-    let extracted = extract_verified_boot_hash_from_metadata(&metadata);
-    if let Err(error) = service.deleteKey(&descriptor) {
-        log::warn!("failed to delete fallback APP vbhash probe key {alias}: {error:?}");
-    }
-    extracted
-}
-
-fn generate_blob_attested_key(
-    security_level: &Strong<dyn IKeystoreSecurityLevel>,
-) -> Result<KeyMetadata> {
-    let descriptor = KeyDescriptor {
-        domain: Domain::BLOB,
-        nspace: 0,
-        alias: None,
-        blob: None,
-    };
-    security_level
-        .generateKey(&descriptor, None, &attested_ec_params(), 0, &[])
-        .context("BLOB attestation key generation failed")
-}
-
-fn app_descriptor(alias: &str) -> KeyDescriptor {
-    KeyDescriptor {
-        domain: Domain::APP,
-        nspace: 0,
-        alias: Some(alias.to_string()),
-        blob: None,
-    }
-}
-
-fn attested_ec_params() -> Vec<KeyParameter> {
-    vec![
-        kp(Tag::ALGORITHM, KeyParameterValue::Algorithm(Algorithm::EC)),
-        kp(Tag::EC_CURVE, KeyParameterValue::EcCurve(EcCurve::P_256)),
-        kp(Tag::KEY_SIZE, KeyParameterValue::Integer(256)),
-        kp(Tag::DIGEST, KeyParameterValue::Digest(Digest::SHA_2_256)),
-        kp(
-            Tag::PURPOSE,
-            KeyParameterValue::KeyPurpose(KeyPurpose::SIGN),
-        ),
-        kp(
-            Tag::ATTESTATION_CHALLENGE,
-            KeyParameterValue::Blob(b"ommega-vbmeta-probe".to_vec()),
-        ),
-    ]
-}
-
-fn kp(tag: Tag, value: KeyParameterValue) -> KeyParameter {
-    KeyParameter { tag, value }
-}
-
-fn extract_verified_boot_hash_from_metadata(metadata: &KeyMetadata) -> Result<[u8; 32]> {
-    let leaf = metadata
-        .certificate
-        .as_deref()
-        .ok_or_else(|| anyhow!("attestation leaf certificate missing"))?;
-    attestation::extract_verified_boot_hash_from_leaf_certificate(leaf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,15 +743,6 @@ mod tests {
         assert_eq!(civil_from_days(1_770_000_000 / 86400), (2026, 2, 2));
         // 0 = 1970-01-01
         assert_eq!(civil_from_days(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn avb_public_key_digest_matches_embedded_blob_hash() {
-        let public_key = b"test-public-key-material";
-        let vbmeta = build_test_vbmeta(public_key, 64, 96);
-        let digest = compute_vbmeta_public_key_digest_from_bytes(&vbmeta).unwrap();
-        let expected = OmmegaSha256 {}.hash(public_key).unwrap();
-        assert_eq!(digest, expected);
     }
 
     #[test]
@@ -1297,31 +996,6 @@ ro.vendor.boot_security_patch.extra = ignored
         );
         assert!(result.is_err());
         assert_eq!(writes.get(), 0);
-    }
-
-    #[test]
-    fn random_sources_still_require_sysprop_writeback() {
-        assert!(TrustValueSource::RandomExplicit.needs_sysprop_write());
-        assert!(TrustValueSource::RandomFallback.needs_sysprop_write());
-        assert!(!TrustValueSource::ExplicitHex.needs_sysprop_write());
-        assert!(!TrustValueSource::Property.needs_sysprop_write());
-    }
-
-    fn build_test_vbmeta(
-        public_key: &[u8],
-        auth_block_size: usize,
-        aux_block_size: usize,
-    ) -> Vec<u8> {
-        let total_size = AVB_HEADER_SIZE + auth_block_size + aux_block_size;
-        let mut blob = vec![0u8; total_size];
-        blob[..4].copy_from_slice(b"AVB0");
-        blob[12..20].copy_from_slice(&(auth_block_size as u64).to_be_bytes());
-        blob[20..28].copy_from_slice(&(aux_block_size as u64).to_be_bytes());
-        blob[64..72].copy_from_slice(&(0u64).to_be_bytes());
-        blob[72..80].copy_from_slice(&(public_key.len() as u64).to_be_bytes());
-        let start = AVB_HEADER_SIZE + auth_block_size;
-        blob[start..start + public_key.len()].copy_from_slice(public_key);
-        blob
     }
 
     fn build_test_vbmeta_with_descriptors(flags: u32, descriptors: &[u8]) -> Vec<u8> {

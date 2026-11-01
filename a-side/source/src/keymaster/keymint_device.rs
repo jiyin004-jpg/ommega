@@ -1399,15 +1399,13 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         .map_err(anyhow::Error::msg)
         .context(err!("Failed to parse boot patch level"))?;
 
+    let (vb_key, vb_hash, device_locked, verified_boot_state) =
+        crate::plat::vbmeta::runtime_root_of_trust();
     let resp = ta.process_req(PerformOpReq::SetBootInfo(kmr_wire::SetBootInfoRequest {
-        verified_boot_state: if config.trust.verified_boot_state {
-            0
-        } else {
-            2
-        },
-        verified_boot_hash: config.trust.vb_hash.clone().to_vec(),
-        verified_boot_key: config.trust.vb_key.clone().to_vec(),
-        device_boot_locked: config.trust.device_locked,
+        verified_boot_state: verified_boot_state as i32,
+        verified_boot_hash: vb_hash.to_vec(),
+        verified_boot_key: vb_key.to_vec(),
+        device_boot_locked: device_locked,
         boot_patchlevel,
     }));
     if resp.error_code != 0 {
