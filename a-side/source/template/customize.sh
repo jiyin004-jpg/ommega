@@ -349,19 +349,17 @@ for f in soter_attk.pem soter_asks.json soter_cpu_id uid_packages foreground tar
   [ -f "$DATA_ROOT/$f" ] && chmod 0644 "$DATA_ROOT/$f" 2>/dev/null
 done
 #
-# keybox 的解压落在模块目录，这里把它们种到密钥根：`ensure_keybox_file` 只管 TEE 那份，
-# StrongBox 那份以前没人种，StrongBox 出证就一直缺 keybox。
-# 同时把上一版误放进数据根的密钥材料清掉（数据根是共享目录，不能放密钥）。
-mkdir -p "$KS_ROOT" 2>/dev/null
+# keybox 的解压落在模块目录，这里把它们种到数据根 —— 跟面板（webroot）写的是同一份。
+# 以前放 keystore 目录，面板没有那里的写权限，导致面板里换 keybox 永远不生效。
+# 数据根里除 keybox 外的密钥材料/D B 不归这里管，keystore 目录那份保持原样。
 for f in keybox_tee.xml keybox_strongbox.xml; do
   [ -f "$MODPATH/$f" ] || continue
-  if [ ! -e "$KS_ROOT/$f" ]; then
-    cp -f "$MODPATH/$f" "$KS_ROOT/$f" 2>/dev/null
+  if [ ! -e "$DATA_ROOT/$f" ]; then
+    cp -f "$MODPATH/$f" "$DATA_ROOT/$f" 2>/dev/null
   fi
-  chmod 0600 "$KS_ROOT/$f" 2>/dev/null
-  chown keystore:keystore "$KS_ROOT/$f" 2>/dev/null
+  chmod 0644 "$DATA_ROOT/$f" 2>/dev/null
+  chown keystore:keystore "$DATA_ROOT/$f" 2>/dev/null
 done
-rm -f "$DATA_ROOT/keybox_tee.xml" "$DATA_ROOT/keybox_strongbox.xml" 2>/dev/null
 # 数据根里不该有 Keymaster 数据库（真库在 keystore 目录）。只清空目录，
 # 万一哪天有东西落进去了也不至于把别人的库一锅端。
 [ -d "$DATA_ROOT/data" ] && rmdir "$DATA_ROOT/data" 2>/dev/null

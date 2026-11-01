@@ -11,8 +11,12 @@
 STATE_DIR=/data/adb/ommega
 DATA_ROOT=/data/misc/ommega
 
-if [ ! -e "$STATE_DIR/ommegadata" ] && [ ! -L "$STATE_DIR/ommegadata" ]; then
-  mkdir -p "$DATA_ROOT" 2>/dev/null
+# 软链目标必须就是数据根。老版本建过指向 /data/misc/keystore/ommega 的软链，
+# 那种不会报错，只会让面板写的配置落到程序不读的地方（远程模式永远开不起来），
+# 所以这里不光补缺，指向不对也直接重建。
+mkdir -p "$DATA_ROOT" 2>/dev/null
+if [ ! -L "$STATE_DIR/ommegadata" ] || [ "$(readlink "$STATE_DIR/ommegadata" 2>/dev/null)" != "$DATA_ROOT" ]; then
+  rm -f "$STATE_DIR/ommegadata" 2>/dev/null
   ln -s "$DATA_ROOT" "$STATE_DIR/ommegadata" 2>/dev/null
 fi
 

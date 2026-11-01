@@ -171,10 +171,10 @@ fn prepare_android_storage() {
         }
     }
 
-    if let Err(e) = crate::keybox::ensure_keybox_file(secret_path!("keybox_tee.xml")) {
+    if let Err(e) = crate::keybox::ensure_keybox_file(root_path!("keybox_tee.xml")) {
         storage_warn(format!(
             "Failed to seed ommega keybox {}: {e:?}",
-            secret_path!("keybox_tee.xml")
+            root_path!("keybox_tee.xml")
         ));
     }
 
@@ -205,8 +205,8 @@ fn prepare_android_storage() {
         root_path!("uid_packages"),
         root_path!("foreground"),
         root_path!("log_flag"),
-        secret_path!("keybox_tee.xml"),
-        secret_path!("keybox_strongbox.xml"),
+        root_path!("keybox_tee.xml"),
+        root_path!("keybox_strongbox.xml"),
         root_path!("crash_count"),
         root_path!("logs/keymint.log"),
         root_path!("logs/keymint.log.1"),

@@ -25,11 +25,11 @@ use regex::Regex;
 use x509_cert::der as x509_der;
 use x509_cert::Certificate;
 
-pub const KEYBOX_PATH: &str = "/data/misc/keystore/ommega/keybox_tee.xml";
+pub const KEYBOX_PATH: &str = "/data/misc/ommega/keybox_tee.xml";
 
-/// StrongBox 级别单独的一份 keybox。文件不存在或解析不了就用内置的 StrongBox 那份，
+/// StrongBox 级别单独的一份。文件不存在或解析不了就用内置的 StrongBox 那份，
 /// **不会**回落到 TEE 那份 —— 回落就是「StrongBox 请求拿 TEE 链」。
-pub const STRONGBOX_KEYBOX_PATH: &str = "/data/misc/keystore/ommega/keybox_strongbox.xml";
+pub const STRONGBOX_KEYBOX_PATH: &str = "/data/misc/ommega/keybox_strongbox.xml";
 
 const BUNDLED_KEYBOX_XML: &str = include_str!("../template/keybox_tee.xml");
 /// 内置的 StrongBox 级 keybox。文件丢了或读坏了就用它，不再退回 TEE 那份 ——
@@ -703,10 +703,7 @@ fn reload_from_disk_inner(retire_db_entries: bool) -> Result<bool> {
         info!("strongbox keybox identity updated from {STRONGBOX_KEYBOX_PATH}");
     }
     if changed {
-        info!(
-            "active keybox identity updated from {} (fallback={})",
-            KEYBOX_PATH, used_fallback
-        );
+        info!("active keybox identity updated from {KEYBOX_PATH} (fallback={used_fallback})");
     } else {
         debug!(
             "keybox reload completed without identity change (fallback={})",
@@ -721,29 +718,24 @@ pub fn initialize() -> Result<()> {
     ensure_strongbox_keybox_file();
     reload_from_disk_inner(false)?;
     KEYBOX_WATCHER.get_or_init(|| {
-        if let Err(error) = kmr_common::runtime::file_watch::spawn_path_watcher(
-            "ommega-keybox-watch",
-            PathBuf::from(KEYBOX_PATH),
-            |_trigger| {
-                if let Err(reload_error) = reload_from_disk() {
-                    error!("failed to reload keybox_tee.xml after change: {reload_error:#}");
-                }
-            },
-        ) {
-            error!("failed to watch keybox_tee.xml: {error:#}");
-        }
-        // StrongBox 那份同理：面板里选完文件就该生效，不该等下次开机。
-        if let Err(error) = kmr_common::runtime::file_watch::spawn_path_watcher(
-            "ommega-keybox-sb-watch",
-            PathBuf::from(STRONGBOX_KEYBOX_PATH),
-            |_trigger| {
-                if let Err(reload_error) = reload_from_disk() {
-                    error!("failed to reload keybox_strongbox.xml after change: {reload_error:#}");
-                }
-            },
-        ) {
-            // 大多数设备上这个文件一开始不存在，watcher 可能装不上，不算错误。
-            debug!("strongbox keybox watcher not installed: {error:#}");
+        for (label, path) in [
+            ("ommega-keybox-watch", KEYBOX_PATH),
+            ("ommega-keybox-sb-watch", STRONGBOX_KEYBOX_PATH),
+        ] {
+            // watcher 把回调活到进程结束：move 进去的 'static 引用才算数。
+            match kmr_common::runtime::file_watch::spawn_path_watcher(
+                label,
+                PathBuf::from(path),
+                move |_trigger| {
+                    if let Err(reload_error) = reload_from_disk() {
+                        error!("failed to reload keybox after change to {path}: {reload_error:#}");
+                    }
+                },
+            ) {
+                Ok(()) => {}
+                // 大多数设备上这几份文件一开始不存在，watcher 可能装不上，不算错误。
+                Err(error) => debug!("keybox watcher not installed for {path}: {error:#}"),
+            }
         }
     });
     Ok(())

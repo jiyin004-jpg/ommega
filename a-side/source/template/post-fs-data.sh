@@ -6,11 +6,10 @@ mkdir -p "$LOG_DIR" 2>/dev/null
 # app 域（SOTER 宿主 uid 1000）进不去 keystore 那个 0770 目录，payload 的日志
 # 得有个它写得动的位置：权限开到 system 组。
 APP_LOG_DIR=/data/misc/ommega/logs
-# keybox 是密钥材料，属于 keystore 目录；其它（config / injector.toml / target.txt）
-# 才是共享数据，放 /data/misc/ommega。之前批量把路径都改成数据根，把 keybox 也
-# 投递了过去 —— keymint 读的是 keystore 那份，两边就对不上了。
-TARGET_KEYBOX=/data/misc/keystore/ommega/keybox_tee.xml
-TARGET_KEYBOX_SB=/data/misc/keystore/ommega/keybox_strongbox.xml
+# keybox 跟面板（webroot）写的是同一份，都在数据根。以前放 keystore 目录，面板没有
+# 那里的写权限，导致面板里换 keybox 永远不生效。旧位置那份第一次开机时搬过来。
+TARGET_KEYBOX=$TARGET_DIR/keybox_tee.xml
+TARGET_KEYBOX_SB=$TARGET_DIR/keybox_strongbox.xml
 TARGET_INJECTOR_CONFIG=$TARGET_DIR/injector.toml
 TARGET_CONF=$TARGET_DIR/config
 TARGET_TARGET_LIST=$TARGET_DIR/target.txt
@@ -240,9 +239,16 @@ fi
 chmod 0644 "$TARGET_CONF" "$TARGET_TARGET_LIST" 2>/dev/null || true
 chown 1017:1017 "$TARGET_CONF" "$TARGET_TARGET_LIST" 2>/dev/null || true
 
-# Keybox: the webroot UI writes `/data/adb/ommega/ommegadata/keybox_tee.xml` which IS
-# $TARGET_KEYBOX (via symlink).  Seed from the module keybox if absent.
-# TEE 和 StrongBox 两份各自独立：各用各的级别，不再共用一份 keybox。
+# Keybox 就在数据根里，跟面板（webroot）写的是一份 —— 面板没有 keystore 目录的写权限，
+# 放那边就是面板改了永远不生效。TEE 和 StrongBox 两份各自独立，各用各的级别。
+# 一次性迁移：老版本把 keybox 放在 keystore 目录，那份还存在的话搬过来。
+for pair in "keybox_tee.xml" "keybox_strongbox.xml"; do
+  old=/data/misc/keystore/ommega/$pair
+  new=$TARGET_DIR/$pair
+  if [ ! -f "$new" ] && [ -f "$old" ]; then
+    cp "$old" "$new" 2>/dev/null || true
+  fi
+done
 if [ ! -f "$TARGET_KEYBOX" ] && [ -f "$MODDIR/keybox_tee.xml" ]; then
   cp "$MODDIR/keybox_tee.xml" "$TARGET_KEYBOX"
 fi

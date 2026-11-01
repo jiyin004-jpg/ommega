@@ -62,6 +62,11 @@ type BinderGetUserData = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type BinderGetCallingUid = unsafe extern "C" fn() -> libc::uid_t;
 type BinderGetCallingPid = unsafe extern "C" fn() -> libc::pid_t;
 type BinderSetRequestingSid = unsafe extern "C" fn(*mut c_void, bool);
+/// `AIBinder_setInheritRt(binder, true)`：让强引用跟着 parcel 传下去。
+/// 不设的话，我们这边一放强引用，App 拿到的那个 binder 就失效了（logcat 里那句
+/// `Binder ... destroyed after setInheritRt before being parceled`），
+/// 表现为「链已经出来了但 App 拿不到」。
+type BinderSetInheritRt = unsafe extern "C" fn(*mut c_void, bool);
 type ParcelCreate = unsafe extern "C" fn() -> *mut c_void;
 type ParcelDelete = unsafe extern "C" fn(*mut c_void);
 type ParcelWriteStrongBinder = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
@@ -94,6 +99,8 @@ struct NativeBinderApi {
     binder_get_calling_uid: BinderGetCallingUid,
     binder_get_calling_pid: BinderGetCallingPid,
     binder_set_requesting_sid: BinderSetRequestingSid,
+    /// 老系统/裁剪过的 libbinder_ndk 可能没这个符号，没有就跳过。
+    binder_set_inherit_rt: Option<BinderSetInheritRt>,
     binder_mark_vintf_stability: BinderRef,
     parcel_create: ParcelCreate,
     parcel_delete: ParcelDelete,
@@ -548,6 +555,7 @@ impl NativeBinderApi {
         let binder_get_calling_uid = load_symbol(binder_ndk, b"AIBinder_getCallingUid\0")?;
         let binder_get_calling_pid = load_symbol(binder_ndk, b"AIBinder_getCallingPid\0")?;
         let binder_set_requesting_sid = load_symbol(binder_ndk, b"AIBinder_setRequestingSid\0")?;
+        let binder_set_inherit_rt = find_symbol(binder_ndk, b"AIBinder_setInheritRt\0");
         let binder_mark_vintf_stability =
             load_symbol(binder_ndk, b"AIBinder_markVintfStability\0")?;
         let parcel_create = load_symbol(binder_ndk, b"AParcel_create\0")?;
@@ -608,6 +616,7 @@ impl NativeBinderApi {
             binder_get_calling_uid,
             binder_get_calling_pid,
             binder_set_requesting_sid,
+            binder_set_inherit_rt,
             binder_mark_vintf_stability,
             parcel_create,
             parcel_delete,
@@ -669,6 +678,10 @@ fn create_native_binder_with_api(
     unsafe {
         (api.binder_set_requesting_sid)(binder.binder as *mut c_void, true);
         (api.binder_mark_vintf_stability)(binder.binder as *mut c_void);
+        // 必须在被 writs 进 parcel 之前设：之后设会 panic/无效。
+        if let Some(set_inherit_rt) = api.binder_set_inherit_rt {
+            set_inherit_rt(binder.binder as *mut c_void, true);
+        }
     }
 
     let parcel = unsafe { (api.parcel_create)() };
