@@ -332,9 +332,9 @@ fn set_prop(name: &str, value: &str) -> bool {
     match resetprop::direct_write_and_verify_property(name, value) {
         Ok(()) => true,
         Err(error) => {
-            // 写失败必须让调用方知道：否则会把"没写成"记成"已应用"，之后每拍都
-            // 因为"这个值已经在 applied 里"而跳过，整轮开机就停在旧值上，而且日志
-            // 里一点痕迹都没有。
+            // 写不进去只记一条。**不要**让调用方因此不记账：`ro.product.*` 这类
+            // 属性本来大多只读，写失败是常态，不记账就会变成每 10 秒一轮 resetprop
+            // （每轮还会挨个试候选二进制），日志也会被刷满。
             log(&format!("failed to set {name}={value}: {error:#}"));
             false
         }
@@ -402,10 +402,10 @@ fn sync_remote_identity() {
             continue;
         }
         if let Some(prop) = identity_prop(key) {
-            // 没写进去就别记账，下一拍还要再试。
-            if !set_prop(prop, value) {
-                continue;
-            }
+            // 写失败也照样记账：`ro.product.*` 这种属性本来就未必写得进去，
+            // 不记账就会每 10 秒重试一轮。身份值真的变了（B 换机器）时这里的
+            // 比对不命中，自然还会再写一次。
+            set_prop(prop, value);
         }
         applied.retain(|(k, _)| k != key);
         applied.push((key.to_string(), value.to_string()));
