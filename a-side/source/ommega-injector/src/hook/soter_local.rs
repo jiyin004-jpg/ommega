@@ -70,9 +70,9 @@ const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
-/// counter 起点：导入 ATTK 时会把 ASK/authkey/counter 全部清掉，之后每个 App
-/// 第一次请求现造 ASK，counter 从 1 开始严格 +1。
-/// （那时腾讯那边也是全新的身份，没有历史值要追；用时间戳反而会让步长乱跳。）
+/// counter 起点：换 ATTK 时它会被清掉（连同 ASK/authkey/App 开通状态），
+/// 之后每个 App 第一次请求现造 ASK，counter 从 1 开始严格 +1。
+/// ATTK 换了就是新身份（新 cpu_id），腾讯那边也是新记录，从 1 合理。
 const COUNTER_BASE: u64 = 1;
 
 /// 强制覆盖 cpu_id 的文件。拿别台设备的 ATTK 重放时要跟那台报同一个号，
@@ -1116,8 +1116,9 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            // 严格 +1（真机就是连续递增）。文件里没有这个 uid（刚导入 ATTK 被清过、
-            // 或者第一次见这个 App）就从 1 开始，**不要**拿 now_secs() 去抬。
+            // 换了 ATTK = 新身份（新 cpu_id），腾讯那边也是新记录，counter 从 1 开始。
+            // 前提是 App 侧的开通状态也清了（daemon 会删 soter_status.xml）——
+            // 否则 App 记着旧 counter，看到 1 就当回退，得连按好几次才追上来。
             let next = match counter_for(&text, uid) {
                 Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
                 None => COUNTER_BASE,

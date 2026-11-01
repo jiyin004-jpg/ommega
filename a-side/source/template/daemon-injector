@@ -595,13 +595,16 @@ while true; do
     # ATTK 换了：旧的 ASK / AuthKey / counter 全部作废。它们要么是用旧 ATTK 签的，
     # 要么只对旧身份有意义；留着会让 App 拿旧状态去上报，腾讯一验就失败，
     # 然后自删自建死循环。清掉之后每个 App 下次请求现造 ASK，counter 从 1 开始。
+    # 换了 ATTK = 新身份：ASK/AuthKey 作废，counter 也从 1 重新开始。
+    # 关键是要**连 App 自己那份开通状态一起清**（见下面几行）——只清 counter
+    # 不清 App，它会记着旧号、看到 1 就当回退，得连按好几次才追上来。
     rm -f /data/misc/ommega/soter_asks.json /data/misc/ommega/soter_counter 2>/dev/null
     log "[injector-daemon] ATTK changed; cleared ASK/authkey/counter"
     # App 自己那份「已开通」也得作废：微信这类把 WechatASK=1 记在
     # shared_prefs/soter_status.xml 里，不清它就不会重走开通，继续拿旧链签名 ——
     # 本地验得过、腾讯不认，就是「换了 ATTK 也没反应」那种卡住。
     _cleared=0
-    for _f in /data/user/*/*/shared_prefs/soter_status.xml; do
+    for _f in /data/user/*/*/shared_prefs/soter_status.xml*; do
       [ -f "$_f" ] || continue
       if rm -f "$_f" 2>/dev/null; then _cleared=$((_cleared + 1)); fi
     done
