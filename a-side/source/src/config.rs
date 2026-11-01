@@ -644,7 +644,10 @@ pub struct Config {
 
 impl Config {
     fn from_file(config_file: &ConfigFile, resolved_trust: ResolvedTrust) -> Self {
-        let remote = load_clienta_remote_override().unwrap_or_else(|| config_file.remote.clone());
+        // 远程配置只有一个来源：面板写的平铺 config。平铺不存在/读不出来就是
+        // 默认值（不启用远程），不再回落到 `config.toml` 的 `[remote]` ——
+        // 同一组设置两个载体只会让“到底哪份生效”变成玄学。
+        let remote = load_clienta_remote_override().unwrap_or_default();
         Self {
             main: config_file.main.clone(),
             crypto: config_file.crypto.clone(),
@@ -828,10 +831,13 @@ pub struct ConfigFile {
     pub crypto: CryptoConfig,
     pub trust: RawTrustConfig,
     pub device: DeviceProperty,
-    /// Remote TEE relay settings (A-side: forward attestation/sign/decrypt to
-    /// a B-side real TEE through the relay_server). Absent in existing configs,
-    /// so defaults to disabled.
-    #[serde(default)]
+    /// Remote TEE relay settings.
+    ///
+    /// **不从 `config.toml` 读写**：远程配置的唯一载体是面板写的平铺
+    /// `/data/misc/keystore/ommega/config`（`load_clienta_remote_override`）。
+    /// 以前两处都能写 `[remote]`，平铺有内容就覆盖 TOML、没内容就用 TOML，
+    /// 同一组设置两个载体。`skip_serializing` 保证保存 TOML 时不会再写回去。
+    #[serde(default, skip_serializing)]
     pub remote: RemoteConfig,
 }
 
