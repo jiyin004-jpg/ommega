@@ -1,0 +1,18 @@
+a-side: 清掉 bin/ 布局的全部残余引用（6 处）
+
+上一轮把运行文件收敛到模块目录后，脚本里还留着「优先 bin/、多路径搜索」的老逻辑：
+
+- customize.sh：删掉 BIN_DIR 定义、mkdir、平铺搬家循环、向 bin 复制 resetprop；
+  安装时只清掉根目录可能残留的 keymint/ommega-inject
+- layout.sh：从 95 行砍到只剩 ommegadata 软链。它原来整个是为 bin 布局和
+  resetprop 多路径兜底存在的，那两件事都没了
+- service.sh::kill_all：pkill 目标从 BIN_DIR/keymint 改成 MODDIR/libs/<abi>/keymint。
+  这是个真 bug：keymint 早就不在 bin 里了，原来那行什么都杀不到，重启时旧实例
+  会活着
+- post-fs-data.sh：RESETPROP_BIN 改指模块 libs
+- daemon-injector::find_module_injector：只认 libs/<abi>/，不再先试模块根、
+  再遍历四个 ABI（打包残缺时会静默选错架构）
+- uninstall.sh：pkill 同样对准模块路径
+
+实测（重启后）：3767 keymint --daemon、4118 sh daemon-injector，
+soter_counter 单文件里已有三个 uid 的计数。

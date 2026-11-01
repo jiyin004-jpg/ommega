@@ -1,6 +1,5 @@
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
-BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
@@ -121,13 +120,14 @@ ensure_sepolicy() {
 # restart where the old watchdog died but its children survived). Only
 # module-owned paths are matched; the system keymint HAL is never touched.
 kill_all() {
-  pkill -9 -f "$BIN_DIR/keymint" 2>/dev/null
-  pkill -9 -f "$BIN_DIR/ommega-inject" 2>/dev/null
+  # 运行文件只在模块目录一处（`bin/` 布局已废弃）。这里按模块路径匹配，
+  # 系统的 keymint HAL 永远不会被碰到。
+  pkill -9 -f "$MODDIR/libs/.*/keymint" 2>/dev/null
+  pkill -9 -f "$MODDIR/libs/.*/ommega-inject" 2>/dev/null
+  pkill -9 -f "$MODDIR/daemon-injector" 2>/dev/null
   sleep 1
 }
 
-# 定位 keymint 二进制：`bin/`（热更新过）→ 模块根 → `libs/<abi>/`（刚安装完的布局，
-# `customize.sh` 会把 bin/ 下的旧二进制删掉，让运行用模块内那份）。
 # keymint 的唯一位置：模块内的 `libs/<abi>/keymint`（按本机 ABI 取）。
 #
 # ELF 只需要 execute 权限，ksu 域有，所以能直接从模块目录跑；`bin/` 那套热更新

@@ -2,7 +2,6 @@
 
 MODDIR=${OMMEGA_MODDIR:-${0%/*}}
 STATE_DIR=/data/adb/ommega
-BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
@@ -74,29 +73,14 @@ device_abi() {
 }
 
 find_module_injector() {
-  if [ -f "$BIN_DIR/ommega-inject" ]; then
-    echo "$BIN_DIR/ommega-inject"
-    return 0
-  fi
-  if [ -f "$MODDIR/ommega-inject" ]; then
-    echo "$MODDIR/ommega-inject"
-    return 0
-  fi
-
+  # 唯一位置：模块内 `libs/<abi>/ommega-inject`。
+  # 不搜模块根、不遍历其它 ABI：那都会在打包残缺时静默选错架构的二进制。
   local abi
   abi=$(device_abi)
   if [ -n "$abi" ] && [ -f "$MODDIR/libs/$abi/ommega-inject" ]; then
     echo "$MODDIR/libs/$abi/ommega-inject"
     return 0
   fi
-
-  # getprop/uname unavailable; accept any packaged ABI rather than nothing.
-  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-    if [ -f "$MODDIR/libs/$abi/ommega-inject" ]; then
-      echo "$MODDIR/libs/$abi/ommega-inject"
-      return 0
-    fi
-  done
   return 1
 }
 

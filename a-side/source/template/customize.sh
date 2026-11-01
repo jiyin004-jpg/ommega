@@ -249,15 +249,11 @@ unset STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF stale_feature
 # 都有，行为也不一致，所以不再依赖。这里把与设备 ABI 匹配的那份拷到状态目录一份，
 # 开机脚本和 keystore 里的代码都只认这一个路径。
 CONFIG_DIR=/data/adb/ommega
-BIN_DIR=$CONFIG_DIR/bin
 CONF_DIR=$CONFIG_DIR/conf
 RUN_DIR=$CONFIG_DIR/run
 DB_DIR=$CONFIG_DIR/db
-mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
-# 老版本平铺在根目录的文件先搬进新子目录（只支持新路径，不做读取兜底）。
-for f in keymint ommega-inject soterta-ta resetprop adbrd; do
-  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$BIN_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$BIN_DIR/$f"
-done
+mkdir -p "$CONFIG_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
+# 只支持新路径，不做旧布局搬运：运行文件在模块 `libs/<abi>/`，状态在 conf/run/db/logs。
 for f in props.conf injector.payload pathmask.state pathmask.owned \
          remote_identity.applied remote_identity.updated empty_permissions.xml \
          relay.conf log_flag; do
@@ -267,13 +263,10 @@ for f in sessions.db sessions.db-wal sessions.db-shm; do
   [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$DB_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$DB_DIR/$f"
 done
 if [ -f "$BINDIR/resetprop" ]; then
-  cp -f "$BINDIR/resetprop" "$BIN_DIR/resetprop.tmp"
-  chmod 0755 "$BIN_DIR/resetprop.tmp"
-  mv -f "$BIN_DIR/resetprop.tmp" "$BIN_DIR/resetprop"
   ui_print "- Bundled resetprop installed (no longer depends on the root manager)"
 fi
 rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.all"
-rm -f "$BIN_DIR/keymint" "$BIN_DIR/ommega-inject" "$CONFIG_DIR/injector" # clean up old hot-update binaries
+rm -f "$CONFIG_DIR/injector" "$CONFIG_DIR/keymint" "$CONFIG_DIR/ommega-inject" 2>/dev/null
 
 if [ ! -e "$CONFIG_DIR/ommegadata" ] && [ ! -L "$CONFIG_DIR/ommegadata" ]; then
   ln -s /data/misc/keystore/ommega "$CONFIG_DIR/ommegadata"

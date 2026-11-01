@@ -11,7 +11,6 @@ TARGET_INJECTOR_CONFIG=$TARGET_DIR/injector.toml
 TARGET_CONF=$TARGET_DIR/config
 TARGET_TARGET_LIST=$TARGET_DIR/target.txt
 STATE_DIR=/data/adb/ommega
-BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
@@ -24,7 +23,15 @@ CLIENTA_DIR=/data/adb/ommega
 # customize.sh 安装时会把与设备 ABI 匹配的那份拷到状态目录）。以前靠管理器提供：
 # Magisk 自带、APatch/KSU 走 busybox/ksud，不是每家都有、行为也不一致，所以不再依赖。
 # 定成同名函数，下面那一串调用一字不用改；实在找不到自己的才退回 PATH 里那个。
-RESETPROP_BIN=$BIN_DIR/resetprop
+# resetprop 的唯一位置：模块内 `libs/<abi>/resetprop`（ELF，ksu 域可 execute）
+pf_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+case "$pf_abi" in
+  arm64*|aarch64*) pf_abi=arm64-v8a ;;
+  armeabi*|armv7*) pf_abi=armeabi-v7a ;;
+  x86_64*) pf_abi=x86_64 ;;
+  *) pf_abi=x86 ;;
+esac
+RESETPROP_BIN=$MODDIR/libs/$pf_abi/resetprop
 if [ ! -x "$RESETPROP_BIN" ]; then
   rp_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
   case "$rp_abi" in
