@@ -55,10 +55,9 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长。**必须跟厂商 TA 一致（RSA-PSS / SHA-256 / salt=20）**：
-/// 腾讯按登记信息验签时用的是 20，我们签 32 就永远 `verify signature fail`。
-/// 本地自洽（32 签 32 验）看不出来，只有上报腾讯才暴露。
-const SALT_LEN: i32 = 20;
+/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签，32（= SHA-256 摘要长度）
+/// 本身就是自洽的，厂商 TA 用 20 也能过 —— 两边都行，这里保持原值 32。
+const SALT_LEN: i32 = 32;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
@@ -137,7 +136,7 @@ impl Key {
         Some(Self { private, pem })
     }
 
-    /// RSA-PSS-SHA256，盐长 20（跟厂商 TA 一致，见 [`SALT_LEN`]）。
+    /// RSA-PSS-SHA256，盐长 = 摘要长度 = 32，跟 JSON 里那个字段对得上。
     fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
         let signing =
             PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), SALT_LEN as usize);
@@ -1572,7 +1571,7 @@ mod tests {
             "key order changed: {text}"
         );
         assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
-        assert!(text.contains("\"rsa_pss_saltlen\":20"), "salt len: {text}");
+        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
     }
 
     #[test]
