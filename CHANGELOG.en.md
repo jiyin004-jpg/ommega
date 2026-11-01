@@ -18,3 +18,4 @@
 - Fixed occasional key generation failures on some devices killing the keystore process.
 - Fixed the background process staying alive after the module was uninstalled and injecting again.
 - Fixed keys being reclaimed on every boot on some devices, forcing apps to create a new key.
+- Fixed the StrongBox capability declaration disagreeing with what the keystore actually serves: installing the module no longer hides it by default, the WebUI switch is the only control.
