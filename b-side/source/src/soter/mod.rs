@@ -473,11 +473,11 @@ fn rebuild_material_then_sign(
     // 对不上，而且没有恢复路径。探不动（HAL 报错）同样当「不缺」。
     let ask_missing = matches!(
         soter.has_ask_already(uid),
-        Ok(SOTER_ASK_NOT_READY) | Ok(SOTER_ITEM_NOT_FOUND)
+        Ok(SOTER_ASK_NOT_READY_CODE) | Ok(SOTER_ITEM_NOT_FOUND_CODE)
     );
     let auth_missing = matches!(
         soter.has_auth_key(uid, alias),
-        Ok(SOTER_AUTH_KEY_NOT_READY) | Ok(SOTER_ITEM_NOT_FOUND)
+        Ok(SOTER_AUTH_KEY_NOT_READY_CODE) | Ok(SOTER_ITEM_NOT_FOUND_CODE)
     );
     if !ask_missing && !auth_missing {
         log::warn!(

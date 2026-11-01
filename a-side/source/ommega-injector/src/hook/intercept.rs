@@ -305,7 +305,8 @@ fn retry_pending_ioctl_copyback(
             PendingReadCopyback::Unread { address, len } => match copy_process_buffer(address, len)
             {
                 Ok(mut data) => {
-                    let effects = unsafe { ioctl::parse_read_buffer(fd, &mut data) };
+                    // 这段回读的就是宿主这次给的读缓冲，装不装得下按它自己的长度算。
+                    let effects = unsafe { ioctl::parse_read_buffer(fd, &mut data, len) };
                     let copied = copy_to_process(address, &data);
                     (
                         PendingReadCopyback::Processed { address, data },
