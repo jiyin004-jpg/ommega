@@ -139,11 +139,18 @@ soter_inject_enabled() {
 # 以前是每 5 秒 fork 一个 sh + 扫一遍 VINTF，就为了一个永远不变的常量。
 hidl_platform_flag() {
   if [ -f "$HIDL_CACHE" ]; then
-    cat "$HIDL_CACHE" 2>/dev/null
-    return
+    v=$(cat "$HIDL_CACHE" 2>/dev/null | tr -d ' \r\n')
+    case "$v" in
+      0|1) printf '%s' "$v"; return ;;
+    esac
+    # 缓存是坏的（空文件、写了一半、乱码）：删掉重算，别拿它当成「不是 HIDL」。
+    rm -f "$HIDL_CACHE" 2>/dev/null
   fi
-  v=$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r')
-  [ -n "$v" ] && printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null
+  v=$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r\n')
+  case "$v" in
+    0|1) printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null ;;
+    *) v="" ;;
+  esac
   printf '%s' "$v"
 }
 

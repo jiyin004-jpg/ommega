@@ -42,8 +42,12 @@ QUIET=0
 # 平台不会变，第一次算完就落盘（见下面 hidl) 分支），之后这里直读文件。
 HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
 if [ "$1" = "hidl" ] && [ -f "$HIDL_CACHE" ]; then
-  cat "$HIDL_CACHE"
-  exit 0
+  _hv=$(cat "$HIDL_CACHE" 2>/dev/null | tr -d ' \r\n')
+  case "$_hv" in
+    0|1) printf '%s\n' "$_hv"; exit 0 ;;
+  esac
+  # 坏缓存（空文件/写了一半）：删掉重算
+  rm -f "$HIDL_CACHE" 2>/dev/null
 fi
 # 单实例：service.sh 的 keep-alive 和 daemon-injector 都会调这个脚本，并发跑两次就会
 # 同时起两个 `--soterta-serve`（实测 6212/6213 并存一个多小时）。会话号存在进程内存里，
