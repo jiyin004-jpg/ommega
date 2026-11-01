@@ -1142,12 +1142,15 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             // 换了 ATTK = 新身份（新 cpu_id），腾讯那边也是新记录，counter 从 1 开始。
             // 前提是 App 侧的开通状态也清了（daemon 会删 soter_status.xml）——
             // 否则 App 记着旧 counter，看到 1 就当回退，得连按好几次才追上来。
+            // 文件里没这个 uid 就从 1 开始。
+            //
+            // 这不是“能优化”的地方：文件没了要么是刚换 ATTK（新 ASK、新身份，
+            // App 的开通状态也被清了，1 就是正确起点），要么是别的 uid 写回时
+            // 重排了文件——不管哪种，从 1 重新开始都比“凭空接一个几万”合理。
+            // 这里刻意不拿内存里的 mem 去接。
             let next = match counter_for(&text, uid) {
                 Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
-                // 文件里没这个 uid 不代表能从头来：daemon 换 ATTK 时会删这个文件，
-                // 别的 uid 写回时也会重排内容，而本进程内存里可能已经给过更大的值。
-                // 回退到 1 会让 App 判「counter 变小 = 重放」，然后删钥匙重开通。
-                None => mem.max(COUNTER_BASE) + 1,
+                None => COUNTER_BASE,
             };
             let updated = set_counter(&text, uid, next);
             let _ = file.seek(SeekFrom::Start(0));
