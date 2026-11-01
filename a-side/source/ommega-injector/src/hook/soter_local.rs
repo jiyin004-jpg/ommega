@@ -1091,12 +1091,14 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            let next = counter_for(&text, uid)
-                .unwrap_or(0)
-                .max(mem)
-                .max(COUNTER_BASE)
-                .max(now_secs())
-                + 1;
+            // 有记录就严格 +1（真机就是连续递增）；**不能拿 now_secs() 去抬**
+            // —— 那样 counter 会从真机的 7394 直接跳到当前时间戳（十八亿），
+            // 而且每次步长不固定（1 或 2），App 那边对不上。
+            // 只有「这个 uid 从来没记过」才用时间戳当起点，避免从 0 开始被当成回退。
+            let next = match counter_for(&text, uid) {
+                Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
+                None => now_secs().max(mem).max(COUNTER_BASE),
+            };
             let updated = set_counter(&text, uid, next);
             let _ = file.set_len(0);
             let _ = file.seek(SeekFrom::Start(0));
