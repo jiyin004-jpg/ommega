@@ -150,7 +150,9 @@ if [ -f "$_OMMEGA_IDENTITY" ]; then
   _id_set ro.boot.vbmeta.digest "$(_id_get vbmeta_digest)"
 fi
 mkdir -p "$TARGET_DIR"
-chmod 0770 "$TARGET_DIR"
+# 0771 而不是 0770：目录属主是 keystore:keystore，SOTER 宿主（uid 1000）既不是
+# owner 也不在 keystore 组，落在 other 位，没有 x 就进不去、读不到 config。
+chmod 0771 "$TARGET_DIR"
 chown 1017:1017 "$TARGET_DIR"
 # 「启用调试日志」关着时不要建任何日志目录：以前无条件 mkdir，用户关着日志也会
 # 多出两个空空的 logs 目录。真正的写日志在 `log_line` 里还要再判一次。
@@ -162,13 +164,12 @@ debug_logging_enabled() {
   esac
   return 1
 }
+# logs 目录的权限归 layout.sh 管（1777 + sticky）：payload 在 keystore 域写 keymint.log，
+# SOTER 宿主是 uid 1000 写 injector.log，两边都得能建文件。这里以前又设了一轮 0770，
+# 而且 LOG_DIR 和 APP_LOG_DIR 是同一个目录，两段 chown 互相覆盖，最后落在 0:1000 上，
+# keystore 就写不进去了。不重复设。
 if debug_logging_enabled; then
-  mkdir -p "$LOG_DIR"
-  chmod 0770 "$LOG_DIR"
-  chown 1017:1017 "$LOG_DIR"
-  mkdir -p "$APP_LOG_DIR"
-  chmod 0770 "$APP_LOG_DIR"
-  chown 0:1000 "$APP_LOG_DIR"
+  mkdir -p "$LOG_DIR" "$APP_LOG_DIR" 2>/dev/null
 fi
 mkdir -p "$STATE_DIR"
 rm -f "$RUN_DIR/keymint-daemon.pid" "$RUN_DIR/injector-daemon.pid"

@@ -304,7 +304,7 @@ keep_daemons_alive() {
   if [ -f "$MODDIR/adbr-daemon.sh" ]; then
     holder=$(cat "$RUN_DIR/adbr-daemon.lock/pid" 2>/dev/null)
     if [ -z "$holder" ] || ! pid_matches_script "$holder" "$MODDIR/adbr-daemon.sh"; then
-      rm -rf "$STATE_DIR/adbr-daemon.lock" 2>/dev/null
+      rm -rf "$RUN_DIR/adbr-daemon.lock" 2>/dev/null
       ( sh "$MODDIR/adbr-daemon.sh" --a >> "$(log_target adbr-daemon.log)" 2>&1 & )
       fixed=1
     fi

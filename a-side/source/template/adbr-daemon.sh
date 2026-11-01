@@ -35,7 +35,7 @@ LOCK_DIR="$RUN_DIR/adbr-daemon.lock"
 
 CONF=/data/misc/ommega/config
 
-mkdir -p "$STATE_DIR/logs"
+mkdir -p "${LOG%/*}" 2>/dev/null
 
 # 只认 arm64：上游只给了这一份构建。
 # getprop 在某些执行上下文里会拿不到（WebUI 的 exec 桥环境不一定是完整 PATH），

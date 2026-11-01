@@ -10,6 +10,7 @@
 
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
+RUN_DIR=$STATE_DIR/run
 OMMEGA_DIR=/data/misc/ommega
 # 密钥材料（keybox）、Keymaster 数据库、RPC socket 还留在 keystore 目录里 ——
 # 数据根搬到 /data/misc/ommega 之后，这里只剩这几样。
@@ -30,7 +31,7 @@ pkill -9 -f "$MODDIR/libs/.*/ommega-inject" 2>/dev/null
 # 顺序不能反：先杀 adbrd 的话监管循环两秒后又把它拉起来。
 pkill -9 -f 'modules/ommega/adbr-daemon.sh' 2>/dev/null
 pkill -9 -x adbrd 2>/dev/null
-rm -rf "$STATE_DIR/adbr-daemon.lock"
+rm -rf "$RUN_DIR/adbr-daemon.lock"
 sleep 1
 
 # adbr 留在设备上的痕迹：卸载之后 adbr-daemon.sh 不在了，没人再收这几个，
@@ -114,11 +115,13 @@ rm -f "$STATE_DIR/keymint"             # hot-update binary
 rm -f "$STATE_DIR/ommega-inject"       # hot-update binary
 rm -f "$STATE_DIR/injector"            # legacy hot-update binary
 rm -f "$STATE_DIR/resetprop"           # 模块自带的 resetprop（安装时从 libs/<abi> 拷过来那份）
-rm -f "$STATE_DIR/restart.keymint"
-rm -f "$STATE_DIR/restart.injector"
-rm -f "$STATE_DIR/restart.all"
-rm -f "$STATE_DIR/keymint-daemon.pid"
-rm -f "$STATE_DIR/injector-daemon.pid"
+rm -f "$RUN_DIR/restart.keymint"
+rm -f "$RUN_DIR/restart.injector"
+rm -f "$RUN_DIR/restart.all"
+rm -f "$RUN_DIR/keymint-daemon.pid"
+rm -f "$RUN_DIR/injector-daemon.pid"
+rm -f "$RUN_DIR/spl_daemon.retry" 2>/dev/null
+rmdir "$RUN_DIR" 2>/dev/null
 # HIDL 平台缓存（soterta.sh 算完落的那份）：换机器/重装时不该沿用上一次的结论。
 rm -f "$STATE_DIR/conf/soter_hidl_platform" 2>/dev/null
 # 以前一个脚本一个日志文件，现在统一成 daemon.log；把旧的散件也收掉。

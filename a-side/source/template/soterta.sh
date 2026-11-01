@@ -68,7 +68,7 @@ BIN=
 # 统一写 daemon.log（见上面 LOG 那行）；纯查询用 QUIET=1 跳过，
 # 不然每 5 秒一条把文件刷满。
 log() {
-  mkdir -p "$STATE_DIR/logs" 2>/dev/null
+  mkdir -p "${LOG%/*}" 2>/dev/null
   printf '%s %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
 }
 
