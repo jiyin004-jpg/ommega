@@ -170,15 +170,6 @@ fn runtime_get_phone_identifier(kind: PhoneIdentifierKind, slot: i32) -> Result<
     with_helper(|helper| helper.get_phone_identifier(kind, slot))
 }
 
-/// 当前前台应用。走 root helper 现跑一次 `dumpsys` —— 只有「包名三层全部落空」才会问到这里，
-/// 频率极低；每次几百毫秒，换一个准的结果值得。
-///
-/// 以前这个值由 daemon 每 N 秒写一个文件、这里读文件；但「N 秒前的前台」对判断「现在
-/// 是谁在调」没有意义——切个 App 就对不上了，60 秒更是不可能对上。
-pub fn runtime_foreground_package() -> Result<Option<String>> {
-    with_helper(|helper| helper.foreground_package())
-}
-
 pub fn runtime_telephony_features() -> Result<TelephonyFeatures> {
     with_helper(|helper| {
         Ok(TelephonyFeatures {
@@ -342,16 +333,6 @@ impl ResetpropHelperClient {
             "TRUE" => Ok(true),
             "FALSE" => Ok(false),
             _ => bail!("unexpected telephony feature helper response"),
-        }
-    }
-
-    fn foreground_package(&mut self) -> Result<Option<String>> {
-        match self.request("FG\n")?.as_str() {
-            "NONE" => Ok(None),
-            other => match other.strip_prefix("OK\t") {
-                Some(pkg) if !pkg.is_empty() => Ok(Some(pkg.to_string())),
-                _ => bail!("unexpected foreground helper response"),
-            },
         }
     }
 
@@ -578,13 +559,7 @@ fn helper_loop(stream: UnixStream, commands: Vec<ResetpropCommand>) -> Result<()
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        let response = if trimmed == "FG" {
-            match execute_foreground_package() {
-                Ok(Some(pkg)) => format!("OK\t{pkg}\n"),
-                Ok(None) => "NONE\n".to_string(),
-                Err(error) => helper_error_response(&error),
-            }
-        } else if let Some(feature) = parse_feature_request(trimmed) {
+        let response = if let Some(feature) = parse_feature_request(trimmed) {
             match execute_has_system_feature(feature) {
                 Ok(true) => "TRUE\n".to_string(),
                 Ok(false) => "FALSE\n".to_string(),
@@ -635,35 +610,6 @@ fn helper_loop(stream: UnixStream, commands: Vec<ResetpropCommand>) -> Result<()
     }
 }
 
-/// 一次性跑 `dumpsys window displays` 拿当前焦点窗口的包名。
-fn execute_foreground_package() -> Result<Option<String>> {
-    let output = Command::new("/system/bin/dumpsys")
-        .args(["window", "displays"])
-        .output()
-        .context("failed to run dumpsys")?;
-    Ok(parse_current_focus(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
-}
-
-/// `mCurrentFocus=Window{abc123 u0 com.foo/.Bar}` -> `com.foo`。
-/// `mCurrentFocus=null`（没窗口）直接返回 `None`。
-fn parse_current_focus(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("mCurrentFocus=") else {
-            continue;
-        };
-        let body = rest.split_once('{')?.1;
-        let before_slash = body.split_once('/')?.0;
-        let pkg = before_slash.split_whitespace().last()?;
-        if pkg.is_empty() || pkg == "null" {
-            return None;
-        }
-        return Some(pkg.to_string());
-    }
-    None
-}
-
 fn parse_request(line: &str) -> Result<(String, String)> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     let mut parts = trimmed.splitn(3, '\t');
@@ -680,21 +626,6 @@ fn parse_request(line: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// dumpsys 的两种形状：正常窗口 / 没窗口。
-    #[test]
-    fn current_focus_is_parsed_from_dumpsys_output() {
-        let ok = "  mCurrentFocus=Window{2c8f9a1 u0 com.tencent.mm/com.tencent.mm.ui.LauncherUI}\n\
-                  mFocusedApp=ActivityRecord{16d u0 com.tencent.mm/.ui.LauncherUI t12}";
-        assert_eq!(parse_current_focus(ok), Some("com.tencent.mm".to_string()));
-
-        assert_eq!(parse_current_focus("  mCurrentFocus=null\n"), None);
-        assert_eq!(parse_current_focus(""), None);
-        assert_eq!(
-            parse_current_focus("mFocusedApp=ActivityRecord{x u0 com.foo/.Bar}"),
-            None
-        );
-    }
 
     #[test]
     fn telephony_transactions_match_android_12_through_17() {
