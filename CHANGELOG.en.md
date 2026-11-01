@@ -7,4 +7,4 @@
 - Turning the adbr debug channel off now also removes the 5555 listener, the manually started adbd and the USB debugging switch, so no debug entry is left behind.
 - Logging defaults to info level; a boot no longer writes a few hundred KB.
 - Fixed occasional "fingerprint does not work" on some devices: the platform check could read back empty under concurrency, skipping the SOTER injection for that round.
-- Foreground app detection now runs once every 60 seconds instead of every 10, cutting the dumpsys traffic.
+- Foreground app detection now runs on every tick (3s during the first 90s after boot, 5s afterwards) instead of reusing a stale sample.
