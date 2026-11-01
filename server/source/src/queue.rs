@@ -1640,7 +1640,11 @@ impl TaskStore {
     ///
     /// 设备真换了卡（离线超过窗口再回来）照样能改，只是多等一个在线窗口 —— 换卡本来
     /// 就要重装/重启，那段时间自然就过了。
-    pub async fn set_device_token_meta(&self, device_id: &str, pair_id: &str, kind: &str) {
+    ///
+    /// 返回 `false` = 这次心跳不被认（有人拿别人的 device_id 在心跳）。调用方据此
+    /// 决定要不要写这台设备的属性（机型串、skip 名单、版本号）—— 那些字段直接决定
+    /// A 端拿到的伪装参数和派发策略，没被认的心跳一律不写。
+    pub async fn set_device_token_meta(&self, device_id: &str, pair_id: &str, kind: &str) -> bool {
         let mut inner = self.inner.lock().await;
         let now = Self::now_ms();
         if let Some((old_pair, _)) = inner.device_token_meta.get(device_id).cloned() {
@@ -1654,13 +1658,14 @@ impl TaskStore {
                     "device {device_id} keeps pair group '{old_pair}': \
                      refusing '{pair_id}' (kind={kind}) while it is still polling"
                 );
-                return;
+                return false;
             }
         }
         inner.device_token_meta.insert(
             device_id.to_string(),
             (pair_id.to_string(), kind.to_string()),
         );
+        true
     }
 
     /// 这台 B 的 token 身份；没登记过返回 `None`。
@@ -2226,11 +2231,11 @@ mod token_meta_tests {
         store.set_device_token_meta("dev", "pair-x", "pair").await;
         heartbeat(&store, "dev").await;
 
-        store.set_device_token_meta("dev", "pair-y", "pair").await;
+        assert!(!store.set_device_token_meta("dev", "pair-y", "pair").await);
         assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-x");
 
         // 洗成空组同样不行：一张没配对的卡发笔空 pair 心跳，约束就没了。
-        store.set_device_token_meta("dev", "", "").await;
+        assert!(!store.set_device_token_meta("dev", "", "").await);
         assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-x");
 
         // 同一组照常更新（kind 跟着变）。
@@ -2250,7 +2255,7 @@ mod token_meta_tests {
         heartbeat(&store, "dev").await;
         go_offline(&store, "dev").await;
 
-        store.set_device_token_meta("dev", "pair-y", "pair").await;
+        assert!(store.set_device_token_meta("dev", "pair-y", "pair").await);
         assert_eq!(store.device_token_meta("dev").await.unwrap().0, "pair-y");
     }
 

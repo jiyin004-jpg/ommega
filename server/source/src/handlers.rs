@@ -2890,8 +2890,14 @@ pub async fn b_poll(
         return json_err(StatusCode::BAD_REQUEST, "device_id required");
     }
     // 记下这台用的是哪种 token（配对 / 公开 / 老卡密），给 A 侧的配对校验用。
+    //
+    // 返回 false 说明这笔心跳不被认：设备还在心跳（在线窗口内），来的却是另一个配对
+    // 组。那就不只是不认这个分组：后面所有设备属性（机型串、skip 名单、版本号）都不写，
+    // 那些字段直接决定 A 端拿到的伪装参数和派发策略。派活本身还是照旧 —— 把心跳
+    // 直接拒掉会让换卡之后没重启的人都失联，而换组会在离线一个窗口后自然生效。
+    let mut trusted_heartbeat = true;
     if let Some(meta) = state.auth.token_meta(token_from_headers(&headers)) {
-        state
+        trusted_heartbeat = state
             .store
             .set_device_token_meta(&q.device_id, &meta.pair_id, &meta.kind)
             .await;
@@ -2922,44 +2928,46 @@ pub async fn b_poll(
     let timeout = Duration::from_secs(timeout_secs.min(120));
 
     // 这台上报的「不跟随补丁日期」名单先记下来：命中名单的认证请求不再往它派。
-    if let Some(raw) = q.skip_pkgs.as_deref() {
+    if trusted_heartbeat {
+        if let Some(raw) = q.skip_pkgs.as_deref() {
+            state
+                .store
+                .set_skip_pkgs(&q.device_id, crate::queue::parse_pkg_list(raw))
+                .await;
+        }
+
+        // 这台报的模块版本号也先记下来（老版本 relay 不带 `ver`，那就不动它）。
         state
             .store
-            .set_skip_pkgs(&q.device_id, crate::queue::parse_pkg_list(raw))
+            .set_device_version(&q.device_id, q.ver.as_deref())
+            .await;
+
+        // 模块 relay 的心跳固定带 `skip_pkgs`（空名单也带）和 `ver`，手机 App
+        // （`org.ommega.deviceb`）两个都不带；用这个把两类设备分开，A 端面板
+        // 「留空自己获取」只挑模块那种。
+        state
+            .store
+            .set_device_from_module(&q.device_id, q.skip_pkgs.is_some() || q.ver.is_some())
+            .await;
+
+        // 本机设备身份（brand/device/product/manufacturer/model/serial）：A 端「伪装参数
+        // → 从服务器同步」要用它，否则链是真机出的、本机属性还是调用方那台，两边对不上。
+        state
+            .store
+            .set_device_identity(
+                &q.device_id,
+                crate::queue::DeviceIdentityReport {
+                    brand: q.brand.clone(),
+                    device: q.product_device.clone(),
+                    product: q.product.clone(),
+                    manufacturer: q.manufacturer.clone(),
+                    model: q.product_model.clone(),
+                    serial: q.serial.clone(),
+                    fingerprint: q.fingerprint.clone(),
+                },
+            )
             .await;
     }
-
-    // 这台报的模块版本号也先记下来（老版本 relay 不带 `ver`，那就不动它）。
-    state
-        .store
-        .set_device_version(&q.device_id, q.ver.as_deref())
-        .await;
-
-    // 模块 relay 的心跳固定带 `skip_pkgs`（空名单也带）和 `ver`，手机 App
-    // （`org.ommega.deviceb`）两个都不带；用这个把两类设备分开，A 端面板
-    // 「留空自己获取」只挑模块那种。
-    state
-        .store
-        .set_device_from_module(&q.device_id, q.skip_pkgs.is_some() || q.ver.is_some())
-        .await;
-
-    // 本机设备身份（brand/device/product/manufacturer/model/serial）：A 端「伪装参数 →
-    // 从服务器同步」要用它，否则链是真机出的、本机属性还是调用方那台，两边对不上。
-    state
-        .store
-        .set_device_identity(
-            &q.device_id,
-            crate::queue::DeviceIdentityReport {
-                brand: q.brand.clone(),
-                device: q.product_device.clone(),
-                product: q.product.clone(),
-                manufacturer: q.manufacturer.clone(),
-                model: q.product_model.clone(),
-                serial: q.serial.clone(),
-                fingerprint: q.fingerprint.clone(),
-            },
-        )
-        .await;
 
     match state
         .store
