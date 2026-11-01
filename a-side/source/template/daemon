@@ -226,7 +226,13 @@ sync_remote_identity() {
   model_changed=0
   brand_changed=0
   device_changed=0
-  for key in brand device product manufacturer model serial vbmeta_digest; do
+  # 只同步机型/品牌/序列号这几项；**不包含 vbmeta_digest**。
+  #
+  # 以前这里也把 `vbmeta_digest` 一并 resetprop 进来，等于拿 B 的值覆盖
+  # `ro.boot.vbmeta.digest`。而现在链是服务端 keybox 造的，B 根本不参与，服务端
+  # 用的就是 A 上报的哈希 —— A 把 prop 改成 B 的，证书和属性立刻对不上，
+  # Duck 的 Boot consistency 一比就是 mismatch。
+  for key in brand device product manufacturer model serial; do
     new=$(sed -n "s/^$key=//p" "$REMOTE_IDENTITY_FILE" 2>/dev/null | head -n1)
     [ -n "$new" ] || continue
     old=$(sed -n "s/^$key=//p" "$REMOTE_IDENTITY_APPLIED" 2>/dev/null | head -n1)
