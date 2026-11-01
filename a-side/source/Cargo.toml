@@ -9,9 +9,6 @@ license = "AGPL-3.0-or-later"
 name = "keymint"
 path = "src/main.rs"
 
-[[bin]]
-name = "webui"
-path = "src/bin/webui.rs"
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
