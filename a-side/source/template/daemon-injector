@@ -260,40 +260,51 @@ sync_soter_attk() {
     if [ -f "$SOTER_ATTK_DST" ]; then
       if rm -f "$SOTER_ATTK_DST" 2>/dev/null; then
         soter_attk_changed=1
+        rm -f "$CONF_DIR/soter_attk.stamp" 2>/dev/null
         log "[injector-daemon] local soter ask removed; back to the built-in key"
       fi
     fi
     return 0
   fi
 
-  # 用 mtime 快路径代替读两边内容比对：`[ -nt ]` 是 shell 内建（零 fork），
-  # 每轮 (cat src) = (cat dst) 是两个 fork，每 3~5 秒一次白烧。
-  if [ -f "$SOTER_ATTK_DST" ] && [ ! "$src" -nt "$SOTER_ATTK_DST" ]; then
+  # 数据根合并之后 src 和 dst 常常是**同一个文件**（都是 /data/misc/ommega/soter_attk.pem），
+  # 这时 `-nt` 恒为 false，ATTK 换了也检测不出来 —— WebUI 导入新私钥不生效就是这么来的。
+  # 改成记住上次处理时的「大小:mtime」，变了才算变化。
+  stamp=$CONF_DIR/soter_attk.stamp
+  cur=$(stat -c '%s:%Y' "$src" 2>/dev/null)
+  [ -n "$cur" ] || return 0
+  if [ -f "$stamp" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$cur" ]; then
     return 0
   fi
 
-  if cp -f "$src" "$SOTER_ATTK_DST" 2>/dev/null; then
-    # 640 而不是 644：这是私钥。app 域的 payload 是 uid 1000，靠 system
-    # 组权限读得到，其他 app 就不行了。
-    chown 0:1000 "$SOTER_ATTK_DST" 2>/dev/null
-    chmod 0640 "$SOTER_ATTK_DST" 2>/dev/null
-    soter_attk_changed=1
-    log "[injector-daemon] local soter ask updated from $src"
-    # 文件里带了 cpu_id 就跟着设 force：ATTK 和 cpu_id 必须是同一台设备的，
-    # 不然腾讯验 ASK 时对不上直接拒（2026-10-30 实测）。
-    cpu=$(sed -n 's/^[[:space:]]*#\{0,1\}[[:space:]]*cpu_id:[[:space:]]*\(0900[0-9a-fA-F]\{28\}\)[[:space:]]*$/\1/p' "$src" 2>/dev/null | head -n 1)
-    if [ -n "$cpu" ]; then
-      if printf '%s\n' "$cpu" > "$SOTER_CPU_FORCE_DST" 2>/dev/null; then
-        chown 0:0 "$SOTER_CPU_FORCE_DST" 2>/dev/null
-        chmod 0644 "$SOTER_CPU_FORCE_DST" 2>/dev/null
-        log "[injector-daemon] cpu_id forced from $src: $cpu"
-      else
-        log "[injector-daemon] failed to write $SOTER_CPU_FORCE_DST"
-      fi
+  # 不同路径才需要搬；同一份文件就别 cp 了（会报 same file）。
+  if [ "$src" != "$SOTER_ATTK_DST" ]; then
+    if ! cp -f "$src" "$SOTER_ATTK_DST" 2>/dev/null; then
+      log "[injector-daemon] failed to copy $src to $SOTER_ATTK_DST"
+      return 0
     fi
-  else
-    log "[injector-daemon] failed to copy $src to $SOTER_ATTK_DST"
   fi
+
+  # 640 而不是 644：这是私钥。app 域的 payload 是 uid 1000，靠 system
+  # 组权限读得到，其他 app 就不行了。
+  chown 0:1000 "$SOTER_ATTK_DST" 2>/dev/null
+  chmod 0640 "$SOTER_ATTK_DST" 2>/dev/null
+  soter_attk_changed=1
+  log "[injector-daemon] local soter ask loaded from $src"
+  # 文件里带了 cpu_id 就跟着设 force：ATTK 和 cpu_id 必须是同一台设备的，
+  # 不然腾讯验 ASK 时对不上直接拒（2026-10-30 实测）。
+  cpu=$(sed -n 's/^[[:space:]]*#\{0,1\}[[:space:]]*cpu_id:[[:space:]]*\(0900[0-9a-fA-F]\{28\}\)[[:space:]]*$/\1/p' "$src" 2>/dev/null | head -n 1)
+  if [ -n "$cpu" ]; then
+    if printf '%s\n' "$cpu" > "$SOTER_CPU_FORCE_DST" 2>/dev/null; then
+      chown 0:0 "$SOTER_CPU_FORCE_DST" 2>/dev/null
+      chmod 0644 "$SOTER_CPU_FORCE_DST" 2>/dev/null
+      log "[injector-daemon] cpu_id forced from $src: $cpu"
+    else
+      log "[injector-daemon] failed to write $SOTER_CPU_FORCE_DST"
+    fi
+  fi
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  printf '%s' "$cur" > "$stamp" 2>/dev/null
 }
 
 # 真机 cpu_id 镜像到 app 域。不删旧件：源不在只说明「daemon 还没学到」（B 端不在线、
@@ -304,6 +315,8 @@ sync_soter_attk() {
 sync_soter_cpu_id() {
   src=$(dirname "$CONF_PATH")/soter_cpu_id
   [ -f "$src" ] || return 0
+  # 数据根合并后 src 就是 dst（同一个文件），没有「镜像」这回事，直接读完事。
+  [ "$src" = "$SOTER_CPU_ID_DST" ] && return 0
 
   # 同样用 mtime 快路径（零 fork）代替两次 cat。
   if [ -f "$SOTER_CPU_ID_DST" ] && [ ! "$src" -nt "$SOTER_CPU_ID_DST" ]; then
