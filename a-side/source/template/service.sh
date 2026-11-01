@@ -31,17 +31,21 @@ debug_logging_enabled() {
 }
 
 if debug_logging_enabled; then
-  mkdir -p "$STATE_DIR/logs"
-  LOG_DIR="$STATE_DIR/logs"
+  mkdir -p /data/misc/ommega/logs
+  LOG_DIR=/data/misc/ommega/logs
 else
   LOG_DIR=/dev/null
 fi
 # 单个脚本的日志目标：开日志才给真路径，否则全部丢 /dev/null。
+#
+# 所有 A 端守护脚本（service / soterta / kmod-loader / adbr / watchdog）都写同一份
+# daemon.log，不再一个脚本一个文件 —— 出问题时要翻的位置就三个：
+# daemon.log（脚本）、injector.log（payload/SOTER）、keymint.log（HAL）。
 log_target() {
   if [ "$LOG_DIR" = /dev/null ]; then
     printf '/dev/null'
   else
-    printf '%s/%s' "$LOG_DIR" "$1"
+    printf '%s/daemon.log' "$LOG_DIR"
   fi
 }
 
@@ -259,7 +263,7 @@ if [ -f "$MODDIR/kmod-loader.sh" ]; then
   kmod_log=/dev/null
   kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$kmod_val" in
-    1|true|yes|on) kmod_log="$STATE_DIR/logs/kmod-loader.log" ;;
+    1|true|yes|on) kmod_log="$LOG_DIR/daemon.log" ;;
   esac
   ( sh "$MODDIR/kmod-loader.sh" >> "$kmod_log" 2>&1 & )
 fi

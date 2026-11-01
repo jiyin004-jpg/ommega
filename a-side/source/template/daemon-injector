@@ -32,7 +32,7 @@ INJECTOR_TOML=/data/misc/ommega/injector.toml
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
 LOG_DIR=/data/misc/ommega/logs
-LOG_FILE=$LOG_DIR/daemon-injector.log
+LOG_FILE=$LOG_DIR/daemon.log
 # app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
 # 得给它一个自己写得动的位置，权限开到 system 组。
 APP_LOG_DIR=$LOG_FLAG_DIR/logs
@@ -138,6 +138,10 @@ soter_inject_enabled() {
 log() {
   [ "$LOG_ON" = "1" ] || return 0
   mkdir -p "$LOG_DIR" 2>/dev/null
+  # daemon.log 是所有 A 端脚本共用一份的，超过 1MB 滚成 .1，别让它无限长。
+  if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null
+  fi
   printf '%s [INFO] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null
   return 0
 }

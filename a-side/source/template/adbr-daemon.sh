@@ -34,7 +34,13 @@ CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-LOG="$STATE_DIR/logs/adbr.log"
+# A 端日志统一到 /data/misc/ommega/logs/daemon.log；B 端还是自己的目录。
+if [ "$MODE" = "a" ]; then
+  LOG=/data/misc/ommega/logs/daemon.log
+else
+  LOG="$STATE_DIR/logs/adbr.log"
+fi
+mkdir -p "${LOG%/*}" 2>/dev/null
 LOCK_DIR="$RUN_DIR/adbr-daemon.lock"
 
 if [ "$MODE" = "a" ]; then

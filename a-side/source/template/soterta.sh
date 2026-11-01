@@ -28,7 +28,8 @@ PIDFILE=$RUN_DIR/soterta.pid
 KICKED_FILE=$RUN_DIR/soterta.host.kicked
 # 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。
 TAKEOVER_PID=$RUN_DIR/soterta.takeover.pid
-LOG=$STATE_DIR/logs/soterta.log
+# 日志统一写 daemon.log（跟 service.sh / daemon-injector / adbr 共用一份）。
+LOG=/data/misc/ommega/logs/daemon.log
 # 解析结果缓存 + 静默开关。service.sh 的 keep-alive 和 daemon-injector 的
 # `soterta.sh hidl` 都是 5 秒一轮、每轮新起一个进程，resolve_hal 无条件 log 会把
 # 这个文件刷满「resolved hal=...」（实测每 2~5 秒一条），真正有用的事件全被埋掉。

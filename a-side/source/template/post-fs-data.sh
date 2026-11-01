@@ -1,7 +1,8 @@
 MODDIR=${0%/*}
 TARGET_DIR=/data/misc/ommega
 LOG_DIR=$TARGET_DIR/logs
-LOG_FILE=$LOG_DIR/post-fs-data.log
+LOG_FILE=$LOG_DIR/daemon.log
+mkdir -p "$LOG_DIR" 2>/dev/null
 # app 域（SOTER 宿主 uid 1000）进不去 keystore 那个 0770 目录，payload 的日志
 # 得有个它写得动的位置：权限开到 system 组。
 APP_LOG_DIR=/data/misc/ommega/logs
@@ -415,7 +416,7 @@ fi
 
 # 开机诊断（不看 debug 开关）：开关状态先落一行，后面 bind 的结果跟着写同一个文件。
 printf '%s mask_sb=%s mask_ids=%s\n' "$(date -u '+%H-%M-%S')" "$mask_sb" "$mask_ids" \
-  >> /data/adb/ommega/boot-debug.log 2>/dev/null
+  >> "$LOG_FILE" 2>/dev/null
 
 # ---- 主力：我们自己把那条 feature 从厂商声明里摘掉 ----
 # KernelSU 3.x 天生不做模块文件挂载（要装挂载 metamodule 才有），所以模块 system/ 里那份
@@ -434,7 +435,7 @@ mask_stage=$STATE_DIR/perm-stage
 mask_binds_file=$STATE_DIR/conf/mask.binds
 mask_n=0
 mask_binds=""
-mask_log() { printf '%s %s\n' "$(date -u '+%H-%M-%S')" "$*" >> /data/adb/ommega/boot-debug.log 2>/dev/null; }
+mask_log() { printf '%s %s\n' "$(date -u '+%H-%M-%S')" "$*" >> "$LOG_FILE" 2>/dev/null; }
 
 # 暂存目录别长得像 root 模块：/mnt/vendor 已经是独立挂载点时，在里面挂个小 tmpfs，看起来
 # 像 OEM 自己挂的权限目录；不是的话退回状态目录（bind 源路径只在 mountinfo 里露一下）。
