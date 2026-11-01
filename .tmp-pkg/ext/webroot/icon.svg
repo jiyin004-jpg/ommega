@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1522"/>
+      <stop offset="1" stop-color="#16293c"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#5ee3c2"/>
+      <stop offset="1" stop-color="#5aa9ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- 盾牌外框 -->
+  <path d="M256 88 L390 144 V276 C390 352 328 408 256 434 C184 408 122 352 122 276 V144 Z"
+        fill="none" stroke="url(#edge)" stroke-width="28" stroke-linejoin="round"/>
+
+  <!-- 钥匙孔（实心，小尺寸也认得出） -->
+  <g fill="#eaf5ff">
+    <circle cx="256" cy="238" r="46"/>
+    <path d="M236 268 h40 l-9 66 a11 11 0 0 1 -22 0 Z"/>
+  </g>
+</svg>

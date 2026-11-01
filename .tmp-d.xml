@@ -1,0 +1,7 @@
+﻿adb.exe : cat: /sdcard/d.xml: No such file or directory
+所在位置 行:2 字符: 187
++ ... t-Sleep 25; & $adb -s 320143945328 shell "uiautomator dump /sdcard/d. ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (cat: /sdcard/d....le or directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

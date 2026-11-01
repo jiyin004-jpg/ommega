@@ -535,17 +535,24 @@ start_daemon_early() {
   return 0
 }
 
-if [ -x "$BIN_DIR/keymint" ]; then
-  if start_daemon_early "$BIN_DIR/keymint" --daemon "$RUN_DIR/keymint-daemon.pid"; then
+pf_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+case "$pf_abi" in
+  arm64*|aarch64*) pf_abi=arm64-v8a ;;
+  armeabi*|armv7*) pf_abi=armeabi-v7a ;;
+  x86_64*) pf_abi=x86_64 ;;
+  *) pf_abi=x86 ;;
+esac
+km_bin=$MODDIR/libs/$pf_abi/keymint
+if [ -x "$km_bin" ]; then
+  if start_daemon_early "$km_bin" --daemon "$RUN_DIR/keymint-daemon.pid"; then
     log_line "ommega: keymint daemon started early in post-fs-data"
   else
     log_line "ommega: keymint daemon early start failed; service.sh will retry"
   fi
 fi
-# 注入器：优先 Rust 的 inject-watchdog（不可执行时回落 shell 版）。
+# 注入器：唯一实现是 shell 版 daemon-injector（Rust 的 watchdog 走不通，见 service.sh）。
 injector_script=$MODDIR/daemon-injector
-[ -x "$BIN_DIR/inject-watchdog" ] && injector_script=$BIN_DIR/inject-watchdog
-if [ -f "$MODDIR/daemon-injector" ]; then
+if [ -f "$injector_script" ]; then
   if start_daemon_early "$injector_script" "" "$RUN_DIR/injector-daemon.pid"; then
     log_line "ommega: injector daemon started early in post-fs-data"
   else

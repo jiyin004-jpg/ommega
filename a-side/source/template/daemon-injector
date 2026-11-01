@@ -511,7 +511,7 @@ tick=0
 FOREGROUND_EVERY=2
 tick_sleep() {
   ticks=$((ticks + 1))
-  # --once：跑完一轮就退出（由 Rust 的 inject-watchdog 在文件变化时叫它）。
+  # --once：跑完一轮就退出（调试用）。
   # 放在这里而不是循环末尾，是因为 prepare_injector 失败那条 continue 也会调到这里。
   if [ "${MAX_TICKS:-0}" -gt 0 ] && [ "$ticks" -ge "$MAX_TICKS" ]; then
     release_lock

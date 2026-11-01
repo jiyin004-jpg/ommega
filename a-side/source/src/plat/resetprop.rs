@@ -59,7 +59,23 @@ impl PhoneIdentifierKind {
 /// 只认这一个路径：`customize.sh` 把与设备 ABI 匹配的那份装进 `libs/`，
 /// `layout.sh` 再搬到 `bin/`。管理器的 resetprop 行为不统一（有的直接写属性区、
 /// 有的只发 socket），读出来的值到底反映哪个时刻说不清，一律不用。
-const RESETPROP_BUNDLED: &str = "/data/adb/ommega/bin/resetprop";
+/// resetprop 的唯一位置：模块内的 `libs/<abi>/resetprop`（ELF，ksu 域可 execute）。
+///
+/// ABI 用**编译期常量**（`cfg!`），不去读 `ro.product.cpu.abi`：
+/// `rsproperties` 在 keymint 这个静态进程里读不到属性区，读失败就会拼出
+/// `libs/x86/resetprop`（不存在）→ 属性全读不到 → 证书里的 verifiedBootKey 变全零。
+fn resetprop_path() -> String {
+    let abi = if cfg!(target_arch = "aarch64") {
+        "arm64-v8a"
+    } else if cfg!(target_arch = "arm") {
+        "armeabi-v7a"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "x86"
+    };
+    format!("/data/adb/modules/ommega/libs/{abi}/resetprop")
+}
 
 #[derive(Clone)]
 pub struct ResetpropCommand {
@@ -241,19 +257,19 @@ fn read_property_via_resetprop(name: &str) -> Option<String> {
 
 /// 所有可用的 resetprop（现在只有一个）。
 ///
-/// 调用方拿到的是列表是为了「第一个 exec 不通就试下一个」，但那属于历史遗留的
-/// 多路径兜底；只认模块自己那份之后，这里就是一个元素。
+/// 读写属性用的 resetprop。只有一个位置，所以这里永远返回 0 或 1 个元素
+/// （保留列表形态是为了让 `read_property_via_resetprop` / 写路径不必改签名）。
 pub fn resetprop_candidates() -> Vec<ResetpropCommand> {
-    if Path::new(RESETPROP_BUNDLED).exists() {
+    let path = resetprop_path();
+    if Path::new(&path).exists() {
         vec![ResetpropCommand {
-            program: RESETPROP_BUNDLED.to_string(),
+            program: path,
             prepend_arg: None,
         }]
     } else {
         Vec::new()
     }
 }
-
 fn execute_write_and_verify(command: &ResetpropCommand, property: &str, value: &str) -> Result<()> {
     let mut process = Command::new(&command.program);
     if let Some(prepend_arg) = &command.prepend_arg {

@@ -133,22 +133,41 @@ fn cached_hex_property(name: &'static str) -> Option<[u8; 32]> {
     Some(value)
 }
 
+/// 解锁设备的 `ro.boot.vbmeta.public_key_digest` 本来就是空的（原生全零），
+/// 而 `verifiedBootKey` 全零本身就是个「未签名/解锁」特征，不能就这么发出去。
+///
+/// 用 boot hash 派生一个稳定的非零值：同一台设备每次一样、不同设备不一样，
+/// 也仍然属同一台机器的根。
+fn derived_boot_key(hash: &[u8; 32]) -> [u8; 32] {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(hash);
+    ctx.update(b"ommega/vbmeta-public-key");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}
+
 /// 当前 RootOfTrust：key / hash 读**当刻属性**（2 秒内复用），锁定与验证状态固定
 /// 「已锁定 + 已验证」。
 ///
-/// 顺序：读属性（带短缓存）→ daemon 启动时读好的环境变量（兜底）→ 全零。
+/// 顺序：读属性（带短缓存）→ daemon 启动时读好的环境变量（兜底）。
 /// **不能反过来**：env 是开机快照，运行中 daemon 会把 B 的属性同步过来（physical
 /// 模式），快照就是旧的 —— 证书和 `getprop` 一对就是 mismatch。
+///
+/// key 全零（设备没这个属性）时用 hash 派生，不发全零证书；hash 全零就真的没招，
+/// 但那种情况下证书本身也没法自洽，保留零值并交给上层报错。
 ///
 /// 代价：缓存过期后的第一笔出证要 fork 两次（约 40ms）；连着来的几笔零开销。
 /// 属性真变了（daemon 同步了 B 的值）最多晚 2 秒被发现，可接受。
 pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
-    let key = cached_hex_property(VBMETA_KEY_PROP)
-        .or_else(boot_key_from_env)
-        .unwrap_or([0u8; 32]);
     let hash = cached_hex_property(VBMETA_HASH_PROP)
         .or_else(boot_hash_from_env)
         .unwrap_or([0u8; 32]);
+    let key = cached_hex_property(VBMETA_KEY_PROP)
+        .filter(|k| k.iter().any(|b| *b != 0))
+        .or_else(boot_key_from_env)
+        .filter(|k| k.iter().any(|b| *b != 0))
+        .unwrap_or_else(|| derived_boot_key(&hash));
     (key, hash, true, 0)
 }
 

@@ -21,7 +21,6 @@ OMMEGA_DIR=/data/misc/keystore/ommega
 pkill -9 -f "$STATE_DIR/bin/keymint --daemon" 2>/dev/null
 pkill -9 -f "$STATE_DIR/bin/keymint" 2>/dev/null
 pkill -9 -f "$STATE_DIR/bin/ommega-inject" 2>/dev/null
-pkill -9 -f "$STATE_DIR/bin/inject-watchdog" 2>/dev/null
 
 # adbr 公网调试通道：先停监管循环（那个进程是 sh 在跑我们的 adbr-daemon.sh，按路径认），
 # 再按进程名停 adbrd 本身（-x 是 comm 精确匹配，不会误伤监管脚本）。

@@ -7,15 +7,13 @@ DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 PROP_FILE="$MODDIR/module.prop"
 
-# 注入器的调度者：优先用 Rust 的 inject-watchdog（stat 轮询，文件变了才跑一轮 shell），
-# 不可用时回落 shell 版自己循环。
+# 注入器的唯一实现：shell 脚本 `daemon-injector`。
 #
-# 这回落不是“兼容旧版本”：两种部署方式下的文件标签不一样 —— 刷模块时
-# `customize.sh` 在 magisk 环境装出来的是可执行的 `magisk_file`；而用 `cp` 热替换
-# 进 `bin/` 的新文件会拿到 `adb_data_file`，SELinux 拒绝 exec（退出码 126）。
-# 用 `[ -x ]` 现场判一下，两种部署都能跑。
+# 这里**没有 Rust 版 watchdog**：watchdog 是 ELF，能被执行（ksu 域有 execute 权限），
+# 但它内部要 `sh daemon-injector` —— 跑 shell 脚本需要的是 **read** 权限，而模块目录的
+# 标签是 magisk_file，ksu 域没有 read（实测 `sh: Permission denied`，退出码 127）。
+# 所以那条路天生走不通，只保留 shell 版，由本脚本（magiskd 域，有 read）拉起。
 INJECTOR_CMD=$MODDIR/daemon-injector
-[ -x "$BIN_DIR/inject-watchdog" ] && INJECTOR_CMD=$BIN_DIR/inject-watchdog
 
 mkdir -p "$STATE_DIR"
 
@@ -124,12 +122,33 @@ ensure_sepolicy() {
 # module-owned paths are matched; the system keymint HAL is never touched.
 kill_all() {
   pkill -9 -f "$BIN_DIR/keymint" 2>/dev/null
-  pkill -9 -f "$BIN_DIR/inject-watchdog" 2>/dev/null
   pkill -9 -f "$BIN_DIR/ommega-inject" 2>/dev/null
   sleep 1
 }
 
-# keymint 守护：`keymint --daemon`（Rust）。唯一入口，没有 shell 回落版。
+# 定位 keymint 二进制：`bin/`（热更新过）→ 模块根 → `libs/<abi>/`（刚安装完的布局，
+# `customize.sh` 会把 bin/ 下的旧二进制删掉，让运行用模块内那份）。
+# keymint 的唯一位置：模块内的 `libs/<abi>/keymint`（按本机 ABI 取）。
+#
+# ELF 只需要 execute 权限，ksu 域有，所以能直接从模块目录跑；`bin/` 那套热更新
+# 布局已经废弃 —— 运行位置只有一个，热更新就是重装模块。
+find_keymint_bin() {
+  abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+  case "$abi" in
+    arm64*|aarch64*) abi=arm64-v8a ;;
+    armeabi*|armv7*) abi=armeabi-v7a ;;
+    x86_64*) abi=x86_64 ;;
+    *) abi=x86 ;;
+  esac
+  cand="$MODDIR/libs/$abi/keymint"
+  if [ -x "$cand" ]; then
+    echo "$cand"
+    return 0
+  fi
+  return 1
+}
+
+# keymint 守护：`keymint --daemon`（Rust）。
 #
 # 以前这里是 371 行的 shell 脚本，每 10 秒十几次 fork（grep/sed/getprop/resetprop），
 # 实测光它自己就吃 4.9% CPU；现在同一份逻辑在 Rust 里，实测 60 秒 0 jiffies。
@@ -144,7 +163,8 @@ start_keymint_daemon() {
     rm -f "$pidfile"
   fi
 
-  "$BIN_DIR/keymint" --daemon &
+  km=$(find_keymint_bin) || return 1
+  "$km" --daemon &
   pid=$!
   echo $pid > "$pidfile"
   sleep 1
@@ -175,7 +195,9 @@ else
   update_status "Ommega ⏳ 启动中"
   start_keymint_daemon
   ensure_sepolicy
-  start_daemon "$INJECTOR_CMD" "$RUN_DIR/injector-daemon.pid"
+  # injector：优先 watchdog；`[ -x ]` 过了但它自己跑不起来（锁、标签、依赖）
+  # 也不能让注入器缺位，直接回落 shell 版，保证注入一定发生。
+  start_daemon "$INJECTOR_CMD" "$RUN_DIR/injector-daemon.pid" || true
 fi
 
 # 属性伪装全部在 post-fs-data 一次性做完（含 ro.boot 启动状态三连）。
@@ -233,7 +255,7 @@ keep_daemons_alive() {
     pf=${spec#*:}
     if ! daemon_one_alive "$sp" "$pf"; then
       case "$sp" in
-        *daemon-injector|*inject-watchdog) ensure_sepolicy ;;
+        *daemon-injector) ensure_sepolicy ;;
       esac
       start_daemon "$sp" "$pf" && fixed=1
     fi

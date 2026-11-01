@@ -1,0 +1,17 @@
+Manifest-Version: 1.0
+
+Name: AndroidManifest.xml
+SHA-256-Digest: yCGL+ycz6wH7a6UQ3RQDqW0KR5AMSM6MLbnGlgP9EZ4=
+
+Name: classes.dex
+SHA-256-Digest: cuNIxJ0XrFP/HCDhX+5fzhi80tCUMgrHXjc7NiYgQTI=
+
+Name: lib/arm64-v8a/libmodeaudit.so
+SHA-256-Digest: dWjbKBFeJDgwbwjUFvss2PeSd//AZOJDOMk0x6jn1OA=
+
+Name: lib/x86_64/libmodeaudit.so
+SHA-256-Digest: nnW/XlchDkTWbeF3ICXM33XclDmAOYsW7RtJ126u+XE=
+
+Name: resources.arsc
+SHA-256-Digest: H6PLKRKFNI7BszyF5zF9mJRncH9HkcTlMC8tMS0eGMg=
+

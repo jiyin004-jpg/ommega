@@ -22,7 +22,7 @@ use crate::plat::resetprop;
 
 const STATE_DIR: &str = "/data/adb/ommega";
 const RUN_DIR: &str = "/data/adb/ommega/run";
-const BIN_DIR: &str = "/data/adb/ommega/bin";
+const MODDIR: &str = "/data/adb/modules/ommega";
 
 const CONF_PATH: &str = "/data/misc/keystore/ommega/config";
 const LOG_FILE: &str = "/data/misc/keystore/ommega/logs/daemon.log";
@@ -222,10 +222,23 @@ fn holder_is_daemon(pid: u32) -> bool {
 // keymint 生命周期
 // ---------------------------------------------------------------------------
 
-/// keymint 就在 `bin/` 下一处 —— `layout.sh` 会把打包的 `libs/<abi>/keymint`
-/// 搬过来，所以不需要再按 ABI 去找别的副本。
+/// keymint 的位置：`bin/`（热更新过）→ 模块根 → `libs/<abi>/`。
+///
+/// 刚安装完时 `customize.sh` 会清掉 `bin/` 里的旧二进制，运行用的是模块内那份；
+/// 热更新过就优先用 `bin/`。两种都是正常布局，不是兼容旧版。
 fn find_keymint() -> Option<PathBuf> {
-    let path = PathBuf::from(BIN_DIR).join("keymint");
+    // 唯一位置：模块内的 `libs/<abi>/keymint`。ELF 只要能 execute（ksu 域有），
+    // 不需要 read；`bin/` 那套热更新布局已废弃。ABI 用编译期常量，不读属性。
+    let abi_dir = if cfg!(target_arch = "aarch64") {
+        "arm64-v8a"
+    } else if cfg!(target_arch = "arm") {
+        "armeabi-v7a"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "x86"
+    };
+    let path = PathBuf::from(format!("{MODDIR}/libs/{abi_dir}/keymint"));
     path.is_file().then_some(path)
 }
 

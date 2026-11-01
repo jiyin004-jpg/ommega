@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="9"
+    android:versionName="1.7"
+    android:compileSdkVersion="37"
+    android:compileSdkVersionCodename="17"
+    package="com.basicas.u52"
+    platformBuildVersionCode="37"
+    platformBuildVersionName="17">
+    <uses-sdk
+        android:minSdkVersion="31"
+        android:targetSdkVersion="37"/>
+    <application
+        android:theme="@android:style/Theme.Holo.Light.NoActionBar"
+        android:label="检测 Demo"
+        android:debuggable="false"
+        android:allowBackup="false"
+        android:supportsRtl="true">
+        <activity
+            android:name="io.github.a13e300.unifiedaudit.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <service
+            android:name="io.github.a13e300.unifiedaudit.AuditService"
+            android:exported="false"
+            android:process=":checks"/>
+    </application>
+</manifest>
