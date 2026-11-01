@@ -7,9 +7,15 @@ DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 PROP_FILE="$MODDIR/module.prop"
 
-# 注入器的调度者：直接用 shell 版 daemon-injector。
+# 注入器的调度者：优先用 Rust 的 inject-watchdog（stat 轮询，文件变了才跑一轮 shell），
+# 不可用时回落 shell 版自己循环。
 #
+# 这回落不是“兼容旧版本”：两种部署方式下的文件标签不一样 —— 刷模块时
+# `customize.sh` 在 magisk 环境装出来的是可执行的 `magisk_file`；而用 `cp` 热替换
+# 进 `bin/` 的新文件会拿到 `adb_data_file`，SELinux 拒绝 exec（退出码 126）。
+# 用 `[ -x ]` 现场判一下，两种部署都能跑。
 INJECTOR_CMD=$MODDIR/daemon-injector
+[ -x "$BIN_DIR/inject-watchdog" ] && INJECTOR_CMD=$BIN_DIR/inject-watchdog
 
 mkdir -p "$STATE_DIR"
 
@@ -118,6 +124,7 @@ ensure_sepolicy() {
 # module-owned paths are matched; the system keymint HAL is never touched.
 kill_all() {
   pkill -9 -f "$BIN_DIR/keymint" 2>/dev/null
+  pkill -9 -f "$BIN_DIR/inject-watchdog" 2>/dev/null
   pkill -9 -f "$BIN_DIR/ommega-inject" 2>/dev/null
   sleep 1
 }
@@ -226,7 +233,7 @@ keep_daemons_alive() {
     pf=${spec#*:}
     if ! daemon_one_alive "$sp" "$pf"; then
       case "$sp" in
-        *daemon-injector) ensure_sepolicy ;;
+        *daemon-injector|*inject-watchdog) ensure_sepolicy ;;
       esac
       start_daemon "$sp" "$pf" && fixed=1
     fi

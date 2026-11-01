@@ -10,6 +10,10 @@ build = "build.rs"
 name = "ommega-inject"
 path = "src/main.rs"
 
+[[bin]]
+name = "inject-watchdog"
+path = "src/bin/inject_watchdog.rs"
+
 [dependencies]
 libc = "0.2.189"
 log = "0.4.33"

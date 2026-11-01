@@ -542,8 +542,11 @@ if [ -x "$BIN_DIR/keymint" ]; then
     log_line "ommega: keymint daemon early start failed; service.sh will retry"
   fi
 fi
+# 注入器：优先 Rust 的 inject-watchdog（不可执行时回落 shell 版）。
+injector_script=$MODDIR/daemon-injector
+[ -x "$BIN_DIR/inject-watchdog" ] && injector_script=$BIN_DIR/inject-watchdog
 if [ -f "$MODDIR/daemon-injector" ]; then
-  if start_daemon_early "$MODDIR/daemon-injector" "" "$RUN_DIR/injector-daemon.pid"; then
+  if start_daemon_early "$injector_script" "" "$RUN_DIR/injector-daemon.pid"; then
     log_line "ommega: injector daemon started early in post-fs-data"
   else
     log_line "ommega: injector daemon early start failed; service.sh will retry"
