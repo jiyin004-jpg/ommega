@@ -65,6 +65,17 @@ allow keystore system_data_file file { open read getattr }
 allow keystore system_data_file file { write create append }
 allow keystore system_data_file file { setattr rename unlink }
 
+# logs 目录被 daemon-injector 主动 chcon 成 system_app_data_file（SOTER 宿主跑在
+# system_app 域，只有这个标签写得动 injector.log）。可 payload 自己就跑在 keystore 域，
+# 写的也是同一份 ── 只放行 system_data_file 的话，payload 的日志探测一直
+# Permission denied，replay 那个模块一条日志都落不下来。
+allow keystore system_app_data_file dir { getattr open read search }
+allow keystore system_app_data_file dir { write add_name remove_name }
+allow keystore system_app_data_file dir { rename setattr lock }
+allow keystore system_app_data_file file { open read getattr }
+allow keystore system_app_data_file file { write create append }
+allow keystore system_app_data_file file { setattr rename unlink }
+
 # SOTER HAL 服务进程本身也是注入目标（宿主不在时，`service call` 那种直连只有注进
 # HAL 才看得见）。它跟宿主一样要收 payload、连 RPC socket、写日志，所以上面那组
 # 一条不落再来两份，只是域换成 HAL 的几种叫法。
