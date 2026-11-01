@@ -1204,16 +1204,28 @@ fn patch_property(env: &str, prop: &str) -> Option<String> {
 /// expects for KM_TAG_OS_PATCH_LEVEL (706).
 fn patch_level_to_yyyymm(value: &str) -> Option<u32> {
     let s = value.trim();
-    // Accept both "YYYY-MM-DD" (or "YYYY-MM") and bare "YYYYMM".
-    if s.len() >= 6 {
-        let (year, month) = if s.as_bytes().get(4) == Some(&b'-') {
-            (s[0..4].parse::<u32>().ok()?, s[5..7].parse::<u32>().ok()?)
-        } else {
-            (s[0..4].parse::<u32>().ok()?, s[4..6].parse::<u32>().ok()?)
-        };
-        if (1..=12).contains(&month) {
-            return Some(year * 100 + month);
-        }
+    // 属性值不做任何假设：ROM 会写成 "2026-8"，也可能被写进别的东西。直接按字节
+    // 切片一旦越界或落在非 char 边界就 panic，而 release 是 panic=abort —— 一笔
+    // generateKey 就能把整个 keystore 打死。先卡成纯数字+-，再按段解析。
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return None;
+    }
+    let mut parts = s.split('-');
+    let head = parts.next()?;
+    let (year, month) = if head.len() == 4 {
+        let month = parts.next()?;
+        (head.parse::<u32>().ok()?, month.parse::<u32>().ok()?)
+    } else if head.len() == 6 {
+        // 裸 "YYYYMM"
+        (
+            head.get(0..4)?.parse::<u32>().ok()?,
+            head.get(4..6)?.parse::<u32>().ok()?,
+        )
+    } else {
+        return None;
+    };
+    if (1..=12).contains(&month) {
+        return Some(year * 100 + month);
     }
     None
 }

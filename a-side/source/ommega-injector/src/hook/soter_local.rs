@@ -166,6 +166,7 @@ pub(crate) fn selftest() -> anyhow::Result<()> {
 }
 
 /// 一次 initSign 挂起来的会话。
+#[derive(Clone)]
 struct SignSession {
     uid: i32,
     alias: String,
@@ -427,7 +428,25 @@ fn current_attk() -> Option<Key> {
         if let Some((key, origin)) = load_attk_key() {
             *cached = key.clone();
             *known = stamp;
-            log::info!("event=soter ATTK hot-reloaded from {origin}");
+            // ATTK 换了 = 新身份。内存里缓存的 ASK / AuthKey / counter / 「已建过 ASK」
+            // 全是拿旧 ATTK 签的，不清的话宿主会继续拿旧链应答（本地验得过、服务端不认，
+            // 典型表现就是「不重启就能用、一重启就不行」）。磁盘 store 那边有指纹校验会
+            // 自己作废，这里把内存这一半补齐。
+            if let Ok(mut map) = state.asks.lock() {
+                map.clear();
+            }
+            if let Ok(mut map) = state.auth.lock() {
+                map.clear();
+            }
+            if let Ok(mut map) = state.counters.lock() {
+                map.clear();
+            }
+            if let Ok(mut set) = state.ask_built.lock() {
+                set.clear();
+            }
+            log::info!(
+                "event=soter ATTK hot-reloaded from {origin}; cleared in-memory ask/auth/counter"
+            );
             return Some(key);
         }
     }
@@ -917,10 +936,14 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 拿 AuthKey 签，回「JSON + 签名」的信封。
         4 => {
             let session = call.session?;
-            let pending = state.sessions.lock().ok()?.remove(&session);
-            let found = pending.and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
+            // 先取授权 key，确认拿得到再摘会话。反过来做的话，auth_key 这次失败
+            // （store 临时读不到 / PEM 坏了）会话就已经从表里没了，宿主拿同一个
+            // session 重试也找不到，这一轮签名直接失败且不可重试。
+            let peeked = state.sessions.lock().ok()?.get(&session).cloned();
+            let found = peeked.and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
             match found {
                 Some((s, key)) => {
+                    state.sessions.lock().ok()?.remove(&session);
                     let counter = bump_counter(state, s.uid);
                     let document = sign_json(s.uid, &s.raw, counter);
                     let signature = key.sign(&document)?;
@@ -1121,12 +1144,18 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             // 否则 App 记着旧 counter，看到 1 就当回退，得连按好几次才追上来。
             let next = match counter_for(&text, uid) {
                 Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
-                None => COUNTER_BASE,
+                // 文件里没这个 uid 不代表能从头来：daemon 换 ATTK 时会删这个文件，
+                // 别的 uid 写回时也会重排内容，而本进程内存里可能已经给过更大的值。
+                // 回退到 1 会让 App 判「counter 变小 = 重放」，然后删钥匙重开通。
+                None => mem.max(COUNTER_BASE) + 1,
             };
             let updated = set_counter(&text, uid, next);
-            let _ = file.set_len(0);
             let _ = file.seek(SeekFrom::Start(0));
-            let _ = file.write_all(updated.as_bytes());
+            // 先写后截。反过来（先 set_len(0)）的话，write_all 一旦失败（ENOSPC/EDQUOT）
+            // 文件就空了，所有 uid 的计数一起丢，下轮全部从 1 开始，日志里还看不出。
+            if file.write_all(updated.as_bytes()).is_ok() {
+                let _ = file.set_len(updated.len() as u64);
+            }
             next
         }
         // 开不了文件（权限异常）：只能拿内存里的值兜一下，至少不回退到比本进程见过的更小。
