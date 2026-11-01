@@ -231,6 +231,9 @@ fn loosen_app_domain_path(path: &str) {
     if let Some(parent) = std::path::Path::new(path).parent() {
         // 目录属主是 root，payload 多半不是 —— 改不动就算了，daemon-injector
         // 那边每轮都会补一刀。
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777));
+        //
+        // 目录必须给 other 写（app 域 payload 要落日志），但用 sticky 位挡住
+        // 删掉 / 改名别人的文件，不要把目录无保护地开成 0777。
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o1777));
     }
 }

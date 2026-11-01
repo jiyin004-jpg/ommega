@@ -4,12 +4,16 @@
 # Runs automatically when the module is removed via a root manager
 # (KernelSU / Magisk / APatch). Removes every runtime artifact the A-side
 # creates so an uninstall leaves no residue: daemon processes, the whole
-# /data/misc/ommega tree, A-side files under the shared
+# /data/misc/ommega tree, the key material and Keymaster DB that stay in
+# /data/misc/keystore/ommega, A-side files under the shared
 # /data/adb/ommega state dir, and WebUI temp files.
 
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
 OMMEGA_DIR=/data/misc/ommega
+# 密钥材料（keybox）、Keymaster 数据库、RPC socket 还留在 keystore 目录里 ——
+# 数据根搬到 /data/misc/ommega 之后，这里只剩这几样。
+KS_DIR=/data/misc/keystore/ommega
 
 # ---------------------------------------------------------------------------
 # 1. Stop runtime processes
@@ -54,13 +58,24 @@ rm -f "$STATE_DIR/pathmask.state" "$STATE_DIR/kmod-loader.log"
 
 # ---------------------------------------------------------------------------
 # 2. Remove the A-side data tree
-#    Keymaster DB, config, keybox, logs, RPC socket, crash counter, webroot
-#    cache, and the standing-unlock mirror (unlock.state) — that last one holds the
-#    LSKF material the framework handed to keystore2, so it must not outlive the
-#    module. This is A-side-only, so deleting it wholesale is safe.
+#    config, logs, crash counter, webroot cache, and the standing-unlock
+#    mirror (unlock.state) — that last one holds the LSKF material the framework
+#    handed to keystore2, so it must not outlive the module. This is A-side-only,
+#    so deleting it wholesale is safe.
 # ---------------------------------------------------------------------------
 rm -f "$OMMEGA_DIR/unlock.state"
 rm -rf "$OMMEGA_DIR"
+
+# ---------------------------------------------------------------------------
+# 2b. Remove the keystore-side tree
+#     keybox_tee.xml / keybox_strongbox.xml, the Keymaster DB under data/, and the
+#     RPC socket + peer table live here.  Key material must not survive an
+#     uninstall, and a leftover DB would be picked up again by a later reinstall.
+# ---------------------------------------------------------------------------
+rm -f "$KS_DIR/keybox_tee.xml" "$KS_DIR/keybox_strongbox.xml" 2>/dev/null
+rm -rf "$KS_DIR/data" "$KS_DIR/backups" 2>/dev/null
+rm -f "$KS_DIR/rpc.sock" "$KS_DIR/rpc.peers" 2>/dev/null
+rmdir "$KS_DIR" 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # 3. Remove A-side files under the shared state dir

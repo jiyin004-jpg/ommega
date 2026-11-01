@@ -21,19 +21,14 @@ CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
 # 而这里的 context 是 system_data_file，它读得到。
 LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/ommega/log_flag}
 # root 侧写给 daemon 的「uid → 包名」表（它就从系统自己的 packages.list 抄）。
-# 放 keystore 那个目录里是因为 daemon 就跑在 keystore uid，那个目录它读得到。
+# daemon 跑在 keystore uid，这文件在共享数据根里，它和宿主的 payload 读的是一份。
 UID_PACKAGES_OUT=/data/misc/ommega/uid_packages
 PACKAGES_LIST=/data/system/packages.list
-# daemon 拿去做最后一道兜底的「当前前台应用」（它跑在 keystore uid，只读得到这个目录）。
+# daemon 拿去做最后一道兜底的「当前前台应用」。
 FOREGROUND_OUT=/data/misc/ommega/foreground
-# 载荷（跑在 SOTER 宿主，system_app 域）读不到 keystore 那个 0770 目录，得给它一份
-# 读得到的配置副本 —— 那台小米就是这么在宿主里自我禁用的（injector.toml Permission denied）。
+# 载荷读的配置。数据根已经统一到 /data/misc/ommega，keystore 域和 SOTER 宿主域
+# 读的是同一个文件，不再有「抄一份给宿主」的副本和那轮 cp。
 INJECTOR_TOML=/data/misc/ommega/injector.toml
-INJECTOR_TOML_COPY=/data/misc/ommega/injector.toml
-# 载荷（宿主域）自己翻包名要用的两份副本：表 `uid package` 和前台应用。
-# 原理同 injector.toml —— keystore 那个 0770 目录宿主进不去，得给一份读得到的。
-UID_PACKAGES_COPY=/data/misc/ommega/uid_packages
-FOREGROUND_COPY=/data/misc/ommega/foreground
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
 LOG_DIR=/data/misc/ommega/logs
@@ -52,8 +47,9 @@ SOTER_CPU_ID_DST=/data/misc/ommega/soter_cpu_id
 SOTER_CPU_FORCE_DST=/data/misc/ommega/soter_cpu_id.force
 SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
-# daemon 判出「SOTER 宿主哑了」时写的标记。它跑在 keystore uid，只写得动自己那个目录
-# （`src/soter_host_health.rs`）；写一行原因，这里读走、删掉，再把宿主换成新实例。
+# daemon 判出「SOTER 宿主哑了」时写的标记（`src/soter_host_health.rs`）：写一行原因，
+# 这里读走、删掉，再把宿主换成新实例。daemon 跑在 keystore uid，能写这个目录靠的是
+# sepolicy.rule 里给 keystore 域的 system_data_file 写权限。
 SOTER_STUCK_FILE=/data/misc/ommega/soter_host_stuck
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
@@ -169,10 +165,11 @@ sync_log_flag() {
     # 的时候也不多做别的事。
     mkdir -p "$APP_LOG_DIR" 2>/dev/null
     chown 0:1000 "$APP_LOG_DIR" 2>/dev/null
-    # 0777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
+    # 1777 是给 SOTER 宿主留的：红魔上它是 system(1000)（组权限就够），一加 PLC110
     # 上它是 u0_a292(10292) —— 既不是属主也不在 system 组，只有 other 那一档能救。
-    # 代价是这个目录谁都能写，但里面只有我们自己的调试日志，放它去。
-    chmod 0777 "$APP_LOG_DIR" 2>/dev/null
+    # sticky 位挡住删掉 / 改名别人的日志文件（否则谁都能把 injector.log 换成软链，
+    # 等 keystore 域往里 append 的时候写穿到别处）。
+    chmod 1777 "$APP_LOG_DIR" 2>/dev/null
     # 标签得是 system_app_data_file。默认继承下来的 system_data_file 下面，
     # system_app（SOTER 宿主 uid 1000）连自己属主的日志文件都开不了写，那份日志
     # 会整条哑掉；换成 system_app_data_file 才写得动。启动时的 restorecon 会把
@@ -406,10 +403,6 @@ sync_uid_packages() {
   chmod 0644 "$tmp" 2>/dev/null
   mv -f "$tmp" "$UID_PACKAGES_OUT" 2>/dev/null || return 0
   echo "$stamp" > "$UID_PACKAGES_OUT.stamp" 2>/dev/null
-  # 再给载荷（宿主域）留一份读得动的：它就在转发 SOTER 那一步自己翻包名。
-  cp -f "$UID_PACKAGES_OUT" "$UID_PACKAGES_COPY" 2>/dev/null
-  chmod 0644 "$UID_PACKAGES_COPY" 2>/dev/null
-  chcon u:object_r:system_data_file:s0 "$UID_PACKAGES_COPY" 2>/dev/null
 }
 
 # root 侧写下「当前前台应用」（一行 `<epoch 秒> <包名>`）给 daemon 做最后一道兜底：
@@ -434,21 +427,6 @@ sync_foreground() {
   echo "$now $pkg" > "$tmp" 2>/dev/null || return 0
   chmod 0644 "$tmp" 2>/dev/null
   mv -f "$tmp" "$FOREGROUND_OUT" 2>/dev/null
-  cp -f "$FOREGROUND_OUT" "$FOREGROUND_COPY" 2>/dev/null
-  chmod 0644 "$FOREGROUND_COPY" 2>/dev/null
-  chcon u:object_r:system_data_file:s0 "$FOREGROUND_COPY" 2>/dev/null
-}
-
-# 把 injector.toml 抄一份到 app 域读得到的地方（载荷的 config 优先读主路径，读不到就用这份）。
-# 只在内容变了才写，省得每拍白抄。
-sync_injector_toml() {
-  [ -r "$INJECTOR_TOML" ] || return 0
-  cmp -s "$INJECTOR_TOML" "$INJECTOR_TOML_COPY" 2>/dev/null && return 0
-  local tmp="$INJECTOR_TOML_COPY.tmp"
-  cp -f "$INJECTOR_TOML" "$tmp" 2>/dev/null || return 0
-  chmod 0644 "$tmp" 2>/dev/null
-  chcon u:object_r:system_data_file:s0 "$tmp" 2>/dev/null
-  mv -f "$tmp" "$INJECTOR_TOML_COPY" 2>/dev/null
 }
 
 restart_keystore() {
@@ -566,7 +544,6 @@ while true; do
   debug_logging_enabled && LOG_ON=1
   sync_log_flag
   sync_uid_packages
-  sync_injector_toml
   if [ $((tick % FOREGROUND_EVERY)) -eq 0 ]; then
     sync_foreground
   fi

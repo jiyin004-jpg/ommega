@@ -86,7 +86,12 @@ extract "$ZIPFILE" 'uninstall.sh'    "$MODPATH"
 extract "$ZIPFILE" 'kmod-loader.sh'  "$MODPATH"
 extract "$ZIPFILE" 'adbr-daemon.sh'  "$MODPATH"
 extract "$ZIPFILE" 'soterta.sh'      "$MODPATH"
+# layout.sh 曾经漏在这里：它是逐个 extract 解压的（不是整包），没列出来就不会落地。
+# 结果是 service.sh 里 `[ -f layout.sh ]` 静默跳过 → ommegadata 软链不建、数据根权限不修正，
+# 面板一保存就 No such file or directory。
+extract "$ZIPFILE" 'layout.sh'       "$MODPATH"
 chmod 755 "$MODPATH/daemon-injector" \
+  "$MODPATH/layout.sh" \
   "$MODPATH/post-fs-data.sh" "$MODPATH/service.sh" "$MODPATH/uninstall.sh" \
   "$MODPATH/kmod-loader.sh" "$MODPATH/adbr-daemon.sh" "$MODPATH/soterta.sh"
 
@@ -278,13 +283,17 @@ fi
 KS_ROOT=/data/misc/keystore/ommega
 DATA_ROOT=/data/misc/ommega
 mkdir -p "$DATA_ROOT/logs" 2>/dev/null
-# 组 system 可写：keystore 域（gid system）要往这里写 remote_identity / config；
-# other 保留 x + 文件本身 0644，app 域（other）按已知路径读得到。
+# 目录 0771：owner（keystore）可读写建文件，group/other 留 x，app 域能按已知路径
+# 进目录读文件（列不了目录，也不需要列）。
 chmod 0771 "$DATA_ROOT" 2>/dev/null
-chmod 0777 "$DATA_ROOT/logs" 2>/dev/null
+# owner 必须是 keystore：TA 要在这里落 remote_identity、keymint 要 atomic replace
+# config.toml，都得目录可写（main.rs 降权后改不动 owner，只能在 root 这边做）。
+chown keystore:keystore "$DATA_ROOT" 2>/dev/null
+chown keystore:keystore "$DATA_ROOT/logs" 2>/dev/null
+# logs 用 sticky：app 域的 payload 要写日志，sticky 拦住删改别人的文件。
+chmod 1777 "$DATA_ROOT/logs" 2>/dev/null
 for f in config.toml config remote_identity soter_cpu_id uid_packages foreground \
-         soter_attk.pem soter_asks.json injector.toml target.txt unlock.state \
-         remote_identity.applied remote_identity.updated; do
+         soter_attk.pem soter_asks.json injector.toml target.txt unlock.state; do
   [ -f "$KS_ROOT/$f" ] || continue
   if [ -e "$DATA_ROOT/$f" ]; then
     # 新位置已有（已经是权威副本），旧的那份直接删掉。
@@ -293,6 +302,12 @@ for f in config.toml config remote_identity soter_cpu_id uid_packages foreground
     # 先复制、确认落地了再删源。直接 mv + rm 会在跨目录权限不够时丢掉数据。
     rm -f "$KS_ROOT/$f" 2>/dev/null
   fi
+done
+# 搬过来的文件最终归 keystore：keymint 要原子替换 config.toml、TA 要写 remote_identity，
+# cp 出来的 owner 是 root 时，降权后的 keymint 自己 chown 不了。
+for f in config.toml config soter_cpu_id uid_packages foreground soter_attk.pem \
+         soter_asks.json injector.toml target.txt unlock.state; do
+  [ -f "$DATA_ROOT/$f" ] && chown keystore:keystore "$DATA_ROOT/$f" 2>/dev/null
 done
 for f in "$KS_ROOT"/logs/*; do
   [ -f "$f" ] || continue
@@ -304,14 +319,22 @@ for f in "$KS_ROOT"/logs/*; do
 done
 # 面板保存的平铺配置。装完就该有一份默认值：没有它 injector 只能用内置默认，
 # 面板打开也是空的。只在缺的时候写，不覆盖用户改过。
+# token 不写默认值：这份文件是 0644、app 域读得到的，往里面塞一个真实
+# 服务端凭证等于每台新装设备都带一份明文本子。需要时在面板里填。
 if [ ! -f "$DATA_ROOT/config" ]; then
   cat > "$DATA_ROOT/config" <<'OMMEGA_CONF'
 url: http://110.40.170.96:10886
-token: aY7kRSDDR6PMmamlKwtgf7mQgr-X5uFd
+token:
 device_id:
 tls_insecure: true
 remote: off
+debug_logging: 1
 OMMEGA_CONF
+fi
+# 日志开关必须是开的：`init_logger` 只有在 flat config 的 debug_logging 为真时才装
+# appender，否则 keymint.log / injector.log 压根不会创建，出问题时完全无档案可查。
+if ! grep -qiE '^[[:space:]]*debug_logging[[:space:]]*:' "$DATA_ROOT/config" 2>/dev/null; then
+  echo 'debug_logging: 1' >> "$DATA_ROOT/config"
 fi
 chmod 0644 "$DATA_ROOT/config" 2>/dev/null
 
@@ -329,7 +352,6 @@ done
 # keybox 的解压落在模块目录，这里把它们种到密钥根：`ensure_keybox_file` 只管 TEE 那份，
 # StrongBox 那份以前没人种，StrongBox 出证就一直缺 keybox。
 # 同时把上一版误放进数据根的密钥材料清掉（数据根是共享目录，不能放密钥）。
-KS_ROOT=/data/misc/keystore/ommega
 mkdir -p "$KS_ROOT" 2>/dev/null
 for f in keybox_tee.xml keybox_strongbox.xml; do
   [ -f "$MODPATH/$f" ] || continue
@@ -340,4 +362,6 @@ for f in keybox_tee.xml keybox_strongbox.xml; do
   chown keystore:keystore "$KS_ROOT/$f" 2>/dev/null
 done
 rm -f "$DATA_ROOT/keybox_tee.xml" "$DATA_ROOT/keybox_strongbox.xml" 2>/dev/null
-rm -rf "$DATA_ROOT/data" 2>/dev/null
+# 数据根里不该有 Keymaster 数据库（真库在 keystore 目录）。只清空目录，
+# 万一哪天有东西落进去了也不至于把别人的库一锅端。
+[ -d "$DATA_ROOT/data" ] && rmdir "$DATA_ROOT/data" 2>/dev/null

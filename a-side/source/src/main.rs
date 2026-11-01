@@ -120,7 +120,11 @@ fn prepare_android_storage() {
     // SOTER 宿主跑在 uid 1000（`system_app`），它按已知路径进目录读文件。
     // 所以不能是 0770：`other` 连目录都进不去，SOTER 直接读不到 ATTK / cpu_id。
     // 目录给 0771（other 只有 x，不能列举但能按名访问），文件给 0644。
-    for (dir, mode) in [(root_path!(), 0o771), (root_path!("logs"), 0o777)] {
+    //
+    // logs 必须是 1777 而不是 0777：注入到 app 域（SOTER 宿主不是 keystore uid）的
+    // payload 得往这里落日志，光靠 group 写不够。sticky 位拦住「删掉/改名别人的
+    // 日志文件」和拿软链顶替已有日志那条路，写内容还是允许的。
+    for (dir, mode) in [(root_path!(), 0o771), (root_path!("logs"), 0o1777)] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             storage_warn(format!("Failed to create ommega directory {dir}: {e:?}"));
             continue;
@@ -152,6 +156,18 @@ fn prepare_android_storage() {
             storage_warn(format!(
                 "Failed to chown ommega db directory {db_dir}: {e:?}"
             ));
+        }
+    }
+
+    // 日志给 app 域读写（面板/排查）：目录 1777（sticky），已有文件一律 0666。
+    // 文件是运行时新建的（keymint.log 由 payload 写），所以每次启动都得扇一遍，
+    // 否则新文件默认 0600，只有 keystore 域读得到。
+    if let Ok(entries) = std::fs::read_dir(root_path!("logs")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+            }
         }
     }
 

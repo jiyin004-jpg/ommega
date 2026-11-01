@@ -18,5 +18,15 @@ fi
 
 # 组 system 可写（keystore 域要写 remote_identity / config），other 留 x 让 app 域读。
 # 目录可能是别人建的，所以每次开机都正一次。
+#
+# owner 必须是 keystore：keystore2 里的 TA 要往这里落 remote_identity、keymint 要
+# atomic replace config.toml，两者都是「在目录里建临时文件再 rename」，光有文件
+# 写权限不够，得目录可写。这个目录是 root 脚本建的，main.rs 降权后那次 chown
+# 改不动它，所以只能在 root 这边做。
+mkdir -p "$DATA_ROOT/logs" 2>/dev/null
+chown keystore:keystore "$DATA_ROOT" 2>/dev/null
+chown keystore:keystore "$DATA_ROOT/logs" 2>/dev/null
 chmod 0771 "$DATA_ROOT" 2>/dev/null
-chmod 0777 "$DATA_ROOT/logs" 2>/dev/null
+# logs 用 sticky：app 域（SOTER 宿主不是 keystore uid）的 payload 要往这里写日志，
+# 不开 other 写它就落不下档；sticky 位拦住删掉 / 改名别人的文件。
+chmod 1777 "$DATA_ROOT/logs" 2>/dev/null
