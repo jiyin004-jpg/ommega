@@ -209,31 +209,36 @@ sync_log_flag() {
   # 属主只有一个，另一个只能靠 other 那一档写。这里统一放到 0666，谁续写都行；
   # 里面只有我们自己的调试日志，不怕被读。文件不在就先放一个空的。
   APP_LOG_FILE=$APP_LOG_DIR/injector.log
-  [ -f "$APP_LOG_FILE" ] || : > "$APP_LOG_FILE" 2>/dev/null
-  chmod 0666 "$APP_LOG_FILE" 2>/dev/null
-  chcon u:object_r:system_app_data_file:s0 "$APP_LOG_FILE" 2>/dev/null
-  # 「这台机器的 SOTER 签成功过」的记录：签名那一瞬间由 app 域的 payload 追加一行，
-  # 所以得跟上面那份日志一样 —— 先建好、放 0666（宿主只能靠 other 那一档写）。
-  # 面板只看最后一条，留多了没意义；超过 64KB 就清掉重来。
   SIGN_OK_FILE=$LOG_FLAG_DIR/soter_ok
-  [ -f "$SIGN_OK_FILE" ] || : > "$SIGN_OK_FILE" 2>/dev/null
-  chmod 0666 "$SIGN_OK_FILE" 2>/dev/null
-  chcon u:object_r:system_app_data_file:s0 "$SIGN_OK_FILE" 2>/dev/null
+  # 这四个路径的「属主/权限」当签名：全都对就一个 fork 的 stat 完事，
+  # 有一样跑偏（被 restorecon 动了、用户改过、升上来的旧版、文件或目录被删重建）才进去修。
+  # 特意不带 mtime：日志文件每写一行 mtime 就变，带上就等于每拍都跑那段修复。
+  # 目录被重建的情况靠 mode 能认出来 —— 新建的目录是 0755，而我们要的是 1777 / 0711。
+  local fix_sig
+  fix_sig=$(stat -c '%n:%u:%g:%a' "$APP_LOG_DIR" "$APP_LOG_FILE" "$SIGN_OK_FILE" "$LOG_FLAG_DIR" 2>/dev/null)
+  if [ "$fix_sig" != "${PERM_SIG:-}" ]; then
+    [ -f "$APP_LOG_FILE" ] || : > "$APP_LOG_FILE" 2>/dev/null
+    chmod 0666 "$APP_LOG_FILE" 2>/dev/null
+    chcon u:object_r:system_app_data_file:s0 "$APP_LOG_FILE" 2>/dev/null
+    [ -f "$SIGN_OK_FILE" ] || : > "$SIGN_OK_FILE" 2>/dev/null
+    chmod 0666 "$SIGN_OK_FILE" 2>/dev/null
+    chcon u:object_r:system_app_data_file:s0 "$SIGN_OK_FILE" 2>/dev/null
+    mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
+    # 这个目录里可能放着用户自己替换的 soter_attk.pem（本地兜底的签名根），
+    # 所以不能让 other 进得来读：属主给 system(1000) 是因为 app 域的 payload
+    # 要进来读开关和钥匙。
+    chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
+    # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_attk.pem（本地兜底
+    # 私钥，0640）还在别的权限保护着，列不出来也读不到；但宿主得能穿过这一层去
+    # 写 logs/，所以 x 必须给。
+    chmod 0711 "$LOG_FLAG_DIR" 2>/dev/null
+    PERM_SIG=$fix_sig
+  fi
   sog_size=$(stat -c %s "$SIGN_OK_FILE" 2>/dev/null)
   case "$sog_size" in
     ''|*[!0-9]*) : ;;
     *) [ "$sog_size" -gt 65536 ] && : > "$SIGN_OK_FILE" 2>/dev/null ;;
   esac
-  mkdir -p "$LOG_FLAG_DIR" 2>/dev/null
-  # 这个目录里可能放着用户自己替换的 soter_attk.pem（本地兜底的签名根），
-  # 所以不能让 other 进得来读：属主给 system(1000) 是因为 app 域的 payload
-  # 要进来读开关和钥匙。
-  chown 0:1000 "$LOG_FLAG_DIR" 2>/dev/null
-  # 0711：other 只给穿越权，不给列目录权 —— 上面那个 soter_attk.pem（本地兜底
-  # 私钥，0640）还在别的权限保护着，列不出来也读不到；但宿主得能穿过这一层去
-  # 写 logs/，所以 x 必须给。每轮都补：boot 时的 restorecon 不碰权限，但用户
-  # 手动改过或者从别的版本升上来就不一定了。
-  chmod 0711 "$LOG_FLAG_DIR" 2>/dev/null
   cur=$(sed -n 's/^log_flag:[[:space:]]*//p' "$LOG_FLAG" 2>/dev/null | head -n1 | tr -d ' \r')
   if [ "$cur" != "$want" ]; then
     printf 'log_flag: %s\n' "$want" > "$LOG_FLAG" 2>/dev/null
@@ -452,11 +457,26 @@ sync_uid_packages() {
 # 采不到就保留上一份 —— daemon 那边带新鲜度阀，旧了它自己不用。
 sync_foreground() {
   local pkg tmp now
-  # 两条路都试：不同 ROM 用的字段不一样（实测 nubia 是 mCurrentFocus / topResumedActivity，
-  # 老的是 mResumedActivity）。取包名的 sed 是贪心的 —— 一行里可能有 Window{hash u0 pkg/cls}
-  # 这种，要的是最后一个 `pkg/` 前的包名。
-  pkg=$(dumpsys window displays 2>/dev/null | grep -m1 mCurrentFocus \
-    | sed -n 's/.* \([a-zA-Z0-9_][a-zA-Z0-9_.]*\)\/[^ }]*.*/\1/p')
+  # 先试最便宜的一条：`cmd activity get-top-activity` 只回一行 `ACTIVITY pkg/cls`，
+  # 比 `dumpsys window displays` 那份全量 dump 小两三个数量级。
+  # 但它不是每个 ROM 都有（本机 Android 16 就回 Unknown command），所以只在第一拍探一次，
+  # 探到了才走这条，探不到就跟以前一样直接 dumpsys —— 不能每拍白 fork 一次。
+  if [ -z "${TOP_ACTIVITY_PROBED:-}" ]; then
+    TOP_ACTIVITY_PROBED=1
+    TOP_ACTIVITY_OK=0
+    cmd activity get-top-activity 2>/dev/null | grep -q '^ACTIVITY ' && TOP_ACTIVITY_OK=1
+  fi
+  if [ "${TOP_ACTIVITY_OK:-0}" = 1 ]; then
+    pkg=$(cmd activity get-top-activity 2>/dev/null \
+      | sed -n 's/^ACTIVITY \([a-zA-Z0-9_][a-zA-Z0-9_.]*\)\/.*/\1/p' | head -n1)
+  fi
+  # 两条 dumpsys 路留着当退路：不同 ROM 用的字段不一样（实测 nubia 是 mCurrentFocus /
+  # topResumedActivity，老的是 mResumedActivity）。取包名的 sed 是贪心的 —— 一行里可能有
+  # Window{hash u0 pkg/cls} 这种，要的是最后一个 `pkg/` 前的包名。
+  if [ -z "$pkg" ]; then
+    pkg=$(dumpsys window displays 2>/dev/null | grep -m1 mCurrentFocus \
+      | sed -n 's/.* \([a-zA-Z0-9_][a-zA-Z0-9_.]*\)\/[^ }]*.*/\1/p')
+  fi
   if [ -z "$pkg" ]; then
     pkg=$(dumpsys activity activities 2>/dev/null \
       | grep -m1 -E "topResumedActivity|mResumedActivity" \

@@ -373,11 +373,38 @@ fn read_store_pem(section: &str, key: &str) -> Option<String> {
     }
 }
 
+/// AUTH 段最多留这么多把 AuthKey（每把约 1.7KB PEM）。
+///
+/// 不设上限的话，探测机 / 异常流程每轮铸一个新别名、签完不收尾，这份 JSON 就只涨
+/// 不降 —— 内存、磁盘、以及每次重读的解析成本会一起涨。超过之后按「挤掉一批」处理：
+/// 被挤掉的那把下次 `has_auth_key` 会回 false，App 自己重签，这正是设计好的路径
+/// （跟换了 ATTK 之后旧 AuthKey 作废一个道理）。
+const MAX_AUTH_KEYS: usize = 1024;
+const AUTH_KEYS_KEEP: usize = MAX_AUTH_KEYS * 3 / 4;
+/// 未完成的 initSign 会话最多留这么多条，超了整表清。
+const MAX_SIGN_SESSIONS: usize = 256;
+/// 内存里那层 AuthKey 缓存，它只是 store 的缓存，满了清掉就回盘上重读。
+const MAX_AUTH_CACHE: usize = MAX_AUTH_KEYS;
+
 fn store_pem(section: &str, key: &str, pem: &str) -> Option<String> {
     let _guard = ASK_STORE_LOCK.lock().ok()?;
     let mut map = read_ask_store();
-    section_of(&mut map, section)
-        .insert(key.to_string(), serde_json::Value::String(pem.to_string()));
+    let entries = section_of(&mut map, section);
+    entries.insert(key.to_string(), serde_json::Value::String(pem.to_string()));
+    if section == AUTH_SECTION && entries.len() > MAX_AUTH_KEYS {
+        // 没有插入顺序可依（serde_json 的 Map 默认按 key 排序），就随便挤掉一批、
+        // 压到 3/4 再慢慢长，避免每写一把都触发一次 prune。
+        let mut victims: Vec<String> = entries
+            .keys()
+            .filter(|k| k.as_str() != key)
+            .take(entries.len() - AUTH_KEYS_KEEP)
+            .cloned()
+            .collect();
+        victims.sort();
+        for victim in victims {
+            entries.remove(&victim);
+        }
+    }
     write_ask_store(&map)
 }
 
@@ -1025,14 +1052,22 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             let mut next = state.next_session.lock().ok()?;
             *next += 1;
             let session = *next;
-            state.sessions.lock().ok()?.insert(
-                session,
-                SignSession {
-                    uid,
-                    alias: alias.to_string(),
-                    raw,
-                },
-            );
+            {
+                // 没走完成功的 initSign 会话不会自己消失（探测机、App 中退、进程被杀），
+                // 不清就只增不减。清了最多让那次签名重来，不会弄错任何数据。
+                let mut sessions = state.sessions.lock().ok()?;
+                if sessions.len() >= MAX_SIGN_SESSIONS {
+                    sessions.clear();
+                }
+                sessions.insert(
+                    session,
+                    SignSession {
+                        uid,
+                        alias: alias.to_string(),
+                        raw,
+                    },
+                );
+            }
             Some(Answer::Init {
                 status: OK,
                 session,
@@ -1105,6 +1140,10 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
     let pem = read_store_pem(AUTH_SECTION, &id)?;
     let key = Key::from_pem(&pem)?;
     if let Ok(mut map) = state.auth.lock() {
+        // 这层只是缓存，跟 store 一样加个上限；清了下次从盘上读回来。
+        if map.len() >= MAX_AUTH_CACHE {
+            map.clear();
+        }
         map.insert(id, key.clone());
     }
     Some(key)

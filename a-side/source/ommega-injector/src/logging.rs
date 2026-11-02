@@ -153,15 +153,17 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
     // 还是路径本身不对。这份探针文本会顺 RPC 报给 daemon。
     let mut last_error: Option<anyhow::Error> = None;
     let mut probes: Vec<String> = Vec::new();
+    // 开关关着的时候不要顺手把日志文件建出来（面板那边的契约是「关着不建 log」）。
+    // 但探针得继续跑 —— 只是改成「不带 create」地开一次：文件已存在时照样能分出
+    // 是 DAC、SELinux 还是路径不对，没文件就报 ENOENT，真开了开关下一轮再建。
+    let switched_on = crate::config::clienta_debug_logging().unwrap_or(false);
     for (label, path) in [("keystore", DEFAULT_LOG_PATH), ("app", APP_DOMAIN_LOG_PATH)] {
-        // 先自己开一次，只为了把 errno 记下来：appender 那边把错误咽了（只 eprintln，
-        // 而注入进去的进程 stderr 根本没人看），光靠“没写出来”分不清是 DAC、SELinux
-        // 还是路径本身不对。这份探针文本会顺 RPC 报给 daemon。
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
+        let mut probe = std::fs::OpenOptions::new();
+        probe.append(true);
+        if switched_on {
+            probe.create(true);
+        }
+        match probe.open(path) {
             Ok(_) => probes.push(format!("{label}=ok")),
             Err(error) => probes.push(format!("{label}={error}")),
         }
