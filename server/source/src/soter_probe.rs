@@ -156,6 +156,50 @@ pub fn session_side(device: &str, session: i64) -> Option<bool> {
     (now.saturating_sub(*at) <= SESSION_SIDE_TTL_MS).then_some(*real)
 }
 
+/// 「这台设备上一笔 SOTER 落在哪一层」记多久。
+///
+/// `get_device_id` 没有 uid 参数，App 那边也没法把调用者带出来（SOTER 宿主是系统进程，
+/// 到 HAL 这一层只剩 soterserver），A 端只能拿「当前前台应用」凑一个 `caller_pkg`——
+/// 跑检测的时候前台多半是桌面，于是同一个 uid 的 ASK 走了 B、getDeviceId 却退回本地，
+/// 两边的 `cpu_id` 一撞就是检测器那条 C5b。它跟 `finish_sign` 一样是会话类调用，
+/// 跟着这台设备上一笔 SOTER 落在的那一层走，别另判一次。
+///
+/// 窗口只要盖得住一轮流程里那几笔的间隔：实测同一轮是亚秒级，30 秒足够；再长会把
+/// 刚跑完检测器的设备接着跑的真应用也拽到本地去。
+const DEVICE_SIDE_MS: i64 = 30 * 1000;
+
+static DEVICE_SIDES: Mutex<Option<HashMap<String, (bool, i64)>>> = Mutex::new(None);
+
+/// 记一笔：这台设备的这一笔是谁答的（`true` = 真机）。
+///
+/// 只有 `get_device_id` 读它（见 [`device_side`]）：那个 op 翻不出调用者，只能跟着
+/// 上一笔走。别的 op 都有自己的判据，不掺这一份。
+pub fn note_device_side(device: &str, real: bool) {
+    let device = device.trim();
+    if device.is_empty() {
+        return;
+    }
+    let Ok(mut guard) = DEVICE_SIDES.lock() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = chrono::Utc::now().timestamp_millis();
+    if map.len() > NOTE_CAP {
+        map.retain(|_, (_, at)| now.saturating_sub(*at) <= DEVICE_SIDE_MS);
+    }
+    map.insert(device.to_string(), (real, now));
+}
+
+/// 这台设备上一笔 SOTER 落在哪一层（`true` = 真机）。`None` = 没证据（刚起来、过期了），
+/// 调用方照老办法自己判。
+pub fn device_side(device: &str) -> Option<bool> {
+    let guard = DEVICE_SIDES.lock().ok()?;
+    let map = guard.as_ref()?;
+    let (real, at) = map.get(device.trim())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    (now.saturating_sub(*at) <= DEVICE_SIDE_MS).then_some(*real)
+}
+
 /// 名单里的分隔符：逗号、分号、空白都算；写成 `none` / `off` / `-` 就是关掉。
 fn split_list(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
@@ -517,6 +561,22 @@ mod tests {
         assert_eq!(notes.last_side(DEV, 10401, now + STICKY_MS + 1), None);
         notes.served(DEV, 10401, true, now);
         assert_eq!(notes.last_side(DEV, 10401, now), Some(true));
+    }
+
+    /// `get_device_id` 跟着这台设备上一笔落在的那一层；没证据时返回 `None`（让调用方
+    /// 照老判据走），别的设备不跟着走。
+    #[test]
+    fn the_device_side_follows_the_last_answer_on_that_device() {
+        let device = "device-b-side-test";
+        assert_eq!(device_side(device), None);
+        note_device_side(device, false);
+        assert_eq!(device_side(device), Some(false));
+        note_device_side(device, true);
+        assert_eq!(device_side(device), Some(true));
+        assert_eq!(device_side("device-b-other-side"), None);
+        // 空设备名不该记进去（A 端不带 device_id 又没配默认设备时就是空的）。
+        note_device_side("  ", true);
+        assert_eq!(device_side("  "), None);
     }
 
     #[test]

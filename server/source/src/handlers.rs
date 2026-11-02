@@ -1725,17 +1725,33 @@ async fn run_soter_task_inner(
     };
     let session_present =
         op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
-    if let Some(why) = crate::soter_probe::reason_with_caller(
-        &state.cfg,
-        requested,
-        uid_arg,
-        probe_alias_arg,
-        body.get(crate::soter_probe::CALLER_PKG_FIELD)
-            .and_then(Value::as_str),
-        body.get(crate::soter_probe::CALLER_PKG_SRC_FIELD)
-            .and_then(Value::as_str),
-    )
-    .or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
+    // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`（跑检测时
+    // 前台往往是桌面），拿它判白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId
+    // 却退回本地，两个 `cpu_id` 一撞就是检测器那条 C5b。它跟 `finish_sign` 一样是会话类
+    // 调用，只看这台设备上一笔落在哪一层。
+    let device_side = if op == "get_device_id" {
+        crate::soter_probe::device_side(requested)
+    } else {
+        None
+    };
+    let probe_verdict = match device_side {
+        // 上一笔是 B 答的：这一笔也给它，两边报同一个 cpu_id。
+        Some(true) => None,
+        // 上一笔是本地答的：跟着本地，别半路换号。
+        Some(false) => Some("这台设备上一笔 SOTER 是 A 端本地答的".to_string()),
+        None => crate::soter_probe::reason_with_caller(
+            &state.cfg,
+            requested,
+            uid_arg,
+            probe_alias_arg,
+            body.get(crate::soter_probe::CALLER_PKG_FIELD)
+                .and_then(Value::as_str),
+            body.get(crate::soter_probe::CALLER_PKG_SRC_FIELD)
+                .and_then(Value::as_str),
+        ),
+    };
+    if let Some(why) =
+        probe_verdict.or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
     {
         // 带会话号的 finishSign 不吃这套：它必须回到开会话的那一侧。
         //
@@ -1758,6 +1774,8 @@ async fn run_soter_task_inner(
                 "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
              直接退回 A 端本地作答，不造料、不落 B"
             );
+            // 这一笔在 A 端本地答：记下来，`get_device_id` 那笔跟着走，别半路换号。
+            crate::soter_probe::note_device_side(requested, false);
             return Json(json!({
                 "op": op,
                 "local_only": true,
@@ -2269,6 +2287,9 @@ async fn run_soter_task_inner(
                 }
                 let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
                 tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
+                // 这一笔归哪一层：`b` 是真机，keybox / self_signed 是服务端自己造的（用的是
+                // A 端带上来的 cpu_id）。`get_device_id` 那笔靠它决定跟哪边走。
+                crate::soter_probe::note_device_side(requested, layer == "b");
                 // 这个槽位的 ASK 被毒化（App 在自删自建）：把「有 ASK」改写成「没有」，
                 // 逼 App 重新生成并上报腾讯。只动这一种答案，别的 op 不碰。
                 if state
