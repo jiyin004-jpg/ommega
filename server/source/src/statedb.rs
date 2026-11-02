@@ -57,6 +57,12 @@ pub const SESSION_MAX: usize = 200_000;
 /// 垃圾。所以只淘汰闲置超过这个时长的，比它新的宁可不删（宁可超上限）。
 pub const SESSION_EVICT_MIN_IDLE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
+/// 一次 `DELETE` 最多删多少条会话。
+///
+/// 保留期到点的那一批可能一次就是十几万条（实测库里 307k 里 303k 都挤在 1~3 天
+/// 这个窗口），一条语句全删会把写锁和 WAL 撑得很大。限量删，剩下的下一轮扫再继续。
+const DELETE_BATCH: i64 = 20_000;
+
 /// 启动时只把最近用过的这么多条会话装进内存。一条（链 + 私钥密文）实测 6~8 KB，
 /// 8000 条 ≈ 50 MB；没装进来的留在库里，取用时按 alias 单查一条（有索引）。
 pub const SESSION_MEMORY_HOT: usize = 8_000;
@@ -352,16 +358,24 @@ impl StateDb {
     }
 
     /// 过期的会话按「最后使用」删。返回删了几条。
+    ///
+    /// 单次最多删 `DELETE_BATCH` 条：过了保留期的会话可能一次就是十几万，
+    /// 一条 `DELETE` 全干会把写锁和 WAL 都撑得很大，中继那一瞬跟着堵。
+    /// 剩下的交给下一轮，反正调用方是周期性跑的。
     pub fn delete_sessions_expired_before(&self, cutoff_ms: i64) -> Result<usize> {
         let conn = self.plain();
         Ok(conn.execute(
-            "DELETE FROM sessions WHERE used_epoch_ms < ?1",
-            params![cutoff_ms],
+            "DELETE FROM sessions WHERE alias IN (
+                 SELECT alias FROM sessions
+                 WHERE used_epoch_ms < ?1
+                 ORDER BY used_epoch_ms ASC
+                 LIMIT ?2)",
+            params![cutoff_ms, DELETE_BATCH],
         )?)
     }
 
     /// 会话表超过 `cap` 条就从最久没用的开始删，但只删闲置超过 `min_idle_ms` 的。
-    /// 返回删了几条；如果全是活跃会话，返回 0（宁可超上限）。
+    /// 返回删了几条；如果全是活跃会话，返回 0（宁可超上限）。单次同样限 `DELETE_BATCH`。
     pub fn trim_sessions_lru(&self, cap: usize, min_idle_ms: u64) -> Result<usize> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -374,8 +388,8 @@ impl StateDb {
                  SELECT alias FROM sessions
                  WHERE used_epoch_ms < ?2
                  ORDER BY used_epoch_ms ASC, created_epoch_ms ASC
-                 LIMIT (SELECT max(0, count(*) - ?1) FROM sessions))",
-            params![cap as i64, idle_cutoff],
+                 LIMIT min(?3, (SELECT max(0, count(*) - ?1) FROM sessions)))",
+            params![cap as i64, idle_cutoff, DELETE_BATCH],
         )?)
     }
 

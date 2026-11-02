@@ -42,6 +42,8 @@ const SESSION_TOUCH_MIN_MS: u64 = 5 * 60 * 1000;
 /// decrypt 请求上都扫一遍纯属浪费；隔一分钟清一次就够，反正过期会话在查表
 /// 时本来也拿不到东西。
 const PURGE_INTERVAL_MS: u64 = 60 * 1000;
+/// 一轮清理最多打几批。每批上限见 `statedb::DELETE_BATCH`，积压很多时靠多轮慢慢推。
+const PURGE_BATCH_ROUNDS: usize = 5;
 
 static LAST_PURGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -246,21 +248,33 @@ impl Fulfill {
         LAST_PURGE.store(now_ms, Ordering::Relaxed);
         map.retain(|_, s| !Self::session_expired_at(s, now_ms));
         let cutoff_ms = now_ms.saturating_sub(SESSION_TTL.as_millis() as u64) as i64;
-        match self.state.delete_sessions_expired_before(cutoff_ms) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!("sessions: 库里清掉 {n} 条过期会话"),
-            Err(e) => tracing::warn!("sessions: 库里清过期会话失败：{e:#}"),
+        // 单条 `DELETE` 已经限量（见 `statedb` 里的 `DELETE_BATCH`），所以这里多打几轮：
+        // 积压多的时候能往前推，但每轮都把活控制在小块里，不拿写锁一堵到底。
+        for _ in 0..PURGE_BATCH_ROUNDS {
+            match self.state.delete_sessions_expired_before(cutoff_ms) {
+                Ok(0) => break,
+                Ok(n) => tracing::info!("sessions: 库里清掉 {n} 条过期会话"),
+                Err(e) => {
+                    tracing::warn!("sessions: 库里清过期会话失败：{e:#}");
+                    break;
+                }
+            }
         }
         let cap = crate::statedb::SESSION_MAX;
-        match self
-            .state
-            .trim_sessions_lru(cap, crate::statedb::SESSION_EVICT_MIN_IDLE_MS)
-        {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                "sessions: 库里按 LRU 淘汰 {n} 条闲置会话（上限 {cap}，只动闲置超 3 天的）"
-            ),
-            Err(e) => tracing::warn!("sessions: 库里按 LRU 淘汰失败：{e:#}"),
+        for _ in 0..PURGE_BATCH_ROUNDS {
+            match self
+                .state
+                .trim_sessions_lru(cap, crate::statedb::SESSION_EVICT_MIN_IDLE_MS)
+            {
+                Ok(0) => break,
+                Ok(n) => tracing::info!(
+                    "sessions: 库里按 LRU 淘汰 {n} 条闲置会话（上限 {cap}，只动闲置超 3 天的）"
+                ),
+                Err(e) => {
+                    tracing::warn!("sessions: 库里按 LRU 淘汰失败：{e:#}");
+                    break;
+                }
+            }
         }
         // 超上限但全是活跃会话时，上一行是 0 —— 得能看出来现在到底多少条。
         // 隔一小时才报一次，不刷屏。
