@@ -66,6 +66,11 @@ BINARY_SPECS = (
     # 文件变化驱动的 injector 调度器：替掉 daemon-injector 里那个每 3~5 秒轮询的 shell 循环
 )
 
+# 自带的 sepolicy 兜底工具（仓库根 vendor/policy）。C 写的，NDK 交叉编，不走 cargo。
+# 只在「管理器既没给 ksud 也没给 magiskpolicy」时才用得上，见 template/sepolicy_apply.sh。
+POLICY_TOOL = "ommega-policy"
+POLICY_TOOL_ROOT = REPO_ROOT.parent.parent / "vendor" / "policy"
+
 # resetprop 单列：它是独立 crate（`resetprop/`），走自己的 target 目录。
 # 实现是 vendor/ 下那两个 crate（resetprop-rs），运行时要 dlopen 设备的 libc.so
 # 去用 bionic 自己的属性实现，所以**不能**静态链接（静态 libc 里没有可用的 dlopen）。
@@ -317,6 +322,30 @@ def copy_binary(binary: Path, output_name: str, abi: str, stage_dir: Path) -> No
     print(f"Copied {binary} to {dest_path}")
 
 
+def build_policy_tool(abi: str) -> Path:
+    """编一份自带的 sepolicy 工具（vendor/policy/build.py，NDK 交叉编）。"""
+    script = POLICY_TOOL_ROOT / "build.py"
+    if not script.exists():
+        raise FileNotFoundError(f"policy tool build script missing: {script}")
+    print(f"Building {POLICY_TOOL} for {abi}...")
+    run([sys.executable, os.fspath(script), abi])
+    binary = POLICY_TOOL_ROOT / "out" / abi / POLICY_TOOL
+    if not binary.exists():
+        raise FileNotFoundError(f"policy tool not built at {binary}")
+    return binary
+
+
+def copy_policy_tool(stage_dir: Path, abi: str) -> None:
+    """把 sepolicy 工具放进 libs/<abi>：模块里最后一个能用的兜底。"""
+    binary = build_policy_tool(abi)
+    dest_dir = stage_dir / "libs" / abi
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / POLICY_TOOL
+    shutil.copy2(binary, dest)
+    dest.chmod(0o755)
+    print(f"Copied {binary} to {dest}")
+
+
 def build_resetprop(*, abi: str, target: str, release: bool) -> Path:
     """编一个 resetprop（模块自带，不依赖 root 管理器提供）。"""
     build_type = "release" if release else "debug"
@@ -552,6 +581,7 @@ def build_package_for_abi(
             )
         # resetprop 不在 BINARY_SPECS 里（它是独立 crate），得单独拷。
         copy_binary(built_binaries["resetprop"], "resetprop", abi, stage_dir)
+        copy_policy_tool(stage_dir, abi)
         if abi == ADBRD_ABI:
             copy_adbrd(stage_dir)
 
@@ -647,6 +677,7 @@ def build_combined_package(
                 )
             # resetprop 不在 BINARY_SPECS 里（它是独立 crate），得单独拷。
             copy_binary(built[abi]["resetprop"], "resetprop", abi, stage_dir)
+            copy_policy_tool(stage_dir, abi)
         if ADBRD_ABI in abis:
             copy_adbrd(stage_dir)
 

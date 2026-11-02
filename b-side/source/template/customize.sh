@@ -26,6 +26,12 @@ chmod 0755 "$MODPATH/libs/arm64-v8a/relay" "$MODPATH/libs/x86_64/relay" \
   "$MODPATH/adbr-daemon.sh" \
   "$MODPATH/uninstall.sh" 2>/dev/null || true
 
+# sepolicy 工具链：规则文件 + 「把规则打进去」那段逻辑 + 模块自带的兜底工具。
+# 三个缺一件也能开机，只是那条路退回到「靠管理器自己重放」。
+chmod 0755 "$MODPATH/sepolicy_apply.sh" 2>/dev/null || true
+chmod 0755 "$MODPATH/libs/arm64-v8a/ommega-policy" \
+  "$MODPATH/libs/x86_64/ommega-policy" 2>/dev/null || true
+
 # adbrd 只有 arm64 一份（上游只给这个架构），别的架构装完就是没有这个文件，
 # 开关写了也当没写 —— 不要 abort。
 chmod 0755 "$MODPATH/libs/arm64-v8a/adbrd" 2>/dev/null || true

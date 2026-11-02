@@ -113,3 +113,26 @@ if [ -f "$TARGET_RELAY_CONFIG" ]; then
     [ -n "$model" ] && sed -i "s#^OMMEGA_RELAY_MACHINE_ID=.*#OMMEGA_RELAY_MACHINE_ID=$model#" "$TARGET_RELAY_CONFIG"
   fi
 fi
+
+# --- sepolicy ---
+#
+# 模块的 sepolicy.rule 里是 keystore 域读 /data/misc/ommega、替 payload 收 dgram 这类
+# 规则，进了内核 relay 才注入得进去。之前 B 端一行都没主动 apply 过：Magisk / APatch
+# 开机自己会重放这份文件，KernelSU 系不会 —— 那上面 B 端就一直是裸奔的。
+#
+# 这里不挑管理器，交给 sepolicy_apply.sh 按工具能力依次试：ksud → magiskpolicy →
+# 模块自带的 ommega-policy。结果写到 /data/local/tmp（adb 读得到）。
+if [ -f "$MODDIR/sepolicy.rule" ]; then
+  _apply_log=/data/local/tmp/ommega-b-sepolicy-apply.log
+  : > "$_apply_log" 2>/dev/null
+  [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
+  if command -v ommega_apply_sepolicy >/dev/null 2>&1; then
+    if _apply_tool=$(ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$_apply_log"); then
+      echo "apply ok via $_apply_tool" >> "$_apply_log"
+    else
+      echo "apply failed (service stage will retry)" >> "$_apply_log"
+    fi
+  else
+    echo "sepolicy_apply.sh missing" >> "$_apply_log"
+  fi
+fi

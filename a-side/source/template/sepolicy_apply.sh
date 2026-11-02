@@ -37,6 +37,24 @@ _ommega_policy_magiskpolicy_candidates() {
     magiskpolicy
 }
 
+# 模块自己带的那份（vendor/policy 编出来的）。上面全找不到时才用它 ——
+# 它不依赖任何管理器，但毕竟是我们自己维护的，能用管理器原生的工具就先用原生的。
+_ommega_policy_bundled_candidates() {
+  [ -n "${MODDIR:-}" ] || return 0
+  _ommega_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
+  case "$_ommega_abi" in
+    arm64* | aarch64*) printf '%s\n' "$MODDIR/libs/arm64-v8a/ommega-policy" ;;
+    armeabi* | armv7*) printf '%s\n' "$MODDIR/libs/armeabi-v7a/ommega-policy" ;;
+    x86_64*) printf '%s\n' "$MODDIR/libs/x86_64/ommega-policy" ;;
+    x86*) printf '%s\n' "$MODDIR/libs/x86/ommega-policy" ;;
+    *)
+      for _ommega_p in "$MODDIR"/libs/*/ommega-policy; do
+        [ -x "$_ommega_p" ] && printf '%s\n' "$_ommega_p"
+      done
+      ;;
+  esac
+}
+
 # 候选名 -> 可直接执行的路径。裸名字走 PATH，绝对路径要可执行。
 _ommega_policy_resolve() {
   case "$1" in
@@ -58,7 +76,8 @@ _ommega_policy_resolve() {
 _ommega_policy_report_candidates() {
   _ommega_line=
   for _ommega_cand in $(_ommega_policy_ksud_candidates) \
-    $(_ommega_policy_magiskpolicy_candidates); do
+    $(_ommega_policy_magiskpolicy_candidates) \
+    $(_ommega_policy_bundled_candidates); do
     if _ommega_path=$(_ommega_policy_resolve "$_ommega_cand"); then
       _ommega_line="$_ommega_line $_ommega_cand=found($_ommega_path)"
     else
@@ -75,6 +94,20 @@ _ommega_policy_exec() {
     timeout 20 "$@" >/dev/null 2>&1
   else
     "$@" >/dev/null 2>&1
+  fi
+}
+
+# 只给「模块自带那份」用：它会把「规则 N 条、动了 X 处、哪些类型被跳过」打在 stderr 上，
+# 这些正是现场排查要看的，所以直接追到日志里而不是咽掉。
+_ommega_policy_exec_logged() {
+  if [ -z "$_OMMEGA_POLICY_LOG" ]; then
+    _ommega_policy_exec "$@"
+    return $?
+  fi
+  if [ -n "$_OMMEGA_POLICY_HAVE_TIMEOUT" ]; then
+    timeout 30 "$@" >>"$_OMMEGA_POLICY_LOG" 2>&1
+  else
+    "$@" >>"$_OMMEGA_POLICY_LOG" 2>&1
   fi
 }
 
@@ -112,9 +145,22 @@ ommega_apply_sepolicy() {
     _ommega_policy_log "fail $_ommega_tool --live --apply"
   done
 
+  # 3) 模块自带的那份：跟 magiskpolicy 一个 CLI（`--live --apply`），但走的是我们
+  # 自己那份 libsepol（vendor/policy/ommega_policy.c）。
+  for _ommega_cand in $(_ommega_policy_bundled_candidates); do
+    _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
+    if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
+      _ommega_policy_log "ok $_ommega_tool --live --apply (bundled)"
+      printf '%s\n' "$_ommega_tool --live --apply"
+      return 0
+    fi
+    _ommega_policy_log "fail $_ommega_tool --live --apply (bundled)"
+  done
+
   # 一个能用的工具都没有。这家管理器既不在 KernelSU 那条路上，也没给 magiskpolicy 的
-  # 入口（改过二进制名、或者压根没有管理器带的工具）。规则这时候只能靠管理器自己开机重放
-  # —— Magisk / APatch 会，KernelSU 不会。这行日志就是为这种情况留的。
+  # 入口（改过二进制名、或者压根不带工具），模块自带的那份也没拷进来。规则这时候
+  # 只能靠管理器自己开机重放 —— Magisk / APatch 会，KernelSU 不会。这行日志就是为
+  # 这种情况留的。
   _ommega_policy_report_candidates
   return 1
 }

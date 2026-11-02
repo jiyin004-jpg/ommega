@@ -51,11 +51,19 @@ BINARY_SPECS = (
     {"package": None, "bin": "relay", "output_name": "relay"},
 )
 
+# 自带的 sepolicy 兜底工具（仓库根 vendor/policy）。C 写的，NDK 交叉编，不走 cargo。
+# B 端也有一样的毛病：sepolicy.rule 只在 Magisk/APatch 上会被自动重放，
+# KernelSU 系不重放，所以我们自己带一份工具，见 template/sepolicy_apply.sh。
+POLICY_TOOL = "ommega-policy"
+POLICY_TOOL_ROOT = REPO_ROOT.parent.parent / "vendor" / "policy"
+
 REQUIRED_TEMPLATE_FILES = (
     "customize.sh",
     "module.prop",
     "post-fs-data.sh",
     "relay.conf",
+    "sepolicy.rule",
+    "sepolicy_apply.sh",
     "service.sh",
     "verify.sh",
     "adbr-daemon.sh",
@@ -72,6 +80,7 @@ MODULE_TEXT_FILES = (
     "relay.conf",
     "restore.sh",
     "sepolicy.rule",
+    "sepolicy_apply.sh",
     "service.sh",
     "verify.sh",
     "webroot/index.html",
@@ -262,6 +271,30 @@ def copy_binary(binary: Path, output_name: str, abi: str, stage_dir: Path) -> No
     print(f"Copied {binary} to {dest_path}")
 
 
+def build_policy_tool(abi: str) -> Path:
+    """编一份自带的 sepolicy 工具（vendor/policy/build.py，NDK 交叉编）。"""
+    script = POLICY_TOOL_ROOT / "build.py"
+    if not script.exists():
+        raise FileNotFoundError(f"policy tool build script missing: {script}")
+    print(f"Building {POLICY_TOOL} for {abi}...")
+    run([sys.executable, os.fspath(script), abi])
+    binary = POLICY_TOOL_ROOT / "out" / abi / POLICY_TOOL
+    if not binary.exists():
+        raise FileNotFoundError(f"policy tool not built at {binary}")
+    return binary
+
+
+def copy_policy_tool(stage_dir: Path, abi: str) -> None:
+    """把 sepolicy 工具放进 libs/<abi>：管理器不给工具时靠它把规则打进内核。"""
+    binary = build_policy_tool(abi)
+    dest_dir = stage_dir / "libs" / abi
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / POLICY_TOOL
+    shutil.copy2(binary, dest)
+    dest.chmod(0o755)
+    print(f"Copied {binary} to {dest}")
+
+
 def copy_adbrd(stage_dir: Path) -> None:
     """把 adbr 的设备侧 adbrd 放进 libs/arm64-v8a/。
 
@@ -421,6 +454,7 @@ def build_package_for_abi(
                 abi,
                 stage_dir,
             )
+        copy_policy_tool(stage_dir, abi)
         if abi == ADBRD_ABI:
             copy_adbrd(stage_dir)
         build_spl_daemon(abi, stage_dir)
@@ -483,6 +517,7 @@ def build_combined_package(
                     abi,
                     stage_dir,
                 )
+            copy_policy_tool(stage_dir, abi)
         if ADBRD_ABI in abis:
             copy_adbrd(stage_dir)
         for abi in abis:

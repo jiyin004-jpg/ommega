@@ -76,3 +76,7 @@ server/run-dev/
 # daemon-injector 和 sepolicy.rule 还是旧的。统一挡住。
 /.tmp-*/
 /.tmp-*
+
+# ===== vendor/policy 的编译产物（.build 缓存和 out 下的二进制）=====
+/vendor/policy/.build/
+/vendor/policy/out/

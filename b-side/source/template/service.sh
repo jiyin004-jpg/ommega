@@ -336,6 +336,30 @@ spl_su() {
   return 1
 }
 
+# sepolicy 自愈：KernelSU 系重启后不重放 sepolicy.rule，payload 进 keystore2 就会吃
+# EACCES。post-fs-data 已经打过一次，这里每 5 分钟确认一次（规则是全局的，重打幂等）。
+# 工具选择见 sepolicy_apply.sh：ksud → magiskpolicy → 模块自带的 ommega-policy。
+[ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
+SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
+SEPOLICY_LOG=/data/local/tmp/ommega-b-sepolicy-apply.log
+keep_sepolicy() {
+  [ -f "$MODDIR/sepolicy.rule" ] || return 0
+  command -v ommega_apply_sepolicy >/dev/null 2>&1 || return 0
+  local now last
+  now=$(date +%s 2>/dev/null || echo 0)
+  last=$(cat "$SEPOLICY_STAMP" 2>/dev/null || echo 0)
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
+    return 0
+  fi
+  ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
+  # 成败都落时间戳：失败时每 10 秒重试一遍只会刷爆日志。
+  mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
+  printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
+  return 0
+}
+
 keep_spl_alive() {
   spl_method_is_live || return 0
   spl_daemon_running && return 0
@@ -415,6 +439,7 @@ stop_spl_if_unused() {
     while kill -0 "$child" 2>/dev/null; do
       keep_adbr_watchdog_alive
       keep_spl_alive
+      keep_sepolicy
       stop_spl_if_unused
       # 10 秒：这三个检查都会读文件甚至扫 /proc，没必要 2 秒一次
       sleep 10

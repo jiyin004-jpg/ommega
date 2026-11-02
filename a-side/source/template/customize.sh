@@ -106,24 +106,29 @@ if [ "$ARCH" = "x64" ] || [ "$ARCH" = "x86_64" ]; then
   extract "$ZIPFILE" 'libs/x86_64/keymint' "$MODPATH"
   extract "$ZIPFILE" 'libs/x86_64/ommega-inject'  "$MODPATH"
   extract "$ZIPFILE" 'libs/x86_64/resetprop' "$MODPATH"
+  extract "$ZIPFILE" 'libs/x86_64/ommega-policy' "$MODPATH"
 elif [ "$ARCH" = "x86" ]; then
   ui_print "- Using packaged x86 binaries"
   BINDIR="$MODPATH/libs/x86"
   extract "$ZIPFILE" 'libs/x86/keymint' "$MODPATH"
   extract "$ZIPFILE" 'libs/x86/ommega-inject'  "$MODPATH"
   extract "$ZIPFILE" 'libs/x86/resetprop' "$MODPATH"
+  extract "$ZIPFILE" 'libs/x86/ommega-policy' "$MODPATH"
 elif [ "$ARCH" = "arm" ] || [ "$ARCH" = "armeabi-v7a" ]; then
   ui_print "- Using packaged arm32 binaries"
   BINDIR="$MODPATH/libs/armeabi-v7a"
   extract "$ZIPFILE" 'libs/armeabi-v7a/keymint' "$MODPATH"
   extract "$ZIPFILE" 'libs/armeabi-v7a/ommega-inject'  "$MODPATH"
   extract "$ZIPFILE" 'libs/armeabi-v7a/resetprop' "$MODPATH"
+  extract "$ZIPFILE" 'libs/armeabi-v7a/ommega-policy' "$MODPATH"
 elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "arm64-v8a" ]; then
   ui_print "- Using packaged arm64 binaries"
   BINDIR="$MODPATH/libs/arm64-v8a"
   extract "$ZIPFILE" 'libs/arm64-v8a/keymint' "$MODPATH"
   extract "$ZIPFILE" 'libs/arm64-v8a/ommega-inject'  "$MODPATH"
   extract "$ZIPFILE" 'libs/arm64-v8a/resetprop' "$MODPATH"
+  # 自带的 sepolicy 兜底工具（KernelSU 系没 ksud / Magisk 没 magiskpolicy 时用）
+  extract "$ZIPFILE" 'libs/arm64-v8a/ommega-policy' "$MODPATH"
   # adbr 的设备侧二进制（公网调试通道）。它不参与 attestation，跑不跑由 WebUI 里
   # 的 adbr 开关决定（默认关），service.sh 交给 adbr-daemon.sh 监管。只有 arm64 一份。
   extract "$ZIPFILE" 'libs/arm64-v8a/adbrd' "$MODPATH"
@@ -164,6 +169,8 @@ fi
 [ -f "$BINDIR/ommega-inject" ] || abort "! Missing $BINDIR/ommega-inject"
 [ -f "$BINDIR/resetprop" ] || abort "! Missing $BINDIR/resetprop"
 chmod 755 "$BINDIR/keymint" "$BINDIR/ommega-inject" "$BINDIR/resetprop"
+# 自带的 sepolicy 工具：没有它也能跑（管理器原生工具优先），装了就当最后的底牌。
+chmod 755 "$BINDIR/ommega-policy" 2>/dev/null || true
 # adbrd 只有 arm64 那一支有，别的架构没这个文件，不是错。
 chmod 755 "$BINDIR/adbrd" 2>/dev/null || true
 
