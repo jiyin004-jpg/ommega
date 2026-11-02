@@ -140,8 +140,11 @@ ensure_sepolicy() {
   if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
     return 0
   fi
-  # 工具不在这一步挑：`sepolicy_apply.sh` 按管理器依次试 ksud / magiskpolicy。
-  ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
+  # 先在内存里比一下：规则都在就不碰内核。只有真缺了才写一次 —— 重写会把整份
+  # policy 重新加载，语义不变，但 policy 文件的字节会换一种排序。
+  if ! ommega_sepolicy_rules_present "$MODDIR/sepolicy.rule"; then
+    ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
+  fi
   # 成败都落时间戳：失败时每 5 秒重试一遍只会刷爆日志，5 分钟后再说。
   mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
   printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null

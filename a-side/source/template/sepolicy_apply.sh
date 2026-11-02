@@ -111,6 +111,24 @@ _ommega_policy_exec_logged() {
   fi
 }
 
+# 规则还在不在：用自带那份的 `--check`（只读、不写内核）。
+# 返回 0 = 全在，1 = 缺（或者判断不了，宁可按「缺」处理）。
+#
+# 为什么要这一步：定期重新 apply 一次会把整份 policy 重新加载 —— 语义不变，
+# 但 /sys/fs/selinux/policy 的字节会跟着换一种排序（ksud 每 apply 一次就换一次）。
+# 对外不可见，但没必要为了「确认」把一台好好的机器每几分钟刷一遍。
+ommega_sepolicy_rules_present() {
+  _ommega_policy_rule=$1
+  for _ommega_cand in $(_ommega_policy_bundled_candidates); do
+    _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
+    if _ommega_policy_exec "$_ommega_tool" --check --apply "$_ommega_policy_rule"; then
+      return 0
+    fi
+    return 1
+  done
+  return 1
+}
+
 ommega_apply_sepolicy() {
   _OMMEGA_POLICY_RULE=$1
   _OMMEGA_POLICY_LOG=$2

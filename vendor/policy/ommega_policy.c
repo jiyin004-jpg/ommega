@@ -16,8 +16,14 @@
  *
  * 用法：
  *   ommega-policy --live --apply /path/sepolicy.rule
+ *   ommega-policy --check --apply /path/sepolicy.rule   # 只看有没有缺规则，不写
  *   ommega-policy --save out.policy              # 只落盘，不动内核（自测用）
  *   ommega-policy --load in.policy --live        # 换一份输入
+ *
+ * `--check` 的退出码：0 = 规则已经全在（不用动内核），3 = 缺规则（该 apply 了），
+ * 1 = 出错。这么定是因为「定期重新 apply 一遍」会把整份 policy 重新加载一次 ——
+ * 语义不变，但 /sys/fs/selinux/policy 的字节会跟着变（ksud apply 一次就换一种排序），
+ * 没必要为了「确认」每几分钟刷一次。
  */
 
 #define _GNU_SOURCE
@@ -500,6 +506,7 @@ int main(int argc, char **argv)
     const char *statements[64];
     int statement_count = 0;
     int live = 0;
+    int check = 0;
     int i, seen = 0, changed = 0;
     policydb_t db;
 
@@ -508,6 +515,8 @@ int main(int argc, char **argv)
 
         if (strcmp(arg, "--live") == 0) {
             live = 1;
+        } else if (strcmp(arg, "--check") == 0) {
+            check = 1;
         } else if (strcmp(arg, "--verbose") == 0) {
             g_verbose = 1;
         } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
@@ -536,8 +545,12 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!live && !save_path && apply_count == 0 && statement_count == 0) {
+    if (!live && !save_path && !check && apply_count == 0 && statement_count == 0) {
         usage(argv[0]);
+        return 2;
+    }
+    if (check && (live || save_path)) {
+        note("ommega-policy: --check 不能跟 --live / --save 一起用");
         return 2;
     }
 
@@ -579,6 +592,11 @@ int main(int argc, char **argv)
     if (live && write_live(&db) != 0) {
         policydb_destroy(&db);
         return 1;
+    }
+    if (check) {
+        /* 规则全在 = 0；缺 = 3（调用方据此决定要不要真 apply）。 */
+        policydb_destroy(&db);
+        return changed > 0 ? 3 : 0;
     }
     policydb_destroy(&db);
     return 0;
