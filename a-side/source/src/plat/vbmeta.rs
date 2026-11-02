@@ -99,6 +99,23 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
     parse_hex_32(raw.trim()).ok()
 }
 
+/// daemon 通过环境变量传进来的 boot 补丁级别（`OMMEGA_PATCH_BOOT`）。
+///
+/// 为什么需要：三个候选属性里，`ro.vendor.boot_security_patch` 落在
+/// `vendor_default_prop`，而 `ro.boot.build.security_patch` /
+/// `ro.boot.image.build.security_patch` 落在 `bootloader_prop`。不少 ROM 不给
+/// keystore 域读 vendor_default_prop（NX721J 实测：policy 里只放行了
+/// vendor_security_patch_level_prop），keymint 里又没法 fork resetprop 兜底
+/// （entrypoint 被拒），于是三个都读不到，退回 boot 镜像编译日期——检测器的 A13
+/// 拿 719 跟 `ro.boot.image.build.security_patch` 一对就报不一致。
+///
+/// daemon 是 shell 域，`getprop` 读得到真实值，开机时传进来。
+fn boot_patchlevel_from_env() -> Option<String> {
+    let raw = std::env::var("OMMEGA_PATCH_BOOT").ok()?;
+    let value = raw.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// 出证路径上 key / hash 的短缓存：一次出证要读两个属性，各 fork 一个进程（实测
 /// 单次 22ms）。而 attest 往往是连着来几笔（generateKey 一笔、getKeyEntry 一笔、
 /// 再换算法一笔），3 秒内复用同一份读结果就够了。
@@ -183,7 +200,8 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
     }
     let vendor_patch = resetprop::read_string_property(VENDOR_PATCH_PROP)
         .or_else(|| read_build_prop_value(VENDOR_PATCH_PROP));
-    let property_boot_patch = resetprop::read_string_property(BOOT_PATCH_PROP)
+    let property_boot_patch = boot_patchlevel_from_env()
+        .or_else(|| resetprop::read_string_property(BOOT_PATCH_PROP))
         .or_else(|| read_build_prop_value(BOOT_PATCH_PROP))
         // 面板「伪装参数」写的是 AOSP 常见名 `ro.boot.build.security_patch`，
         // 而厂商习惯用 `ro.vendor.boot_security_patch`。两个都认，否则用户在面板上
@@ -192,7 +210,15 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
         .or_else(|| read_build_prop_value(BOOT_PATCH_ALT_PROP))
         // AProbe 的 A13 直接读这个名字，三个变体都认，免得检测器查的跟我们写的不是同一个。
         .or_else(|| resetprop::read_string_property(BOOT_PATCH_APROBE_PROP))
-        .or_else(|| read_build_prop_value(BOOT_PATCH_APROBE_PROP));
+        .or_else(|| read_build_prop_value(BOOT_PATCH_APROBE_PROP))
+        // 上面的开机属性在不少 ROM 上根本读不到（keystore 域没有 vendor_default_prop /
+        // bootloader_prop 的读权限），那就退到「设备自己报的安全补丁」这两个属性：
+        // 它们是 build.prop 里的静态值，读文件就能拿到，而且检测器一般都拿它们当基准。
+        // 比退回 boot 镜像编译日期（可能差好几个月）准得多。
+        .or_else(|| resetprop::read_string_property(VENDOR_PATCH_PROP))
+        .or_else(|| read_build_prop_value(VENDOR_PATCH_PROP))
+        .or_else(|| resetprop::read_string_property(SECURITY_PATCH_PROP))
+        .or_else(|| read_build_prop_value(SECURITY_PATCH_PROP));
     let boot_patch = if trust.boot_patchlevel.trim() == "auto" {
         // 顺序：属性 → boot 镜像编译日期 → AVB 元数据。
         //

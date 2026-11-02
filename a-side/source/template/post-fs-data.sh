@@ -351,7 +351,9 @@ if [ -r "$PROP_OVERRIDES" ]; then
     case "$p_key" in
       # digest 只喂给 keymint 填证书，boot 补丁只进 HAL info，两者都不参与 FBE 解密，
       # 可以早写；其余 ro.boot.*（启动状态三连）本脚本前面已经设过。
-      ro.boot.vbmeta.digest|ro.boot.vbmeta.public_key_digest|ro.boot.build.security_patch) : ;;
+      # ro.boot.image.build.security_patch 是 AProbe A13 拿来当期望值的那条，面板现在
+      # 会直接把 boot 补丁日期写到这里（不再是只写 bootimage 编译时间），所以得放行。
+      ro.boot.vbmeta.digest|ro.boot.vbmeta.public_key_digest|ro.boot.build.security_patch|ro.boot.image.build.security_patch) : ;;
       ro.boot.*) continue ;;
       ro.*|persist.*|sys.*) : ;;
       *) continue ;;

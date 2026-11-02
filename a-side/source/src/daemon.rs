@@ -42,12 +42,15 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 /// 子进程存活检查周期（比同步密，重启请求能尽快生效）。
 const TICK: Duration = Duration::from_secs(1);
 
-const KEYMINT_ENV: [&str; 5] = [
+const KEYMINT_ENV: [&str; 6] = [
     "ro.boot.vbmeta.digest",
     "ro.boot.vbmeta.public_key_digest",
     "ro.build.version.security_patch",
     "ro.vendor.build.security_patch",
     "ro.boot.build.security_patch",
+    // AProbe 的 A13 拿这个名字当期望值；后面设置会覆盖前面的同名环境变量，
+    // 所以它在最前面被读到、最后写进 OMMEGA_PATCH_BOOT，优先生效。
+    "ro.boot.image.build.security_patch",
 ];
 
 /// 守护进程入口。`extra` 是原始参数里除 `--daemon` 以外的部分，原样交给 keymint。

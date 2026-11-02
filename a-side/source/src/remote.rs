@@ -1086,14 +1086,25 @@ impl RemoteRelay {
         if let Some(patch) = vendor_patch_level {
             ctx.insert("vendor_patch_level".to_string(), Value::from(patch));
         }
+        // 719 必须跟本地链上的那个用同一个来源，不然「本机出链 20260601、转发出去
+        // 变成 202606」这种两边自相矛盾就会出现在 A14 上。
+        //
+        // 顺序跟 plat::vbmeta::resolve_patch_levels 对齐：先吃 daemon 传进来的
+        // `OMMEGA_PATCH_BOOT`（shell 域读的 `ro.boot.image.build.security_patch`），
+        // 再读属性，再退回面板里显式写的值，最后才用 os_patch_level 兜底。
+        // 以前这里只读 `ro.boot.build.security_patch`，keymint 在自己的域里读不到，
+        // 直接就退到 os_patch_level（YYYYMM）了 —— 那是个月级值，跟本地链差一天都算不对。
         let boot_patch_level =
-            crate::plat::resetprop::read_string_property("ro.boot.build.security_patch")
+            patch_property("OMMEGA_PATCH_BOOT", "ro.boot.image.build.security_patch")
+                .or_else(|| patch_property("OMMEGA_PATCH_BOOT", "ro.boot.build.security_patch"))
+                .or_else(|| match config::config().read() {
+                    Ok(g) if !matches!(g.trust.boot_patchlevel.trim(), "auto" | "latest") => {
+                        Some(g.trust.boot_patchlevel.clone())
+                    }
+                    _ => None,
+                })
                 .as_deref()
                 .and_then(patch_level_to_yyyymmdd)
-                .or_else(|| match config::config().read() {
-                    Ok(g) => patch_level_to_yyyymmdd(&g.trust.boot_patchlevel),
-                    Err(_) => None,
-                })
                 .or(os_patch_level);
         if let Some(patch) = boot_patch_level {
             ctx.insert("boot_patch_level".to_string(), Value::from(patch));
