@@ -1,25 +1,71 @@
 # 把模块目录里的 sepolicy.rule 打进内核。post-fs-data.sh 和 service.sh 都 source 这个文件，
-# 免得同一段逻辑抄两遍又各自跑偏（以前 post-fs-data 那侧会重试三次、service 那侧只认 ksud，
-# 两边行为不一样）。
+# 免得同一段逻辑抄两遍又各自跑偏（以前 post-fs-data 那侧会重试三次、service 那侧只认 ksud）。
 #
-# 为什么不能只认 ksud：各家 root 管理器带的工具和语法都不同。
-#   - KernelSU 系（KernelSU / KernelSU-Next / SukiSU / ReSukiSU）：`ksud sepolicy apply <file>`，
-#     ksud 在 /data/adb/ksu/bin 下，不在 PATH 里；只有它认「一份文件一次 apply」。
-#   - Magisk 系（Magisk / Delta / Alpha）和 APatch：带的是 magiskpolicy，参数是 `--live`，
-#     整份文件用 `--apply FILE`（Magisk 24+ 才有这个选项）。
-#   - Magisk 开机时会自己重放 sepolicy.rule，所以那边即使一条都打不进去也不影响开机；
-#     这里只是把「运行期再确认一次」补齐到所有管理器上。
+# 各家 root 管理器的工具和语法都不一样，这里按能力依次试：
+#   - KernelSU 系（KernelSU / KernelSU-Next / SukiSU / ReSukiSU）：`ksud sepolicy apply <file>`。
+#     ksud 在 /data/adb/ksu/bin 下，不在 PATH 里（个别 fork 会放进 PATH，也认）。
+#   - Magisk 系（Magisk / Delta / Alpha）：`magiskpolicy --live --apply <file>`，
+#     `--apply` 是 24.0 之后才有的选项，正好也是本模块要求的最低版本附近。
+#   - APatch：`/data/adb/ap/bin/magiskpolicy` 是 `/data/adb/apd` 的软链（apd 的多命令入口），
+#     CLI 跟 Magisk 一致，`--live --apply` 同样能用。
 #
-# 不做「一行一条喂 magiskpolicy」那级：老 magiskpolicy 没有 --apply 时只能那样，但
-# Magisk 自己会重放，且逐行喂在开机阶段可能把 post-fs-data 拖上几十秒，不值。
+# 还要说清楚一件事：Magisk 和 APatch 开机时都会自己把模块目录里的 sepolicy.rule 读一遍
+# （Magisk 的 sepolicy 模块、APatch 的 `apd/src/module.rs:load_sepolicy_rule`），只有
+# KernelSU 系重放这件事从来不做 —— 这正是这段自愈逻辑存在的原因。所以另外两家即使这里
+# 一条都打不进去，功能上也过得去；日志会写明白到底找没找到工具。
 #
 # 用法：ommega_apply_sepolicy <rule 文件> [日志文件]
 #   返回 0 时 stdout 打一行「用了哪个工具」，失败返回 1 且 stdout 为空。
-#   日志一行一笔（成功/失败/没有可用工具），给现场排查用。
+#   日志一行一笔，失败时把每个候选路径的存在情况也记下来，方便现场反馈该补哪个位置。
 
 _ommega_policy_log() {
   [ -n "$_OMMEGA_POLICY_LOG" ] || return 0
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$*" >>"$_OMMEGA_POLICY_LOG" 2>/dev/null
+}
+
+# 候选工具列表：分成两组只是因为调用语法不同，不是按管理器分家。
+_ommega_policy_ksud_candidates() {
+  printf '%s\n' /data/adb/ksu/bin/ksud /data/adb/ksud ksud
+}
+
+_ommega_policy_magiskpolicy_candidates() {
+  printf '%s\n' \
+    /data/adb/magisk/magiskpolicy \
+    /data/adb/ap/bin/magiskpolicy \
+    /data/adb/ksu/bin/magiskpolicy \
+    /debug_ramdisk/magiskpolicy \
+    magiskpolicy
+}
+
+# 候选名 -> 可直接执行的路径。裸名字走 PATH，绝对路径要可执行。
+_ommega_policy_resolve() {
+  case "$1" in
+    /*)
+      if [ -x "$1" ]; then printf '%s\n' "$1"; return 0; fi
+      ;;
+    *)
+      _ommega_resolved=$(command -v "$1" 2>/dev/null)
+      if [ -n "$_ommega_resolved" ] && [ -x "$_ommega_resolved" ]; then
+        printf '%s\n' "$_ommega_resolved"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+# 一个都找不到时，把每个候选的存在情况写进日志：现场照着这行就能知道该给我们补哪个路径。
+_ommega_policy_report_candidates() {
+  _ommega_line=
+  for _ommega_cand in $(_ommega_policy_ksud_candidates) \
+    $(_ommega_policy_magiskpolicy_candidates); do
+    if _ommega_path=$(_ommega_policy_resolve "$_ommega_cand"); then
+      _ommega_line="$_ommega_line $_ommega_cand=found($_ommega_path)"
+    else
+      _ommega_line="$_ommega_line $_ommega_cand=none"
+    fi
+  done
+  _ommega_policy_log "no usable policy tool; probed:$_ommega_line"
 }
 
 # 带超时跑一条命令。老 toybox 可能没有 timeout 这个 applet，没有就直接跑（这几个工具
@@ -43,9 +89,10 @@ ommega_apply_sepolicy() {
     return 1
   fi
 
-  # 1) KernelSU 系：整份文件一次 apply。
-  for _ommega_tool in /data/adb/ksu/bin/ksud /data/adb/ksud; do
-    [ -x "$_ommega_tool" ] || continue
+  # 1) KernelSU 系：整份文件一次 apply（ksud 自己的解析器按行读，列表长度有上限，
+  #    sepolicy.rule 里已经按它的上限拆好了）。
+  for _ommega_cand in $(_ommega_policy_ksud_candidates); do
+    _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
     if _ommega_policy_exec "$_ommega_tool" sepolicy apply "$_OMMEGA_POLICY_RULE"; then
       _ommega_policy_log "ok $_ommega_tool sepolicy apply"
       printf '%s\n' "$_ommega_tool sepolicy apply"
@@ -55,18 +102,8 @@ ommega_apply_sepolicy() {
   done
 
   # 2) Magisk 系 / APatch：magiskpolicy --live --apply。
-  #
-  # 位置按「先管理器自己的目录、最后 PATH」排。APatch 那份在 /data/adb/ap/bin 下，
-  # 实测有的版本没有这个文件，没有就跳过 —— 后面会记一行「没有可用工具」，别再猜。
-  for _ommega_tool in /data/adb/magisk/magiskpolicy \
-    /data/adb/ap/bin/magiskpolicy \
-    /data/adb/ksu/bin/magiskpolicy \
-    /debug_ramdisk/magiskpolicy \
-    magiskpolicy; do
-    case "$_ommega_tool" in
-      /*) [ -x "$_ommega_tool" ] || continue ;;
-      *) command -v "$_ommega_tool" >/dev/null 2>&1 || continue ;;
-    esac
+  for _ommega_cand in $(_ommega_policy_magiskpolicy_candidates); do
+    _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
     if _ommega_policy_exec "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
       _ommega_policy_log "ok $_ommega_tool --live --apply"
       printf '%s\n' "$_ommega_tool --live --apply"
@@ -75,8 +112,9 @@ ommega_apply_sepolicy() {
     _ommega_policy_log "fail $_ommega_tool --live --apply"
   done
 
-  # 一个能用的工具都没有：说明这台机器的 root 管理器既不是 KernelSU 系、也没带
-  # magiskpolicy（Magisk 那条路上规则本身会在开机由管理器重放，所以多半没事）。
-  _ommega_policy_log "no usable policy tool (tried ksud then magiskpolicy)"
+  # 一个能用的工具都没有。这家管理器既不在 KernelSU 那条路上，也没给 magiskpolicy 的
+  # 入口（改过二进制名、或者压根没有管理器带的工具）。规则这时候只能靠管理器自己开机重放
+  # —— Magisk / APatch 会，KernelSU 不会。这行日志就是为这种情况留的。
+  _ommega_policy_report_candidates
   return 1
 }
