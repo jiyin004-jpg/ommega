@@ -16,7 +16,7 @@
 //! AIDL spec.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use kmr_common::consts::{AID_KEYSTORE, AID_ROOT, AID_SYSTEM};
 
@@ -58,6 +58,9 @@ use rsbinder::{Status, Strong};
 /// Implementation of the IKeystoreService.
 pub struct KeystoreService {
     security_levels: RwLock<SecurityLevels>,
+    /// 重建 security level 时的互斥：并发进来时只让一个线程真去重建，其余线程
+    /// 等它完了拿新表就走（双检锁）。重建期间的中间态不再对外暴露。
+    refresh_lock: Mutex<()>,
     id_rotation_state: IdRotationState,
     strongbox_enabled: bool,
 }
@@ -66,6 +69,7 @@ impl Default for KeystoreService {
     fn default() -> Self {
         Self {
             security_levels: RwLock::new(Default::default()),
+            refresh_lock: Mutex::new(()),
             id_rotation_state: IdRotationState::new(db_root_path()),
             strongbox_enabled: false,
         }
@@ -153,46 +157,68 @@ impl KeystoreService {
     }
 
     fn ensure_security_levels_current(&self) -> Result<()> {
-        let tee_uuid = Uuid::from(SecurityLevel::TRUSTED_ENVIRONMENT);
-        let refresh_tee = {
-            let security_levels = self.security_levels.read().unwrap();
-            security_levels
-                .uuid_by_sec_level
-                .get(&SecurityLevel::TRUSTED_ENVIRONMENT)
-                .copied()
-                != Some(tee_uuid)
-        };
+        // 快路径：表里 UUID 跟当前 keybox 一致就直接返回，不碰重建锁。
+        if !self.needs_tee_refresh() && !self.needs_strongbox_refresh() {
+            if self.strongbox_available() {
+                return Ok(());
+            }
+            if self.unregister_strongbox() {
+                log::info!(
+                    "StrongBox disabled by config (hide_strongbox); unregistered STRONGBOX security level."
+                );
+            }
+            return Ok(());
+        }
 
-        if refresh_tee {
+        // 慢路径：只让一个线程重建。以前是多个线程同时进来、各自把这一档先
+        // 摘掉再重新挂，中间那个空档就是并发出证报 `No such security level`、
+        // JCA 报 “No installed provider supports this key: (null)” 的根。
+        let _guard = self
+            .refresh_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 抢到锁之后重新判一次：等锁的这段时间里可能已经有人重建好了。
+        if self.needs_tee_refresh() {
             self.register_security_level(SecurityLevel::TRUSTED_ENVIRONMENT)
                 .context(err!("refreshing TEE security level after keybox change"))?;
         }
-
-        if self.strongbox_available() {
-            let strongbox_uuid = Uuid::from(SecurityLevel::STRONGBOX);
-            let refresh_strongbox = {
-                let security_levels = self.security_levels.read().unwrap();
-                security_levels
-                    .uuid_by_sec_level
-                    .get(&SecurityLevel::STRONGBOX)
-                    .copied()
-                    != Some(strongbox_uuid)
-            };
-
-            if refresh_strongbox {
-                if let Err(error) = self.register_security_level(SecurityLevel::STRONGBOX) {
-                    log::warn!(
-                        "Failed to refresh optional StrongBox security level after keybox change: {error:#}"
-                    );
-                }
+        if self.needs_strongbox_refresh() {
+            if let Err(error) = self.register_security_level(SecurityLevel::STRONGBOX) {
+                log::warn!(
+                    "Failed to refresh optional StrongBox security level after keybox change: {error:#}"
+                );
             }
-        } else if self.unregister_strongbox() {
+        } else if !self.strongbox_available() && self.unregister_strongbox() {
             log::info!(
                 "StrongBox disabled by config (hide_strongbox); unregistered STRONGBOX security level."
             );
         }
 
         Ok(())
+    }
+
+    /// 表里这一档的 UUID 是不是还得（重新）注册。
+    fn needs_tee_refresh(&self) -> bool {
+        let tee_uuid = Uuid::from(SecurityLevel::TRUSTED_ENVIRONMENT);
+        let security_levels = self.security_levels.read().unwrap();
+        security_levels
+            .uuid_by_sec_level
+            .get(&SecurityLevel::TRUSTED_ENVIRONMENT)
+            .copied()
+            != Some(tee_uuid)
+    }
+
+    fn needs_strongbox_refresh(&self) -> bool {
+        if !self.strongbox_available() {
+            return false;
+        }
+        let strongbox_uuid = Uuid::from(SecurityLevel::STRONGBOX);
+        let security_levels = self.security_levels.read().unwrap();
+        security_levels
+            .uuid_by_sec_level
+            .get(&SecurityLevel::STRONGBOX)
+            .copied()
+            != Some(strongbox_uuid)
     }
 
     /// StrongBox is offered when the A-side natively exposes a StrongBox
@@ -237,14 +263,9 @@ impl KeystoreService {
                     "Failed to retire stale keybox-bound entries for old UUID {cur_uuid:?}: {e:?}"
                 ))
             })?;
-
-            let mut security_levels = self.security_levels.write().unwrap();
-            if security_levels.uuid_by_sec_level.get(&sec_level) == Some(&cur_uuid) {
-                security_levels.unregister(sec_level);
-                log::warn!(
-                    "Unregistered stale security level {sec_level:?} for UUID {cur_uuid:?}."
-                );
-            }
+            // 注意：这里**不**把旧那一档从表里摘掉。旧实例一直在表里服务，直到下面
+            // 新实例构造好、一把写锁里整体换过去；否则摘掉到挂上之间就是个空档，
+            // 并发出证会踩到「No such security level」。
         }
 
         let (i_sec_level, i_osec_level) =
