@@ -123,7 +123,7 @@ impl Default for InjectorConfig {
 fn default_scoop() -> Vec<String> {
     // 出厂作用域是**空**的：作用域只从面板写的 `target.txt` 来。
     //
-    // 以前这里列了六个包当默认套餐，���果跟 `target.txt` 表达同一件事、靠“文件在不在”
+    // 以前这里列了六个包当默认套餐，结果跟 `target.txt` 表达同一件事、靠“文件在不在”
     // 判优先级。普通应用现在由 `global_scope` 覆盖，不需要默认值；需要接管的
     // 系统 app 域（工程模式）由 `system_sid_packages` 自动补回。
     Vec::new()
