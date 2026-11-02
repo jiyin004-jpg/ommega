@@ -120,6 +120,40 @@ impl ServerListener {
         }
     }
 
+    /// 等「有连接可接」或超时：在内核里等，不在用户态空转。
+    ///
+    /// listener 是非阻塞的，本来只为了每轮能看一眼 `shutdown` / 连接名额，代价是
+    /// accept 撞上 `WouldBlock` 就得睡一下再来。睡 50ms 就是 20 次/秒，A 端两个
+    /// RPC server（主 socket + app 域那一个）合起来 40 次/秒，实测常驻 0.3~0.4%
+    /// 单核，是 keymint 空闲时唯一看得见的 CPU。改成 poll 之后：有连接立刻醒，
+    /// 没有就一秒醒一次，空闲的就真闲了。
+    ///
+    /// 非 UDS 的两个后端（vsock / tcp）平时用不着，退路仍然是原来那个短睡。
+    fn wait_readable(&self, timeout: std::time::Duration) {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            ServerListener::Unix(l) => {
+                let mut pfd = libc::pollfd {
+                    fd: l.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+                // 返回值不用看：有连接、被信号打断、超时都是下一轮重新判
+                // `shutdown` 和 `max_connections`，跟原来的睡一下等价。
+                unsafe { libc::poll(&mut pfd, 1, ms) };
+            }
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            ServerListener::Vsock(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            #[cfg(feature = "rpc-tls")]
+            ServerListener::Tcp(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
     /// Per-backend accept: returns the raw stream paired with its
     /// backend tag, *without* wrapping it as `RpcTransport`. The wrap
     /// (and any TLS handshake) runs in the worker thread spawned by
@@ -249,6 +283,12 @@ const TX_GET_SERVICE: TransactionCode = crate::binder::FIRST_CALL_TRANSACTION;
 /// after this so it cannot hold a `max_connections` slot (or pin the
 /// server's `Arc`) forever.
 const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 空闲时 accept 循环多久醒一次，只为了看一眼 `shutdown` / 连接名额。
+///
+/// 有连接进来 poll 会立即返回，这个值只决定「没人的时候醒得多慢」：
+/// 一秒一次就够（关服务最多晚一秒），比原来 20 次/秒省下整块空闲 CPU。
+const ACCEPT_IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Built-in name → binder directory, used to back [`RpcServer::add_service`]
 /// (android RPC has a single root object; this *is* that root when
@@ -1432,13 +1472,11 @@ impl RpcServer {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Listener 是 non-blocking 的，只为了能定期看一眼 `shutdown`。
-                    // 这里原来是 5ms（每秒 200 次空转）—— A 端有两个 RPC server
-                    // （主 server + app domain 那个），两个循环加起来的常驻 CPU
-                    // 就有 1.8%，是 keymint 那 2% 的全部来源。
-                    //
-                    // 放宽到 50ms：接入延迟最坏多等 45ms（本地 socket，正常情况下
-                    // accept 立即返回，感知不到），而空转次数降到原来的 1/10。
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // 这里原来是「睡 50ms 再回来空转一次」：一个 server 20 次/秒，
+                    // A 端两个 server 合计 40 次/秒，实测常驻 0.3~0.4% 单核 ——
+                    // keymint 闲着也看得见的那点 CPU 就是它。改成 poll 等可读：
+                    // 有连接立即返回，没有就一秒醒一次。
+                    self.listener.wait_readable(ACCEPT_IDLE_WAIT);
                 }
                 Err(e)
                     if matches!(
