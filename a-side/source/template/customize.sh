@@ -271,15 +271,22 @@ CONFIG_DIR=/data/adb/ommega
 CONF_DIR=$CONFIG_DIR/conf
 RUN_DIR=$CONFIG_DIR/run
 DB_DIR=$CONFIG_DIR/db
-mkdir -p "$CONFIG_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
+# 只建真用得上的：conf（app 域读的副本）、run（pid/lock）。
+# db 和 logs 不再预建：A 端早就没有写 sessions.db 了，模块目录下这份 logs 也搬去了
+# /data/misc/ommega/logs（见 service.sh 里那段注释），以前装完就留两个空目录在那儿。
+mkdir -p "$CONFIG_DIR" "$CONF_DIR" "$RUN_DIR"
 # 只支持新路径，不做旧布局搬运：运行文件在模块 `libs/<abi>/`，状态在 conf/run/db/logs。
 for f in props.conf injector.payload pathmask.state pathmask.owned \
          remote_identity.applied remote_identity.updated empty_permissions.xml \
          relay.conf log_flag; do
   [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$CONF_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$CONF_DIR/$f"
 done
+# 老版把会话库放在 CONFIG_DIR 下，遇到过才建 db/ 把它搬进去；平时不建。
 for f in sessions.db sessions.db-wal sessions.db-shm; do
-  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$DB_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$DB_DIR/$f"
+  [ -f "$CONFIG_DIR/$f" ] || continue
+  [ -e "$DB_DIR/$f" ] && continue
+  mkdir -p "$DB_DIR" 2>/dev/null
+  mv -f "$CONFIG_DIR/$f" "$DB_DIR/$f"
 done
 if [ -f "$BINDIR/resetprop" ]; then
   ui_print "- Bundled resetprop installed (no longer depends on the root manager)"
