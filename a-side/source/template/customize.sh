@@ -77,6 +77,10 @@ extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
 extract "$ZIPFILE" 'sepolicy.rule'   "$MODPATH"
+# sepolicy_apply.sh 跟 sepolicy.rule 是一对：规则本身 + 把规则打进去的那段逻辑（ksud /
+# magiskpolicy 两家工具都在里面选）。一样的道理，没列在这里就不会落地，两个脚本里
+# `[ -f ]` 一判就静默跳过了。
+extract "$ZIPFILE" 'sepolicy_apply.sh' "$MODPATH"
 extract "$ZIPFILE" 'daemon-injector' "$MODPATH"
 extract "$ZIPFILE" 'injector.toml'   "$MODPATH"
 extract "$ZIPFILE" 'keybox_tee.xml'  "$MODPATH"

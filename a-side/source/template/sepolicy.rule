@@ -125,7 +125,7 @@ allow { hal_cryptoeng_oplus } tmpfs file { write getattr read execute map }
 # oplus 的 cryptoeng）按名字 + 接口名去拿。find 不够，得能 add。
 # 起它的域跟着根实现走：Magisk 是 magisk/su、KernelSU 是 ksu，脚本本体常常落
 # system_file；三个都列上。
-allow { magisk ksu su system_file } default_android_service service_manager { add find };
+allow { magisk ksu su system_file } default_android_service service_manager { add find }
 
 allow keystore default_android_service service_manager find
 allow shell default_android_service service_manager find

@@ -19,25 +19,29 @@ RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 
-# KernelSU 开机不会重放 sepolicy.rule，而 keystore 域要读 /data/misc/ommega。
+# keystore 域要读 /data/misc/ommega，规则得在 keystore2 起来之前就在内核里。
 # 这里是能抢在 keystore2 之前跑的最早时机，所以同步应用（带超时）。
 #
+# 各家管理器的重放行为不一样：KernelSU 系开机根本不重放 sepolicy.rule，Magisk 会自己
+# 重放，APatch 看版本。所以这里不挑管理器，统一交给 `sepolicy_apply.sh` 按工具能力
+# 依次试（ksud → magiskpolicy），谁有就用谁。
+#
 # 结果写到 /data/local/tmp（adb 读得到）：之前它静默失败，avc 一直在刷，
-# 但没有任何地方能看到到底跑没跑、失败在哪。
+# 但没有任何地方能看到到底跑没跑、失败在哪、用的是哪个工具。
 if [ -f "$MODDIR/sepolicy.rule" ]; then
   _apply_log=/data/local/tmp/ommega-sepolicy-apply.log
   : > "$_apply_log" 2>/dev/null
-  if [ -x /data/adb/ksu/bin/ksud ]; then
-    for _try in 1 2 3; do
-      if timeout 15 /data/adb/ksu/bin/ksud sepolicy apply "$MODDIR/sepolicy.rule" >>"$_apply_log" 2>&1; then
-        echo "apply ok on try $_try" >> "$_apply_log"
-        break
-      fi
-      echo "apply failed on try $_try rc=$?" >> "$_apply_log"
-      sleep 2
-    done
+  [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
+  if command -v ommega_apply_sepolicy >/dev/null 2>&1; then
+    # 只试一次：失败也不要在这里重试，service 阶段（20 秒后）会再跑一遍
+    # `ensure_sepolicy` —— 那里不带节流、也不依赖这次的成败。
+    if _apply_tool=$(ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$_apply_log"); then
+      echo "apply ok via $_apply_tool" >> "$_apply_log"
+    else
+      echo "apply failed (service stage will retry)" >> "$_apply_log"
+    fi
   else
-    echo "ksud missing" >> "$_apply_log"
+    echo "sepolicy_apply.sh missing" >> "$_apply_log"
   fi
 fi
 # A-side config directory (webroot UI writes here; `ommegadata` is a symlink to

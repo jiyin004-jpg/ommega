@@ -117,21 +117,22 @@ start_daemon() {
   return 0
 }
 
-# sepolicy 自愈：设备重启之后 ksud 的规则会丢，payload 进到 keystore2 里就会
-# 一路吃 EACCES（errno 13），KeyMint 那边直接出不了链 —— 症状是面板看着一切正常，
+# sepolicy 自愈：KernelSU 系重启之后规则会丢（Magisk 自己会重放），payload 进到 keystore2
+# 里就会一路吃 EACCES（errno 13），KeyMint 那边直接出不了链 —— 症状是面板看着一切正常，
 # 但认证一直失败，得人工补一刀 `ksud sepolicy apply` 才好。
 #
 # 这里在拉起 injector 之前补一次规则；规则是全局的，apply 完对已在跑的进程也立即生效。
 # 用时间戳节流，5 分钟内不重复 apply（keep-alive 每 5 秒跑一轮，不节流会刷爆）。
 SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
-# ksud / magiskpolicy 的**绝对路径**。以前这里用 `command -v ksud` 判断，但 ksud 不在
-# PATH 里（它只在 /data/adb/ksu/bin 下），于是这个函数直接 return 0、从来没 apply 过 ——
-# 症状就是：开机后 20 秒（service 阶段）规则失效，payload 读 injector.toml 吃 EACCES，
-# keymint 一条链都出不来，而面板看着一切正常。
-KSUS_KSud=/data/adb/ksu/bin/ksud
+# 工具路径不在这里硬编码了：`sepolicy_apply.sh` 里按 ksud → magiskpolicy 依次试。
+# 以前这里只写死 ksud 的绝对路径，非 KSU 的机器上这个函数直接 return 0、一次都没
+# apply 过 —— 症状是开机后 20 秒（service 阶段）规则失效，payload 读 injector.toml
+# 吃 EACCES，keymint 一条链都出不来，而面板看着一切正常。
+SEPOLICY_LOG=/data/local/tmp/ommega-sepolicy-apply.log
+[ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
 ensure_sepolicy() {
   [ -f "$MODDIR/sepolicy.rule" ] || return 0
-  [ -x "$KSUS_KSud" ] || return 0
+  command -v ommega_apply_sepolicy >/dev/null 2>&1 || return 0
   now=$(date +%s 2>/dev/null || echo 0)
   last=$(cat "$SEPOLICY_STAMP" 2>/dev/null || echo 0)
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
@@ -139,10 +140,11 @@ ensure_sepolicy() {
   if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
     return 0
   fi
-  if timeout 15 "$KSUS_KSud" sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1; then
-    mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
-    printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
-  fi
+  # 工具不在这一步挑：`sepolicy_apply.sh` 按管理器依次试 ksud / magiskpolicy。
+  ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
+  # 成败都落时间戳：失败时每 5 秒重试一遍只会刷爆日志，5 分钟后再说。
+  mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
+  printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
   return 0
 }
 
