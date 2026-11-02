@@ -4,6 +4,8 @@
 
 ## 1.7.13
 
+- SELinux 放行规则不再只认 KernelSU 的 ksud：Magisk / Delta / APatch 走 magiskpolicy，管理器什么工具都没给时用模块自带的 `ommega-policy`（自带一份 libsepol），不再有「模块装上了、规则没进内核」的机型。
+- 规则巡检改成先比对、缺了才写：修掉每 5 分钟把整份 policy 重新加载一遍的问题（语义不变，但 `/sys/fs/selinux/policy` 的字节会被反复改写）。
 - 关闭 adbr 调试通道后，设备上的 5555 端口、手动起的 adbd 和 USB 调试开关会一起收掉，不再留调试入口。
 - 日志默认只记 info 级，不再一次开机写几百 KB。
 - 修复部分机型偶发「指纹不生效」：平台类型判断在并发时会被读成空值，那一轮就不注入 SOTER。

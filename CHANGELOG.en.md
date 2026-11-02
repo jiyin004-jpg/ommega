@@ -4,6 +4,8 @@
 
 ## 1.7.13
 
+- The SELinux allow rules are no longer ksud-only: Magisk / Delta / APatch go through magiskpolicy, and when the manager ships no policy tool at all the module falls back to its own `ommega-policy` (bundled libsepol), so no device is left with "module installed, rules never loaded".
+- The rule check now compares first and only writes when something is missing, so the whole policy is no longer reloaded every five minutes (same semantics, but `/sys/fs/selinux/policy` bytes kept being rewritten).
 - Turning the adbr debug channel off now also removes the 5555 listener, the manually started adbd and the USB debugging switch, so no debug entry is left behind.
 - Logging defaults to info level; a boot no longer writes a few hundred KB.
 - Fixed occasional "fingerprint does not work" on some devices: the platform check could read back empty under concurrency, skipping the SOTER injection for that round.
