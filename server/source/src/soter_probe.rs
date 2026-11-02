@@ -200,6 +200,38 @@ pub fn device_side(device: &str) -> Option<bool> {
     (now.saturating_sub(*at) <= DEVICE_SIDE_MS).then_some(*real)
 }
 
+/// `get_device_id` 这一笔归哪一层（`None` = 交给真机）。
+///
+/// 这个 op 没有 uid 参数，A 端那傷 `caller_pkg` 是拿「当前前台应用」凑的，所以不能像
+/// 别的 op 那样直接拿它定生死；但也不能反过来只看「上一笔谁答的」——真应用的 getDeviceId
+/// 往往是一轮流程的第一笔（微信就是这样），上一笔刚好是探测机的本地答案时，它就会被
+/// 拉到本地去，跟紧跟着走 B 的 ASK 撞成两个 cpu_id。SO：
+///
+/// 1. 包名命中白名单 → 真机。“要身份的这个 App 就是真应用”这条信号比上一笔硬；
+/// 2. 包名不在名单里 / 拿不到 → 看这台设备上一笔落在哪一层（探测机与 SoterChecker
+///    都是走这条）；
+/// 3. 什么证据都没有 → 本地作答，跟没有这个参数之前一样。
+pub fn get_device_id_side(
+    cfg: &Config,
+    caller_pkg: Option<&str>,
+    device_side: Option<bool>,
+) -> Option<String> {
+    if is_listed_real_app(cfg, caller_pkg) {
+        return None;
+    }
+    match device_side {
+        Some(true) => None,
+        Some(false) => Some("这台设备上一笔 SOTER 是 A 端本地答的".to_string()),
+        None => Some(format!(
+            "getDeviceId 翻不出真调用者（前台包名 {}），按老规矩本地作答",
+            caller_pkg
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .unwrap_or("-")
+        )),
+    }
+}
+
 /// 名单里的分隔符：逗号、分号、空白都算；写成 `none` / `off` / `-` 就是关掉。
 fn split_list(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
@@ -577,6 +609,31 @@ mod tests {
         // 空设备名不该记进去（A 端不带 device_id 又没配默认设备时就是空的）。
         note_device_side("  ", true);
         assert_eq!(device_side("  "), None);
+    }
+
+    /// `get_device_id` 的优先级：包名在白名单里就该走真机，哪怕这台设备上一笔是本地答的；
+    /// 包名不可信时才看上一笔；都没有才回落本地。
+    #[test]
+    fn get_device_id_prefers_a_listed_caller_over_the_last_side() {
+        let cfg = Config::default();
+        // 真应用：三种 device_side 都给真机。
+        for side in [None, Some(true), Some(false)] {
+            assert_eq!(
+                get_device_id_side(&cfg, Some("com.tencent.mm"), side),
+                None,
+                "真应用不该被上一笔的本地答案拉回本地（device_side={side:?}）"
+            );
+        }
+        // 检测器（包名不在名单）：跟着上一笔。
+        assert_eq!(
+            get_device_id_side(&cfg, Some("com.andrealyz.soterchecker"), Some(true)),
+            None,
+            "上一笔在真机，这一笔也给它"
+        );
+        assert!(get_device_id_side(&cfg, Some("com.eltavine.duckdetector"), Some(false)).is_some());
+        // 没证据：本地作答。
+        assert!(get_device_id_side(&cfg, Some("com.zte.mifavor.launcher"), None).is_some());
+        assert!(get_device_id_side(&cfg, None, None).is_some());
     }
 
     #[test]

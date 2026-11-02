@@ -1728,27 +1728,29 @@ async fn run_soter_task_inner(
     // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`（跑检测时
     // 前台往往是桌面），拿它判白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId
     // 却退回本地，两个 `cpu_id` 一撞就是检测器那条 C5b。它跟 `finish_sign` 一样是会话类
-    // 调用，只看这台设备上一笔落在哪一层。
-    let device_side = if op == "get_device_id" {
-        crate::soter_probe::device_side(requested)
+    // 调用，只看这台设备上一笔落在哪一层。    // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`（跑检测时
+    // 前台往往是桌面），拿它判白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId
+    // 却退回本地，两个 `cpu_id` 一撞就是检测器那条 C5b。怎么定它归哪一层见
+    // `soter_probe::get_device_id_side`（白名单优先，其次跟上这笔设备上一笔，最后才本地）。
+    let caller_pkg_arg = body
+        .get(crate::soter_probe::CALLER_PKG_FIELD)
+        .and_then(Value::as_str);
+    let probe_verdict = if op == "get_device_id" {
+        crate::soter_probe::get_device_id_side(
+            &state.cfg,
+            caller_pkg_arg,
+            crate::soter_probe::device_side(requested),
+        )
     } else {
-        None
-    };
-    let probe_verdict = match device_side {
-        // 上一笔是 B 答的：这一笔也给它，两边报同一个 cpu_id。
-        Some(true) => None,
-        // 上一笔是本地答的：跟着本地，别半路换号。
-        Some(false) => Some("这台设备上一笔 SOTER 是 A 端本地答的".to_string()),
-        None => crate::soter_probe::reason_with_caller(
+        crate::soter_probe::reason_with_caller(
             &state.cfg,
             requested,
             uid_arg,
             probe_alias_arg,
-            body.get(crate::soter_probe::CALLER_PKG_FIELD)
-                .and_then(Value::as_str),
+            caller_pkg_arg,
             body.get(crate::soter_probe::CALLER_PKG_SRC_FIELD)
                 .and_then(Value::as_str),
-        ),
+        )
     };
     if let Some(why) =
         probe_verdict.or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
