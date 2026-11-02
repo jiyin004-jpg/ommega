@@ -1737,14 +1737,18 @@ async fn run_soter_task_inner(
     )
     .or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
     {
-        // 能改设备的身份类 op、以及带着会话号的 finishSign，不吃这套。
+        // 带会话号的 finishSign 不吃这套：它必须回到开会话的那一侧。
         //
-        // `get_device_id` 本身没有 uid 参数，`finish_sign` 只带 session —— 它们翻不出
-        // 调用方包名，只能拿「当前前台应用」凑，前台不是它自己就变成探测机。而它们的
-        // 料在 B 上（ASK 是 B 签的、session 是 B 建的），退回本地只会拿到另一份：
-        // getDeviceId 回 A 的 cpu_id（C5b 对不上）、finishSign 本地没这张会话（T12 报错）。
-        // 所以这两个直接接下去走正常的设备路由。
-        if !soter_identity_op(op) && !session_present {
+        // 以前这里还豁免了 `soter_identity_op`（ASK/AuthKey/get_device_id 那几笔），
+        // 理由是「它们的料在 B 上、ASK 要拿去上报腾讯」。那个理由只对**真应用**成立；
+        // 对检测器恰好相反：它们要的是「料自洽」。当时的效果是 Duck 的 ASK 由 B 的真
+        // TEE 出、cpu_id 自然是 B 那台的，它一句「the device behind the default Soter
+        // relay」就把中继点破了（2026-11-02 实测）。
+        //
+        // 现在只留 finishSign 一个例外：非白名单调用者的身份类 op 也退回 A 本地作答，
+        // ASK / AuthKey / getDeviceId / cpu_id 全来自同一台机器，互相不矛盾；真应用
+        // 本来就在白名单里，根本走不到这个分支，腾讯那边照样能验。
+        if !session_present {
             // 白名单外（检测器一类）：**不造料**，直接告诉 A 端「这笔你自己本地答」。
             // 造料要现签名，几十台检测器一起刷就把 CPU 占满，真应用的请求只能排队；
             // 退回 A 端本地后，工作负载分散到各台手机上，服务端只负责转发真应用。
