@@ -21,3 +21,5 @@
 - Fixed the background process staying alive after the module was uninstalled and injecting again.
 - Fixed keys being reclaimed on every boot on some devices, forcing apps to create a new key.
 - Fixed the StrongBox capability declaration disagreeing with what the keystore actually serves: installing the module no longer hides it by default, the WebUI switch is the only control.
+- Fixed detectors reporting "two different cpu_ids" (C5b in SoterChecker): getDeviceId used to judge the caller by the current foreground app, so a detector running in the background (foreground = launcher) had its ASK served by the real device while getDeviceId fell back to a local answer, and the two identities collided. It now follows whichever layer served the previous SOTER call on this device.
+- keymint no longer burns 0.4%~1% of a core while idle: both RPC accept loops used to sleep 50ms and then poll again (40 wakes/s combined, 0.34% of one core measured), now they wait in the kernel for a readable listener, waking immediately on a connection and once a second otherwise. Idle wakeups went from 42/s to 4/s and CPU ticks in a 30s window dropped to zero.
