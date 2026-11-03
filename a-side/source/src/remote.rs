@@ -614,11 +614,49 @@ fn candidates() -> (Vec<String>, Vec<String>) {
     split_candidates(live, physical_like)
 }
 
+/// 本机有没有任何非环回的 IPv4 地址（跟选哪张路由表无关）。
+///
+/// `/proc/net/route` 只反映主表（main）。Android 从某个版本起把默认路由放进按接口
+/// 分的表里（`rmnet_data3` 这种，靠 fwmark 规则选表），主表空着 —— 只认
+/// `/proc/net/route` 就会把「蜂窝正常在用」判成离线，远程那一路整段被跳过，SOTER /
+/// attest 全落本地兜底（OnePlus PKG110 / Android 16 上实测过）。
+/// `/proc/net/fib_trie` 是内核 FIB 的全量视图，不分表，拿它补这一刀。
+fn has_ipv4_address() -> bool {
+    let Ok(text) = std::fs::read_to_string("/proc/net/fib_trie") else {
+        // 读不到就当有：宁可多发一次请求，也别把能用的网络判成离线。
+        return true;
+    };
+    has_ipv4_address_in(&text)
+}
+
+/// `has_ipv4_address` 的纯文本版：单抽出来是为了能拿真实 fib_trie 片段写测试。
+fn has_ipv4_address_in(text: &str) -> bool {
+    let mut pending: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(addr) = line.strip_prefix("|-- ") {
+            pending = Some(addr.trim().to_string());
+            continue;
+        }
+        // 形如 `/32 host LOCAL` 的前一行才是本机地址；`127.*` 是环回，不算上行。
+        if line.contains("host LOCAL") {
+            if let Some(addr) = pending.take() {
+                if !addr.starts_with("127.") && addr != "0.0.0.0" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 这台机器现在有没有任何持 IPv4 路由的接口。
 ///
 /// 跟 `pick_uplink` 里“一个都没有就留空”那个判断同一件事，但这里要的是个是非题：
 /// 飞行模式、数据与 WiFi 都关的时候，把请求发出去只会白撞一轮连接超时（还要重试
 /// 一次），App 那边早就不等了 —— 看起来就是「远程不通也不回退本地」。
+///
+/// 主表没路由不等于没网（见 `has_ipv4_address`），两样都空才算离线。
 fn uplink_absent() -> bool {
     // 这条路每笔请求都会问一次，而 `candidates()` 要读 `/proc/net/route`
     // + 每个接口的 `operstate` / `physical_like` —— 几十微秒到几毫秒的纯 IO，
@@ -634,7 +672,7 @@ fn uplink_absent() -> bool {
         }
     }
     let (preferred, rest) = candidates();
-    let absent = preferred.is_empty() && rest.is_empty();
+    let absent = preferred.is_empty() && rest.is_empty() && !has_ipv4_address();
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some((absent, Instant::now()));
     }
@@ -1654,6 +1692,21 @@ mod iface_choice_tests {
         let probe: Arc<dyn Fn(&str) -> bool + Send + Sync> =
             Arc::new(|_: &str| panic!("an empty race must not probe"));
         assert_eq!(race_with(&[], probe), None::<String>);
+    }
+
+    /// 主表空着、路由全在按接口分的表里（Android 蜂窝网络就这样）：
+    /// `/proc/net/route` 空了，但本机有非环回 IPv4 地址 —— 不能判成离线。
+    #[test]
+    fn a_routed_cellular_uplink_counts_as_online() {
+        let fib_trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 0.0.0.0\n        /0 universe UNICAST\n  +-- 10.189.150.0/24 2 0 2\n     |-- 10.189.150.0\n        /24 link UNICAST\n     |-- 10.189.150.217\n        /32 host LOCAL\n";
+        assert!(has_ipv4_address_in(fib_trie));
+    }
+
+    /// 只有环回（飞行模式 + 没网）才算离线。
+    #[test]
+    fn loopback_alone_is_still_offline() {
+        let fib_trie = "Main:\n  +-- 127.0.0.0/8 2 0 2\n     |-- 127.0.0.0\n        /8 host LOCAL\n     |-- 127.0.0.1\n        /32 host LOCAL\n";
+        assert!(!has_ipv4_address_in(fib_trie));
     }
 }
 
