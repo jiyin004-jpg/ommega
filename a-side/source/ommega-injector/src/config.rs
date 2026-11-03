@@ -124,8 +124,8 @@ fn default_scoop() -> Vec<String> {
     // 出厂作用域是**空**的：作用域只从面板写的 `target.txt` 来。
     //
     // 以前这里列了六个包当默认套餐，结果跟 `target.txt` 表达同一件事、靠“文件在不在”
-    // 判优先级。普通应用现在由 `global_scope` 覆盖，不需要默认值；需要接管的
-    // 系统 app 域（工程模式）由 `system_sid_packages` 自动补回。
+    // 判优先级。现在一律以面板为准：全局开就接管普通应用（外加 `system_sid_packages`
+    // 里那几个系统 app 域）；全局关就只接管 `target.txt` 里勾选的那些。
     Vec::new()
 }
 
@@ -349,17 +349,19 @@ fn apply_clienta_overrides(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
         merged.filter.global_scope = value;
     }
     if let Some(list) = overrides.target.as_ref() {
-        // 系统 uid 的 ROM app（工程模式那类）必须**始终**留在 scoop 里：
-        // 它们的包名命中 `SYSTEM_PACKAGE_PREFIXES`（`com.oplus.` 等），只有被
-        // 显式收进去才过得了 `RejectedSystemPackage` 那关。而面板一保存应用列表
-        // 就会把 target.txt 写成唯一事实源、整个替掉默认套餐 —— 工程模式就从
-        // scoop 里消失了，它的 attestation 就只能落回系统 keystore（工模里
-        // keybox / rpmbkey 页拿不到我们的链）。这里把域→包名映射里的包补回来。
+        // 非全局模式：作用域只看面板勾的那份（`target.txt`），不再自动塞内置包。
+        //
+        // 全局模式：把 `system_sid_packages`（工程模式那类系统 app 域）补回来。
+        // 它们的包名命中 ROM 前缀，只有显式列入才过得了 `RejectedSystemPackage`；
+        // GMS / 商店不需要补——`GLOBAL_SCOPE_ALWAYS` 已经让它们不算系统包，
+        // 全局模式下自然接管。
         let mut effective = list.clone();
-        for packages in base.filter.system_sid_packages.values() {
-            for pkg in packages {
-                if !pkg.is_empty() && !effective.iter().any(|existing| existing == pkg) {
-                    effective.push(pkg.clone());
+        if merged.filter.global_scope {
+            for packages in base.filter.system_sid_packages.values() {
+                for pkg in packages {
+                    if !pkg.is_empty() && !effective.iter().any(|existing| existing == pkg) {
+                        effective.push(pkg.clone());
+                    }
                 }
             }
         }
