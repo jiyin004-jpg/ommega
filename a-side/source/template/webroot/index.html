@@ -90,6 +90,15 @@
   .kv span:last-child{flex:1;min-width:0;word-break:break-all;font-family:ui-monospace,monospace}
   /* 「当前」那种句子式的值不用等宽字体，让它正常换行、跟左边对齐 */
   .kv span.plain{font-family:inherit;word-break:break-word;line-height:1.5}
+  /* 关于里的界面语言：自绘按钮 + 共用浮层菜单。原生 select 的弹层样式由系统控制，
+     在 WebView 里字体/配色都跟面板对不上，换语言时还会闪一下原生列表。 */
+  .lang-pick{display:inline-flex;align-items:center;justify-content:space-between;gap:8px;
+      width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
+      background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit;
+      line-height:1.35;text-align:left;white-space:nowrap;overflow:hidden}
+  .lang-pick::after{content:"";flex:0 0 auto;width:0;height:0;
+      border-left:3px solid transparent;border-right:3px solid transparent;
+      border-top:4px solid currentColor;opacity:.6}
   .row button.btn{flex:0 0 84px;min-width:0;padding:8px 0;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .hint{color:var(--dim);font-size:12px;line-height:1.5;margin:6px 0 0}
   /* 应用列表 */
@@ -110,12 +119,11 @@
      原生 <select> 每行都要画一遍控件、还带 4 个 option 子节点，行数一多单页绘制就重；
      自绘按钮只有一行字，菜单只有一个、关着时 display:none，不参与光栅化。 */
   .app .pick{display:inline-flex;align-items:center;justify-content:center;gap:4px;
-      flex:0 0 104px;padding:4px 9px;border:1px solid var(--line);border-radius:8px;
+      flex:0 0 auto;padding:4px 9px;border:1px solid var(--line);border-radius:8px;
       background:var(--bg);color:var(--fg);font-size:12px;font-family:inherit;font-weight:400;
-      line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  /* 小三角用边框画，作为按钮里的一个 flex 项，跟着文字一起居中。
-     宽度还是给死（跟原来的 <select> 一样）：几种文案长短差得多，按内容自适应会让行尾参差，
-     长语言下还会把左边应用名挤成省略号。 */
+      line-height:1.35;white-space:nowrap;max-width:100%}
+  /* 小三角用边框画，作为按钮里的一个 flex 项：宽度只按「文字 + 间隙 + 三角 + 内边距」来，
+     不再为固定宽度留空；右侧内边距留一点呼吸感。 */
   .app .pick::after{content:"";flex:0 0 auto;width:0;height:0;
       border-left:2.5px solid transparent;border-right:2.5px solid transparent;
       border-top:3.5px solid currentColor;opacity:.6}
@@ -213,7 +221,7 @@
       <input type="text" id="app-search" class="search" data-i18n-ph="apps.search">
       <div class="toolbar">
         <button class="btn sm" id="app-reload" data-i18n="apps.refresh"></button>
-        <button class="btn sm" id="toggle-system" data-i18n="apps.showSys"></button>
+        <button class="btn sm" id="toggle-system"></button>
         <button class="btn sm" id="pick-all" data-i18n="apps.all"></button>
         <button class="btn sm" id="pick-none" data-i18n="apps.unall"></button>
       </div>
@@ -326,7 +334,7 @@
     <div class="sheet-body">
       <div class="kv"><span data-i18n="about.version"></span><span id="about-ver">-</span></div>
       <div class="kv"><span data-i18n="about.lang"></span>
-        <span><select id="lang" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit"></select></span></div>
+        <span class="plain"><button id="lang" type="button" class="lang-pick"></button></span></div>
       <div class="kv"><span data-i18n="about.qq"></span><span class="link" data-open="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=2167063739&amp;card_type=group" data-open-fallback="https://qm.qq.com/cgi-bin/qm/qr?group_code=2167063739">2167063739</span></div>
       <div class="kv"><span>GitHub</span><span class="link" data-open="https://github.com/jiyin004-jpg/ommega">jiyin004-jpg/ommega</span></div>
       <p class="hint" data-i18n="about.disclaimer"></p>
@@ -451,12 +459,21 @@ function t(key, vars){
   if (vars) Object.keys(vars).forEach(function(k){ s = s.split("{" + k + "}").join(String(vars[k])); });
   return s;
 }
-function applyI18n(){
-  document.documentElement.lang = LANG;
-  document.querySelectorAll("[data-i18n]").forEach(function(e){ e.textContent = t(e.dataset.i18n); });
-  document.querySelectorAll("[data-i18n-ph]").forEach(function(e){ e.placeholder = t(e.dataset.i18nPh); });
+function applyI18n(scope){
+  var root = scope || document;
+  /* 整页换语言才动 <html lang>（它会让 WebView 重新挑字体，是最贵的一步），
+     只重绘某一小块时不要碰。 */
+  if (!scope) document.documentElement.lang = LANG;
+  root.querySelectorAll("[data-i18n]").forEach(function(e){
+    var s = t(e.dataset.i18n);
+    if (e.textContent !== s) e.textContent = s;      /* 没变就别换文本节点，省一次重排 */
+  });
+  root.querySelectorAll("[data-i18n-ph]").forEach(function(e){
+    var s = t(e.dataset.i18nPh);
+    if (e.placeholder !== s) e.placeholder = s;
+  });
   /* setT 记下来的那些动态值也一起按新语言重算。 */
-  document.querySelectorAll("[data-i18n-key]").forEach(function(e){ paintT(e); });
+  root.querySelectorAll("[data-i18n-key]").forEach(function(e){ paintT(e); });
 }
 
 /* ---------------------------- 与设备交互（ksu） ---------------------------- */
@@ -943,7 +960,8 @@ function paintT(node){
   /* 变量里存的是原始值，不能在存的时候就把 op 翻好 —— 否则切语言又停在旧语言。
      SOTER 记录的 op 是文件里的 selftest 这种原样字符串，显示前在这里翻。 */
   if (vars && typeof vars.op === "string" && vars.op === "selftest") vars.op = t("soter.record.selftest");
-  node.textContent = t(node.dataset.i18nKey, vars);
+  var s = t(node.dataset.i18nKey, vars);
+  if (node.textContent !== s) node.textContent = s;
 }
 function truthy(v){ v = String(v == null ? "" : v).trim().toLowerCase(); return v === "1" || v === "true" || v === "yes" || v === "on"; }
 function toast(msg, isErr, sticky){
@@ -1357,12 +1375,12 @@ function setActiveTab(i){
 function buildBoolRow(f, value, host){
   var row = el("div", "row");
   var name = el("div", "name");
-  name.appendChild(el("b", null, t("f." + f.key)));
-  name.appendChild(el("small", null, t("f." + f.key + ".hint")));
+  name.appendChild(setT(el("b"), "f." + f.key));
+  name.appendChild(setT(el("small"), "f." + f.key + ".hint"));
   /* 系统现在到底还报不报这个能力，直接问 PackageManager 一句，免得以为勾了就已经生效
      （声明要重启才换，管理器不给挂载时永远不会生效）。 */
   if (f.key === "hide_strongbox" && SB_LIVE){
-    name.appendChild(el("small", null, SB_LIVE === "false" ? t("f.hide_strongbox.live.off") : t("f.hide_strongbox.live.on")));
+    name.appendChild(setT(el("small"), SB_LIVE === "false" ? "f.hide_strongbox.live.off" : "f.hide_strongbox.live.on"));
   }
   row.appendChild(name);
   var sw = el("button", "sw");
@@ -1377,8 +1395,8 @@ function buildTextRow(f, value, host){
   var row = el("div", "row");
   if (f.key === "token" || f.key === "url") row.classList.add("stacked");
   var name = el("div", "name");
-  name.appendChild(el("b", null, t("f." + f.key)));
-  name.appendChild(el("small", null, t("f." + f.key + ".hint")));
+  name.appendChild(setT(el("b"), "f." + f.key));
+  name.appendChild(setT(el("small"), "f." + f.key + ".hint"));
   row.appendChild(name);
   var inp = document.createElement("input");
   inp.type = "text";
@@ -1473,7 +1491,15 @@ function appRowEl(a){
   row.appendChild(img);
   var meta = el("div", "meta");
   meta.appendChild(el("b", null, a.label || a.pkg));
-  meta.appendChild(el("small", null, a.system ? (a.pkg + " · " + t("apps.sysTag")) : a.pkg));
+  /* 「系统」两个字也交给 setT：切语言时 applyI18n 直接换，不用为它重建整行。 */
+  var sub = el("small");
+  if (a.system){
+    sub.appendChild(document.createTextNode(a.pkg + " · "));
+    sub.appendChild(setT(el("span"), "apps.sysTag"));
+  } else {
+    sub.textContent = a.pkg;
+  }
+  meta.appendChild(sub);
   row.appendChild(meta);
   var pick = document.createElement("button");
   pick.type = "button";
@@ -1489,48 +1515,79 @@ function appRowEl(a){
 /* 每行的「接管方式」：一个按钮 + 一个全屏浮层里的共用菜单。
    原生 <select> 每行都要画控件、还挂着 4 个 option 子节点，行数一多单页绘制明显变重；
    自绘按钮只有一行字，菜单只有一个、关着时不参与绘制。 */
-/* 菜单打开时记下「哪一行、哪个按钮」，转屏 / 改窗口尺寸要按新位置重新贴一次。 */
-var pickApp = null, pickBtn = null;
-function pickLabel(v){
-  if (v !== "normal" && v !== "generate" && v !== "hack") v = "off";
-  return t("pick." + v);
-}
+/* 菜单打开时记下「哪个按钮、选中后做什么」，转屏 / 改窗口尺寸要按新位置重新贴一次。 */
+var pickBtn = null;
+/* 按钮上的文字交给 setT 记着，切语言时 applyI18n 顺手就换掉了，
+   不用为了几个按钮把整份应用列表重建一遍（重建会重新请求图标，那才是切语言卡顿的大头）。 */
 function paintPick(btn, v){
-  if (btn) btn.textContent = pickLabel(v);
+  if (!btn) return;
+  if (v !== "normal" && v !== "generate" && v !== "hack") v = "off";
+  setT(btn, "pick." + v);
 }
 function closePick(){
   var host = document.getElementById("apick");
   if (host) host.classList.add("hidden");
-  pickApp = null; pickBtn = null;
+  pickBtn = null;
 }
-function openPick(a, btn){
+/* 一个浮层菜单给两处共用：应用行的「接管方式」、关于里的「界面语言」。
+   wide=true 时菜单跟按钮一样宽（语言那种整行按钮），否则用固定窄宽。 */
+function openMenu(btn, items, cur, cb, wide){
   var host = document.getElementById("apick");
   var menu = document.getElementById("apick-menu");
-  if (!host || !menu) return;
-  pickApp = a; pickBtn = btn;
-  var cur = a.checked ? a.mode : "off";
+  if (!host || !menu || !btn) return;
+  pickBtn = btn;
+  if (wide){
+    menu.style.minWidth = Math.min(btn.getBoundingClientRect().width, window.innerWidth - 16) + "px";
+    menu.style.maxWidth = "calc(100vw - 16px)";
+  } else {
+    menu.style.minWidth = ""; menu.style.maxWidth = "";
+  }
   menu.innerHTML = "";
-  ["off", "normal", "generate", "hack"].forEach(function(v){
-    var it = document.createElement("button");
-    it.type = "button";
-    it.className = "apick-item" + (v === cur ? " on" : "");
-    it.textContent = t("pick." + v);
-    it.onclick = function(){
-      a.checked = v !== "off";
-      a.mode = v === "off" ? "normal" : v;
-      if (btn.parentNode) btn.parentNode.className = "app" + (a.checked ? " on" : " off");
-      paintPick(btn, v);
-      updateCount();
-      /* 原来是 <select>，改值会冒泡出 change 事件，靠它置位 aDirty；换成按钮后没人置位了，
-         补一句：有没保存的改动就别让 refreshFromDisk 把列表冲掉。 */
-      aDirty = true;
+  items.forEach(function(it){
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "apick-item" + (it.v === cur ? " on" : "");
+    b.textContent = it.label;
+    b.onclick = function(){
       closePick();
+      if (cb) cb(it.v);
     };
-    menu.appendChild(it);
+    menu.appendChild(b);
   });
   host.classList.remove("hidden");
   host.onclick = function(ev){ if (ev.target === host) closePick(); };
   placePick(btn, menu);
+}
+function openPick(a, btn){
+  var cur = a.checked ? a.mode : "off";
+  var items = ["off", "normal", "generate", "hack"].map(function(v){
+    return {v: v, label: t("pick." + v)};
+  });
+  openMenu(btn, items, cur, function(v){
+    a.checked = v !== "off";
+    a.mode = v === "off" ? "normal" : v;
+    if (btn.parentNode) btn.parentNode.className = "app" + (a.checked ? " on" : " off");
+    paintPick(btn, v);
+    updateCount();
+    /* 原来是 <select>，改值会冒泡出 change 事件，靠它置位 aDirty；换成按钮后没人置位了，
+       补一句：有没保存的改动就别让 refreshFromDisk 把列表冲掉。 */
+    aDirty = true;
+  });
+}
+/* 关于里的语言选择：按钮只写当前语言名，菜单列出全部；选中后 setLang 会整套重绘。 */
+function langName(code){
+  for (var i = 0; i < LANGS.length; i++) if (LANGS[i][0] === code) return LANGS[i][1];
+  return code;
+}
+function paintLang(){
+  var b = document.getElementById("lang");
+  if (b) b.textContent = langName(LANG);
+}
+function openLangMenu(){
+  var b = document.getElementById("lang");
+  if (!b) return;
+  var items = LANGS.map(function(p){ return {v: p[0], label: p[1]}; });
+  openMenu(b, items, LANG, function(code){ setLang(code); }, true);
 }
 /* 贴着按钮右下角放；下面放不下就翻到按钮上方，左右再夹在屏幕内。
    单抽出来是因为转屏 / 分屏会换视口，得按新位置再贴一次，不然菜单会停在旧像素上。 */
@@ -1702,8 +1759,10 @@ async function defaultScopePackages(){
   return out;
 }
 async function loadApps(){
-  document.getElementById("applist").innerHTML = '<p class="hint">' + t("apps.loading") + "</p>";
   appHint = {key: "apps.loading", vars: null};
+  var box0 = document.getElementById("applist");
+  if (box0) box0.innerHTML = "";
+  paintAppHint();
   appShown = [];                       /* 载入期间别让滚动事件拿旧数据重建列表 */
   appWinStart = appWinEnd = -1;
   var sysSet = {};
@@ -1969,7 +2028,7 @@ async function fpPick(path){
 
 async function openSysApp(){
   showSystem = !showSystem;
-  document.getElementById("toggle-system").textContent = showSystem ? t("apps.hideSys") : t("apps.showSys");
+  setT(document.getElementById("toggle-system"), showSystem ? "apps.hideSys" : "apps.showSys");
   renderApps();
 }
 
@@ -2332,33 +2391,51 @@ function setLang(code){
   if (!I18N[code]) code = "zh-CN";
   LANG = code;
   try { localStorage.setItem("ommega.lang", code); } catch (e){}
-  /* 伪装参数那几个输入框还没保存的值先收进 patchValues，重建后再由 fillPatchInputs 填回去。 */
-  try { capturePatchInputs(); } catch (e){}
-  /* applyI18n 除了静态的 data-i18n，还会把 setT 记下来的动态值（SOTER 记录、
-     密钥状态、进程状态、计数）一起按新语言重算，不再依赖后面某一步有没有跑到。 */
-  applyI18n();
-  /* 下面几个是「拿缓存数据重建整块 UI」：任何一块出问题（比如某个元素还没渲染）
-     都不该把后面的重绘一起带走 —— 以前 SOTER 记录停在旧语言就是这么来的。 */
-  [
-    function(){ renderRemote(parseKV(curConfText, true)); },
-    fillPatchInputs,
-    refreshPatchSummary,
-    function(){ if (appRows.length) renderApps(); else paintAppHint(); },
-    updateCount,
-    paintSoterRecord,
-    paintAttk,
-    paintSoter,
-    function(){
-      var sysBtn = document.getElementById("toggle-system");
-      if (sysBtn) sysBtn.textContent = showSystem ? t("apps.hideSys") : t("apps.showSys");
-    },
-    /* 异步刷新完再摆一次：状态条文字换语言后宽度会变，标签栏跟着挪，高亮块不能停在旧位置。 */
-    function(){ refreshStatus().catch(function(){}).then(relayoutActivePage); },
-    function(){ refreshCount().catch(function(){}).then(relayoutActivePage); }
-  ].forEach(function(fn){ try { fn(); } catch (e){} });
-  /* 文字换完、重排稳定之后，把当前页和高亮块重新摆正（不用再靠手动滑动刷新）。 */
+  /* 切语言的时候人正看着「关于」窗：只先把这一块和语言按钮换掉，点击立刻有反馈。
+     整页文字、计数、状态条都被遮罩盖着，看不见，等这一帧画完再统一换（见 scheduleLangPass）——
+     以前是先重建设置页和整份应用列表再返回，重绘期间点击没反应，看着就是切语言卡一下。 */
+  var about = document.getElementById("about-modal");
+  if (about) applyI18n(about);
+  paintLang();
+  scheduleLangPass();
+}
+
+/* 整页换语言拆成两步：本帧只改看得见的那块，剩下的排到下一帧之后。
+   设置页和应用行的文案现在都由 setT 记着键，applyI18n 一遍就能换完，
+   不再需要 renderRemote / renderApps 重建 DOM（重建应用列表会重新请求几十个图标）。 */
+var langPassId = 0, langPassPending = false;
+function scheduleLangPass(){
+  langPassPending = true;
+  if (langPassId) return;
+  /* 两跳 rAF：第一跳结束浏览器会绘制一次（关于窗和按钮已经是新文字），第二跳再干重活。 */
+  if (window.requestAnimationFrame){
+    langPassId = requestAnimationFrame(function(){
+      langPassId = requestAnimationFrame(function(){
+        langPassId = 0; langPassNow();
+      });
+    });
+  } else {
+    langPassId = setTimeout(function(){ langPassId = 0; langPassNow(); }, 32);
+  }
+}
+function flushLangPass(){
+  if (!langPassId) return;
+  if (window.cancelAnimationFrame) cancelAnimationFrame(langPassId);
+  clearTimeout(langPassId);
+  langPassId = 0;
+  langPassNow();
+}
+function langPassNow(){
+  if (!langPassPending) return;
+  langPassPending = false;
+  /* 任何一块出错都不该把后面的重绘一起带走。 */
+  try { applyI18n(); } catch (e){}
+  try { refreshPatchSummary(); } catch (e){}
+  try { setT(document.getElementById("toggle-system"), showSystem ? "apps.hideSys" : "apps.showSys"); } catch (e){}
+  /* 状态条的「运行中/已停止」、计数、SOTER 记录都由 setT 记着键，上面这一遍已经换好了，
+     不用再跑一次 shell 去重新探测（那是两次跨桥调用，白等）。 */
+  /* 文字换完、重排稳定之后，把当前页和高亮块重新摆正。 */
   relayoutSoon();
-  document.getElementById("lang").value = code;
 }
 
 /* --------------------------------- 初始化 -------------------------------- */
@@ -2436,12 +2513,12 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     A_VER = ver;
     try { await loadOwnPatch(); } catch (e){}
 
-    var langSel = document.getElementById("lang");
-    LANGS.forEach(function(pair){ var op = el("option", null, pair[1]); op.value = pair[0]; langSel.appendChild(op); });
-    langSel.value = LANG;
-    langSel.onchange = function(){ setLang(langSel.value); };
+    var langBtn = document.getElementById("lang");
+    langBtn.onclick = openLangMenu;
+    paintLang();
 
     applyI18n();
+    setT(document.getElementById("toggle-system"), showSystem ? "apps.hideSys" : "apps.showSys");
     document.getElementById("tb-ver").textContent = ver;
     document.getElementById("about-ver").textContent = ver;
 
@@ -2455,8 +2532,8 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     document.querySelectorAll("[data-open]").forEach(function(n){
       n.onclick = function(){ openExternal(n.dataset.open, n.dataset.openFallback); };
     });
-    document.getElementById("about-close").onclick = function(){ document.getElementById("about-modal").className = "modal hidden"; relayoutSoon(); };
-    document.getElementById("about-modal").onclick = function(ev){ if (ev.target.id === "about-modal"){ this.className = "modal hidden"; relayoutSoon(); } };
+    document.getElementById("about-close").onclick = function(){ closePick(); document.getElementById("about-modal").className = "modal hidden"; flushLangPass(); relayoutSoon(); };
+    document.getElementById("about-modal").onclick = function(ev){ if (ev.target.id === "about-modal"){ closePick(); this.className = "modal hidden"; flushLangPass(); relayoutSoon(); } };
     document.getElementById("fp-close").onclick = fpClose;
     document.getElementById("fp-modal").onclick = function(ev){ if (ev.target.id === "fp-modal") fpClose(); };
     document.getElementById("fp-up").onclick = function(){
