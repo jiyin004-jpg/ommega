@@ -23,12 +23,6 @@ const BOOT_PATCH_ALT_PROP: &str = "ro.boot.build.security_patch";
 /// AProbe 的 A13 查的就是这个名字（`boot.image`，不是 `boot.build`）。
 const BOOT_PATCH_APROBE_PROP: &str = "ro.boot.image.build.security_patch";
 
-/// boot 补丁的三个属性变体，第一个是权威名。
-///
-/// 归一之后三个一起写成同一个值：面板伪装只写这一处，检测器（AProbe A13 读的是
-/// `ro.boot.image.build.security_patch`）和出链读的也就是同一份，不用每处各猜一遍。
-const BOOT_PATCH_VARIANTS: [&str; 3] =
-    [BOOT_PATCH_APROBE_PROP, BOOT_PATCH_PROP, BOOT_PATCH_ALT_PROP];
 const VBMETA_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
 const VBMETA_HASH_PROP: &str = "ro.boot.vbmeta.digest";
 const AVB_HEADER_SIZE: usize = 256;
@@ -380,7 +374,50 @@ fn current_patchlevel() -> Result<String> {
     Ok(format!("{year:04}-{month:02}-05"))
 }
 
+/// 读 build.prop 里的原始值。伪装清掉之后要把属性写回它。
+pub fn build_prop_value(key: &str) -> Option<String> {
+    read_build_prop_value(key)
+}
+
+/// build.prop 的键值表，进程内只解析一次。
+///
+/// 归一每次重跑要查十几个键，一个个去遍历那八个文件会变成几十次整文读取；
+/// 缓存之后只是一次哈希查表。同一进程生命周期内 build.prop 不会变，缓存安全。
+fn build_props() -> &'static std::collections::HashMap<String, String> {
+    static PROPS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    PROPS.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        for path in BUILD_PROP_PATHS {
+            let Ok(contents) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let (key, value) = (key.trim(), value.trim());
+                if key.is_empty() || value.is_empty() {
+                    continue;
+                }
+                // 跟以前一样：前面的文件优先。
+                map.entry(key.to_string())
+                    .or_insert_with(|| value.to_string());
+            }
+        }
+        map
+    })
+}
+
 fn read_build_prop_value(key: &str) -> Option<String> {
+    build_props().get(key).cloned()
+}
+
+#[cfg(test)]
+fn read_build_prop_value_uncached(key: &str) -> Option<String> {
     BUILD_PROP_PATHS.iter().find_map(|path| {
         std::fs::read_to_string(path)
             .ok()
@@ -388,6 +425,7 @@ fn read_build_prop_value(key: &str) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn parse_build_prop_value(contents: &str, key: &str) -> Option<String> {
     contents
         .lines()
@@ -519,10 +557,23 @@ pub fn boot_image_patchlevel_date() -> Result<String> {
 /// bootloader 只在 bootconfig 里给 `androidboot.vbmeta.digest`（对应 verifiedBootHash），
 /// 不给公钥摘要；原生 HAL 自己读分区算。以前我们拿 boot hash 派生一个、后来变成全零，
 /// 两个都不是真值，检测器一看就知道。这里按 AVB 规范算真的。
+/// 顶层 vbmeta 的字节，进程内只读一次（归一和公钥摘要都要它，以前各读一份）。
+fn cached_top_level_vbmeta() -> Result<&'static [u8]> {
+    static CACHE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
+    match CACHE.get_or_init(|| {
+        let slot_suffix =
+            resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
+        let path = find_top_level_vbmeta_path(&slot_suffix).map_err(|e| format!("{e:#}"))?;
+        load_vbmeta_blob(&path).map_err(|e| format!("{e:#}"))
+    }) {
+        Ok(blob) => Ok(blob),
+        Err(error) => bail!("{error}"),
+    }
+}
+
 pub fn boot_image_public_key_digest() -> Result<String> {
-    let slot_suffix = resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
-    let top_level = load_vbmeta_blob(&find_top_level_vbmeta_path(&slot_suffix)?)?;
-    let key = avb_public_key(&top_level)?;
+    let top_level = cached_top_level_vbmeta()?;
+    let key = avb_public_key(top_level)?;
     Ok(hex::encode(
         ring::digest::digest(&ring::digest::SHA256, key).as_ref(),
     ))
@@ -630,28 +681,27 @@ fn read_boot_patchlevel_state() -> Option<String> {
 
 fn read_abl_boot_patchlevel() -> Result<String> {
     let slot_suffix = resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
+    // 顶层 vbmeta 走缓存，只有 boot 分区尾部要去现读（很小：footer 64B + 内嵌 vbmeta）。
+    let top_level_blob = cached_top_level_vbmeta();
     let boot_path = find_avb_partition_path(&slot_suffix, "boot")
         .context("failed to locate active boot partition")?;
-    read_abl_boot_patchlevel_from_paths(find_top_level_vbmeta_path(&slot_suffix), &boot_path)
-        .map(|value| value.to_string())
+    read_abl_boot_patchlevel_from_blob(top_level_blob, &boot_path).map(|value| value.to_string())
 }
 
-fn read_abl_boot_patchlevel_from_paths(
-    top_level_path: Result<PathBuf>,
+fn read_abl_boot_patchlevel_from_blob(
+    top_level: Result<&'static [u8]>,
     boot_path: &Path,
 ) -> Result<u32> {
-    let top_level_error = match top_level_path {
-        Ok(path) => {
-            let top_level = load_vbmeta_blob(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if let Some(value) = vbmeta_boot_patchlevel(&top_level)? {
+    let top_level_error = match top_level {
+        Ok(blob) => {
+            if let Some(value) = vbmeta_boot_patchlevel(blob)? {
                 return Ok(value);
             }
             None
         }
         Err(error) => {
             log::debug!("failed to locate top-level vbmeta; checking boot image: {error:#}");
-            Some(error)
+            Some(error.to_string())
         }
     };
 

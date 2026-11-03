@@ -61,11 +61,12 @@ pub fn run(extra: Vec<String>) -> ! {
         std::process::exit(0);
     }
     log("keymint daemon started");
-    normalize_boot_patch();
-    normalize_vbmeta_digest();
-    normalize_vbmeta_public_key();
 
     loop {
+        // 每次拉起 keymint 之前都重新算一遍：面板保存（清掉伪装也算）会戳
+        // restart.keymint，归一必须跟着重跑，不然属性会一直停在旧的伪装值上。
+        normalize_all();
+
         let Some(target) = find_keymint() else {
             log("keymint binary not found");
             sleep(Duration::from_secs(5));
@@ -366,6 +367,71 @@ const BOOT_PATCH_PROPS: [&str; 3] = [
 /// 旧日期（实测属性 2025-03-01，而 boot 分区里写的是 2026-08-01）。以前出链是属性优先，
 /// 属性又会被 `remote_identity` 反写回来，旧日期就永远出不去。现在开机对齐一次，之后
 /// 出链、面板、检测器读的都是同一个值，也省得每次去解析分区。
+fn normalize_all() {
+    normalize_boot_patch();
+    normalize_vbmeta_digest();
+    normalize_vbmeta_public_key();
+    normalize_patch_props();
+    normalize_identity_props();
+}
+
+/// 伪装清掉后，机型/指纹/系统版本这些属性也得回 build.prop 的真值。
+///
+/// 分区级那份（ro.product.system.* 等）不在 build.prop 明文里，读不到就不动 —— 宁可不改也比
+/// 写一个错值强。
+fn normalize_identity_props() {
+    for prop in [
+        "ro.product.brand",
+        "ro.product.device",
+        "ro.product.name",
+        "ro.product.manufacturer",
+        "ro.product.model",
+        "ro.build.fingerprint",
+        "ro.build.version.release",
+    ] {
+        if props_conf_value(prop).is_some() {
+            continue;
+        }
+        let Some(truth) = crate::plat::vbmeta::build_prop_value(prop) else {
+            continue;
+        };
+        let current = resetprop::read_string_property(prop).unwrap_or_default();
+        if current == truth {
+            continue;
+        }
+        set_prop(prop, &truth);
+        log(&format!(
+            "identity: {prop} was {current}, restored to {truth} (build.prop)"
+        ));
+    }
+}
+
+/// os / vendor 补丁清掉伪装后回 build.prop 的真值。
+///
+/// 这两个没有分区级别的“真值”概念，伪装写的就是属性；用户把伪装清掉时，props.conf
+/// 里那行没了，但属性还停在旧值上，没人拉得回去。这里每次归一都跟 build.prop 对一遍。
+fn normalize_patch_props() {
+    for prop in [
+        "ro.build.version.security_patch",
+        "ro.vendor.build.security_patch",
+    ] {
+        if props_conf_value(prop).is_some() {
+            continue;
+        }
+        let Some(truth) = crate::plat::vbmeta::build_prop_value(prop) else {
+            continue;
+        };
+        let current = resetprop::read_string_property(prop).unwrap_or_default();
+        if current == truth {
+            continue;
+        }
+        set_prop(prop, &truth);
+        log(&format!(
+            "patch level: {prop} was {current}, restored to {truth} (build.prop)"
+        ));
+    }
+}
+
 fn normalize_boot_patch() {
     // 优先级：props.conf 里的伪装 > config.toml 的显式值 > boot 分区真值。
     // 伪装不只需要跳过归一，还得把三个变体都刷成伪装值 —— 面板保存时那次 resetprop
