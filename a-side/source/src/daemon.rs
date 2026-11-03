@@ -27,6 +27,7 @@ const MODDIR: &str = "/data/adb/modules/ommega";
 const CONF_PATH: &str = "/data/misc/ommega/config";
 const LOG_FILE: &str = "/data/misc/ommega/logs/daemon.log";
 const REMOTE_IDENTITY: &str = "/data/misc/ommega/remote_identity";
+const CONFIG_TOML: &str = "/data/misc/ommega/config.toml";
 const REMOTE_IDENTITY_APPLIED: &str = "/data/adb/ommega/conf/remote_identity.applied";
 const REMOTE_IDENTITY_UPDATED: &str = "/data/adb/ommega/conf/remote_identity.updated";
 const PROPS_CONF: &str = "/data/adb/ommega/conf/props.conf";
@@ -60,6 +61,9 @@ pub fn run(extra: Vec<String>) -> ! {
         std::process::exit(0);
     }
     log("keymint daemon started");
+    normalize_boot_patch();
+    normalize_vbmeta_digest();
+    normalize_vbmeta_public_key();
 
     loop {
         let Some(target) = find_keymint() else {
@@ -349,20 +353,170 @@ fn set_prop(name: &str, value: &str) -> bool {
 /// 来源是 `remote_identity`（TA 每次收到链都写）：服务端 keybox 出链时里面的哈希
 /// 就是本机属性，值相同不会写；真机 B 出链时是 B 的说法，同步一次之后每次都比得上；
 /// 本地模式下这个文件不更新，走不到这里。
+/// boot 补丁的三个属性变体，第一个是权威名（AProbe 的 A13 与 bootloader 都用它）。
+const BOOT_PATCH_PROPS: [&str; 3] = [
+    "ro.boot.image.build.security_patch",
+    "ro.boot.build.security_patch",
+    "ro.vendor.boot_security_patch",
+];
+
+/// 开机把三个 boot 补丁属性统一到 boot 分区的真值上。
+///
+/// 为什么要有这一步：属性是 bootloader 的快照，厂商不跟着 OTA 刷 bootloader 就会停在
+/// 旧日期（实测属性 2025-03-01，而 boot 分区里写的是 2026-08-01）。以前出链是属性优先，
+/// 属性又会被 `remote_identity` 反写回来，旧日期就永远出不去。现在开机对齐一次，之后
+/// 出链、面板、检测器读的都是同一个值，也省得每次去解析分区。
+fn normalize_boot_patch() {
+    // 优先级：props.conf 里的伪装 > config.toml 的显式值 > boot 分区真值。
+    // 伪装不只需要跳过归一，还得把三个变体都刷成伪装值 —— 面板保存时那次 resetprop
+    // 不一定每条都写成（实测 ro.vendor.boot_security_patch 会漏）。
+    let (value, source) = match props_conf_explicit_boot_patch() {
+        Some(value) => (value, "props.conf"),
+        None => match declared_boot_patchlevel() {
+            Some(value) => (value, "config.toml"),
+            None => match crate::plat::vbmeta::boot_image_patchlevel_date() {
+                Ok(value) => (value, "boot image"),
+                Err(error) => {
+                    log(&format!(
+                        "boot patch: cannot read boot image metadata: {error:#}"
+                    ));
+                    return;
+                }
+            },
+        },
+    };
+    write_patch_state(&value, source);
+    let mut changed = false;
+    for prop in BOOT_PATCH_PROPS {
+        if resetprop::read_string_property(prop).as_deref() == Some(value.as_str()) {
+            continue;
+        }
+        if set_prop(prop, &value) {
+            changed = true;
+        }
+    }
+    if changed {
+        log(&format!("boot patch: properties set to {value} ({source})"));
+    }
+}
+
+/// props.conf 里手写的 boot 补丁（伪装参数那页）。三个变体任一有值即算。
+fn props_conf_explicit_boot_patch() -> Option<String> {
+    BOOT_PATCH_PROPS
+        .iter()
+        .find_map(|key| props_conf_value(key))
+}
+
+/// 把最终值告诉 keymint：`/data/misc/ommega/patch.state`。
+fn write_patch_state(value: &str, source: &str) {
+    let body = format!("boot_patchlevel={value}\nsource={source}\n");
+    let path = "/data/misc/ommega/patch.state";
+    if fs::read_to_string(path).ok().as_deref() == Some(body.as_str()) {
+        return;
+    }
+    if let Err(error) = fs::write(path, body.as_bytes()) {
+        log(&format!("boot patch: cannot write {path}: {error}"));
+    }
+}
+
+/// config.toml `[trust] boot_patchlevel` 里手写的值（auto/latest 不算）。
+fn declared_boot_patchlevel() -> Option<String> {
+    let text = fs::read_to_string(CONFIG_TOML).ok()?;
+    let value = text.lines().find_map(|line| {
+        let line = line.trim();
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "boot_patchlevel").then(|| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
+        })
+    })?;
+    (!value.is_empty() && !matches!(value.as_str(), "auto" | "latest")).then_some(value)
+}
+
+/// 链上的 `verifiedBootKey` 是 SHA256(vbmeta 公钥)。bootloader 只在 bootconfig 里给
+/// digest（那就是 verifiedBootHash），不给公钥摘要 —— 原生 HAL 自己读分区算。
+/// 不算这一份就只能发全零或者自己派生的假值，两个都是明显指纹。
+fn normalize_vbmeta_public_key() {
+    // 伪装优先：props.conf 里写了就用写的，没写才按 vbmeta 公钥算真值。
+    if let Some(value) = props_conf_value("ro.boot.vbmeta.public_key_digest") {
+        let current =
+            resetprop::read_string_property("ro.boot.vbmeta.public_key_digest").unwrap_or_default();
+        if !current.eq_ignore_ascii_case(&value) {
+            set_prop("ro.boot.vbmeta.public_key_digest", &value);
+            log("vbmeta key: property set from props.conf override");
+        }
+        return;
+    }
+    let current =
+        resetprop::read_string_property("ro.boot.vbmeta.public_key_digest").unwrap_or_default();
+    if !current.is_empty() && current.chars().any(|c| c != '0') {
+        return;
+    }
+    match crate::plat::vbmeta::boot_image_public_key_digest() {
+        Ok(value) => {
+            set_prop("ro.boot.vbmeta.public_key_digest", &value);
+            log(&format!(
+                "vbmeta key: property set to {value} (from vbmeta public key)"
+            ));
+        }
+        Err(error) => log(&format!("vbmeta key: cannot read vbmeta: {error:#}")),
+    }
+}
+
+/// vbmeta 摘要（链上的 `verifiedBootHash`）对齐到 bootloader 的真值。
+///
+/// 本机实测过：属性里能是 `8a7aa2b9…`，而 `/proc/bootconfig` 里 bootloader 写的是
+/// `a2a08ff43…`——属性被改过后就再也回不去。bootconfig 只读，拿它当准。
+fn normalize_vbmeta_digest() {
+    // 伪装优先：写了就用写的（并保证属性也真是它），没写才用 bootloader 的真值。
+    let truth = props_conf_value("ro.boot.vbmeta.digest")
+        .or_else(crate::plat::vbmeta::bootloader_vbmeta_digest);
+    let Some(truth) = truth else {
+        return;
+    };
+    let current = resetprop::read_string_property("ro.boot.vbmeta.digest").unwrap_or_default();
+    if current.eq_ignore_ascii_case(&truth) {
+        return;
+    }
+    set_prop("ro.boot.vbmeta.digest", &truth);
+    log(&format!(
+        "vbmeta digest: property was {current}, set to {truth}"
+    ));
+}
+
+fn props_conf_value(key: &str) -> Option<String> {
+    let text = fs::read_to_string(PROPS_CONF).ok()?;
+    config_value(&text, key)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn sync_remote_identity() {
-    let remote_mode = fs::read_to_string(CONF_PATH)
-        .ok()
-        .and_then(|text| config_value(&text, "remote").map(|value| value.trim().to_string()))
-        .is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
+    let configured = fs::read_to_string(CONF_PATH).unwrap_or_default();
+    let remote_mode = config_value(&configured, "remote").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
 
     if !remote_mode {
         // 本地模式：把上次远程留下的 boot 状态改回「已锁定 + 已验证」，
         // 跟证书那侧的口径保持一致。
+        lock_down_boot_state();
+        return;
+    }
+
+    // 只有真连得上远端 B 才拿 identity 刷属性。以前只看 remote 开关：面板勾了远端
+    // 而 device_id/token 没填时，链其实是本地出的，属性却被 B（或上一次）的旧值
+    // 刷回去 —— boot 补丁就此锁死，本机就是这么锁在 2025-03-01 的。
+    let remote_ready = ["device_id", "token"]
+        .iter()
+        .all(|key| config_value(&configured, key).is_some_and(|v| !v.trim().is_empty()));
+    if !remote_ready {
         lock_down_boot_state();
         return;
     }
@@ -428,11 +582,7 @@ fn sync_remote_identity() {
         if boot.len() == 8 && boot.chars().all(|c| c.is_ascii_digit()) {
             let (y, m, d) = (&boot[0..4], &boot[4..6], &boot[6..8]);
             let text = format!("{y}-{m}-{d}");
-            for prop in [
-                "ro.vendor.boot_security_patch",
-                "ro.boot.build.security_patch",
-                "ro.boot.image.build.security_patch",
-            ] {
+            for prop in BOOT_PATCH_PROPS {
                 set_prop(prop, &text);
             }
             if let Some(epoch) = epoch_from_ymd(y, m, d) {

@@ -22,6 +22,13 @@ const BOOT_PATCH_PROP: &str = "ro.vendor.boot_security_patch";
 const BOOT_PATCH_ALT_PROP: &str = "ro.boot.build.security_patch";
 /// AProbe 的 A13 查的就是这个名字（`boot.image`，不是 `boot.build`）。
 const BOOT_PATCH_APROBE_PROP: &str = "ro.boot.image.build.security_patch";
+
+/// boot 补丁的三个属性变体，第一个是权威名。
+///
+/// 归一之后三个一起写成同一个值：面板伪装只写这一处，检测器（AProbe A13 读的是
+/// `ro.boot.image.build.security_patch`）和出链读的也就是同一份，不用每处各猜一遍。
+const BOOT_PATCH_VARIANTS: [&str; 3] =
+    [BOOT_PATCH_APROBE_PROP, BOOT_PATCH_PROP, BOOT_PATCH_ALT_PROP];
 const VBMETA_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
 const VBMETA_HASH_PROP: &str = "ro.boot.vbmeta.digest";
 const AVB_HEADER_SIZE: usize = 256;
@@ -219,23 +226,36 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
         .or_else(|| read_build_prop_value(VENDOR_PATCH_PROP))
         .or_else(|| resetprop::read_string_property(SECURITY_PATCH_PROP))
         .or_else(|| read_build_prop_value(SECURITY_PATCH_PROP));
+    // boot 分区内嵌 vbmeta 里的补丁日期是**镜像事实**：跟 os/vendor 同一次 OTA，
+    // 不会像 bootloader 属性那样停在旧值（本机实测属性 2025-03-01、分区 2026-08-01，
+    // 因为厂商没跟着刷 bootloader）。所以 auto 模式下它排在属性前面，两者不一致时
+    // 以它为准并打一条 warn —— 以前是属性优先，旧日期就此锁进链里。
+    let avb_boot_patch = match read_abl_boot_patchlevel() {
+        Ok(value) => Some(value.to_string()),
+        Err(error) => {
+            log::debug!("failed to resolve boot patch level from boot metadata: {error:#}");
+            None
+        }
+    };
+    if let (Some(prop), Some(avb)) = (property_boot_patch.as_deref(), avb_boot_patch.as_deref()) {
+        if boot_patchlevel_wire(prop) != boot_patchlevel_wire(avb) {
+            log::warn!(
+                "boot patch level mismatch: property {prop}, boot image {avb}; using the boot image value"
+            );
+        }
+    }
+    // 顺序：daemon 算好的最终值（伪装优先）→ boot 分区真值 → 属性 → 编译日期。
+    //
+    // 以前属性排第一，属性被污染后旧日期就锁进链里；反过来把 AVB 排第一又有另一个
+    // 毛病：用户明明伪装了日期，链上还是真值。所以优先级统一在 daemon 里定，结果落进
+    // `patch.state`，这里只管用它。
+    let state_boot_patch = read_boot_patchlevel_state();
     let boot_patch = if trust.boot_patchlevel.trim() == "auto" {
-        // 顺序：属性 → boot 镜像编译日期 → AVB 元数据。
-        //
-        // 属性是面板「伪装参数」和服务器同步写的那份，最先认；没有的话用 boot
-        // 镜像的编译日期 —— 检测器比的就是它（ro.bootimage.build.date.utc 与链上
-        // boot 补丁），跟它对上才不会差几个月。AVB 里的值放最后：不少机型那里陈
-        // 旧得很，只能当个兜底。
-        property_boot_patch
+        state_boot_patch
             .clone()
+            .or(avb_boot_patch.clone())
+            .or(property_boot_patch.clone())
             .or_else(bootimage_date_patchlevel)
-            .or_else(|| match read_abl_boot_patchlevel() {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    log::warn!("failed to resolve boot patch level from boot metadata: {error:#}");
-                    None
-                }
-            })
     } else {
         property_boot_patch
     };
@@ -473,6 +493,139 @@ fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
     decoded
         .try_into()
         .map_err(|decoded: Vec<u8>| anyhow!("hex value must be 32 bytes, got {}", decoded.len()))
+}
+
+/// 比较用的线值：`2026-08-01` 与 `20260801` 视为同一个补丁日期。
+fn boot_patchlevel_wire(value: &str) -> Option<u32> {
+    crate::keymaster::keymint_device::extract_boot_patchlevel(value).ok()
+}
+
+/// boot 分区里的补丁日期（`YYYY-MM-DD`）。开机归一时用它对齐三个属性，
+/// 免得每次出链都要去翻分区。
+pub fn boot_image_patchlevel_date() -> Result<String> {
+    let raw = read_abl_boot_patchlevel()?;
+    let value = crate::keymaster::keymint_device::extract_boot_patchlevel(&raw)
+        .map_err(anyhow::Error::msg)?;
+    Ok(format!(
+        "{:04}-{:02}-{:02}",
+        value / 10000,
+        (value / 100) % 100,
+        value % 100
+    ))
+}
+
+/// 顶层 vbmeta 的公钥摘要（SHA256(public key)），就是链上的 `verifiedBootKey`。
+///
+/// bootloader 只在 bootconfig 里给 `androidboot.vbmeta.digest`（对应 verifiedBootHash），
+/// 不给公钥摘要；原生 HAL 自己读分区算。以前我们拿 boot hash 派生一个、后来变成全零，
+/// 两个都不是真值，检测器一看就知道。这里按 AVB 规范算真的。
+pub fn boot_image_public_key_digest() -> Result<String> {
+    let slot_suffix = resetprop::read_string_property("ro.boot.slot_suffix").unwrap_or_default();
+    let top_level = load_vbmeta_blob(&find_top_level_vbmeta_path(&slot_suffix)?)?;
+    let key = avb_public_key(&top_level)?;
+    Ok(hex::encode(
+        ring::digest::digest(&ring::digest::SHA256, key).as_ref(),
+    ))
+}
+
+/// 在 vbmeta 里找 AVB 公钥结构：`num_bits(u32=2048) + n0inv(u32) + modulus(256) + rr(256)`。
+///
+/// 不定死偏移：这台 ROM 的 offset 字段跟 AOSP 的基准不一致（hash_offset 是 0、公钥偏移
+/// 相对 aux block），按规矩解析会指错地方；直接按结构扫反而稳，同一把 key 扫到的几处
+/// 摘要都一样。
+fn avb_public_key(vbmeta: &[u8]) -> Result<&[u8]> {
+    const KEY_LEN: usize = 520;
+    // 先走 O(1)：按 header 里的偏移取候选，两种基准都试（AOSP 是相对文件头，
+    // 本机这 ROM 实测是相对 aux block）。取到先验证结构像公钥，不像才退化成扫描。
+    if vbmeta.len() >= AVB_HEADER_SIZE && &vbmeta[..4] == b"AVB0" {
+        if let (Ok(pub_off), Ok(pub_sz), Ok(auth_sz)) = (
+            be_u64(&vbmeta[64..72]),
+            be_u64(&vbmeta[72..80]),
+            be_u64(&vbmeta[12..20]),
+        ) {
+            if pub_sz == KEY_LEN {
+                for start in [pub_off, AVB_HEADER_SIZE + auth_sz + pub_off] {
+                    if let Some(candidate) = vbmeta.get(start..start + KEY_LEN) {
+                        if looks_like_avb_public_key(candidate) {
+                            return Ok(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 兜底：按结构扫。不定死偏移是因为各 ROM 的 offset 基准不一定一样，
+    // 扫一遍最多 64KB/4 = 16K 次比较，只在上面全部失败时才走。
+    if vbmeta.len() < KEY_LEN {
+        bail!("vbmeta is too small to hold a public key");
+    }
+    for start in (0..=vbmeta.len() - KEY_LEN).step_by(4) {
+        let candidate = &vbmeta[start..start + KEY_LEN];
+        if looks_like_avb_public_key(candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("no AVB public key found in vbmeta")
+}
+
+/// AVB 公钥结构：`num_bits(u32=2048) + n0inv(u32) + modulus(256) + rr(256)`。
+fn looks_like_avb_public_key(candidate: &[u8]) -> bool {
+    const RSA_2048_BITS: [u8; 4] = [0x00, 0x00, 0x08, 0x00];
+    candidate.len() >= 8
+        && candidate[..4] == RSA_2048_BITS
+        && candidate[4..8].iter().any(|b| *b != 0)
+}
+
+/// bootloader 实际算出来的 vbmeta 摘要（`androidboot.vbmeta.digest`）。
+///
+/// `ro.boot.vbmeta.digest` 只是 init 从 bootconfig 拄过来的一份，抄完谁都能 resetprop；
+/// 一旦抄坏，链和属性就会互相喂着错下去。bootconfig 本身是 bootloader 写的、只读的，
+/// 拿它当最后的真值。
+pub fn bootloader_vbmeta_digest() -> Option<String> {
+    for path in ["/proc/bootconfig", "/proc/cmdline"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(value) = find_bootloader_digest(&text) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn find_bootloader_digest(text: &str) -> Option<String> {
+    for line in text.lines() {
+        // bootconfig 是 `key = "value"`，cmdline 是 `key=value`。
+        let Some(rest) = line.trim().strip_prefix("androidboot.vbmeta.digest") else {
+            continue;
+        };
+        let value = rest
+            .trim_start_matches(|c: char| c == '=' || c.is_whitespace())
+            .trim_matches('"')
+            .trim();
+        if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(value.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// 归一后的 boot 补丁值落盘位置（daemon 写、keymint 读）。
+///
+/// 为什么不直接让 keymint 读 props.conf：keystore 域读不了 `/data/adb`；而这个文件
+/// 就在 `/data/misc/ommega` 里，是 TA 自己的目录。伪装和真值的优先级只在 daemon 里
+/// 判一次，落进这个文件，出链就只认它 —— 不会出现「属性伪装了、链上却是真值」。
+const PATCH_STATE_PATH: &str = "/data/misc/ommega/patch.state";
+
+/// 读 daemon 算好的 boot 补丁值。
+fn read_boot_patchlevel_state() -> Option<String> {
+    let text = std::fs::read_to_string(PATCH_STATE_PATH).ok()?;
+    text.lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "boot_patchlevel").then(|| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
 }
 
 fn read_abl_boot_patchlevel() -> Result<String> {

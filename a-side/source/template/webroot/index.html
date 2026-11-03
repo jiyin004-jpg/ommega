@@ -718,6 +718,13 @@ Object.keys(ATTK_STATE_TEXT).forEach(function(code){
   I18N[code]["toast.skCleared"] = s.cleared;
 });
 var MANAGED = REMOTE_FIELDS.map(function(f){ return f.key; });
+/* boot 补丁的三个属性变体：写就写全。出链/检测器各自认一个名字，归一之前三份打
+   架过（属性旧、分区新），一份写全了以后读哪份都一样。
+   第一个是权威名：bootloader 和 AProbe 的 A13 都用它，daemon 的 OMMEGA_PATCH_BOOT
+   也是从它取的。 */
+var BOOT_PATCH_PROPS = ["ro.boot.image.build.security_patch"];
+var BOOT_PATCH_EXTRA_KEYS = ["ro.boot.build.security_patch", "ro.vendor.boot_security_patch"];
+BOOT_PATCH_PROPS = BOOT_PATCH_PROPS.concat(BOOT_PATCH_EXTRA_KEYS);
 var curConfText = "", curPropsText = "";
 /* 伪装参数写进 props.conf 的键。两组：
    PATCH_KEYS = 启动链那几项（模式2 只写这些）；
@@ -731,7 +738,8 @@ var PATCH_KEYS = ["ro.boot.vbmeta.digest", "ro.build.version.security_patch",
                      OMMEGA_PATCH_BOOT，AProbe 的 A13 也拿它当期望值。只写 bootimage 日期的话，
                      keystore 域里那条 ro.boot.image.build.security_patch 会退回镜像里写死的值。*/
                   "ro.boot.image.build.security_patch",
-                  "ro.bootimage.build.date.utc", "ro.bootimage.build.date"];
+                  "ro.bootimage.build.date.utc", "ro.bootimage.build.date"]
+                 .concat(BOOT_PATCH_EXTRA_KEYS);
 var IDENT_ROOT_KEYS = ["ro.product.brand", "ro.product.device", "ro.product.name",
                        "ro.product.manufacturer", "ro.product.model"];
 var IDENT_PART_KEYS = [];
@@ -1006,6 +1014,11 @@ async function writeFile(path, text, mode){
   var cmd = "mkdir -p " + dir + " 2>/dev/null; printf '%s' '" + b64(text) + "' | base64 -d > " + path;
   if (mode) cmd += " && chmod " + mode + " " + path;
   return exec(cmd);
+}
+/* 戳一下重启请求：daemon 看到 run/restart.keymint 就重启 keymint，让它重新 resolve
+   一遍配置和属性（伪装参数存完，链上的值才会跟着变）。 */
+async function kickKeymint(){
+  try { await writeFile("/data/adb/ommega/run/restart.keymint", "", "0644"); } catch (e){}
 }
 function parseKV(text, sep){
   var out = {};
@@ -2290,24 +2303,26 @@ async function syncPatch(){
   if (bootPatch){
     var bootEpoch = patchDateToEpoch(bootPatch);
     if (bootEpoch){
-      kv["ro.boot.image.build.security_patch"] = bootPatch;
+      BOOT_PATCH_PROPS.forEach(function(k){ kv[k] = bootPatch; });
       kv["ro.bootimage.build.date.utc"] = String(bootEpoch);
       kv["ro.bootimage.build.date"] = epochToPatchDateText(bootEpoch);
     }
   }
   if (!(await writePropsKV(kv))) return;
   await saveRemote();
-  /* 只当场该那两项：重启前 zygote 里的 Build 已经固化，身份那几项只能等下次开机。 */
+  /* props.conf 里写的是下次开机生效的那份；这里再把同一批值当场 resetprop 一遍，
+     不用等到重启。身份那几项（ro.product.* / 指纹 / release）属性会改，但 zygote
+     里的 Build 已经固化，只能等下次开机才看得到。 */
   var now = {};
-  if (kv["ro.boot.image.build.security_patch"]) now["ro.boot.image.build.security_patch"] = kv["ro.boot.image.build.security_patch"];
-  if (kv["ro.bootimage.build.date.utc"]) now["ro.bootimage.build.date.utc"] = kv["ro.bootimage.build.date.utc"];
-  if (kv["ro.bootimage.build.date"]) now["ro.bootimage.build.date"] = kv["ro.bootimage.build.date"];
-  if (kv["ro.boot.vbmeta.digest"]) now["ro.boot.vbmeta.digest"] = kv["ro.boot.vbmeta.digest"];
+  Object.keys(kv).forEach(function(k){ var v = kv[k]; if (v) now[k] = v; });
   var keys = Object.keys(now);
   if (keys.length){
     await exec(keys.map(function(k){
       return '(R=' + RESETPROP + '; [ -x "$R" ] || R=resetprop; "$R" -n ' + k + " " + quoteShell(now[k]) + ")";
     }).join("; "));
+    /* 属性是当场改了，但链里的值在 keymint 启动时就算好了。不戳这一下，面板说
+       「已生效」而链上还是旧的，得等到下次开机。 */
+    await kickKeymint();
   }
   refreshPatchSummary();
   refreshSoter().catch(function(){});
@@ -2333,26 +2348,20 @@ async function savePatch(){
   if (boot){
     var bootEpoch = patchDateToEpoch(boot);
     if (!bootEpoch){ toast(t("toast.patchBad", {field: t("patch.boot")}), true); return; }
-    kv["ro.boot.image.build.security_patch"] = boot;
+    BOOT_PATCH_PROPS.forEach(function(k){ kv[k] = boot; });
     kv["ro.bootimage.build.date.utc"] = String(bootEpoch);
     kv["ro.bootimage.build.date"] = epochToPatchDateText(bootEpoch);
   }
   if (!(await writePropsKV(kv))) return;
+  /* 同保存那条：props.conf 管下次开机，这里当场再改一遍属性，keymint 重启后链就跟着换。 */
   var now = {};
-  if (boot){
-    var ep = patchDateToEpoch(boot);
-    if (ep){
-      now["ro.boot.image.build.security_patch"] = boot;
-      now["ro.bootimage.build.date.utc"] = String(ep);
-      now["ro.bootimage.build.date"] = epochToPatchDateText(ep);
-    }
-  }
-  if (hash) now["ro.boot.vbmeta.digest"] = hash;
+  Object.keys(kv).forEach(function(k){ var v = kv[k]; if (v) now[k] = v; });
   var keys = Object.keys(now);
   if (keys.length){
     await exec(keys.map(function(k){
       return '(R=' + RESETPROP + '; [ -x "$R" ] || R=resetprop; "$R" -n ' + k + " " + quoteShell(now[k]) + ")";
     }).join("; "));
+    await kickKeymint();
   }
   toast(keys.length ? t("toast.savedApplied") : t("toast.savedBoot"));
   refreshPatchSummary();
