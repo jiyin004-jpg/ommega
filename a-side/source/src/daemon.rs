@@ -61,12 +61,11 @@ pub fn run(extra: Vec<String>) -> ! {
         std::process::exit(0);
     }
     log("keymint daemon started");
+    // 伪装参数只在开机（或本守护重启）时算一次：面板保存只写 props.conf，
+    // 不会即时改运行时；这样属性和证书永远是同一份，不会一边新一边旧。
+    normalize_all();
 
     loop {
-        // 每次拉起 keymint 之前都重新算一遍：面板保存（清掉伪装也算）会戳
-        // restart.keymint，归一必须跟着重跑，不然属性会一直停在旧的伪装值上。
-        normalize_all();
-
         let Some(target) = find_keymint() else {
             log("keymint binary not found");
             sleep(Duration::from_secs(5));
