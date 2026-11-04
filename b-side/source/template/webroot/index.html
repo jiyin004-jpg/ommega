@@ -207,7 +207,6 @@
       <div class="kv"><span data-i18n="about.qq"></span><span class="link" data-open="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=2167063739&amp;card_type=group" data-open-fallback="https://qm.qq.com/cgi-bin/qm/qr?group_code=2167063739">2167063739</span></div>
       <div class="kv"><span>GitHub</span><span class="link" data-open="https://github.com/jiyin004-jpg/ommega">jiyin004-jpg/ommega</span></div>
       <p class="hint" data-i18n="about.disclaimer"></p>
-      <p class="hint hidden" id="egg-line"> 不要再点了 </p>
     </div>
   </div>
 </div>
@@ -1078,23 +1077,6 @@ async function removeSkip(pkg){
     };
     document.getElementById("open-status").onclick = function(){ openStatus().catch(function(){}); };
     document.getElementById("about-btn").onclick = function(){ document.getElementById("about-modal").className = "modal"; };
-    var eggTaps = 0, eggTimer = 0, eggTitleTimer = 0;
-    var eggTitle = document.querySelector(".topbar h1");
-    eggTitle.onclick = function(){
-      eggTaps++;
-      clearTimeout(eggTimer);
-      eggTimer = setTimeout(function(){ eggTaps = 0; }, 1800);
-      if (eggTaps >= 5){
-        eggTaps = 0;
-        var line = document.getElementById("egg-line");
-        if (line) line.classList.remove("hidden");
-        eggTitle.textContent = "Ommega-B";
-        clearTimeout(eggTitleTimer);
-        eggTitleTimer = setTimeout(function(){ eggTitle.textContent = "Ommega-B"; }, 2600);
-        toast("原神,启动!");
-        try { console.log("%c原神,启动!", "font-size:14px;color:#3867d6"); } catch (e){}
-      }
-    };
     document.querySelectorAll("[data-open]").forEach(function(n){
       n.onclick = function(){ openExternal(n.dataset.open, n.dataset.openFallback); };
     });
