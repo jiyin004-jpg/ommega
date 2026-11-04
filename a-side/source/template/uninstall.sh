@@ -144,9 +144,11 @@ rm -f "$STATE_DIR"/logs/adbr.log "$STATE_DIR"/logs/adbr-daemon.log \
       "$STATE_DIR"/logs/watchdog.log 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# 4. WebUI temp files
+# 4. /data/local/tmp 里的遗留文件
 # ---------------------------------------------------------------------------
-rm -f /data/local/tmp/ommega_save.log /data/local/tmp/ommega_*.log 2>/dev/null
+# 1.7.14 及以前这些东西落在 shell 的公共目录，新版本已经不写了，卸载时把老装机上的残留清掉。
+rm -f /data/local/tmp/ommega_save.log /data/local/tmp/ommega_*.log /data/local/tmp/ommega-*.log \
+      /data/local/tmp/adbr.log 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # 5. Drop the shared state dir only if it is now completely empty (i.e. the

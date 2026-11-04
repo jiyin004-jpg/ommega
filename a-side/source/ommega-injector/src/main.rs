@@ -525,18 +525,16 @@ fn install_payload_panic_hook() {
                 "<non-string panic>".to_string()
             };
             log::error!("payload panic at {location}: {msg}");
-            for path in [
-                "/data/misc/ommega/logs/panic.log",
-                "/data/local/tmp/ommega-panic.log",
-            ] {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] {location}: {msg}", std::process::id());
-                }
+            // 只落数据根的 logs（1777 + sticky，app 域的 payload 也写得进去）。
+            // 以前另写一份 /data/local/tmp/ommega-panic.log 兜底，那是 shell 的
+            // 公共目录，不再拿它当我们的落盘位置。
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/data/misc/ommega/logs/panic.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "[{}] {location}: {msg}", std::process::id());
             }
         }));
     });

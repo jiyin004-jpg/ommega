@@ -128,7 +128,8 @@ SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
 # 以前这里只写死 ksud 的绝对路径，非 KSU 的机器上这个函数直接 return 0、一次都没
 # apply 过 —— 症状是开机后 20 秒（service 阶段）规则失效，payload 读 injector.toml
 # 吃 EACCES，keymint 一条链都出不来，而面板看着一切正常。
-SEPOLICY_LOG=/data/local/tmp/ommega-sepolicy-apply.log
+# 结果跟其它日志一起落数据根的 logs，不再用 /data/local/tmp（那是 shell 的公共目录）。
+SEPOLICY_LOG=${DATA_ROOT:-/data/misc/ommega}/logs/sepolicy-apply.log
 [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
 ensure_sepolicy() {
   [ -f "$MODDIR/sepolicy.rule" ] || return 0

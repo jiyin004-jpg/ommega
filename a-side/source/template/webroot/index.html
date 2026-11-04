@@ -1712,15 +1712,13 @@ async function refreshCount(){
 var __pkgCache = null, __pkgAt = 0;
 function loadPackages(){
   // 整页最慢的一步就是这里：`pm list packages` 在这类机器上单条就要几百毫秒
-  // 到两秒。所以做两件事：①包列表 60 秒内不重复拉（几十秒内基本不会变，每次
-  // 进页面都重拉是纯浪费）；②两条 pm 并行跑（各自落临时文件再一起 cat），别
-  // 串行等。
+  // 到两秒，所以 60 秒内不重复拉（几十秒内基本不会变，每次进页面都重拉是纯浪费）。
+  // 不往 /data/local/tmp 落临时文件：那是 shell 的公共目录，我们不留东西；
+  // 两条 pm 顺序跑，中间用一个分隔行切开。
   var now = Date.now();
   if (__pkgCache && (now - __pkgAt) < 60000) return Promise.resolve(__pkgCache);
-  var script = "A=/data/local/tmp/.ommega_pkg3; B=/data/local/tmp/.ommega_pkgs; "
-    + "pm list packages -3 2>/dev/null | sed 's/^package://' > $A & "
-    + "pm list packages -s 2>/dev/null | sed 's/^package://' > $B & wait; "
-    + "cat $A; echo '---'; cat $B; rm -f $A $B";
+  var script = "pm list packages -3 2>/dev/null | sed 's/^package://'; echo '---'; "
+    + "pm list packages -s 2>/dev/null | sed 's/^package://'";
   return exec(script)
     .then(function(r){
       var parts = r.stdout.split("---");

@@ -26,10 +26,11 @@ DB_DIR=$STATE_DIR/db
 # 重放，APatch 看版本。所以这里不挑管理器，统一交给 `sepolicy_apply.sh` 按工具能力
 # 依次试（ksud → magiskpolicy），谁有就用谁。
 #
-# 结果写到 /data/local/tmp（adb 读得到）：之前它静默失败，avc 一直在刷，
-# 但没有任何地方能看到到底跑没跑、失败在哪、用的是哪个工具。
+# 结果写进数据根的 logs（1777 + sticky，payload 要写；adb 也读得到）：
+# 以前落在 /data/local/tmp —— 那是 shell 的公共目录，不该有我们常驻的文件，卸载也清不干净。
+# 之前它静默失败，avc 一直在刷，但没有任何地方能看到到底跑没跑、失败在哪、用的是哪个工具。
 if [ -f "$MODDIR/sepolicy.rule" ]; then
-  _apply_log=/data/local/tmp/ommega-sepolicy-apply.log
+  _apply_log="${DATA_ROOT:-/data/misc/ommega}/logs/sepolicy-apply.log"
   : > "$_apply_log" 2>/dev/null
   [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
   if command -v ommega_apply_sepolicy >/dev/null 2>&1; then
