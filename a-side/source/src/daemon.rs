@@ -204,7 +204,9 @@ fn config_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 // + `packages_list_file`，DAC 和 SELinux 两头都拦）。本守护一直是 root，读得到，
 // 那就抄一份到数据根，TA 从那里拿。
 //
-// 表里行格式：`uid 包名 版本号`（`#` 开头是注释）。版本号从 `pm` 拿，拿不到写 1。
+// 表里行格式：`uid 包名 版本号 签名摘要`（`#` 开头是注释；摘要拿不到写 `-`）。
+// 版本号和 APK 路径从 `pm list packages -f --show-versioncode` 拿，
+// 签名摘要是 APK 签名证书的 SHA-256 —— 就是 AAID（709）里那个 signatureDigests。
 // 只 stat `packages.list`，装/卸载才会变，变了才重抄 —— 常驻零开销。
 fn aaid_sync_loop() {
     let mut last_stamp: Option<(u64, u64)> = None;
@@ -234,8 +236,9 @@ fn sync_aaid_table() -> bool {
         log("aaid table: cannot read packages.list");
         return false;
     };
-    let versions = package_versions();
-    let mut body = String::from("# uid package versionCode  (from /data/system/packages.list)\n");
+    let entries = package_entries();
+    let mut body =
+        String::from("# uid package versionCode sigDigest  (from packages.list + APK)\n");
     let mut count = 0usize;
     for line in list.lines() {
         let mut fields = line.split_whitespace();
@@ -246,12 +249,13 @@ fn sync_aaid_table() -> bool {
         else {
             continue;
         };
-        let version = versions
-            .iter()
-            .find(|(package, _)| package == name)
-            .map(|(_, code)| *code)
-            .unwrap_or(1);
-        body.push_str(&format!("{uid} {name} {version}\n"));
+        let entry = entries.iter().find(|entry| entry.package == name);
+        let version = entry.map(|entry| entry.version).unwrap_or(1);
+        let digest = entry
+            .and_then(|entry| signing_cert_digest(&entry.apk))
+            .map(hex::encode)
+            .unwrap_or_else(|| "-".to_string());
+        body.push_str(&format!("{uid} {name} {version} {digest}\n"));
         count += 1;
     }
     if count == 0 {
@@ -278,12 +282,18 @@ fn sync_aaid_table() -> bool {
     true
 }
 
-/// `pm list packages --show-versioncode` → `(包名, 版本号)`。
-/// 拿不到就空表（调用方回落成 1）—— 版本号只是证书里给人看的一个字段，
-/// 不值得为它重试或者拖慢守护。
-fn package_versions() -> Vec<(String, i64)> {
+struct PackageEntry {
+    package: String,
+    version: i64,
+    apk: PathBuf,
+}
+
+/// `pm list packages -f --show-versioncode` 一趟拿全：
+/// `package:/data/app/~~xxxx/base.apk=com.foo versionCode:123`。
+/// 带 `-f` 才有 APK 路径，不然得去猜 `/data/app` 下那串目录名。
+fn package_entries() -> Vec<PackageEntry> {
     let output = match Command::new("/system/bin/pm")
-        .args(["list", "packages", "--show-versioncode"])
+        .args(["list", "packages", "-f", "--show-versioncode"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -292,23 +302,165 @@ fn package_versions() -> Vec<(String, i64)> {
         _ => return Vec::new(),
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut versions = Vec::new();
+    let mut entries = Vec::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("package:") else {
             continue;
         };
-        let mut fields = rest.split_whitespace();
-        let Some(name) = fields.next() else { continue };
-        let Some(code) = fields
+        // 路径里带着 `~~xxxx==` 这种哈希，里面就有 `=`；包名一定是最后一个 `=` 后面那段。
+        let Some((apk, tail)) = rest.rsplit_once('=') else {
+            continue;
+        };
+        let mut fields = tail.split_whitespace();
+        let Some(package) = fields.next() else {
+            continue;
+        };
+        let version = fields
             .next()
             .and_then(|value| value.strip_prefix("versionCode:"))
             .and_then(|value| value.parse::<i64>().ok())
-        else {
-            continue;
-        };
-        versions.push((name.to_string(), code));
+            .unwrap_or(1);
+        entries.push(PackageEntry {
+            package: package.to_string(),
+            version,
+            apk: PathBuf::from(apk),
+        });
     }
-    versions
+    entries
+}
+
+// APK 签名块里的 scheme id（v2 / v3），跟 AOSP apksig 里的常量一致。
+const APK_SIG_SCHEME_V2: u32 = 0x7109_871a;
+const APK_SIG_SCHEME_V3: u32 = 0xf053_68c0;
+const APK_SIG_BLOCK_MAGIC: &[u8; 16] = b"APK Sig Block 42";
+
+/// APK 签名证书的 SHA-256 —— AAID（tag 709）里 `signatureDigests` 就是这个值。
+/// 拿不到就 None（表里写 `-`）：宁可空着，也不能塞个假摘要。
+fn signing_cert_digest(apk: &Path) -> Option<Vec<u8>> {
+    use kmr_common::crypto::Sha256;
+    let cert = apk_signing_cert(apk)?;
+    kmr_crypto_ommega::sha256::OmmegaSha256 {}
+        .hash(&cert)
+        .ok()
+        .map(|digest| digest.to_vec())
+}
+
+/// 先 v3 再 v2（跟 apksig 一样优先新方案）。
+/// 从 EOCD 拿中央目录偏移，中央目录紧前面就是签名块，块里取
+/// `signed_data.certificates` 的第一张证书。
+fn apk_signing_cert(apk: &Path) -> Option<Vec<u8>> {
+    match apk_signing_cert_inner(apk) {
+        Ok(cert) => Some(cert),
+        Err(stage) => {
+            log(&format!("aaid: {} failed at {stage}", apk.display()));
+            None
+        }
+    }
+}
+
+fn apk_signing_cert_inner(apk: &Path) -> Result<Vec<u8>, &'static str> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(apk).map_err(|_| "open")?;
+    let len = file.metadata().map_err(|_| "stat")?.len();
+    if len < 64 {
+        return Err("too-small");
+    }
+
+    // EOCD 从文件尾 22 字节起，前面最多还有 64KiB 的注释。
+    let tail_len = std::cmp::min(len, 64 * 1024 + 22) as usize;
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::Start(len - tail_len as u64))
+        .map_err(|_| "seek-tail")?;
+    file.read_exact(&mut tail).map_err(|_| "read-tail")?;
+    let mut eocd = None;
+    for i in (0..tail.len().saturating_sub(21)).rev() {
+        if tail[i..i + 4] == [b'P', b'K', 5, 6] {
+            eocd = Some(i);
+            break;
+        }
+    }
+    let eocd = eocd.ok_or("no-eocd")?;
+    let cd_offset = le_u32(&tail, eocd + 16).ok_or("no-cd-offset")? as u64;
+    if cd_offset < 32 || cd_offset > len {
+        return Err("bad-cd-offset");
+    }
+
+    // 中央目录前面 24 字节：块长(8) + magic(16)。
+    let mut footer = [0u8; 24];
+    file.seek(SeekFrom::Start(cd_offset - 24))
+        .map_err(|_| "seek-footer")?;
+    file.read_exact(&mut footer).map_err(|_| "read-footer")?;
+    if &footer[8..24] != APK_SIG_BLOCK_MAGIC {
+        return Err("no-block-magic");
+    }
+    let block_size = u64::from_le_bytes(footer[0..8].try_into().map_err(|_| "footer-size")?);
+    if block_size + 8 > cd_offset {
+        return Err("block-too-big");
+    }
+    let block_start = cd_offset - block_size - 8;
+    let mut block = vec![0u8; (block_size + 8) as usize];
+    file.seek(SeekFrom::Start(block_start))
+        .map_err(|_| "seek-block")?;
+    file.read_exact(&mut block).map_err(|_| "read-block")?;
+
+    // 布局：size(8) + (len(8)+id(4)+value)* + size(8) + magic(16)
+    let pairs_end = block.len().checked_sub(24).ok_or("short-block")?;
+    let mut pos = 8usize;
+    let mut v2 = None;
+    let mut v3 = None;
+    while pos + 12 <= pairs_end {
+        let pair_len = u64::from_le_bytes(
+            block
+                .get(pos..pos + 8)
+                .and_then(|raw| raw.try_into().ok())
+                .ok_or("pair-len")?,
+        ) as usize;
+        pos += 8;
+        if pair_len < 4 || pos + pair_len > block.len() {
+            break;
+        }
+        let id = u32::from_le_bytes(block[pos..pos + 4].try_into().map_err(|_| "pair-id")?);
+        let value = &block[pos + 4..pos + pair_len];
+        match id {
+            APK_SIG_SCHEME_V3 => v3 = Some(value),
+            APK_SIG_SCHEME_V2 => v2 = Some(value),
+            _ => {}
+        }
+        pos += pair_len;
+    }
+
+    let value = v3.or(v2).ok_or("no-v2-v3")?;
+    first_signer_cert(value)
+        .map(<[u8]>::to_vec)
+        .ok_or("no-cert")
+}
+
+/// 长度前缀（u32 小端）切一段，返回 (这一段, 剩下)。
+fn lp32(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    let body = buf.get(4..4 + len)?;
+    Some((body, &buf[4 + len..]))
+}
+
+/// v2/v3 的值：signers → 第一个 signer → signed_data → (digests, certificates) → 第一张证书。
+/// 注意层级：`certificates` 已经是「证书序列」那个 blob 了，里面第一段就是第一张证书的
+/// 长度前缀 + DER，不要再往下一层。
+fn first_signer_cert(value: &[u8]) -> Option<&[u8]> {
+    let (signers, _) = lp32(value)?;
+    let (signer, _) = lp32(signers)?;
+    let (signed_data, _) = lp32(signer)?;
+    let (_digests, rest) = lp32(signed_data)?;
+    let (certificates, _) = lp32(rest)?;
+    let (cert, _) = lp32(certificates)?;
+    (!cert.is_empty()).then_some(cert)
+}
+
+fn le_u32(buf: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(buf.get(at..at + 4)?.try_into().ok()?))
 }
 
 // ---------------------------------------------------------------------------

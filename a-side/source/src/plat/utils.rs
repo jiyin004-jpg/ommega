@@ -12,6 +12,7 @@ use crate::android::apex::IApexService::IApexService;
 use crate::android::security::keystore::IKeyAttestationApplicationIdProvider::IKeyAttestationApplicationIdProvider;
 use crate::android::security::keystore::KeyAttestationApplicationId::KeyAttestationApplicationId;
 use crate::android::security::keystore::KeyAttestationPackageInfo::KeyAttestationPackageInfo;
+use crate::android::security::keystore::Signature::Signature;
 use crate::android::system::keystore2::{
     IKeystoreService::IKeystoreService, ResponseCode::ResponseCode,
 };
@@ -240,7 +241,8 @@ fn package_infos_from_packages_list(text: &str, uid: u32) -> Vec<KeyAttestationP
     package_infos
 }
 
-/// 守护写的表：「uid 包名 版本号」，`#` 开头是注释。
+/// 守护写的表：「uid 包名 版本号 签名摘要」，`#` 开头是注释。
+/// 签名摘要是 APK 签名证书的 SHA-256（十六进制），没有就是 `-`。
 fn package_infos_from_aaid_table(text: &str, uid: u32) -> Vec<KeyAttestationPackageInfo> {
     let mut package_infos = Vec::new();
     for line in text.lines() {
@@ -261,13 +263,26 @@ fn package_infos_from_aaid_table(text: &str, uid: u32) -> Vec<KeyAttestationPack
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(1);
+        let signatures = fields
+            .next()
+            .and_then(decode_signature_digest)
+            .into_iter()
+            .collect();
         package_infos.push(KeyAttestationPackageInfo {
             packageName: name.to_string(),
             versionCode: version,
-            ..Default::default()
+            signatures,
         });
     }
     package_infos
+}
+
+/// 表里存的是签名证书的 SHA-256（十六进制），这里把它当成「已经有了摘要的签名」交上去。
+/// `encode_application_id` 会对 32 字节的 `data` 直接当摘要用（证书不可能是 32 字节），
+/// 所以不会变成双重哈希。
+fn decode_signature_digest(value: &str) -> Option<Signature> {
+    let bytes = hex::decode(value).ok()?;
+    (!bytes.is_empty()).then_some(Signature { data: bytes })
 }
 
 /// 这个 uid 挂着哪些包（AAID 里那几个 `packageInfos` 的包名）。
@@ -535,10 +550,16 @@ fn encode_application_id(
 
     let mut signature_digests = Vec::new();
     for sig in &first_package.signatures {
+        // 32 字节就是已经算好的摘要（本地兜底表里存的那种）：证书不可能这么短，
+        // 再哈希一次就成了双重 SHA-256，跟 App 真实签名对不上。
+        if sig.data.len() == 32 {
+            signature_digests.push(sig.data.clone());
+            continue;
+        }
         let result = sha256
             .hash(sig.data.as_slice())
             .map_err(|e| anyhow::anyhow!("Failed to hash signature: {:?}", e))?;
-        signature_digests.push(result);
+        signature_digests.push(result.to_vec());
     }
 
     let mut signature_digest_records = Vec::new();
