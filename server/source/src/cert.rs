@@ -395,7 +395,8 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                     });
                 }
                 704 => {
-                    // Always present — matches Django's default vb_key/vb_hash = bytes(32)
+                    // Always present。没有 rootOfTrust 时也不能发全零：全零是「未签名 /
+                    // 异常」的明确特征，改用稳定派生值（同一序列号每次一样）。
                     let rot = p
                         .root_of_trust
                         .as_ref()
@@ -407,7 +408,18 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                                 r.verified_boot_hash.clone(),
                             )
                         })
-                        .unwrap_or_else(|| (vec![0u8; 32], true, 0i64, vec![0u8; 32]));
+                        .unwrap_or_else(|| {
+                            // 这条路径拿不到 device_id，只锚时间：同一小时内稳定。
+                            // 真正常走的路径是 fulfill 的 parse_ctx，那里锚的是 device_id + 小时。
+                            let stamp = current_hour_stamp();
+                            let seed = format!("serial-{}", p.serial);
+                            (
+                                boot_value_seed(&seed, "bootkey", &stamp).to_vec(),
+                                true,
+                                0i64,
+                                boot_value_seed(&seed, "boothash", &stamp).to_vec(),
+                            )
+                        });
                     w.next().write_tagged(yasna::Tag::context(704), |w| {
                         w.write_sequence(|w| {
                             w.next().write_bytes(&rot.0);
@@ -1062,6 +1074,33 @@ fn make_name(attrs: &[(&[u64], &[u8])]) -> Vec<u8> {
     let mut name = Der::new();
     name.seq(&name_content.into_vec()); // Name
     name.into_vec()
+}
+
+/// 兜底值的锚点：只到小时（UTC 的 `YYYYMMDDHH`）。
+///
+/// 同一小时内稳定，跨小时才换。不要用 app_id：那个在部分调用路径上没有，而且
+/// 也没必要——兜底值本来就不是真值，锚在时间上简单、不会缺。
+pub fn current_hour_stamp() -> String {
+    chrono::Utc::now().format("%Y%m%d%H").to_string()
+}
+
+/// 稳定的兜底值：同一输入 + 同一小时得到同一个 32 字节。
+///
+/// **绝不允许全零**：全零是「没有 rootOfTrust」的明确特征，本地链和远程链都不能
+/// 把它发出去，否则检测器和 Play Integrity 会直接当未签名设备处理。
+pub fn boot_value_seed(device_id: &str, kind: &str, stamp: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ommega-boot-value|");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"|");
+    hasher.update(device_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(stamp.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn default_name() -> Vec<u8> {

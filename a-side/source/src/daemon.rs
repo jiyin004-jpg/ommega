@@ -442,10 +442,17 @@ fn normalize_boot_patch() {
             None => match crate::plat::vbmeta::boot_image_patchlevel_date() {
                 Ok(value) => (value, "boot image"),
                 Err(error) => {
-                    log(&format!(
-                        "boot patch: cannot read boot image metadata: {error:#}"
-                    ));
-                    return;
+                    // AVB 读不到就退 vendor，跟出链侧的兜底一致；bootloader 那份
+                    // boot 属性不随 OTA 更新，不作为来源。
+                    match resetprop::read_string_property("ro.vendor.build.security_patch") {
+                        Some(v) if !v.trim().is_empty() => (v.trim().to_string(), "vendor"),
+                        _ => {
+                            log(&format!(
+                                "boot patch: cannot read boot image metadata: {error:#}"
+                            ));
+                            return;
+                        }
+                    }
                 }
             },
         },

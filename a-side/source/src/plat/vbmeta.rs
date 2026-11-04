@@ -165,6 +165,36 @@ fn derived_boot_key(hash: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// `#RRGGBB` 风格的 64 位十六进制串 → 32 字节。
+fn decode_hex32(value: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(value.trim()).ok()?;
+    bytes.try_into().ok()
+}
+
+/// 最后一道兜底：同一天内固定，跨天才换。
+///
+/// 不用随机、不用进程号（那些每笔请求都会变，检测器一看就知道是编的）；
+/// 也不用真机属性（已经读不到了）。
+fn derived_boot_hash() -> [u8; 32] {
+    let stamp = utc_day_stamp();
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(b"ommega/vbmeta-hash-fallback");
+    ctx.update(stamp.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}
+
+/// UTC 的 `YYYYMMDD`（兜底值用天做锚点）。
+fn utc_day_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let (year, month, day) = civil_from_days(secs / 86_400);
+    format!("{year:04}{month:02}{day:02}")
+}
+
 /// 当前 RootOfTrust：key / hash 读**当刻属性**（2 秒内复用），锁定与验证状态固定
 /// 「已锁定 + 已验证」。
 ///
@@ -178,9 +208,14 @@ fn derived_boot_key(hash: &[u8; 32]) -> [u8; 32] {
 /// 代价：缓存过期后的第一笔出证要 fork 两次（约 40ms）；连着来的几笔零开销。
 /// 属性真变了（daemon 同步了 B 的值）最多晚 2 秒被发现，可接受。
 pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
+    // 全零不往外发：全零是「没有 rootOfTrust」的明确特征，本地链和服务端兜底
+    // 都不能带它。属性读不到时退到 bootloader 的 bootconfig，再不行就「同一天内
+    // 稳定」地派生一个（跟服务端兜底同一个思路：锚时间，不锚随机）。
     let hash = cached_hex_property(VBMETA_HASH_PROP)
         .or_else(boot_hash_from_env)
-        .unwrap_or([0u8; 32]);
+        .filter(|h| h.iter().any(|b| *b != 0))
+        .or_else(|| bootloader_vbmeta_digest().and_then(|v| decode_hex32(&v)))
+        .unwrap_or_else(|| derived_boot_hash());
     let key = cached_hex_property(VBMETA_KEY_PROP)
         .filter(|k| k.iter().any(|b| *b != 0))
         .or_else(boot_key_from_env)
@@ -238,16 +273,21 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
             );
         }
     }
-    // 顺序：daemon 算好的最终值（伪装优先）→ boot 分区真值 → 属性 → 编译日期。
+    // 顺序：daemon 算好的最终值（伪装优先）→ boot 分区真值 → vendor → boot 属性 → 编译日期。
     //
     // 以前属性排第一，属性被污染后旧日期就锁进链里；反过来把 AVB 排第一又有另一个
     // 毛病：用户明明伪装了日期，链上还是真值。所以优先级统一在 daemon 里定，结果落进
     // `patch.state`，这里只管用它。
+    //
+    // AVB 读不到时用 **vendor 的值**，而不是 bootloader 那份 `ro.boot.image.build.security_patch`：
+    // 后者不随 OTA 更新（本机实测停在 2025-03-01，而系统镜像早就是 2026-08-01），跟
+    // os/vendor 一对比就露。TEESimulator 干脆一直这么干（boot 直接用 vendor）。
     let state_boot_patch = read_boot_patchlevel_state();
     let boot_patch = if trust.boot_patchlevel.trim() == "auto" {
         state_boot_patch
             .clone()
             .or(avb_boot_patch.clone())
+            .or(vendor_patch.clone())
             .or(property_boot_patch.clone())
             .or_else(bootimage_date_patchlevel)
     } else {

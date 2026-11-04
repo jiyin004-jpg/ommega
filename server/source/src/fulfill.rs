@@ -851,13 +851,18 @@ impl Fulfill {
         // 跟设备上任何固定属性都对不上（Duck 的 Boot consistency 直接拿证书里的
         // verifiedBootHash 比 ro.boot.vbmeta.digest，必 mismatch）。现在同一设备永远
         // 得到同一个值；正常路径是 A 端带上伪装参数解出来的哈希，直接用它。
-        let stamp = "fixed";
+        // 兜底锚点：设备 ID + 当前小时。同一小时内算出来的值不变，
+        // 不会出现“每笔请求都不一样”那种一看就假的链。
+        let stamp = crate::cert::current_hour_stamp();
+        let stamp = stamp.as_str();
+        // 全零也当没传：A 端属性读不到时会发 32 字节全零，照收等于把「未签名 /
+        // 异常」的特征写进证书，Play Integrity 一看就拒。
         let vb_key = match b64("verified_boot_key") {
-            Some(k) if k.len() == 32 => k,
+            Some(k) if k.len() == 32 && k.iter().any(|b| *b != 0) => k,
             _ => boot_value_seed(device_id, "bootkey", stamp).to_vec(),
         };
         let vb_hash = match b64("verified_boot_hash") {
-            Some(h) if h.len() == 32 => h,
+            Some(h) if h.len() == 32 && h.iter().any(|b| *b != 0) => h,
             _ => boot_value_seed(device_id, "boothash", stamp).to_vec(),
         };
         // 排障：A 端到底报了什么。Boot consistency 那类问题全看这一行。
@@ -1805,18 +1810,7 @@ fn hex_prefix(bytes: &[u8], n: usize) -> String {
 /// 跟设备上任何固定属性都对不上）。`kind` 把 boot key 和 boot hash 分开，
 /// 避免两者变成同一串。
 fn boot_value_seed(device_id: &str, kind: &str, stamp: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"ommega-boot-value|");
-    hasher.update(kind.as_bytes());
-    hasher.update(b"|");
-    hasher.update(device_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(stamp.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+    crate::cert::boot_value_seed(device_id, kind, stamp)
 }
 
 #[cfg(test)]
