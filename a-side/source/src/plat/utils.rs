@@ -178,12 +178,13 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
 /// 或者 SKRoot 下以 root 跑）自己拼一份。
 ///
 /// 两个来源，按可靠程度排：
-///   1. `/data/system/packages.list` —— 只有我们以 root 跑时读得到。真机上这个文件是
-///      `0640 system:package_info` + `packages_list_file`，被注入之后我们在 keystore
-///      （uid 1017）里跑，DAC 和 SELinux 两头都拦，一读就是 EACCES；
-///   2. `/data/misc/ommega/aaid_table` —— keymint 守护（一直是 root）从 packages.list
-///      + `pm list packages --show-versioncode` 抄出来的。放在数据根里、0644、
-///      system_data_file，keystore 域读得到，也不用动系统文件半个字节。
+///
+/// 1. `/data/system/packages.list`：只有我们以 root 跑时读得到。真机上这个文件是
+///    `0640 system:package_info` + `packages_list_file`，被注入之后我们在 keystore
+///    （uid 1017）里跑，DAC 和 SELinux 两头都拦，一读就是 EACCES。
+/// 2. `/data/misc/ommega/aaid_table`：keymint 守护（一直是 root）从 packages.list
+///    和 `pm list packages --show-versioncode` 抄出来的，放在数据根里、0644、
+///    system_data_file，keystore 域读得到，也不用动系统文件半个字节。
 fn aaid_from_packages_list(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
     let mut direct_error: Option<String> = None;
     match std::fs::read_to_string(PACKAGES_LIST) {

@@ -215,7 +215,7 @@ pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
         .or_else(boot_hash_from_env)
         .filter(|h| h.iter().any(|b| *b != 0))
         .or_else(|| bootloader_vbmeta_digest().and_then(|v| decode_hex32(&v)))
-        .unwrap_or_else(|| derived_boot_hash());
+        .unwrap_or_else(derived_boot_hash);
     let key = cached_hex_property(VBMETA_KEY_PROP)
         .filter(|k| k.iter().any(|b| *b != 0))
         .or_else(boot_key_from_env)
@@ -454,15 +454,6 @@ fn build_props() -> &'static std::collections::HashMap<String, String> {
 
 fn read_build_prop_value(key: &str) -> Option<String> {
     build_props().get(key).cloned()
-}
-
-#[cfg(test)]
-fn read_build_prop_value_uncached(key: &str) -> Option<String> {
-    BUILD_PROP_PATHS.iter().find_map(|path| {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|contents| parse_build_prop_value(&contents, key))
-    })
 }
 
 #[cfg(test)]
@@ -728,10 +719,7 @@ fn read_abl_boot_patchlevel() -> Result<String> {
     read_abl_boot_patchlevel_from_blob(top_level_blob, &boot_path).map(|value| value.to_string())
 }
 
-fn read_abl_boot_patchlevel_from_blob(
-    top_level: Result<&'static [u8]>,
-    boot_path: &Path,
-) -> Result<u32> {
+fn read_abl_boot_patchlevel_from_blob(top_level: Result<&[u8]>, boot_path: &Path) -> Result<u32> {
     let top_level_error = match top_level {
         Ok(blob) => {
             if let Some(value) = vbmeta_boot_patchlevel(blob)? {
@@ -767,6 +755,23 @@ fn read_abl_boot_patchlevel_from_blob(
         }
     }
     read_boot_header_patchlevel(boot_path)
+}
+
+/// 跟 `read_abl_boot_patchlevel_from_blob` 同一套判断，只是顶层 vbmeta 现从路径读。
+/// 真机上顶层那份是缓存好的字节，这个入口留给测试用（测试要能摆一份自己的文件）。
+#[cfg(test)]
+fn read_abl_boot_patchlevel_from_paths(
+    top_level: Result<std::path::PathBuf>,
+    boot_path: &Path,
+) -> Result<u32> {
+    match top_level {
+        Ok(path) => {
+            let blob = std::fs::read(&path)
+                .with_context(|| format!("failed to read top-level vbmeta {}", path.display()))?;
+            read_abl_boot_patchlevel_from_blob(Ok(blob.as_slice()), boot_path)
+        }
+        Err(error) => read_abl_boot_patchlevel_from_blob(Err(error), boot_path),
+    }
 }
 
 fn vbmeta_boot_patchlevel(vbmeta: &[u8]) -> Result<Option<u32>> {
