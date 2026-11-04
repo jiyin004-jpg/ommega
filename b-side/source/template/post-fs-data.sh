@@ -121,9 +121,10 @@ fi
 # 开机自己会重放这份文件，KernelSU 系不会 —— 那上面 B 端就一直是裸奔的。
 #
 # 这里不挑管理器，交给 sepolicy_apply.sh 按工具能力依次试：ksud → magiskpolicy →
-# 模块自带的 ommega-policy。结果写到 /data/local/tmp（adb 读得到）。
+# 模块自带的 ommega-policy。结果写进自己的 logs，不再用 /data/local/tmp（那是 shell 的公共目录）。
 if [ -f "$MODDIR/sepolicy.rule" ]; then
-  _apply_log=/data/local/tmp/ommega-b-sepolicy-apply.log
+  _apply_log=${LOG_DIR:-/data/adb/ommega-b/logs}/sepolicy-apply.log
+  mkdir -p "${_apply_log%/*}" 2>/dev/null
   : > "$_apply_log" 2>/dev/null
   [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
   if command -v ommega_apply_sepolicy >/dev/null 2>&1; then

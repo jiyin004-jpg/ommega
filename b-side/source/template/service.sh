@@ -341,7 +341,9 @@ spl_su() {
 # 工具选择见 sepolicy_apply.sh：ksud → magiskpolicy → 模块自带的 ommega-policy。
 [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
 SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
-SEPOLICY_LOG=/data/local/tmp/ommega-b-sepolicy-apply.log
+# 日志跟其它 B 端日志一起落自己的 logs，不再写 /data/local/tmp（shell 的公共目录）。
+SEPOLICY_LOG=$STATE_DIR/logs/sepolicy-apply.log
+mkdir -p "$STATE_DIR/logs" 2>/dev/null
 keep_sepolicy() {
   [ -f "$MODDIR/sepolicy.rule" ] || return 0
   command -v ommega_apply_sepolicy >/dev/null 2>&1 || return 0
@@ -379,7 +381,7 @@ keep_spl_alive() {
   fi
   [ "$now" -gt 100000 ] && echo "$now" > "$RUN_DIR/spl_daemon.retry" 2>/dev/null
 
-  local bin su_bin staged
+  local bin su_bin
   if ! bin=$(find_spl_bin); then
     echo "[service] spl_daemon 不在包里，live 方法会退回 prop"
     return 0
@@ -388,19 +390,14 @@ keep_spl_alive() {
     echo "[service] 找不到 su，起不了 spl_daemon（live 方法会退回 prop）"
     return 0
   fi
-  # /data/adb 下的文件是 adb_data_file，uid 1000 执行报 "inaccessible or not found"
-  # （2026-10-22 实测）；shell_data_file 的 /data/local/tmp 才行。所以每次拉起的
-  # 时候先拷一份过去 —— 重启会清空 /data/local/tmp，这份不能当唯一的家。
-  staged=/data/local/tmp/spl_daemon
-  if ! cp -f "$bin" "$staged" 2>/dev/null; then
-    echo "[service] 拷 spl_daemon 到 /data/local/tmp 失败"
-    return 0
-  fi
-  chmod 0755 "$staged" 2>/dev/null || true
-  # 失败原因得看得到：su 拒绝、SELinux、bin 不起来都写进 spl.log。
-  setsid "$su_bin" 1000 -c "LD_LIBRARY_PATH=/vendor/lib64:/system/lib64 $staged" \
+  # 直接在模块自己的目录里跑：/data/adb 下的文件是 adb_data_file，uid 1000 执行默认
+  # 会被拒（"inaccessible or not found"，实机测过），所以由 sepolicy.rule 里那条
+  # `allow shell adb_data_file file { … execute }` 放行。以前的做法是每轮拷一份到
+  # shell_data_file 的 /data/local/tmp 再跑 —— 那是 shell 的公共目录，我们不在那儿
+  # 留东西（顺带也省了一次拷贝）。规则没打进去时这里就起不来，live 会自动退回 prop。
+  setsid "$su_bin" 1000 -c "LD_LIBRARY_PATH=/vendor/lib64:/system/lib64 $bin" \
     </dev/null >> "$(log_target spl.log)" 2>&1 &
-  echo "[service] spl_daemon launched ($staged <- $bin)"
+  echo "[service] spl_daemon launched ($bin)"
 }
 
 # 把 live 关掉（改成 prop、或者整个跟随关掉）时，不能让 daemon 一直挂着不管 ——
@@ -411,6 +408,7 @@ stop_spl_if_unused() {
   pkill -TERM -x spl_daemon 2>/dev/null
   sleep 1
   pkill -9 -x spl_daemon 2>/dev/null
+  # 老版本把自己的副本放在 shell 的公共目录里，顺手清掉（新版本不再往那里写）。
   rm -f /data/local/tmp/spl_daemon 2>/dev/null
   echo "[service] live 已关闭，spl_daemon 已停并回基线"
 }

@@ -6,3 +6,10 @@ allow crash_dump keystore process *
 
 allow keystore default_android_service service_manager find
 allow shell default_android_service service_manager find
+
+# spl_daemon（补丁日期的 live 改法）直接在 /data/adb/ommega-b/bin 里以 uid 1000 跑。
+# 那个目录是 adb_data_file，shell 默认既不能进目录也不能执行里面的文件（实机报
+# "inaccessible or not found"）。放行这两条后就不用再拷一份到 shell_data_file 的
+# /data/local/tmp 了 —— 那是 shell 的公共目录，不在那儿留东西。
+allow shell adb_data_file dir { open read getattr search }
+allow shell adb_data_file file { open read getattr map execute execute_no_trans }

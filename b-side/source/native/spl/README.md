@@ -68,9 +68,12 @@ verifiedBootState）、安全等级都来自真实启动链或硬件，TA 的 co
 2. `sendCmd` 返回 `16` 不代表失败。判断生效只能看实际签出来的证书。
 
 还有一个不是 TA 的坑：**不能直接从 `/data/adb` 下执行**。那里的文件是
-`u:object_r:adb_data_file:s0`，uid 1000 执行时报 `inaccessible or not found`；只有
-`shell_data_file` 的 `/data/local/tmp` 能跑。所以 `service.sh` 每次拉起前先把二进制
-拷到 `/data/local/tmp/spl_daemon`（重启会清空，不能只靠那份）。
+`u:object_r:adb_data_file:s0`，uid 1000 执行时报 `inaccessible or not found`。
+1.7.14 及以前的做法是每次拉起前把二进制拷到 `shell_data_file` 的
+`/data/local/tmp/spl_daemon` 再跑。现在已经不往那个公共目录写东西了：
+`sepolicy.rule` 里加了两条放行（`allow shell adb_data_file dir/file …`），直接
+在原位置以 uid 1000 跑。规则没打进去时这里就起不来，live 自动退回 prop
+（`spl.log` 里能看到失败的启动行）。
 
 原始研究与实测记录在仓库外的 `D:\keymint-spl-live\`（小米 peridot / Android 16 /
 QTI 上跑的：单次 0.4–0.6ms，200 轮压测全 rc=0）。这里只搬了设备侧要用的三个文件，

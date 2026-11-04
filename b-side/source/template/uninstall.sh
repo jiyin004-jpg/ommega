@@ -29,8 +29,11 @@ sleep 1
 pkill -TERM -x spl_daemon 2>/dev/null
 sleep 1
 pkill -9 -x spl_daemon 2>/dev/null
-rm -f "$STATE_DIR/bin/spl_daemon" \
-      "$RUN_DIR/spl_daemon.retry" /data/local/tmp/spl_daemon
+rm -f "$STATE_DIR/bin/spl_daemon" "$RUN_DIR/spl_daemon.retry"
+# 1.7.14 及以前 spl_daemon 的副本、sepolicy 应用日志都落在 shell 的公共目录，
+# 新版本已经不写那里了；卸载时把老装机上的残留一起清掉。
+rm -f /data/local/tmp/spl_daemon /data/local/tmp/ommega-b-sepolicy-apply.log \
+      /data/local/tmp/adbr.log 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # 1b. Drop the relay's wake lock. It is a named lock in /sys/power/wake_lock and
