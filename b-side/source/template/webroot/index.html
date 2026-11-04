@@ -15,10 +15,16 @@
     :root{--bg:#141518;--card:#1e2024;--fg:#eceef2;--dim:#9aa0a8;--line:#2c2f35;--accent:#7aa2f7;--ok:#4ec97b;--bad:#f0736f;}
   }
   *{box-sizing:border-box}
-  body{margin:0;padding:16px 14px 40px;background:var(--bg);color:var(--fg);
+  /* 整页不再滚动：顶栏和标签固定，两页各自是独立的滚动容器（见 .pages / .page）。
+     这样横着滑去黑名单再滑回来，主页的上下位置还是原来那个像素 —— 两页不共用一根
+     文档滚动条，就不会因为高度不同被夹到 0。 */
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;
+       overflow:hidden;
        font:15px/1.6 -apple-system,"Noto Sans SC","Segoe UI",Roboto,sans-serif}
+  .head{flex:0 0 auto;padding:14px 14px 0}
   h1{margin:0 0 4px;font-size:19px;font-weight:600}
-  .sub{color:var(--dim);font-size:13px;margin-bottom:14px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:10px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
         padding:12px 14px;margin-bottom:12px}
   .card h2{margin:0 0 10px;font-size:14px;font-weight:600;color:var(--dim)}
@@ -57,6 +63,18 @@
   #toast.show{opacity:1;transform:translateX(-50%)}
   #toast.err{background:#8d2b2b}
   #boot{color:var(--dim);font-size:13px;padding:8px 0}
+  /* 分页：视口里两页并排，靠 translateX 横移。只给 transform 做过渡，不叠 opacity
+     混合；看不见的邻居页不摆位置，拖动时每帧只写当前页 ±1。 */
+  .pages{flex:1;position:relative;overflow:hidden;min-width:0;touch-action:pan-y}
+  .page{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;
+      padding:2px 14px 28px;background:var(--bg);
+      -webkit-overflow-scrolling:touch;
+      opacity:0;pointer-events:none;transform:translateX(12%);
+      contain:layout paint;
+      transition:transform .22s cubic-bezier(.22,.61,.36,1)}
+  .page.on{opacity:1;pointer-events:auto;transform:translateX(0)}
+  /* 标签栏跟着顶栏固定，别占太多高度 */
+  #tabs{margin:10px 0 6px}
   /* 点按钮时浏览器会画一圈方框焦点框（有时还带点按高亮），手机上看很突兀 —— 去掉；
      输入框/下拉保留一圈柔和高亮，不然点进去看不出焦点在哪。 */
   button, .sw, .btn, .tb-btn { -webkit-tap-highlight-color: transparent; }
@@ -85,10 +103,39 @@
   .sheet-head b{flex:1;font-size:15px}
   .sheet-body{padding:12px 14px;overflow:auto}
   .hint{color:var(--dim);font-size:12px;line-height:1.5;margin:6px 0 0}
+  /* 表单里的枚举项（日志级别等）用自绘按钮 + 共用一个浮层菜单，替掉原生 <select>：
+     原生下拉的弹层样式不受控，WebView 里跟面板对不上；菜单只有一个，关着时不参与绘制。 */
+  .row .pick{display:inline-flex;align-items:center;justify-content:space-between;gap:8px;
+      flex:0 0 46%;min-width:0;padding:7px 9px;border:1px solid var(--line);border-radius:8px;
+      background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit;
+      line-height:1.4;text-align:left;white-space:nowrap;overflow:hidden}
+  .row .pick::after{content:"";flex:0 0 auto;width:0;height:0;
+      border-left:3px solid transparent;border-right:3px solid transparent;
+      border-top:4px solid currentColor;opacity:.6}
+  /* 关于里的界面语言：同一个菜单，宽度跟按钮对齐。 */
+  .kv span.plain{font-family:inherit;word-break:break-word;line-height:1.5}
+  .lang-pick{display:inline-flex;align-items:center;justify-content:space-between;gap:8px;
+      width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
+      background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit;
+      line-height:1.35;text-align:left;white-space:nowrap;overflow:hidden}
+  .lang-pick::after{content:"";flex:0 0 auto;width:0;height:0;
+      border-left:3px solid transparent;border-right:3px solid transparent;
+      border-top:4px solid currentColor;opacity:.6}
+  .apick{position:fixed;inset:0;z-index:70}
+  .apick-menu{position:fixed;min-width:158px;max-width:70vw;background:var(--card);
+      border:1px solid var(--line);border-radius:12px;padding:6px;
+      display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 28px rgba(0,0,0,.22)}
+  .apick-item{display:block;width:100%;text-align:left;padding:9px 10px;border:0;border-radius:8px;
+      background:transparent;color:var(--fg);font-size:13px;font-family:inherit}
+  .apick-item.on{background:rgba(56,103,214,.12);color:var(--accent);font-weight:600}
+  /* 次要动作（停止模块 / 恢复并重启）用小号按钮，别被 flex:1 抻成两个半屏大按钮。 */
+  button.btn.sm{flex:0 0 auto;min-width:0;padding:6px 10px;font-size:13px;border-radius:8px}
+  button.btn[disabled]{opacity:.5}
 </style>
 </head>
 <body>
 
+<div class="head">
 <div class="topbar">
   <h1>Ommega-B</h1>
   <button class="tb-btn" id="about-btn" data-i18n="about.open"></button>
@@ -97,12 +144,13 @@
 <div id="boot" data-i18n="boot"></div>
 
 <div id="tabs" class="acts hidden">
-  <button class="btn primary" id="tab-home" data-i18n="tab.home"></button>
-  <button class="btn" id="tab-skip" data-i18n="tab.skip"></button>
+  <button class="btn primary" id="tab-home" data-tab="0" data-i18n="tab.home"></button>
+  <button class="btn" id="tab-skip" data-tab="1" data-i18n="tab.skip"></button>
+</div>
 </div>
 
-<div id="panel" class="hidden">
-<div id="page-home">
+<div id="pages" class="pages hidden">
+  <section class="page on" id="page-home">
   <div class="card">
     <h2 data-i18n="status.title"></h2>
     <div class="kv"><span>relay</span><span id="st-relay">-</span></div>
@@ -133,9 +181,9 @@
     <button class="btn" id="restart" data-i18n="restart"></button>
   </div>
   <p class="hint" data-i18n="save.hint"></p>
-</div>
+  </section>
 
-<div id="page-skip" class="hidden">
+  <section class="page" id="page-skip">
   <div class="card">
     <h2 data-i18n="skip.title"></h2>
     <p class="hint" data-i18n="skip.hint"></p>
@@ -144,7 +192,7 @@
       <button class="btn primary" id="skip-add" data-i18n="skip.add"></button>
     </div>
   </div>
-</div>
+  </section>
 </div>
 
 <!-- 关于（悬浮窗，右上角那个按钮开） -->
@@ -155,10 +203,11 @@
     <div class="sheet-body">
       <div class="kv"><span data-i18n="about.version"></span><span id="about-ver">-</span></div>
       <div class="kv"><span data-i18n="about.lang"></span>
-        <span><select id="lang" style="width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit"></select></span></div>
+        <span class="plain"><button id="lang" type="button" class="lang-pick"></button></span></div>
       <div class="kv"><span data-i18n="about.qq"></span><span class="link" data-open="mqqapi://card/show_pslcard?src_type=internal&amp;version=1&amp;uin=2167063739&amp;card_type=group" data-open-fallback="https://qm.qq.com/cgi-bin/qm/qr?group_code=2167063739">2167063739</span></div>
       <div class="kv"><span>GitHub</span><span class="link" data-open="https://github.com/jiyin004-jpg/ommega">jiyin004-jpg/ommega</span></div>
       <p class="hint" data-i18n="about.disclaimer"></p>
+      <p class="hint hidden" id="egg-line"> 不要再点了 </p>
     </div>
   </div>
 </div>
@@ -179,6 +228,7 @@
 </div>
 
 <div id="toast"></div>
+<div id="apick" class="apick hidden"><div id="apick-menu" class="apick-menu"></div></div>
 
 <script>
 "use strict";
@@ -210,9 +260,32 @@ function t(key, vars){
   if (vars) Object.keys(vars).forEach(function(k){ s = s.split("{" + k + "}").join(String(vars[k])); });
   return s;
 }
-function applyI18n(){
-  document.documentElement.lang = LANG;
-  document.querySelectorAll("[data-i18n]").forEach(function(el){ el.textContent = t(el.dataset.i18n); });
+function applyI18n(scope){
+  var root = scope || document;
+  /* 整页换语言才动 <html lang>；只重绘某一小块时不要碰。 */
+  if (!scope) document.documentElement.lang = LANG;
+  root.querySelectorAll("[data-i18n]").forEach(function(el){
+    var s = t(el.dataset.i18n);
+    if (el.textContent !== s) el.textContent = s;      /* 没变就别换文本节点，省一次重排 */
+  });
+  root.querySelectorAll("[data-i18n-key]").forEach(function(el){ paintT(el); });
+}
+/* 动态文本（运行状态、pid、计数…）是渲染时用 t() 算好塞进去的，data-i18n 扫不到，
+   切语言后会停在旧语言。setT 把「用的哪个键、带什么变量」记在元素上，
+   applyI18n 换语言时统一按新语言重算，不用为了几个字把整张表单重建一遍。 */
+function setT(node, key, vars){
+  if (!node) return null;
+  node.dataset.i18nKey = key;
+  node.dataset.i18nVars = vars ? JSON.stringify(vars) : "";
+  paintT(node);
+  return node;
+}
+function paintT(node){
+  if (!node || !node.dataset || !node.dataset.i18nKey) return;
+  var vars = null;
+  try { vars = node.dataset.i18nVars ? JSON.parse(node.dataset.i18nVars) : null; } catch (e){ vars = null; }
+  var s = t(node.dataset.i18nKey, vars);
+  if (node.textContent !== s) node.textContent = s;
 }
 
 /* ---------------------------- 与设备交互（ksu） ---------------------------- */
@@ -290,12 +363,15 @@ function parseConf(text){
   return out;
 }
 function el(tag, cls, text){ var n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
-function toast(msg, isErr){
+function toast(msg, isErr, sticky){
   var e = document.getElementById("toast");
   e.textContent = msg;
   e.className = isErr ? "show err" : "show";
+  e.dataset.busy = sticky ? "1" : "";
   clearTimeout(toast._t);
-  toast._t = setTimeout(function(){ e.className = ""; }, 2800);
+  /* sticky：留给「正在做某件要等的事」（停止模块、恢复并重启），做完之前不许自己消失，
+     不然机器慢的时候面板看上去就是点了没反应。 */
+  if (!sticky) toast._t = setTimeout(function(){ e.className = ""; }, 2800);
 }
 function b64(text){
   var bytes = new TextEncoder().encode(text);
@@ -334,6 +410,7 @@ function merge(original, vals){
 
 /* --------------------------------- 渲染 --------------------------------- */
 function render(){
+  closePick();   /* 行都要重建了，浮层菜单别留着指向旧按钮 */
   /* 先把各组容器清空。以前是直接 append，没清 —— 切一次语言就多出一份旧语言的表单行，
      屏幕上于是中英各一份（用户实测：简中→英→简中后中英混在一起）。 */
   ["remote", "server", "log", "patch", "soter", "net"].forEach(function(g){
@@ -345,9 +422,10 @@ function render(){
     if (!host) return;
     var row = el("div", "row");
     var name = el("div", "name");
-    name.appendChild(el("b", null, t("f." + f.key)));
+    /* 标题 / 说明交给 setT：切语言时 applyI18n 直接换字，不用重建整张表单。 */
+    name.appendChild(setT(el("b"), "f." + f.key));
     var hintKey = "f." + f.key + ".hint";
-    if (I18N["zh-CN"][hintKey]) name.appendChild(el("small", null, t(hintKey)));
+    if (I18N["zh-CN"][hintKey]) name.appendChild(setT(el("small"), hintKey));
     row.appendChild(name);
     var full = envOf(f);
     var raw = (full in curMap) ? curMap[full] : (DEFAULTS[f.key] !== undefined ? DEFAULTS[f.key] : "");
@@ -356,25 +434,25 @@ function render(){
       sw.type = "button";
       sw.dataset.key = f.key;
       sw.setAttribute("aria-checked", truthy(raw) ? "true" : "false");
-      sw.onclick = function(){ sw.setAttribute("aria-checked", sw.getAttribute("aria-checked") === "true" ? "false" : "true"); };
+      sw.onclick = function(){
+        sw.setAttribute("aria-checked", sw.getAttribute("aria-checked") === "true" ? "false" : "true");
+        dirty = true;
+      };
       row.appendChild(sw);
     } else if (f.type === "enum"){
-      var sel = el("select");
-      sel.dataset.key = f.key;
+      /* 自绘按钮 + 共用菜单，替代原生 <select>：值放在 dataset.value 里，collect() 照旧读得到。 */
       var cur = String(raw).toLowerCase();
-      f.options.forEach(function(o){
-        var op = el("option", null, o);
-        op.value = o;
-        if (o === cur) op.selected = true;
-        sel.appendChild(op);
-      });
-      if (raw !== "" && f.options.indexOf(cur) < 0){
-        var extra = el("option", null, String(raw));
-        extra.value = String(raw);
-        extra.selected = true;
-        sel.appendChild(extra);
-      }
-      row.appendChild(sel);
+      var opts = f.options.slice();
+      if (cur !== "" && opts.indexOf(cur) < 0) opts.push(cur);
+      var pick = el("button", "pick", cur);
+      pick.type = "button";
+      pick.dataset.key = f.key;
+      pick.dataset.value = cur;
+      pick.onclick = function(ev){
+        if (ev && ev.stopPropagation) ev.stopPropagation();
+        openEnumPick(pick, opts);
+      };
+      row.appendChild(pick);
     } else {
       var inp = document.createElement("input");
       inp.type = f.type === "num" ? "number" : "text";
@@ -394,7 +472,7 @@ function collect(keepEmpty){
     if (f.type === "bool"){
       v = document.querySelector('.sw[data-key="' + f.key + '"]').getAttribute("aria-checked") === "true" ? "true" : "false";
     } else if (f.type === "enum"){
-      v = document.querySelector('select[data-key="' + f.key + '"]').value.trim();
+      v = document.querySelector('.pick[data-key="' + f.key + '"]').dataset.value.trim();
     } else {
       v = document.querySelector('input[data-key="' + f.key + '"]').value.trim();
     }
@@ -402,6 +480,16 @@ function collect(keepEmpty){
     vals[envOf(f)] = v;
   });
   return vals;
+}
+
+/* 状态行 = 一个圆点 + 一段会跟着语言换的文字。文字用 setT 记住键，
+   切语言时 applyI18n 直接换好，不用再跑一遍 pidof。 */
+function paintState(id, on, key, vars){
+  var e = document.getElementById(id);
+  if (!e) return;
+  e.innerHTML = "";
+  e.appendChild(el("i", "dot " + (on ? "on" : "off")));
+  e.appendChild(setT(el("span"), key, vars));
 }
 
 /* --------------------------------- 状态 --------------------------------- */
@@ -420,16 +508,13 @@ async function refreshStatus(){
   function first(s){ s = (s || "").trim(); return s ? s.split(/\s+/)[0] : ""; }
   [["st-relay", first(p[0])], ["st-adbrd", first(p[1])], ["st-keystore", first(p[2])],
    ["st-spl", first(p[4])]].forEach(function(pair){
-    document.getElementById(pair[0]).innerHTML = pair[1]
-      ? '<i class="dot on"></i>' + t("status.running", {p: pair[1]})
-      : '<i class="dot off"></i>' + t("status.stopped");
+    paintState(pair[0], !!pair[1], pair[1] ? "status.running" : "status.stopped",
+               pair[1] ? {p: pair[1]} : null);
   });
   /* SOTER：看 HAL 服务注册没注册（这台是 vendor.trustonic.hardware.soter），
      名字里带 soter 就算在 —— 各家叫法不一样，只认这一族关键词。 */
   var n = parseInt((p[3] || "").trim(), 10) || 0;
-  document.getElementById("st-soter").innerHTML = n > 0
-    ? '<i class="dot on"></i>' + t("status.registered")
-    : '<i class="dot off"></i>' + t("status.missing");
+  paintState("st-soter", n > 0, n > 0 ? "status.registered" : "status.missing", null);
 }
 
 /* --------------------------------- 动作 --------------------------------- */
@@ -483,23 +568,130 @@ async function restartRelay(){
   setTimeout(function(){ refreshStatus().catch(function(){}); }, 2500);
 }
 
+/* ------------------------------ 浮层菜单 ------------------------------ */
+/* 界面语言和表单里的枚举项共用一个浮层菜单：只有一个菜单节点，关着时 display:none，
+   不参与绘制；点空白、换页、重建表单都会关掉它。 */
+var pickBtn = null;
+function closePick(){
+  var host = document.getElementById("apick");
+  if (host) host.classList.add("hidden");
+  pickBtn = null;
+}
+function openMenu(btn, items, cur, cb, wide){
+  var host = document.getElementById("apick");
+  var menu = document.getElementById("apick-menu");
+  if (!host || !menu || !btn) return;
+  pickBtn = btn;
+  if (wide){
+    menu.style.minWidth = Math.min(btn.getBoundingClientRect().width, window.innerWidth - 16) + "px";
+    menu.style.maxWidth = "calc(100vw - 16px)";
+  } else {
+    menu.style.minWidth = ""; menu.style.maxWidth = "";
+  }
+  menu.innerHTML = "";
+  items.forEach(function(it){
+    var b = el("button", "apick-item" + (it.v === cur ? " on" : ""), it.label);
+    b.type = "button";
+    b.onclick = function(){
+      closePick();
+      if (cb) cb(it.v);
+    };
+    menu.appendChild(b);
+  });
+  host.classList.remove("hidden");
+  host.onclick = function(ev){ if (ev.target === host) closePick(); };
+  placePick(btn, menu);
+}
+/* 贴着按钮右下角放；下面放不下就翻到上方，左右夹在屏幕内。转屏 / 分屏时按新位置再贴一次。 */
+function placePick(btn, menu){
+  if (!btn || !menu || !btn.isConnected){ closePick(); return; }
+  var r = btn.getBoundingClientRect();
+  var mw = menu.offsetWidth, mh = menu.offsetHeight;
+  var left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.right - mw));
+  var top = r.bottom + 6;
+  if (top + mh > window.innerHeight - 8) top = r.top - mh - 6;
+  menu.style.left = left + "px";
+  menu.style.top = Math.max(8, top) + "px";
+}
+window.addEventListener("resize", function(){
+  if (pickBtn) placePick(pickBtn, document.getElementById("apick-menu"));
+});
+function openEnumPick(btn, opts){
+  var items = opts.map(function(o){ return {v: o, label: o}; });
+  openMenu(btn, items, btn.dataset.value, function(v){
+    btn.dataset.value = v;
+    btn.textContent = v;
+    /* 原生 select 改值会冒泡 change，dirty 靠它置位；换成按钮后自己补一句，
+       免得 refreshFromDisk 把没保存的改动冲掉。 */
+    dirty = true;
+  });
+}
+function langName(code){
+  for (var i = 0; i < LANGS.length; i++) if (LANGS[i][0] === code) return LANGS[i][1];
+  return code;
+}
+function paintLang(){
+  var b = document.getElementById("lang");
+  if (b) b.textContent = langName(LANG);
+}
+function openLangMenu(){
+  var b = document.getElementById("lang");
+  if (!b) return;
+  var items = LANGS.map(function(p){ return {v: p[0], label: p[1]}; });
+  openMenu(b, items, LANG, function(code){ setLang(code); }, true);
+}
+
 /* -------------------------------- 语言切换 ------------------------------- */
 function setLang(code){
   if (!I18N[code]) code = "zh-CN";
-  /* 先把界面上的值（含还没保存的改动、含被清空的项）并回 curMap，再重建表单。
-     render() 是从 curMap 渲染的，不并回去就会把没保存的编辑冲掉。 */
-  var keep = collect(true);
-  Object.keys(keep).forEach(function(k){ curMap[k] = keep[k]; });
   LANG = code;
   try { localStorage.setItem("ommega.lang", code); } catch (e){}
-  applyI18n();
-  render();
-  refreshStatus().catch(function(){});
-  document.getElementById("lang").value = code;
+  /* 切语言时人正看着「关于」窗：先把这一块和语言按钮换掉，点击立刻有反馈；
+     整页文字都被遮罩盖着，看不见，等这一帧画完再统一换（见 scheduleLangPass）。
+     表单不再重建 —— 行标题/说明都由 setT 记着键，applyI18n 一遍就换完。 */
+  var about = document.getElementById("about-modal");
+  if (about) applyI18n(about);
+  paintLang();
+  scheduleLangPass();
+}
+var langPassId = 0, langPassPending = false;
+function scheduleLangPass(){
+  langPassPending = true;
+  if (langPassId) return;
+  /* 两跳 rAF：第一跳结束浏览器会绘制一次（关于窗和按钮已经是新文字），第二跳再干整页的活。 */
+  if (window.requestAnimationFrame){
+    langPassId = requestAnimationFrame(function(){
+      langPassId = requestAnimationFrame(function(){
+        langPassId = 0; langPassNow();
+      });
+    });
+  } else {
+    langPassId = setTimeout(function(){ langPassId = 0; langPassNow(); }, 32);
+  }
+}
+function flushLangPass(){
+  if (!langPassId) return;
+  if (window.cancelAnimationFrame) cancelAnimationFrame(langPassId);
+  clearTimeout(langPassId);
+  langPassId = 0;
+  langPassNow();
+}
+function langPassNow(){
+  if (!langPassPending) return;
+  langPassPending = false;
+  try { applyI18n(); } catch (e){}
+  try { paintModline(); } catch (e){}
 }
 
 /* 从磁盘读一遍配置。init 用一次，页面重新可见时也用它 —— WebView 常常把上次那页
    留着不重建，只在 init 里读会让人一直看到旧值（用户实测：面板显示关、配置其实是开）。 */
+var MOD_VER = "?";
+/* 「模块版本」这一行是「文案 + 版本号」拼起来的，setT 的模板塞不进版本号，
+   换语言时按当前版本重拼一次就行。 */
+function paintModline(){
+  var e = document.getElementById("modline");
+  if (e) e.textContent = t("about.version") + " " + MOD_VER;
+}
 async function readConf(){
   var r = await exec("cat " + CONF + " 2>/dev/null; echo '---P---'; cat " + PROP + " 2>/dev/null");
   var parts = r.stdout.split("---P---");
@@ -508,6 +700,7 @@ async function readConf(){
   var propText = parts[1] || "";
   var ver = "?";
   propText.split("\n").forEach(function(l){ if (l.indexOf("version=") === 0) ver = l.slice(8).trim(); });
+  MOD_VER = ver;
   return ver;
 }
 /* 页面又露出来了（或者拿回焦点）就重读一次：没动过手的直接刷新，动过手的不碰 ——
@@ -523,7 +716,7 @@ async function refreshFromDisk(){
   try {
     var ver = await readConf();
     render();
-    document.getElementById("modline").textContent = t("about.version") + " " + ver;
+    paintModline();
     document.getElementById("about-ver").textContent = ver;
     refreshStatus().catch(function(){});
   } catch (e){}
@@ -540,16 +733,242 @@ document.addEventListener("input", function(ev){
 document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.target.id === "lang")) dirty = true; }, true);
 
 /* ------------------------------ 页面切换 ------------------------------ */
+/* 两页并排放在 #pages 这个视口里，各自是独立的滚动容器（.page 的 overflow-y:auto）。
+   以前两页共用一个文档滚动条，高度差得多，切页时浏览器会把位置夹到短页的最大值
+   （通常直接变成 0）；现在横着滑走再滑回来，主页的上下位置还是原来那个像素。 */
 var PAGES = ["home", "skip"];
-function showPage(name){
-  if (PAGES.indexOf(name) < 0) name = "home";
-  PAGES.forEach(function(p){
-    var page = document.getElementById("page-" + p);
+var activeTab = 0;
+function pageEls(){ return document.querySelectorAll(".page"); }
+function pageCount(){ return pageEls().length; }
+
+/* 每帧只动当前页和左右各一页，其余页的 transform/opacity/pointer-events 不动 ——
+   一帧最多给两页各写几个样式，也不读 offset*，不强制同步布局。 */
+function layoutPages(dx, dragMode){
+  var ps = pageEls();
+  if (!ps.length) return;
+  for (var k = 0; k < ps.length; k++){
+    var rel = k - activeTab;
+    var show = dragMode ? Math.abs(rel) <= 1 : rel === 0;
+    var node = ps[k];
+    if (node._show !== show){
+      node._show = show;
+      node.classList.toggle("on", show);
+      node.style.opacity = show ? "1" : "0";
+    }
+    var pe = (rel === 0) ? "auto" : "none";
+    if (node._pe !== pe){ node._pe = pe; node.style.pointerEvents = pe; }
+    if (Math.abs(rel) > 1) continue;
+    var tf = dx ? "translateX(calc(" + (rel * 100) + "% + " + dx + "px))"
+                : "translateX(" + (rel * 100) + "%)";
+    if (node._tf !== tf){ node._tf = tf; node.style.transform = tf; }
+  }
+}
+function setActiveTab(i){
+  if (i === activeTab) return;
+  activeTab = i;
+  PAGES.forEach(function(p, idx){
     var tab = document.getElementById("tab-" + p);
-    if (page) page.classList.toggle("hidden", p !== name);
-    if (tab) tab.classList.toggle("primary", p === name);
+    if (tab) tab.classList.toggle("primary", idx === i);
   });
-  if (name === "skip") renderSkip();
+}
+function applyPage(i, animate){
+  var ps = pageEls();
+  if (!ps.length) return;
+  closePick();                       /* 换页时把浮层菜单收起来，别让它飘在别的页上面 */
+  var next = Math.max(0, Math.min(ps.length - 1, i));
+  var prevTab = activeTab;
+  var host = document.getElementById("pages");
+  /* 动画开始前还露着的页（拖动中的邻居页、上一页）先记下来，等动画走完再收。 */
+  var keep = [];
+  if (animate){
+    for (var k = 0; k < ps.length; k++){
+      if (k !== next && ps[k].classList.contains("on")) keep.push(ps[k]);
+    }
+  }
+  if (host) host.classList.toggle("dragging", !animate);
+  setActiveTab(next);
+  activeTab = next;
+  if (next === 1) renderSkip();
+  /* 把参与动画的页面留在合成层里，过渡结束（320ms）再撤。 */
+  var fxEnd = 0;
+  for (var f = 0; f < ps.length; f++){
+    ps[f].style.transition = "";
+    if (f === next || keep.indexOf(ps[f]) >= 0){
+      ps[f].style.willChange = "transform";
+      fxEnd = 1;
+    } else {
+      ps[f].style.willChange = "";
+      ps[f].style.zIndex = "";
+    }
+  }
+  clearTimeout(applyPage._t);
+  if (fxEnd){
+    applyPage._t = setTimeout(function(){
+      if (host && host.classList.contains("dragging")) return;
+      pageEls().forEach(function(node){ node.style.willChange = ""; });
+    }, 320);
+  }
+  layoutPages(0, false);
+  /* 相邻页是并肩平移、互相不会盖住，正常滑动不用改 z-index（改层叠顺序会惊动合成器）。
+     只有跨页跳转才需要把新页压在上面。 */
+  var far = Math.abs(next - prevTab) > 1;
+  if (far && ps[next]) ps[next].style.zIndex = "2";
+  /* 页面整屏平移，旧页要是一直留到滑出屏幕外再隐藏，否则它一消失就露出底色闪一下。 */
+  if (animate && keep.length){
+    keep.forEach(function(node){
+      node.classList.add("on");
+      node.style.opacity = "1";
+      if (far) node.style.zIndex = "1";
+      node._show = true;
+    });
+    clearTimeout(applyPage._o);
+    applyPage._o = setTimeout(function(){
+      if (host && host.classList.contains("dragging")) return;   /* 又开始拖了，交给拖动流程 */
+      pageEls().forEach(function(node, idx){
+        if (idx === activeTab || !node.classList.contains("on")) return;
+        node.classList.remove("on");
+        node.style.opacity = "0";
+        node.style.zIndex = "";
+        node._show = false;
+      });
+    }, 240);
+  }
+}
+/* 标签点击 / 代码里跳页都走这个 */
+function showPage(name){
+  var i = PAGES.indexOf(name);
+  applyPage(i < 0 ? 0 : i, true);
+}
+
+/* ------------------------------ 左右滑动 ------------------------------ */
+/* 手势：拖动时两页跟手平移，松手时两种情形都翻页 —— 慢慢拖要拖过一屏的 1/6（至少 40px）；
+   轻轻一甩只要 20px 往上、而且松手那一刻够快就算。纵向优先时完全不拦，页内滚动照旧。 */
+function wireSwipe(){
+  var pages = document.getElementById("pages");
+  if (!pages || pages._swipeWired) return;
+  pages._swipeWired = 1;
+  applyPage(activeTab, true);
+  requestAnimationFrame(function(){ layoutPages(0, false); });
+
+  var x0 = null, y0 = null, dx = 0, raw = 0, axis = 0;   /* axis: 0 未定 / 1 横向 / 2 纵向 */
+  var samples = [];                                      /* 最近几百毫秒的位移采样，算松手速度 */
+  var idleTimer = null;
+  var frame = 0;
+  var lastPage = 0;              /* 页数缓存下来，避免每个 touchmove 都 querySelectorAll */
+  var swallowUntil = 0;          /* 滑动后浏览器补的那一下 click 要吞掉 */
+
+  function paintDrag(){
+    frame = 0;
+    layoutPages(dx, true);
+  }
+  function queueDrag(){ if (!frame) frame = requestAnimationFrame(paintDrag); }
+  function stopFrame(){ if (frame){ cancelAnimationFrame(frame); frame = 0; } }
+
+  /* 兜底：touchend 被系统手势吞掉时（快速滑动常见），700ms 没新位移就当作松手，
+     不然 layoutPages 留下的 translateX 会一直挂着，内容就停在半路。 */
+  var lastMove = 0;
+  function armIdle(){
+    lastMove = Date.now();
+    if (!idleTimer) idleTimer = setTimeout(idleCheck, 700);
+  }
+  function idleCheck(){
+    idleTimer = null;
+    if (x0 === null) return;
+    var wait = 700 - (Date.now() - lastMove);
+    if (wait > 0){ idleTimer = setTimeout(idleCheck, wait); return; }
+    settleDrag();
+  }
+  function settleDrag(){
+    if (idleTimer){ clearTimeout(idleTimer); idleTimer = null; }
+    stopFrame();
+    pages.classList.remove("dragging");
+    x0 = null; dx = 0; raw = 0; axis = 0; samples = [];
+    applyPage(activeTab, true);
+  }
+
+  pages.addEventListener("touchstart", function(e){
+    if (e.touches.length !== 1) return;
+    /* 从输入框上按下去时不接管手势：那儿横向拖动是在挪光标 / 选文字，
+       不能一拖就把整页翻走。想翻页从别处起手就行。 */
+    var t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (idleTimer){ clearTimeout(idleTimer); idleTimer = null; }
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+    dx = 0; raw = 0; axis = 0;
+    lastPage = pageCount() - 1;
+    samples = [{t: Date.now(), x: 0}];
+  }, {passive: true});
+
+  pages.addEventListener("touchmove", function(e){
+    if (x0 === null || e.touches.length !== 1) return;
+    var nx = e.touches[0].clientX - x0;
+    var ny = e.touches[0].clientY - y0;
+    if (!axis){
+      if (Math.abs(nx) < 8 && Math.abs(ny) < 8) return;
+      axis = Math.abs(nx) > Math.abs(ny) ? 1 : 2;
+      if (axis === 2){ x0 = null; return; }    /* 纵向：放手，页内滚动*/
+      /* 确定是横向滑动才关过渡、提合成层；纵向滚页面时完全不动这些。 */
+      pages.classList.add("dragging");
+      var fxs = pageEls();
+      for (var fi = 0; fi < fxs.length; fi++){
+        if (Math.abs(fi - activeTab) <= 1){
+          fxs[fi].style.transition = "none";
+          fxs[fi].style.willChange = "transform";
+        }
+      }
+    }
+    raw = nx;
+    var now = Date.now();
+    samples.push({t: now, x: raw});
+    while (samples.length > 2 && now - samples[0].t > 220) samples.shift();
+    dx = nx;
+    /* 到头的方向阻尼一下，避免拉出去一屏空白 */
+    if ((activeTab === 0 && dx > 0) || (activeTab === lastPage && dx < 0)) dx = dx / 3;
+    queueDrag();
+    armIdle();
+    if (e.cancelable) e.preventDefault();
+  }, {passive: false});
+
+  function endDrag(e){
+    if (idleTimer){ clearTimeout(idleTimer); idleTimer = null; }
+    if (x0 === null) return;
+    /* 松手那一瞬的位置也算进来，不然最后一下的位移和速度会漏掉 */
+    if (e && e.changedTouches && e.changedTouches.length){
+      raw = e.changedTouches[0].clientX - x0;
+      samples.push({t: Date.now(), x: raw});
+    }
+    var w = pages.clientWidth || 1;
+    var now = Date.now();
+    /* 取 90ms 往前的采样点算平均速度（px/ms，正数=往右滑） */
+    var ref = samples.length ? samples[0] : {t: now, x: raw};
+    for (var i = samples.length - 1; i >= 0; i--){
+      if (now - samples[i].t >= 90){ ref = samples[i]; break; }
+    }
+    var dt = Math.max(16, now - ref.t);
+    var v = (raw - ref.x) / dt;
+    var th = Math.max(40, w / 6);       /* 慢拖的阈值 */
+    var flick = Math.max(20, w / 16);   /* 快甩的最小位移 */
+    var next = activeTab;
+    if (dx <= -th || (v <= -0.18 && raw <= -flick)) next = activeTab + 1;
+    else if (dx >= th || (v >= 0.18 && raw >= flick)) next = activeTab - 1;
+    if (Math.abs(raw) >= 12) swallowUntil = Date.now() + 400;
+    /* 把还没画出去的那一帧补上，翻页动画才能从手指松开时的真实位置接着走。 */
+    if (frame){ cancelAnimationFrame(frame); frame = 0; layoutPages(dx, true); }
+    pages.classList.remove("dragging");
+    x0 = null; dx = 0; raw = 0; axis = 0; samples = [];
+    applyPage(next, true);
+  }
+  pages.addEventListener("touchend", endDrag, {passive: true});
+  pages.addEventListener("touchcancel", endDrag, {passive: true});
+
+  /* 滑动结束后浏览器还会补一个 click 落在手指抬起的位置上，别让它点到下面的按钮/输入框。 */
+  document.addEventListener("click", function(ev){
+    if (Date.now() < swallowUntil){
+      swallowUntil = 0;
+      ev.stopPropagation();
+      if (ev.cancelable) ev.preventDefault();
+    }
+  }, true);
 }
 
 /* -------------------------------- 黑名单 --------------------------------
@@ -582,11 +1001,12 @@ function renderSkip(){
   if (!box) return;
   var list = skipList();
   box.innerHTML = "";
-  if (!list.length){ box.appendChild(el("p", "hint", t("skip.empty"))); return; }
+  if (!list.length){ box.appendChild(setT(el("p", "hint"), "skip.empty")); return; }
   list.forEach(function(pkg){
     var row = el("div", "skiprow");
     row.appendChild(el("span", "pkg", pkg));
-    var del = el("button", "btn", t("skip.remove"));
+    /* 删除按钮的文字也交给 setT：切语言时直接换，不用重建整张列表。 */
+    var del = setT(el("button", "btn"), "skip.remove");
     del.type = "button";
     del.onclick = function(){ removeSkip(pkg).catch(function(){}); };
     row.appendChild(del);
@@ -632,47 +1052,62 @@ async function removeSkip(pkg){
 
     var ver = await readConf();
 
-    var langSel = document.getElementById("lang");
-    LANGS.forEach(function(pair){
-      var op = el("option", null, pair[1]);
-      op.value = pair[0];
-      langSel.appendChild(op);
-    });
-    langSel.value = LANG;
-    langSel.onchange = function(){ setLang(langSel.value); };
+    var langBtn = document.getElementById("lang");
+    langBtn.onclick = openLangMenu;
+    paintLang();
 
     applyI18n();
-    document.getElementById("modline").textContent = t("about.version") + " " + ver;
+    paintModline();
     document.getElementById("about-ver").textContent = ver;
 
     render();
 
-    document.getElementById("act-stop").onclick = function(){
+    document.getElementById("act-stop").onclick = async function(){
       if (!confirm(t("act.stop") + "?")) return;
-      exec("sh " + MODDIR + "/restore.sh stop 2>&1");
+      /* 脚本可能要跑几秒：先挂一条不自动消失的提示，等命令返回再换成会自己消失的。 */
       toast(t("act.stop"), false, true);
+      try { await exec("sh " + MODDIR + "/restore.sh stop 2>&1"); } catch (e){}
+      toast(t("act.stop"), false);
       setTimeout(function(){ refreshStatus().catch(function(){}); }, 4000);
     };
-    document.getElementById("act-restore-reboot").onclick = function(){
+    document.getElementById("act-restore-reboot").onclick = async function(){
       if (!confirm(t("act.restoreReboot") + "?")) return;
-      exec("sh " + MODDIR + "/restore.sh reboot 2>&1");
       toast(t("act.restoreReboot"), false, true);
+      try { await exec("sh " + MODDIR + "/restore.sh reboot 2>&1"); } catch (e){}
+      toast(t("act.restoreReboot"), false);
     };
     document.getElementById("open-status").onclick = function(){ openStatus().catch(function(){}); };
     document.getElementById("about-btn").onclick = function(){ document.getElementById("about-modal").className = "modal"; };
+    var eggTaps = 0, eggTimer = 0, eggTitleTimer = 0;
+    var eggTitle = document.querySelector(".topbar h1");
+    eggTitle.onclick = function(){
+      eggTaps++;
+      clearTimeout(eggTimer);
+      eggTimer = setTimeout(function(){ eggTaps = 0; }, 1800);
+      if (eggTaps >= 5){
+        eggTaps = 0;
+        var line = document.getElementById("egg-line");
+        if (line) line.classList.remove("hidden");
+        eggTitle.textContent = "Ommega-B";
+        clearTimeout(eggTitleTimer);
+        eggTitleTimer = setTimeout(function(){ eggTitle.textContent = "Ommega-B"; }, 2600);
+        toast("原神,启动!");
+        try { console.log("%c原神,启动!", "font-size:14px;color:#3867d6"); } catch (e){}
+      }
+    };
     document.querySelectorAll("[data-open]").forEach(function(n){
       n.onclick = function(){ openExternal(n.dataset.open, n.dataset.openFallback); };
     });
-    document.getElementById("about-close").onclick = function(){ document.getElementById("about-modal").className = "modal hidden"; };
-    document.getElementById("about-modal").onclick = function(ev){ if (ev.target.id === "about-modal") this.className = "modal hidden"; };
+    document.getElementById("about-close").onclick = function(){ closePick(); document.getElementById("about-modal").className = "modal hidden"; flushLangPass(); };
+    document.getElementById("about-modal").onclick = function(ev){ if (ev.target.id === "about-modal"){ closePick(); this.className = "modal hidden"; flushLangPass(); } };
     document.getElementById("save").onclick = function(){ save().catch(function(e){ toast(t("toast.saveFail", {msg: e.message}), true); }); };
     document.getElementById("reload").onclick = function(){
       /* 这个按钮的本意是「让 relay 重读配置」，但它读完了面板自己却还是旧值 —— 连同面板一起刷新。 */
       reloadNow().then(function(){ dirty = false; return refreshFromDisk(); }).catch(function(e){ toast(String(e.message), true); });
     };
     document.getElementById("restart").onclick = function(){ restartRelay().catch(function(e){ toast(String(e.message), true); }); };
-    document.getElementById("tab-home").onclick = function(){ showPage("home"); };
-    document.getElementById("tab-skip").onclick = function(){ showPage("skip"); };
+    document.getElementById("tab-home").onclick = function(){ applyPage(0, true); };
+    document.getElementById("tab-skip").onclick = function(){ applyPage(1, true); };
     document.getElementById("skip-add").onclick = function(){
       document.getElementById("skip-modal").className = "modal";
       document.getElementById("skip-input").focus();
@@ -683,7 +1118,8 @@ async function removeSkip(pkg){
 
     document.getElementById("boot").className = "hidden";
     document.getElementById("tabs").className = "acts";
-    document.getElementById("panel").className = "";
+    document.getElementById("pages").className = "pages";
+    wireSwipe();
     refreshStatus().catch(function(){});
   } catch (e){
     document.getElementById("boot").textContent = t("toast.initFail", {msg: e.message});
