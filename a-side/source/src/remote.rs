@@ -773,6 +773,18 @@ fn http_request_with(
 
 // ── RemoteRelay public API ─────────────────────────────────────────────
 
+/// 取转发地址。`require_keymint_remote` 是「这条请求要不要远程 keymint 那个开关放行」：
+/// KeyMint 出证/签名那条路要，SOTER 那条路不要 —— 它有自己的 `soter_remote`。
+fn base_url_of(r: &config::RemoteConfig, require_keymint_remote: bool) -> Result<String> {
+    if require_keymint_remote && !r.enabled {
+        return Err(anyhow!("remote relay not enabled"));
+    }
+    if r.url.is_empty() {
+        return Err(anyhow!("remote url not configured"));
+    }
+    Ok(r.url.trim_end_matches('/').to_string())
+}
+
 impl RemoteRelay {
     fn remote() -> Result<config::RemoteConfig> {
         let guard = config::config()
@@ -781,15 +793,20 @@ impl RemoteRelay {
         Ok(guard.remote.clone())
     }
 
+    /// KeyMint 出证/签名用的地址：必须「远程 keymint」这个开关是开的。
     fn base_url() -> Result<String> {
+        Self::base_url_with(true)
+    }
+
+    /// SOTER 用的地址：只看 URL。SOTER 走不走远程由它自己的 `soter_remote` 决定
+    /// （`soter_relay` 已经判过），这里再拿 `remote` 拦一刀就等于两个开关又绑在一起。
+    fn base_url_for_soter() -> Result<String> {
+        Self::base_url_with(false)
+    }
+
+    fn base_url_with(require_keymint_remote: bool) -> Result<String> {
         let r = Self::remote()?;
-        if !r.enabled {
-            return Err(anyhow!("remote relay not enabled"));
-        }
-        if r.url.is_empty() {
-            return Err(anyhow!("remote url not configured"));
-        }
-        Ok(r.url.trim_end_matches('/').to_string())
+        base_url_of(&r, require_keymint_remote)
     }
 
     fn token() -> Result<String> {
@@ -811,7 +828,16 @@ impl RemoteRelay {
     /// POST a JSON body to a relay endpoint.  Returns `Ok(Some(json))` on 2xx
     /// with a JSON body, `Ok(None)` if the remote is unreachable/non-2xx.
     fn post_json(path: &str, body: &Value) -> Result<Option<Value>> {
-        let url = format!("{}{}", Self::base_url()?, path);
+        Self::post_json_at(&Self::base_url()?, path, body)
+    }
+
+    /// SOTER 专用：不要求「远程 keymint」是开的，见 [`Self::base_url_for_soter`]。
+    fn post_json_soter(path: &str, body: &Value) -> Result<Option<Value>> {
+        Self::post_json_at(&Self::base_url_for_soter()?, path, body)
+    }
+
+    fn post_json_at(base_url: &str, path: &str, body: &Value) -> Result<Option<Value>> {
+        let url = format!("{base_url}{path}");
         // 根本没有上行就先别发：一轮 3 秒连接超时再加一次重试，App 那边早就超时
         // 放弃了，看到的就成了「远程不通也不回退」。这里直接报错，上层（attest /
         // sign / soter 那几条）立刻落到本地兜底，这也就是“快速失败”。
@@ -1225,7 +1251,7 @@ impl RemoteRelay {
             None => return Err(anyhow!("soter payload must be a JSON object")),
         };
         body.insert("device_id".to_string(), Value::from(Self::device_id()?));
-        Self::post_json("/api/soter/", &Value::Object(body))
+        Self::post_json_soter("/api/soter/", &Value::Object(body))
     }
 }
 
@@ -1569,6 +1595,24 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
 #[cfg(test)]
 mod iface_choice_tests {
     use super::*;
+
+    /// SOTER 走不走远程只看它自己的开关：`remote` 关着时，SOTER 这条仍然得拿到地址，
+    /// 否则两个开关又绑在一起（面板上「只开 SOTER」就等于什么都不走）。
+    #[test]
+    fn soter_url_does_not_need_the_keymint_remote_switch() {
+        let mut r = config::RemoteConfig::default();
+        r.enabled = false;
+        r.url = "https://example.com:8443/".to_string();
+        assert_eq!(base_url_of(&r, false).unwrap(), "https://example.com:8443");
+        assert!(base_url_of(&r, true).is_err());
+    }
+
+    #[test]
+    fn an_empty_url_is_still_an_error_for_both() {
+        let r = config::RemoteConfig::default();
+        assert!(base_url_of(&r, false).is_err());
+        assert!(base_url_of(&r, true).is_err());
+    }
 
     #[test]
     fn bind_iface_spellings_map_to_the_right_choice() {
