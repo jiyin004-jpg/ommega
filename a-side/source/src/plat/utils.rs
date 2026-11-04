@@ -81,6 +81,11 @@ fn get_pm() -> anyhow::Result<rsbinder::Strong<dyn IKeyAttestationApplicationIdP
     })
 }
 
+/// 系统那份 uid→包名 表（root 域读得到）。
+const PACKAGES_LIST: &str = "/data/system/packages.list";
+/// keymint 守护抄出来的那份（keystore 域读得到），见 `daemon::aaid_sync_loop`。
+const AAID_TABLE: &str = "/data/misc/ommega/aaid_table";
+
 const ERROR_GET_ATTESTATION_APPLICATION_ID_FAILED: i32 = 1;
 const KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE: usize = 1024;
 const AAID_PKG_INFO_OVERHEAD: usize = 15;
@@ -168,11 +173,54 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
     encode_application_id(application_id)
 }
 
-/// 从 `/data/system/packages.list` 里找这个 uid 挂的包，拼一份 AAID。
-/// 只给「系统 AAID provider 用不了」的场合兜底（比如 SKRoot 下 keymint 以 root 跑）。
+/// AAID 的本地兜底：系统 AAID provider 用不了的时候（我们被注入进 keystore2、
+/// 或者 SKRoot 下以 root 跑）自己拼一份。
+///
+/// 两个来源，按可靠程度排：
+///   1. `/data/system/packages.list` —— 只有我们以 root 跑时读得到。真机上这个文件是
+///      `0640 system:package_info` + `packages_list_file`，被注入之后我们在 keystore
+///      （uid 1017）里跑，DAC 和 SELinux 两头都拦，一读就是 EACCES；
+///   2. `/data/misc/ommega/aaid_table` —— keymint 守护（一直是 root）从 packages.list
+///      + `pm list packages --show-versioncode` 抄出来的。放在数据根里、0644、
+///      system_data_file，keystore 域读得到，也不用动系统文件半个字节。
 fn aaid_from_packages_list(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
-    let text = std::fs::read_to_string("/data/system/packages.list")
-        .map_err(|error| anyhow::anyhow!("read packages.list: {error}"))?;
+    let mut direct_error: Option<String> = None;
+    match std::fs::read_to_string(PACKAGES_LIST) {
+        Ok(text) => {
+            let package_infos = package_infos_from_packages_list(&text, uid);
+            if !package_infos.is_empty() {
+                return Ok(KeyAttestationApplicationId {
+                    packageInfos: package_infos,
+                });
+            }
+        }
+        Err(error) => {
+            debug!("AAID fallback cannot read {PACKAGES_LIST}: {error}");
+            direct_error = Some(format!("read packages.list: {error}"));
+        }
+    }
+
+    let text = std::fs::read_to_string(AAID_TABLE).map_err(|error| {
+        anyhow::anyhow!(
+            "read packages.list: {}; read aaid_table: {error}",
+            direct_error.as_deref().unwrap_or("uid not listed")
+        )
+    })?;
+    let package_infos = package_infos_from_aaid_table(&text, uid);
+    if package_infos.is_empty() {
+        return Err(anyhow::anyhow!("no package registered for uid {uid}"));
+    }
+    debug!(
+        "AAID resolved locally from {AAID_TABLE}: {} package(s) for uid {uid}",
+        package_infos.len()
+    );
+    Ok(KeyAttestationApplicationId {
+        packageInfos: package_infos,
+    })
+}
+
+/// 行格式跟系统那份一样：「包名 uid 标志 数据目录 ...」。版本号这里没有，给 1。
+fn package_infos_from_packages_list(text: &str, uid: u32) -> Vec<KeyAttestationPackageInfo> {
     let mut package_infos = Vec::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
@@ -189,12 +237,37 @@ fn aaid_from_packages_list(uid: u32) -> anyhow::Result<KeyAttestationApplication
             ..Default::default()
         });
     }
-    if package_infos.is_empty() {
-        return Err(anyhow::anyhow!("no package registered for uid {uid}"));
+    package_infos
+}
+
+/// 守护写的表：「uid 包名 版本号」，`#` 开头是注释。
+fn package_infos_from_aaid_table(text: &str, uid: u32) -> Vec<KeyAttestationPackageInfo> {
+    let mut package_infos = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(field_uid) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+        if field_uid != uid {
+            continue;
+        }
+        let Some(name) = fields.next() else { continue };
+        let version = fields
+            .next()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1);
+        package_infos.push(KeyAttestationPackageInfo {
+            packageName: name.to_string(),
+            versionCode: version,
+            ..Default::default()
+        });
     }
-    Ok(KeyAttestationApplicationId {
-        packageInfos: package_infos,
-    })
+    package_infos
 }
 
 /// 这个 uid 挂着哪些包（AAID 里那几个 `packageInfos` 的包名）。

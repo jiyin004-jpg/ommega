@@ -13,6 +13,7 @@
 //!   - `run/restart.keymint` 出现就重启 keymint（面板操作 / watchdog 触发）。
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -26,6 +27,11 @@ const MODDIR: &str = "/data/adb/modules/ommega";
 
 const CONF_PATH: &str = "/data/misc/ommega/config";
 const LOG_FILE: &str = "/data/misc/ommega/logs/daemon.log";
+/// 系统自己的 uid→包名 表，只有 root（本守护）读得到。
+const PACKAGES_LIST: &str = "/data/system/packages.list";
+/// 抄给 keystore 域看的 AAID 表：我们被注入进 keystore2 之后在那儿跑，
+/// `packages.list` 是 `0640 system:package_info` + `packages_list_file`，两头都拦。
+const AAID_TABLE: &str = "/data/misc/ommega/aaid_table";
 const REMOTE_IDENTITY: &str = "/data/misc/ommega/remote_identity";
 const CONFIG_TOML: &str = "/data/misc/ommega/config.toml";
 const REMOTE_IDENTITY_APPLIED: &str = "/data/adb/ommega/conf/remote_identity.applied";
@@ -42,6 +48,8 @@ const LOCK_DIR: &str = "/data/adb/ommega/run/keymint-daemon.lock";
 const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 /// 子进程存活检查周期（比同步密，重启请求能尽快生效）。
 const TICK: Duration = Duration::from_secs(1);
+/// AAID 表的巡检周期：只 stat `packages.list`，变了才重抄（装/卸包才会变）。
+const AAID_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 const KEYMINT_ENV: [&str; 6] = [
     "ro.boot.vbmeta.digest",
@@ -64,6 +72,8 @@ pub fn run(extra: Vec<String>) -> ! {
     // 伪装参数只在开机（或本守护重启）时算一次：面板保存只写 props.conf，
     // 不会即时改运行时；这样属性和证书永远是同一份，不会一边新一边旧。
     normalize_all();
+    // AAID 兜底表：悄悄跑着，不让它拖住主循环（里面会 fork 一次 `pm`）。
+    std::thread::spawn(aaid_sync_loop);
 
     loop {
         let Some(target) = find_keymint() else {
@@ -182,6 +192,123 @@ fn config_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         let (k, v) = line.split_once(':')?;
         (k.trim() == key).then(|| v.trim())
     })
+}
+
+// ---------------------------------------------------------------------------
+// AAID 兜底表
+// ---------------------------------------------------------------------------
+//
+// 为什么要有这张表：出证要往证书里塞 `attestationApplicationId`（tag 709），
+// 系统只给 Keystore/Credstore 的 uid 提供，而我们的 TA 被注入进 keystore2 之后
+// 拿不到那个服务；自己读 `/data/system/packages.list` 也不行（`0640 system:package_info`
+// + `packages_list_file`，DAC 和 SELinux 两头都拦）。本守护一直是 root，读得到，
+// 那就抄一份到数据根，TA 从那里拿。
+//
+// 表里行格式：`uid 包名 版本号`（`#` 开头是注释）。版本号从 `pm` 拿，拿不到写 1。
+// 只 stat `packages.list`，装/卸载才会变，变了才重抄 —— 常驻零开销。
+fn aaid_sync_loop() {
+    let mut last_stamp: Option<(u64, u64)> = None;
+    loop {
+        let stamp = fs::metadata(PACKAGES_LIST).ok().map(|meta| {
+            let secs = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|delta| delta.as_secs())
+                .unwrap_or(0);
+            (secs, meta.len())
+        });
+        if stamp != last_stamp {
+            let written = sync_aaid_table();
+            if written {
+                last_stamp = stamp;
+            }
+        }
+        sleep(AAID_CHECK_INTERVAL);
+    }
+}
+
+/// 抄一遍。返回是否已经把表写成（写失败就下轮再来，不丢状态）。
+fn sync_aaid_table() -> bool {
+    let Ok(list) = fs::read_to_string(PACKAGES_LIST) else {
+        log("aaid table: cannot read packages.list");
+        return false;
+    };
+    let versions = package_versions();
+    let mut body = String::from("# uid package versionCode  (from /data/system/packages.list)\n");
+    let mut count = 0usize;
+    for line in list.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(uid) = fields
+            .next()
+            .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let version = versions
+            .iter()
+            .find(|(package, _)| package == name)
+            .map(|(_, code)| *code)
+            .unwrap_or(1);
+        body.push_str(&format!("{uid} {name} {version}\n"));
+        count += 1;
+    }
+    if count == 0 {
+        log("aaid table: packages.list had no entries");
+        return false;
+    }
+    if fs::read_to_string(AAID_TABLE).ok().as_deref() == Some(body.as_str()) {
+        return true;
+    }
+    // 先落临时文件再 rename：TA 那边随时可能来读，不能读到半张表。
+    let tmp = format!("{AAID_TABLE}.tmp");
+    if let Err(error) = fs::write(&tmp, body.as_bytes()) {
+        log(&format!("aaid table: cannot write {tmp}: {error}"));
+        return false;
+    }
+    // 0644：TA 跑在 keystore 域，跟本守护不是一个 uid。
+    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644));
+    if let Err(error) = fs::rename(&tmp, AAID_TABLE) {
+        log(&format!("aaid table: cannot rename into place: {error}"));
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    log(&format!("aaid table: {count} packages"));
+    true
+}
+
+/// `pm list packages --show-versioncode` → `(包名, 版本号)`。
+/// 拿不到就空表（调用方回落成 1）—— 版本号只是证书里给人看的一个字段，
+/// 不值得为它重试或者拖慢守护。
+fn package_versions() -> Vec<(String, i64)> {
+    let output = match Command::new("/system/bin/pm")
+        .args(["list", "packages", "--show-versioncode"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut versions = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("package:") else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(code) = fields
+            .next()
+            .and_then(|value| value.strip_prefix("versionCode:"))
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        versions.push((name.to_string(), code));
+    }
+    versions
 }
 
 // ---------------------------------------------------------------------------
