@@ -1329,6 +1329,16 @@ pub fn remote_enabled() -> bool {
     }
 }
 
+/// SOTER 是否走远程：跟 KeyMint 的 `remote_enabled()` 完全独立，各自一个开关。
+///
+/// SOTER 转发只看 `soter_remote`，出证只看 `remote`；URL 空则两边都发不出去。
+pub fn soter_remote_enabled() -> bool {
+    match config::config().read() {
+        Ok(g) => g.remote.soter_remote && !g.remote.url.is_empty(),
+        Err(_) => false,
+    }
+}
+
 /// Convenience: `true` if the remote chain may fall back to local processing.
 ///
 /// The flat A-side config spells this `local_hw` (`RemoteConfig::fallback_local`

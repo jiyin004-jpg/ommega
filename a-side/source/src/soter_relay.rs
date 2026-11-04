@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use kmr_common::soter_relay::{self, Outcome};
 use serde_json::Value;
 
-use crate::remote::{fallback_local, remote_enabled, RemoteRelay};
+use crate::remote::{fallback_local, soter_remote_enabled, RemoteRelay};
 
 /// 「这些调用只在本地兜底回答、一次都不往 B 端转」的缺省别名前缀。
 ///
@@ -101,10 +101,11 @@ fn forward_inner(request: &str) -> Vec<u8> {
         return Outcome::Local.encode();
     }
 
-    // WebUI 的「是否远程」关着：跟接线之前一样，本地自签兜底。这一行走 info：开关拨到
+    // WebUI 的「SOTER 走远程」关着：跟接线之前一样，本地自签兜底。这一行走 info：开关拨到
     // 关之后，日志里看不到 "answered remotely" 了，得能看见为什么没看见。
-    if !remote_enabled() {
-        log::info!("event=soter relay op={op} remote disabled; using the local backend");
+    // 这个开关与 KeyMint 的远程开关完全分开（`remote` 只管出证）。
+    if !soter_remote_enabled() {
+        log::info!("event=soter relay op={op} soter remote disabled; using the local backend");
         return Outcome::Local.encode();
     }
 
@@ -318,11 +319,15 @@ fn heal_soter_slot(pkg: &str, uid: i64) -> anyhow::Result<()> {
         "uid": uid,
         "force_scope_wipe": true,
     });
-    match RemoteRelay::soter(&body) {
-        Ok(_) => log::info!("event=soter selfheal cleared B slot uid={uid}"),
-        Err(error) => {
-            log::warn!("event=soter selfheal clear B slot failed uid={uid}: {error:#}")
+    if crate::remote::soter_remote_enabled() {
+        match RemoteRelay::soter(&body) {
+            Ok(_) => log::info!("event=soter selfheal cleared B slot uid={uid}"),
+            Err(error) => {
+                log::warn!("event=soter selfheal clear B slot failed uid={uid}: {error:#}")
+            }
         }
+    } else {
+        log::info!("event=soter selfheal skip clearing B slot uid={uid}: soter remote disabled");
     }
     Ok(())
 }

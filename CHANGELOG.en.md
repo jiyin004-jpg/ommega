@@ -7,3 +7,4 @@
 - The patch dates in certificates follow the system image itself; when image metadata is unreadable they follow the vendor patch date, so all three stay consistent.
 - The verified boot key and hash in certificates are derived from the device's own data instead of coming out empty or wrong.
 - Disguise settings are applied at boot only, so properties and certificates always agree.
+- Remote SOTER is now its own switch, independent from remote attestation.

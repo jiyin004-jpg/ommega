@@ -727,6 +727,15 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         _ => !is_url_disabled,
     };
 
+    // WebUI「SOTER 走远程」：与 `remote` 完全独立的开关，缺省关。
+    // 两个开关各管各的，不互相跟随。
+    let soter_remote = matches!(
+        get(&["soter_remote", "remote_soter"])
+            .map(|v| v.to_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+
     let tls_insecure = matches!(
         get(&["tls_insecure", "tls_skip_verify", "insecure_tls"])
             .map(|v| v.to_lowercase())
@@ -808,6 +817,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
 
     Some(RemoteConfig {
         enabled: prefer_remote,
+        soter_remote,
         url,
         token,
         device_id,
@@ -864,6 +874,10 @@ impl Default for ConfigFile {
 #[serde(default)]
 pub struct RemoteConfig {
     pub enabled: bool,
+    /// WebUI「SOTER 走远程」：与 `enabled` 完全独立的开关，缺省关。
+    /// SOTER 的转发只看它，KeyMint 出证只看 `enabled`，互不影响。
+    #[serde(default)]
+    pub soter_remote: bool,
     /// Base URL of the relay_server, e.g. `https://example.com:8443`.
     pub url: String,
     /// B-side relay token (`X-Relay-Token`).
@@ -938,6 +952,7 @@ impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            soter_remote: false,
             url: String::new(),
             token: String::new(),
             device_id: String::new(),

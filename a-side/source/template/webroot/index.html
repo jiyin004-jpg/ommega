@@ -518,6 +518,7 @@ var REMOTE_FIELDS = [
   {key:"hide_device_ids",type:"bool"},
   {key:"soter_hide",    type:"bool", oneZero:true},
   {key:"soter_inject",  type:"bool", oneZero:true},
+  {key:"soter_remote",  type:"bool", oneZero:true},
   {key:"device_id",     type:"text", group:"patch"}
 ];
 /* device_id 的说明改了口径：A 端装好默认留空 = 交给服务端挑（控制台可以指定默认设备）。
@@ -532,6 +533,21 @@ var DEVICE_ID_HINT = {
 };
 Object.keys(DEVICE_ID_HINT).forEach(function(code){
   if (I18N[code]) I18N[code]["f.device_id.hint"] = DEVICE_ID_HINT[code];
+});
+
+/* 「SOTER 走远程」与 KeyMint 的远程开关分开的文案，同样用覆盖方式加。 */
+var SOTER_REMOTE_TEXT = {
+  "zh-CN": {name:"SOTER 走远程", hint:"SOTER 请求发给远端；关着就只在本机作答。与上面的远程开关互不影响。"},
+  "zh-TW": {name:"SOTER 走遠端", hint:"SOTER 請求發給遠端；關著就只在本機作答。與上面的遠端開關互不影響。"},
+  "en": {name:"Remote SOTER", hint:"Send SOTER requests to the relay; off means local answers only. Independent from the remote switch above."},
+  "ja": {name:"SOTER をリモートへ", hint:"SOTER リクエストを中継サーバーへ送ります。オフなら本機のみで応答します。上のリモートスイッチとは無関係です。"},
+  "ko": {name:"SOTER 원격 사용", hint:"SOTER 요청을 중계 서버로 보냅니다. 끄면 이 기기에서만 응답합니다. 위 원격 스위치와 무관합니다."},
+  "ru": {name:"SOTER через сервер", hint:"Запросы SOTER уходят на сервер; выключено — только на устройстве. Не зависит от переключателя выше."}
+};
+Object.keys(SOTER_REMOTE_TEXT).forEach(function(code){
+  if (!I18N[code]) return;
+  I18N[code]["f.soter_remote"] = SOTER_REMOTE_TEXT[code].name;
+  I18N[code]["f.soter_remote.hint"] = SOTER_REMOTE_TEXT[code].hint;
 });
 
 /* 两个「声明不支持」开关的文案：只说清楚系统不再上报这个能力、所有应用看到同一份视图、
