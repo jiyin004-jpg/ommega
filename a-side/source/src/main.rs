@@ -503,9 +503,23 @@ fn run() -> Result<()> {
     keybox::initialize().context("failed to initialize keybox runtime")?;
 
     info!("setting uid/gid={} role=keystore", KEYSTORE_UID);
-    set_keystore_identity()?;
-
+    // 顺序很重要（SKRoot 下）：
+    //  - rpc.sock 要在还是 root-like 时建：SKRoot 的 avc 只对 root-like 放行，
+    //    先降权再建会被 `avc: denied { create } unix_stream_socket` 直接拒；
+    //  - 降权到 keystore 才能让后面取 AAID 的 binder 身份合法 —— 系统的
+    //    KeyAttestationApplicationIdProvider 只认 Keystore/Credstore uid，
+    //    以 root 去要会回 “This service can only be used by Keystore or Credstore”。
     let injector_rpc_server = create_rpc_server(RpcBind::FileSocket)?;
+    // 抽象 socket（ommega.soter.rpc）也得在降权前绑：keystore2 里的 payload 域是
+    // keystore，而 SKRoot 的 avc 只对 root-like 放行 —— 降权后再绑会被拒，
+    // 表现就是 payload 一直报 “trying the abstract socket” 却连不上。
+    // 服务（add_service）仍然在降权后添加，这里只先占住 listen 端。
+    let app_server = create_rpc_server(RpcBind::Abstract)?;
+    if std::env::var("OMMEGA_KEEP_ROOT").as_deref() != Ok("1") {
+        set_keystore_identity()?;
+    } else {
+        info!("OMMEGA_KEEP_ROOT=1: staying root (skroot fallback)");
+    }
 
     crate::keymaster::metrics_store::update_keystore_crash_count();
 
@@ -552,7 +566,7 @@ fn run() -> Result<()> {
     // Second rendezvous point for app-domain callers: the SOTER host cannot reach
     // the file socket (0700 keystore dir), so it connects here instead. Served by
     // its own accept loop, same wire version, same services, narrower authorizer.
-    let app_server = create_rpc_server(RpcBind::Abstract)?;
+    // （绑定已在降权前完成，见上面 app_server。）
     for (name, binder) in &services {
         app_server
             .add_service(name, binder.clone())

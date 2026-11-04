@@ -151,12 +151,50 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
             packageInfos: vec![info],
         }
     } else {
-        get_application_id_from_provider(uid)?
+        match get_application_id_from_provider(uid) {
+            Ok(id) => id,
+            Err(error) => {
+                // SKRoot 下 keymint 必须保持 root（降权后绑不了 socket、binder 初始化也会 abort），
+                // 而 AAID provider 只认 Keystore/Credstore 的 uid，以 root 去问必被拒。
+                // 退一步自己从 /data/system/packages.list 造一份（包名一样，versionCode 给 1）。
+                debug!("AAID provider failed ({error:#}), falling back to packages.list");
+                aaid_from_packages_list(uid)?
+            }
+        }
     };
 
     debug!("resolved application_id={:?}", application_id);
 
     encode_application_id(application_id)
+}
+
+/// 从 `/data/system/packages.list` 里找这个 uid 挂的包，拼一份 AAID。
+/// 只给「系统 AAID provider 用不了」的场合兜底（比如 SKRoot 下 keymint 以 root 跑）。
+fn aaid_from_packages_list(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
+    let text = std::fs::read_to_string("/data/system/packages.list")
+        .map_err(|error| anyhow::anyhow!("read packages.list: {error}"))?;
+    let mut package_infos = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        let Some(field_uid) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+        if field_uid != uid {
+            continue;
+        }
+        package_infos.push(KeyAttestationPackageInfo {
+            packageName: name.to_string(),
+            versionCode: 1,
+            ..Default::default()
+        });
+    }
+    if package_infos.is_empty() {
+        return Err(anyhow::anyhow!("no package registered for uid {uid}"));
+    }
+    Ok(KeyAttestationApplicationId {
+        packageInfos: package_infos,
+    })
 }
 
 /// 这个 uid 挂着哪些包（AAID 里那几个 `packageInfos` 的包名）。

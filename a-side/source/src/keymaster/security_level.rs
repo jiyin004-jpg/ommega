@@ -14,6 +14,28 @@
 
 //! This crate implements the IKeystoreSecurityLevel interface.
 
+/// 临时以 keystore uid 执行一段代码。
+///
+/// 系统那侧的 KeyAttestationApplicationIdProvider 只认 Keystore/Credstore 身份，
+/// 而 SKRoot 下 keymint 要保持 root（否则 setuid 后会脱离 avc 的 root-like 放行，
+/// 建 rpc.sock / 写日志全被拒）。所以只把取 AAID 这一步切成 keystore uid。
+fn with_keystore_uid<T>(f: impl FnOnce() -> T) -> T {
+    const KEYSTORE_UID: u32 = 1017;
+    let saved = unsafe { libc::geteuid() };
+    if saved == 0 {
+        unsafe {
+            libc::seteuid(KEYSTORE_UID);
+        }
+    }
+    let result = f();
+    if saved == 0 {
+        unsafe {
+            libc::seteuid(0);
+        }
+    }
+    result
+}
+
 use crate::android::hardware::security::keymint::{
     Algorithm::Algorithm, AttestationKey::AttestationKey,
     HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
@@ -560,7 +582,10 @@ impl KeystoreSecurityLevel {
         if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) {
             let _wp =
                 self.watch(" KeystoreSecurityLevel::add_required_parameters: calling get_aaid");
-            let aaid = plat_utils::get_aaid(uid.0 as u32)
+            // 系统那侧的 KeyAttestationApplicationIdProvider 只认 Keystore/Credstore uid。
+            // SKRoot 下 keymint 必须保持 root（否则 setuid 之后脱离 avc 的 root-like 放行，
+            // 建 rpc.sock / 写日志全被拒），所以这里单独把取 AAID 这一步切成 keystore uid。
+            let aaid = with_keystore_uid(|| plat_utils::get_aaid(uid.0 as u32))
                 .context(ks_err!("Attestation ID retrieval error."))?;
             result.push(KeyParameter {
                 tag: Tag::ATTESTATION_APPLICATION_ID,
