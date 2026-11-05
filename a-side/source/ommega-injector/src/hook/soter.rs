@@ -1205,13 +1205,30 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
         (1 | 4 | 5 | 7, Answer::Code(code)) => AppAnswer::Int(code),
         // App 那边的 `has*` 是布尔：语义是「我们答成功了吗」。
         (3 | 8, Answer::Code(code)) => AppAnswer::Int(i32::from(code == 0)),
-        (2 | 6 | 10 | 11, Answer::Buffer { code, data }) => AppAnswer::Export { code, data },
+        (2 | 6 | 10 | 11, Answer::Buffer { code, data }) => AppAnswer::Export {
+            code: vendor_export_code(call.code, code),
+            data,
+        },
         (9, Answer::Init { status, session }) => AppAnswer::Session {
             session,
             code: status,
         },
         _ => return None,
     })
+}
+
+/// App 面向那半边把「缺料」的码位对齐到原厂 TA 的词汇。
+///
+/// 同一件事在不同链路上有三个写法：原厂对「没这把 AuthKey」回 -6；走 B 端时拿到的是
+/// B 自己的 -8，本地兜底是 -5；未知会话号原厂回 -1000，B 不认识句柄时回 -204。
+/// App 只当它们都是失败，但检测器会把别的号码判成「别家的词汇」（T5 / T6 / T13 那几条
+/// warn 就是这么来的）。对外就统一成原厂那套，内部日志里还是原值。
+fn vendor_export_code(app_code: u32, code: i32) -> i32 {
+    match (app_code, code) {
+        (6, -5 | -8) => -6,
+        (10, -204) => -1000,
+        _ => code,
+    }
 }
 
 /// 把一笔 App 面向的答复拼成 parcel（给顶掉 BC_REPLY 那条路用）。

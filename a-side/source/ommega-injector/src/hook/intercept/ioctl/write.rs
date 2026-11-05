@@ -354,10 +354,23 @@ pub(super) unsafe fn parse_write_buffer(
                         // 宿主自己那块回复缓冲的指针（下面 completion 那份账用它的，
                         // 不能用我们换上去的那个）。
                         let host_reply_buffer = tr.data.ptr.buffer as usize;
+                        // 先把「宿主这笔回复是谁、原指针在哪」记进 prepared 队列（用的必须是
+                        // 宿主自己那份 transaction，不能用下面换过的），再决定要不要顶掉它。
+                        if let Some(frame_id) = frame_id {
+                            remember_prepared_bc_reply(
+                                fd,
+                                PreparedBcReply {
+                                    frame_id,
+                                    data_ptr: tr.data.ptr.buffer as usize,
+                                    transaction: tr,
+                                },
+                            );
+                        }
                         // 宿主回给 App 的那笔要是归我们答：把 copy 源换成我们自己的 parcel。
                         // 必须在 `shadow.restore` 之后做 —— restore 会把 tr.data 换回宿主的指针。
-                        // `frame_id` 有值时这笔是宿主自己合成的 keystore 操作回复，不碰。
-                        if is_reply && prepared.is_none() && frame_id.is_none() && inspectable {
+                        // 不用看 `frame_id`：入站每笔同步事务都会压一个 pending frame，回复时
+                        // 再认领一个，那是常规记账，不是「这笔归 keystore」的意思。
+                        if is_reply && prepared.is_none() && inspectable {
                             if let Some(reply) = crate::hook::soter::take_app_answer() {
                                 tr.data_size = reply.data_size();
                                 tr.offsets_size = reply.offsets_size();
@@ -376,16 +389,6 @@ pub(super) unsafe fn parse_write_buffer(
                                 tr.flags &= !crate::hook::binder::TF_STATUS_CODE;
                                 app_replies.push(reply);
                             }
-                        }
-                        if let Some(frame_id) = frame_id {
-                            remember_prepared_bc_reply(
-                                fd,
-                                PreparedBcReply {
-                                    frame_id,
-                                    data_ptr: tr.data.ptr.buffer as usize,
-                                    transaction: tr,
-                                },
-                            );
                         }
                         std::ptr::write_unaligned(tr_ptr, tr);
                         completion_commands.push((
