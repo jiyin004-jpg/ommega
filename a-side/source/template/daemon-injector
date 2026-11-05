@@ -746,9 +746,14 @@ while true; do
     fi
   fi
 
-  # Clear a stale inject instance (exact binary path) before injecting, so a
-  # leftover injector from a previous run cannot coexist with the new one.
-  pkill -9 -f "$TARGET_INJECTOR" 2>/dev/null
+  # 清掉一个残留的注入器实例再注，免得上一次的注入器和新的并存。
+  # **只杀「光秃秃就是那个路径」的那条**：同一个二进制既是注入器、又是软件 SOTER TA
+  # （`--soterta-serve`）。以前用 `pkill -9 -f "$TARGET_INJECTOR"` 是按子串匹配，会把
+  # TA 一起杀掉 —— 只注 keystore2 时看不出来（那条路早就注完了，走不到这里），一旦开始
+  # 注宿主就成了死循环：杀 TA → soterta.sh 拉起 → 踢宿主 → 守护进程再注入 → 再杀 TA。
+  for stale in $(ps -A -o PID,ARGS 2>/dev/null | awk -v t="$TARGET_INJECTOR" 'NF == 2 && $2 == t {print $1}'); do
+    kill -9 "$stale" 2>/dev/null
+  done
   sleep 1
   if [ "$keystore_pending" -eq 1 ]; then
     log "[injector-daemon] injecting into keystore2 pid=$pid via $TARGET_INJECTOR"

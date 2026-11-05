@@ -1007,7 +1007,7 @@ fn switch_state(path: &str) -> Option<bool> {
 /// 这台机器上 App 面向的 SOTER 由我们答吗。
 ///
 /// 优先级：手工开关（`soter_app_serve`）→ root 侧那份宿主体检结论 → 现场见过 -200。
-fn app_serving_enabled() -> bool {
+pub(crate) fn app_serving_enabled() -> bool {
     // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
     if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
         .ok()

@@ -595,7 +595,15 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
         log::error!("binder hook not installed in this process: {error:#}");
     }
     if in_soter_host() {
-        spawn_soter_selfcheck();
+        // 宿主是「只会回 -200 的壳」时不造这种流量：它压根不发 HAL 请求，自检没有意义；
+        // 而它每秒一次 `getService(vendor…soter)` 会把原厂那个懒加载 HAL 叫起来 ——
+        // 那个一注册就按 VINTF 把名字从我们手里拿走，soterta.sh 再抢回来，来回打架
+        // （实测：TA 起 → 名字被抢 → 重抢 → 踢宿主，5 秒一轮）。
+        if hook::soter::app_serving_enabled() {
+            log::info!("event=soter host is a stub; skipping the HAL selfcheck");
+        } else {
+            spawn_soter_selfcheck();
+        }
     }
     true
 }
