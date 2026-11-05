@@ -51,6 +51,10 @@ SOTER_ACTION=$SOTER_PKG.ISoterService
 # 这里读走、删掉，再把宿主换成新实例。daemon 跑在 keystore uid，能写这个目录靠的是
 # sepolicy.rule 里给 keystore 域的 system_data_file 写权限。
 SOTER_STUCK_FILE=/data/misc/ommega/soter_host_stuck
+# soterta.sh 算完落盘的「这台是不是 HIDL 平台」（0/1）。
+HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
+# root 侧判出来的宿主体检结论（stub / real），见 sync_soter_host_state。
+SOTER_HOST_STATE_OUT=/data/misc/ommega/soter_host_state
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
@@ -129,6 +133,29 @@ conf_get() {
 soter_inject_enabled() {
   case "$(conf_get soter_inject | tr 'A-Z' 'a-z' | tr -d ' \r')" in
     1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# 这台是不是 HIDL 平台：读 soterta.sh 算完落盘的那份缓存（0/1），不再每拍 fork 一次。
+soter_hidl_platform() {
+  [ -f "$HIDL_CACHE" ] || return 1
+  case "$(cat "$HIDL_CACHE" 2>/dev/null | tr -d ' \r\n')" in
+    1) return 0 ;;
+  esac
+  return 1
+}
+
+# 要不要把载荷注进 SOTER 宿主。只有两种机器需要：
+#   * HIDL 平台：客户端走 hwservicemanager，那个名字我们顶不了，只能注进宿主截它发往
+#     HAL 的调用；
+#   * 宿主是壳：它压根不发 HAL 请求，得在它进程里替它答 App（见 sync_soter_host_state）。
+# 正常宿主的 AIDL 机器不注 —— 跟以前一样，省一次 ptrace，也不给宿主添每秒一次 HAL 自检
+# 的流量（那个自检会把原厂懒加载 HAL 叫起来抢服务名）。
+soter_host_needs_payload() {
+  soter_hidl_platform && return 0
+  case "$(cat "$SOTER_HOST_STATE_OUT" 2>/dev/null | tr -d ' \r\n')" in
+    stub) return 0 ;;
   esac
   return 1
 }
@@ -582,7 +609,6 @@ fi
 # /proc/self/maps 猜 APK 会猜错（那里有几十个 overlay 的 apk，自己的不在第一）。
 # 壳子意味着「它压根不发 HAL 请求」，于是只有让载荷把它给 App 的答复顶掉（见
 # `hook/soter.rs` 的 `take_app_answer`）。
-SOTER_HOST_STATE_OUT=/data/misc/ommega/soter_host_state
 sync_soter_host_state() {
   local pkg path want prev
   pkg=com.tencent.soter.soterserver
@@ -698,7 +724,7 @@ while true; do
   # SoterService.apk 17 KB，压根不发 HAL 请求），那种机器只能靠宿主里的载荷把 App 那笔答复
   # 顶掉（`hook/soter.rs` 的 `take_app_answer`）。壳与否由载荷自己判（壳的 APK 里没有 HAL
   # 服务名），真宿主上不会动它。
-  if soter_inject_enabled; then
+  if soter_inject_enabled && soter_host_needs_payload; then
     inject_targets=keystore2,soter
   else
     inject_targets=keystore2
