@@ -38,7 +38,8 @@ fn write_parser_tracks_transaction_and_reply_completions() {
         },
     );
 
-    let completions = unsafe { parse_write_buffer(20, &mut write) };
+    let mut app_replies = Vec::new();
+    let completions = unsafe { parse_write_buffer(20, &mut write, &mut app_replies) };
     assert_eq!(completions.len(), 3);
     assert_eq!(completions[0].1, None);
     assert!(completions[0].2);
@@ -79,7 +80,9 @@ fn inbound_shadow_free_is_translated_and_released_only_after_consumption() {
     assert_eq!(removed, 0);
     assert_eq!(rewritten, vec![(command_end, shadow_buffer)]);
     assert_eq!(
-        unsafe { std::ptr::read_unaligned(write.as_ptr().add(size_of::<u32>()) as *const usize) },
+        unsafe {
+            std::ptr::read_unaligned(write.as_ptr().add(std::mem::size_of::<u32>()) as *const usize)
+        },
         original.as_ptr() as usize
     );
 
@@ -127,4 +130,86 @@ fn our_own_reply_buffer_gets_its_free_command_dropped_whole() {
     );
     // 记录也一并清了，不然宿主下次再释放同一个地址会重复命中。
     assert!(!is_soter_owned_buffer(connection, owned));
+}
+
+/// 宿主回给 App 的那笔 BC_REPLY 得被换成我们自己的 parcel：指针、长度都指向我们的，
+/// TF_STATUS_CODE 也得清掉（不清客户端会把答复当错误码读）。
+///
+/// 用 12 号（`getVersion`）做样本：它不需要问 daemon，纯本地就能出一份答复，正好把
+/// 「待答 → 拼 parcel → 换 copy 源」这一整条串起来。
+#[test]
+fn the_hosts_app_reply_is_replaced_by_ours() {
+    let _guard = SYNTHETIC_REPLY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("OMMEGA_SOTER_APP_SERVE", "1");
+    crate::hook::soter::stash_app_call_for_test(
+        crate::hook::soter::SoterCall {
+            hal: false,
+            hidl: false,
+            has_return_code: false,
+            code: 12,
+            wire_code: 12,
+            op: "getVersion",
+            uid: None,
+            alias: None,
+            challenge: None,
+            session: None,
+            key: None,
+            caller_uid: None,
+            data_size: 0,
+        },
+        10349,
+    );
+
+    // 宿主自己那份答复（壳子回的 -200 那种形状）放一块真内存里，让它可读。
+    let host_reply = [0u8, 0, 0, 0, 1, 0, 0, 0, 0x38, 0xff, 0xff, 0xff];
+    let mut tr: binder_transaction_data = unsafe { std::mem::zeroed() };
+    tr.data_size = host_reply.len();
+    tr.data.ptr.buffer = host_reply.as_ptr() as libc::c_ulong;
+    // 故意带上「这是一个错误码」的标：换完之后必须被清掉。
+    tr.flags = crate::hook::binder::TF_STATUS_CODE;
+    let mut write = Vec::new();
+    push_unaligned(&mut write, &BC_REPLY_CMD);
+    push_unaligned(&mut write, &tr);
+
+    let mut app_replies = Vec::new();
+    let _ = unsafe { parse_write_buffer(20, &mut write, &mut app_replies) };
+
+    assert_eq!(app_replies.len(), 1, "着一笔应该归我们答");
+    let ours = &app_replies[0];
+    let (patched_size, patched_buffer, patched_flags) = unsafe {
+        let patched = std::ptr::read_unaligned(
+            write.as_ptr().add(std::mem::size_of::<u32>()) as *const binder_transaction_data
+        );
+        (patched.data_size, patched.data.ptr.buffer, patched.flags)
+    };
+    assert_eq!(patched_size, ours.data_size(), "长度指向我们的 parcel");
+    assert_eq!(
+        patched_buffer as usize,
+        ours.data_ptr() as usize,
+        "copy 源换成我们的了"
+    );
+    assert_eq!(
+        patched_flags & crate::hook::binder::TF_STATUS_CODE,
+        0,
+        "错误码标得清掉，否则客户端把答复当异常读"
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(ours.data_ptr(), ours.data_size()) };
+    assert_eq!(
+        &bytes[..8],
+        &[0, 0, 0, 0, 1, 0, 0, 0],
+        "Status ok + 版本号 1"
+    );
+
+    // 一笔只认一次：再来一笔 BC_REPLY 没有待答的请求，就不该动它。
+    let mut write2 = Vec::new();
+    push_unaligned(&mut write2, &BC_REPLY_CMD);
+    push_unaligned(&mut write2, &tr);
+    let mut app_replies2 = Vec::new();
+    let _ = unsafe { parse_write_buffer(20, &mut write2, &mut app_replies2) };
+    assert!(app_replies2.is_empty(), "没有待答请求时不许动宿主的答复");
+
+    crate::hook::soter::clear_app_call_for_test();
+    std::env::remove_var("OMMEGA_SOTER_APP_SERVE");
 }

@@ -30,8 +30,6 @@ FOREGROUND_OUT=/data/misc/ommega/foreground
 # 读的是同一个文件，不再有「抄一份给宿主」的副本和那轮 cp。
 INJECTOR_TOML=/data/misc/ommega/injector.toml
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
-# soterta.sh 算完落盘的「这台是不是 HIDL 平台」，读文件比每 5 秒 fork 一次便宜得多。
-HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
 LOG_DIR=/data/misc/ommega/logs
 LOG_FILE=$LOG_DIR/daemon.log
@@ -133,25 +131,6 @@ soter_inject_enabled() {
     1|true|yes|on) return 0 ;;
   esac
   return 1
-}
-
-# 这台是不是 HIDL 平台。soterta.sh 算完就落盘，这里直接读；文件不在才现问一次。
-# 以前是每 5 秒 fork 一个 sh + 扫一遍 VINTF，就为了一个永远不变的常量。
-hidl_platform_flag() {
-  if [ -f "$HIDL_CACHE" ]; then
-    v=$(cat "$HIDL_CACHE" 2>/dev/null | tr -d ' \r\n')
-    case "$v" in
-      0|1) printf '%s' "$v"; return ;;
-    esac
-    # 缓存是坏的（空文件、写了一半、乱码）：删掉重算，别拿它当成「不是 HIDL」。
-    rm -f "$HIDL_CACHE" 2>/dev/null
-  fi
-  v=$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r\n')
-  case "$v" in
-    0|1) printf '%s\n' "$v" > "$HIDL_CACHE" 2>/dev/null ;;
-    *) v="" ;;
-  esac
-  printf '%s' "$v"
 }
 
 # 日志只落文件。「启用调试日志」关着时一条都不打，开关按循环现读，WebUI 一改
@@ -597,8 +576,34 @@ if [ "${OMMEGA_SKIP_LOCK:-0}" != 1 ]; then
   sleep 1
   lock_owned || exit 0
 fi
+# 宿主能不能自己干活，由 root 这边看一眼它的 APK 就能定：真宿主的 dex 里一定有 SOTER HAL 的
+# 服务名（`vendor.qti.hardware.soter@1.0::ISoter` 或 `vendor.qti.hardware.soter.ISoter`），
+# 壳子一个字节都没有。结果写一份世界可读的小文件，宿主里的载荷读它 —— 宿主进程自己按
+# /proc/self/maps 猜 APK 会猜错（那里有几十个 overlay 的 apk，自己的不在第一）。
+# 壳子意味着「它压根不发 HAL 请求」，于是只有让载荷把它给 App 的答复顶掉（见
+# `hook/soter.rs` 的 `take_app_answer`）。
+SOTER_HOST_STATE_OUT=/data/misc/ommega/soter_host_state
+sync_soter_host_state() {
+  local pkg path want prev
+  pkg=com.tencent.soter.soterserver
+  path=$(pm path "$pkg" 2>/dev/null | head -n 1 | sed 's/^package://')
+  [ -n "$path" ] || return 0
+  [ -r "$path" ] || return 0
+  if grep -a -q "hardware.soter" "$path" 2>/dev/null; then
+    want=real
+  else
+    want=stub
+  fi
+  prev=$(cat "$SOTER_HOST_STATE_OUT" 2>/dev/null | tr -d ' \r\n')
+  [ "$prev" = "$want" ] && return 0
+  printf '%s\n' "$want" > "$SOTER_HOST_STATE_OUT" 2>/dev/null || return 0
+  chmod 0644 "$SOTER_HOST_STATE_OUT" 2>/dev/null
+  log "[injector-daemon] soter host apk $path -> $want"
+}
+
 trap 'release_lock' EXIT INT TERM HUP
 
+sync_soter_host_state
 while true; do
   # Config and target list live in the single data location
   # (/data/misc/ommega/); the webroot UI writes them through the
@@ -686,14 +691,14 @@ while true; do
   fi
 
 
-  # SOTER 走哪条路决定注不注宿主：
-  # - AIDL 平台（如 PLC110）：我们自己顶服务名，宿主手里的代理会失效、由 soterta.sh 踢它
-  #   重连；宿主里的载荷用不上，ptrace 去装一次反而浪费。
-  # - HIDL 平台（如 MEIZU 20 Pro / 骁龙 8 Gen2，`vendor.qti.hardware.soter@1.0::ISoter`）：
-  #   客户端走 hwservicemanager，我们顶不了那个名字，只能注进宿主，在它进程里把发往
-  #   HAL 的那笔截下来自己答（hook/soter.rs 按 HIDL 布局回包）。不注就等于没接管，
-  #   原厂 TA 死着的时候整族调用 -20。
-  if [ "$(hidl_platform_flag)" = "1" ] && soter_inject_enabled; then
+  # SOTER 宿主只要接管开着就总是注一份。
+  # HIDL 平台（MEIZU 20 Pro / 骁龙 8 Gen2）客户端走 hwservicemanager，那个名字我们顶不了，
+  # 只能注进宿主，在它进程里把发往 HAL 的那笔截下来自己答（hook/soter.rs）。
+  # AIDL 平台大多数时候用不上，但有的 ROM 把宿主整个换成只会回 -200 的壳（Oppo/ColorOS 实测：
+  # SoterService.apk 17 KB，压根不发 HAL 请求），那种机器只能靠宿主里的载荷把 App 那笔答复
+  # 顶掉（`hook/soter.rs` 的 `take_app_answer`）。壳与否由载荷自己判（壳的 APK 里没有 HAL
+  # 服务名），真宿主上不会动它。
+  if soter_inject_enabled; then
     inject_targets=keystore2,soter
   else
     inject_targets=keystore2

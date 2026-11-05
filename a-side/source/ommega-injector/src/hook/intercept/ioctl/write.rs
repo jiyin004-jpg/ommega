@@ -243,6 +243,7 @@ fn intercept_soter_call(fd: c_int, tr: &mut binder_transaction_data, call: &Sote
 pub(super) unsafe fn parse_write_buffer(
     fd: c_int,
     write: &mut [u8],
+    app_replies: &mut Vec<crate::parcel::OwnedReply>,
 ) -> Vec<(usize, Option<usize>, bool, Option<NativeBinderRetirement>)> {
     let base = write.as_mut_ptr();
     let total_size = write.len();
@@ -327,6 +328,10 @@ pub(super) unsafe fn parse_write_buffer(
                         };
                         if inspectable {
                             log_write_transaction(label, &tr);
+                            if is_reply && prepared.is_none() {
+                                // 宿主回给 App 的东西里出现 -200，就记下「它不会干活」。
+                                unsafe { crate::hook::soter::note_host_reply(&tr) };
+                            }
                             if !is_reply {
                                 // 出站的 transaction 里可能就有 SOTER 的：宿主进程
                                 // 把 App 的请求转成对高通 HAL 的调用发出去。认出来了、
@@ -346,6 +351,32 @@ pub(super) unsafe fn parse_write_buffer(
                         if let Some(shadow) = shadow.as_ref() {
                             shadow.restore(&mut tr);
                         }
+                        // 宿主自己那块回复缓冲的指针（下面 completion 那份账用它的，
+                        // 不能用我们换上去的那个）。
+                        let host_reply_buffer = tr.data.ptr.buffer as usize;
+                        // 宿主回给 App 的那笔要是归我们答：把 copy 源换成我们自己的 parcel。
+                        // 必须在 `shadow.restore` 之后做 —— restore 会把 tr.data 换回宿主的指针。
+                        // `frame_id` 有值时这笔是宿主自己合成的 keystore 操作回复，不碰。
+                        if is_reply && prepared.is_none() && frame_id.is_none() && inspectable {
+                            if let Some(reply) = crate::hook::soter::take_app_answer() {
+                                tr.data_size = reply.data_size();
+                                tr.offsets_size = reply.offsets_size();
+                                tr.data = crate::hook::binder::binder_transaction_data_data {
+                                    ptr: crate::hook::binder::binder_transaction_data_data_ptr {
+                                        buffer: reply.data_ptr() as libc::c_ulong,
+                                        offsets: if reply.offsets.is_empty() {
+                                            0
+                                        } else {
+                                            reply.offsets.as_ptr() as libc::c_ulong
+                                        },
+                                    },
+                                };
+                                // 宿主自己把这次调用当异常回时，flags 里带 TF_STATUS_CODE；
+                                // 留着它，客户端会把我们这份 parcel 当错误码读。
+                                tr.flags &= !crate::hook::binder::TF_STATUS_CODE;
+                                app_replies.push(reply);
+                            }
+                        }
                         if let Some(frame_id) = frame_id {
                             remember_prepared_bc_reply(
                                 fd,
@@ -359,7 +390,7 @@ pub(super) unsafe fn parse_write_buffer(
                         std::ptr::write_unaligned(tr_ptr, tr);
                         completion_commands.push((
                             offset + cmd_size,
-                            is_reply.then_some(tr.data.ptr.buffer as usize),
+                            is_reply.then_some(host_reply_buffer),
                             !is_reply && (tr.flags & TF_ONE_WAY) == 0,
                             None,
                         ));

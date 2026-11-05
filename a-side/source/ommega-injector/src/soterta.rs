@@ -447,6 +447,107 @@ impl Remotable for SoterTa {
 ///
 /// `driver` 决定注册到哪个 servicemanager：vendor 的 AIDL HAL 习惯落在
 /// `/dev/vndbinder`（vndservicemanager），应用侧的 Java 客户端只看 `/dev/binder`。
+/// App 面向接口的自测端点：只在开关（环境变量或 `/data/misc/ommega/soter_app_selftest`）
+/// 打开时注册。它的**接口描述符就是** `com.tencent.soter.soterserver.ISoterService`，
+/// 所以 `service call ommega.soter.app/default <code> i32 <uid>` 发出来的字节跟宿主
+/// 收到的那笔一模一样：解析、答复两段能单独验，不用起任何 app。
+const APP_SELFTEST_ENV: &str = "OMMEGA_SOTER_APP_SELFTEST";
+const APP_SELFTEST_SWITCH: &str = "/data/misc/ommega/soter_app_selftest";
+const APP_SELFTEST_SERVICE: &str = "ommega.soter.app/default";
+
+struct AppFace;
+
+impl Remotable for AppFace {
+    fn descriptor() -> &'static str {
+        soter::APP_DESCRIPTOR
+    }
+
+    fn on_transact(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> BinderResult<()> {
+        if code == INTERFACE_TRANSACTION {
+            reply.write(&soter::APP_DESCRIPTOR.to_string())?;
+            return Ok(());
+        }
+        // 这一层还没人读过 reader，data_position 是 0，直接拿整块字节就是请求原文。
+        let data = unsafe { std::slice::from_raw_parts(reader.as_ptr(), reader.data_size()) };
+        let Some(call) = soter::parse(data, code) else {
+            log::warn!("event=soterta app-selftest code={code} unparsable");
+            reply.write_i32(-1)?;
+            return Ok(());
+        };
+        log::info!(
+            "event=soterta app-selftest code={} op={} uid={:?} alias={:?}",
+            code,
+            call.op,
+            call.uid,
+            call.alias
+        );
+        match soter::answer_app_call(&call, call.uid.unwrap_or(-1)) {
+            Some(answer) => write_app_answer(reply, &answer)?,
+            None => {
+                log::warn!("event=soterta app-selftest code={code} no answer");
+                reply.write_i32(-1)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn on_dump(&self, _writer: &mut dyn std::io::Write, _args: &[String]) -> BinderResult<()> {
+        Ok(())
+    }
+}
+
+/// 把一份 App 面向的答复写进 rsbinder 的 reply（形状跟宿主自己写的一致）。
+fn write_app_answer(reply: &mut Parcel, answer: &soter::AppAnswer) -> BinderResult<()> {
+    // 第一格是 AIDL 的 Status（0 = OK），Java 的 `readException()` 读的就是它。
+    reply.write_i32(0)?;
+    match answer {
+        soter::AppAnswer::Int(value) => {
+            reply.write_i32(*value)?;
+        }
+        soter::AppAnswer::Export { code, data } => {
+            reply.write_i32(1)?;
+            reply.write_i32(*code)?;
+            match data {
+                Some(bytes) => {
+                    reply.write(&bytes.clone())?;
+                    reply.write_i32(bytes.len() as i32)?;
+                }
+                None => {
+                    reply.write_i32(-1)?;
+                    reply.write_i32(0)?;
+                }
+            }
+        }
+        soter::AppAnswer::Session { session, code } => {
+            reply.write_i64(*session)?;
+            reply.write_i32(*code)?;
+        }
+        soter::AppAnswer::Extra(value) => {
+            // 非空标记 + writeValue(Integer) 的类型标 + 值
+            reply.write_i32(1)?;
+            reply.write_i32(1)?;
+            reply.write_i32(*value)?;
+        }
+    }
+    Ok(())
+}
+
+/// 自测端点开着吗。
+fn app_selftest_enabled() -> bool {
+    if std::path::Path::new(APP_SELFTEST_SWITCH).exists() {
+        return true;
+    }
+    std::env::var(APP_SELFTEST_ENV).is_ok_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        value == "1" || value == "true" || value == "on"
+    })
+}
+
 pub fn serve(driver: &str) -> anyhow::Result<()> {
     // 第二个参数是 binder 线程池上限。传 0 会让驱动把上限设成 0：framework 那边会报
     // 「Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be
@@ -476,6 +577,15 @@ pub fn serve(driver: &str) -> anyhow::Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
     hub::add_service(&service, binder.as_binder())?;
+    if app_selftest_enabled() {
+        let face = Binder::new_with_stability(AppFace, Stability::System);
+        match hub::add_service(APP_SELFTEST_SERVICE, face.as_binder()) {
+            Ok(()) => {
+                log::info!("event=soterta registered app selftest endpoint {APP_SELFTEST_SERVICE}")
+            }
+            Err(error) => log::warn!("event=soterta app selftest endpoint failed ({error:#})"),
+        }
+    }
     log::info!(
         "event=soterta registered {service} on {driver} (descriptor={descriptor} return_code={})",
         has_return_code()

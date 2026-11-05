@@ -52,20 +52,23 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::hook::binder::{
     binder_transaction_data, binder_transaction_data_data, binder_transaction_data_data_ptr,
     binder_transaction_data_target, BINDER_BUFFER_FLAG_HAS_PARENT, BINDER_TYPE_PTR, BR_REPLY_CMD,
-    BR_TRANSACTION_COMPLETE_CMD,
+    BR_TRANSACTION_COMPLETE_CMD, TF_ONE_WAY,
 };
 use crate::hook::soter_local::{self, Answer};
 use crate::parcel::{
-    build_hidl_soter_buffer_reply, build_hidl_soter_init_reply, build_plain_reply,
-    build_soter_buffer_reply, build_soter_init_reply, OwnedReply, HIDL_STRUCT_SIZE,
+    build_app_export_reply, build_app_extra_param_reply, build_app_int_reply,
+    build_app_session_reply, build_hidl_soter_buffer_reply, build_hidl_soter_init_reply,
+    build_plain_reply, build_soter_buffer_reply, build_soter_init_reply, OwnedReply,
+    HIDL_STRUCT_SIZE,
 };
 
 /// 高通 HAL 的接口描述符（SoterService 发出去的那条）。
@@ -858,6 +861,11 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
                 remember_alias_owner(alias, tr.sender_euid);
             }
         }
+        // 宿主待会儿就在这个线程上回它：留一份，BC_REPLY 出来时对号。
+        // 异步事务没有回复，不记。
+        if (tr.flags & TF_ONE_WAY) == 0 {
+            stash_pending_app(&call, tr.sender_euid);
+        }
     }
     log_call(&call);
     Some(call)
@@ -955,6 +963,278 @@ fn log_call(call: &SoterCall) {
 /// 不够的仍在 `intercept_soter_call` 里原样透传，不会把宿主挂住。
 pub(crate) fn interceptable(call: &SoterCall) -> bool {
     call.hal && soter_local::answerable(call.code)
+}
+
+// ---------------------------------------------------------------------------------
+// App 面向那一半：宿主自己不干活的时候，由我们把它的答复顶掉
+// ---------------------------------------------------------------------------------
+//
+// 有些 ROM 把 `com.tencent.soter.soterserver` 整个换成一个壳（Oppo/ColorOS 实测：
+// `SoterService.apk` 只有 17 KB，13 个事务一律回 -200 并打一行 `soter unsupported`）。
+// 那种机器上我们去顶 SOTER HAL 的服务名一点用都没有 —— 宿主压根不发 HAL 请求，
+// App 拿到的永远是 -200。唯一的办法是在宿主进程里，把它对 App 的那笔 BC_REPLY 换掉。
+//
+// 为什么换答复而不换请求：宿主这个壳没有任何副作用（不回就是回），先在原位看它回什么、
+// 再把 copy 源指到我们自己的 parcel 上，比在 read 阶段抢过入站事务、自己拼 BC_REPLY
+// 要安全得多（后者要跟内核的 transaction_stack 与 BC_FREE_BUFFER 双重对账）。
+
+/// 面板/手工留的开关：`1` 强制接、`0` 强制不接。文件不在就是自动判。
+const APP_SERVE_SWITCH: &str = "/data/misc/ommega/soter_app_serve";
+
+/// root 侧（`daemon-injector` 的 `sync_soter_host_state`）写下的宿主体检结论：
+/// `stub` = 这个宿主压根不发 HAL 请求（它自己的 APK 里连 SOTER HAL 的服务名都没有），
+/// `real` = 正常宿主。宿主进程自己按 `/proc/self/maps` 猜 APK 会猜错（那里面几十个
+/// overlay 的 apk，自己的不在第一），所以这件事交给能跑 `pm path` 的 root 侧做。
+const HOST_STATE: &str = "/data/misc/ommega/soter_host_state";
+
+/// 真看见宿主回 -200 之后也当它是壳（root 侧那份没写出来时的退路）。
+static HOST_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 认一个开关值：`1/true/on/stub` = 开，`0/false/off/real` = 关。
+fn switch_state_text(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "stub" => Some(true),
+        "0" | "false" | "off" | "real" => Some(false),
+        _ => None,
+    }
+}
+
+/// 读一个开关文件。
+fn switch_state(path: &str) -> Option<bool> {
+    switch_state_text(&std::fs::read_to_string(path).ok()?)
+}
+
+/// 这台机器上 App 面向的 SOTER 由我们答吗。
+///
+/// 优先级：手工开关（`soter_app_serve`）→ root 侧那份宿主体检结论 → 现场见过 -200。
+fn app_serving_enabled() -> bool {
+    // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
+    if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
+        .ok()
+        .and_then(|value| switch_state_text(&value))
+    {
+        return on;
+    }
+    switch_state(APP_SERVE_SWITCH)
+        .or_else(|| switch_state(HOST_STATE))
+        .unwrap_or_else(|| HOST_REFUSED.load(Ordering::Relaxed))
+}
+
+/// 测试用：假装本线程刚收到一笔 App 请求。
+#[cfg(test)]
+pub(crate) fn stash_app_call_for_test(call: SoterCall, caller_uid: i32) {
+    stash_pending_app(&call, caller_uid);
+}
+
+/// 测试用：把待答的那笔清掉。
+#[cfg(test)]
+pub(crate) fn clear_app_call_for_test() {
+    PENDING_APP.with(|slot| slot.borrow_mut().take());
+}
+
+/// 宿主回给 App 的答复里出现它自己的 `ERR_HAL_UNAVAILABLE`（-200）就记下来。
+///
+/// 形状：`[Status i32][...]`，接口返回值与 parcelable 的 resultCode 都是 i32，
+/// 偏移 4 或 8 处那几个字节就够看了。判错的方向是「多接一笔」，不会把真宿主顶掉。
+///
+/// # Safety
+///
+/// `tr.data.ptr.buffer` 必须指向 `tr.data_size` 个可读字节（调用方已装 shadow）。
+pub(crate) unsafe fn note_host_reply(tr: &binder_transaction_data) {
+    if HOST_REFUSED.load(Ordering::Relaxed) {
+        return;
+    }
+    let size = tr.data_size.min(64);
+    if size < 8 || tr.data.ptr.buffer == 0 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(tr.data.ptr.buffer as *const u8, size) };
+    let refused = [4usize, 8].iter().any(|at| {
+        data.len() >= at + 4
+            && i32::from_le_bytes([data[*at], data[*at + 1], data[*at + 2], data[*at + 3]]) == -200
+    });
+    if refused {
+        HOST_REFUSED.store(true, Ordering::Relaxed);
+        info!("event=soter host answered -200; serving the app-facing calls ourselves");
+        crate::ipc::report_event(
+            "event=soter host answered -200 (ERR_HAL_UNAVAILABLE)".to_string(),
+        );
+    }
+}
+
+/// 宿主刚收进来的那笔 App 请求，留着跟它的答复对号。
+#[derive(Debug, Clone)]
+struct PendingApp {
+    call: SoterCall,
+    /// 内核填的调用者 uid（`sender_euid`），请求参数里那个 uid 信不得。
+    caller_uid: i32,
+    at: Instant,
+}
+
+/// 宿主回一笔 App 请求要在一眨眼之内（真机是毫秒级）；超时就不认了。
+const APP_REPLY_WINDOW: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// 本线程最近一笔 App 面向的 SOTER 请求。宿主收进来之后就在同一个 binder 线程上
+    /// 写 BC_REPLY，所以按线程记；一笔同步事务没回完，那个线程不会接下一笔。
+    static PENDING_APP: RefCell<Option<PendingApp>> = const { RefCell::new(None) };
+}
+
+fn stash_pending_app(call: &SoterCall, caller_uid: i32) {
+    PENDING_APP.with(|slot| {
+        *slot.borrow_mut() = Some(PendingApp {
+            call: call.clone(),
+            caller_uid,
+            at: Instant::now(),
+        });
+    });
+}
+
+/// App 号 → HAL 内部号（4 槽那套 14 号表）。12/13 号宿主自己发，走不到这里。
+fn app_code_to_hal(code: u32) -> Option<u32> {
+    Some(match code {
+        1 => 5,  // generateAppSecureKey → generateAskKeyPair
+        2 => 1,  // getAppSecureKey → exportAskPublicKey
+        3 => 9,  // hasAskAlready
+        4 => 7,  // generateAuthKey → generateAuthKeyPair
+        5 => 13, // removeAuthKey
+        6 => 3,  // getAuthKey → exportAuthKeyPublicKey
+        7 => 12, // removeAllAuthKey → removeAllUidKey
+        8 => 10, // hasAuthKey
+        9 => 11, // initSigh → initSign
+        10 => 4, // finishSign
+        11 => 8, // getDeviceId
+        _ => return None,
+    })
+}
+
+/// 宿主要写 BC_REPLY 了：上一笔 App 请求归我们答的话，把答复 parcel 交出去，
+/// 调用方把 `data.ptr.buffer` 指到它上面。`None` = 别动，让宿主自己那份过去。
+///
+/// 返回的 parcel 得活到 `ioctl` 返回之后（内核在这期间从它里面拷字节），调用方负责。
+pub(crate) fn take_app_answer() -> Option<OwnedReply> {
+    let pending = PENDING_APP.with(|slot| slot.borrow_mut().take())?;
+    if pending.at.elapsed() > APP_REPLY_WINDOW {
+        return None;
+    }
+    if !app_serving_enabled() {
+        return None;
+    }
+    let reply = build_app_answer(&pending)?;
+    let head = unsafe { std::slice::from_raw_parts(reply.data_ptr(), reply.data_size().min(16)) };
+    let hex: String = head.iter().map(|byte| format!("{byte:02x}")).collect();
+    info!(
+        "event=soter app-serve code={} op={} caller_uid={} bytes={} head={hex}",
+        pending.call.code,
+        pending.call.op,
+        pending.caller_uid,
+        reply.data_size()
+    );
+    crate::ipc::report_event(format!(
+        "event=soter app-serve code={} op={} caller_uid={}",
+        pending.call.code, pending.call.op, pending.caller_uid
+    ));
+    Some(reply)
+}
+
+/// 拼一笔 App 面向的答复。答不了就返回 `None`（宿主自己那份答复照旧过去）。
+/// 一笔 App 面向调用该答什么。内容与渲染分开：宿主里是顶掉它的 BC_REPLY（拼成 parcel），
+/// 自测端点里是直接往 rsbinder 的 reply 里写 —— 两边用的是同一张答案。
+pub(crate) enum AppAnswer {
+    /// 只有返回值的（`generate*` / `has*` / `remove*` / `getVersion`）。
+    Int(i32),
+    /// `SoterExportResult`：`[非空标记][resultCode][byte[]][dataLength]`。
+    Export { code: i32, data: Option<Vec<u8>> },
+    /// `SoterSessionResult`：`[session][resultCode]`。
+    Session { session: i64, code: i32 },
+    /// `SoterExtraParam` 里的一个整数。
+    Extra(i32),
+}
+
+/// 算出一笔 App 面向调用的答复。`caller_uid` 是拿谁的 uid 去建/查料：
+/// 宿主里是内核填的 `sender_euid`，自测端点里是命令行给的 uid。
+pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAnswer> {
+    // 这两个号宿主自己不碰 HAL，是我们自己能直接给的。
+    match call.code {
+        12 => return Some(AppAnswer::Int(1)),
+        13 => {
+            let key = call.key.as_deref()?;
+            let value = match key {
+                // 1 = 面容、2 = 指纹（真机取值）。检测器就认 2。
+                "fingerprint_type" => 2,
+                _ => 0,
+            };
+            return Some(AppAnswer::Extra(value));
+        }
+        _ => {}
+    }
+    let hal_code = app_code_to_hal(call.code)?;
+    let (op, _) = describe(true, hal_code)?;
+    // uid 一律用调用者那个：真宿主也是拿 `Binder.getCallingUid()` 盖掉参数，
+    // 参数里那个 uid 是 App 自己填的（检测器的 T4 就是照这个判分的）。
+    // uid 能没有：`getDeviceId` / `getVersion` 这类根本没这个参数，本地后端也不用它。
+    let uid = if caller_uid >= 0 {
+        Some(caller_uid)
+    } else {
+        call.uid
+    };
+    let hal_call = SoterCall {
+        hal: true,
+        hidl: false,
+        has_return_code: true,
+        code: hal_code,
+        wire_code: hal_code,
+        op,
+        uid,
+        alias: call.alias.clone(),
+        challenge: call.challenge.clone(),
+        session: call.session,
+        key: None,
+        caller_uid: (caller_uid >= 0).then_some(caller_uid),
+        data_size: call.data_size,
+    };
+    // finishSign 的会话要是本进程开的（init 那笔本地答的），这一笔也必须本地答：
+    // 去问远程就是 B 端不认识这个句柄，直接 -204。
+    let local_session = hal_code == 4 && hal_call.session.is_some_and(soter_local::has_session);
+    let answer = if local_session {
+        soter_local::answer(&hal_call)
+    } else {
+        crate::hook::soter_relay::answer(&hal_call)
+    }?;
+    Some(match (call.code, answer) {
+        (1 | 4 | 5 | 7, Answer::Code(code)) => AppAnswer::Int(code),
+        // App 那边的 `has*` 是布尔：语义是「我们答成功了吗」。
+        (3 | 8, Answer::Code(code)) => AppAnswer::Int(i32::from(code == 0)),
+        (2 | 6 | 10 | 11, Answer::Buffer { code, data }) => AppAnswer::Export { code, data },
+        (9, Answer::Init { status, session }) => AppAnswer::Session {
+            session,
+            code: status,
+        },
+        _ => return None,
+    })
+}
+
+/// 把一笔 App 面向的答复拼成 parcel（给顶掉 BC_REPLY 那条路用）。
+fn build_app_reply(answer: &AppAnswer) -> Option<OwnedReply> {
+    let built = match answer {
+        AppAnswer::Int(value) => build_app_int_reply(*value),
+        AppAnswer::Export { code, data } => build_app_export_reply(*code, data.as_deref()),
+        AppAnswer::Session { session, code } => build_app_session_reply(*session, *code),
+        AppAnswer::Extra(value) => build_app_extra_param_reply(*value),
+    };
+    match built {
+        Ok(reply) => Some(reply),
+        Err(error) => {
+            warn!("event=soter app answer could not be built ({error:#})");
+            None
+        }
+    }
+}
+
+/// 拼一笔 App 面向的答复。答不了就返回 `None`（宿主自己那份答复照旧过去）。
+fn build_app_answer(pending: &PendingApp) -> Option<OwnedReply> {
+    let answer = answer_app_call(&pending.call, pending.caller_uid)?;
+    build_app_reply(&answer)
 }
 
 /// 把一笔答复拼成宿主能直接吃的内核命令字节流，连同一块得活着的 parcel 一起交出去。
@@ -2203,5 +2483,72 @@ mod tests {
         assert_eq!(&head[..8], &[0u8; 8], "hardware::Status ok + 错误码 0");
         let type_ = u32::from_le_bytes(head[8..12].try_into().unwrap());
         assert_eq!(type_, BINDER_TYPE_PTR, "8 那里就该是对象 A");
+    }
+
+    /// App 号 → HAL 号的表得对得上：11 个运行时方法都有落点，而且落到的号码本地后端
+    /// 都答得了；12/13 号宿主本就不发 HAL 请求，不该出现在这张表里。
+    #[test]
+    fn every_app_transaction_maps_to_a_hal_number_the_local_backend_answers() {
+        for code in 1..=11u32 {
+            let hal = app_code_to_hal(code).unwrap_or_else(|| panic!("app {code}"));
+            assert!(soter_local::answerable(hal), "app {code} -> hal {hal}");
+        }
+        assert_eq!(app_code_to_hal(12), None, "getVersion 不落地为 HAL 调用");
+        assert_eq!(app_code_to_hal(13), None, "getExtraParam 同理");
+        // 两个含义最容易弄反的：generate 该去 5、has 该去 9。
+        assert_eq!(app_code_to_hal(1), Some(5));
+        assert_eq!(app_code_to_hal(3), Some(9));
+    }
+
+    /// App 面向的答复字节流：`[Status][…]`，跟宿主自己写的那份一模一样。
+    /// 写错一格客户端就会把字段读歪（`exportData` 成 null、session 成 0），
+    /// 所以这里直接把字节钉住。
+    #[test]
+    fn the_app_facing_replies_match_the_host_wire_layout() {
+        let raw = |reply: &OwnedReply| unsafe {
+            std::slice::from_raw_parts(reply.data_ptr(), reply.data_size()).to_vec()
+        };
+
+        // SoterExportResult：Status + 非空标记 + resultCode + byte[] + dataLength
+        let with_data = build_app_export_reply(0, Some(&[1, 2, 3, 4])).unwrap();
+        assert_eq!(
+            raw(&with_data),
+            vec![
+                0, 0, 0, 0, // Status ok
+                1, 0, 0, 0, // 非空标记
+                0, 0, 0, 0, // resultCode
+                4, 0, 0, 0, 1, 2, 3, 4, // byte[]
+                4, 0, 0, 0, // dataLength
+            ]
+        );
+        // 没数据那一支跟宿主一样是 `writeByteArray(null)`（-1）+ 长度 0。
+        let empty = build_app_export_reply(-6, None).unwrap();
+        assert_eq!(
+            raw(&empty),
+            vec![
+                0, 0, 0, 0, 1, 0, 0, 0, 0xfa, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,
+            ]
+        );
+        // SoterSessionResult：session 在前、resultCode 在后（跟 HAL 那份相反）。
+        let session = build_app_session_reply(0x1122_3344_5566_7788, 0).unwrap();
+        assert_eq!(
+            raw(&session),
+            vec![
+                0, 0, 0, 0, 1, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0,
+            ]
+        );
+        // SoterExtraParam：非空标记 + writeValue(Integer) 的类型标 + 值。
+        let extra = build_app_extra_param_reply(2).unwrap();
+        assert_eq!(
+            raw(&extra),
+            vec![0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]
+        );
+    }
+
+    /// 没东西可答（没有待答请求 / 不在窗口内）就什么都不动 —— 宿主自己那份答复照旧过去。
+    #[test]
+    fn no_pending_app_call_means_we_leave_the_host_answer_alone() {
+        PENDING_APP.with(|slot| slot.borrow_mut().take());
+        assert!(take_app_answer().is_none());
     }
 }

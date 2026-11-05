@@ -115,6 +115,9 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
 
     let mut completion_commands = Vec::new();
     let mut freed_inbound_shadows = Vec::new();
+    // 顶掉宿主那笔 BC_REPLY 时用的 parcel：内核在下面那次 ioctl 里从它里面拷字节，
+    // 所以得活到 ioctl 返回之后（这里就是它们的生命周期）。
+    let mut app_replies: Vec<crate::parcel::OwnedReply> = Vec::new();
     // 我们自己的 parcel 被宿主释放时那条 BC_FREE_BUFFER 会被整条抹掉，write 缓冲就短了。
     let mut dropped_write_bytes = 0usize;
     if write_remaining > 0 {
@@ -124,7 +127,7 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
             *end += input_write_consumed;
         }
         if write_buffer_is_safe_to_intercept(&host_write) {
-            completion_commands = parse_write_buffer(fd, &mut host_write);
+            completion_commands = parse_write_buffer(fd, &mut host_write, &mut app_replies);
             for (end, _, _, _) in &mut completion_commands {
                 *end += input_write_consumed;
             }

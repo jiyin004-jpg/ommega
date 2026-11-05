@@ -419,6 +419,60 @@ pub fn build_soter_init_reply(code: i32, session: i64) -> Result<OwnedReply> {
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
+/// App 面向 `ISoterService` 那边：只有返回值的那些（`generate*` / `has*` / `remove*` /
+/// `getVersion`），形状就是 `[Status][i32]`。`has*` 那两个布尔也是这一格（0/1）。
+pub fn build_app_int_reply(value: i32) -> Result<OwnedReply> {
+    build_plain_reply(&value)
+}
+
+/// App 面向的 `SoterExportResult`：`[Status][非空标记=1][resultCode][byte[]][dataLength]`。
+///
+/// `data = None` 照宿主自己的写法（`writeByteArray(null)` 是 `-1` + 长度 0），别写成空数组：
+/// 客户端 `createByteArray()` 看到 -1 才回 null，看到 0 是「长度为 0 的数组」，两者在
+/// 检测器眼里不一样（`exportData == null` 的那几条判据）。
+pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+    parcel.write(&code)?;
+    match data {
+        Some(bytes) => {
+            parcel.write(&bytes.to_vec())?;
+            parcel.write(&(bytes.len() as i32))?;
+        }
+        None => {
+            parcel.write(&(-1i32))?;
+            parcel.write(&0i32)?;
+        }
+    }
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
+/// App 面向的 `SoterSessionResult`：`[Status][非空标记=1][session i64][resultCode i32]`。
+/// 注意字段顺序跟 HAL 那份 `SoterInitReturn` 相反（那边是 status 在前）。
+pub fn build_app_session_reply(session: i64, code: i32) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+    parcel.write(&session)?;
+    parcel.write(&code)?;
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
+/// App 面向的 `SoterExtraParam`：`[Status][非空标记=1][VAL_INTEGER=1][i32]`
+/// （字段本身是个 `Object`，宿主写的是 `writeValue(Integer)`）。
+pub fn build_app_extra_param_reply(value: i32) -> Result<OwnedReply> {
+    let mut parcel = Parcel::new();
+    parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
+    parcel.write(&VAL_INTEGER)?;
+    parcel.write(&value)?;
+    Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
+}
+
+/// `Parcel.writeValue` 里整数那个类型标（frameworks/base 的 `Parcel::VAL_INTEGER`）。
+const VAL_INTEGER: i32 = 1;
+
 /// `SoterBufferReturn` 自己那段：`[总长][(错误码)][byte[]][dataLength]`。
 /// 总长从它自己那 4 字节算起，一路盖到最后的 dataLength：联发科把错误码也圈进来
 /// （16 = 4+4+4+4，再加补到 4 的数据），高通没有错误码那一格（12 = 4+4+4）。
