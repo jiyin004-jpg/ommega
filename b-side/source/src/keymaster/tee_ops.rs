@@ -197,10 +197,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 内存热缓存：alias -> (最后一次使用的时间戳, 会话)。时间戳既给 LRU 用（满了丢最旧
-/// 的），也给「要不要写库」的节流用。
-fn sessions() -> &'static Mutex<HashMap<String, (i64, TeeSession)>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<String, (i64, TeeSession)>>> = OnceLock::new();
+/// 内存热缓存里的一格。
+///
+/// `used_ms` 给 LRU（满了丢最旧的）和「刚用过」看；`db_ms` 是**上一次真写库**的时间，
+/// 写库节流只能比它。两个时间分开存是修一个 bug：以前只有 `used_ms`，而它每次命中都
+/// 刷成 now，`should_touch` 拿它比就变成「两次取用相隔 5 分钟才写库」—— 热 key 永远
+/// 不写，库里的 `used_ms` 冻在铸出来那天，7 天 TTL 一到被清，重启后签不了。
+struct Hot {
+    used_ms: i64,
+    db_ms: i64,
+    session: TeeSession,
+}
+
+/// 内存热缓存：alias -> 一份 `Hot`。
+fn sessions() -> &'static Mutex<HashMap<String, Hot>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Hot>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -248,15 +259,25 @@ fn session_to_stored(session: &TeeSession) -> session_db::Stored {
 
 /// 往内存里放一份；满了按「最后使用」丢掉最旧的那些。丢的只是内存副本，库里那条还
 /// 在，下次取用会从库里读回来。
-fn cache_put(alias: &str, session: TeeSession, used_ms: i64) {
+///
+/// `db_ms` = 这一份跟库里对齐的那一瞬（刚 `put` 进去、或者刚从库里捞出来并 `touch`
+/// 过）。之后只刷新 `used_ms`，`db_ms` 一直停在「上次真写库」。
+fn cache_put(alias: &str, session: TeeSession, used_ms: i64, db_ms: i64) {
     let mut sessions = sessions()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    sessions.insert(alias.to_string(), (used_ms, session));
+    sessions.insert(
+        alias.to_string(),
+        Hot {
+            used_ms,
+            db_ms,
+            session,
+        },
+    );
     while sessions.len() > SESSION_MEMORY_HOT {
         let Some(oldest) = sessions
             .iter()
-            .min_by_key(|(_, (used_ms, _))| *used_ms)
+            .min_by_key(|(_, hot)| hot.used_ms)
             .map(|(alias, _)| alias.clone())
         else {
             break;
@@ -265,22 +286,38 @@ fn cache_put(alias: &str, session: TeeSession, used_ms: i64) {
     }
 }
 
-/// 命中内存就返回会话，并说明这次要不要把 `used_ms` 写回库里（距上次够久了才写）。
-/// 内存里的位置每次都刷新，写库那步才节流。
+/// 写库成功后把「对齐时间」推到 now（那一格已经被 LRU 换出去了就算了）。
+fn cache_note_db_write(alias: &str) {
+    let now = now_ms();
+    let mut sessions = sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hot) = sessions.get_mut(alias) {
+        hot.db_ms = now;
+    }
+}
+
+/// 命中内存就返回会话，并说明这次要不要把 `used_ms` 写回库里。
+///
+/// 节流比的是 `db_ms`（上次真写库），不是 `used_ms`（上次取用）。拿取用时间比是错的：
+/// 那个值每次命中都刷成 now，于是一个几秒用一次的热 key 永远够不着 5 分钟阈值，库里
+/// 的 `used_ms` 冻在铸出来那天，7 天 TTL 一到就被 `prune_rows` 清掉；内存里那把还在
+/// 签，重启或者热缓存被挤掉之后才发现 `no key for alias`。
 fn cache_get(alias: &str) -> Option<(TeeSession, bool)> {
     let now = now_ms();
     let mut sessions = sessions()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (used_ms, session) = sessions.get_mut(alias)?;
-    let should_touch = now.saturating_sub(*used_ms) >= SESSION_TOUCH_MIN_AGE_MS;
-    *used_ms = now;
-    Some((session.clone(), should_touch))
+    let hot = sessions.get_mut(alias)?;
+    let should_touch = now.saturating_sub(hot.db_ms) >= SESSION_TOUCH_MIN_AGE_MS;
+    hot.used_ms = now;
+    Some((hot.session.clone(), should_touch))
 }
 
 fn session_put(alias: &str, session: TeeSession) {
     session_db::put(alias, &session_to_stored(&session));
-    cache_put(alias, session, now_ms());
+    let now = now_ms();
+    cache_put(alias, session, now, now);
     session_db::prune_if_due();
 }
 
@@ -288,6 +325,7 @@ fn session_get(alias: &str) -> Result<TeeSession> {
     if let Some((session, should_touch)) = cache_get(alias) {
         if should_touch {
             session_db::touch(alias);
+            cache_note_db_write(alias);
         }
         return Ok(session);
     }
@@ -297,7 +335,8 @@ fn session_get(alias: &str) -> Result<TeeSession> {
         let session = session_from_stored(stored)
             .ok_or_else(|| anyhow!("persisted session for alias '{alias}' is unusable"))?;
         session_db::touch(alias);
-        cache_put(alias, session.clone(), now_ms());
+        let now = now_ms();
+        cache_put(alias, session.clone(), now, now);
         log::info!("recovered persisted session for alias '{alias}'");
         return Ok(session);
     }
@@ -339,10 +378,10 @@ mod session_cache_tests {
         let cache = sessions();
         cache.lock().unwrap().clear();
         for id in 0..SESSION_MEMORY_HOT {
-            cache_put(&format!("k{id}"), session(id as u8), id as i64);
+            cache_put(&format!("k{id}"), session(id as u8), id as i64, id as i64);
         }
         assert_eq!(cache.lock().unwrap().len(), SESSION_MEMORY_HOT);
-        cache_put("newest", session(200), 10_000_000);
+        cache_put("newest", session(200), 10_000_000, 10_000_000);
         let sessions = cache.lock().unwrap();
         assert_eq!(sessions.len(), SESSION_MEMORY_HOT, "多出来的只能是换出去的");
         assert!(sessions.contains_key("newest"));
@@ -372,19 +411,32 @@ mod session_cache_tests {
         assert!(reusable_session(None, SYSTEM_KEYMINT_DEFAULT).is_none());
     }
 
-    /// 命中内存时位置刷新、写库节流：刚用过的不用再写，隔够久了才写一次。
+    /// 写库节流看「上次真写库」而不是「上次取用」：热 key 刚用过但库里那条很久没刷，
+    /// 就得刷；刚刷过的不用再刷。
     #[test]
     fn cache_hits_refresh_recency_but_throttle_the_db_write() {
         let _guard = exclusive();
         let cache = sessions();
         cache.lock().unwrap().clear();
-        cache_put("alias", session(1), now_ms());
+        cache_put("alias", session(1), now_ms(), now_ms());
         let (hit, should_touch) = cache_get("alias").expect("刚放进去的必须在");
         assert_eq!(hit.key_blob, vec![1]);
         assert!(!should_touch, "刚写过就不用再写一遍");
         assert!(cache_get("does-not-exist").is_none());
-        cache_put("alias", session(1), now_ms() - SESSION_TOUCH_MIN_AGE_MS - 1);
+
+        // 一直在用（used_ms 是新的），但上次写库已经过了节流窗口：这一下必须写。
+        // 旧实现拿 used_ms 比，这个用例是 false —— 热 key 永远不写库，TTL 一到就被清。
+        cache_put(
+            "alias",
+            session(1),
+            now_ms(),
+            now_ms() - SESSION_TOUCH_MIN_AGE_MS - 1,
+        );
         assert!(cache_get("alias").unwrap().1, "隔够久了就该写一次");
+
+        // 写完把对齐时间推一下，紧接着的下一笔又不用写了。
+        cache_note_db_write("alias");
+        assert!(!cache_get("alias").unwrap().1, "刚写完的那笔不该重复写");
     }
 
     /// 存进库再取回来，字段一个不差（含枚举 <-> 字符串的来回）。
@@ -930,13 +982,16 @@ fn build_attestation_params(
         params.push(KeyParam::Purpose(p));
     }
 
-    // Digest set: the app's requested digests plus SHA-256 (the relay always
-    // signs with it). begin() later requests one of these.
-    let mut digests = spec.digests.clone();
-    if !digests.contains(&KmDigest::Sha256) {
-        digests.push(KmDigest::Sha256);
-    }
-    for d in digests {
+    // Digest set: 只发调用方要求的那些。
+    //
+    // 以前这里会额外补一个 SHA-256（注释说「relay 总用它签」），结果叶子授权列表比
+    // 请求多一项：调用方明明只要 SHA-384，证书里却拄着 SHA-256，而 A 端 KeyInfo 是
+    // 按请求参数生成的（`tag::extract_key_gen_characteristics`），两边一对就不一样。
+    // 服务端 keybox 层也一直是照拄请求（`fulfill.rs` 里的 `digest`），所以三层之间
+    // 还不自洽。那个理由已经失效了：签名摘要现在由算法串决定（`digest_for_algorithm`），
+    // 算法串来自调用方的 begin 参数；「拿 SIGN 代签子证书」那条路早就不用了。
+    // 真机对没有 DIGEST tag 的钥匙也不会补，这里跟着不补。
+    for d in spec.digests.iter().copied() {
         params.push(KeyParam::Digest(d));
     }
 
