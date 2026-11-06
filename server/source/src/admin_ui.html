@@ -669,6 +669,8 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
               style="width:100%;box-sizing:border-box;margin-top:8px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:12px;font-family:var(--mono,monospace);"></textarea>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
       <button class="btn primary" onclick="uploadSoterAttk()">上传 ATTK</button>
+      <button class="btn" onclick="document.getElementById('spAttkFile').click()">从文件选私钥</button>
+      <input type="file" id="spAttkFile" accept=".pem,.key,.txt" style="display:none" onchange="pickSoterAttkFile(this)">
     </div>
     <p class="hint" id="spAttkStatus" style="margin:10px 0 0;line-height:1.7;"></p>
 
@@ -1727,6 +1729,19 @@ function renderSoterAttkList() {
         <button class="btn small danger" onclick="delSoterAttk(${a.id})">删除</button>
       </td>
     </tr>`).join('');
+}
+
+async function pickSoterAttkFile(input) {
+  const file = input.files && input.files[0];
+  input.value = '';
+  if (!file) return;
+  try {
+    $('#spAttkPem').value = (await file.text()).trim();
+    if (!$('#spAttkName').value.trim()) {
+      $('#spAttkName').value = file.name.replace(/\.[^.]+$/, '');
+    }
+    $('#spAttkStatus').textContent = `已读入 ${file.name}，确认 cpu_id 后点「上传 ATTK」`;
+  } catch (e) { $('#spAttkStatus').textContent = '读取文件失败: ' + e.message; }
 }
 
 async function uploadSoterAttk() {

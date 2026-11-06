@@ -1000,11 +1000,15 @@ pub async fn admin_soter_policy_set(
     }
     // 引用了库里不存在的 ATTK 就直接拒：存进去也只会让这一层永远没物料，
     // 请求默默落到自签上，控制台还以为自己配好了。
-    let referenced: Vec<i64> = body
-        .attk_id
-        .into_iter()
-        .chain(body.identities.iter().flatten().map(|r| r.attk_id))
-        .collect();
+    let referenced: Vec<i64> = if body.reset {
+        Vec::new()
+    } else {
+        body.attk_id
+            .filter(|_| !body.clear_attk)
+            .into_iter()
+            .chain(body.identities.iter().flatten().map(|r| r.attk_id))
+            .collect()
+    };
     if !referenced.is_empty() {
         if let Some(db) = state.db.clone() {
             match tokio::task::spawn_blocking(move || db.list_soter_attks()).await {
