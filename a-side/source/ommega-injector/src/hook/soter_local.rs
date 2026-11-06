@@ -745,14 +745,15 @@ fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 一台像真机的设备号：`09000000` + 12 字节十六进制。只拿真实序列号算，没有就不算。
+/// 一台像真机的设备号：平台前缀（高通 `00000000` / MTK `09000000`）+ 12 字节十六进制。
+/// 只拿真实序列号算，没有就不算。
 fn cpu_id_from(serial: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"ommega-a-side-soter:");
     hasher.update(serial.as_bytes());
     let digest = hasher.finalize();
-    let mut out = String::from("09000000");
+    let mut out = String::from(platform().cpu_prefix);
     for byte in &digest[..12] {
         out.push_str(&format!("{byte:02x}"));
     }
@@ -989,16 +990,30 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 None => None,
             }
         }
-        // generateAskKeyPair(uid) —— 真机语义：已经有 ASK 就回 -5（实测 PLC110），不重铸。
+        // generateAskKeyPair(uid) —— 平台两条路：
+        //   - 高通（实测 SM8635）：每次重铸、回 0（前后两次 ASK 公钥指纹确实不同）
+        //   - MTK（实测 MT6991）：已有就回 -5、不重铸；但跨进程第一次仍回 0（见下）
         //
-        // 但有一个我们故意保留的偏差：**跨进程的第一次仍回 0**。原因：9 号（hasAskAlready）
-        // 在那个 uid 上报过之前一律答「没有」（2026-10-11 毒化事故后的定论），如果 5 号
-        // 也跟真机一样直接 -5，应用就会「问→没有→建→-5→删→再问」直接锁死。所以只在
-        // **本会话已经建过/碰过**（`ask_built`）之后才回 -5 —— 同一进程里连调两次的应答
-        // 跟真机一致，跨进程不会因这个把应用卡住。
+        // MTK 那个偏差是有意的：9 号（hasAskAlready）在上报过之前一律答「没有」
+        // （2026-10-11 毒化事故后的定论），5 号如果也直接 -5，应用就会
+        // 「问→没有→建→-5→删→再问」锁死。所以只在**本会话已经建过/碰过**
+        // （`ask_built`）之后才回 -5；同一进程连调两次的应答跟真机一致。
         // **不要重置 counter**：重置就回退了，App 会当重放把钥匙删掉。
         5 => {
             let uid = call.uid?;
+            if platform().generate_rotates {
+                let (key, origin) = generate_ask_for(uid)?;
+                if let Ok(mut map) = state.asks.lock() {
+                    map.insert(uid, key);
+                }
+                if let Ok(mut map) = ASK_ORIGINS.lock() {
+                    map.insert(uid, origin);
+                }
+                if let Ok(mut set) = state.ask_built.lock() {
+                    set.insert(uid);
+                }
+                return Some(Answer::Code(OK));
+            }
             let built = state
                 .ask_built
                 .lock()
@@ -1013,10 +1028,10 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             }
             Some(Answer::Code(OK))
         }
-        // generateAuthKeyPair(uid, alias) —— 同样：这个别名下已经有 AuthKey 就回 -5。
+        // generateAuthKeyPair(uid, alias) —— 高通重铸回 0；MTK 已存在时回 -5。
         7 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
-            if auth_key(state, uid, alias).is_some() {
+            if !platform().generate_rotates && auth_key(state, uid, alias).is_some() {
                 return Some(Answer::Code(NOT_FOUND));
             }
             let key = Key::generate()?;
@@ -1034,7 +1049,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 它熟悉的那个串。
         8 => Some(Answer::Buffer {
             code: OK,
-            data: Some(ascii_device_id(&device_id())),
+            data: Some(device_id_reply(&device_id())),
         }),
         // hasAskAlready(uid) —— 兜底层**必须**答「没有」。
         //
@@ -1301,22 +1316,74 @@ fn envelope(document: &[u8], signature: &[u8]) -> Vec<u8> {
 /// AuthKey 那份 JSON，`pub_key` 是 AuthKey 自己的公钥 —— **拿 ASK 私钥签**。
 fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
     format!(
-        "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
+        "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\"{}}}",
         json_string(&key.pem),
         cpu_id(),
         counter,
         uid,
-        SALT_LEN
+        salt_field()
     )
     .into_bytes()
 }
 
 /// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
 /// 都不能少 —— App 会把它们存下来当设备指纹。
+/// 真机在这几处是按平台分的（两台实测）：
+///
+/// | | 高通（SM8635 / peridot） | MTK（MT6991 / Kinibi） |
+/// |---|---|---|
+/// | `cpu_id` | `00000000…` | `09000000…` |
+/// | `getDeviceId` | 16 字节 raw | 32 个 ASCII hex + NUL（33 字节） |
+/// | 文档里的盐长字段 | **没有**这个字段 | `rsa_pss_saltlen:32` |
+/// | 已有料时 `generate` | 重铸、回 0 | 回 -5、不重铸 |
+///
+/// 所以本地兜底不能写死一套形状，按本机 SoC 选一。认不出来（含开发机）按高通算。
+struct Platform {
+    cpu_prefix: &'static str,
+    device_id_ascii: bool,
+    declares_salt: bool,
+    generate_rotates: bool,
+}
+
+fn platform() -> &'static Platform {
+    static P: OnceLock<Platform> = OnceLock::new();
+    P.get_or_init(|| {
+        let soc = prop("ro.soc.manufacturer")
+            .unwrap_or_default()
+            .to_lowercase();
+        let board = prop("ro.board.platform").unwrap_or_default().to_lowercase();
+        let mtk = soc.contains("mediatek") || soc.contains("mtk") || board.starts_with("mt");
+        if mtk {
+            Platform {
+                cpu_prefix: "09000000",
+                device_id_ascii: true,
+                declares_salt: true,
+                generate_rotates: false,
+            }
+        } else {
+            Platform {
+                cpu_prefix: "00000000",
+                device_id_ascii: false,
+                declares_salt: false,
+                generate_rotates: true,
+            }
+        }
+    })
+}
+
+/// 一份自描述文档的尾巴：盐长字段（高通那套不放这个字段，验签方按默认的摘要长度 32 算）。
+fn salt_field() -> String {
+    if platform().declares_salt {
+        format!(",\"rsa_pss_saltlen\":{SALT_LEN}")
+    } else {
+        String::new()
+    }
+}
+
 fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
     let info = device_info();
     format!(
-        "{{\"raw\":{},\"fid\":{},\"counter\":{},\"tee_n\":{},\"tee_v\":{},\"fp_n\":{},\"fp_v\":{},\"cpu_id\":{},\"uid\":{},\"rsa_pss_saltlen\":{}}}",
+        "{{\"raw\":{},\"fid\":{},\"counter\":{},\"tee_n\":{},\"tee_v\":{},\"fp_n\":{},\"fp_v\":{},\"cpu_id\":{},\"uid\":{}{}}}",
         json_string(raw),
         json_string(&info.fid),
         counter,
@@ -1326,7 +1393,7 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
         json_string(&info.fp_v),
         json_string(&cpu_id()),
         json_string(&uid.to_string()),
-        SALT_LEN
+        salt_field()
     )
     .into_bytes()
 }
@@ -1335,21 +1402,25 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
 /// `pub_pem` 是 **ASK 自己的公钥**（可能是独立的一把，也可能是 ATTK）。
 fn ask_json(pub_pem: &str, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
     let document = format!(
-        "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\",\"rsa_pss_saltlen\":{}}}",
+        "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\"{}}}",
         json_string(pub_pem),
         cpu_id(),
         counter,
         uid,
-        SALT_LEN
+        salt_field()
     );
     Ok(document.into_bytes())
 }
 
-/// `getDeviceId` 的答复字节：32 个 ASCII 十六进制字符 + 结尾 `\0`（真机实测 33 字节）。
-fn ascii_device_id(cpu_id: &str) -> Vec<u8> {
-    let mut out = cpu_id.as_bytes().to_vec();
-    out.push(0);
-    out
+/// `getDeviceId` 的答复字节：高通回 16 字节 raw，MTK 回 32 个 ASCII hex + NUL。
+fn device_id_reply(cpu: &str) -> Vec<u8> {
+    if platform().device_id_ascii {
+        let mut out = cpu.as_bytes().to_vec();
+        out.push(0);
+        out
+    } else {
+        hex_bytes(cpu).unwrap_or_default()
+    }
 }
 
 /// 把一段文本包成 JSON 字符串字面量（转义引号、反斜杠和换行）。
@@ -1427,7 +1498,7 @@ mod tests {
     fn device_id_looks_like_a_real_one() {
         let id = device_id();
         assert_eq!(id.len(), 32, "SOTER device ids are 32 hex chars");
-        assert!(id.starts_with("09000000"));
+        assert!(id.starts_with(platform().cpu_prefix), "platform prefix");
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(id, device_id(), "the device id must be stable");
     }
@@ -1444,16 +1515,19 @@ mod tests {
         let signature = &data[4 + len..];
         assert_eq!(signature.len(), 256, "RSA-2048 signature is 256 bytes");
 
-        // 键序和字段名是现场抓的，别改
+        // 键序和字段名是现场抓的，别改。盐长字段按平台：MTK 带、高通不带。
         let text = String::from_utf8(document.to_vec()).unwrap();
         assert!(text.starts_with("{\"pub_key\":"), "got {text}");
-        for field in [
-            "\"cpu_id\":",
-            "\"counter\":",
-            "\"uid\":\"10373\"",
-            "\"rsa_pss_saltlen\":32",
-        ] {
+        for field in ["\"cpu_id\":", "\"counter\":", "\"uid\":\"10373\""] {
             assert!(text.contains(field), "ASK json is missing {field}: {text}");
+        }
+        if platform().declares_salt {
+            assert!(text.contains("\"rsa_pss_saltlen\":32"), "got {text}");
+        } else {
+            assert!(
+                !text.contains("rsa_pss_saltlen"),
+                "高通那套不带这个字段: {text}"
+            );
         }
 
         // 文档是 ASK 的自描述，签名那把是 ATTK（ATTK 签 ASK 的认证）
@@ -1509,31 +1583,55 @@ mod tests {
     }
 
     #[test]
-    fn device_id_answers_32_ascii_chars_and_a_nul() {
-        // 实测 PLC110（MTK Kinibi）：33 字节 = 32 个 ASCII 十六进制字符 + `\0`。
+    fn device_id_answer_follows_the_platform_shape() {
         let data = as_buffer(answer(&call(8, None, None)));
-        assert_eq!(data.len(), 33);
-        assert_eq!(&data[..32], device_id().as_bytes());
-        assert_eq!(data[32], 0, "末尾那个字节是 NUL");
-        assert!(data[..32].iter().all(|b| b.is_ascii_hexdigit()));
+        if platform().device_id_ascii {
+            // MTK（实测 MT6991）：33 字节 = 32 个 ASCII hex + `\0`。
+            assert_eq!(data.len(), 33);
+            assert_eq!(&data[..32], device_id().as_bytes());
+            assert_eq!(data[32], 0, "末尾那个字节是 NUL");
+            assert!(data[..32].iter().all(|b| b.is_ascii_hexdigit()));
+        } else {
+            // 高通（实测 SM8635）：16 字节 raw，hex 出来就是 cpu_id。
+            assert_eq!(data.len(), 16);
+            let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, device_id());
+        }
     }
 
-    /// 真机语义：同一个进程里第二次 generate 回 -5（实测 PLC110）。
+    /// generate 的语义按平台走：MTK 第二次回 -5；高通每次重铸回 0。
     #[test]
-    fn a_second_generate_reports_not_found() {
+    fn generate_follows_the_platform_semantics() {
         let uid = 4701;
         assert_eq!(as_code(answer(&call(5, Some(uid), None))), OK);
-        assert_eq!(as_code(answer(&call(5, Some(uid), None))), NOT_FOUND);
-
         let alias = "SecondGenerate";
         assert_eq!(as_code(answer(&call(7, Some(uid), Some(alias)))), OK);
-        assert_eq!(
-            as_code(answer(&call(7, Some(uid), Some(alias)))),
-            NOT_FOUND,
-            "AuthKey 已经在了就不该重铸"
+        let first_auth = pem_of(
+            &String::from_utf8(
+                split_envelope(&as_buffer(answer(&call(3, Some(uid), Some(alias))))).0,
+            )
+            .unwrap(),
         );
-        // 原有那把没被换掉：还是能查到、还是能导出。
-        assert_eq!(as_code(answer(&call(10, Some(uid), Some(alias)))), OK);
+
+        if platform().generate_rotates {
+            assert_eq!(as_code(answer(&call(5, Some(uid), None))), OK);
+            assert_eq!(as_code(answer(&call(7, Some(uid), Some(alias)))), OK);
+            let second_auth = pem_of(
+                &String::from_utf8(
+                    split_envelope(&as_buffer(answer(&call(3, Some(uid), Some(alias))))).0,
+                )
+                .unwrap(),
+            );
+            assert_ne!(first_auth, second_auth, "高通那套每次 generate 都重铸");
+        } else {
+            assert_eq!(as_code(answer(&call(5, Some(uid), None))), NOT_FOUND);
+            assert_eq!(
+                as_code(answer(&call(7, Some(uid), Some(alias)))),
+                NOT_FOUND,
+                "MTK 那套已经在了就不重铸"
+            );
+            assert_eq!(as_code(answer(&call(10, Some(uid), Some(alias)))), OK);
+        }
     }
 
     #[test]
@@ -1794,28 +1892,30 @@ mod tests {
         let (document, _) = split_envelope(&as_buffer(answer(&finish)));
         let text = String::from_utf8(document).unwrap();
 
-        // 字段和键序照 B 端 TEE 现场抓的来，一个都不能少
-        let order: Vec<usize> = [
-            "raw",
-            "fid",
-            "counter",
-            "tee_n",
-            "tee_v",
-            "fp_n",
-            "fp_v",
-            "cpu_id",
-            "uid",
-            "rsa_pss_saltlen",
-        ]
-        .iter()
-        .map(|k| text.find(&format!("\"{k}\":")).expect("key present"))
-        .collect();
+        // 字段和键序照 B 端 TEE 现场抓的来；盐长字段按平台（MTK 带、高通不带）。
+        let mut fields = vec![
+            "raw", "fid", "counter", "tee_n", "tee_v", "fp_n", "fp_v", "cpu_id", "uid",
+        ];
+        if platform().declares_salt {
+            fields.push("rsa_pss_saltlen");
+        }
+        let order: Vec<usize> = fields
+            .iter()
+            .map(|k| text.find(&format!("\"{k}\":")).expect("key present"))
+            .collect();
         assert!(
             order.windows(2).all(|w| w[0] < w[1]),
             "key order changed: {text}"
         );
         assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
-        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
+        if platform().declares_salt {
+            assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
+        } else {
+            assert!(
+                !text.contains("rsa_pss_saltlen"),
+                "高通那套不带这个字段: {text}"
+            );
+        }
     }
 
     #[test]
@@ -1826,7 +1926,7 @@ mod tests {
             .as_deref()
             .expect("真机/真设备上序列号读得到；读不到这儿就该是 None");
         assert_eq!(derived.len(), 32, "SOTER device ids are 32 hex chars");
-        assert!(derived.starts_with("09000000"));
+        assert!(derived.starts_with(platform().cpu_prefix));
         assert!(derived.chars().all(|c| c.is_ascii_hexdigit()));
         // `device_id()` 报的是「当前该报的那个」（文件里有就用文件里的，没有才用它）。
         assert_eq!(device_id(), cpu_id(), "device_id() 就是那个 cpu_id");

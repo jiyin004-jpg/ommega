@@ -878,10 +878,16 @@ pub fn run_layer(
             "get_device_id" => {
                 // 带上层名：A 端要靠它分辨这个号是真机报的还是服务端自己造的（只有
                 // 真机那个值能当设备身份转出去，见 `docs_cpu_id`）。
-                // 回什么形状：实测 PLC110（MTK Kinibi）真机回 **32 个 ASCII 十六进制字符
-                // + 结尾 `\0`**（33 字节），不是 16 字节二进制。跟着真机来，形状才对得上。
-                let mut raw = product.as_bytes().to_vec();
-                raw.push(0);
+                // 形状跟平台：高通回 16 字节 raw（hex 出来就是 cpu_id），MTK 回
+                // 32 个 ASCII 十六进制字符 + `\0`（33 字节）。
+                let profile = profile_of(&product);
+                let raw = if profile.device_id_ascii {
+                    let mut bytes = product.as_bytes().to_vec();
+                    bytes.push(0);
+                    bytes
+                } else {
+                    hex_bytes(&product).unwrap_or_default()
+                };
                 let mut out = data_result(op, OK, &raw);
                 out["layer"] = json!(layer);
                 Ok(out)
@@ -1197,16 +1203,46 @@ fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
     format!("{scope}|{device_id}|{uid}")
 }
 
+/// 真机形状是按平台分的（两台实测）：
+///   - 高通（SM8635）：`cpu_id` 以 `00000000` 开头、getDeviceId 回 16 字节 raw、
+///     文档里**不带** `rsa_pss_saltlen` 字段；
+///   - MTK（MT6991 / Kinibi）：`cpu_id` 以 `09000000` 开头、getDeviceId 回 32 ASCII + NUL、
+///     文档带 `rsa_pss_saltlen:32`。
+///
+/// 服务端拿不到 A/B 的 SoC，但 `cpu_id` 本身带着平台前缀 —— 自己造的时候按它选形状，
+/// 跟转发过来的那个真机号保持一致。
+#[derive(Clone, Copy)]
+struct Platform {
+    declares_salt: bool,
+    device_id_ascii: bool,
+}
+
+fn profile_of(cpu_id: &str) -> Platform {
+    if cpu_id.starts_with("09000000") {
+        Platform {
+            declares_salt: true,
+            device_id_ascii: true,
+        }
+    } else {
+        Platform {
+            declares_salt: false,
+            device_id_ascii: false,
+        }
+    }
+}
+
 /// 一份自描述文档（ASK 或 AuthKey 的都用它）。键序照现场抓到的来：`pub_key` /
-/// `cpu_id` / `counter` / `uid` / `rsa_pss_saltlen`，`uid` 是字符串别写成数字。
+/// `cpu_id` / `counter` / `uid`（+ MTK 那套的 `rsa_pss_saltlen`），`uid` 是字符串。
 fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result<Vec<u8>> {
-    let doc = json!({
+    let mut doc = json!({
         "pub_key": pub_key_pem,
         "cpu_id": device_id,
         "counter": counter,
         "uid": uid.to_string(),
-        "rsa_pss_saltlen": ASK_SALT_LEN,
     });
+    if profile_of(device_id).declares_salt {
+        doc["rsa_pss_saltlen"] = json!(ASK_SALT_LEN);
+    }
     serde_json::to_vec(&doc).context("failed to serialize the key document")
 }
 
@@ -1214,7 +1250,7 @@ fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result
 /// 都不能少 —— App 会把它们存下来当设备指纹。服务端两层是虚拟设备，指纹和 TEE
 /// 这几个字段没有真值，用固定值加这台设备派生的 fid 填，稳定可复现就行。
 fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64, layer: &str) -> Result<Vec<u8>> {
-    let doc = json!({
+    let mut doc = json!({
         "raw": raw,
         "fid": fid_of(cpu_id),
         "counter": counter,
@@ -1224,8 +1260,10 @@ fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64, layer: &str) -> Res
         "fp_v": layer,
         "cpu_id": cpu_id,
         "uid": uid.to_string(),
-        "rsa_pss_saltlen": ASK_SALT_LEN,
     });
+    if profile_of(cpu_id).declares_salt {
+        doc["rsa_pss_saltlen"] = json!(ASK_SALT_LEN);
+    }
     serde_json::to_vec(&doc).context("failed to serialize the sign document")
 }
 
@@ -1682,6 +1720,42 @@ mod tests {
             )
             .expect("handled")["error_code"],
             json!(-6)
+        );
+    }
+
+    /// 高通那套（实测 SM8635 / peridot）：`cpu_id` 以 `00000000` 开头，`getDeviceId` 回
+    /// 16 字节 raw，ASK 文档里**不带** `rsa_pss_saltlen` 字段。
+    #[test]
+    fn a_qti_cpu_id_switches_to_the_qti_shape() {
+        let cpu = "00000000002750e110768fdc8351ee88";
+        let device = "device-a-qti";
+
+        let id = run(
+            "self_signed",
+            device,
+            &json!({ "op": "get_device_id", "cpu_id": cpu }),
+            None,
+        )
+        .expect("handled");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(id["data"].as_str().expect("data"))
+            .expect("base64");
+        assert_eq!(raw.len(), 16, "高通回 16 字节 raw");
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, cpu);
+
+        let ask = run(
+            "self_signed",
+            device,
+            &json!({ "op": "export_ask_public_key", "uid": 10490, "cpu_id": cpu }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(ask["payload"]["cpu_id"], json!(cpu));
+        assert!(
+            ask["payload"].get("rsa_pss_saltlen").is_none(),
+            "高通那套不带盐长字段：{}",
+            ask["payload"]
         );
     }
 
