@@ -384,40 +384,81 @@ fn ec_digest_bytes(digest: Digest, data: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// 把比域窄的摘要左边补 0（P-224 只剩 28 字节的域）。
-fn left_pad(data: &[u8], len: usize, curve: ec::NistCurve) -> Result<Vec<u8>, Error> {
-    if data.len() > len {
-        return Err(km_err!(
-            InvalidInputLength,
-            "{:?} digest is {} bytes, field is {len}",
-            curve,
-            data.len()
-        ));
-    }
+/// ECDSA 的输入是 `bits2int(摘要)`：取最左边「群阶位数」那几位，多出来的低位右移掉，
+/// 不足的左边补 0。
+///
+/// P-256/P-384 的域宽正好等于阶位数（32/48 字节），这条看不出来；**P-521 的域是 528 位、
+/// 阶只有 521 位**，多出的 7 位必须右移掉。以前这里把这 66 字节原样交给 RustCrypto，
+/// 它按域宽截断而不是按阶位数截断，签出来的签名只对「未做 521 位截断的那个整数」成立，
+/// 用 FIPS/NONEwithECDSA 的标准验签一验就不过（真机缺口探针 E02 命中的就是这条）。
+fn bits2int(msg: &[u8], curve: ec::NistCurve) -> Vec<u8> {
+    let nbits = match curve {
+        ec::NistCurve::P224 => 224,
+        ec::NistCurve::P256 => 256,
+        ec::NistCurve::P384 => 384,
+        ec::NistCurve::P521 => 521,
+    };
+    let len = curve.coord_len();
     let mut out = vec![0u8; len];
-    out[len - data.len()..].copy_from_slice(data);
-    Ok(out)
+    if msg.is_empty() {
+        return out;
+    }
+    // 大端：先按域宽取**最左边**（高位）那几字节，比域窄的左边补 0。
+    let take = msg.len().min(len);
+    out[len - take..].copy_from_slice(&msg[..take]);
+    // 再按「阶位数」把多出来的低位右移掉（P-521 域 528 位、阶 521 位 → 右移 7 位）。
+    let bits = take * 8;
+    if bits > nbits {
+        shift_right_be(&mut out, bits - nbits);
+    }
+    out
 }
 
+/// 大端字节串整体右移 `bits` 位。
+///
+/// 大端下「位 0」是最高位：右移之后结果的最低位来自原串更靠后的位，所以结果第 `pos`
+/// 位（从最高位数）对应原串第 `pos - bits` 位，负数补 0。别把方向搞反 —— 反了会把
+/// 62 个 0xFF 右移成 0xFF 而不是 0x01FF…（我第一次就写反了）。
+fn shift_right_be(buf: &mut [u8], bits: usize) {
+    let total = buf.len() * 8;
+    if bits == 0 {
+        return;
+    }
+    if bits >= total {
+        buf.fill(0);
+        return;
+    }
+    let bit_at = |idx: usize| -> u8 {
+        let byte = idx / 8;
+        let bit = 7 - (idx % 8);
+        buf.get(byte).map(|b| (b >> bit) & 1).unwrap_or(0)
+    };
+    let mut out = vec![0u8; buf.len()];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut byte = 0u8;
+        for k in 0..8 {
+            let pos = i * 8 + k;
+            let src = pos.checked_sub(bits).map(bit_at).unwrap_or(0);
+            byte = (byte << 1) | src;
+        }
+        *slot = byte;
+    }
+    buf.copy_from_slice(&out);
+}
 /// Sign a digest directly with ECDSA, returning a DER signature.
 ///
-/// 必须用 `sign_prehash`：`sign()` 会按曲线默认摘要（P-256 是 SHA-256）把输入
-/// 再哈希一遍，`Digest::None` 那种「输入已经是摘要」的请求就被多算了一层，
-/// 产出的签名用 NONEwithECDSA 验不过。
+/// 两件事必须跟 AOSP 的 BoringSSL 一致，否则检测器一眼能看出这不是 TEE 的行为：
+///
+/// - 输入按 `bits2int` 处理（最左边阶位数的位），见 [`bits2int`]；
+/// - **每次签名取随机 k**。RustCrypto 的 `sign_prehash`/`SigningKey::sign` 走 RFC 6979，
+///   同一把钥匙同一个消息签两次字节完全一样；BoringSSL 是 `ECDSA_do_sign` 取随机 k，
+///   两次不一样。真机缺口探针 E04 就是拿这个判的。
 fn sign_ecdsa_prehashed(key: &Key, curve: ec::NistCurve, msg: &[u8]) -> Result<Vec<u8>, Error> {
-    use ecdsa::signature::hazmat::PrehashSigner as _;
+    use ecdsa::hazmat::SignPrimitive as _;
+    use elliptic_curve::ff::Field as _;
     let priv_bytes = nist_priv_bytes(key)?;
-    // 比域短的输入要左边补 0（跟 ECDSA 把输入当大整数的做法一致）。RustCrypto 的
-    // `bits2field` 只接受「至少半个域宽」，再短就直接报错 —— 以前我们把摘要交给
-    // `sign()` 时永远不会踩到，改成 prehash 后短摘要（比如 8 字节）会莫名其妙失败。
-    // 长的输入由 `bits2field` 按位截断（SHA-512 配 P-256 就是这种）。
-    let padded;
-    let msg = if msg.len() < curve.coord_len() {
-        padded = left_pad(msg, curve.coord_len(), curve)?;
-        padded.as_slice()
-    } else {
-        msg
-    };
+    let z = bits2int(msg, curve);
+    let mut rng = rand_core::OsRng;
     let sig = match curve {
         // P-224 只有工程模式那类自检会要（`KeyAttestationTest.testEcAttestation` 用的就是
         // secp224r1）。以前这里直接回 UnsupportedEcCurve，于是工程模式的
@@ -425,44 +466,51 @@ fn sign_ecdsa_prehashed(key: &Key, curve: ec::NistCurve, msg: &[u8]) -> Result<V
         ec::NistCurve::P224 => {
             let sk = EcdsaSigningKey::<p224::NistP224>::from_slice(&priv_bytes)
                 .map_err(|e| km_err!(UnknownError, "P-224 key: {e:?}"))?;
-            let s: SigP224 = sk
-                .sign_prehash(msg)
+            let field = p224::FieldBytes::clone_from_slice(&z);
+            let k = p224::Scalar::random(&mut rng);
+            let (s, _) = sk
+                .as_nonzero_scalar()
+                .try_sign_prehashed(k, &field)
                 .map_err(|e| km_err!(UnknownError, "P-224 prehash sign: {e:?}"))?;
+            let s: SigP224 = s;
             s.to_der().to_vec()
         }
         ec::NistCurve::P256 => {
             let sk = EcdsaSigningKey::<p256::NistP256>::from_slice(&priv_bytes)
                 .map_err(|e| km_err!(UnknownError, "P-256 key: {e:?}"))?;
-            let s: SigP256 = sk
-                .sign_prehash(msg)
+            let field = p256::FieldBytes::clone_from_slice(&z);
+            let k = p256::Scalar::random(&mut rng);
+            let (s, _) = sk
+                .as_nonzero_scalar()
+                .try_sign_prehashed(k, &field)
                 .map_err(|e| km_err!(UnknownError, "P-256 prehash sign: {e:?}"))?;
+            let s: SigP256 = s;
             s.to_der().to_vec()
         }
         ec::NistCurve::P384 => {
             let sk = EcdsaSigningKey::<p384::NistP384>::from_slice(&priv_bytes)
                 .map_err(|e| km_err!(UnknownError, "P-384 key: {e:?}"))?;
-            let s: SigP384 = sk
-                .sign_prehash(msg)
+            let field = p384::FieldBytes::clone_from_slice(&z);
+            let k = p384::Scalar::random(&mut rng);
+            let (s, _) = sk
+                .as_nonzero_scalar()
+                .try_sign_prehashed(k, &field)
                 .map_err(|e| km_err!(UnknownError, "P-384 prehash sign: {e:?}"))?;
+            let s: SigP384 = s;
             s.to_der().to_vec()
         }
         ec::NistCurve::P521 => {
-            // RustCrypto 的 P-521 没给 `PrehashSigner`/`DigestPrimitive` 实现，但
-            // 底层标量运算有：走 `SignPrimitive::try_sign_prehashed`，自己做
-            // bits2field + reduce（aprobe C11 的 P-521 项）。
-            use ecdsa::hazmat::SignPrimitive as _;
-            use p521::elliptic_curve::ff::Field as _;
+            // RustCrypto 的 P-521 没给 `PrehashSigner`/`DigestPrimitive` 实现，但底层标量
+            // 运算有：走 `SignPrimitive::try_sign_prehashed`，自己做 bits2int。
             let sk = EcdsaSigningKey::<p521::NistP521>::from_slice(&priv_bytes)
                 .map_err(|e| km_err!(UnknownError, "P-521 key: {e:?}"))?;
-            let field = ecdsa::hazmat::bits2field::<p521::NistP521>(msg)
-                .map_err(|e| km_err!(UnknownError, "P-521 bits2field: {e:?}"))?;
-            let mut rng = rand_core::OsRng;
+            let field = p521::FieldBytes::clone_from_slice(&z);
             let k = p521::Scalar::random(&mut rng);
-            let (sig, _) = sk
+            let (s, _) = sk
                 .as_nonzero_scalar()
                 .try_sign_prehashed(k, &field)
                 .map_err(|e| km_err!(UnknownError, "P-521 prehash sign: {e:?}"))?;
-            sig.to_der().to_vec()
+            s.to_der().to_vec()
         }
     };
     Ok(sig)
@@ -610,5 +658,96 @@ mod signing_tests {
         verifier
             .verify_prehash(&sha2::Sha384::digest(message), &sig)
             .unwrap_or_else(|e| panic!("SHA384withECDSA 验签失败: {e:?}"));
+    }
+
+    /// bits2int：P-521 的域是 528 位、阶只有 521 位，多出的 7 位必须右移掉。
+    /// 全 0xFF 的 66 字节右移 7 位就是 `0x01` + 65 个 0xFF（521 个 1）。
+    #[test]
+    fn bits2int_truncates_p521_to_the_group_order() {
+        let all_ones = vec![0xffu8; 66];
+        let z = bits2int(&all_ones, ec::NistCurve::P521);
+        assert_eq!(z.len(), 66);
+        assert_eq!(z[0], 0x01);
+        assert!(z[1..].iter().all(|b| *b == 0xff));
+    }
+
+    /// bits2int：比域宽的输入取最左边那几字节（P-256 拿 128 字节就是前 32 字节）。
+    #[test]
+    fn bits2int_keeps_the_leftmost_bytes() {
+        let long: Vec<u8> = (0u8..128).collect();
+        assert_eq!(bits2int(&long, ec::NistCurve::P256), long[..32].to_vec());
+        assert_eq!(bits2int(&long, ec::NistCurve::P384), long[..48].to_vec());
+    }
+
+    /// bits2int：比域窄的输入左补 0。
+    #[test]
+    fn bits2int_pads_short_inputs_on_the_left() {
+        let short = [0x11u8; 10];
+        let z = bits2int(&short, ec::NistCurve::P256);
+        assert_eq!(z.len(), 32);
+        assert!(z[..22].iter().all(|b| *b == 0));
+        assert_eq!(&z[22..], &short);
+    }
+
+    /// 同一把钥匙、同一个摘要签两次，字节必须不同（AOSP 的 BoringSSL 取随机 k）。
+    /// 以前走 RFC 6979 是确定性的，两次一模一样，检测器拿这个判「不是 TEE 的 ECDSA」。
+    #[test]
+    fn repeated_ecdsa_signatures_differ() {
+        let digest = [0x42u8; 32];
+        let key = p256_key();
+        let priv_bytes = nist_priv_bytes(&key).unwrap();
+        let first = sign_ecdsa_prehashed(&key, ec::NistCurve::P256, &digest).unwrap();
+        let second = sign_ecdsa_prehashed(&key, ec::NistCurve::P256, &digest).unwrap();
+        assert_ne!(first, second, "P-256 两次签名不该相同");
+
+        // 两份都得能验过（随机 k 不影响正确性）。
+        let verifier = p256_verifier(&key);
+        for der in [first, second] {
+            let sig = SigP256::from_der(&der).unwrap();
+            verifier
+                .verify_prehash(&digest, &sig)
+                .unwrap_or_else(|e| panic!("随机 k 的签名验不过: {e:?}"));
+        }
+        let _ = priv_bytes;
+    }
+
+    /// P-384 同样是随机 k。
+    #[test]
+    fn p384_signatures_are_randomized_too() {
+        let sk = p384::SecretKey::random(&mut rand_core::OsRng);
+        let key = Key::P384(ec::NistKey(sk.to_sec1_der().unwrap().to_vec()));
+        let digest = [0x24u8; 48];
+        let first = sign_ecdsa_prehashed(&key, ec::NistCurve::P384, &digest).unwrap();
+        let second = sign_ecdsa_prehashed(&key, ec::NistCurve::P384, &digest).unwrap();
+        assert_ne!(first, second, "P-384 两次签名不该相同");
+    }
+
+    /// P-521：66 字节的输入按 521 位截断后再签，用同一套截断去验必须过；
+    /// 用「未截断的 66 字节」验则不该过（这正是探针 E02 命中的那个差别）。
+    #[test]
+    fn p521_signs_the_truncated_digest() {
+        use ecdsa::hazmat::VerifyPrimitive as _;
+        let sk = p521::SecretKey::random(&mut rand_core::OsRng);
+        let key = Key::P521(ec::NistKey(sk.to_sec1_der().unwrap().to_vec()));
+        let digest = [0x7fu8; 66];
+        let der = sign_ecdsa_prehashed(&key, ec::NistCurve::P521, &digest).unwrap();
+
+        let priv_bytes = nist_priv_bytes(&key).unwrap();
+        let sk = EcdsaSigningKey::<p521::NistP521>::from_slice(&priv_bytes).unwrap();
+        let verifying = sk.verifying_key();
+        let sig = p521::ecdsa::Signature::from_der(&der).unwrap();
+
+        let z = bits2int(&digest, ec::NistCurve::P521);
+        let truncated = p521::FieldBytes::clone_from_slice(&z);
+        verifying
+            .as_affine()
+            .verify_prehashed(&truncated, &sig)
+            .unwrap_or_else(|e| panic!("按 521 位截断后应当验得过: {e:?}"));
+
+        let raw = p521::FieldBytes::clone_from_slice(&digest);
+        assert!(
+            verifying.as_affine().verify_prehashed(&raw, &sig).is_err(),
+            "按未截断的 528 位整数验应当不过"
+        );
     }
 }
