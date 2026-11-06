@@ -243,12 +243,26 @@ pub fn session_attk(requested: &str, session: i64) -> Option<i64> {
 }
 
 /// 控制台上传的 ATTK：私钥 + 它对应的 `cpu_id`（SOTER 的身份就是这两样）。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AttkMaterial {
     pub id: i64,
     pub name: String,
     pub cpu_id: String,
     pub pem: String,
+}
+
+/// 手写 `Debug`：`pem` 就是私钥，谁哪天在日志里 `?attk` 一下都不该把它吐到 stdout。
+/// 这把钥匙永不对外暴露（控制台列表只有元数据、`/api/status` 不带它、A 端只能拿到公钥），
+/// 日志是最后一条能漏的路，这里直接堵死。
+impl std::fmt::Debug for AttkMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttkMaterial")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("cpu_id", &self.cpu_id)
+            .field("pem", &"<redacted>")
+            .finish()
+    }
 }
 
 fn store() -> &'static Store {
@@ -1774,6 +1788,23 @@ mod tests {
             op(json!({ "op": "export_ask_public_key", "uid": uid }))["error_code"],
             json!(0)
         );
+    }
+
+    /// 私钥不能因为一行日志就漏出去：`AttkMaterial` 的 Debug 得把 `pem` 抹掉。
+    #[test]
+    fn the_attk_material_never_prints_the_private_key() {
+        let material = AttkMaterial {
+            id: 1,
+            name: "leak-check".to_string(),
+            cpu_id: "09000000aaaabbbbccccddddeeeeffff".to_string(),
+            pem: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n"
+                .to_string(),
+        };
+        let text = format!("{material:?}");
+        assert!(!text.contains("PRIVATE KEY"), "{text}");
+        assert!(!text.contains("MIIEvQ"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.contains("leak-check"), "元数据该留的还得留：{text}");
     }
 
     /// `attk` 层跟兜底层不一样：它的 ASK 是用上传的真 ATTK 签的，所以 `has_ask_already`
