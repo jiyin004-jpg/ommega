@@ -330,7 +330,12 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
                 wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
                 return wrapped;
             }
-            map.retain(|key, _| key == ASK_SECTION || key == AUTH_SECTION || key == ATTK_FIELD);
+            map.retain(|key, _| {
+                key == ASK_SECTION
+                    || key == AUTH_SECTION
+                    || key == GONE_SECTION
+                    || key == ATTK_FIELD
+            });
             // 指纹对不上（换了 ATTK）或者是没记指纹的旧 store：整份作废，让调用方
             // 重新生成。留着只会拿旧 ATTK 签的链去跑，本地能过、腾讯不认。
             let want = attk_fingerprint();
@@ -444,6 +449,33 @@ fn forget_pem(section: &str, key: &str) {
     if removed {
         write_ask_store(&map);
     }
+}
+
+/// 「删过了」的墓碑段（落盘，重启也黏着）。
+///
+/// 真机删了就是删了：`removeAllUidKey` / `removeAuthKey` 之后，后面的 `export*` 不能
+/// 现造一把新的顶上 —— 我们的实现在那之前就是“要就现生成”，于是删完还能导出，
+/// 跟真机不一样（检测器就测这个）。键：`ask:<uid>` / `auth:<uid>|<alias>`。
+const GONE_SECTION: &str = "gone";
+
+fn mark_gone(key: &str) {
+    store_pem(GONE_SECTION, key, "1");
+}
+
+fn is_gone(key: &str) -> bool {
+    read_store_pem(GONE_SECTION, key).is_some()
+}
+
+fn clear_gone(key: &str) {
+    forget_pem(GONE_SECTION, key);
+}
+
+fn ask_gone_key(uid: i32) -> String {
+    format!("ask:{uid}")
+}
+
+fn auth_gone_key(uid: i32, alias: &str) -> String {
+    format!("auth:{uid}|{alias}")
 }
 
 /// 删掉某个 uid 的全部东西：ASK、这个 uid 名下所有 AuthKey、以及旧版散落的 pem。
@@ -924,6 +956,13 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // exportAskPublicKey(uid) —— 这个 uid 的 ASK 自描述，由 ATTK 签（ATTK 是 ASK 的根）
         1 => {
             let uid = call.uid?;
+            // 删过就不再现造（墓碑），跟真机一样“删了就是没了”。
+            if is_gone(&ask_gone_key(uid)) {
+                return Some(Answer::Buffer {
+                    code: NOT_FOUND,
+                    data: None,
+                });
+            }
             let counter = bump_counter(state, uid);
             let ask = ask_for(state, uid)?;
             let document = ask_json(&ask.pem, uid, counter).ok()?;
@@ -937,6 +976,13 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 拿 ASK 私钥签（App 先有 ASK 公钥，验的就是这把）。
         3 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
+            // AuthKey 自己删过，或者整个 uid 删过（ASK 都没了）—— 都不能现造。
+            if is_gone(&auth_gone_key(uid, alias)) || is_gone(&ask_gone_key(uid)) {
+                return Some(Answer::Buffer {
+                    code: AUTH_KEY_NOT_READY,
+                    data: None,
+                });
+            }
             match auth_key(state, uid, alias) {
                 Some(key) => {
                     let counter = bump_counter(state, uid);
@@ -1001,6 +1047,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // **不要重置 counter**：重置就回退了，App 会当重放把钥匙删掉。
         5 => {
             let uid = call.uid?;
+            clear_gone(&ask_gone_key(uid));
             if platform().generate_rotates {
                 let (key, origin) = generate_ask_for(uid)?;
                 if let Ok(mut map) = state.asks.lock() {
@@ -1031,6 +1078,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // generateAuthKeyPair(uid, alias) —— 高通重铸回 0；MTK 已存在时回 -5。
         7 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
+            clear_gone(&auth_gone_key(uid, alias));
             if !platform().generate_rotates && auth_key(state, uid, alias).is_some() {
                 return Some(Answer::Code(NOT_FOUND));
             }
@@ -1131,6 +1179,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 map.remove(&uid);
             }
             forget_uid_keys(uid);
+            mark_gone(&ask_gone_key(uid));
             if let Ok(mut set) = state.ask_built.lock() {
                 set.remove(&uid);
             }
@@ -1143,6 +1192,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 map.remove(&auth_id(uid, alias));
             }
             forget_pem(AUTH_SECTION, &auth_id(uid, alias));
+            mark_gone(&auth_gone_key(uid, alias));
             Some(Answer::Code(OK))
         }
         _ => None,
@@ -1916,6 +1966,39 @@ mod tests {
                 "高通那套不带这个字段: {text}"
             );
         }
+    }
+
+    /// 删过了就是删过了：`removeAllUidKey` / `removeAuthKey` 之后 `export*` 不能现造
+    /// 一把新的顶上（真机的删除是黏的，检测器就测这个）。
+    #[test]
+    fn a_deleted_key_does_not_grow_back() {
+        let uid = 4801;
+        let alias = "DeletedGone";
+        assert_eq!(as_code(answer(&call(5, Some(uid), None))), OK);
+        assert_eq!(as_code(answer(&call(7, Some(uid), Some(alias)))), OK);
+
+        // 删单个 AuthKey：它会消失，而且导不出来（不现造）。
+        assert_eq!(as_code(answer(&call(13, Some(uid), Some(alias)))), OK);
+        assert_eq!(
+            as_code(answer(&call(10, Some(uid), Some(alias)))),
+            AUTH_KEY_NOT_READY
+        );
+        assert_eq!(
+            as_buffer_code(answer(&call(3, Some(uid), Some(alias)))),
+            AUTH_KEY_NOT_READY
+        );
+
+        // 删整个 uid：ASK 也没了，导出不能把它变回来。
+        assert_eq!(as_code(answer(&call(12, Some(uid), None))), OK);
+        assert_eq!(as_buffer_code(answer(&call(1, Some(uid), None))), NOT_FOUND);
+        assert_eq!(
+            as_buffer_code(answer(&call(3, Some(uid), Some(alias)))),
+            AUTH_KEY_NOT_READY
+        );
+
+        // 重建之后又能导出（墓碑被清）。
+        assert_eq!(as_code(answer(&call(5, Some(uid), None))), OK);
+        assert_eq!(as_buffer_code(answer(&call(1, Some(uid), None))), OK);
     }
 
     #[test]

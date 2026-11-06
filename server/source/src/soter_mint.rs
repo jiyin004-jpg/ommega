@@ -41,7 +41,7 @@
 //!   - 每层自己也得把整个流程走完：ASK 自描述、AuthKey 自描述、签名现场，
 //!     三份信封一个不少，签名的那把钥匙和导出的公钥对得上。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -150,6 +150,11 @@ struct Store {
     auth: Mutex<HashMap<String, Arc<MintKey>>>,
     /// `{device}|{uid}` -> 签名计数器
     counters: Mutex<HashMap<String, u64>>,
+    /// 删过的 ASK 墓碑：`{scope}|{device}|{uid}`。
+    ///
+    /// 真机的删除是黏的：`remove_all_uid_key` 之后 `export*` 不能现造一把新的顶上。
+    /// 服务端物料本来就在内存里，墓碑也一起在内存（重启后两边一起没，口径一致）。
+    gone_ask: Mutex<HashSet<String>>,
     /// `{device}|{uid}` -> 下一次会话号
     next_session: Mutex<i64>,
     /// 会话号 -> 这一次要签的挑战
@@ -243,6 +248,7 @@ fn store() -> &'static Store {
         builtin: Mutex::new(None),
         attk: Mutex::new(HashMap::new()),
         ask: Mutex::new(HashMap::new()),
+        gone_ask: Mutex::new(HashSet::new()),
         auth: Mutex::new(HashMap::new()),
         counters: Mutex::new(HashMap::new()),
         next_session: Mutex::new(chrono::Utc::now().timestamp_millis()),
@@ -313,7 +319,7 @@ fn moment_scope(layer: &str, attk_id: Option<i64>) -> String {
     }
 }
 
-/// ATTK 被删/换了：物料缓存和它签出来的 ASK/AuthKey 一起丢。
+/// ATTK 被删/换了：物料缓存、它签出来的 ASK/AuthKey、以及这个身份的墓碑一起丢。
 pub fn forget_attk(id: i64) {
     if let Ok(mut map) = store().attk.lock() {
         map.remove(&id);
@@ -324,6 +330,9 @@ pub fn forget_attk(id: i64) {
     }
     if let Ok(mut map) = store().auth.lock() {
         map.retain(|key, _| !key.starts_with(&prefix));
+    }
+    if let Ok(mut set) = store().gone_ask.lock() {
+        set.retain(|key| !key.starts_with(&prefix));
     }
 }
 
@@ -386,6 +395,26 @@ fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     let fresh = Arc::new(MintKey::generate()?);
     map.insert(id, fresh.clone());
     Ok(fresh)
+}
+
+fn ask_gone_key(scope: &str, device_id: &str, uid: i32) -> String {
+    format!("{scope}|{device_id}|{uid}")
+}
+
+fn ask_is_gone(scope: &str, device_id: &str, uid: i32) -> bool {
+    let key = ask_gone_key(scope, device_id, uid);
+    store()
+        .gone_ask
+        .lock()
+        .map(|set| set.contains(&key))
+        .unwrap_or(false)
+}
+
+fn clear_ask_gone(scope: &str, device_id: &str, uid: i32) {
+    let key = ask_gone_key(scope, device_id, uid);
+    if let Ok(mut set) = store().gone_ask.lock() {
+        set.remove(&key);
+    }
 }
 
 /// 重建 ASK（`generate_ask_key_pair` 就是它）：只换这个 uid 的那一把。
@@ -895,8 +924,13 @@ pub fn run_layer(
             "export_attk_public_key" => Ok(data_result(op, OK, key.attk_pem.as_bytes())),
             // 导出的是 **ASK** 的公钥（跟 ATTK 是两把），文档用 ATTK 签 —— 与真机一致。
             "export_ask_public_key" => {
-                let ask = layer_ask_key(&scope, uid_of(body)?, layer)?;
-                ask_result(op, layer, &scope, &ask, &key, &product, uid_of(body)?)
+                let uid = uid_of(body)?;
+                // 删过就不再现造（墓碑）：真机删了就是没了。
+                if ask_is_gone(&scope, device_id, uid) {
+                    return Ok(code_result(op, NOT_FOUND));
+                }
+                let ask = layer_ask_key(&scope, uid, layer)?;
+                ask_result(op, layer, &scope, &ask, &key, &product, uid)
             }
             // 兜底层**不许声称「ASK 已存在」**（2026-10-11 实测的毒化根源）。
             //
@@ -922,6 +956,9 @@ pub fn run_layer(
                 // 真机上 AuthKey 证书就是 ASK 签的，App 拿 exportAskPublicKey 的
                 // 公钥验这一份（用 ATTK 签就验不过）。
                 Some(auth) => {
+                    if ask_is_gone(&scope, device_id, uid_of(body)?) {
+                        return Ok(code_result(op, AUTH_KEY_NOT_READY));
+                    }
                     let ask = layer_ask_key(&scope, uid_of(body)?, layer)?;
                     let counter = counter_for(&counter_key(&scope, device_id, uid_of(body)?));
                     let document = key_doc(&auth.attk_pem, &product, counter, uid_of(body)?)?;
@@ -953,6 +990,11 @@ pub fn run_layer(
                 if let Ok(mut map) = store().auth.lock() {
                     map.retain(|k, _| !k.starts_with(&prefix));
                 }
+                // 不能靠“缓存没了就现造”顶上去：盖个墓碑，等 generate 才解。
+                let gone = ask_gone_key(&scope, device_id, uid);
+                if let Ok(mut set) = store().gone_ask.lock() {
+                    set.insert(gone);
+                }
                 // 钥匙没了，槽位的钉子也跟着拔：下次哪一层服务它都算从头来。
                 unpin_layer(device_id, uid);
                 Ok(code_result(op, OK))
@@ -960,6 +1002,7 @@ pub fn run_layer(
             // 重建 ASK：只换 ASK，不动 ATTK（两把）。AuthKey 是 ASK 签的，
             // 换了 ASK 它们也就验不过了，App 会自己重新生成。
             "generate_ask_key_pair" => {
+                clear_ask_gone(&scope, device_id, uid_of(body)?);
                 rotate_layer_ask_key(&scope, uid_of(body)?, layer)?;
                 unpin_layer(device_id, uid_of(body)?);
                 Ok(code_result(op, OK))
@@ -1507,6 +1550,42 @@ mod tests {
         assert!(
             order.windows(2).all(|w| w[0] < w[1]),
             "key order changed: {text}"
+        );
+    }
+
+    /// 删过的槽位不能“导出时现造”：`remove_all_uid_key` 之后 export 回 -5，
+    /// 只有重新 `generate_ask_key_pair` 才解。
+    #[test]
+    fn a_deleted_slot_does_not_grow_back() {
+        let device = "device-a-gone";
+        let uid = 4321i64;
+        let op = |body: Value| run("self_signed", device, &body, None).expect("handled");
+
+        assert_eq!(
+            op(json!({ "op": "generate_ask_key_pair", "uid": uid }))["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            op(json!({ "op": "export_ask_public_key", "uid": uid }))["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            op(json!({ "op": "remove_all_uid_key", "uid": uid }))["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            op(json!({ "op": "export_ask_public_key", "uid": uid }))["error_code"],
+            json!(-5),
+            "删了就不能再凭 export 现造"
+        );
+        // 重建之后又好了。
+        assert_eq!(
+            op(json!({ "op": "generate_ask_key_pair", "uid": uid }))["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            op(json!({ "op": "export_ask_public_key", "uid": uid }))["error_code"],
+            json!(0)
         );
     }
 
