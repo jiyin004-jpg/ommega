@@ -388,14 +388,28 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
 /// `exportAttkPublicKey` 吐同一把会让 App 把该 uid 下的钥匙全删掉重来。
 fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     let id = format!("{scope}|{uid}|{layer}");
+    // 先在锁里看一眼；生成 RSA 放到锁外。
+    //
+    // 以前是抱着整张表的锁去 keygen（2048 位 RSA，几十到上百毫秒），一堆 A 机同时
+    // 进来时全部串在这一把锁上 —— 一个新建 ASK 能把别的设备、别的 uid 的请求一起拖住。
+    if let Some(existing) = store()
+        .ask
+        .lock()
+        .map_err(|_| anyhow!("ask material lock poisoned"))?
+        .get(&id)
+        .cloned()
+    {
+        return Ok(existing);
+    }
+    let fresh = Arc::new(MintKey::generate()?);
     let mut map = store()
         .ask
         .lock()
         .map_err(|_| anyhow!("ask material lock poisoned"))?;
+    // 两个请求同时给同一个 uid 建料：先进去的算数，后到的用它的（不能各建一把）。
     if let Some(existing) = map.get(&id) {
         return Ok(existing.clone());
     }
-    let fresh = Arc::new(MintKey::generate()?);
     map.insert(id, fresh.clone());
     Ok(fresh)
 }
