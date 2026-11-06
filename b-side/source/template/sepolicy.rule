@@ -13,3 +13,11 @@ allow shell default_android_service service_manager find
 # /data/local/tmp 了 —— 那是 shell 的公共目录，不在那儿留东西。
 allow shell adb_data_file dir { open read getattr search }
 allow shell adb_data_file file { open read getattr map execute execute_no_trans }
+
+# 一加/OPPO 工程模式的「Attestation 全量功能测试」页：App 拿 setUniqueIdIncluded()
+# 建带 ID attestation 的钥匙时，keystore2 要检查调用方对 keystore2_key 有没有
+# gen_unique_id。系统源码策略里这条只给了 gmscore_app，engineermode_app 一律被拒
+# （PKG110 / Android 16 实测：avc denied gen_unique_id → 页面「Attestation Key ID
+# Modify: Fail」）。只补这一个权限，use_dev_id 那些更宽的一个都不给。
+# 没有这个域的机型上 kernel 会直接跳过这行，不影响别家。
+allow engineermode_app keystore keystore2_key { gen_unique_id }
