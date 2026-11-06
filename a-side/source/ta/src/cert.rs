@@ -727,7 +727,12 @@ pub(crate) fn attestation_extension<'a>(
         keymint::SecurityLevel::Software => (params, &[]),
         _ => (&[], params),
     };
-    let sw_enforced = AuthorizationList::new(
+    // 两个列表都把 `attestation_ids` 传进去（第三个参数）：那是**已固化的设备身份**，
+    // 只用于校验（AOSP 里是 `check_attestation_id!` 宏，对不上回 CannotAttestIds），
+    // 不是写进列表的值。真正写进去的是 `AuthorizationList::new` 里从 keygen_params
+    // 抽出来的那几项：级别非 Software 时 params 全给了 hw_enforced，所以 710..717
+    // 天然只落在 teeEnforced（`device_ids_are_hardware_enforced_only` 钉住了这一点）。
+    let mut sw_enforced = AuthorizationList::new(
         sw_chars,
         sw_params,
         attestation_ids,
@@ -735,6 +740,15 @@ pub(crate) fn attestation_extension<'a>(
         Some(app_id),
         additional_attestation_info,
     )?;
+    // 兜底：软件强制列表里一个设备 ID 都不许有。
+    //
+    // 设备属性（brand/device/product/manufacturer/model）是**硬件层证明的事实**，真机
+    // （TEE 和 SE 都一样）只把它写进 teeEnforced；一加/OPPO 工程模式的「StrongBox
+    // Attestation Key ID Modify」把 softwareEnforced 里出现 710/711/712/716/717 直接
+    // 判 Fail（日志写 Device properties should not be software enforced）。
+    // 上面那条路径本来就落不到这儿，这道清空是为了 chars 里万一混进 ID tag（它不属
+    // key_characteristic，理论上不会）时叶子仍然只有硬件那侧带设备属性。
+    sw_enforced.ids = AttestationIds::default();
     let hw_enforced = AuthorizationList::new(
         hw_chars,
         hw_params,
@@ -2365,5 +2379,162 @@ mod tests {
             assert_eq!(parsed.attestation_security_level as u32, want);
             assert_eq!(parsed.keymint_security_level as u32, want);
         }
+    }
+
+    /// 设备 ID（710..717）只出现在 teeEnforced，softwareEnforced 里一个都不行 ——
+    /// 这正是一加/OPPO 工程模式「StrongBox Attestation Key ID Modify」的判据
+    /// （`StrongBoxAttestationIdSupportChecker.verifyStrongBoxAttestedDeviceProperties`）：
+    /// teeEnforced 里必须有这五项且值与 Build.* 一致，softwareEnforced 里出现了直接 Fail
+    /// （"Device properties should not be software enforced"）。
+    ///
+    /// 注意写入的值来自调用方的 keygen params，`attestation_ids` 只是「本机已固化那套」
+    /// 用来校验的；两者对不上时 `AuthorizationList::new` 回 CannotAttestIds。
+    #[test]
+    fn device_ids_are_hardware_enforced_only() {
+        let ids = crate::AttestationIdInfo {
+            brand: b"OnePlus".to_vec(),
+            device: b"PLQ110".to_vec(),
+            product: b"PLQ110".to_vec(),
+            serial: b"3B161G007F500000".to_vec(),
+            imei: b"864500000000001".to_vec(),
+            imei2: Vec::new(),
+            meid: Vec::new(),
+            manufacturer: b"OnePlus".to_vec(),
+            model: b"PLQ110".to_vec(),
+        };
+        // 调用方（应用/框架）请求要证明的那几项，走的就是这些 tag。
+        let requested = [
+            KeyParam::AttestationIdBrand(b"OnePlus".to_vec()),
+            KeyParam::AttestationIdDevice(b"PLQ110".to_vec()),
+            KeyParam::AttestationIdProduct(b"PLQ110".to_vec()),
+            KeyParam::AttestationIdManufacturer(b"OnePlus".to_vec()),
+            KeyParam::AttestationIdModel(b"PLQ110".to_vec()),
+        ];
+        let unique_id: Vec<u8> = Vec::new();
+        let boot_info = keymint::BootInfo {
+            verified_boot_key: Vec::new(),
+            device_boot_locked: true,
+            verified_boot_state: keymint::VerifiedBootState::Verified,
+            verified_boot_hash: Vec::new(),
+            boot_patchlevel: 0,
+        };
+
+        for level in [
+            keymint::SecurityLevel::TrustedEnvironment,
+            keymint::SecurityLevel::Strongbox,
+        ] {
+            let ext = attestation_extension(
+                300,
+                b"challenge",
+                b"appid",
+                level,
+                Some(&ids),
+                &requested,
+                &[],
+                &unique_id,
+                &boot_info,
+                &[],
+            )
+            .expect("extension encodes");
+            let der = asn1_der_encode(&ext).expect("extension serializes");
+            let parsed = AttestationExtension::from_der(&der).expect("round-trips");
+
+            // 硬件那侧：该有的都有。
+            assert_eq!(
+                parsed.hw_enforced.ids.brand.as_deref(),
+                Some(&b"OnePlus"[..])
+            );
+            assert_eq!(
+                parsed.hw_enforced.ids.device.as_deref(),
+                Some(&b"PLQ110"[..])
+            );
+            assert_eq!(
+                parsed.hw_enforced.ids.product.as_deref(),
+                Some(&b"PLQ110"[..])
+            );
+            assert_eq!(
+                parsed.hw_enforced.ids.manufacturer.as_deref(),
+                Some(&b"OnePlus"[..])
+            );
+            assert_eq!(
+                parsed.hw_enforced.ids.model.as_deref(),
+                Some(&b"PLQ110"[..])
+            );
+
+            // 软件那侧：一个都不能有。
+            assert!(
+                parsed.sw_enforced.ids.brand.is_none(),
+                "{level:?}: sw 里出现了 710"
+            );
+            assert!(
+                parsed.sw_enforced.ids.device.is_none(),
+                "{level:?}: sw 里出现了 711"
+            );
+            assert!(
+                parsed.sw_enforced.ids.product.is_none(),
+                "{level:?}: sw 里出现了 712"
+            );
+            assert!(
+                parsed.sw_enforced.ids.manufacturer.is_none(),
+                "{level:?}: sw 里出现了 716"
+            );
+            assert!(
+                parsed.sw_enforced.ids.model.is_none(),
+                "{level:?}: sw 里出现了 717"
+            );
+
+            // 应用 ID（709）还在软件那侧，没被动到。
+            assert_eq!(parsed.sw_enforced.app_id.as_deref(), Some(&b"appid"[..]));
+        }
+
+        // 请求里带了 ID、但本机那套对不上时，不能默默写一份假的：得报 CannotAttestIds。
+        let mut wrong = ids.clone();
+        wrong.brand = b"Other".to_vec();
+        assert!(
+            attestation_extension(
+                300,
+                b"challenge",
+                b"appid",
+                keymint::SecurityLevel::Strongbox,
+                Some(&wrong),
+                &requested,
+                &[],
+                &unique_id,
+                &boot_info,
+                &[],
+            )
+            .is_err(),
+            "ID 不匹配时必须拒绝"
+        );
+
+        // chars 里混进 ID tag（这组 tag 是 NotKeyCharacteristic，理论上不会有）也只
+        // 能落在被剔掉的那侧，绝不能出现在软件强制列表里。
+        let chars = [keymint::KeyCharacteristics {
+            security_level: keymint::SecurityLevel::Keystore,
+            authorizations: vec![KeyParam::AttestationIdBrand(b"OnePlus".to_vec())],
+        }];
+        let ext = attestation_extension(
+            300,
+            b"challenge",
+            b"appid",
+            keymint::SecurityLevel::Strongbox,
+            Some(&ids),
+            &requested,
+            &chars,
+            &unique_id,
+            &boot_info,
+            &[],
+        )
+        .expect("chars 里混进 ID tag 也不能把整笔搅黄");
+        let der = asn1_der_encode(&ext).expect("extension serializes");
+        let parsed = AttestationExtension::from_der(&der).expect("round-trips");
+        assert!(
+            parsed.sw_enforced.ids.brand.is_none(),
+            "chars 里带的 710 也不能进软件强制列表"
+        );
+        assert_eq!(
+            parsed.hw_enforced.ids.brand.as_deref(),
+            Some(&b"OnePlus"[..])
+        );
     }
 }
