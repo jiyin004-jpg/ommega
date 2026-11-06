@@ -105,6 +105,16 @@ impl MintKey {
         })
     }
 
+    /// 落盘用：私钥的 PKCS#8 PEM。
+    fn to_pem(&self) -> Result<String> {
+        use pkcs8::EncodePrivateKey as _;
+        Ok(self
+            .private
+            .to_pkcs8_pem(pkcs8::LineEnding::LF)
+            .context("failed to encode the private key as PEM")?
+            .to_string())
+    }
+
     /// RSA-PSS-SHA256，盐长 = `ASK_SALT_LEN`（20，跟真机 TA 对齐、也跟 JSON 里那个
     /// `rsa_pss_saltlen` 字段一致）。
     ///
@@ -337,6 +347,10 @@ pub fn forget_attk(id: i64) {
     if let Err(e) = statedb::shared().clear_gone_ask_prefix(&prefix) {
         tracing::warn!("soter: 按身份清墓碑失败（{prefix}）：{e:#}");
     }
+    // 落盘的那份也得跟着走，不然重启后旧 ATTK 铸的 ASK 又回来了。
+    if let Err(e) = statedb::shared().mint_key_delete_prefix(&prefix) {
+        tracing::warn!("soter: 按身份清落盘料失败（{prefix}）：{e:#}");
+    }
 }
 
 /// 探测机专用的那把 ASK。跟自签层分开，是因为探测流量会一直让 `generate_ask_key_pair`
@@ -401,6 +415,13 @@ fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     {
         return Ok(existing);
     }
+    // 进程重启后内存是空的，但库里那把还是用户的 ASK —— 先把它捞回来，不能现造一把。
+    if let Some(loaded) = load_persisted_key(&id, persists(scope)) {
+        if let Ok(mut map) = store().ask.lock() {
+            map.insert(id, loaded.clone());
+        }
+        return Ok(loaded);
+    }
     let fresh = Arc::new(MintKey::generate()?);
     let mut map = store()
         .ask
@@ -410,8 +431,60 @@ fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     if let Some(existing) = map.get(&id) {
         return Ok(existing.clone());
     }
-    map.insert(id, fresh.clone());
+    map.insert(id.clone(), fresh.clone());
+    drop(map);
+    persist_key(&id, "ask", &fresh, persists(scope));
     Ok(fresh)
+}
+
+/// 哪些层的料落盘。
+///
+/// 只落 `attk` 层：它是「服务端自己出一整套身份」那条路，进程重启换一把 ASK 就等于
+/// 跟 App 手里缓存的公钥对不上（拿同一个身份重签，验不过就自删重来）。自签层不动：
+/// 它本来就是一次性的假身份，重启换一把反而干净。
+fn persists(scope: &str) -> bool {
+    scope.starts_with("attk:")
+}
+
+/// 从库里捞一把落过盘的物料（没开落盘、库里没有、解不开都当没有）。
+fn load_persisted_key(slot: &str, persisted: bool) -> Option<Arc<MintKey>> {
+    if !persisted {
+        return None;
+    }
+    let (_kind, cipher) = match statedb::shared().mint_key_get(slot) {
+        Ok(hit) => hit?,
+        Err(e) => {
+            tracing::warn!("soter: 读物料落盘记录失败（{slot}）：{e:#}");
+            return None;
+        }
+    };
+    // 跟 `sessions.leaf_key_pem` 一个口径：加密是在写的时候做的，这里解得回来才算数。
+    let pem = crate::crypto::decrypt_private_pem(&cipher);
+    match MintKey::from_pem(&pem) {
+        Ok(key) => Some(Arc::new(key)),
+        Err(e) => {
+            tracing::warn!("soter: 落盘的物料 {slot} 解不出来（{e:#}），当没有");
+            None
+        }
+    }
+}
+
+fn persist_key(slot: &str, kind: &str, key: &MintKey, persisted: bool) {
+    if !persisted {
+        return;
+    }
+    let pem = match key.to_pem() {
+        Ok(pem) => pem,
+        Err(e) => {
+            tracing::warn!("soter: 物料 {slot} 转不成 PEM，没法落盘：{e:#}");
+            return;
+        }
+    };
+    let cipher = crate::crypto::encrypt_private_pem(&pem);
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Err(e) = statedb::shared().mint_key_put(slot, kind, &cipher, now) {
+        tracing::warn!("soter: 物料 {slot} 落盘失败：{e:#}（进程重启后会换成新的一把）");
+    }
 }
 
 fn ask_gone_key(scope: &str, device_id: &str, uid: i32) -> String {
@@ -467,7 +540,9 @@ fn rotate_layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKe
         .ask
         .lock()
         .map_err(|_| anyhow!("ask material lock poisoned"))?;
-    map.insert(id, fresh.clone());
+    map.insert(id.clone(), fresh.clone());
+    drop(map);
+    persist_key(&id, "ask", &fresh, persists(scope));
     Ok(fresh)
 }
 
@@ -477,6 +552,11 @@ fn drop_layer_ask_keys(scope: &str) {
     let prefix = format!("{scope}|");
     if let Ok(mut map) = store().ask.lock() {
         map.retain(|key, _| !key.starts_with(&prefix));
+    }
+    if persists(scope) {
+        if let Err(e) = statedb::shared().mint_key_delete_prefix(&prefix) {
+            tracing::warn!("soter: 按身份清落盘的 ASK 失败（{prefix}）：{e:#}");
+        }
     }
 }
 
@@ -974,16 +1054,40 @@ pub fn run_layer(
                 let ask = layer_ask_key(&scope, uid, layer)?;
                 ask_result(op, layer, &scope, &ask, &key, &product, uid)
             }
-            // 兜底层**不许声称「ASK 已存在」**（2026-10-11 实测的毒化根源）。
+            // `has_ask_already`：
             //
-            // 应用只在「没有 ASK」时才把 ASK 上报腾讯；而这两层现造的 ASK 腾讯那边永远
-            // 不会认。以前这里照答 OK（= 有），应用于是跳过上报、拿着假 ASK 去建 AuthKey，
-            // 被腾讯拒了再自删重试 —— B 不在线时兜一次底就永久毒化该槽位。现在答
-            // `NOT_FOUND`（「没有」）：应用会老实地重新生成并**上报**，真机一回来就能
-            // 走通；就算这轮跟腾讯过不去，也**不会留下假的「已存在」状态**。
+            //   - `attk` 层（服务端密钥模式）：**如实回答**。这一层的 ASK 是用上传的
+            //     那把真 ATTK 签的，App 拿着它能走完上报，所以它跟自签层不是一回事：
+            //     一直答 -5 的话 App 每轮都判「没有 ASK」，建一把、导一把、上报、
+            //     清掉重来，永远走不到下一步（2026-11-06 微信实测就是这个圈）。
+            //     为不然重启就换身份，ASK/AuthKey 跟计数器都是落盘的。
             //
-            // `verify_attk_key_pair` 不动：那笔不参与「上报不上报」的判定。
-            "has_ask_already" => Ok(code_result(op, NOT_FOUND)),
+            //   - 自签 / keybox 两层：**不许声称「ASK 已存在」**（2026-10-11 实测的
+            //     毒化根源）。它们现造的 ASK 腾讯永远不会认，照答 OK 会让 App 跳过
+            //     上报、拿着假 ASK 去建 AuthKey，被拒了再自删重试 —— B 不在线时兑
+            //     一次底就把该槽位永久毒化。现在答 `NOT_FOUND`（「没有」），App 会
+            //     老实地重新生成并**上报**，真机一回来就能走通。
+            "has_ask_already" => {
+                if layer != "attk" {
+                    return Ok(code_result(op, NOT_FOUND));
+                }
+                let uid = uid_of(body)?;
+                if ask_is_gone(&scope, device_id, uid) {
+                    return Ok(code_result(op, NOT_FOUND));
+                }
+                let id = format!("{scope}|{uid}|{layer}");
+                let in_memory = store()
+                    .ask
+                    .lock()
+                    .map(|map| map.contains_key(&id))
+                    .unwrap_or(false);
+                let on_disk =
+                    !in_memory && statedb::shared().mint_key_get(&id).ok().flatten().is_some();
+                Ok(code_result(
+                    op,
+                    if in_memory || on_disk { OK } else { NOT_FOUND },
+                ))
+            }
             "verify_attk_key_pair" => Ok(code_result(op, OK)),
             "has_auth_key" => Ok(code_result(
                 op,
@@ -1012,17 +1116,25 @@ pub fn run_layer(
                 None => Ok(code_result(op, AUTH_KEY_NOT_READY)),
             },
             "generate_auth_key_pair" => {
-                let fresh = MintKey::generate().context("RSA keygen for the auth key failed")?;
+                let fresh = std::sync::Arc::new(
+                    MintKey::generate().context("RSA keygen for the auth key failed")?,
+                );
                 let id = auth_key_id(device_id, &scope, body)?;
                 if let Ok(mut map) = store().auth.lock() {
-                    map.insert(id, Arc::new(fresh));
+                    map.insert(id.clone(), fresh.clone());
                 }
+                persist_key(&id, "auth", &fresh, persists(&scope));
                 Ok(code_result(op, OK))
             }
             "remove_auth_key" => {
                 let id = auth_key_id(device_id, &scope, body)?;
                 if let Ok(mut map) = store().auth.lock() {
                     map.remove(&id);
+                }
+                if persists(&scope) {
+                    if let Err(e) = statedb::shared().mint_key_delete(&id) {
+                        tracing::warn!("soter: 删落盘的 AuthKey 失败（{id}）：{e:#}");
+                    }
                 }
                 Ok(code_result(op, OK))
             }
@@ -1031,6 +1143,20 @@ pub fn run_layer(
                 let prefix = format!("{scope}|{device_id}|{uid}|");
                 if let Ok(mut map) = store().auth.lock() {
                     map.retain(|k, _| !k.starts_with(&prefix));
+                }
+                // ASK 的槽位串里没带设备名（`{scope}|{uid}|ask`），单独按它删。
+                let ask_id = format!("{scope}|{uid}|{layer}");
+                if let Ok(mut map) = store().ask.lock() {
+                    map.remove(&ask_id);
+                }
+                if persists(&scope) {
+                    let db = statedb::shared();
+                    if let Err(e) = db.mint_key_delete(&ask_id) {
+                        tracing::warn!("soter: 删落盘的 ASK 失败（{ask_id}）：{e:#}");
+                    }
+                    if let Err(e) = db.mint_key_delete_prefix(&prefix) {
+                        tracing::warn!("soter: 删落盘的 AuthKey 失败（{prefix}）：{e:#}");
+                    }
                 }
                 // 不能靠“缓存没了就现造”顶上去：盖个墓碑，等 generate 才解。
                 mark_ask_gone(&scope, device_id, uid);
@@ -1195,7 +1321,15 @@ fn auth_key_id(device_id: &str, scope: &str, body: &Value) -> Result<String> {
 
 fn auth_key(device_id: &str, scope: &str, body: &Value) -> Option<Arc<MintKey>> {
     let id = auth_key_id(device_id, scope, body).ok()?;
-    store().auth.lock().ok()?.get(&id).cloned()
+    if let Some(hit) = store().auth.lock().ok()?.get(&id).cloned() {
+        return Some(hit);
+    }
+    // 重启后内存是空的：库里那把还是用户的 AuthKey，捞回来接着用。
+    let loaded = load_persisted_key(&id, persists(scope))?;
+    if let Ok(mut map) = store().auth.lock() {
+        map.insert(id, loaded.clone());
+    }
+    Some(loaded)
 }
 
 /// 请求里那个「真机 cpu_id」的字段名。A 端转发时带上，B 端不带（B 自己也改不了它）。
@@ -1271,12 +1405,26 @@ fn virtual_device_id(device_id: &str) -> String {
 }
 
 fn counter_for(key: &str) -> u64 {
+    let persisted = persists(key);
     let Ok(mut map) = store().counters.lock() else {
         return 1;
     };
+    // 重启后计数器不能从 1 重新数：App 会看它（真机上同一个 uid 只增不减）。
+    if !map.contains_key(key) && persisted {
+        if let Ok(Some(value)) = statedb::shared().mint_counter_get(key) {
+            map.insert(key.to_string(), value.max(0) as u64);
+        }
+    }
     let entry = map.entry(key.to_string()).or_insert(0);
     *entry += 1;
-    *entry
+    let value = *entry;
+    drop(map);
+    if persisted {
+        if let Err(e) = statedb::shared().mint_counter_put(key, value as i64) {
+            tracing::warn!("soter: 计数器落盘失败（{key}）：{e:#}");
+        }
+    }
+    value
 }
 
 /// 签名计数器的键：身份 + 设备 + uid。身份也得算进去，否则同一台设备换一把 ATTK
@@ -1625,6 +1773,80 @@ mod tests {
         assert_eq!(
             op(json!({ "op": "export_ask_public_key", "uid": uid }))["error_code"],
             json!(0)
+        );
+    }
+
+    /// `attk` 层跟兜底层不一样：它的 ASK 是用上传的真 ATTK 签的，所以 `has_ask_already`
+    /// 得如实回答，而且重启不能换钥匙（钥匙跟计数器都落盘）。
+    ///
+    /// 2026-11-06 微信实测：这一层一直答 -5，App 每轮都判「没有 ASK」—— 建一把、导一把、
+    /// 上报腾讯、清掉重来，永远走不到下一步。
+    #[test]
+    fn the_attk_layer_answers_has_ask_honestly_across_a_restart() {
+        use pkcs8::{EncodePrivateKey as _, LineEnding};
+
+        let device = "device-a-attk-ask-state";
+        let uid = 10_777i64;
+        let key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("rsa keygen");
+        let material = AttkMaterial {
+            id: 900_777,
+            name: "test-attk-ask".to_string(),
+            cpu_id: "09000000777788889999000011112222".to_string(),
+            pem: key
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("pkcs8 pem")
+                .to_string(),
+        };
+        let call = |body: Value| {
+            run_layer("attk", device, &body, None, Some(&material))
+                .expect("the attk layer handles every known op")
+        };
+        let code = |op: &str| call(json!({ "op": op, "uid": uid }))["error_code"].clone();
+        let ask_pub = || {
+            call(json!({ "op": "export_ask_public_key", "uid": uid }))["payload"]["pub_key"].clone()
+        };
+
+        assert_eq!(code("has_ask_already"), json!(-5), "没建过就得说没有");
+        assert_eq!(code("generate_ask_key_pair"), json!(0));
+        assert_eq!(
+            code("has_ask_already"),
+            json!(0),
+            "建过就得说有 —— 一直回 -5，App 每轮都会自删重建"
+        );
+        let first = ask_pub();
+
+        // 模拟进程重启：内存里那把丢掉，库里那份还在。
+        let scope = material_scope("attk", Some(&material));
+        let slot = format!("{scope}|{uid}|attk");
+        store().ask.lock().expect("ask map").remove(&slot);
+        assert_eq!(code("has_ask_already"), json!(0), "重启后仍然算有");
+        assert_eq!(ask_pub(), first, "重启后得捞回同一把 ASK，不能现造一把新的");
+
+        // 计数器同理：只增不减。
+        let counter_a = call(json!({ "op": "export_ask_public_key", "uid": uid }))["payload"]
+            ["counter"]
+            .as_u64()
+            .expect("counter");
+        store()
+            .counters
+            .lock()
+            .expect("counters")
+            .remove(&counter_key(&scope, device, uid as i32));
+        let counter_b = call(json!({ "op": "export_ask_public_key", "uid": uid }))["payload"]
+            ["counter"]
+            .as_u64()
+            .expect("counter");
+        assert_eq!(counter_b, counter_a + 1, "计数器不能从 1 重新数");
+
+        assert_eq!(code("remove_all_uid_key"), json!(0));
+        assert_eq!(code("has_ask_already"), json!(-5), "删了就是没有");
+        assert!(
+            statedb::shared()
+                .mint_key_get(&slot)
+                .ok()
+                .flatten()
+                .is_none(),
+            "删了库里也不能接着留"
         );
     }
 

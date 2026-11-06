@@ -187,6 +187,14 @@ impl StateDb {
              CREATE TABLE IF NOT EXISTS soter_gone_ask(
                  gone_id   TEXT PRIMARY KEY,
                  at_millis INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS soter_mint_keys(
+                 slot       TEXT PRIMARY KEY,
+                 kind       TEXT NOT NULL,
+                 pem_cipher TEXT NOT NULL,
+                 updated_ms INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS soter_mint_counters(
+                 slot  TEXT PRIMARY KEY,
+                 value INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS meta(
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL);",
@@ -445,6 +453,77 @@ impl StateDb {
         conn.execute(
             "DELETE FROM soter_gone_ask WHERE substr(gone_id, 1, length(?1)) = ?1",
             params![prefix],
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // SOTER 物料（服务端密钥模式自己铸的 ASK / AuthKey / 计数器）
+    //
+    // 这些以前只活在进程内存里：服务端一重启，所有 uid 的 ASK 换成新的，而 App
+    // 手里缓存的公钥还是旧的 —— 拿新的 ASK 去验旧的 AuthKey，验不过就自删重来。
+    // 落盘之后重启不再换身份（`has_ask_already` 才敢如实回答）。
+    // -----------------------------------------------------------------------
+
+    /// 取一条物料的（种类, 私钥密文）。
+    pub fn mint_key_get(&self, slot: &str) -> Result<Option<(String, String)>> {
+        let conn = self.plain();
+        Ok(conn
+            .query_row(
+                "SELECT kind, pem_cipher FROM soter_mint_keys WHERE slot = ?1",
+                params![slot],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// 写一条物料（同一个槽位就是换钥匙）。
+    pub fn mint_key_put(&self, slot: &str, kind: &str, cipher: &str, now_ms: i64) -> Result<()> {
+        let conn = self.plain();
+        conn.execute(
+            "INSERT INTO soter_mint_keys(slot, kind, pem_cipher, updated_ms)
+             VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(slot) DO UPDATE SET kind = excluded.kind,
+                                            pem_cipher = excluded.pem_cipher,
+                                            updated_ms = excluded.updated_ms",
+            params![slot, kind, cipher, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 删一条（`remove_auth_key` 这类点名删）。
+    pub fn mint_key_delete(&self, slot: &str) -> Result<usize> {
+        let conn = self.plain();
+        Ok(conn.execute("DELETE FROM soter_mint_keys WHERE slot = ?1", params![slot])?)
+    }
+
+    /// 按前缀删（`remove_all_uid_key` 清一个 uid，换 ATTK 清一整个身份）。
+    pub fn mint_key_delete_prefix(&self, prefix: &str) -> Result<usize> {
+        let conn = self.plain();
+        Ok(conn.execute(
+            "DELETE FROM soter_mint_keys WHERE substr(slot, 1, length(?1)) = ?1",
+            params![prefix],
+        )?)
+    }
+
+    /// 签名计数器：真机上同一个 (身份, 设备, uid) 的计数器只增不减，App 会看它。
+    pub fn mint_counter_get(&self, slot: &str) -> Result<Option<i64>> {
+        let conn = self.plain();
+        Ok(conn
+            .query_row(
+                "SELECT value FROM soter_mint_counters WHERE slot = ?1",
+                params![slot],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn mint_counter_put(&self, slot: &str, value: i64) -> Result<()> {
+        let conn = self.plain();
+        conn.execute(
+            "INSERT INTO soter_mint_counters(slot, value) VALUES(?1, ?2)
+             ON CONFLICT(slot) DO UPDATE SET value = excluded.value",
+            params![slot, value],
         )?;
         Ok(())
     }
