@@ -893,7 +893,7 @@ mod tests {
             "cpu_id": "090000005171734c42866bea148b21f5",
             "counter": 3,
             "uid": "10489",
-            "rsa_pss_saltlen": 32,
+            "rsa_pss_saltlen": 20,
         })
     }
 
@@ -908,7 +908,7 @@ mod tests {
             "fp_v": "1",
             "cpu_id": "090000005171734c42866bea148b21f5",
             "uid": "10489",
-            "rsa_pss_saltlen": 32,
+            "rsa_pss_saltlen": 20,
         })
     }
 

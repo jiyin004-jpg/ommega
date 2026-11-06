@@ -55,9 +55,9 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签，32（= SHA-256 摘要长度）
-/// 本身就是自洽的，厂商 TA 用 20 也能过 —— 两边都行，这里保持原值 32。
-const SALT_LEN: i32 = 32;
+/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签，厂商 TA 用 20（emBits 2047），
+/// 这里跟着 TA 取 20 —— 拿别的值也能自洽，但跟真机对齐才是「看上去就是这台机」。
+const SALT_LEN: i32 = 20;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
@@ -1399,7 +1399,7 @@ mod tests {
             "\"cpu_id\":",
             "\"counter\":",
             "\"uid\":\"10373\"",
-            "\"rsa_pss_saltlen\":32",
+            "\"rsa_pss_saltlen\":20",
         ] {
             assert!(text.contains(field), "ASK json is missing {field}: {text}");
         }
@@ -1675,7 +1675,7 @@ mod tests {
             "key order changed: {text}"
         );
         assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
-        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
+        assert!(text.contains("\"rsa_pss_saltlen\":20"), "salt len: {text}");
     }
 
     #[test]

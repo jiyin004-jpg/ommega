@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! {"pub_key":"<ASK 公钥 PEM>","cpu_id":"<32 位十六进制>","counter":<数字>,
-//!  "uid":"<字符串>","rsa_pss_saltlen":32}
+//!  "uid":"<字符串>","rsa_pss_saltlen":20}
 //! ```
 //!
 //! 签名用 ATTK 私钥做 RSA-PSS-SHA256，盐长 32。也就是说：手里只要有（或者现
@@ -57,8 +57,8 @@ const NOT_FOUND: i32 = -5;
 const AUTH_KEY_NOT_READY: i32 = -6;
 /// `finish_sign` 拿到一个不存在的 session。真机 TA 用 -1000，不是 -5。
 const SESSION_UNKNOWN: i32 = -1000;
-/// ASK 里写死的盐长，SHA-256 摘要长度。
-const ASK_SALT_LEN: i32 = 32;
+/// ASK 里写死的盐长，跟真机 TA 对齐（emBits 2047 / salt 20）。
+const ASK_SALT_LEN: i32 = 20;
 
 // ---------------------------------------------------------------------------
 // 物料
@@ -1282,7 +1282,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(doc["uid"], json!("10373"), "uid is a string in SOTER");
-        assert_eq!(doc["rsa_pss_saltlen"], json!(32));
+        assert_eq!(doc["rsa_pss_saltlen"], json!(20));
         assert!(doc["counter"].as_u64().unwrap_or(0) > 0);
 
         let cpu_id = doc["cpu_id"].as_str().expect("cpu_id is a string");
