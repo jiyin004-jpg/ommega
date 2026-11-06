@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! {"pub_key":"<ASK 公钥 PEM>","cpu_id":"<32 位十六进制>","counter":<数字>,
-//!  "uid":"<字符串>","rsa_pss_saltlen":20}
+//!  "uid":"<字符串>","rsa_pss_saltlen":32}
 //! ```
 //!
 //! 签名用 ATTK 私钥做 RSA-PSS-SHA256，盐长 32。也就是说：手里只要有（或者现
@@ -65,8 +65,9 @@ const NOT_FOUND: i32 = -5;
 const AUTH_KEY_NOT_READY: i32 = -6;
 /// `finish_sign` 拿到一个不存在的 session。真机 TA 用 -1000，不是 -5。
 const SESSION_UNKNOWN: i32 = -1000;
-/// ASK 里写死的盐长，跟真机 TA 对齐（emBits 2047 / salt 20）。
-const ASK_SALT_LEN: i32 = 20;
+/// ASK 里写死的盐长。实测真机（PLC110，MTK Kinibi，Android 16）三份文档都写 32，
+/// 签名也真是 32 —— 自己的声明和签名得对得上，验签方才验得过。
+const ASK_SALT_LEN: i32 = 32;
 
 // ---------------------------------------------------------------------------
 // 物料
@@ -108,8 +109,8 @@ impl MintKey {
     /// `rsa_pss_saltlen` 字段一致）。
     ///
     /// 这里必须显式 `new_with_salt_len`：`PssSigningKey::new` 给的是摘要长度（32），
-    /// 而验签方（App / openssl `rsa_pss_saltlen:20`）是按 JSON 里声明的 20 严卡盐长的，
-    /// 签成 32 就是验不过 —— 以前就这样错着，自己用自己的“拿 32 验”的测试还验得过。
+    /// 跟 `ASK_SALT_LEN` 恰好同为 32；写成显式的，以后谁改常量都不会忘了同步签名。
+    /// 验签方（App / openssl `rsa_pss_saltlen:32`）是按 JSON 里声明的值严卡盐长的。
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let signing = PssSigningKey::<Sha256>::new_with_salt_len(
             (*self.private).clone(),
@@ -877,10 +878,10 @@ pub fn run_layer(
             "get_device_id" => {
                 // 带上层名：A 端要靠它分辨这个号是真机报的还是服务端自己造的（只有
                 // 真机那个值能当设备身份转出去，见 `docs_cpu_id`）。
-                // 回 16 字节 raw：真机 TA 的 getDeviceId 出的是二进制，检测器会把它
-                // 转成 hex 再跟 cpu_id 对比（32 字符）。把 hex 文本当字节发出去，
-                // 检测器看到的是 "30393030…"，跟 cpu_id 对不上。
-                let raw = hex_bytes(&product).unwrap_or_default();
+                // 回什么形状：实测 PLC110（MTK Kinibi）真机回 **32 个 ASCII 十六进制字符
+                // + 结尾 `\0`**（33 字节），不是 16 字节二进制。跟着真机来，形状才对得上。
+                let mut raw = product.as_bytes().to_vec();
+                raw.push(0);
                 let mut out = data_result(op, OK, &raw);
                 out["layer"] = json!(layer);
                 Ok(out)
@@ -1129,7 +1130,9 @@ fn is_soter_cpu_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// 32 字符 hex 转 16 字节。真机 getDeviceId 出的是二进制，不是文本。
+/// 32 字符 hex 转 16 字节。旧版 getDeviceId 答复的二进制形状，现在已经改成跟真机
+/// 一样的 ASCII + NUL 了；留着是因为偶尔还要把 `cpu_id` 对成 16 字节看一眼。
+#[allow(dead_code)]
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
@@ -1324,13 +1327,17 @@ pub fn split_ask_payload(data: &[u8]) -> Result<(&[u8], &[u8])> {
 mod tests {
     use super::*;
 
-    /// 把应答里的 `data`（base64）还原成 hex 文本，好跟 cpu_id 那样的 32 字符串直接比。
-    fn hex_of_data(value: &Value) -> String {
+    /// `get_device_id` 的答复（实测真机是 32 个 ASCII 十六进制字符 + `\0`，共 33 字节）
+    /// 取成字符串，好跟 `cpu_id` 那种 32 字符串直接比。
+    fn device_id_text(value: &Value) -> String {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(value["data"].as_str().expect("data"))
             .expect("base64");
-        raw.iter().map(|b| format!("{b:02x}")).collect()
+        assert_eq!(raw.len(), 33, "真机形状是 33 字节：32 个字符 + NUL");
+        assert_eq!(raw[32], 0, "末尾那个字节是 NUL");
+        String::from_utf8(raw[..32].to_vec()).expect("hex text is ascii")
     }
+
     use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
     use rsa::signature::Verifier;
 
@@ -1436,7 +1443,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(doc["uid"], json!("10373"), "uid is a string in SOTER");
-        assert_eq!(doc["rsa_pss_saltlen"], json!(20));
+        assert_eq!(doc["rsa_pss_saltlen"], json!(32));
         assert!(doc["counter"].as_u64().unwrap_or(0) > 0);
 
         let cpu_id = doc["cpu_id"].as_str().expect("cpu_id is a string");
@@ -1502,7 +1509,7 @@ mod tests {
             "device_id": device,
             "cpu_id": "09000000deadbeefdeadbeefdeadbeef",
         }));
-        assert_eq!(hex_of_data(&id), own_cpu);
+        assert_eq!(device_id_text(&id), own_cpu);
         assert_eq!(id["layer"], json!("attk"));
 
         // 2. ASK 文档：cpu_id 是 ATTK 的、pub_key 是 ASK 的、签名是 ATTK 私钥签的。
@@ -1692,7 +1699,7 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(hex_of_data(&id), forwarded);
+        assert_eq!(device_id_text(&id), forwarded);
         // 层名是给 A 端分辨「这个号是真机报的还是服务端造的」用的。
         assert_eq!(id["layer"], json!("self_signed"));
 
@@ -1718,10 +1725,10 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(hex_of_data(&plain), time_device_id());
+        assert_eq!(device_id_text(&plain), time_device_id());
         assert_eq!(plain["layer"], json!("self_signed"));
         assert_ne!(
-            hex_of_data(&plain),
+            device_id_text(&plain),
             virtual_device_id(device),
             "不再用按设备名派生的虚拟号"
         );
@@ -1746,7 +1753,7 @@ mod tests {
                 None,
             )
             .expect("handled");
-            let text = hex_of_data(&id);
+            let text = device_id_text(&id);
             assert_eq!(text.len(), 32, "{bad:?}");
             assert!(text.starts_with("09000000"), "{bad:?}: {text}");
             assert!(

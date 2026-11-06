@@ -57,9 +57,12 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签，厂商 TA 用 20（emBits 2047），
-/// 这里跟着 TA 取 20 —— 拿别的值也能自洽，但跟真机对齐才是「看上去就是这台机」。
-const SALT_LEN: i32 = 20;
+/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签。
+///
+/// 32 是实测值：PLC110（MTK Kinibi，Android 16）真机 TA 的 ASK / AuthKey / 签名现场
+/// 三份文档都写 `"rsa_pss_saltlen":32`，签名也真的是 32。本地兜底跟它对齐（声明和
+/// 签名一把钥匙，客户端按声明验总能过）。
+const SALT_LEN: i32 = 32;
 /// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
 /// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
@@ -723,7 +726,9 @@ fn device_info() -> &'static DeviceInfo {
     })
 }
 
-/// 32 字符 hex 转 16 字节。真机 getDeviceId 出的是二进制，不是文本。
+/// 32 字符 hex 转 16 字节。历史形状（早期真机的 getDeviceId 出二进制），现在答复跟
+/// 真机实测走 ASCII 了；留着是因为总有人问“能不能给成二进制”。
+#[allow(dead_code)]
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
@@ -984,20 +989,36 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 None => None,
             }
         }
-        // generateAskKeyPair(uid) —— 真机上这是给这个 uid 建 ASK，这里按需生成并落盘。
+        // generateAskKeyPair(uid) —— 真机语义：已经有 ASK 就回 -5（实测 PLC110），不重铸。
+        //
+        // 但有一个我们故意保留的偏差：**跨进程的第一次仍回 0**。原因：9 号（hasAskAlready）
+        // 在那个 uid 上报过之前一律答「没有」（2026-10-11 毒化事故后的定论），如果 5 号
+        // 也跟真机一样直接 -5，应用就会「问→没有→建→-5→删→再问」直接锁死。所以只在
+        // **本会话已经建过/碰过**（`ask_built`）之后才回 -5 —— 同一进程里连调两次的应答
+        // 跟真机一致，跨进程不会因这个把应用卡住。
         // **不要重置 counter**：重置就回退了，App 会当重放把钥匙删掉。
         5 => {
             let uid = call.uid?;
-            // 先把该 uid 的 ASK 备好（必要时现生成），下一次 9 号才能答「有」。
+            let built = state
+                .ask_built
+                .lock()
+                .map(|set| set.contains(&uid))
+                .unwrap_or(false);
+            if built && ask_exists(state, uid) {
+                return Some(Answer::Code(NOT_FOUND));
+            }
             ask_for(state, uid)?;
             if let Ok(mut set) = state.ask_built.lock() {
                 set.insert(uid);
             }
             Some(Answer::Code(OK))
         }
-        // generateAuthKeyPair(uid, alias)
+        // generateAuthKeyPair(uid, alias) —— 同样：这个别名下已经有 AuthKey 就回 -5。
         7 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
+            if auth_key(state, uid, alias).is_some() {
+                return Some(Answer::Code(NOT_FOUND));
+            }
             let key = Key::generate()?;
             // 落盘：真机的 AuthKey 重启还在，我们也不能只吊在内存里。
             if let Ok(private_pem) = key.private.to_pkcs8_pem(LineEnding::LF) {
@@ -1007,11 +1028,13 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             Some(Answer::Code(OK))
         }
         // getDeviceId()
+        //
+        // 真机那套 TA 回的是 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（实测 PLC110：33 字节），
+        // 不是 16 字节二进制。这里跟着真机来：形状一致，文本比较的那类检测器看到的就是
+        // 它熟悉的那个串。
         8 => Some(Answer::Buffer {
             code: OK,
-            // 回 16 字节 raw：真机 TA 出的是二进制，检测器转 hex 后再跟 cpu_id 比。
-            // 把 hex 文本当字节发出去，检测器看到的是 "30393030…"，对不上。
-            data: Some(hex_bytes(&device_id()).unwrap_or_default()),
+            data: Some(ascii_device_id(&device_id())),
         }),
         // hasAskAlready(uid) —— 兜底层**必须**答「没有」。
         //
@@ -1134,6 +1157,21 @@ pub(crate) fn ask_public_document(uid: i32) -> Vec<u8> {
 
 fn auth_id(uid: i32, alias: &str) -> String {
     format!("{uid}|{alias}")
+}
+
+/// 这个 uid 的 ASK 在不在（内存缓存或盘上那份都算）。
+///
+/// 给 `generateAskKeyPair` 用：真机对“已经有 ASK”的请求回 -5，不重铸。
+fn ask_exists(state: &State, uid: i32) -> bool {
+    if state
+        .asks
+        .lock()
+        .map(|map| map.contains_key(&uid))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    read_store_pem(ASK_SECTION, &uid.to_string()).is_some()
 }
 
 /// 取某个 uid 的 AuthKey。内存里没有（payload 重新注入过）就从 store 读回来，
@@ -1307,6 +1345,13 @@ fn ask_json(pub_pem: &str, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
     Ok(document.into_bytes())
 }
 
+/// `getDeviceId` 的答复字节：32 个 ASCII 十六进制字符 + 结尾 `\0`（真机实测 33 字节）。
+fn ascii_device_id(cpu_id: &str) -> Vec<u8> {
+    let mut out = cpu_id.as_bytes().to_vec();
+    out.push(0);
+    out
+}
+
 /// 把一段文本包成 JSON 字符串字面量（转义引号、反斜杠和换行）。
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -1406,7 +1451,7 @@ mod tests {
             "\"cpu_id\":",
             "\"counter\":",
             "\"uid\":\"10373\"",
-            "\"rsa_pss_saltlen\":20",
+            "\"rsa_pss_saltlen\":32",
         ] {
             assert!(text.contains(field), "ASK json is missing {field}: {text}");
         }
@@ -1464,11 +1509,31 @@ mod tests {
     }
 
     #[test]
-    fn device_id_answers_16_raw_bytes() {
-        // 真机 TA 的 getDeviceId 出二进制（16 字节），检测器转 hex 后再跟 cpu_id 比。
+    fn device_id_answers_32_ascii_chars_and_a_nul() {
+        // 实测 PLC110（MTK Kinibi）：33 字节 = 32 个 ASCII 十六进制字符 + `\0`。
         let data = as_buffer(answer(&call(8, None, None)));
-        assert_eq!(data, hex_bytes(&device_id()).unwrap());
-        assert_eq!(data.len(), 16);
+        assert_eq!(data.len(), 33);
+        assert_eq!(&data[..32], device_id().as_bytes());
+        assert_eq!(data[32], 0, "末尾那个字节是 NUL");
+        assert!(data[..32].iter().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// 真机语义：同一个进程里第二次 generate 回 -5（实测 PLC110）。
+    #[test]
+    fn a_second_generate_reports_not_found() {
+        let uid = 4701;
+        assert_eq!(as_code(answer(&call(5, Some(uid), None))), OK);
+        assert_eq!(as_code(answer(&call(5, Some(uid), None))), NOT_FOUND);
+
+        let alias = "SecondGenerate";
+        assert_eq!(as_code(answer(&call(7, Some(uid), Some(alias)))), OK);
+        assert_eq!(
+            as_code(answer(&call(7, Some(uid), Some(alias)))),
+            NOT_FOUND,
+            "AuthKey 已经在了就不该重铸"
+        );
+        // 原有那把没被换掉：还是能查到、还是能导出。
+        assert_eq!(as_code(answer(&call(10, Some(uid), Some(alias)))), OK);
     }
 
     #[test]
@@ -1750,7 +1815,7 @@ mod tests {
             "key order changed: {text}"
         );
         assert!(text.contains("\"uid\":\"6200\""), "uid is a string: {text}");
-        assert!(text.contains("\"rsa_pss_saltlen\":20"), "salt len: {text}");
+        assert!(text.contains("\"rsa_pss_saltlen\":32"), "salt len: {text}");
     }
 
     #[test]

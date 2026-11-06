@@ -34,11 +34,11 @@
 //!
 //! ```text
 //! openssl dgst -sha256 -verify attk.pem -signature ask.sig \
-//!     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:20 ask.json
+//!     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 ask.json
 //! openssl dgst -sha256 -verify ask_pub.pem -signature auth.sig \
-//!     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:20 auth.json
+//!     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 auth.json
 //! openssl dgst -sha256 -verify auth_pub.pem -signature sign.sig \
-//!     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:20 sign.json
+//!     -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 sign.json
 //! ```
 //!
 //! 三跳都 `Verified OK` 才算这条链自洽（ASK ← ATTK、AuthKey ← ASK、签名 ← AuthKey）。
@@ -240,7 +240,7 @@ where
     println!(
         "验链提示：\n\
          openssl dgst -sha256 -verify {0}/attk.pem -signature {0}/ask.sig \\\n\
-         \x20   -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:20 {0}/ask.json",
+         \x20   -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 {0}/ask.json",
         dir.display()
     );
     println!("（AuthKey、签名现场同理：换成 ask_pub.pem / auth_pub.pem 那两把公钥）");
