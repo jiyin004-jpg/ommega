@@ -768,6 +768,168 @@ pub async fn admin_toggle_token(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SOTER ATTK（服务端密钥模式的身份库）
+// ---------------------------------------------------------------------------
+
+/// GET /api/admin/soter_attk/ — 列出所有 ATTK（不吐私钥）。
+pub async fn admin_soter_attk_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    match tokio::task::spawn_blocking(move || db.list_soter_attks()).await {
+        Ok(Ok(rows)) => {
+            let items: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "name": r.name,
+                        "cpu_id": r.cpu_id,
+                        "enabled": r.enabled,
+                        "is_default": r.is_default,
+                        "remark": r.remark,
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "items": items })).into_response()
+        }
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SoterAttkUploadBody {
+    pub name: String,
+    pub cpu_id: String,
+    pub private_key_pem: String,
+    #[serde(default)]
+    pub remark: String,
+}
+
+/// POST /api/admin/soter_attk/ — 上传一把 ATTK（RSA 私钥 PEM + 它对应的 cpu_id）。
+pub async fn admin_soter_attk_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SoterAttkUploadBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    // 只收 RSA 私钥：SOTER 的签名是 RSA-PSS，EC 签不动。
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    let pem = body.private_key_pem.trim().replace("\r\n", "\n");
+    if rsa::RsaPrivateKey::from_pkcs8_pem(&pem).is_err()
+        && rsa::RsaPrivateKey::from_pkcs1_pem(&pem).is_err()
+    {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "not an RSA private key (expect PKCS#8 or PKCS#1 PEM)",
+        );
+    }
+    let name = body.name.trim().to_string();
+    let cpu_id = body.cpu_id.trim().to_string();
+    if name.is_empty() || cpu_id.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "name and cpu_id are required");
+    }
+    let remark = body.remark.trim().to_string();
+    match tokio::task::spawn_blocking(move || db.insert_soter_attk(&name, &cpu_id, &pem, &remark))
+        .await
+    {
+        Ok(Ok(id)) => Json(json!({ "status": "ok", "id": id })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct EnabledBody {
+    pub enabled: bool,
+}
+
+/// POST /api/admin/soter_attk/:id/active/ — 启用/禁一把。
+pub async fn admin_soter_attk_active(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<EnabledBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    let enabled = body.enabled;
+    match tokio::task::spawn_blocking(move || db.set_soter_attk_active(id, enabled)).await {
+        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id, "enabled": enabled })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
+}
+
+/// POST /api/admin/soter_attk/:id/default/ — 指定默认那把（同时会把它启用）。
+pub async fn admin_soter_attk_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    match tokio::task::spawn_blocking(move || db.set_soter_attk_default(id)).await {
+        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
+}
+
+/// DELETE /api/admin/soter_attk/:id/ — 删一把。
+pub async fn admin_soter_attk_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let Some(db) = state.db.clone() else {
+        return json_err(StatusCode::NOT_FOUND, "no db");
+    };
+    match tokio::task::spawn_blocking(move || db.delete_soter_attk(id)).await {
+        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("join error: {e}"),
+        ),
+    }
+}
+
 /// DELETE /api/admin/tokens/:id/ — delete a token.
 pub async fn admin_delete_token(
     State(state): State<AppState>,

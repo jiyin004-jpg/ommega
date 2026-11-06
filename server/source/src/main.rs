@@ -101,6 +101,10 @@ fn build_router(cfg: &Arc<Config>) -> Router {
                 if let Err(e) = d.ensure_token_device_columns() {
                     tracing::warn!("api_token device-binding columns not ensured: {e}");
                 }
+                // SOTER 服务端密钥模式的 ATTK 库（新表，启动时自己建）。
+                if let Err(e) = d.ensure_soter_attk_table() {
+                    tracing::warn!("soter_attk table not ensured: {e}");
+                }
                 Some(Arc::new(d))
             }
             Err(e) => {
@@ -225,6 +229,22 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .route("/api/admin/reports/", get(admin::admin_reports))
         .route("/api/admin/keybox/", post(admin::admin_upload_keybox))
         .route("/api/admin/mode/", post(admin::admin_set_mode))
+        .route(
+            "/api/admin/soter_attk/",
+            get(admin::admin_soter_attk_list).post(admin::admin_soter_attk_upload),
+        )
+        .route(
+            "/api/admin/soter_attk/:id/active/",
+            post(admin::admin_soter_attk_active),
+        )
+        .route(
+            "/api/admin/soter_attk/:id/default/",
+            post(admin::admin_soter_attk_default),
+        )
+        .route(
+            "/api/admin/soter_attk/:id/",
+            axum::routing::delete(admin::admin_soter_attk_delete),
+        )
         .route(
             "/api/admin/default_device/",
             get(admin::admin_default_device_status).post(admin::admin_default_device_set),

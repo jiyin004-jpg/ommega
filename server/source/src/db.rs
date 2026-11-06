@@ -90,6 +90,19 @@ pub struct DeviceIdentity {
     pub created_at: String,
 }
 
+/// 服务端密钥模式下的一把 SOTER 身份（ATTK 私钥 + 它对应的 cpu_id）。
+/// 列表接口不吐私钥，只有真正要用时（`pick_soter_attk`）才解密。
+#[derive(Debug, Clone)]
+pub struct SoterAttkRow {
+    pub id: i64,
+    pub name: String,
+    pub cpu_id: String,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub remark: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiTokenRow {
     pub id: i64,
@@ -402,6 +415,168 @@ impl Db {
             params! {
                 "device_id" => device_id,
             },
+        )?;
+        Ok(())
+    }
+
+    // ---- SOTER ATTK（服务端密钥模式的身份库）----
+
+    /// 建表（幂等）。服务端没有 migration，启动时自己 ensure 一次。
+    pub fn ensure_soter_attk_table(&self) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.query_drop(
+            r#"
+            CREATE TABLE IF NOT EXISTS soter_attk (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(128) NOT NULL,
+                cpu_id VARCHAR(64) NOT NULL,
+                private_key_pem_cipher TEXT NOT NULL,
+                enabled TINYINT NOT NULL DEFAULT 1,
+                is_default TINYINT NOT NULL DEFAULT 0,
+                remark VARCHAR(256) NOT NULL DEFAULT '',
+                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            "#,
+        )?;
+        Ok(())
+    }
+
+    /// 列表。私钥不解、也不吐出去 —— 管理页只需要知道「有几把、开没开、是不是默认」。
+    pub fn list_soter_attks(&self) -> anyhow::Result<Vec<SoterAttkRow>> {
+        let mut conn = self.conn()?;
+        let rows: Vec<mysql::Row> = conn.exec(
+            "SELECT id, name, cpu_id, enabled, is_default, remark,
+                    DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
+             FROM soter_attk ORDER BY is_default DESC, id ASC",
+            (),
+        )?;
+        Ok(rows.into_iter().map(Self::soter_attk_from_row).collect())
+    }
+
+    fn soter_attk_from_row(row: mysql::Row) -> SoterAttkRow {
+        let (id, name, cpu_id, enabled, is_default, remark, created_at) =
+            mysql::from_row::<(i64, String, String, i8, i8, String, Option<String>)>(row);
+        SoterAttkRow {
+            id,
+            name,
+            cpu_id,
+            enabled: enabled != 0,
+            is_default: is_default != 0,
+            remark,
+            created_at: created_at.unwrap_or_default(),
+        }
+    }
+
+    /// 取一把 ATTK 的私钥（解密后的 PEM）。
+    pub fn get_soter_attk_key(&self, id: i64) -> anyhow::Result<Option<String>> {
+        let mut conn = self.conn()?;
+        let rows: Vec<mysql::Row> = conn.exec(
+            "SELECT private_key_pem_cipher FROM soter_attk WHERE id = :id AND enabled = 1",
+            params! { "id" => id },
+        )?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let cipher = mysql::from_row::<String>(row);
+        Ok(Some(crate::crypto::decrypt_private_pem(&cipher)))
+    }
+
+    /// 服务端密钥模式下要用的那一把：优先 `is_default`，没有就取最早启用的一条。
+    /// 指定了 id 就只认它（「多个 ATTK 时能指定选哪个」）。
+    pub fn pick_soter_attk(
+        &self,
+        id: Option<i64>,
+    ) -> anyhow::Result<Option<(SoterAttkRow, String)>> {
+        let mut conn = self.conn()?;
+        let (sql, param_id) = match id {
+            Some(id) => (
+                "SELECT id, name, cpu_id, enabled, is_default, remark,
+                        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), private_key_pem_cipher
+                 FROM soter_attk WHERE id = :id AND enabled = 1 LIMIT 1",
+                Some(id),
+            ),
+            None => (
+                "SELECT id, name, cpu_id, enabled, is_default, remark,
+                        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), private_key_pem_cipher
+                 FROM soter_attk WHERE enabled = 1
+                 ORDER BY is_default DESC, id ASC LIMIT 1",
+                None,
+            ),
+        };
+        let rows: Vec<mysql::Row> = match param_id {
+            Some(id) => conn.exec(sql, params! { "id" => id })?,
+            None => conn.exec(sql, ())?,
+        };
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let (id, name, cpu_id, enabled, is_default, remark, created_at, cipher) =
+            mysql::from_row::<(i64, String, String, i8, i8, String, Option<String>, String)>(row);
+        Ok(Some((
+            SoterAttkRow {
+                id,
+                name,
+                cpu_id,
+                enabled: enabled != 0,
+                is_default: is_default != 0,
+                remark,
+                created_at: created_at.unwrap_or_default(),
+            },
+            crate::crypto::decrypt_private_pem(&cipher),
+        )))
+    }
+
+    /// 上传一把 ATTK。返回新行 id。
+    pub fn insert_soter_attk(
+        &self,
+        name: &str,
+        cpu_id: &str,
+        private_key_pem: &str,
+        remark: &str,
+    ) -> anyhow::Result<i64> {
+        let mut conn = self.conn()?;
+        let cipher = crate::crypto::encrypt_private_pem(private_key_pem);
+        conn.exec_drop(
+            "INSERT INTO soter_attk (name, cpu_id, private_key_pem_cipher, remark)
+             VALUES (:name, :cpu_id, :cipher, :remark)",
+            params! {
+                "name" => name,
+                "cpu_id" => cpu_id,
+                "cipher" => cipher,
+                "remark" => remark,
+            },
+        )?;
+        Ok(conn.last_insert_id() as i64)
+    }
+
+    pub fn set_soter_attk_active(&self, id: i64, active: bool) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "UPDATE soter_attk SET enabled = :active WHERE id = :id",
+            params! { "active" => active as i64, "id" => id },
+        )?;
+        Ok(())
+    }
+
+    /// 指定默认那把：先全清再置一条，保证库里最多一个 `is_default`。
+    pub fn set_soter_attk_default(&self, id: i64) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "UPDATE soter_attk SET is_default = 0 WHERE is_default = 1",
+            (),
+        )?;
+        conn.exec_drop(
+            "UPDATE soter_attk SET is_default = 1, enabled = 1 WHERE id = :id",
+            params! { "id" => id },
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_soter_attk(&self, id: i64) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "DELETE FROM soter_attk WHERE id = :id",
+            params! { "id" => id },
         )?;
         Ok(())
     }
