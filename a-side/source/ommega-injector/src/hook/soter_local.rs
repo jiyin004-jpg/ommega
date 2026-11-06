@@ -37,6 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
@@ -173,6 +174,25 @@ struct SignSession {
     /// 挑战原文，宿主传下来什么样就存什么样。真机把它写进签名 JSON 的 `raw` 里，
     /// 我们照做，不去解它（解了反而签的不是 App 要的东西）。
     raw: String,
+    /// 开这笔会话的时刻。真机的会话会过期（服务端按 60 秒算），我们也得会过期，
+    /// 否则一个早就丢掉的 init 能在表里躺到重启。
+    created: Instant,
+    /// 开这笔会话的调用方（内核填的 `sender_euid`）。本地兜底有时拿不到，那就只靠 TTL。
+    caller: Option<i32>,
+}
+
+impl SignSession {
+    /// 这次调用还能不能花掉这个会话：在 TTL 内，且调用方就是开它的那个。
+    /// 两边都拿得到 caller 才比 —— 拿不到就不拿它当拒绝理由。
+    fn is_usable(&self, caller: Option<i32>) -> bool {
+        if self.created.elapsed() > SESSION_TTL {
+            return false;
+        }
+        match (self.caller, caller) {
+            (Some(owner), Some(actual)) => owner == actual,
+            _ => true,
+        }
+    }
 }
 
 /// 后端状态。签发用的 key 一开始就加载好（编译进来的，失败就是编坏了）。
@@ -383,6 +403,9 @@ const MAX_AUTH_KEYS: usize = 1024;
 const AUTH_KEYS_KEEP: usize = MAX_AUTH_KEYS * 3 / 4;
 /// 未完成的 initSign 会话最多留这么多条，超了整表清。
 const MAX_SIGN_SESSIONS: usize = 256;
+/// 一个签名会话的生命周期。真机的会话不是永久的，服务端那边按 60 秒算，
+/// 本地兜底也跟这个数：过期就当没这个号，让上层去重开。
+const SESSION_TTL: Duration = Duration::from_secs(60);
 /// 内存里那层 AuthKey 缓存，它只是 store 的缓存，满了清掉就回盘上重读。
 const MAX_AUTH_CACHE: usize = MAX_AUTH_KEYS;
 
@@ -859,11 +882,10 @@ pub(crate) fn answerable(code: u32) -> bool {
 pub(crate) fn has_session(session: i64) -> bool {
     state()
         .and_then(|state| {
-            state
-                .sessions
-                .lock()
-                .ok()
-                .map(|map| map.contains_key(&session))
+            state.sessions.lock().ok().map(|map| {
+                map.get(&session)
+                    .is_some_and(|s| s.created.elapsed() <= SESSION_TTL)
+            })
         })
         .unwrap_or(false)
 }
@@ -966,8 +988,17 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             // 先取授权 key，确认拿得到再摘会话。反过来做的话，auth_key 这次失败
             // （store 临时读不到 / PEM 坏了）会话就已经从表里没了，宿主拿同一个
             // session 重试也找不到，这一轮签名直接失败且不可重试。
+            // 会话过期了就顺手从表里抹掉；调用方对不上的不动它（那可能是别人正在用的号）。
             let peeked = state.sessions.lock().ok()?.get(&session).cloned();
-            let found = peeked.and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
+            if peeked
+                .as_ref()
+                .is_some_and(|s| s.created.elapsed() > SESSION_TTL)
+            {
+                state.sessions.lock().ok()?.remove(&session);
+            }
+            let found = peeked
+                .filter(|s| s.is_usable(call.caller_uid))
+                .and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
             match found {
                 Some((s, key)) => {
                     state.sessions.lock().ok()?.remove(&session);
@@ -1057,7 +1088,11 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 // 不清就只增不减。清了最多让那次签名重来，不会弄错任何数据。
                 let mut sessions = state.sessions.lock().ok()?;
                 if sessions.len() >= MAX_SIGN_SESSIONS {
-                    sessions.clear();
+                    // 先清过期的，还超才整表清。
+                    sessions.retain(|_, s| s.created.elapsed() <= SESSION_TTL);
+                    if sessions.len() >= MAX_SIGN_SESSIONS {
+                        sessions.clear();
+                    }
                 }
                 sessions.insert(
                     session,
@@ -1065,6 +1100,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                         uid,
                         alias: alias.to_string(),
                         raw,
+                        created: Instant::now(),
+                        caller: call.caller_uid,
                     },
                 );
             }
