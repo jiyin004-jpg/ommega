@@ -70,6 +70,10 @@ pub(crate) enum CryptoOperation {
         alias: String,
         algorithm: String,
         data: Vec<u8>,
+        /// 这把钥匙铸在哪台 B（keyblob 里 `RemoteRef::device_id`）。私钥只在那台上，
+        /// 转发时得带上，否则多台 B 在线时服务端会按负载挑一台，挑错了就报
+        /// `no key for alias`。`None` = 铸在服务端 keybox 层，不钉设备。
+        device_id: Option<String>,
         /// `NONEwithECDSA` 时要的域宽：真 TEE 对输入长度很挑，太短太长都可能拒；
         /// 本地软件 TA 是 pad/truncate 处理，两边不统一就会出现「本地能签、远程报错」。
         raw_digest_len: Option<usize>,
@@ -79,6 +83,8 @@ pub(crate) enum CryptoOperation {
         alias: String,
         algorithm: String,
         data: Vec<u8>,
+        /// 同上：这把钥匙的出生设备。
+        device_id: Option<String>,
         /// RSA 的模长（字节）。真 TEE 收到长度不对的密文会回自己的错误码（QTI 上是
         /// `-33 INVALID_KEY_BLOB`），本地软件 TA 回 `-30 VERIFICATION_FAILED` ——
         /// 同一台机上本地/远程两边不一致就是检测器能看到的差异。所以在这里先按模长
@@ -94,6 +100,8 @@ pub(crate) enum CryptoOperation {
         alias: String,
         algorithm: String,
         data: Vec<u8>,
+        /// 同上：这把钥匙的出生设备。
+        device_id: Option<String>,
     },
 }
 
@@ -457,6 +465,7 @@ impl crate::KeyMintTa {
                 alias,
                 algorithm,
                 mut data,
+                device_id,
                 raw_digest_len,
             } => {
                 if let Some(input) = finish_data {
@@ -479,7 +488,7 @@ impl crate::KeyMintTa {
                 if !remote.enabled() {
                     return Err(km_err!(UnknownError, "remote backend disabled"));
                 }
-                let signed = remote.sign(&alias, &data, &algorithm);
+                let signed = remote.sign(&alias, &data, &algorithm, device_id.as_deref());
                 if let Err(error) = &signed {
                     error!(
                         "remote_sign failed alias={alias} algorithm={algorithm} raw={raw_len} sent={sent} fitted={raw_digest_len:?}: {error:?}"
@@ -491,6 +500,7 @@ impl crate::KeyMintTa {
                 alias,
                 algorithm,
                 mut data,
+                device_id,
             } => {
                 if let Some(input) = finish_data {
                     data.try_extend_from_slice(input).map_err(|_| {
@@ -506,7 +516,7 @@ impl crate::KeyMintTa {
                 if !remote.enabled() {
                     return Err(km_err!(UnknownError, "remote backend disabled"));
                 }
-                let secret = remote.agree(&alias, &data, &algorithm);
+                let secret = remote.agree(&alias, &data, &algorithm, device_id.as_deref());
                 if let Err(error) = &secret {
                     error!("remote_agree failed alias={alias} algorithm={algorithm}: {error:?}");
                 }
@@ -516,6 +526,7 @@ impl crate::KeyMintTa {
                 alias,
                 algorithm,
                 mut data,
+                device_id,
                 expected_len,
                 modulus,
             } => {
@@ -558,7 +569,7 @@ impl crate::KeyMintTa {
                 if !remote.enabled() {
                     return Err(km_err!(UnknownError, "remote backend disabled"));
                 }
-                let plain = remote.decrypt(&alias, &data, &algorithm);
+                let plain = remote.decrypt(&alias, &data, &algorithm, device_id.as_deref());
                 if let Err(error) = &plain {
                     error!(
                         "remote_decrypt failed alias={alias} algorithm={algorithm} in={in_len} expected={expected_len:?}: {error:?}"
@@ -760,7 +771,7 @@ impl crate::KeyMintTa {
     /// `KeyMintDevice` 的全局 Mutex 包着。在锁内做网络会把别人的 begin 一起堵住，
     /// 检测器（TrustAttestor keystore_timing）量的就是“忙时 begin 慢不慢”。
     ///
-    /// 返回 `(is_sign, alias, algorithm, data)`，由调用方在锁外完成请求。
+    /// 返回 `(is_sign, alias, algorithm, data, 这把钥匙的出生设备)`，由调用方在锁外完成请求。
     #[allow(clippy::type_complexity)]
     pub fn take_remote_finish(
         &mut self,
@@ -768,7 +779,7 @@ impl crate::KeyMintTa {
         data: Option<&[u8]>,
         auth_token: Option<HardwareAuthToken>,
         timestamp_token: Option<TimeStampToken>,
-    ) -> Result<Option<(bool, String, String, Vec<u8>)>, Error> {
+    ) -> Result<Option<(bool, String, String, Vec<u8>, Option<String>)>, Error> {
         let op_idx = self.op_index(OpHandle(op_handle))?;
         let mut op = self.operations[op_idx]
             .take()
@@ -777,6 +788,7 @@ impl crate::KeyMintTa {
             CryptoOperation::RemoteSign {
                 alias,
                 algorithm,
+                device_id,
                 raw_digest_len,
                 ..
             } => Some((
@@ -786,10 +798,12 @@ impl crate::KeyMintTa {
                 *raw_digest_len,
                 None,
                 None,
+                device_id.clone(),
             )),
             CryptoOperation::RemoteDecrypt {
                 alias,
                 algorithm,
+                device_id,
                 expected_len,
                 modulus,
                 ..
@@ -800,10 +814,12 @@ impl crate::KeyMintTa {
                 None,
                 *expected_len,
                 Some(modulus.clone()),
+                device_id.clone(),
             )),
             _ => None,
         };
-        let Some((is_sign, alias, algorithm, raw_digest_len, expected_len, modulus)) = remote
+        let Some((is_sign, alias, algorithm, raw_digest_len, expected_len, modulus, device_id)) =
+            remote
         else {
             // 不是远程 key：放回去，让正常 finish 路径处理。
             self.operations[op_idx] = Some(op);
@@ -846,7 +862,7 @@ impl crate::KeyMintTa {
                 }
             }
         }
-        Ok(Some((is_sign, alias, algorithm, buf)))
+        Ok(Some((is_sign, alias, algorithm, buf, device_id)))
     }
 
     fn take_operation(&mut self, op_handle: OpHandle) -> Result<Operation, Error> {

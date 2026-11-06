@@ -290,17 +290,38 @@ pub trait RemoteBackend: Send {
 
     /// Forward a sign request for a remote key.  Returns the signature bytes,
     /// or `None` if the remote is unavailable.
-    fn sign(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error>;
+    ///
+    /// `key_device` 是这把钥匙铸在哪台 B（keyblob 里 `RemoteRef::device_id`）。
+    /// 带上它，服务端才能把请求钉回那一台 —— 另一台没有这把私钥。
+    fn sign(
+        &self,
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+        key_device: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, Error>;
 
     /// Forward a decrypt request for a remote key.  Returns the plaintext, or
     /// `None` if the remote is unavailable.
-    fn decrypt(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error>;
+    fn decrypt(
+        &self,
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+        key_device: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, Error>;
 
     /// Forward an ECDH agreement for a remote key (`data` is the peer public key,
     /// X.509 SubjectPublicKeyInfo DER).  Returns the shared secret, or `None` if
     /// the remote cannot do it.
-    fn agree(&self, alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Vec<u8>>, Error> {
-        let _ = (alias, data, algorithm);
+    fn agree(
+        &self,
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+        key_device: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let _ = (alias, data, algorithm, key_device);
         Ok(None)
     }
 

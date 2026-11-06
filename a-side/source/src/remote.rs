@@ -1201,35 +1201,62 @@ impl RemoteRelay {
     }
 
     /// Forward a sign request for a remote key.
-    pub fn sign(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
-        let body = json!({
+    ///
+    /// `key_device` = 这把钥匙铸在哪台 B（keyblob 的 `RemoteRef::device_id`）。服务端
+    /// 据此把请求钉回那一台：另一台没有这把私钥，换台只会报 `no key for alias`。
+    pub fn sign(
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+        key_device: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut body = json!({
             "alias": alias,
             "data": base64_encode(data),
             "algorithm": algorithm,
             "device_id": Self::device_id()?,
         });
+        if let Some(owner) = key_device.filter(|d| !d.is_empty()) {
+            body["key_device_id"] = Value::from(owner);
+        }
         Self::post_json("/api/sign/", &body)
     }
 
     /// Forward a decrypt request for a remote key.
-    pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
-        let body = json!({
+    pub fn decrypt(
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+        key_device: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut body = json!({
             "alias": alias,
             "data": base64_encode(data),
             "algorithm": algorithm,
             "device_id": Self::device_id()?,
         });
+        if let Some(owner) = key_device.filter(|d| !d.is_empty()) {
+            body["key_device_id"] = Value::from(owner);
+        }
         Self::post_json("/api/decrypt/", &body)
     }
 
     /// Forward an ECDH agreement for a remote key (`data` = peer public key SPKI).
-    pub fn agree(alias: &str, data: &[u8], algorithm: &str) -> Result<Option<Value>> {
-        let body = json!({
+    pub fn agree(
+        alias: &str,
+        data: &[u8],
+        algorithm: &str,
+        key_device: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut body = json!({
             "alias": alias,
             "data": base64_encode(data),
             "algorithm": algorithm,
             "device_id": Self::device_id()?,
         });
+        if let Some(owner) = key_device.filter(|d| !d.is_empty()) {
+            body["key_device_id"] = Value::from(owner);
+        }
         Self::post_json("/api/agree/", &body)
     }
 
@@ -1477,8 +1504,9 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         alias: &str,
         data: &[u8],
         algorithm: &str,
+        key_device: Option<&str>,
     ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
-        let Some(resp) = RemoteRelay::sign(alias, data, algorithm)
+        let Some(resp) = RemoteRelay::sign(alias, data, algorithm, key_device)
             .map_err(|e| kmr_common::km_err!(UnknownError, "remote sign: {e:#}"))?
         else {
             return Ok(None);
@@ -1498,6 +1526,9 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
                 // 真机上「attest key 的 blob 指向的钥匙已经不在」就是 INVALID_KEY_BLOB，
                 // 调用方据此作废并重建，而不是一直把它当 -1000 重试。
                 "key_not_found" => kmr_common::km_err!(InvalidKeyBlob, "{msg}"),
+                // 钥匙所在的那台 B 暂时离线：这是「那台机器不在线」，不是「钥匙没了」。
+                // 不能跟着 key_not_found 一起作废钥匙，交回可重试的 -1000 就行。
+                "key_device_offline" => kmr_common::km_err!(UnknownError, "{msg}"),
                 _ => kmr_common::km_err!(UnknownError, "{msg}"),
             });
         }
@@ -1519,8 +1550,9 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         alias: &str,
         data: &[u8],
         algorithm: &str,
+        key_device: Option<&str>,
     ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
-        let Some(resp) = RemoteRelay::decrypt(alias, data, algorithm)
+        let Some(resp) = RemoteRelay::decrypt(alias, data, algorithm, key_device)
             .map_err(|e| kmr_common::km_err!(UnknownError, "remote decrypt: {e:#}"))?
         else {
             return Ok(None);
@@ -1535,6 +1567,8 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             log::warn!("remote decrypt refused (kind={kind}): {msg}");
             return Err(match kind {
                 "key_not_found" => kmr_common::km_err!(InvalidKeyBlob, "{msg}"),
+                // 同上：设备不在线不算钥匙丢了。
+                "key_device_offline" => kmr_common::km_err!(UnknownError, "{msg}"),
                 _ => kmr_common::km_err!(UnknownError, "{msg}"),
             });
         }
@@ -1552,8 +1586,9 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
         alias: &str,
         data: &[u8],
         algorithm: &str,
+        key_device: Option<&str>,
     ) -> Result<Option<Vec<u8>>, kmr_common::Error> {
-        let Some(resp) = RemoteRelay::agree(alias, data, algorithm)
+        let Some(resp) = RemoteRelay::agree(alias, data, algorithm, key_device)
             .map_err(|e| kmr_common::km_err!(UnknownError, "remote agree: {e:#}"))?
         else {
             return Ok(None);
@@ -1567,6 +1602,8 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             log::warn!("remote agree refused (kind={kind}): {msg}");
             return Err(match kind {
                 "key_not_found" => kmr_common::km_err!(InvalidKeyBlob, "{msg}"),
+                // 同上：设备不在线不算钥匙丢了。
+                "key_device_offline" => kmr_common::km_err!(UnknownError, "{msg}"),
                 _ => kmr_common::km_err!(UnknownError, "{msg}"),
             });
         }

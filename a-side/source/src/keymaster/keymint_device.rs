@@ -1111,16 +1111,16 @@ impl KeyMintWrapper {
             )
             .map_err(kmerr_to_keystore)?
         };
-        if let Some((is_sign, alias, algorithm, data)) = remote_job {
+        if let Some((is_sign, alias, algorithm, data, key_device)) = remote_job {
             use kmr_ta::device::RemoteBackend;
             let backend = crate::remote::RemoteRelayBackend;
             let out = if is_sign {
                 backend
-                    .sign(&alias, &data, &algorithm)
+                    .sign(&alias, &data, &algorithm, key_device.as_deref())
                     .map_err(kmerr_to_keystore)?
             } else {
                 backend
-                    .decrypt(&alias, &data, &algorithm)
+                    .decrypt(&alias, &data, &algorithm, key_device.as_deref())
                     .map_err(kmerr_to_keystore)?
             };
             return out.ok_or(Error::Km(ErrorCode::UNKNOWN_ERROR));

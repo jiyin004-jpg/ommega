@@ -341,6 +341,8 @@ impl crate::KeyMintTa {
                             alias: remote.alias.clone(),
                             algorithm,
                             data: Vec::new(),
+                            // 私钥在那台上，转发时带上去（`RemoteRef::device_id`）。
+                            device_id: remote.device_id.clone(),
                             raw_digest_len,
                         }
                     }
@@ -348,6 +350,7 @@ impl crate::KeyMintTa {
                         alias: remote.alias.clone(),
                         algorithm: remote_decrypt_algorithm(key_chars, &params)?,
                         data: Vec::new(),
+                        device_id: remote.device_id.clone(),
                         expected_len: rsa_modulus_len(key_chars)?,
                         modulus: rsa_modulus_from_spki(&remote.public_key).unwrap_or_default(),
                     },
@@ -355,6 +358,7 @@ impl crate::KeyMintTa {
                         alias: remote.alias.clone(),
                         algorithm: "ECDH".to_string(),
                         data: Vec::new(),
+                        device_id: remote.device_id.clone(),
                     },
                     _ => {
                         return Err(km_err!(
