@@ -96,6 +96,9 @@ pub struct DeviceIdentity {
 pub struct SoterAttkRow {
     pub id: i64,
     pub name: String,
+    /// 这把 ATTK 属于哪台 B（服务端密钥模式按请求的设备 id 匹配它）。
+    /// 空 = 没绑定设备，只能当兜底用。
+    pub device_id: String,
     pub cpu_id: String,
     pub enabled: bool,
     pub is_default: bool,
@@ -429,15 +432,27 @@ impl Db {
             CREATE TABLE IF NOT EXISTS soter_attk (
                 id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
                 name VARCHAR(128) NOT NULL,
+                device_id VARCHAR(96) NOT NULL DEFAULT '',
                 cpu_id VARCHAR(64) NOT NULL,
                 private_key_pem_cipher TEXT NOT NULL,
                 enabled TINYINT NOT NULL DEFAULT 1,
                 is_default TINYINT NOT NULL DEFAULT 0,
                 remark VARCHAR(256) NOT NULL DEFAULT '',
-                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                KEY idx_soter_attk_device (device_id, enabled)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             "#,
         )?;
+        // 先建表再补列：早一版已经建过这张表（没有 device_id），这里补一下。
+        // 列已经在了 MySQL 会报 1060，当没事。
+        if let Err(e) = conn.query_drop(
+            "ALTER TABLE soter_attk ADD COLUMN device_id VARCHAR(96) NOT NULL DEFAULT '' AFTER name",
+        ) {
+            let text = format!("{e}");
+            if !text.contains("1060") && !text.contains("Duplicate column") {
+                tracing::warn!("soter_attk: device_id 列补不上（{text}），按老表继续跑");
+            }
+        }
         Ok(())
     }
 
@@ -445,7 +460,7 @@ impl Db {
     pub fn list_soter_attks(&self) -> anyhow::Result<Vec<SoterAttkRow>> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
-            "SELECT id, name, cpu_id, enabled, is_default, remark,
+            "SELECT id, name, device_id, cpu_id, enabled, is_default, remark,
                     DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')
              FROM soter_attk ORDER BY is_default DESC, id ASC",
             (),
@@ -454,11 +469,12 @@ impl Db {
     }
 
     fn soter_attk_from_row(row: mysql::Row) -> SoterAttkRow {
-        let (id, name, cpu_id, enabled, is_default, remark, created_at) =
-            mysql::from_row::<(i64, String, String, i8, i8, String, Option<String>)>(row);
+        let (id, name, device_id, cpu_id, enabled, is_default, remark, created_at) =
+            mysql::from_row::<(i64, String, String, String, i8, i8, String, Option<String>)>(row);
         SoterAttkRow {
             id,
             name,
+            device_id,
             cpu_id,
             enabled: enabled != 0,
             is_default: is_default != 0,
@@ -481,55 +497,94 @@ impl Db {
         Ok(Some(crate::crypto::decrypt_private_pem(&cipher)))
     }
 
-    /// 服务端密钥模式下要用的那一把：优先 `is_default`，没有就取最早启用的一条。
-    /// 指定了 id 就只认它（「多个 ATTK 时能指定选哪个」）。
+    /// 这一笔该用哪把 ATTK。顺序就是身份归属的顺序，一步都不能跳：
+    ///
+    /// 1. `preferred_id`（身份绑定规则点名的那把）；
+    /// 2. 绑定在**请求那台设备**上的那把（`device_id`）—— 服务端密钥模式默认走这条；
+    ///    请求 device_id 为空时 handler 已用控制台配的 SOTER 默认设备填过，所以这支
+    ///    就是「默认 id 对应的那把 ATTK」；
+    /// 3. `fallback_id`（控制台显式指定的兜底那把）；
+    /// 4. 库里标了默认 / 最早启用的那把。
+    ///
+    /// 前一步失败（那一把被禁、被删了）才往下走一步 —— 指定的东西不该因为一次禁用就
+    /// 只剩自签。
     pub fn pick_soter_attk(
         &self,
-        id: Option<i64>,
+        device: Option<&str>,
+        preferred_id: Option<i64>,
+        fallback_id: Option<i64>,
     ) -> anyhow::Result<Option<(SoterAttkRow, String)>> {
         let mut conn = self.conn()?;
-        let (sql, param_id) = match id {
-            Some(id) => (
-                "SELECT id, name, cpu_id, enabled, is_default, remark,
-                        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), private_key_pem_cipher
-                 FROM soter_attk WHERE id = :id AND enabled = 1 LIMIT 1",
-                Some(id),
-            ),
-            None => (
-                "SELECT id, name, cpu_id, enabled, is_default, remark,
-                        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), private_key_pem_cipher
-                 FROM soter_attk WHERE enabled = 1
-                 ORDER BY is_default DESC, id ASC LIMIT 1",
-                None,
-            ),
+        const COLS: &str = "SELECT id, name, device_id, cpu_id, enabled, is_default, remark,
+                    DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), private_key_pem_cipher
+             FROM soter_attk";
+        let device = device.map(str::trim).filter(|d| !d.is_empty());
+
+        let fetch = |rows: Vec<mysql::Row>| -> Option<(SoterAttkRow, String)> {
+            let row = rows.into_iter().next()?;
+            let (id, name, device_id, cpu_id, enabled, is_default, remark, created_at, cipher) =
+                mysql::from_row::<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    i8,
+                    i8,
+                    String,
+                    Option<String>,
+                    String,
+                )>(row);
+            Some((
+                SoterAttkRow {
+                    id,
+                    name,
+                    device_id,
+                    cpu_id,
+                    enabled: enabled != 0,
+                    is_default: is_default != 0,
+                    remark,
+                    created_at: created_at.unwrap_or_default(),
+                },
+                crate::crypto::decrypt_private_pem(&cipher),
+            ))
         };
-        let rows: Vec<mysql::Row> = match param_id {
-            Some(id) => conn.exec(sql, params! { "id" => id })?,
-            None => conn.exec(sql, ())?,
-        };
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        let (id, name, cpu_id, enabled, is_default, remark, created_at, cipher) =
-            mysql::from_row::<(i64, String, String, i8, i8, String, Option<String>, String)>(row);
-        Ok(Some((
-            SoterAttkRow {
-                id,
-                name,
-                cpu_id,
-                enabled: enabled != 0,
-                is_default: is_default != 0,
-                remark,
-                created_at: created_at.unwrap_or_default(),
-            },
-            crate::crypto::decrypt_private_pem(&cipher),
-        )))
+
+        // 1/3. 点名的那把（规则优先，其次控制台兜底）—— 两个 id 都走「按 id 查」。
+        for wanted in [preferred_id, fallback_id].into_iter().flatten() {
+            let rows: Vec<mysql::Row> = conn.exec(
+                format!("{COLS} WHERE id = :id AND enabled = 1 LIMIT 1"),
+                params! { "id" => wanted },
+            )?;
+            if let Some(hit) = fetch(rows) {
+                return Ok(Some(hit));
+            }
+        }
+        // 2. 绑定在请求那台设备上的那一把（多台 B 各用各的身份）。
+        if let Some(device) = device {
+            let rows: Vec<mysql::Row> = conn.exec(
+                format!(
+                    "{COLS} WHERE enabled = 1 AND device_id = :device \
+                     ORDER BY is_default DESC, id ASC LIMIT 1"
+                ),
+                params! { "device" => device },
+            )?;
+            if let Some(hit) = fetch(rows) {
+                return Ok(Some(hit));
+            }
+        }
+        // 4. 人工兜底：库里标默认的 / 最早启用的。
+        let rows: Vec<mysql::Row> = conn.exec(
+            format!("{COLS} WHERE enabled = 1 ORDER BY is_default DESC, id ASC LIMIT 1"),
+            (),
+        )?;
+        Ok(fetch(rows))
     }
 
-    /// 上传一把 ATTK。返回新行 id。
+    /// 上传一把 ATTK。`device_id` 是它属于哪台 B（空 = 只能当兜底）。返回新行 id。
     pub fn insert_soter_attk(
         &self,
         name: &str,
+        device_id: &str,
         cpu_id: &str,
         private_key_pem: &str,
         remark: &str,
@@ -537,10 +592,11 @@ impl Db {
         let mut conn = self.conn()?;
         let cipher = crate::crypto::encrypt_private_pem(private_key_pem);
         conn.exec_drop(
-            "INSERT INTO soter_attk (name, cpu_id, private_key_pem_cipher, remark)
-             VALUES (:name, :cpu_id, :cipher, :remark)",
+            "INSERT INTO soter_attk (name, device_id, cpu_id, private_key_pem_cipher, remark)
+             VALUES (:name, :device_id, :cpu_id, :cipher, :remark)",
             params! {
                 "name" => name,
+                "device_id" => device_id,
                 "cpu_id" => cpu_id,
                 "cipher" => cipher,
                 "remark" => remark,

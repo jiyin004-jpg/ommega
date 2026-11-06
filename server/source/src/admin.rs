@@ -788,6 +788,7 @@ pub async fn admin_soter_attk_list(State(state): State<AppState>, headers: Heade
                     json!({
                         "id": r.id,
                         "name": r.name,
+                        "device_id": r.device_id,
                         "cpu_id": r.cpu_id,
                         "enabled": r.enabled,
                         "is_default": r.is_default,
@@ -809,6 +810,10 @@ pub async fn admin_soter_attk_list(State(state): State<AppState>, headers: Heade
 #[derive(serde::Deserialize)]
 pub struct SoterAttkUploadBody {
     pub name: String,
+    /// 这把 ATTK 属于哪台 B。服务端密钥模式按请求（或者控制台默认）的设备 id 匹配它。
+    /// 留空 = 不绑设备，只能当兜底。
+    #[serde(default)]
+    pub device_id: String,
     pub cpu_id: String,
     pub private_key_pem: String,
     #[serde(default)]
@@ -841,12 +846,21 @@ pub async fn admin_soter_attk_upload(
     }
     let name = body.name.trim().to_string();
     let cpu_id = body.cpu_id.trim().to_string();
+    let device_id = body.device_id.trim().to_string();
     if name.is_empty() || cpu_id.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "name and cpu_id are required");
     }
+    if !cpu_id.chars().all(|c| c.is_ascii_hexdigit()) || cpu_id.len() != 32 {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "cpu_id must be 32 hex characters (SOTER device id shape)",
+        );
+    }
     let remark = body.remark.trim().to_string();
-    match tokio::task::spawn_blocking(move || db.insert_soter_attk(&name, &cpu_id, &pem, &remark))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        db.insert_soter_attk(&name, &device_id, &cpu_id, &pem, &remark)
+    })
+    .await
     {
         Ok(Ok(id)) => Json(json!({ "status": "ok", "id": id })).into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),

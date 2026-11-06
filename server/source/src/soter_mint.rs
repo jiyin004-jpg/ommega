@@ -358,10 +358,15 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
 
 /// 这一层的 ASK（按需生成、进程内缓存）。
 ///
+/// 键里带 **uid**：真机的 ASK 是 per-user、per-uid 的（`generateAskKeyPair(uid)` 建的就是
+/// 那个 uid 的 ASK），`exportAskPublicKey(uid)` 吐的是那个 uid 的公钥。以前这里只按
+/// 设备缓存，同设备上所有应用拿到同一把 ASK —— 真机上永远不会出现的形状，多用户下
+/// 更糟：工作资料的应用会拿到机主那把的公钥。
+///
 /// 跟 ATTK 分开存：真机上这两把公钥永远不相等，`exportAskPublicKey` 和
 /// `exportAttkPublicKey` 吐同一把会让 App 把该 uid 下的钥匙全删掉重来。
-fn layer_ask_key(scope: &str, device: &str, layer: &str) -> Result<Arc<MintKey>> {
-    let id = format!("{scope}|{device}|{layer}");
+fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
+    let id = format!("{scope}|{uid}|{layer}");
     let mut map = store()
         .ask
         .lock()
@@ -374,9 +379,9 @@ fn layer_ask_key(scope: &str, device: &str, layer: &str) -> Result<Arc<MintKey>>
     Ok(fresh)
 }
 
-/// 重建 ASK（`generate_ask_key_pair` 就是它）。
-fn rotate_layer_ask_key(scope: &str, device: &str, layer: &str) -> Result<Arc<MintKey>> {
-    let id = format!("{scope}|{device}|{layer}");
+/// 重建 ASK（`generate_ask_key_pair` 就是它）：只换这个 uid 的那一把。
+fn rotate_layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
+    let id = format!("{scope}|{uid}|{layer}");
     let fresh = Arc::new(MintKey::generate()?);
     let mut map = store()
         .ask
@@ -386,11 +391,12 @@ fn rotate_layer_ask_key(scope: &str, device: &str, layer: &str) -> Result<Arc<Mi
     Ok(fresh)
 }
 
-/// ATTK 换了以后旧的 ASK 证书就废了（ASK 证书是 ATTK 签的），缓存要一并丢掉。
-fn drop_layer_ask_key(scope: &str, device: &str, layer: &str) {
-    let id = format!("{scope}|{device}|{layer}");
+/// ATTK 换了以后旧的 ASK 证书就废了（ASK 证书是 ATTK 签的），这个身份下所有 uid 的
+/// ASK 缓存要一并丢掉。
+fn drop_layer_ask_keys(scope: &str) {
+    let prefix = format!("{scope}|");
     if let Ok(mut map) = store().ask.lock() {
-        map.remove(&id);
+        map.retain(|key, _| !key.starts_with(&prefix));
     }
 }
 
@@ -874,8 +880,8 @@ pub fn run_layer(
             "export_attk_public_key" => Ok(data_result(op, OK, key.attk_pem.as_bytes())),
             // 导出的是 **ASK** 的公钥（跟 ATTK 是两把），文档用 ATTK 签 —— 与真机一致。
             "export_ask_public_key" => {
-                let ask = layer_ask_key(&scope, &product, layer)?;
-                ask_result(op, layer, &ask, &key, &product, uid_of(body)?)
+                let ask = layer_ask_key(&scope, uid_of(body)?, layer)?;
+                ask_result(op, layer, &scope, &ask, &key, &product, uid_of(body)?)
             }
             // 兜底层**不许声称「ASK 已存在」**（2026-10-11 实测的毒化根源）。
             //
@@ -901,8 +907,8 @@ pub fn run_layer(
                 // 真机上 AuthKey 证书就是 ASK 签的，App 拿 exportAskPublicKey 的
                 // 公钥验这一份（用 ATTK 签就验不过）。
                 Some(auth) => {
-                    let ask = layer_ask_key(&scope, &product, layer)?;
-                    let counter = counter_for(&slot_id(device_id, uid_of(body)?));
+                    let ask = layer_ask_key(&scope, uid_of(body)?, layer)?;
+                    let counter = counter_for(&counter_key(&scope, device_id, uid_of(body)?));
                     let document = key_doc(&auth.attk_pem, &product, counter, uid_of(body)?)?;
                     let signature = ask.sign(&document)?;
                     let mut out = envelope_result(op, &document, &signature)?;
@@ -939,7 +945,7 @@ pub fn run_layer(
             // 重建 ASK：只换 ASK，不动 ATTK（两把）。AuthKey 是 ASK 签的，
             // 换了 ASK 它们也就验不过了，App 会自己重新生成。
             "generate_ask_key_pair" => {
-                rotate_layer_ask_key(&scope, &product, layer)?;
+                rotate_layer_ask_key(&scope, uid_of(body)?, layer)?;
                 unpin_layer(device_id, uid_of(body)?);
                 Ok(code_result(op, OK))
             }
@@ -955,7 +961,7 @@ pub fn run_layer(
                     );
                 }
                 // ATTK 换了，旧 ASK 证书就废了（ASK 证书是 ATTK 签的）。
-                drop_layer_ask_key(&scope, &product, layer);
+                drop_layer_ask_keys(&scope);
                 unpin_layer(device_id, uid_of(body)?);
                 Ok(code_result(op, OK))
             }
@@ -1039,7 +1045,8 @@ pub fn run_layer(
                     None => return Ok(code_result(op, NOT_FOUND)),
                 };
                 // 签的是那段 JSON 原文，不是 challenge 的字节；回「JSON + 签名」的信封
-                let counter = counter_for(&slot_id(device_id, sign_session.uid));
+                let counter =
+                    counter_for(&counter_key(&session_scope, device_id, sign_session.uid));
                 let document = sign_doc(
                     &product,
                     sign_session.uid,
@@ -1173,6 +1180,12 @@ fn counter_for(key: &str) -> u64 {
     *entry
 }
 
+/// 签名计数器的键：身份 + 设备 + uid。身份也得算进去，否则同一台设备换一把 ATTK
+/// 后计数器継续从旧值走，真机上「同一个 uid 的计数器只增不减」那个规律就对不上了。
+fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
+    format!("{scope}|{device_id}|{uid}")
+}
+
 /// 一份自描述文档（ASK 或 AuthKey 的都用它）。键序照现场抓到的来：`pub_key` /
 /// `cpu_id` / `counter` / `uid` / `rsa_pss_saltlen`，`uid` 是字符串别写成数字。
 fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result<Vec<u8>> {
@@ -1234,12 +1247,13 @@ fn envelope_result(op: &str, document: &[u8], signature: &[u8]) -> Result<Value>
 fn ask_result(
     op: &str,
     layer: &str,
+    scope: &str,
     ask: &MintKey,
     attk: &MintKey,
     device_id: &str,
     uid: i32,
 ) -> Result<Value> {
-    let counter = counter_for(&slot_id(device_id, uid));
+    let counter = counter_for(&counter_key(scope, device_id, uid));
     let document = key_doc(&ask.attk_pem, device_id, counter, uid)?;
     let signature = attk.sign(&document)?;
     let mut out = envelope_result(op, &document, &signature)?;
@@ -1588,6 +1602,71 @@ mod tests {
             auth_other["error_code"],
             json!(-6),
             "另一把 ATTK 不认识前一把建过的 AuthKey"
+        );
+    }
+
+    /// 多用户 / 多身份：同一个身份下，ASK 与 AuthKey 按 **uid** 分。
+    ///
+    /// 真机的 `generateAskKeyPair(uid)` 建的就是那个 uid 的 ASK，`hasAuthKey(uid, alias)`
+    /// 也只认那个 uid 自己建的。工作资料（1000000+）和分身（99900000+）里的同一个应用
+    /// 是另一个 uid，所以不能共用一把。
+    #[test]
+    fn ask_and_auth_are_per_uid_inside_one_identity() {
+        let device = "device-a-per-uid";
+        let layer = "self_signed";
+        let ask_for = |uid: i64| {
+            let value = run(
+                layer,
+                device,
+                &json!({ "op": "export_ask_public_key", "uid": uid }),
+                None,
+            )
+            .expect("handled");
+            value["payload"]["pub_key"]
+                .as_str()
+                .expect("ASK pem")
+                .to_string()
+        };
+
+        let owner = ask_for(10490);
+        let work_profile = ask_for(1_010_490);
+        assert_ne!(owner, work_profile, "不同用户不能共用一把 ASK");
+        assert_eq!(ask_for(10490), owner, "同一 uid 一轮流程里不能换 ASK");
+
+        // 重建这个 uid 的 ASK：只换它自己，别人的不动。
+        assert_eq!(
+            run(
+                layer,
+                device,
+                &json!({ "op": "generate_ask_key_pair", "uid": 10490 }),
+                None
+            )
+            .expect("handled")["error_code"],
+            json!(0)
+        );
+        assert_ne!(ask_for(10490), owner);
+        assert_eq!(ask_for(1_010_490), work_profile);
+
+        // AuthKey 同理：在机主上建的，工作资料那边就当没建。
+        assert_eq!(
+            run(
+                layer,
+                device,
+                &json!({ "op": "generate_auth_key_pair", "uid": 10490, "alias": "pay" }),
+                None
+            )
+            .expect("handled")["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            run(
+                layer,
+                device,
+                &json!({ "op": "has_auth_key", "uid": 1_010_490, "alias": "pay" }),
+                None
+            )
+            .expect("handled")["error_code"],
+            json!(-6)
         );
     }
 

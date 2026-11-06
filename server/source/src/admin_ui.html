@@ -602,7 +602,7 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
 
 <!-- SOTER 策略：真机模式 / 服务端密钥模式 + 白名单 + 多身份选路 -->
 <div class="panel">
-  <h2>SOTER 策略 <span class="hint">两种模式共用一份白名单：不在名单里的调用一律打回 A 端本地作答。真机模式按设备 id 找 B 端处理（处理不了才落服务端身份 → 自签）；服务端密钥模式全用下面 ATTK 库里那把私钥铸料，一次都不碰 B</span></h2>
+  <h2>SOTER 策略 <span class="hint">两种模式共用一份白名单：不在名单里的调用一律打回 A 端本地作答。真机模式按设备 id 找 B 端处理（处理不了才落服务端 → 自签）；服务端密钥模式用「请求那台设备的 ATTK」铸料（设备没绑就落兜底 / 默认那把），一次都不碰 B</span></h2>
   <div class="body">
     <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
       <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">模式</span>
@@ -613,11 +613,16 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
       <span class="hint" id="spModeHint" style="flex:1;min-width:220px;">—</span>
     </div>
     <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
-      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">默认 ATTK</span>
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">兜底 ATTK</span>
       <select id="spAttk" style="flex:1;min-width:260px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
-        <option value="">（用 ATTK 库里标了默认的那把）</option>
+        <option value="">（不指定：按请求设备匹配，再落库里默认那把）</option>
       </select>
     </div>
+    <p class="hint" style="margin:0 0 10px;line-height:1.7;">
+      服务端密钥模式默认是「跟着请求的设备 id 走」：哪台 B 的请求就用那台 B 上传的 ATTK。
+      请求 device_id 为空时，先被上面「默认设备 ID → SOTER 链」那台填上，所以落的就是那台的 ATTK。
+      这里选的只是最后一级兜底，不是「只能生效这一把」。
+    </p>
     <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; margin-bottom:10px;">
       <span style="flex:0 0 104px;color:var(--muted);font-size:13px;padding-top:9px;">真应用白名单</span>
       <textarea id="spPackages" rows="4" placeholder="com.tencent.mm, com.eg.android.AlipayGphone …（留空 = 用环境变量 / 内置缺省那套）"
@@ -641,7 +646,8 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
     <p class="hint" style="margin:0 0 10px;line-height:1.7;">
       uid 照 AOSP 拆：<b>用户号 = uid / 100000</b>（机主 0、工作资料 10/11、分身 999），<b>应用号 = uid % 100000</b>。
       所以同一个包在不同用户下 uid 完全不同（微信在机主是 10490，在分身里是 99910490），每一条槽位、每一把钥匙都各算各的。
-      规则里四个格子内是「或」、格子之间是「且」，自上往下第一条命中的算数；都不命中就用上面的默认 ATTK。四格全空的规则不算数。
+      规则里四个格子内是「或」、格子之间是「且」，自上往下第一条命中的算数。
+      规则都不命中就按「请求设备绑的那把 → 兜底 ATTK → 库里默认」走。四格全空的规则不算数。
     </p>
     <div id="spRules"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
@@ -651,19 +657,25 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
 
     <hr style="margin:18px 0;border:none;border-top:1px solid var(--border);">
     <h3 style="margin:0 0 6px;font-size:14px;">ATTK 库 <span class="hint">SOTER 的身份 = 一对 RSA 私钥 + 它自己的 cpu_id；私钥加密存库、列表不回显</span></h3>
+    <p class="hint" style="margin:0 0 10px;line-height:1.7;">
+      每把 ATTK 绑一台 B（设备 ID 就是请求里那个 device id）；同一台有多把时取「默认」那把。
+      设备 ID 留空的只能当兜底用。cpu_id 必须 32 个十六进制字符 —— 它就是这个身份报出去的设备号。
+    </p>
     <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>名称</th><th>cpu_id</th><th>状态</th><th>默认</th><th>备注</th><th>上传时间</th><th>操作</th></tr></thead>
-        <tbody id="spAttkBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        <thead><tr><th>名称</th><th>设备 ID</th><th>cpu_id</th><th>状态</th><th>默认</th><th>备注</th><th>上传时间</th><th>操作</th></tr></thead>
+        <tbody id="spAttkBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
       </table>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;">
       <input id="spAttkName" placeholder="名称（例如 PLC110-ATTK）"
-             style="flex:0 1 200px;min-width:160px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+             style="flex:0 1 180px;min-width:150px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+      <input id="spAttkDevice" placeholder="设备 ID（device-b-xxxxxxxx，可空）" autocapitalize="none"
+             style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;font-family:var(--mono,monospace);">
       <input id="spAttkCpu" placeholder="cpu_id（32 个十六进制字符）" autocapitalize="none"
              style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;font-family:var(--mono,monospace);">
       <input id="spAttkRemark" placeholder="备注（可空）"
-             style="flex:0 1 180px;min-width:140px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+             style="flex:0 1 160px;min-width:130px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
     </div>
     <textarea id="spAttkPem" rows="5" placeholder="-----BEGIN PRIVATE KEY-----（RSA，PKCS#8 或 PKCS#1；EC 不行，SOTER 的签名是 RSA-PSS）"
               style="width:100%;box-sizing:border-box;margin-top:8px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:12px;font-family:var(--mono,monospace);"></textarea>
@@ -1535,13 +1547,14 @@ let _soterPolicy = null;
 
 const SOTER_MODE_DESC = {
   real: '真机模式：按请求里的设备 id 交给那台 B（B 处理不了才落服务端身份 → 自签）',
-  server_key: '服务端密钥模式：全用下面 ATTK 那把私钥铸料，一次都不碰 B（没有可用 ATTK 时落自签）',
+  server_key: '服务端密钥模式：用请求那台设备绑的 ATTK 铸料，不碰 B（没绑到就落兜底 / 默认那把）',
 };
 
 function soterAttkLabel(a) {
   const state = a.enabled ? '' : '（已禁用）';
   const def = a.is_default ? '（默认）' : '';
-  return `#${a.id} ${a.name} · ${a.cpu_id}${def}${state}`;
+  const dev = a.device_id ? a.device_id : '未绑设备';
+  return `#${a.id} ${a.name} · ${dev} · ${a.cpu_id}${def}${state}`;
 }
 
 function renderSoterAttkOptions() {
@@ -1718,6 +1731,7 @@ function renderSoterAttkList() {
   body.innerHTML = _soterAttk.map(a => `
     <tr>
       <td><b>#${a.id}</b> ${esc(a.name)}</td>
+      <td class="mono">${a.device_id ? esc(a.device_id) : '<span class="muted">未绑（只能兜底）</span>'}</td>
       <td class="mono">${esc(a.cpu_id)}</td>
       <td>${a.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">禁用</span>'}</td>
       <td>${a.is_default ? '<span class="tag on">默认</span>' : '<span class="muted">—</span>'}</td>
@@ -1749,14 +1763,15 @@ async function uploadSoterAttk() {
   const cpu = $('#spAttkCpu').value.trim();
   const pem = $('#spAttkPem').value.trim();
   const remark = $('#spAttkRemark').value.trim();
+  const device = $('#spAttkDevice').value.trim();
   if (!name || !cpu || !pem) return toast('名称、cpu_id、私钥三样都要填', 'err');
   try {
     const d = await api('/api/admin/soter_attk/', {
       method: 'POST',
-      body: JSON.stringify({ name, cpu_id: cpu, private_key_pem: pem, remark }),
+      body: JSON.stringify({ name, device_id: device, cpu_id: cpu, private_key_pem: pem, remark }),
     });
-    $('#spAttkStatus').textContent = `已上传：id=${d.id} ${name}`;
-    $('#spAttkName').value = ''; $('#spAttkCpu').value = ''; $('#spAttkPem').value = ''; $('#spAttkRemark').value = '';
+    $('#spAttkStatus').textContent = `已上传：id=${d.id} ${name}` + (device ? ` → ${device}` : '（未绑设备）');
+    $('#spAttkName').value = ''; $('#spAttkCpu').value = ''; $('#spAttkPem').value = ''; $('#spAttkRemark').value = ''; $('#spAttkDevice').value = '';
     toast('ATTK 已上传');
     loadSoterPolicy();
   } catch (e) { $('#spAttkStatus').textContent = '上传失败: ' + e.message; }

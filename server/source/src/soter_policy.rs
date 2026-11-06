@@ -11,11 +11,15 @@
 //!    - `server_key`（服务端密钥模式）：`attk → self_signed`，**一次都不碰 B**。用控制台
 //!      上传的 ATTK（私钥 + 它对应的 cpuid）铸料，身份就是那把 ATTK 的。
 //!
-//! 2. **身份绑定**（`identities`）：多个 ATTK 时哪一笔用哪把。规则按
+//! 2. **身份绑定**（`identities`）：哪一笔用哪把 ATTK。默认是「跟着请求的设备 id 走」：
+//!    哪台 B 的请求就用哪台 B 上传的 ATTK（请求 device_id 空的，已经被控制台那个
+//!    「默认 SOTER 设备 id」填过，所以就是那台设备的 ATTK）。规则是按
 //!    `users`（AOSP 用户号：0 机主、10/11 工作资料、999 分身）、`uids`（完整 uid）、
-//!    `app_ids`（用户内应用号）、`packages`（包里那一格）四种条件挑；同一格内是「或」，
-//!    不同格子之间是「且」。第一条命中的规则算数，都不命中就用默认 ATTK（`attk_id`，
-//!    再没有就用 ATTK 库里标了默认的那把）。
+//!    `app_ids`（用户内应用号）、`packages`（包里那一格）四种条件挑的例外；同一格内是
+//!    「或」，不同格子之间是「且」。第一条命中的规则算数。
+//!
+//!    都不命中就按顺序退：请求设备绑定的那把 → `attk_id`（控制台显式兜底）→ ATTK 库里
+//!    标了默认/最早启用的那把。所以「指定」不是只能生效一把，它只是最后一级兜底。
 //!
 //!    四格全空的规则不算数（不许一条空规则把后面全吃了）。
 //!
@@ -199,7 +203,8 @@ pub struct WhitelistPatch {
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub mode: Mode,
-    /// 服务端密钥模式默认用哪一把 ATTK（`None` = 用 ATTK 库里标了默认的那把）。
+    /// 服务端密钥模式的全局兜底 ATTK（`None` = 只用设备匹配 / 库里默认）。
+    /// 请求设备绑了 ATTK 时不会用到它 —— 它是最后一级兜底，不是「只能生效这一把」。
     pub attk_id: Option<i64>,
     pub whitelist: Whitelist,
     pub identities: Vec<IdentityRule>,
@@ -211,14 +216,21 @@ impl Snapshot {
         self.mode.layers()
     }
 
-    /// 这一笔该用哪一把 ATTK：先看身份绑定规则，再退回默认。
+    /// 这一笔该用哪把 ATTK：先看身份绑定规则，再退回默认。
+    /// 注意真实的选路是「规则 → 请求设备绑定的那把 → 默认」，设备那一步在
+    /// `db::pick_soter_attk` 里；这里只管规则和全局兜底。
     pub fn attk_for(&self, uid: Option<i32>, caller_pkg: Option<&str>) -> Option<i64> {
+        self.rule_attk(uid, caller_pkg).or(self.attk_id)
+    }
+
+    /// 只有身份绑定规则命中的那把（没命中回 `None`，交给设备匹配）。
+    pub fn rule_attk(&self, uid: Option<i32>, caller_pkg: Option<&str>) -> Option<i64> {
         for rule in &self.identities {
             if rule.matches(uid, caller_pkg) {
                 return Some(rule.attk_id);
             }
         }
-        self.attk_id
+        None
     }
 }
 
@@ -241,9 +253,14 @@ pub fn layers() -> Vec<&'static str> {
     snapshot().layers()
 }
 
-/// 这一笔用哪个 ATTK（服务端密钥模式）。
+/// 这一笔用哪个 ATTK（服务端密钥模式）。规则命中就用规则那把；否则交给设备匹配。
 pub fn attk_for(uid: Option<i32>, caller_pkg: Option<&str>) -> Option<i64> {
     snapshot().attk_for(uid, caller_pkg)
+}
+
+/// 只有身份绑定规则命中的那把（`None` = 没规则管，按请求设备匹配）。
+pub fn rule_attk(uid: Option<i32>, caller_pkg: Option<&str>) -> Option<i64> {
+    snapshot().rule_attk(uid, caller_pkg)
 }
 
 // ---------------------------------------------------------------------------
