@@ -26,6 +26,22 @@ fn fingerprint(data: &[u8]) -> String {
     format!("{h:016x}")
 }
 
+/// 把一段原始答复落盘（给 PC 上 `xxd` / `jq` / openssl 看形状用）。
+fn dump_bytes(dir: Option<&str>, name: &str, data: &[u8]) {
+    let Some(dir) = dir else { return };
+    if data.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(dir).join(name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, data) {
+        Ok(()) => println!("[direct] wrote {} ({} bytes)", path.display(), data.len()),
+        Err(e) => println!("[direct] write {} failed: {e}", path.display()),
+    }
+}
+
 fn main() -> Result<()> {
     // 跟 relay 的 main 一样先起 binder 的 ProcessState：`Soter::open()` 会先试 AIDL
     // 那条后端，rsbinder 没初始化就直接 panic（HIDL 那家不需要）。
@@ -41,6 +57,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_ALIAS.to_string());
     // 第三个参数是模式：`gen` 先现造一份材料再看能不能签，`rm` 收尾把这个 uid 的钥匙清掉。
     let mode = std::env::args().nth(3).unwrap_or_default();
+    // 第四个参数：把导出的原始信封落盘（`ask.bin` / `auth.bin` / `sign.bin`）。
+    // 看「真机到底吐 JSON 还是 certs 链」就靠它 —— 别在 PC 上看重新拼过的东西。
+    let dump = std::env::args().nth(4);
 
     let Some(soter) = Soter::open()? else {
         println!("[direct] uid={uid}: no SOTER service on this device");
@@ -60,6 +79,7 @@ fn main() -> Result<()> {
         device_id.text(),
         device_id.data.len()
     );
+    dump_bytes(dump.as_deref(), "device_id.bin", &device_id.data);
 
     if mode == "gen" {
         let ask = soter.generate_ask_key_pair(uid)?;
@@ -73,6 +93,7 @@ fn main() -> Result<()> {
             ask_pub.data.len(),
             fingerprint(&ask_pub.data)
         );
+        dump_bytes(dump.as_deref(), "ask.bin", &ask_pub.data);
     }
 
     let ask = soter.has_ask_already(uid)?;
@@ -91,6 +112,7 @@ fn main() -> Result<()> {
     // （前几十字节是 JSON/PEM 包装，谁铸都一样；签名还带随机数，也比不了）。
     if !pub_key.data.is_empty() {
         println!("[direct]   pub_key fp: {}", fingerprint(&pub_key.data));
+        dump_bytes(dump.as_deref(), "auth.bin", &pub_key.data);
     }
 
     let session = soter.init_sign(uid, &alias, CHALLENGE)?;
@@ -113,6 +135,7 @@ fn main() -> Result<()> {
                 .collect();
             println!("[direct]   head: {}", head.join(" "));
         }
+        dump_bytes(dump.as_deref(), "sign.bin", &signed.data);
     } else {
         println!("[direct] finish_sign          -> skipped (no session)");
     }
