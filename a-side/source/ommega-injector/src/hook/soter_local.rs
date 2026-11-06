@@ -12,8 +12,8 @@
 //! [i32 le JSON 长度][JSON][256 字节 RSA-PSS-SHA256 签名]
 //! ```
 //!
-//! - `exportAskPublicKey`：JSON 是 ASK 的自描述（`pub_key` 就是本机 ASK 公钥），
-//!   拿 ASK 自己签 —— 本地模式里 ASK 兼 ATTK，跟服务端 self_signed 那层一个道理；
+//! - `exportAskPublicKey`：JSON 是这个 uid 的 ASK 自描述（`pub_key` 就是那把 ASK 公钥），
+//!   **拿 ATTK 私钥签** —— 真机上 ASK 证书就是 ATTK 签的（ATTK 是这条链的根）；
 //! - `exportAuthKeyPublicKey`：JSON 是 AuthKey 的自描述，**拿 ASK 私钥签**。App 是
 //!   先拿到 ASK 公钥、再拿它验这个信封的，签错了它验不过；
 //! - `finishSign`：JSON 是这次签名的现场（`raw` / `fid` / `counter` / `tee_*` /
@@ -23,8 +23,9 @@
 //! 键序全照真机现场抓到的来，字段名一个都别改，`uid` 是字符串不是数字。
 //!
 //! 设备信息（`cpu_id` / `fp_n` / `fp_v` / `tee_n` / `tee_v` / `fid`）按本机属性推：
-//! `cpu_id` 先看 daemon 学来的那份真机值（[`kmr_common::soter_relay::CPU_ID_PATHS`]），
-//! 没有才按 `ro.boot.serialno` 派生一个；指纹和 TEE 也从属性读，读不到才退回兜底值。
+//! `cpu_id` 只认这份本地身份自己的号（ATTK 自带的 force 号，没有就按 `ro.boot.serialno`
+//! 派生）；**不拿转发链路跟 B 学来的真机号**，那是另一份身份的数字。指纹和 TEE 也从属性读，
+//! 读不到才退回兜底值。
 //! 不要把它写成编死的常量 —— 那样装过这套的机器全是同一个设备，业务侧一眼假。
 //!
 //! 心里得有数的边界：自签的链**骗得过 App 本地**（它拿我们给的公钥验我们签的
@@ -137,7 +138,7 @@ impl Key {
         Some(Self { private, pem })
     }
 
-    /// RSA-PSS-SHA256，盐长 = 摘要长度 = 32，跟 JSON 里那个字段对得上。
+    /// RSA-PSS-SHA256，盐长 = `SALT_LEN`（跟真机 TA 对齐的 20），JSON 里那个字段也是它。
     fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
         let signing =
             PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), SALT_LEN as usize);
@@ -615,74 +616,41 @@ pub(crate) fn device_id() -> String {
     cpu_id()
 }
 
-/// 当前该报的 cpu_id。
+/// 本地兜底这条路该报的 cpu_id。
 ///
-/// 不缓存：
-/// `line!` 之前这里是「30 秒看一次文件」的缓存，后来改成每次都现读（daemon 学到新值就
-/// 立即跟上，少一份状态少一个错），但常量和结构体没清，编译会报三个 dead_code。
-/// 真机 cpu_id 一辈子不换，这里读文件的开销可以忽略。
-/// 本地兜底这条路上该报的 cpu_id：**只按本机真实序列号派生**。
+/// 只认**本地这份身份自己的号**，顺序就两级：
+///   1. `soter_cpu_id.force` —— 这份 ATTK 自带的号（导入 WebUI 时 `cpu_id:` 那一行被 daemon
+///      落成它；拿别台设备的 ATTK 重放时也靠它对齐）；
+///   2. 本机序列号派生的号 —— 本地 ATTK 是我们自己现造的那把，它的身份就是这台机器。
 ///
-/// 不能读 `/data/misc/ommega/soter_cpu_id` 那份：那是转发给服务端用的 **B 端真机号**
-/// （见 `src/soter_cpu_id.rs`）。本地兜底是 A 端自己的软件 TA，跟 B 不是同一台设备，
-/// 拿 B 的号会让同一个 uid 下出现两个不同的 cpu_id —— 检测器一条「两次 cpuid 不一致」
-/// 直接判红。两份身份各用各的：转发走 B 的号，本地走本机号。
+/// **不读** `/data/misc/ommega/soter_cpu_id`：那是转发链路跟 B 学来的真机号，属于 B 的身份。
+/// 本地兜底是另一份身份（另一把 ATTK），硬把 B 的号拿过来只是“两处数字一样”而已，
+/// 但 ATTK/ASK/AuthKey 对不上那个号 —— 三处文档里声明的 cpu_id 必须跟签字那把钥匙是同一个
+/// 身份。两边各报各的才对；测器觉得两处不一样，那是因为它们本来就不是同一台。
+///
+/// 一个来源都拿不到就报空串：这层宁可不答，也不编一个号（编出来的一眼假）。
 fn cpu_id() -> String {
-    // 顺序：daemon 学来的那份（`CPU_ID_PATHS` 文件 / 环境变量）→ 本机序列号派生。
-    //
-    // 优先用文件是因为那个位置就是给 app 域准备的（`system_app_data_file`），一定读得到；
-    // 而 `prop()` 在注入进去的 payload 里读不到 `ro.boot.serialno`（NX721J 实测：shell 的
-    // `getprop` 能读到序列号，payload 里却拿不到），于是 `cpu_id()` 空、整层不答。
-    //
-    // 代价：文件里存的是 daemon 从真机学来的号，不是本机序列号派生的那个。同一 uid 下
-    // 转发和本地报不同号时检测器会判「两次 cpuid 不一致」；但「不答」比「号不一致」更糟
-    // （前者整条链路直接不通），所以先取文件。
-    // 强制覆盖：重放别台设备的 ATTK 时，cpu_id 也得跟那台一致。
-    if let Ok(text) = std::fs::read_to_string(CPU_ID_OVERRIDE) {
-        if let Some(value) = kmr_common::soter_relay::parse_cpu_id(&text) {
+    let forced = std::fs::read_to_string(CPU_ID_OVERRIDE).ok();
+    match local_cpu_id(forced.as_deref(), device_info().derived_cpu_id.as_deref()) {
+        (value, "forced") => {
             log::info!("event=soter cpu_id forced by {CPU_ID_OVERRIDE}");
-            return value;
+            value
         }
-        log::warn!("event=soter {CPU_ID_OVERRIDE} exists but holds no valid cpu_id");
+        (value, _) => value,
     }
-    let (learned, source) = load_cpu_id();
-    if let Some(value) = learned {
-        log::debug!("event=soter cpu_id from {source}");
-        return value;
-    }
-    device_info().derived_cpu_id.clone().unwrap_or_default()
 }
 
-/// 找一份学来的 cpu_id：环境变量 > 两个候选文件。找不到返回 `(None, "derived")`，
-/// 调用方再用本机真实序列号现派生那份兜底（两处都没有才空着）。
-fn load_cpu_id() -> (Option<String>, String) {
-    let env = std::env::var_os(kmr_common::soter_relay::CPU_ID_ENV)
-        .map(|raw| raw.to_string_lossy().into_owned());
-    load_cpu_id_from(&kmr_common::soter_relay::CPU_ID_PATHS, env)
-}
-
-/// `load_cpu_id` 里跟「从哪读」无关的那半（测试要拿临时文件跑，不进进程环境）。
-fn load_cpu_id_from(paths: &[&str], env: Option<String>) -> (Option<String>, String) {
-    if let Some(raw) = env {
-        match kmr_common::soter_relay::parse_cpu_id(raw.trim()) {
-            Some(id) => return (Some(id), "env".to_string()),
+/// `cpu_id()` 里跟文件读写无关的那半（测试要拿假输入跑）。
+fn local_cpu_id(forced: Option<&str>, derived: Option<&str>) -> (String, &'static str) {
+    if let Some(text) = forced {
+        match kmr_common::soter_relay::parse_cpu_id(text) {
+            Some(id) => return (id, "forced"),
             None => log::warn!(
-                "soter local {} is not a usable cpu_id; ignoring it",
-                kmr_common::soter_relay::CPU_ID_ENV
+                "event=soter {CPU_ID_OVERRIDE} exists but holds no valid cpu_id; falling back to this machine's own id"
             ),
         }
     }
-    for path in paths {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match kmr_common::soter_relay::parse_cpu_id(&text) {
-            Some(id) => return (Some(id), format!("file {path}")),
-            // 文件在那儿但里面没有合形状的值：别当没事，也别拿它顶，继续往下找。
-            None => log::warn!("soter local cpu_id at {path} has no usable value; ignoring it"),
-        }
-    }
-    (None, "derived".to_string())
+    (derived.unwrap_or_default().to_string(), "derived")
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +690,8 @@ fn prop(_name: &str) -> Option<String> {
 
 /// 这台机器的 SOTER 设备信息。属性只读一次，之后复用。
 struct DeviceInfo {
-    /// 按本机真实序列号现派生的那个号，`09000000` + 12 字节十六进制。只当兜底：
-    /// daemon 那份文件没读到、又没有环境变量时才用它；序列号都读不到就是 `None`。
+    /// 按本机真实序列号派生的号，`09000000` + 12 字节十六进制。
+    /// 本地这条路报的就是它（除非这份 ATTK 自带一个 force 号）；序列号读不到就是 `None`。
     derived_cpu_id: Option<String>,
     fp_n: String,
     fp_v: String,
@@ -1143,8 +1111,10 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
     }
 }
 
-/// 产线 provisioning（`exportAttkPublicKey`）要的那份“ATTK 公钥”。软件 TA 里 ASK 兼
-/// ATTK，所以这里交出去的就是 ASK 的自描述信封（跟 1 号 `exportAskPublicKey` 同一份东西）。
+/// 产线 provisioning（2 号 `exportAttkPublicKey`）要的那份 ATTK 自描述：
+/// `pub_key` 就是 ATTK 的公钥，签名用 ATTK 自己那把私钥 —— 真机上 ATTK 是这条链的根，
+/// 它自签、ATTK 再签 ASK。注意这跟 1 号（ASK 证书）不是同一份东西：1 号的 `pub_key`
+/// 是该 uid 的 ASK。
 pub(crate) fn ask_public_document(uid: i32) -> Vec<u8> {
     let Some(state) = state() else {
         return Vec::new();
@@ -1674,6 +1644,74 @@ mod tests {
         );
     }
 
+    /// 2 号（exportAttkPublicKey）的 ATTK 自描述：`pub_key` 就是 ATTK、签名也是 ATTK 自己。
+    ///
+    /// 真机上 ATTK 是这条链的根（它自签、再用它签 ASK），所以这里必须自洽：
+    /// 拿 ATTK 公钥验得过，拿这个 uid 的 ASK 公钥验不过。
+    #[test]
+    fn the_attk_certificate_is_self_signed() {
+        let uid = 6401;
+        let attk_pem = current_attk().expect("attk").pem.clone();
+
+        let envelope = as_buffer(answer(&call(2, Some(uid), None)));
+        let (document, signature) = split_envelope(&envelope);
+        let text = String::from_utf8(document.clone()).unwrap();
+        assert_eq!(pem_of(&text), attk_pem, "pub_key 必须是 ATTK 自己那把");
+        assert!(
+            verifies(&attk_pem, &document, &signature),
+            "ATTK 证书是自签的"
+        );
+        assert!(
+            !verifies(&ask_pem(uid), &document, &signature),
+            "ATTK 证书不是 ASK 签的，别把两层搞反"
+        );
+    }
+
+    /// 本地兜底也跟着 uid 分家（跟真机 TA 一样）：
+    /// 机主 10490 和工作资料 1010490 是两个槽位，ASK 两把、AuthKey 各管各的。
+    #[test]
+    fn local_material_is_per_uid() {
+        let (owner, work_profile) = (10490, 1_010_490);
+        let alias = "SoterAuthKey";
+
+        let owner_ask = ask_pem(owner);
+        let work_ask = ask_pem(work_profile);
+        assert_ne!(owner_ask, work_ask, "不同用户不能共用一把 ASK");
+        assert_eq!(ask_pem(owner), owner_ask, "同一 uid 的 ASK 要稳定");
+
+        // AuthKey 也在 uid 下面：机主建了，工作资料那边就当没建。
+        assert_eq!(as_code(answer(&call(7, Some(owner), Some(alias)))), OK);
+        assert_eq!(as_code(answer(&call(10, Some(owner), Some(alias)))), OK);
+        assert_eq!(
+            as_code(answer(&call(10, Some(work_profile), Some(alias)))),
+            AUTH_KEY_NOT_READY
+        );
+
+        // 工作资料那边自己建一把：两边的 AuthKey 和各自的 ASK 对得上，不串。
+        assert_eq!(
+            as_code(answer(&call(7, Some(work_profile), Some(alias)))),
+            OK
+        );
+        let owner_auth = pem_of(
+            &String::from_utf8(
+                split_envelope(&as_buffer(answer(&call(3, Some(owner), Some(alias))))).0,
+            )
+            .unwrap(),
+        );
+        let work_auth = pem_of(
+            &String::from_utf8(
+                split_envelope(&as_buffer(answer(&call(
+                    3,
+                    Some(work_profile),
+                    Some(alias),
+                ))))
+                .0,
+            )
+            .unwrap(),
+        );
+        assert_ne!(owner_auth, work_auth, "两个 uid 的 AuthKey 不能是同一把");
+    }
+
     #[test]
     fn the_sign_document_carries_the_device_fields() {
         let uid = 6200;
@@ -1737,51 +1775,36 @@ mod tests {
         assert!(info.fid.chars().all(|c| c.is_ascii_digit()));
     }
 
-    /// daemon 学来的真机号一旦落到文件里，本地这一套就得报它，不能自己再派生一个。
+    /// 本地这条路的号只认两份：这份 ATTK 自带的那份（force 文件）、本机派生那份。
+    /// 转发链路学来的 B 端真机号**不参与** —— 那是另一份身份的数字。
     #[test]
-    fn a_learned_cpu_id_wins_over_the_derived_one() {
-        let learned = "090000005171734c42866bea148b21f5";
-        let path = temp_pem("soter_cpu_id", &format!("soter_cpu_id: {learned}\n"));
-        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], None);
-        assert_eq!(value.as_deref(), Some(learned));
-        assert!(origin.starts_with("file "), "origin = {origin}");
-        assert_ne!(
-            Some(learned),
-            device_info().derived_cpu_id.as_deref(),
-            "两份号必须不是一个"
-        );
+    fn the_local_cpu_id_belongs_to_the_local_identity() {
+        let forced = "090000005171734c42866bea148b21f5";
+        let derived = device_info()
+            .derived_cpu_id
+            .as_deref()
+            .expect("真机/真设备上序列号读得到");
 
-        // 环境变量优先于文件。
-        let other = "09000000aabbccddeeff001122334455";
-        let (value, origin) = load_cpu_id_from(&[path.to_str().unwrap()], Some(other.to_string()));
-        assert_eq!(value.as_deref(), Some(other));
-        assert_eq!(origin, "env");
-    }
-
-    /// 文件缺了、内容废了、环境变量写错了，一律当作没学到，回落本机派生值 ——
-    /// 绝不拿半截东西去当设备身份。
-    #[test]
-    fn a_broken_cpu_id_source_falls_back_to_nothing() {
-        let broken = temp_pem("soter_cpu_id_broken", "soter_cpu_id: 09000000\n");
-        let missing = std::env::temp_dir().join("ommega-soter-cpu-id-does-not-exist");
-        let _ = std::fs::remove_file(&missing);
-        for paths in [
-            vec![missing.to_str().unwrap()],
-            vec![broken.to_str().unwrap()],
-            vec![missing.to_str().unwrap(), broken.to_str().unwrap()],
-        ] {
-            let (value, origin) = load_cpu_id_from(&paths, None);
-            assert_eq!(value, None, "{paths:?} 里没有合形状的值");
-            assert_eq!(origin, "derived");
-        }
-        // 坏的环境变量不牵连后面的文件。
-        let good = temp_pem(
-            "soter_cpu_id_good",
-            "soter_cpu_id: 09000000aabbccddeeff001122334455\n",
+        // force 文件（这份 ATTK 自己的号）优先。
+        assert_eq!(
+            local_cpu_id(Some(forced), Some(derived)),
+            (forced.to_string(), "forced")
         );
-        let (value, _) =
-            load_cpu_id_from(&[good.to_str().unwrap()], Some("not-a-cpu-id".to_string()));
-        assert_eq!(value.as_deref(), Some("09000000aabbccddeeff001122334455"));
+        // 没带号就用本机派生那份。
+        assert_eq!(
+            local_cpu_id(None, Some(derived)),
+            (derived.to_string(), "derived")
+        );
+        // 形状不对的 force 文件不采纳，回落本机号（绝不编一个）。
+        assert_eq!(
+            local_cpu_id(Some("nonsense"), Some(derived)),
+            (derived.to_string(), "derived")
+        );
+        // 两个来源都没有：空串，上层据此整笔不答。
+        assert_eq!(local_cpu_id(None, None), (String::new(), "derived"));
+        assert_eq!(cpu_id(), device_id(), "device_id() 就是本地这个号");
+        // 两台设备的号本来就不该一样。
+        assert_ne!(forced, derived, "跟转发那条路的号必须是两个");
     }
 
     #[test]
