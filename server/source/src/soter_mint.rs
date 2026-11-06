@@ -104,9 +104,17 @@ impl MintKey {
         })
     }
 
-    /// RSA-PSS-SHA256，盐长 = 摘要长度 = 32，正好对上 JSON 里那个字段。
+    /// RSA-PSS-SHA256，盐长 = `ASK_SALT_LEN`（20，跟真机 TA 对齐、也跟 JSON 里那个
+    /// `rsa_pss_saltlen` 字段一致）。
+    ///
+    /// 这里必须显式 `new_with_salt_len`：`PssSigningKey::new` 给的是摘要长度（32），
+    /// 而验签方（App / openssl `rsa_pss_saltlen:20`）是按 JSON 里声明的 20 严卡盐长的，
+    /// 签成 32 就是验不过 —— 以前就这样错着，自己用自己的“拿 32 验”的测试还验得过。
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-        let signing = PssSigningKey::<Sha256>::new((*self.private).clone());
+        let signing = PssSigningKey::<Sha256>::new_with_salt_len(
+            (*self.private).clone(),
+            ASK_SALT_LEN as usize,
+        );
         let mut rng = rand::rngs::OsRng;
         Ok(signing.sign_with_rng(&mut rng, message).to_bytes().to_vec())
     }
@@ -1373,7 +1381,7 @@ mod tests {
         let pem = attk["text"].as_str().expect("ATTK PEM is printable");
         use pkcs8::DecodePublicKey as _;
         let public = rsa::RsaPublicKey::from_public_key_pem(pem).expect("ATTK PEM parses");
-        let verifying = PssVerifyingKey::<Sha256>::new(public);
+        let verifying = PssVerifyingKey::<Sha256>::new_with_salt_len(public, ASK_SALT_LEN as usize);
         let signature = PssSignature::try_from(signature).expect("signature parses");
         verifying
             .verify(document, &signature)
@@ -1852,7 +1860,7 @@ mod tests {
         document[start..end].replace("\\n", "\n")
     }
 
-    /// 拿一把 PEM 公钥验一段签名（RSA-PSS-SHA256）。
+    /// 拿一把 PEM 公钥验一段签名（RSA-PSS-SHA256，盐长按真机那套 20 严卡）。
     fn verifies(pem: &str, message: &[u8], signature: &[u8]) -> bool {
         use pkcs8::DecodePublicKey as _;
         let Ok(public) = rsa::RsaPublicKey::from_public_key_pem(pem) else {
@@ -1861,7 +1869,7 @@ mod tests {
         let Ok(signature) = PssSignature::try_from(signature) else {
             return false;
         };
-        PssVerifyingKey::<Sha256>::new(public)
+        PssVerifyingKey::<Sha256>::new_with_salt_len(public, ASK_SALT_LEN as usize)
             .verify(message, &signature)
             .is_ok()
     }
