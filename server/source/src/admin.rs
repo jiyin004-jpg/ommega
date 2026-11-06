@@ -921,13 +921,171 @@ pub async fn admin_soter_attk_delete(
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
     match tokio::task::spawn_blocking(move || db.delete_soter_attk(id)).await {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id })).into_response(),
+        Ok(Ok(())) => {
+            // 物料缓存跟着丢：这把 ATTK 签出来的 ASK/AuthKey 一起作废，
+            // 下次再传同一把就是新行新 id。
+            crate::soter_mint::forget_attk(id);
+            Json(json!({ "status": "ok", "id": id })).into_response()
+        }
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("join error: {e}"),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SOTER 策略（真机模式 / 服务端密钥模式 + 白名单 + 多身份选路）
+// ---------------------------------------------------------------------------
+
+/// 当前策略的完整快照（控制台把这一份整块拿去渲染）。
+fn soter_policy_view(state: &AppState) -> Value {
+    let snap = crate::soter_policy::snapshot();
+    let cfg = &state.cfg;
+    let packages_fallback = if cfg.soter_real_app_packages.trim().is_empty() {
+        crate::soter_probe::DEFAULT_REAL_APP_PACKAGES
+    } else {
+        cfg.soter_real_app_packages.as_str()
+    };
+    let prefixes_fallback = if cfg.soter_real_app_prefixes.trim().is_empty() {
+        crate::soter_probe::DEFAULT_REAL_APP_PREFIXES
+    } else {
+        cfg.soter_real_app_prefixes.as_str()
+    };
+    json!({
+        "mode": snap.mode.as_str(),
+        "layers": snap.layers(),
+        "attk_id": snap.attk_id,
+        "whitelist": {
+            "packages": snap.whitelist.packages.clone(),
+            "prefixes": snap.whitelist.prefixes.clone(),
+            "local_only_prefixes": snap.whitelist.local_only_prefixes.clone(),
+            "local_only_uids": snap.whitelist.local_only_uids.clone(),
+        },
+        // 真正生效的那一份（控制台空的就回落到环境变量 / 内置缺省）。
+        "effective_whitelist": {
+            "packages": crate::soter_policy::real_packages(packages_fallback),
+            "prefixes": crate::soter_policy::real_prefixes(prefixes_fallback),
+            "local_only_prefixes": crate::soter_policy::local_only_prefixes(&cfg.soter_local_only_prefixes),
+            "local_only_uids": crate::soter_policy::local_only_uids(&cfg.soter_local_only_uids),
+        },
+        "identities": snap.identities.clone(),
+        "path": crate::soter_policy::PATH,
+        "persisted": std::path::Path::new(crate::soter_policy::PATH).is_file(),
+    })
+}
+
+/// GET /api/admin/soter_policy/ — SOTER 现在的策略。
+pub async fn admin_soter_policy_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    Json(soter_policy_view(&state)).into_response()
+}
+
+/// POST /api/admin/soter_policy/ — 改策略（立即生效 + 落盘）。
+///
+/// 可改：模式、默认 ATTK、四份白名单、身份绑定规则（整份替换）；`reset: true` 恢复缺省。
+pub async fn admin_soter_policy_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::soter_policy::Patch>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    // 引用了库里不存在的 ATTK 就直接拒：存进去也只会让这一层永远没物料，
+    // 请求默默落到自签上，控制台还以为自己配好了。
+    let referenced: Vec<i64> = body
+        .attk_id
+        .into_iter()
+        .chain(body.identities.iter().flatten().map(|r| r.attk_id))
+        .collect();
+    if !referenced.is_empty() {
+        if let Some(db) = state.db.clone() {
+            match tokio::task::spawn_blocking(move || db.list_soter_attks()).await {
+                Ok(Ok(rows)) => {
+                    let known: Vec<i64> = rows.iter().map(|r| r.id).collect();
+                    if let Some(missing) = referenced.iter().find(|id| !known.contains(id)) {
+                        return json_err(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "soter_attk id {missing} 不存在（先上传，或在列表里刷新一下）"
+                            ),
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
+                }
+                Err(e) => {
+                    return json_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("join error: {e}"),
+                    )
+                }
+            }
+        }
+    }
+    match crate::soter_policy::set(body) {
+        Ok(_) => Json(soter_policy_view(&state)).into_response(),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+/// GET /api/admin/soter_slots/ — 服务端记着的那些槽位（按设备 + uid）。
+///
+/// uid 照 AOSP 拆成 `user = uid / 100000`、`app = uid % 100000`：工作资料（10/11）
+/// 和分身（999）里的同一个应用在这张表里是分开的几条，钉在哪一层也各算各的。
+pub async fn admin_soter_slots(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let snap = match crate::statedb::shared().slots_snapshot() {
+        Ok(snap) => snap,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+    };
+    let mut items: Vec<Value> = snap
+        .slots
+        .into_iter()
+        .map(|(id, layer, at_millis)| {
+            let (device, uid) = match id.split_once('|') {
+                Some((device, uid)) => (device.to_string(), uid.parse::<i32>().ok()),
+                None => (id.clone(), None),
+            };
+            let scope = uid
+                .and_then(crate::android_uid::Uid::parse)
+                .map(|u| {
+                    json!({
+                        "raw": u.raw,
+                        "user": u.user,
+                        "app": u.app,
+                        "is_app": u.is_app(),
+                        "is_isolated": u.is_isolated(),
+                    })
+                })
+                .unwrap_or(Value::Null);
+            json!({
+                "slot_id": id,
+                "device_id": device,
+                "uid": uid,
+                "uid_scope": scope,
+                "layer": layer,
+                "pinned_at": at_millis,
+            })
+        })
+        .collect();
+    // 按最近钉的时间倒序，最多给 300 条（控制台只是看个大概，不是全量表）。
+    let total = items.len();
+    items.sort_by_key(|v| {
+        std::cmp::Reverse(v.get("pinned_at").and_then(Value::as_i64).unwrap_or(0))
+    });
+    items.truncate(300);
+    Json(json!({ "items": items, "total": total })).into_response()
 }
 
 /// DELETE /api/admin/tokens/:id/ — delete a token.

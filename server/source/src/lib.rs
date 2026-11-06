@@ -1,6 +1,7 @@
 //! relay_rs library crate (modules shared with the binary).
 
 pub mod admin;
+pub mod android_uid;
 pub mod attest_policy;
 pub mod attstatus;
 pub mod auth;
@@ -22,6 +23,7 @@ pub mod pay;
 pub mod queue;
 pub mod soter_gate;
 pub mod soter_mint;
+pub mod soter_policy;
 pub mod soter_probe;
 pub mod soter_sign_sessions;
 pub mod statedb;

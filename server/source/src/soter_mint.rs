@@ -18,8 +18,16 @@
 //! 层与层的分工：
 //!   - `keybox`：用服务端数据库里这台设备名下的身份私钥。只有它带的是 RSA 才
 //!     能干 SOTER（keybox 里常见的是 EC，那就这层处理不了，回退下一层）。
+//!   - `attk`：服务端密钥模式专用。用控制台上传的那把 ATTK（RSA 私钥 + 它自己的
+//!     `cpu_id`）铸料 —— 身份就是那把 ATTK 的，A 端转过来的真机号在这儿不作数。
+//!     多个 ATTK 时选哪把由 `crate::soter_policy` 的身份规则决定。
 //!   - `self_signed`：现生成一把 RSA-2048，进程内复用；服务端一重启就等于换了
 //!     一把新身份，A 端要重新取 ATTK 公钥。
+//!
+//! 物料是按「身份」隔离的：ASK / AuthKey 的缓存键前面都带一层 `scope`
+//! （见 `material_scope`）。换了 ATTK 就等于换了一整套钥匙，不会拿 A 的 ASK 去配
+//! B 的 AuthKey —— 那种状态下 App 导出的公钥和签名用的私钥对不上，会自己把该 uid
+//! 下的钥匙全删掉重来。
 //!
 //! 处理不了的 op 会返回带 `error` 的对象，调用方据此回退下一层。
 //!
@@ -118,6 +126,9 @@ struct Store {
     self_signed: Mutex<Option<Arc<MintKey>>>,
     /// 专给探测机作答的那一把（见 `crate::soter_probe`），自己一份、永不轮换。
     builtin: Mutex<Option<Arc<MintKey>>>,
+    /// `soter_attk` 行 id -> 这把 ATTK 解出来的物料（服务端密钥模式）。
+    /// 按 id 缓存：控制台删掉再传就是新的一行，不会串。
+    attk: Mutex<HashMap<i64, Arc<MintKey>>>,
     /// `{device}|{layer}` -> 这一层的 ASK。
     ///
     /// 真机的 SOTER 里 ATTK 和 ASK 是两把钥匙：ASK 证书用 ATTK 签、AuthKey 证书用
@@ -183,6 +194,8 @@ struct SignSession {
     requested: String,
     device: String,
     layer: String,
+    /// `attk` 层开出来的会话归哪一把 ATTK。finish 得用同一把签，否则验不过。
+    attk_id: Option<i64>,
     uid: i32,
     alias: String,
     /// 挑战原文。真机把这段原文写进签名 JSON 的 `raw` 里，不是解出来的字节。
@@ -196,11 +209,30 @@ pub fn session_layer(requested: &str, session: i64) -> Option<String> {
     (owner.requested == requested).then(|| owner.layer.clone())
 }
 
+/// 这张会话当初是哪把 ATTK 开的（`attk` 层之外的会话回 `None`）。
+pub fn session_attk(requested: &str, session: i64) -> Option<i64> {
+    let sessions = store().sessions.lock().ok()?;
+    let owner = sessions.get(&session)?;
+    (owner.requested == requested)
+        .then_some(owner.attk_id)
+        .flatten()
+}
+
+/// 控制台上传的 ATTK：私钥 + 它对应的 `cpu_id`（SOTER 的身份就是这两样）。
+#[derive(Clone, Debug)]
+pub struct AttkMaterial {
+    pub id: i64,
+    pub name: String,
+    pub cpu_id: String,
+    pub pem: String,
+}
+
 fn store() -> &'static Store {
     static STORE: OnceLock<Store> = OnceLock::new();
     STORE.get_or_init(|| Store {
         self_signed: Mutex::new(None),
         builtin: Mutex::new(None),
+        attk: Mutex::new(HashMap::new()),
         ask: Mutex::new(HashMap::new()),
         auth: Mutex::new(HashMap::new()),
         counters: Mutex::new(HashMap::new()),
@@ -211,16 +243,79 @@ fn store() -> &'static Store {
     })
 }
 
-/// 取这一层的物料。`key_pem` 只有 keybox 层才需要（服务端存的那把设备身份私钥）。
-fn material(layer: &str, key_pem: Option<&str>) -> Result<Arc<MintKey>> {
+/// 取这一层的物料。`key_pem` 只有 keybox 层才需要（服务端存的那把设备身份私钥），
+/// `attk` 只有服务端密钥模式才需要。
+fn material(
+    layer: &str,
+    key_pem: Option<&str>,
+    attk: Option<&AttkMaterial>,
+) -> Result<Arc<MintKey>> {
     if layer == "keybox" {
         let pem = key_pem.ok_or_else(|| anyhow!("服务端在这台设备名下没有 RSA 身份的私钥"))?;
         return Ok(Arc::new(MintKey::from_pem(pem)?));
+    }
+    if layer == "attk" {
+        let attk = attk.ok_or_else(|| {
+            anyhow!("服务端密钥模式没有可用的 ATTK（控制台上传一把，或换回真机模式）")
+        })?;
+        let mut map = store()
+            .attk
+            .lock()
+            .map_err(|_| anyhow!("attk material lock poisoned"))?;
+        if let Some(existing) = map.get(&attk.id) {
+            return Ok(existing.clone());
+        }
+        let fresh = Arc::new(MintKey::from_pem(&attk.pem)?);
+        map.insert(attk.id, fresh.clone());
+        return Ok(fresh);
     }
     if layer == "builtin" {
         return builtin_key();
     }
     self_signed_key()
+}
+
+/// 这一层的物料挂在哪份身份下。
+///
+/// ASK / AuthKey 的缓存键都以它打头：`attk` 层按 ATTK 行 id 分（换一把就是换一整套），
+/// 其余三层各是各的。不这么分的话，控制台换一把 ATTK 之后旧 AuthKey 还留在表里，
+/// 而它的 ASK 已经换成新的了 —— App 导出的公钥和签名用的私钥对不上。
+fn material_scope(layer: &str, attk: Option<&AttkMaterial>) -> String {
+    match layer {
+        "attk" => attk
+            .map(|a| format!("attk:{}", a.id))
+            .unwrap_or_else(|| "attk:none".to_string()),
+        "keybox" => "keybox".to_string(),
+        "builtin" => "builtin".to_string(),
+        _ => "self_signed".to_string(),
+    }
+}
+
+/// 会话收尾时按「当初开它的那把身份」算 scope（`attk` 层要回到同一把 ATTK 上）。
+fn moment_scope(layer: &str, attk_id: Option<i64>) -> String {
+    match layer {
+        "attk" => match attk_id {
+            Some(id) => format!("attk:{id}"),
+            None => "attk:none".to_string(),
+        },
+        "keybox" => "keybox".to_string(),
+        "builtin" => "builtin".to_string(),
+        _ => "self_signed".to_string(),
+    }
+}
+
+/// ATTK 被删/换了：物料缓存和它签出来的 ASK/AuthKey 一起丢。
+pub fn forget_attk(id: i64) {
+    if let Ok(mut map) = store().attk.lock() {
+        map.remove(&id);
+    }
+    let prefix = format!("attk:{id}|");
+    if let Ok(mut map) = store().ask.lock() {
+        map.retain(|key, _| !key.starts_with(&prefix));
+    }
+    if let Ok(mut map) = store().auth.lock() {
+        map.retain(|key, _| !key.starts_with(&prefix));
+    }
 }
 
 /// 探测机专用的那把 ASK。跟自签层分开，是因为探测流量会一直让 `generate_ask_key_pair`
@@ -265,8 +360,8 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
 ///
 /// 跟 ATTK 分开存：真机上这两把公钥永远不相等，`exportAskPublicKey` 和
 /// `exportAttkPublicKey` 吐同一把会让 App 把该 uid 下的钥匙全删掉重来。
-fn layer_ask_key(device: &str, layer: &str) -> Result<Arc<MintKey>> {
-    let id = format!("{device}|{layer}");
+fn layer_ask_key(scope: &str, device: &str, layer: &str) -> Result<Arc<MintKey>> {
+    let id = format!("{scope}|{device}|{layer}");
     let mut map = store()
         .ask
         .lock()
@@ -280,8 +375,8 @@ fn layer_ask_key(device: &str, layer: &str) -> Result<Arc<MintKey>> {
 }
 
 /// 重建 ASK（`generate_ask_key_pair` 就是它）。
-fn rotate_layer_ask_key(device: &str, layer: &str) -> Result<Arc<MintKey>> {
-    let id = format!("{device}|{layer}");
+fn rotate_layer_ask_key(scope: &str, device: &str, layer: &str) -> Result<Arc<MintKey>> {
+    let id = format!("{scope}|{device}|{layer}");
     let fresh = Arc::new(MintKey::generate()?);
     let mut map = store()
         .ask
@@ -292,8 +387,8 @@ fn rotate_layer_ask_key(device: &str, layer: &str) -> Result<Arc<MintKey>> {
 }
 
 /// ATTK 换了以后旧的 ASK 证书就废了（ASK 证书是 ATTK 签的），缓存要一并丢掉。
-fn drop_layer_ask_key(device: &str, layer: &str) {
-    let id = format!("{device}|{layer}");
+fn drop_layer_ask_key(scope: &str, device: &str, layer: &str) {
+    let id = format!("{scope}|{device}|{layer}");
     if let Ok(mut map) = store().ask.lock() {
         map.remove(&id);
     }
@@ -692,30 +787,60 @@ const KNOWN_OPS: &[&str] = &[
 ];
 
 pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) -> Option<Value> {
+    run_layer(layer, device_id, body, key_pem, None)
+}
+
+/// 带身份的版本：`attk` 层（服务端密钥模式）需要把上传的那把 ATTK 递进来。
+pub fn run_layer(
+    layer: &str,
+    device_id: &str,
+    body: &Value,
+    key_pem: Option<&str>,
+    attk: Option<&AttkMaterial>,
+) -> Option<Value> {
     // 账号指纹的 TTL 清理：节流在里面，不会拖慢请求。
     purge_owners_if_due();
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
-    // A 端把真机的 cpu_id 一起转过来了就用它的：同一台设备上，本地兜底那条路、这里这
-    // 两层、还有 B 端 TEE，必须报同一个号，否则「两次 cpuid 不一致」的检测项就亮红。
-    // 没给（老 A 端）或者给得不成样子才回落到按设备名派生的虚拟号。
-    let product = docs_cpu_id(body).unwrap_or_else(|| {
-        if body.get(CPU_ID_FIELD).is_some() {
+    // 身份号（cpu_id）从哪来：
+    //   - `attk` 层：就是上传那把 ATTK 的 cpu_id。A 端转过来的真机号在这儿不作数 ——
+    //     ASK 证书是这把 ATTK 签的，签的是一台机器、App 却按另一台去验，谁也验不过。
+    //   - 其余三层：A 端把真机的 cpu_id 一起转过来了就用它的。同一台设备上，本地兜底
+    //     那条路、服务端这几层、还有 B 端 TEE 必须报同一个号，否则「两次 cpuid 不一致」
+    //     的检测项就亮红。没给（老 A 端）或者给得不成样子才回落到按时间现造的虚拟号。
+    let product = if layer == "attk" {
+        let own = attk.map(|a| a.cpu_id.trim()).unwrap_or("");
+        if is_soter_cpu_id(own) {
+            own.to_string()
+        } else {
             tracing::warn!(
-                "soter: {layer} 层收到形状不对的 cpu_id {:?}，按当前时间现造一个",
-                body.get(CPU_ID_FIELD)
+                "soter: attk 层的 cpu_id {own:?} 形状不对（要 32 个十六进制字符），\
+                 先按当前时间现造一个顶上"
             );
+            time_device_id()
         }
-        // 老 A 端不带 cpu_id：按当时的年月日时分现造一个。同一分钟内稳定，
-        // 一轮 ASK/AuthKey 流程跑在同一分钟里就能对上；不再用按设备名派生的那个，
-        // 免得到处都是同一个号、探测器一对比就认出来。
-        time_device_id()
-    });
+    } else {
+        docs_cpu_id(body).unwrap_or_else(|| {
+            if body.get(CPU_ID_FIELD).is_some() {
+                tracing::warn!(
+                    "soter: {layer} 层收到形状不对的 cpu_id {:?}，按当前时间现造一个",
+                    body.get(CPU_ID_FIELD)
+                );
+            }
+            // 老 A 端不带 cpu_id：按当时的年月日时分现造一个。同一分钟内稳定，
+            // 一轮 ASK/AuthKey 流程跑在同一分钟里就能对上；不再用按设备名派生的那个，
+            // 免得到处都是同一个号、探测器一对比就认出来。
+            time_device_id()
+        })
+    };
 
     if !KNOWN_OPS.contains(&op) {
         return None;
     }
 
-    let key = match material(layer, key_pem) {
+    // 物料按身份分家（见 `material_scope`），换 ATTK 不会拿旧 AuthKey 顶上。
+    let scope = material_scope(layer, attk);
+
+    let key = match material(layer, key_pem, attk) {
         Ok(key) => key,
         Err(e) => {
             return Some(json!({
@@ -749,7 +874,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             "export_attk_public_key" => Ok(data_result(op, OK, key.attk_pem.as_bytes())),
             // 导出的是 **ASK** 的公钥（跟 ATTK 是两把），文档用 ATTK 签 —— 与真机一致。
             "export_ask_public_key" => {
-                let ask = layer_ask_key(&product, layer)?;
+                let ask = layer_ask_key(&scope, &product, layer)?;
                 ask_result(op, layer, &ask, &key, &product, uid_of(body)?)
             }
             // 兜底层**不许声称「ASK 已存在」**（2026-10-11 实测的毒化根源）。
@@ -765,18 +890,18 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             "verify_attk_key_pair" => Ok(code_result(op, OK)),
             "has_auth_key" => Ok(code_result(
                 op,
-                if auth_key(device_id, body).is_some() {
+                if auth_key(device_id, &scope, body).is_some() {
                     OK
                 } else {
                     AUTH_KEY_NOT_READY
                 },
             )),
-            "export_auth_key_public_key" => match auth_key(device_id, body) {
+            "export_auth_key_public_key" => match auth_key(device_id, &scope, body) {
                 // 回的是「AuthKey 的自描述 + 签名」的信封，签名用 **ASK** 私钥 ——
                 // 真机上 AuthKey 证书就是 ASK 签的，App 拿 exportAskPublicKey 的
                 // 公钥验这一份（用 ATTK 签就验不过）。
                 Some(auth) => {
-                    let ask = layer_ask_key(&product, layer)?;
+                    let ask = layer_ask_key(&scope, &product, layer)?;
                     let counter = counter_for(&slot_id(device_id, uid_of(body)?));
                     let document = key_doc(&auth.attk_pem, &product, counter, uid_of(body)?)?;
                     let signature = ask.sign(&document)?;
@@ -788,14 +913,14 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             },
             "generate_auth_key_pair" => {
                 let fresh = MintKey::generate().context("RSA keygen for the auth key failed")?;
-                let id = auth_key_id(device_id, body)?;
+                let id = auth_key_id(device_id, &scope, body)?;
                 if let Ok(mut map) = store().auth.lock() {
                     map.insert(id, Arc::new(fresh));
                 }
                 Ok(code_result(op, OK))
             }
             "remove_auth_key" => {
-                let id = auth_key_id(device_id, body)?;
+                let id = auth_key_id(device_id, &scope, body)?;
                 if let Ok(mut map) = store().auth.lock() {
                     map.remove(&id);
                 }
@@ -803,7 +928,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             }
             "remove_all_uid_key" => {
                 let uid = uid_of(body)?;
-                let prefix = format!("{device_id}|{uid}|");
+                let prefix = format!("{scope}|{device_id}|{uid}|");
                 if let Ok(mut map) = store().auth.lock() {
                     map.retain(|k, _| !k.starts_with(&prefix));
                 }
@@ -814,7 +939,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             // 重建 ASK：只换 ASK，不动 ATTK（两把）。AuthKey 是 ASK 签的，
             // 换了 ASK 它们也就验不过了，App 会自己重新生成。
             "generate_ask_key_pair" => {
-                rotate_layer_ask_key(&product, layer)?;
+                rotate_layer_ask_key(&scope, &product, layer)?;
                 unpin_layer(device_id, uid_of(body)?);
                 Ok(code_result(op, OK))
             }
@@ -830,14 +955,14 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                     );
                 }
                 // ATTK 换了，旧 ASK 证书就废了（ASK 证书是 ATTK 签的）。
-                drop_layer_ask_key(&product, layer);
+                drop_layer_ask_key(&scope, &product, layer);
                 unpin_layer(device_id, uid_of(body)?);
                 Ok(code_result(op, OK))
             }
             "init_sign" => {
                 let uid = uid_of(body)?;
                 let alias = alias_of(body)?;
-                if auth_key(device_id, body).is_none() {
+                if auth_key(device_id, &scope, body).is_none() {
                     // AuthKey 没建就是没建，真机这里答 -6（AUTH_KEY_NOT_READY）；
                     // 答 -5 会被上层当成「ASK 还没准备好」。
                     return Ok(code_result(op, AUTH_KEY_NOT_READY));
@@ -868,6 +993,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                                 .to_string(),
                             device: device_id.to_string(),
                             layer: layer.to_string(),
+                            attk_id: attk.map(|a| a.id),
                             uid,
                             alias,
                             raw,
@@ -900,9 +1026,11 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                     Some(s) => s,
                     None => return Ok(code_result(op, SESSION_UNKNOWN)),
                 };
+                // 会话里记着它当初由哪把身份开出来，这里按同一个 scope 取 AuthKey。
+                let session_scope = moment_scope(layer, sign_session.attk_id);
                 let key = match store().auth.lock().ok().and_then(|m| {
                     m.get(&format!(
-                        "{device_id}|{}|{}",
+                        "{session_scope}|{device_id}|{}|{}",
                         sign_session.uid, sign_session.alias
                     ))
                     .cloned()
@@ -953,12 +1081,16 @@ fn alias_of(body: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("soter payload needs the key alias"))
 }
 
-fn auth_key_id(device_id: &str, body: &Value) -> Result<String> {
-    Ok(format!("{device_id}|{}|{}", uid_of(body)?, alias_of(body)?))
+fn auth_key_id(device_id: &str, scope: &str, body: &Value) -> Result<String> {
+    Ok(format!(
+        "{scope}|{device_id}|{}|{}",
+        uid_of(body)?,
+        alias_of(body)?
+    ))
 }
 
-fn auth_key(device_id: &str, body: &Value) -> Option<Arc<MintKey>> {
-    let id = auth_key_id(device_id, body).ok()?;
+fn auth_key(device_id: &str, scope: &str, body: &Value) -> Option<Arc<MintKey>> {
+    let id = auth_key_id(device_id, scope, body).ok()?;
     store().auth.lock().ok()?.get(&id).cloned()
 }
 
@@ -1308,6 +1440,154 @@ mod tests {
         assert!(
             order.windows(2).all(|w| w[0] < w[1]),
             "key order changed: {text}"
+        );
+    }
+
+    /// 服务端密钥模式（`attk` 层）：身份就是控制台上传的那一把 ATTK。
+    ///
+    /// 三件事得同时成立：cpu_id 用 ATTK 自己的（A 端转什么都不算数）、ASK 文档用它的
+    /// 私钥签、换一把 ATTK 就等于换了一整套料（旧的 AuthKey 不会再被认成新的）。
+    #[test]
+    fn the_attk_layer_signs_with_the_uploaded_identity() {
+        use pkcs8::{
+            DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _, LineEnding,
+        };
+
+        let device = "device-a-attk";
+        let own_cpu = "09000000111122223333444455556666";
+        let key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("rsa keygen");
+        let pem = key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("pkcs8 pem")
+            .to_string();
+        let own_public = rsa::RsaPublicKey::from(&key)
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public pem");
+        let material = AttkMaterial {
+            id: 900_001,
+            name: "test-attk".to_string(),
+            cpu_id: own_cpu.to_string(),
+            pem: pem.clone(),
+        };
+        let call = |body: Value| {
+            run_layer("attk", device, &body, None, Some(&material))
+                .expect("the attk layer handles every known op")
+        };
+
+        // 1. getDeviceId 报的就是这把 ATTK 的 cpu_id，A 端转过来的真机号盖不掉它。
+        let id = call(json!({
+            "op": "get_device_id",
+            "device_id": device,
+            "cpu_id": "09000000deadbeefdeadbeefdeadbeef",
+        }));
+        assert_eq!(hex_of_data(&id), own_cpu);
+        assert_eq!(id["layer"], json!("attk"));
+
+        // 2. ASK 文档：cpu_id 是 ATTK 的、pub_key 是 ASK 的、签名是 ATTK 私钥签的。
+        let uid = 1_010_490i64; // user 10 的微信，uid 本身是完整的
+        let ask = call(json!({ "op": "export_ask_public_key", "uid": uid, "device_id": device }));
+        assert_eq!(ask["payload"]["cpu_id"], json!(own_cpu));
+        assert_eq!(ask["payload"]["uid"], json!(uid.to_string()));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(ask["data"].as_str().expect("data is base64"))
+            .expect("payload decodes");
+        let (ask_doc, ask_sig) = split_ask_payload(&raw).expect("ASK payload splits");
+        let ask_public = pem_of(core::str::from_utf8(ask_doc).expect("json is utf-8"));
+        assert!(
+            verifies(&own_public, ask_doc, ask_sig),
+            "ASK 证书必须由上传的那把 ATTK 签"
+        );
+        assert!(
+            !verifies(&ask_public, ask_doc, ask_sig),
+            "ASK 不是自己签自己"
+        );
+        let exported = call(json!({ "op": "export_attk_public_key" }));
+        let exported_pem = exported["text"].as_str().expect("ATTK PEM is printable");
+        assert!(rsa::RsaPublicKey::from_public_key_pem(exported_pem).is_ok());
+        assert_eq!(exported_pem, own_public, "导出的 ATTK 公钥就是上传那把");
+
+        // 3. AuthKey 用 ASK 签，签名现场用 AuthKey 签，一条链自洽。
+        assert_eq!(
+            call(
+                json!({ "op": "generate_auth_key_pair", "uid": uid, "alias": "pay", "device_id": device })
+            )["error_code"],
+            json!(0)
+        );
+        assert_eq!(
+            call(json!({ "op": "has_auth_key", "uid": uid, "alias": "pay", "device_id": device }))
+                ["error_code"],
+            json!(0)
+        );
+        let auth = call(
+            json!({ "op": "export_auth_key_public_key", "uid": uid, "alias": "pay", "device_id": device }),
+        );
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(auth["data"].as_str().expect("data is base64"))
+            .expect("auth payload decodes");
+        let (auth_doc, auth_sig) = split_ask_payload(&raw).expect("auth payload splits");
+        assert!(
+            verifies(&ask_public, auth_doc, auth_sig),
+            "AuthKey 证书是 ASK 签的"
+        );
+        let auth_public = pem_of(core::str::from_utf8(auth_doc).expect("json is utf-8"));
+
+        let init = call(
+            json!({ "op": "init_sign", "uid": uid, "alias": "pay", "challenge": "raw", "device_id": device }),
+        );
+        let session = init["session"].as_i64().expect("init returns a session");
+        let finish = call(json!({
+            "op": "finish_sign",
+            "uid": uid,
+            "alias": "pay",
+            "session": session,
+            "device_id": device,
+        }));
+        assert_eq!(finish["error_code"], json!(0));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(finish["data"].as_str().expect("data is base64"))
+            .expect("sign payload decodes");
+        let (sign_doc, sign_sig) = split_ask_payload(&raw).expect("sign payload splits");
+        assert!(
+            verifies(&auth_public, sign_doc, sign_sig),
+            "签名现场是 AuthKey 签的"
+        );
+
+        // 4. 换一把 ATTK（同层、不同 id）就是另一套料：新身份手里没有刚才那张会话/钥匙。
+        let other = AttkMaterial {
+            id: 900_002,
+            name: "test-attk-2".to_string(),
+            cpu_id: "09000000aaaabbbbccccddddeeeeffff".to_string(),
+            pem: RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)
+                .expect("rsa keygen")
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("pkcs8 pem")
+                .to_string(),
+        };
+        let ask_other = run_layer(
+            "attk",
+            device,
+            &json!({ "op": "export_ask_public_key", "uid": uid, "device_id": device }),
+            None,
+            Some(&other),
+        )
+        .expect("handled");
+        assert_eq!(
+            ask_other["payload"]["cpu_id"],
+            json!(other.cpu_id),
+            "换一把 ATTK，cpu_id 跟着换"
+        );
+        let auth_other = run_layer(
+            "attk",
+            device,
+            &json!({ "op": "has_auth_key", "uid": uid, "alias": "pay", "device_id": device }),
+            None,
+            Some(&other),
+        )
+        .expect("handled");
+        assert_eq!(
+            auth_other["error_code"],
+            json!(-6),
+            "另一把 ATTK 不认识前一把建过的 AuthKey"
         );
     }
 

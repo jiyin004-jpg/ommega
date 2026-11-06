@@ -350,6 +350,8 @@ pub fn is_listed_real_app(cfg: &Config, caller_pkg: Option<&str>) -> bool {
     } else {
         cfg.soter_real_app_packages.clone()
     };
+    // 控制台上写了名单就盖掉上面那套（`soter_policy` 是运行时可改的）。
+    let packages = crate::soter_policy::real_packages(&packages);
     let known = split_list(&packages);
     split_list(pkg)
         .iter()
@@ -384,6 +386,7 @@ pub fn reason_with_caller(
         } else {
             cfg.soter_real_app_packages.clone()
         };
+        let packages = crate::soter_policy::real_packages(&packages);
         let known = split_list(&packages);
         // 一个 uid 可能挂着好几个包（GMS 那种共享 uid），A 端把本机解析出来的包名
         // 逗号连起来一起报；命中任意一个就算真应用。
@@ -421,9 +424,13 @@ fn reason_without_caller(
     } else {
         cfg.soter_real_app_prefixes.clone()
     };
+    let real_prefixes = crate::soter_policy::real_prefixes(&real_prefixes);
+    let local_only_prefixes =
+        crate::soter_policy::local_only_prefixes(&cfg.soter_local_only_prefixes);
+    let local_only_uids = crate::soter_policy::local_only_uids(&cfg.soter_local_only_uids);
     let now = chrono::Utc::now().timestamp_millis();
     let force_real = uid
-        .map(|uid| uid_listed(device, uid, cfg.soter_local_only_uids.as_str()))
+        .map(|uid| uid_listed(device, uid, local_only_uids.as_str()))
         .unwrap_or(false);
 
     // 只认包名（2026-10-20 定）：带 uid 但没包名 = 老 A 端，没有可信判据，
@@ -440,7 +447,7 @@ fn reason_without_caller(
     // 上一笔是谁答的：ASK 与 AuthKey 必须同源（两把 ASK 不是同一把，混着给 App 就验不过）。
     let sticky = uid.and_then(|uid| notes.last_side(device, uid, now));
 
-    if prefix_hit(alias, cfg.soter_local_only_prefixes.as_str()) {
+    if prefix_hit(alias, &local_only_prefixes) {
         if let Some(uid) = uid {
             notes.served(device, uid, false, now);
         }

@@ -246,6 +246,11 @@ fn build_router(cfg: &Arc<Config>) -> Router {
             axum::routing::delete(admin::admin_soter_attk_delete),
         )
         .route(
+            "/api/admin/soter_policy/",
+            get(admin::admin_soter_policy_status).post(admin::admin_soter_policy_set),
+        )
+        .route("/api/admin/soter_slots/", get(admin::admin_soter_slots))
+        .route(
             "/api/admin/default_device/",
             get(admin::admin_default_device_status).post(admin::admin_default_device_set),
         )

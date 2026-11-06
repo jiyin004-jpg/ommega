@@ -1698,14 +1698,32 @@ async fn run_soter_task_inner(
         .map(str::trim)
         .filter(|pkg| !pkg.is_empty())
         .unwrap_or("-");
+    // AOSP 那套拆法（`user = uid / 100000`、`app = uid % 100000`）：工作资料（10/11）、
+    // 分身（999）里的同一个应用 uid 完全不同，日志里分开写，排障时一眼能认出是谁。
+    let uid_ctx = body
+        .get("uid")
+        .and_then(Value::as_i64)
+        .map(|v| v as i32)
+        .and_then(crate::android_uid::Uid::parse);
     tracing::info!(
-        "soter: op={op} uid={probe_uid} alias={probe_alias} caller_pkg={caller_pkg} requested={}",
+        "soter: op={op} uid={probe_uid} uid_scope={} alias={probe_alias} caller_pkg={caller_pkg} requested={}",
+        uid_ctx
+            .map(|u| u.label())
+            .unwrap_or_else(|| "-".to_string()),
         if requested.is_empty() {
             "<any>"
         } else {
             requested
         }
     );
+    // 隔离进程（AOSP 90000..=99999）没有自己的身份，真机上这类进程也拿不到 keystore 里的
+    // 密钥。真报上来就是探测信号，记一笔留着看，不改变答复（老 A 端也可能这么报）。
+    if let Some(iso) = uid_ctx.filter(|u| u.is_isolated()) {
+        tracing::warn!(
+            "soter: 隔离进程在要 SOTER（uid={}），AOSP 里这种进程没有独立身份",
+            iso.label()
+        );
+    }
 
     // 探测机（春秋 / 鸭子）的 SOTER 请求不落 B 端：用服务端内置物料就地作答。这两台探测器
     // 把整套流程反复地跑，每一笔都要真机 TEE 陪着走一遍（实测当前每分钟十几到二十几笔），
@@ -1813,6 +1831,12 @@ async fn run_soter_task_inner(
 
     let request_deadline =
         tokio::time::Instant::now() + Duration::from_secs(state.cfg.soter_wait_result_timeout_secs);
+    // 层序跟着 SOTER 策略走（控制台可改、立即生效、落盘）：
+    //   真机模式   `b → keybox → self_signed`（B 按设备 id 处理，处理不了才落服务端）
+    //   服务端密钥  `attk → self_signed`（全用控制台上传的 ATTK，一次都不碰 B）
+    let policy = crate::soter_policy::snapshot();
+    let server_key_mode = policy.mode == crate::soter_policy::Mode::ServerKey;
+    let order_owned = policy.layers();
     let mut last_error: Option<String> = None;
 
     // B 端这一层有没有能接活的设备，先问一次：没有就是「这层结构性地做不了」，
@@ -1890,12 +1914,15 @@ async fn run_soter_task_inner(
     } else {
         b_target
     };
+    // 服务端密钥模式不碰 B：候选一律作废，后面的写操作拦截、签名租约、能力挑选
+    // 都跟着走不着（那一整套是给真机那条路用的）。
+    let b_target = if server_key_mode { None } else { b_target };
 
     // 点名的 B 端能用就先走它，物理 / serverbox 两种模式一样：服务端那两层只在
     // 这台接不了（离线、能力不足、或这一笔做不下去）时才接管。没点名、或点名那台
     // 不可用时保持原来的模式顺序（serverbox 先服务端）。
     // 点名的 B 能用、或者落到了兜底 B，都先走 B；两者都没有才按模式顺序。
-    let order: &[&str] = &["b", "keybox", "self_signed"];
+    let order: &[&str] = &order_owned;
 
     // Physical finish must never fall through to a fabricated session or repair
     // without a live lease. Unknown/expired handles are terminal business errors.
@@ -1930,13 +1957,15 @@ async fn run_soter_task_inner(
     } else {
         false
     };
-    if soter_mutation_cross_served(
-        op,
-        requested,
-        b_target.as_deref(),
-        session_present,
-        substituted,
-    ) {
+    if !server_key_mode
+        && soter_mutation_cross_served(
+            op,
+            requested,
+            b_target.as_deref(),
+            session_present,
+            substituted,
+        )
+    {
         tracing::warn!(
             "soter: op={op} uid={probe_uid} 点名设备 {requested} 这会儿接不了这笔写操作\
              （b_target={:?} requested_online={requested_online}），不换设备、不落兜底层",
@@ -2021,6 +2050,9 @@ async fn run_soter_task_inner(
     // 把它原样还回去 —— 比递一个「钥匙不在这层」的 -5 准得多。
     let mut b_error_reply: Option<Value> = None;
     let mut served_device: Option<String> = None;
+    // 服务端密钥模式用哪把 ATTK：先看身份绑定规则（用户号 / 完整 uid / 用户内应用号 /
+    // 包名），没命中就用控制台设的默认那把，都没有才用库里标了默认的。
+    let attk_choice = policy.attk_for(uid_arg, caller_pkg_arg);
 
     for &layer in &layers {
         let result = match layer {
@@ -2247,7 +2279,31 @@ async fn run_soter_task_inner(
                     Err(_) => return Json(json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_deadline"})).into_response(),
                 }
             }
-            "keybox" | "self_signed" => run_layer_soter(state, layer, body, requested).await,
+            "keybox" | "self_signed" | "attk" => {
+                // `attk` 层：finish 必须回到开这张会话的那把 ATTK 上 —— 同一层换一把
+                // 就是另一套 ASK/AuthKey，拿别的钥匙签回来的会话 App 验不过。
+                let attk_id = if layer == "attk" {
+                    if op == "finish_sign" {
+                        session_arg
+                            .and_then(|s| crate::soter_mint::session_attk(requested, s))
+                            .or(attk_choice)
+                    } else {
+                        attk_choice
+                    }
+                } else {
+                    None
+                };
+                run_layer_soter(
+                    state,
+                    layer,
+                    body,
+                    requested,
+                    uid_arg,
+                    caller_pkg_arg,
+                    attk_id,
+                )
+                .await
+            }
             _ => None,
         };
         match result {
@@ -2775,22 +2831,30 @@ fn server_layer_missed_the_slot(layer: &str, op: &str, reply: &Value) -> Option<
     .then_some(code)
 }
 
-/// 服务端那两层：`keybox` 层得先从库里把这台设备名下的服务端身份私钥拿出来
-/// （只有 RSA 才签得动 SOTER），拿不到就让下一层试。
+/// 服务端那三层：
+///   - `keybox` 得先从库里把这台设备名下的服务端身份私钥拿出来（只有 RSA 才签得动
+///     SOTER），拿不到就让下一层试；
+///   - `attk` 是服务端密钥模式，拿控制台上传的那把 ATTK（私钥 + 它自己的 cpu_id），
+///     具体哪把由 `soter_policy` 的身份规则挑（`attk_id`）；
+///   - `self_signed` 现生成一把。
 async fn run_layer_soter(
     state: &AppState,
     layer: &str,
     body: &Value,
     device_id: &str,
+    uid: Option<i32>,
+    caller_pkg: Option<&str>,
+    attk_id: Option<i64>,
 ) -> Option<Value> {
     let db = state.db.clone();
     let layer = layer.to_string();
     let body = body.clone();
     let device_id = device_id.to_string();
+    let caller_pkg = caller_pkg.unwrap_or("-").to_string();
     let result = tokio::task::spawn_blocking(move || {
         let key_pem = if layer == "keybox" {
             // keybox 层只认 RSA：EC 身份签不动 SOTER，那就是这层没物料。
-            db.and_then(|db| match db.get_device_identity_by_id(&device_id, "rsa") {
+            db.as_ref().and_then(|db| match db.get_device_identity_by_id(&device_id, "rsa") {
                 Ok(Some(identity)) => Some(identity.private_key_pem_cipher),
                 Ok(None) => None,
                 Err(e) => {
@@ -2803,7 +2867,54 @@ async fn run_layer_soter(
         } else {
             None
         };
-        crate::soter_mint::run(&layer, &device_id, &body, key_pem.as_deref())
+        // 服务端密钥模式：按策略挑出来的那把 ATTK。挑不出来（没传过、被禁了、删了）
+        // 就是这层没物料，往下落自签，别把请求挂在这一层上。
+        // 点名了具体 id 但那一把被禁/删了时，退回「库里标默认/最早启用的那把」——
+        // 总比直接落到自签好（自签对腾讯那边肯定是假料）。
+        let attk = if layer == "attk" {
+            let pick = |wanted: Option<i64>| {
+                db.as_ref().and_then(|db| match db.pick_soter_attk(wanted) {
+                    Ok(hit) => hit,
+                    Err(e) => {
+                        tracing::warn!("soter: attk 层读 ATTK 库失败: {e:#}");
+                        None
+                    }
+                })
+            };
+            let mut picked = pick(attk_id);
+            if picked.is_none() && attk_id.is_some() {
+                picked = pick(None);
+                if picked.is_some() {
+                    tracing::warn!(
+                        "soter: 指定的 ATTK {attk_id:?} 不可用（被禁/删了），改用库里标默认的那把"
+                    );
+                }
+            }
+            match picked {
+                Some((row, pem)) => Some(crate::soter_mint::AttkMaterial {
+                    id: row.id,
+                    name: row.name,
+                    cpu_id: row.cpu_id,
+                    pem,
+                }),
+                None => {
+                    tracing::warn!(
+                        "soter: 服务端密钥模式没有可用的 ATTK（attk_id={attk_id:?} \
+                         uid={uid:?} caller_pkg={caller_pkg}），这一笔落到下一层"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        crate::soter_mint::run_layer(
+            &layer,
+            &device_id,
+            &body,
+            key_pem.as_deref(),
+            attk.as_ref(),
+        )
     })
     .await;
     match result {

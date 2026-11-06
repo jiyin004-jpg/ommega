@@ -600,6 +600,93 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
   </div>
 </div>
 
+<!-- SOTER 策略：真机模式 / 服务端密钥模式 + 白名单 + 多身份选路 -->
+<div class="panel">
+  <h2>SOTER 策略 <span class="hint">两种模式共用一份白名单：不在名单里的调用一律打回 A 端本地作答。真机模式按设备 id 找 B 端处理（处理不了才落服务端身份 → 自签）；服务端密钥模式全用下面 ATTK 库里那把私钥铸料，一次都不碰 B</span></h2>
+  <div class="body">
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">模式</span>
+      <div class="seg" id="spMode">
+        <button type="button" class="seg-btn" data-mode="real" onclick="setSoterMode('real')">真机模式</button>
+        <button type="button" class="seg-btn" data-mode="server_key" onclick="setSoterMode('server_key')">服务端密钥模式</button>
+      </div>
+      <span class="hint" id="spModeHint" style="flex:1;min-width:220px;">—</span>
+    </div>
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">默认 ATTK</span>
+      <select id="spAttk" style="flex:1;min-width:260px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+        <option value="">（用 ATTK 库里标了默认的那把）</option>
+      </select>
+    </div>
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; margin-bottom:10px;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;padding-top:9px;">真应用白名单</span>
+      <textarea id="spPackages" rows="4" placeholder="com.tencent.mm, com.eg.android.AlipayGphone …（留空 = 用环境变量 / 内置缺省那套）"
+                style="flex:1;min-width:260px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;font-family:var(--mono,monospace);"></textarea>
+    </div>
+    <p class="hint" style="margin:0 0 10px;line-height:1.7;">按包名判真应用（A 端用内核给的调用方 uid 在本机翻出来，伪造不了）。逗号或换行分隔，写主包名就够，`:push` / `:tools` 这类进程名自动算同一个应用。</p>
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:6px;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">只许真机 uid</span>
+      <input id="spLocalUids" placeholder="10490, device-b-xxxxxxxx:10490（留空 = 用环境变量）" autocapitalize="none"
+             style="flex:1;min-width:240px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+      <button class="btn primary" onclick="saveSoterPolicy()">保存策略</button>
+      <button class="btn" onclick="loadSoterPolicy()">重新读取</button>
+      <button class="btn" onclick="resetSoterPolicy()">恢复缺省</button>
+    </div>
+    <p class="hint" id="spStatus" style="margin:12px 0 0;line-height:1.7;">加载中…</p>
+
+    <hr style="margin:18px 0;border:none;border-top:1px solid var(--border);">
+    <h3 style="margin:0 0 6px;font-size:14px;">身份绑定（多 ATTK / 多用户 / 多身份）</h3>
+    <p class="hint" style="margin:0 0 10px;line-height:1.7;">
+      uid 照 AOSP 拆：<b>用户号 = uid / 100000</b>（机主 0、工作资料 10/11、分身 999），<b>应用号 = uid % 100000</b>。
+      所以同一个包在不同用户下 uid 完全不同（微信在机主是 10490，在分身里是 99910490），每一条槽位、每一把钥匙都各算各的。
+      规则里四个格子内是「或」、格子之间是「且」，自上往下第一条命中的算数；都不命中就用上面的默认 ATTK。四格全空的规则不算数。
+    </p>
+    <div id="spRules"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
+      <button class="btn small" onclick="addSoterRule()">+ 加一条规则</button>
+      <button class="btn small primary" onclick="saveSoterPolicy()">保存规则</button>
+    </div>
+
+    <hr style="margin:18px 0;border:none;border-top:1px solid var(--border);">
+    <h3 style="margin:0 0 6px;font-size:14px;">ATTK 库 <span class="hint">SOTER 的身份 = 一对 RSA 私钥 + 它自己的 cpu_id；私钥加密存库、列表不回显</span></h3>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>名称</th><th>cpu_id</th><th>状态</th><th>默认</th><th>备注</th><th>上传时间</th><th>操作</th></tr></thead>
+        <tbody id="spAttkBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;">
+      <input id="spAttkName" placeholder="名称（例如 PLC110-ATTK）"
+             style="flex:0 1 200px;min-width:160px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+      <input id="spAttkCpu" placeholder="cpu_id（32 个十六进制字符）" autocapitalize="none"
+             style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;font-family:var(--mono,monospace);">
+      <input id="spAttkRemark" placeholder="备注（可空）"
+             style="flex:0 1 180px;min-width:140px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+    </div>
+    <textarea id="spAttkPem" rows="5" placeholder="-----BEGIN PRIVATE KEY-----（RSA，PKCS#8 或 PKCS#1；EC 不行，SOTER 的签名是 RSA-PSS）"
+              style="width:100%;box-sizing:border-box;margin-top:8px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:12px;font-family:var(--mono,monospace);"></textarea>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+      <button class="btn primary" onclick="uploadSoterAttk()">上传 ATTK</button>
+    </div>
+    <p class="hint" id="spAttkStatus" style="margin:10px 0 0;line-height:1.7;"></p>
+
+    <hr style="margin:18px 0;border:none;border-top:1px solid var(--border);">
+    <h3 style="margin:0 0 6px;font-size:14px;">槽位（多用户视角） <span class="hint">服务端记着的「设备 + uid」槽位，钉在哪一层、最近什么时候动过</span></h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+      <button class="btn small" onclick="loadSoterSlots()">刷新槽位</button>
+      <span class="hint" id="spSlotStatus">点一下才去读（这台库里有几万条时不占页面）</span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>设备</th><th>uid</th><th>用户</th><th>应用号</th><th>钉在</th><th>最近</th></tr></thead>
+        <tbody id="spSlotBody"><tr><td colspan="6" class="empty">未加载</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <div class="modal-mask" id="modalMask" onclick="if(event.target===this)closeModal()">
@@ -1440,8 +1527,273 @@ async function clearDefaultDevice() {
   await saveDefaultDevice();
 }
 
+/* ---------------- SOTER 策略 / ATTK / 槽位 ---------------- */
+let _soterAttk = [];
+let _soterPolicy = null;
+
+const SOTER_MODE_DESC = {
+  real: '真机模式：按请求里的设备 id 交给那台 B（B 处理不了才落服务端身份 → 自签）',
+  server_key: '服务端密钥模式：全用下面 ATTK 那把私钥铸料，一次都不碰 B（没有可用 ATTK 时落自签）',
+};
+
+function soterAttkLabel(a) {
+  const state = a.enabled ? '' : '（已禁用）';
+  const def = a.is_default ? '（默认）' : '';
+  return `#${a.id} ${a.name} · ${a.cpu_id}${def}${state}`;
+}
+
+function renderSoterAttkOptions() {
+  // 默认那把 + 每条规则里的下拉共用同一份 ATTK 列表。
+  const fill = (sel, current) => {
+    if (!sel) return;
+    const head = sel.querySelector('option[value=""]');
+    const headHtml = head ? head.outerHTML : '<option value="">（未指定）</option>';
+    sel.innerHTML = headHtml + _soterAttk.map(a =>
+      `<option value="${a.id}" ${String(a.id) === String(current || '') ? 'selected' : ''}>${esc(soterAttkLabel(a))}</option>`
+    ).join('');
+    sel.value = current == null ? '' : String(current);
+    if (sel.value === '' && current != null) {
+      // 引用了库里不存在的 ATTK：留一条看得见的选项，别默默清掉。
+      const op = document.createElement('option');
+      op.value = String(current);
+      op.textContent = `#${current}（已不在库里）`;
+      sel.appendChild(op);
+      sel.value = String(current);
+    }
+  };
+  fill($('#spAttk'), _soterPolicy ? _soterPolicy.attk_id : '');
+  document.querySelectorAll('#spRules .spRuleAttk').forEach(sel => {
+    fill(sel, sel.value || sel.dataset.current || '');
+  });
+}
+
+function setSoterModeUI(mode) {
+  document.querySelectorAll('#spMode .seg-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  $('#spModeHint').textContent = SOTER_MODE_DESC[mode] || SOTER_MODE_DESC.real;
+}
+
+async function setSoterMode(mode) {
+  try {
+    await api('/api/admin/soter_policy/', { method: 'POST', body: JSON.stringify({ mode }) });
+    toast(`SOTER 策略已切到「${mode === 'server_key' ? '服务端密钥模式' : '真机模式'}」（立即生效）`);
+    loadSoterPolicy();
+  } catch (e) { toast('切换失败: ' + e.message, 'err'); loadSoterPolicy(); }
+}
+
+function soterRuleRow(rule) {
+  const row = document.createElement('div');
+  row.className = 'token-gen';
+  row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;';
+  const box = 'background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:8px 10px;font-size:12px;';
+  row.innerHTML = `
+    <select class="spRuleAttk" style="flex:1 1 220px;min-width:200px;${box}"><option value="">（未指定）</option></select>
+    <input class="spRuleUsers" placeholder="用户号 0,10,999" style="flex:0 1 130px;min-width:110px;${box}">
+    <input class="spRuleUids" placeholder="完整 uid" style="flex:0 1 120px;min-width:100px;${box}">
+    <input class="spRuleApps" placeholder="应用号" style="flex:0 1 110px;min-width:90px;${box}">
+    <input class="spRulePkgs" placeholder="包名（逗号分隔）" style="flex:1 1 200px;min-width:160px;${box}">
+    <button class="btn small danger" onclick="this.parentNode.remove()">删</button>`;
+  row.querySelector('.spRuleUsers').value = (rule && rule.users || []).join(',');
+  row.querySelector('.spRuleUids').value = (rule && rule.uids || []).join(',');
+  row.querySelector('.spRuleApps').value = (rule && rule.app_ids || []).join(',');
+  row.querySelector('.spRulePkgs').value = (rule && rule.packages || []).join(',');
+  row.querySelector('.spRuleAttk').dataset.current = rule ? String(rule.attk_id) : '';
+  return row;
+}
+
+function renderSoterRules(rules) {
+  const box = $('#spRules');
+  box.innerHTML = '';
+  if (!rules.length) {
+    box.innerHTML = '<p class="hint" style="margin:0 0 8px;line-height:1.7;">还没有规则：服务端密钥模式下所有请求都用「默认 ATTK」。</p>';
+    return;
+  }
+  rules.forEach(r => box.appendChild(soterRuleRow(r)));
+  renderSoterAttkOptions();
+}
+
+function addSoterRule() {
+  const box = $('#spRules');
+  if (!box.querySelector('.spRuleAttk')) box.innerHTML = '';
+  box.appendChild(soterRuleRow(null));
+  renderSoterAttkOptions();
+}
+
+function soterNumList(raw) {
+  return String(raw || '').split(/[,;\s]+/).map(s => s.trim()).filter(Boolean)
+    .map(s => Number(s)).filter(n => Number.isInteger(n));
+}
+
+function soterNameList(raw) {
+  return String(raw || '').split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+}
+
+async function loadSoterPolicy() {
+  try {
+    const [p, a] = await Promise.all([
+      api('/api/admin/soter_policy/'),
+      api('/api/admin/soter_attk/'),
+    ]);
+    _soterPolicy = p;
+    _soterAttk = a.items || [];
+    $('#spPackages').value = (p.whitelist && p.whitelist.packages) || '';
+    $('#spLocalUids').value = (p.whitelist && p.whitelist.local_only_uids) || '';
+    renderSoterRules(p.identities || []);
+    renderSoterAttkOptions();
+    setSoterModeUI(p.mode || 'real');
+    renderSoterAttkList();
+    const eff = p.effective_whitelist || {};
+    const pkgs = soterNameList(eff.packages);
+    const bCount = (p.layers || []).length;
+    $('#spStatus').textContent =
+      `当前：${p.mode === 'server_key' ? '服务端密钥模式' : '真机模式'} · 层序 ${(p.layers || []).join(' → ')}（${bCount} 层）`
+      + ` · 生效白名单 ${pkgs.length} 个包 · 身份规则 ${(p.identities || []).length} 条`
+      + (p.persisted ? '' : '（尚未落盘）');
+  } catch (e) { $('#spStatus').textContent = '读取失败: ' + e.message; }
+}
+
+function soterPolicyFromForm() {
+  const identities = [];
+  document.querySelectorAll('#spRules .spRuleAttk').forEach(sel => {
+    const row = sel.closest('.token-gen');
+    const attkId = Number(sel.value || 0);
+    const rule = {
+      attk_id: attkId,
+      users: soterNumList(row.querySelector('.spRuleUsers').value),
+      uids: soterNumList(row.querySelector('.spRuleUids').value),
+      app_ids: soterNumList(row.querySelector('.spRuleApps').value),
+      packages: soterNameList(row.querySelector('.spRulePkgs').value),
+    };
+    if (!attkId) { toast('规则里有一行没选 ATTK，先去选一把', 'err'); throw new Error('rule without attk'); }
+    if (!rule.users.length && !rule.uids.length && !rule.app_ids.length && !rule.packages.length) {
+      toast('规则里有一行四个条件都空着，删掉那行或补一个条件', 'err');
+      throw new Error('empty rule');
+    }
+    identities.push(rule);
+  });
+  const body = {
+    whitelist: {
+      packages: $('#spPackages').value.trim(),
+      local_only_uids: $('#spLocalUids').value.trim(),
+    },
+    identities,
+  };
+  const attk = $('#spAttk').value;
+  if (attk) body.attk_id = Number(attk); else body.clear_attk = true;
+  return body;
+}
+
+async function saveSoterPolicy() {
+  try {
+    const body = soterPolicyFromForm();
+    const d = await api('/api/admin/soter_policy/', { method: 'POST', body: JSON.stringify(body) });
+    _soterPolicy = d;
+    toast('SOTER 策略已保存（立即生效）');
+    loadSoterPolicy();
+  } catch (e) {
+    if (e && e.message && e.message !== 'rule without attk' && e.message !== 'empty rule') {
+      toast('保存失败: ' + e.message, 'err');
+    }
+  }
+}
+
+async function resetSoterPolicy() {
+  if (!confirm('恢复缺省：真机模式、白名单改回环境变量 / 内置那套、身份规则清空。确定？')) return;
+  try {
+    await api('/api/admin/soter_policy/', { method: 'POST', body: JSON.stringify({ reset: true }) });
+    toast('已恢复缺省');
+    loadSoterPolicy();
+  } catch (e) { toast('恢复失败: ' + e.message, 'err'); }
+}
+
+function renderSoterAttkList() {
+  const body = $('#spAttkBody');
+  if (!_soterAttk.length) {
+    body.innerHTML = '<tr><td colspan="7" class="empty">还没有 ATTK（在下面粘贴一把 RSA 私钥上传）</td></tr>';
+    return;
+  }
+  body.innerHTML = _soterAttk.map(a => `
+    <tr>
+      <td><b>#${a.id}</b> ${esc(a.name)}</td>
+      <td class="mono">${esc(a.cpu_id)}</td>
+      <td>${a.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">禁用</span>'}</td>
+      <td>${a.is_default ? '<span class="tag on">默认</span>' : '<span class="muted">—</span>'}</td>
+      <td>${esc(a.remark || '—')}</td>
+      <td class="mono">${esc(a.created_at || '—')}</td>
+      <td>
+        <button class="btn small" onclick="toggleSoterAttk(${a.id}, ${a.enabled ? 'false' : 'true'})">${a.enabled ? '禁用' : '启用'}</button>
+        ${a.is_default ? '' : `<button class="btn small" onclick="makeSoterAttkDefault(${a.id})">设为默认</button>`}
+        <button class="btn small danger" onclick="delSoterAttk(${a.id})">删除</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function uploadSoterAttk() {
+  const name = $('#spAttkName').value.trim();
+  const cpu = $('#spAttkCpu').value.trim();
+  const pem = $('#spAttkPem').value.trim();
+  const remark = $('#spAttkRemark').value.trim();
+  if (!name || !cpu || !pem) return toast('名称、cpu_id、私钥三样都要填', 'err');
+  try {
+    const d = await api('/api/admin/soter_attk/', {
+      method: 'POST',
+      body: JSON.stringify({ name, cpu_id: cpu, private_key_pem: pem, remark }),
+    });
+    $('#spAttkStatus').textContent = `已上传：id=${d.id} ${name}`;
+    $('#spAttkName').value = ''; $('#spAttkCpu').value = ''; $('#spAttkPem').value = ''; $('#spAttkRemark').value = '';
+    toast('ATTK 已上传');
+    loadSoterPolicy();
+  } catch (e) { $('#spAttkStatus').textContent = '上传失败: ' + e.message; }
+}
+
+async function toggleSoterAttk(id, enabled) {
+  try {
+    await api(`/api/admin/soter_attk/${id}/active/`, { method: 'POST', body: JSON.stringify({ enabled }) });
+    toast(enabled ? '已启用' : '已禁用（引用了它的规则会落空到下一层）');
+    loadSoterPolicy();
+  } catch (e) { toast('操作失败: ' + e.message, 'err'); }
+}
+
+async function makeSoterAttkDefault(id) {
+  try {
+    await api(`/api/admin/soter_attk/${id}/default/`, { method: 'POST' });
+    toast('已设为默认 ATTK');
+    loadSoterPolicy();
+  } catch (e) { toast('操作失败: ' + e.message, 'err'); }
+}
+
+async function delSoterAttk(id) {
+  if (!confirm(`删除 ATTK #${id}？引用它的规则也会失效（会落到下一层自签）。`)) return;
+  try {
+    await api(`/api/admin/soter_attk/${id}/`, { method: 'DELETE' });
+    toast('已删除');
+    loadSoterPolicy();
+  } catch (e) { toast('删除失败: ' + e.message, 'err'); }
+}
+
+async function loadSoterSlots() {
+  $('#spSlotStatus').textContent = '读取中…';
+  try {
+    const d = await api('/api/admin/soter_slots/');
+    const items = d.items || [];
+    $('#spSlotStatus').textContent = `共 ${d.total ?? items.length} 条，最多显示最近 300 条`;
+    $('#spSlotBody').innerHTML = items.length ? items.map(s => {
+      const u = s.uid_scope;
+      return `<tr>
+        <td class="mono">${esc(s.device_id)}</td>
+        <td class="mono">${s.uid ?? '—'}</td>
+        <td>${u ? esc(u.user) : '—'}</td>
+        <td>${u ? esc(u.app) : '—'}${u && !u.is_app ? ' <span class="muted">（非应用 uid）</span>' : ''}</td>
+        <td>${esc(s.layer || '—')}</td>
+        <td class="mono">${s.pinned_at ? fmtTime(s.pinned_at) : '—'}</td>
+      </tr>`;
+    }).join('') : '<tr><td colspan="6" class="empty">还没有槽位</td></tr>';
+  } catch (e) { $('#spSlotStatus').textContent = '读取失败: ' + e.message; }
+}
+
 function loadAll() {
-  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadIdentityPolicy(); loadDefaultDevice(); loadBLimit();
+  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadIdentityPolicy(); loadDefaultDevice(); loadBLimit(); loadSoterPolicy();
 }
 
 /* Upload */
