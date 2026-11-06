@@ -2230,7 +2230,13 @@ async fn run_soter_task_inner(
                                 }
                             }
                         }
-                        None if op == "finish_sign" => return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response(),
+                        // 没有 B 可派（服务端密钥模式、或者这一笔本来就落在服务端那两层）
+                        // 时不能拿它当会话过期：这张会话是服务端自己开的，签名也在服务端
+                        // 本地做，压根不需要 B 的租约。以前这里不看 server_owner，服务端
+                        // 密钥模式下每一笔 finish_sign 都被判成 -204。
+                        None if op == "finish_sign" && server_owner.is_none() => {
+                            return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response()
+                        }
                         None => None,
                     }
                 } else {
