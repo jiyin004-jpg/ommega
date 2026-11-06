@@ -142,6 +142,10 @@ pub fn check_key_permission(
 }
 
 /// This function checks whether a given tag corresponds to the access of device identifiers.
+///
+/// 范围与 AOSP `keystore2/src/utils.rs` 一字不差（IMEI / MEID / SERIAL /
+/// DEVICE_UNIQUE_ATTESTATION / SECOND_IMEI）—— 这五项都要 READ_PRIVILEGED_PHONE_STATE。
+/// 不要自作主张删掉 SERIAL 或 DEVICE_UNIQUE_ATTESTATION：AOSP 就是包含它们的。
 pub fn is_device_id_attestation_tag(tag: Tag) -> bool {
     matches!(
         tag,

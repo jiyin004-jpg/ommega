@@ -630,10 +630,15 @@ impl KeystoreSecurityLevel {
         //
         // 原因：中继给不了「叶子带本机 710..717 + 真 TEE 链」这两头。带上 ID 后 B 的真
         // TEE 会以 CannotAttestIds(-66) 拒，链就掉到服务端的 keybox（那份已吊销），拿链的
-        // 一方（Google 服务端）会直接判不过 —— 反而不如给一条真 TEE 链、叶子不带 ID，
-        // 也就是改动前的行为。而普通 App（自查类）要的是公开的 brand/device/product/…，
-        // 这些带上去由中继 keybox 层照写、叶子自洽，那一类检查才过。
-        if params.iter().any(|kp| is_attestation_id_tag(kp.tag))
+        // 一方（Google 服务端）会直接判不过 —— 反而不如给一条真 TEE 链、叶子不带 ID。
+        // 而普通 App（自查类）要的是公开的 brand/device/product/…，这些带上去由中继
+        // keybox 层照写、叶子自洽，那一类检查才过。
+        //
+        // 只在远程出证（`remote_enabled()`：开关开着且 url 不空）时摘：本地模式我们自己的 TA
+        // 能同时给出「本机 ID + 自洽的链」，没必要动调用方要的参数，按 AOSP（它没这一步）
+        // 原样往下传。
+        if crate::remote::remote_enabled()
+            && params.iter().any(|kp| is_attestation_id_tag(kp.tag))
             && check_device_attestation_permissions(ctx).is_ok()
         {
             let before = result.len();
