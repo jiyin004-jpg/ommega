@@ -9,4 +9,5 @@
 - Disguise settings are applied at boot only, so properties and certificates always agree.
 - Remote SOTER is now its own switch, independent from remote attestation.
 - SOTER takeover closes one more gap: on devices whose system SOTER service is unusable and never reaches the hardware, apps' SOTER requests are answered properly now.
+- ECDSA signing in certificates now behaves like the platform's own implementation (long digests are truncated by bit length, every signature is randomized).
 - Nothing is written to /data/local/tmp at runtime any more: the sepolicy application log and the panel's temporary package lists live under the data directory.
