@@ -1600,9 +1600,11 @@ mod iface_choice_tests {
     /// 否则两个开关又绑在一起（面板上「只开 SOTER」就等于什么都不走）。
     #[test]
     fn soter_url_does_not_need_the_keymint_remote_switch() {
-        let mut r = config::RemoteConfig::default();
-        r.enabled = false;
-        r.url = "https://example.com:8443/".to_string();
+        let r = config::RemoteConfig {
+            enabled: false,
+            url: "https://example.com:8443/".to_string(),
+            ..Default::default()
+        };
         assert_eq!(base_url_of(&r, false).unwrap(), "https://example.com:8443");
         assert!(base_url_of(&r, true).is_err());
     }
