@@ -57,16 +57,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # mysql's compression uses flate2; give it the pure-Rust (miniz_oxide) backend so
 # no C zlib (libz-sys) is linked in the musl cross-build.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# 銆岃闀挎湡淇濈暀鐨勭姸鎬併€嶄笉鍐嶅悇鍐欏悇鐨?JSON锛岀粺涓€杩涗竴涓?SQLite 鏂囦欢锛堣 src/statedb.rs锛夈€?
-# bundled 浼氭妸 SQLite 鐨?C 婧愮爜缂栬繘鏉ワ細musl 閭ｆ潯璧?cargo-zigbuild 鐨?zig cc銆?
-# Android 閭ｆ潯璧?NDK 鐨?clang锛屼袱鏉′氦鍙夌紪璇戦兘瀹炴祴杩囷紝鎵€浠ヤ笉鐮磋繖涓枃浠朵竴鐩磋翰鐫€
-# C 渚濊禆鐨勫簳绾匡紙韬茬殑鏄?aws-lc-sys / libz-sys 閭ｇ zig 涔熻垂鍔茬殑锛夈€?
+# 「要长期保留的状态」不再各写各的 JSON，统一进一个 SQLite 文件（见 src/statedb.rs）。
+# bundled 会把 SQLite 的 C 源码编进来：musl 那条走 cargo-zigbuild 的 zig cc。
+# Android 那条走 NDK 的 clang，两条交叉编译都实测过，所以不碰这个文件一直躲着
+# C 依赖的底线（躲的是 aws-lc-sys / libz-sys 那种 zig 也费劲的）。
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-# 鏈湴鎻愪氦鍓嶉挬瀛愶紙閽╁瓙鑴氭湰鍦ㄤ粨搴撴牴鐨?.cargo-husky/hooks/锛夈€備笁绔兘澹版槑涓€浠斤紝
-# 杩欐牱鍦ㄥ摢涓伐浣滃尯璺?cargo test 閮借兘鎶婇挬瀛愯涓娾€斺€旈挬瀛愪笉杩涚増鏈簱锛屽彧瑁呭埌 .git/hooks/銆?
+# 本地提交前钩子（钩子脚本在仓库根的 .cargo-husky/hooks/）。三端都声明一份，
+# 这样在哪个工作区跑 cargo test 都能把钩子装上——钩子不进版本库，只装到 .git/hooks/。
 cargo-husky = { version = "1.5.0", default-features = false, features = ["user-hooks"] }
 
 [profile.release]
