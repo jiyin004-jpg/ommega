@@ -1140,6 +1140,7 @@ pub(crate) fn take_app_answer() -> Option<OwnedReply> {
 /// 拼一笔 App 面向的答复。答不了就返回 `None`（宿主自己那份答复照旧过去）。
 /// 一笔 App 面向调用该答什么。内容与渲染分开：宿主里是顶掉它的 BC_REPLY（拼成 parcel），
 /// 自测端点里是直接往 rsbinder 的 reply 里写 —— 两边用的是同一张答案。
+#[derive(Debug)]
 pub(crate) enum AppAnswer {
     /// 只有返回值的（`generate*` / `has*` / `remove*` / `getVersion`）。
     Int(i32),
@@ -1150,6 +1151,12 @@ pub(crate) enum AppAnswer {
     /// `SoterExtraParam` 里的一个整数。
     Extra(i32),
 }
+
+/// 原厂宿主服务层在把请求发给 HAL 之前自己回的码：空别名 -202、空 challenge -203。
+/// 真机的 SoterService 对这两类请求**根本不发到 TA**，服务层先校验、直接回错。留到下一步
+/// 才处理的话，宿主是壳（只回 -200）的机型上就变成 -200，检测器一眼能看出不是原厂词汇。
+const APP_ERR_EMPTY_ALIAS: i32 = -202;
+const APP_ERR_EMPTY_CHALLENGE: i32 = -203;
 
 /// 算出一笔 App 面向调用的答复。`caller_uid` 是拿谁的 uid 去建/查料：
 /// 宿主里是内核填的 `sender_euid`，自测端点里是命令行给的 uid。
@@ -1166,6 +1173,32 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
             };
             return Some(AppAnswer::Extra(value));
         }
+        _ => {}
+    }
+    // 空参数先按原厂宿主的口径挡掉，顺序也跟原厂一样：别名先、challenge 后。
+    // `hasAuthKey` 例外 —— 原厂对空别名不报错，只回 false。
+    let alias_empty = call.alias.as_deref().unwrap_or("").is_empty();
+    match call.code {
+        4 | 5 | 6 | 9 if alias_empty => {
+            return Some(match call.code {
+                9 => AppAnswer::Session {
+                    session: 0,
+                    code: APP_ERR_EMPTY_ALIAS,
+                },
+                6 => AppAnswer::Export {
+                    code: APP_ERR_EMPTY_ALIAS,
+                    data: None,
+                },
+                _ => AppAnswer::Int(APP_ERR_EMPTY_ALIAS),
+            });
+        }
+        9 if call.challenge.as_deref().unwrap_or("").is_empty() => {
+            return Some(AppAnswer::Session {
+                session: 0,
+                code: APP_ERR_EMPTY_CHALLENGE,
+            });
+        }
+        8 if alias_empty => return Some(AppAnswer::Int(0)),
         _ => {}
     }
     let hal_code = app_code_to_hal(call.code)?;
@@ -2094,6 +2127,57 @@ mod tests {
         // 2 / 6 / 14 是宿主那半边不发、我们也不认的空号
         for code in [2u32, 6, 14] {
             assert!(parse(&request(&|_out| {}), code).is_none());
+        }
+    }
+
+    #[test]
+    fn empty_alias_and_challenge_keep_the_vendors_codes() {
+        // 原厂宿主在服务层就把这两类挡掉、不发 HAL：空别名 -202、空 challenge -203。
+        // 我们要是在这层漏过去，宿主是壳（只回 -200）的机型上就变成 -200 了。
+        fn call(code: u32, alias: &str, challenge: Option<&str>) -> SoterCall {
+            SoterCall {
+                hal: false,
+                hidl: false,
+                has_return_code: true,
+                code,
+                wire_code: code,
+                op: "test",
+                uid: Some(10373),
+                alias: Some(alias.to_string()),
+                challenge: challenge.map(str::to_string),
+                session: None,
+                key: None,
+                caller_uid: Some(10373),
+                data_size: 0,
+            }
+        }
+
+        for code in [4u32, 5] {
+            match answer_app_call(&call(code, "", None), 10373) {
+                Some(AppAnswer::Int(rc)) => assert_eq!(rc, -202, "app {code}"),
+                other => panic!("app {code}: 期望 -202，拿到 {other:?}"),
+            }
+        }
+        match answer_app_call(&call(6, "", None), 10373) {
+            Some(AppAnswer::Export { code: rc, data }) => {
+                assert_eq!(rc, -202);
+                assert!(data.is_none(), "空别名不该带导出数据");
+            }
+            other => panic!("app 6: 期望 -202，拿到 {other:?}"),
+        }
+        // 9 号是别名先、challenge 后，顺序跟原厂一致。
+        match answer_app_call(&call(9, "", Some("0102")), 10373) {
+            Some(AppAnswer::Session { session, code: rc }) => assert_eq!((session, rc), (0, -202)),
+            other => panic!("app 9 空别名：期望 -202，拿到 {other:?}"),
+        }
+        match answer_app_call(&call(9, "SoterAuthKey", Some("")), 10373) {
+            Some(AppAnswer::Session { session, code: rc }) => assert_eq!((session, rc), (0, -203)),
+            other => panic!("app 9 空 challenge：期望 -203，拿到 {other:?}"),
+        }
+        // hasAuthKey 例外：原厂对空别名只回 false，不报错。
+        match answer_app_call(&call(8, "", None), 10373) {
+            Some(AppAnswer::Int(rc)) => assert_eq!(rc, 0, "hasAuthKey 空别名就是 false"),
+            other => panic!("app 8: 期望 0，拿到 {other:?}"),
         }
     }
 
