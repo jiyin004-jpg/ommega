@@ -287,6 +287,7 @@ async fn try_b_device_layer(
     task_type: &str,
     body: &Value,
     device_id: &str,
+    pinned_key_device: bool,
     any_b_online: bool,
     a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Option<Value> {
@@ -294,8 +295,12 @@ async fn try_b_device_layer(
         return Some(json!({ "error": "no B-side device online" }));
     }
     let target = state.store.resolve_online_target(device_id).await;
-    // 配对校验：`pair` 卡密的 A 只能派给同 `pair_id` 的 B；`public` 卡任意；
-    // 两边有一方是老卡密 / 静态 token / 未登记就按历史行为放行。
+    // 配对校验：两个卡种都过一遍 `allows`（`public` 只能配 `public`、`pair` 必须同组）。
+    //
+    // 以前这里写的是 `if a.kind == "pair"`，于是 public 卡整段跳过 —— `allows` 里那条
+    // 「公开卡不能指挥别人的私机」永远执行不到，任何一张白卡都能指挥任意一台私 B 出证、
+    // 签名、动 SOTER 槽位。两边有一方没登记（老客户端 / 静态 token）时 `b_meta` 为
+    // None，仍旧按历史行为放行。
     if let Some(a) = a_meta {
         let b_meta = state
             .store
@@ -307,10 +312,12 @@ async fn try_b_device_layer(
                 kind,
             });
         if let Some(b_meta) = b_meta {
-            if a.kind.eq_ignore_ascii_case("pair") && !a.allows(&b_meta) {
+            if !a.allows(&b_meta) {
                 tracing::info!(
-                    "b_layer: pair mismatch for {target}: A pair={} B pair={}",
+                    "b_layer: pair mismatch for {target}: A kind={} pair={} B kind={} pair={}",
+                    a.kind,
                     a.pair_id,
+                    b_meta.kind,
                     b_meta.pair_id
                 );
                 return Some(json!({
@@ -319,6 +326,24 @@ async fn try_b_device_layer(
                 }));
             }
         }
+    }
+    // 这笔要用的私钥只在那台 B 上（`key_device_id`，A 端从 keyblob 的 RemoteRef 里带
+    // 上来）：它离线时不许换替身。
+    //
+    // 以前没有这个参数，多台 B 在线时 sign/decrypt 按负载挑一台，挑到没有这把钥匙的
+    // 那台就回 `no key for alias`，服务端再折成 `key_not_found`，App 拿这个结论把一把
+    // 好好的钥匙作废重建。`resolve_online_target` 那套「离线换替身」对认证有意义，对
+    // 已有的私钥没意义 —— 换台签不出同一个东西。
+    if pinned_key_device && target != device_id {
+        tracing::info!(
+            "b_layer: key owner {device_id} is offline; not re-routing this {task_type} to {target}"
+        );
+        return Some(json!({
+            "error": format!(
+                "the device holding this key ({device_id}) is offline; the request was not re-routed"
+            ),
+            "relay_error_kind": "key_device_offline",
+        }));
     }
     // B 心跳里报上来的 `skip_pkgs` 原本是「补丁日期不跟随」的名单（relay.conf 的
     // OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS），不是「这些包不服务」。以前拿它当派发黑名单，
@@ -600,7 +625,9 @@ async fn run_smart_strongbox_attest(
     }
 
     if any_b_online {
-        if let Some(v) = try_b_device_layer(state, task_type, body, device_id, true, a_meta).await {
+        if let Some(v) =
+            try_b_device_layer(state, task_type, body, device_id, false, true, a_meta).await
+        {
             if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
                 // Only a chain that is itself StrongBox-tagged counts as the B
                 // device fulfilling the StrongBox request.  The b-app relay goes
@@ -692,8 +719,16 @@ async fn run_refuse_strongbox_attest(
     let task_type = "attest";
 
     // Only the B device's own StrongBox can answer in this mode.
-    if let Some(v) =
-        try_b_device_layer(state, task_type, body, device_id, any_b_online, a_meta).await
+    if let Some(v) = try_b_device_layer(
+        state,
+        task_type,
+        body,
+        device_id,
+        false,
+        any_b_online,
+        a_meta,
+    )
+    .await
     {
         if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
             let level = chain_attestation_security_level(&v);
@@ -910,6 +945,28 @@ async fn run_a_side_task(
         .unwrap_or("")
         .trim()
         .to_string();
+    // 这把钥匙铸在哪台 B（`key_device_id`，A 端 sign/decrypt/agree 从 keyblob 的
+    // `RemoteRef::device_id` 带上来）：私钥只在那台上，必须钉回去。
+    //
+    // 以前整条链路都不带这个信息：attest 回来时 A 端把 `device_id` 存进了 keyblob，
+    // 但 sign/decrypt 的请求体里只有本机配的那台（默认还是空的），于是多台 B 在线时
+    // 按负载挑一台，挑到没有这把钥匙的那台就报 `key_not_found`，App 把一把好好的
+    // 钥匙作废重建。钉子只影响「哪一台」，不动卡身份、不换层。
+    let mut pinned_key_device = false;
+    if let Some(owner) = key_device_pin(body) {
+        if owner != device_id {
+            tracing::info!(
+                "run_a_side_task: pin device to key owner {owner} (requested {})",
+                if device_id.is_empty() {
+                    "<any>"
+                } else {
+                    &device_id
+                }
+            );
+            device_id = owner.to_string();
+        }
+        pinned_key_device = true;
+    }
     // 用一把已有 AK 签子钥：钉在那把 AK 出生的那台 B 上。服务端默认设备、负载均衡、
     // 用户临时切的策略都不能把它改成另一台 —— 另一台没有这把私钥。
     if let Some(issuer) = attestation_key_ref(body) {
@@ -1032,6 +1089,7 @@ async fn run_a_side_task(
                     task_type,
                     body,
                     &device_id,
+                    pinned_key_device,
                     any_b_online,
                     a_meta.as_ref(),
                 )
@@ -1087,6 +1145,7 @@ async fn run_a_side_task(
                         task_type,
                         &demoted,
                         &device_id,
+                        false,
                         any_b_online,
                         a_meta.as_ref(),
                     )
@@ -1188,6 +1247,41 @@ async fn run_a_side_task(
 /// 拿不回原样。
 fn b_said_key_missing(layer: &str, msg: &str) -> bool {
     layer == "b" && msg.contains("no key for alias")
+}
+
+/// 请求里「这把钥匙铸在哪台 B」（A 端 sign/decrypt/agree 带上来的）。
+///
+/// 空串 / 缺省都当没钉：老版本 A 端不带这个字段，行为跟以前一样由服务端挑。
+fn key_device_pin(body: &Value) -> Option<&str> {
+    body.get("key_device_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod key_pin_tests {
+    use super::key_device_pin;
+    use serde_json::json;
+
+    /// 只认非空 id：老版本 A 端根本不带这个字段，带了空串/空白的也不能当钉子用
+    /// （否则一个手滑的空值就把请求钉在名为 "" 的设备上，永远报离线）。
+    #[test]
+    fn only_a_non_empty_id_pins_the_key() {
+        assert_eq!(
+            key_device_pin(&json!({ "key_device_id": "device-b-1" })),
+            Some("device-b-1")
+        );
+        assert_eq!(
+            key_device_pin(&json!({ "key_device_id": "  device-b-1  " })),
+            Some("device-b-1")
+        );
+        assert_eq!(key_device_pin(&json!({ "key_device_id": "" })), None);
+        assert_eq!(key_device_pin(&json!({ "key_device_id": "   " })), None);
+        // 没这个字段的（老 A 端）不能拿通用 `device_id` 顶上来。
+        assert_eq!(key_device_pin(&json!({ "device_id": "device-b-1" })), None);
+        assert_eq!(key_device_pin(&json!(null)), None);
+    }
 }
 
 pub async fn ping() -> &'static str {
@@ -2526,40 +2620,41 @@ async fn try_b_soter_layer(
             hardware_reply: None,
         });
     };
-    // A/B 配对：跟 `/api/attest/` 那条路同一个判据。`pair` 卡的 A 只能派给同组的 B；
+    // A/B 配对：跟 `/api/attest/` 那条路同一个判据 —— 两个卡种都过 `allows`。
     // 两边有一方没登记（老客户端 / 老卡密 / 静态 token）就按历史行为放行。
     //
     // 这条以前只在认证那条路上有，SOTER 整条是裸的：任何一张 A 卡都能拿着 device_id
-    // 指挥别人客户的真机建料、签名。不匹配时不碰那台设备，直接交给下面的服务端层
-    // （自签兜底不需要别人的真机）。
+    // 指挥别人客户的真机建料、签名。后来补了个门，但写成了 `if a.kind == "pair"`，
+    // public 卡又整段跳过一遍 —— 跟 `try_b_device_layer` 里那处同一个毛病。
+    // 不匹配时不碰那台设备，直接交给下面的服务端层（自签兜底不需要别人的真机）。
     if let Some(a) = a_meta {
-        if a.kind.eq_ignore_ascii_case("pair") {
-            let b_meta = state
-                .store
-                .device_token_meta(target)
-                .await
-                .map(|(pair_id, kind)| crate::auth::TokenMeta {
-                    role: "b".to_string(),
-                    pair_id,
-                    kind,
+        let b_meta = state
+            .store
+            .device_token_meta(target)
+            .await
+            .map(|(pair_id, kind)| crate::auth::TokenMeta {
+                role: "b".to_string(),
+                pair_id,
+                kind,
+            });
+        if let Some(b_meta) = b_meta {
+            if !a.allows(&b_meta) {
+                tracing::warn!(
+                    "soter: pair mismatch for {target}: A kind={} pair={} B kind={} pair={}",
+                    a.kind,
+                    a.pair_id,
+                    b_meta.kind,
+                    b_meta.pair_id
+                );
+                return Some(BSoterLayer {
+                    value: json!({
+                        "error": "pair mismatch: this A token is not paired with that B token",
+                        "relay_error_kind": "pair_mismatch",
+                    }),
+                    unavailable: true,
+                    device: None,
+                    hardware_reply: None,
                 });
-            if let Some(b_meta) = b_meta {
-                if !a.allows(&b_meta) {
-                    tracing::warn!(
-                        "soter: pair mismatch for {target}: A pair={} B pair={}",
-                        a.pair_id,
-                        b_meta.pair_id
-                    );
-                    return Some(BSoterLayer {
-                        value: json!({
-                            "error": "pair mismatch: this A token is not paired with that B token",
-                            "relay_error_kind": "pair_mismatch",
-                        }),
-                        unavailable: true,
-                        device: None,
-                        hardware_reply: None,
-                    });
-                }
             }
         }
     }
@@ -3039,15 +3134,30 @@ pub async fn b_poll(
     // 记下这台用的是哪种 token（配对 / 公开 / 老卡密），给 A 侧的配对校验用。
     //
     // 返回 false 说明这笔心跳不被认：设备还在心跳（在线窗口内），来的却是另一个配对
-    // 组。那就不只是不认这个分组：后面所有设备属性（机型串、skip 名单、版本号）都不写，
-    // 那些字段直接决定 A 端拿到的伪装参数和派发策略。派活本身还是照旧 —— 把心跳
-    // 直接拒掉会让换卡之后没重启的人都失联，而换组会在离线一个窗口后自然生效。
-    let mut trusted_heartbeat = true;
+    // 组 —— 那是「有人拿着这台的 device_id 在心跳」。这种情况**既不写属性、也不派活**：
+    // 以前只跳过属性，派活照旧，于是这台机器照样被登记成在线（`pop_for_b` 会把它写进
+    // 设备表）、照样能领走派给这个 device_id 的任务 —— A 侧配对校验比的是旧分组，还是
+    // 通的，任务和请求体就这么落到别人的机器上。
+    //
+    // 直接回 403 不会把人挡死：被拒的这一轮不刷新 last_seen，等这台设备在线窗口过去
+    // （120s，见 `queue::TOKEN_META_REBIND_AFTER_MS`）下一次心跳就能换组成功。换卡本来
+    // 就要重装/重启，多等这一个窗口能接受；B 端把非 200 当普通失败指数退避重试，不会退。
     if let Some(meta) = state.auth.token_meta(token_from_headers(&headers)) {
-        trusted_heartbeat = state
+        if !state
             .store
             .set_device_token_meta(&q.device_id, &meta.pair_id, &meta.kind)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                "b_poll: {} 在线时换到配对组 {:?}，这一轮不派活（等在线窗口过去再试）",
+                q.device_id,
+                meta.pair_id
+            );
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "this device_id is registered to another pair group; retry later",
+            );
+        }
     }
     let machine_id = q.machine_id.unwrap_or_default();
 
@@ -3075,46 +3185,44 @@ pub async fn b_poll(
     let timeout = Duration::from_secs(timeout_secs.min(120));
 
     // 这台上报的「不跟随补丁日期」名单先记下来：命中名单的认证请求不再往它派。
-    if trusted_heartbeat {
-        if let Some(raw) = q.skip_pkgs.as_deref() {
-            state
-                .store
-                .set_skip_pkgs(&q.device_id, crate::queue::parse_pkg_list(raw))
-                .await;
-        }
-
-        // 这台报的模块版本号也先记下来（老版本 relay 不带 `ver`，那就不动它）。
+    if let Some(raw) = q.skip_pkgs.as_deref() {
         state
             .store
-            .set_device_version(&q.device_id, q.ver.as_deref())
-            .await;
-
-        // 模块 relay 的心跳固定带 `skip_pkgs`（空名单也带）和 `ver`，手机 App
-        // （`org.ommega.deviceb`）两个都不带；用这个把两类设备分开，A 端面板
-        // 「留空自己获取」只挑模块那种。
-        state
-            .store
-            .set_device_from_module(&q.device_id, q.skip_pkgs.is_some() || q.ver.is_some())
-            .await;
-
-        // 本机设备身份（brand/device/product/manufacturer/model/serial）：A 端「伪装参数
-        // → 从服务器同步」要用它，否则链是真机出的、本机属性还是调用方那台，两边对不上。
-        state
-            .store
-            .set_device_identity(
-                &q.device_id,
-                crate::queue::DeviceIdentityReport {
-                    brand: q.brand.clone(),
-                    device: q.product_device.clone(),
-                    product: q.product.clone(),
-                    manufacturer: q.manufacturer.clone(),
-                    model: q.product_model.clone(),
-                    serial: q.serial.clone(),
-                    fingerprint: q.fingerprint.clone(),
-                },
-            )
+            .set_skip_pkgs(&q.device_id, crate::queue::parse_pkg_list(raw))
             .await;
     }
+
+    // 这台报的模块版本号也先记下来（老版本 relay 不带 `ver`，那就不动它）。
+    state
+        .store
+        .set_device_version(&q.device_id, q.ver.as_deref())
+        .await;
+
+    // 模块 relay 的心跳固定带 `skip_pkgs`（空名单也带）和 `ver`，手机 App
+    // （`org.ommega.deviceb`）两个都不带；用这个把两类设备分开，A 端面板
+    // 「留空自己获取」只挑模块那种。
+    state
+        .store
+        .set_device_from_module(&q.device_id, q.skip_pkgs.is_some() || q.ver.is_some())
+        .await;
+
+    // 本机设备身份（brand/device/product/manufacturer/model/serial）：A 端「伪装参数
+    // → 从服务器同步」要用它，否则链是真机出的、本机属性还是调用方那台，两边对不上。
+    state
+        .store
+        .set_device_identity(
+            &q.device_id,
+            crate::queue::DeviceIdentityReport {
+                brand: q.brand.clone(),
+                device: q.product_device.clone(),
+                product: q.product.clone(),
+                manufacturer: q.manufacturer.clone(),
+                model: q.product_model.clone(),
+                serial: q.serial.clone(),
+                fingerprint: q.fingerprint.clone(),
+            },
+        )
+        .await;
 
     match state
         .store
