@@ -9,3 +9,4 @@
 - SOTER material and deletion records are isolated per user, app and device.
 - Deleted SOTER keys no longer come back on their own (matches a real device), and it survives restarts.
 - Certificate and device-id shapes now follow the real device on both Qualcomm and MediaTek platforms.
+- Fixed missing device-property attestation entries in some attestation paths.

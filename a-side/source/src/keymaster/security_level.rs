@@ -626,13 +626,17 @@ impl KeystoreSecurityLevel {
         }
 
         // 持有 READ_PRIVILEGED_PHONE_STATE 的调用方（GMS 的 DroidGuard、Play 商店自己的
-        // 完整性钥匙等）把 ID 类 tag 全部摘掉再往下走。
+        // 完整性钥匙等）把**敏感 ID 类** tag 摘掉再往下走。
         //
-        // 原因：中继给不了「叶子带本机 710..717 + 真 TEE 链」这两头。带上 ID 后 B 的真
-        // TEE 会以 CannotAttestIds(-66) 拒，链就掉到服务端的 keybox（那份已吊销），拿链的
-        // 一方（Google 服务端）会直接判不过 —— 反而不如给一条真 TEE 链、叶子不带 ID。
-        // 而普通 App（自查类）要的是公开的 brand/device/product/…，这些带上去由中继
-        // keybox 层照写、叶子自洽，那一类检查才过。
+        // 原因：中继给不了「叶子带本机 IMEI/MEID/SERIAL + 真 TEE 链」这两头。带上这些后
+        // B 的真 TEE 会以 CannotAttestIds(-66) 拒，链就掉到服务端的 keybox（那份已吊销），
+        // 拿链的一方（Google 服务端）会直接判不过 —— 反而不如给一条真 TEE 链、叶子不带
+        // 敏感 ID。
+        //
+        // 公开的 brand/device/product/manufacturer/model 必须留着：它们不需要任何权限，
+        // 真机本来就带，摘掉反而露馅。工程模式「StrongBox Attestation Key ID Modify」
+        // 就是拿叶子里的 brand 跟 ro.product.brand 比，摘掉这一项直接判 Fail（logcat:
+        // `StrongBox attested brand mismatch, expected: OnePlus, actual: null`）。
         //
         // 只在远程出证（`remote_enabled()`：开关开着且 url 不空）时摘：本地模式我们自己的 TA
         // 能同时给出「本机 ID + 自洽的链」，没必要动调用方要的参数，按 AOSP（它没这一步）
@@ -642,7 +646,7 @@ impl KeystoreSecurityLevel {
             && check_device_attestation_permissions(ctx).is_ok()
         {
             let before = result.len();
-            result.retain(|kp| !is_attestation_id_tag(kp.tag));
+            result.retain(|kp| !is_device_id_attestation_tag(kp.tag));
             if result.len() != before {
                 log::debug!(
                     "event=device_id_attest uid={} stripped={} (privileged caller: keep a real TEE chain)",
