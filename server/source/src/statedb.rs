@@ -184,6 +184,9 @@ impl StateDb {
                  last_seen_ms  INTEGER NOT NULL,
                  PRIMARY KEY(slot_id, family, token));
              CREATE INDEX IF NOT EXISTS idx_owners_slot ON soter_slot_owners(slot_id, family);
+             CREATE TABLE IF NOT EXISTS soter_gone_ask(
+                 gone_id   TEXT PRIMARY KEY,
+                 at_millis INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS meta(
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL);",
@@ -401,6 +404,49 @@ impl StateDb {
         let conn = self.plain();
         let n: i64 = conn.query_row("SELECT count(*) FROM soter_slots", [], |r| r.get(0))?;
         Ok(n as usize)
+    }
+
+    /// 启动时把「删过的 ASK」墓碑整个装进来（真机删了就是删了，重启也不能复活）。
+    pub fn gone_asks(&self) -> Result<Vec<String>> {
+        let conn = self.plain();
+        let mut stmt = conn.prepare("SELECT gone_id FROM soter_gone_ask")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// 记一个墓碑（幂等）。行数上界是「身份 × 设备 × uid」，只在删料时出现，不会无限长。
+    pub fn mark_gone_ask(&self, gone_id: &str) -> Result<()> {
+        let conn = self.plain();
+        conn.execute(
+            "INSERT INTO soter_gone_ask(gone_id, at_millis) VALUES (?1, ?2)
+             ON CONFLICT(gone_id) DO UPDATE SET at_millis = excluded.at_millis",
+            params![gone_id, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// 重建料之后把墓碑解开。
+    pub fn clear_gone_ask(&self, gone_id: &str) -> Result<()> {
+        let conn = self.plain();
+        conn.execute(
+            "DELETE FROM soter_gone_ask WHERE gone_id = ?1",
+            params![gone_id],
+        )?;
+        Ok(())
+    }
+
+    /// 删 ATTK / 换身份时按前缀清（`attk:<id>|`）。
+    pub fn clear_gone_ask_prefix(&self, prefix: &str) -> Result<()> {
+        let conn = self.plain();
+        conn.execute(
+            "DELETE FROM soter_gone_ask WHERE substr(gone_id, 1, length(?1)) = ?1",
+            params![prefix],
+        )?;
+        Ok(())
     }
 
     pub fn slots_snapshot(&self) -> Result<SlotsSnapshot> {

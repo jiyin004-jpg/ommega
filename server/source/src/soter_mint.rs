@@ -248,7 +248,7 @@ fn store() -> &'static Store {
         builtin: Mutex::new(None),
         attk: Mutex::new(HashMap::new()),
         ask: Mutex::new(HashMap::new()),
-        gone_ask: Mutex::new(HashSet::new()),
+        gone_ask: Mutex::new(load_gone_asks()),
         auth: Mutex::new(HashMap::new()),
         counters: Mutex::new(HashMap::new()),
         next_session: Mutex::new(chrono::Utc::now().timestamp_millis()),
@@ -334,6 +334,9 @@ pub fn forget_attk(id: i64) {
     if let Ok(mut set) = store().gone_ask.lock() {
         set.retain(|key| !key.starts_with(&prefix));
     }
+    if let Err(e) = statedb::shared().clear_gone_ask_prefix(&prefix) {
+        tracing::warn!("soter: 按身份清墓碑失败（{prefix}）：{e:#}");
+    }
 }
 
 /// 探测机专用的那把 ASK。跟自签层分开，是因为探测流量会一直让 `generate_ask_key_pair`
@@ -414,6 +417,31 @@ fn clear_ask_gone(scope: &str, device_id: &str, uid: i32) {
     let key = ask_gone_key(scope, device_id, uid);
     if let Ok(mut set) = store().gone_ask.lock() {
         set.remove(&key);
+    }
+    if let Err(e) = statedb::shared().clear_gone_ask(&key) {
+        tracing::warn!("soter: 墓碑解不开（{key}）：{e:#}");
+    }
+}
+
+fn mark_ask_gone(scope: &str, device_id: &str, uid: i32) {
+    let key = ask_gone_key(scope, device_id, uid);
+    if let Ok(mut set) = store().gone_ask.lock() {
+        set.insert(key.clone());
+    }
+    // 真机删了就是删了，重启也得算数 —— 墓碑落库。
+    if let Err(e) = statedb::shared().mark_gone_ask(&key) {
+        tracing::warn!("soter: 墓碑落库失败（{key}）：{e:#}，只能先记在内存");
+    }
+}
+
+/// 启动时把墓碑从库里读回来。库读不出来就当空（宁可多给一次机会，也不要卡住服务）。
+fn load_gone_asks() -> HashSet<String> {
+    match statedb::shared().gone_asks() {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!("soter: 墓碑表从 state db 读不出来（{e:#}），按空的算");
+            HashSet::new()
+        }
     }
 }
 
@@ -991,10 +1019,7 @@ pub fn run_layer(
                     map.retain(|k, _| !k.starts_with(&prefix));
                 }
                 // 不能靠“缓存没了就现造”顶上去：盖个墓碑，等 generate 才解。
-                let gone = ask_gone_key(&scope, device_id, uid);
-                if let Ok(mut set) = store().gone_ask.lock() {
-                    set.insert(gone);
-                }
+                mark_ask_gone(&scope, device_id, uid);
                 // 钥匙没了，槽位的钉子也跟着拔：下次哪一层服务它都算从头来。
                 unpin_layer(device_id, uid);
                 Ok(code_result(op, OK))
