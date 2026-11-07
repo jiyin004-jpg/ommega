@@ -1889,7 +1889,7 @@ async fn run_soter_task_inner(
              直接退回 A 端本地作答，不造料、不落 B"
             );
             // 这一笔在 A 端本地答：记下来，`get_device_id` 那笔跟着走，别半路换号。
-            crate::soter_probe::note_device_side(requested, false);
+            crate::soter_probe::note_device_side(requested, crate::soter_probe::Side::Local);
             return Json(json!({
                 "op": op,
                 "local_only": true,
@@ -2113,6 +2113,23 @@ async fn run_soter_task_inner(
     }
     if layers.is_empty() {
         layers.extend(order.iter().copied());
+    }
+    // `get_device_id` 钉回上一笔那一层。
+    //
+    // ASK 是服务端造料（`keybox` / `self_signed` / `attk`）时，这个 op 也必须由同一层答：
+    // 两边的 `cpu_id` 出自同一套材料，才不会一高一低（退回 A 端本地就是本机派生号，
+    // 跟 ATTK 的号差得远）。检测器那条 C5b 就是拿这两个数对的。
+    if op == "get_device_id" {
+        if let Some(layer) = crate::soter_probe::server_layer(requested) {
+            if let Some(pos) = order.iter().position(|l| *l == layer) {
+                let pinned = order[pos];
+                layers.retain(|l| *l != pinned);
+                layers.insert(0, pinned);
+                tracing::info!(
+                    "soter: get_device_id 跟着上一笔的层 {layer} 走（换层 cpu_id 就不一致）"
+                );
+            }
+        }
     }
     // ASK 身份类的 op 只走真机。
     //
@@ -2439,9 +2456,18 @@ async fn run_soter_task_inner(
                 }
                 let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
                 tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
-                // 这一笔归哪一层：`b` 是真机，keybox / self_signed 是服务端自己造的（用的是
-                // A 端带上来的 cpu_id）。`get_device_id` 那笔靠它决定跟哪边走。
-                crate::soter_probe::note_device_side(requested, layer == "b");
+                // 这一笔归哪一层：`b` 是真机，`keybox` / `self_signed` / `attk` 是服务端
+                // 自己造的（用的是 A 端带上来的 cpu_id），A 端本地作答是第三种。
+                // `get_device_id` 那笔靠它决定跟哪边走 —— 三态不能归并：服务端造料跟
+                // A 端本地是两个不同的号。
+                crate::soter_probe::note_device_side(
+                    requested,
+                    if layer == "b" {
+                        crate::soter_probe::Side::Real
+                    } else {
+                        crate::soter_probe::Side::Server(layer.to_string())
+                    },
+                );
                 // 这个槽位的 ASK 被毒化（App 在自删自建）：把「有 ASK」改写成「没有」，
                 // 逼 App 重新生成并上报腾讯。只动这一种答案，别的 op 不碰。
                 if state

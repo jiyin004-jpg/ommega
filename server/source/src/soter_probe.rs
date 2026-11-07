@@ -168,13 +168,29 @@ pub fn session_side(device: &str, session: i64) -> Option<bool> {
 /// 刚跑完检测器的设备接着跑的真应用也拽到本地去。
 const DEVICE_SIDE_MS: i64 = 30 * 1000;
 
-static DEVICE_SIDES: Mutex<Option<HashMap<String, (bool, i64)>>> = Mutex::new(None);
+/// 这台设备上一笔 SOTER 是谁答的。
+///
+/// 三态而不是布尔：`keybox` / `self_signed` / `attk` 是**服务端自己造料**（用 A 端带上来的
+/// `cpu_id`），跟“A 端本地作答”是两回事。以前只记“是不是真机”，这两类都落到 `false`，
+/// 于是 ASK 走服务端造料、getDeviceId 却退回 A 端本地（报的是本机派生号），两个 `cpu_id`
+/// 一撞就是检测器的 C5b。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Side {
+    /// B 端真机。
+    Real,
+    /// 服务端自己那几层，带层名（`keybox` / `self_signed` / `attk`）。
+    Server(String),
+    /// A 端本地作答（探测机那种 `local_only`）。
+    Local,
+}
 
-/// 记一笔：这台设备的这一笔是谁答的（`true` = 真机）。
+static DEVICE_SIDES: Mutex<Option<HashMap<String, (Side, i64)>>> = Mutex::new(None);
+
+/// 记一笔：这台设备的这一笔是谁答的。
 ///
 /// 只有 `get_device_id` 读它（见 [`device_side`]）：那个 op 翻不出调用者，只能跟着
 /// 上一笔走。别的 op 都有自己的判据，不掺这一份。
-pub fn note_device_side(device: &str, real: bool) {
+pub fn note_device_side(device: &str, side: Side) {
     let device = device.trim();
     if device.is_empty() {
         return;
@@ -187,17 +203,27 @@ pub fn note_device_side(device: &str, real: bool) {
     if map.len() > NOTE_CAP {
         map.retain(|_, (_, at)| now.saturating_sub(*at) <= DEVICE_SIDE_MS);
     }
-    map.insert(device.to_string(), (real, now));
+    map.insert(device.to_string(), (side, now));
 }
 
-/// 这台设备上一笔 SOTER 落在哪一层（`true` = 真机）。`None` = 没证据（刚起来、过期了），
+/// 这台设备上一笔 SOTER 落在哪一层。`None` = 没证据（刚起来、过期了），
 /// 调用方照老办法自己判。
-pub fn device_side(device: &str) -> Option<bool> {
+pub fn device_side(device: &str) -> Option<Side> {
     let guard = DEVICE_SIDES.lock().ok()?;
     let map = guard.as_ref()?;
-    let (real, at) = map.get(device.trim())?;
+    let (side, at) = map.get(device.trim())?;
     let now = chrono::Utc::now().timestamp_millis();
-    (now.saturating_sub(*at) <= DEVICE_SIDE_MS).then_some(*real)
+    (now.saturating_sub(*at) <= DEVICE_SIDE_MS).then(|| side.clone())
+}
+
+/// 上一笔是服务端自己造料时，它用的是哪一层。
+///
+/// `get_device_id` 要钉回同一层：只有同一层才用同一个 `cpu_id`。
+pub fn server_layer(device: &str) -> Option<String> {
+    match device_side(device)? {
+        Side::Server(layer) => Some(layer),
+        _ => None,
+    }
 }
 
 /// `get_device_id` 这一笔归哪一层（`None` = 交给真机）。
@@ -214,14 +240,16 @@ pub fn device_side(device: &str) -> Option<bool> {
 pub fn get_device_id_side(
     cfg: &Config,
     caller_pkg: Option<&str>,
-    device_side: Option<bool>,
+    device_side: Option<Side>,
 ) -> Option<String> {
     if is_listed_real_app(cfg, caller_pkg) {
         return None;
     }
     match device_side {
-        Some(true) => None,
-        Some(false) => Some("这台设备上一笔 SOTER 是 A 端本地答的".to_string()),
+        // 真机，或者服务端自己造料：两种都得让层序去答。服务端造料那一笔由调用方
+        // 钉回同一层（见 `server_layer`），才能跟 ASK 报同一个 `cpu_id`。
+        Some(Side::Real) | Some(Side::Server(_)) => None,
+        Some(Side::Local) => Some("这台设备上一笔 SOTER 是 A 端本地答的".to_string()),
         None => Some(format!(
             "getDeviceId 翻不出真调用者（前台包名 {}），按老规矩本地作答",
             caller_pkg
@@ -608,13 +636,16 @@ mod tests {
     fn the_device_side_follows_the_last_answer_on_that_device() {
         let device = "device-b-side-test";
         assert_eq!(device_side(device), None);
-        note_device_side(device, false);
-        assert_eq!(device_side(device), Some(false));
-        note_device_side(device, true);
-        assert_eq!(device_side(device), Some(true));
+        note_device_side(device, Side::Local);
+        assert_eq!(device_side(device), Some(Side::Local));
+        note_device_side(device, Side::Real);
+        assert_eq!(device_side(device), Some(Side::Real));
+        note_device_side(device, Side::Server("attk".to_string()));
+        assert_eq!(device_side(device), Some(Side::Server("attk".to_string())));
+        assert_eq!(server_layer(device), Some("attk".to_string()));
         assert_eq!(device_side("device-b-other-side"), None);
         // 空设备名不该记进去（A 端不带 device_id 又没配默认设备时就是空的）。
-        note_device_side("  ", true);
+        note_device_side("  ", Side::Real);
         assert_eq!(device_side("  "), None);
     }
 
@@ -624,20 +655,38 @@ mod tests {
     fn get_device_id_prefers_a_listed_caller_over_the_last_side() {
         let cfg = Config::default();
         // 真应用：三种 device_side 都给真机。
-        for side in [None, Some(true), Some(false)] {
+        for side in [
+            None,
+            Some(Side::Real),
+            Some(Side::Local),
+            Some(Side::Server("keybox".to_string())),
+        ] {
             assert_eq!(
-                get_device_id_side(&cfg, Some("com.tencent.mm"), side),
+                get_device_id_side(&cfg, Some("com.tencent.mm"), side.clone()),
                 None,
                 "真应用不该被上一笔的本地答案拉回本地（device_side={side:?}）"
             );
         }
         // 检测器（包名不在名单）：跟着上一笔。
         assert_eq!(
-            get_device_id_side(&cfg, Some("com.andrealyz.soterchecker"), Some(true)),
+            get_device_id_side(&cfg, Some("com.andrealyz.soterchecker"), Some(Side::Real)),
             None,
             "上一笔在真机，这一笔也给它"
         );
-        assert!(get_device_id_side(&cfg, Some("com.eltavine.duckdetector"), Some(false)).is_some());
+        // 上一笔是服务端造料：让层序去答（调用方会钉回同一层），不能退回 A 端本地。
+        assert_eq!(
+            get_device_id_side(
+                &cfg,
+                Some("com.andrealyz.soterchecker"),
+                Some(Side::Server("attk".to_string()))
+            ),
+            None,
+            "ASK 是服务端造料时，getDeviceId 也得服务端答，否则两个 cpu_id 不一致"
+        );
+        assert!(
+            get_device_id_side(&cfg, Some("com.eltavine.duckdetector"), Some(Side::Local))
+                .is_some()
+        );
         // 没证据：本地作答。
         assert!(get_device_id_side(&cfg, Some("com.zte.mifavor.launcher"), None).is_some());
         assert!(get_device_id_side(&cfg, None, None).is_some());
