@@ -913,6 +913,11 @@ fn untokened_app_allowed(sender_uid: i32, cmdline: &str) -> bool {
     if cmdline.contains("keystore") {
         return false;
     }
+    // HAL 进程（`vendor.*.soter-service` / `@1.0-service`）名字里也带 soter，但它们收到
+    // 的是宿主转过去的出站调用，不是 App 直接调的；放宽只给宿主类进程。
+    if cmdline.contains("-service") {
+        return false;
+    }
     cmdline.contains("soter") || cmdline.contains("tencent")
 }
 
@@ -3142,9 +3147,19 @@ mod tests {
             10490,
             "com.tencent.soter.soterserver"
         ));
+        // HAL 进程名字里也带 soter，但它们不直接服务 App，不放宽。
+        assert!(!untokened_app_allowed(
+            10490,
+            "vendor.qti.hardware.soter-service"
+        ));
+        assert!(!untokened_app_allowed(
+            10490,
+            "vendor.qti.hardware.soter@1.0-service"
+        ));
+        // 多用户/分身的宿主实例（cmdline 带冒号）照旧放宽。
         assert!(untokened_app_allowed(
             99910365,
-            "vendor.qti.hardware.soter-service"
+            "com.tencent.soter.soterserver:u0a123"
         ));
 
         assert!(parse_untokened_with(&data, 8, 10490, false).is_none());
