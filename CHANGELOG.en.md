@@ -10,3 +10,4 @@
 - Deleted SOTER keys no longer come back on their own (matches a real device), and it survives restarts.
 - Certificate and device-id shapes now follow the real device on both Qualcomm and MediaTek platforms.
 - Fixed missing device-property attestation entries in some attestation paths.
+- Fixed the boot-state claim in certificates minted with a self-supplied attest key.
