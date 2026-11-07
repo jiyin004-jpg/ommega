@@ -1,6 +1,6 @@
-# A-side module changelog
+﻿# A-side module changelog
 
-[中文](CHANGELOG.md)
+[涓枃](CHANGELOG.md)
 
 ## 1.7.15
 
@@ -11,3 +11,4 @@
 - Certificate and device-id shapes now follow the real device on both Qualcomm and MediaTek platforms.
 - Fixed missing device-property attestation entries in some attestation paths.
 - Fixed the boot-state claim in certificates minted with a self-supplied attest key.
+- SOTER compatibility: no longer affected by system service interface naming differences on some devices.
