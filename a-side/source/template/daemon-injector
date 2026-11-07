@@ -615,14 +615,17 @@ sync_soter_host_state() {
   path=$(pm path "$pkg" 2>/dev/null | head -n 1 | sed 's/^package://')
   [ -n "$path" ] || return 0
   [ -r "$path" ] || return 0
-  # -o -E 把 dex 里出现过的 SOTER HAL 服务名逐个抓出来对名单；toybox grep 不认 \|，
-  # 所以用扩展正则。认得出我们伺候的厂商前缀才是 real，其余（壳、以及带 soter HAL
-  # 词汇但厂商前缀我们不认识的机器）一律 stub，让载荷把宿主给 App 的答复顶掉。
-  if grep -a -o -E 'vendor\.(qti|trustonic|xiaomi|microtrust)\.hardware\.soter' "$path" 2>/dev/null | grep -q .; then
-    want=real
-  else
-    want=stub
-  fi
+  # 逐个厂商前缀对一遍（不用 -E/-o：不同 ROM 的 toybox/busybox grep 支持面不一样，
+  # -o -E 在这台 NX721J 上能用、在别的机器上未必）。认得出我们伺候的那几家才是 real，
+  # 其余（壳、以及带 soter HAL 词汇但厂商前缀我们不认识的机器）一律 stub，让载荷把
+  # 宿主给 App 的答复顶掉。
+  want=stub
+  for vendor in qti trustonic xiaomi microtrust; do
+    if grep -a -q "vendor.$vendor.hardware.soter" "$path" 2>/dev/null; then
+      want=real
+      break
+    fi
+  done
   prev=$(cat "$SOTER_HOST_STATE_OUT" 2>/dev/null | tr -d ' \r\n')
   [ "$prev" = "$want" ] && return 0
   printf '%s\n' "$want" > "$SOTER_HOST_STATE_OUT" 2>/dev/null || return 0

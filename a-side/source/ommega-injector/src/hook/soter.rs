@@ -1089,11 +1089,13 @@ pub(crate) unsafe fn note_host_reply(tr: &binder_transaction_data) {
     }
 }
 
-/// 测试用：把自动接管的现场证据全清零。
+/// 测试用：把自动接管的现场证据全清零。`HOST_REFUSED` 也算现场证据的一部分，
+/// 不清的话前面哪个测试点亮过它，后面的 `app_serving_enabled()` 就一律为 true。
 #[cfg(test)]
 pub(crate) fn reset_auto_serve_for_test() {
     AUTO_APP_SERVE.store(false, Ordering::Relaxed);
     APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+    HOST_REFUSED.store(false, Ordering::Relaxed);
     if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
         *slot = None;
     }
@@ -2794,6 +2796,12 @@ mod tests {
     /// 并行跑会互相清零。拿这把锁把整个测试体串行化。
     static AUTO_SERVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 自动接管开了没有。只看进程内那个标记，不渗文件/环境变量那头（那是
+    /// `app_serving_enabled()` 的事，本组要验的是兜底逻辑本身）。
+    fn auto_serve_on() -> bool {
+        AUTO_APP_SERVE.load(Ordering::Relaxed)
+    }
+
     /// 宿主没碰 HAL 的首笔请求就接管（阈值 1）：当笔就用我们的答复顶掉，之后每笔都答。
     #[test]
     fn auto_app_serve_engages_after_a_blind_streak() {
@@ -2801,13 +2809,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         reset_auto_serve_for_test();
-        assert!(!app_serving_enabled(), "没攒满不该开");
+        assert!(!auto_serve_on(), "还没接管");
 
         // 首笔盲请求当场接管。
         stash_app_call_for_test(blind_app_call(), 10373);
         let reply = take_app_answer().expect("首笔盲请求必须由我们答");
         assert!(reply.data_size() > 0);
-        assert!(app_serving_enabled(), "接管开了就一直在");
+        assert!(auto_serve_on(), "接管开了就一直在");
 
         // 之后每一笔都直接答，不再攒。
         stash_app_call_for_test(blind_app_call(), 10373);
@@ -2828,7 +2836,7 @@ mod tests {
             note_hal_activity();
             assert!(take_app_answer().is_none(), "HAL 腿活着就不该接");
         }
-        assert!(!app_serving_enabled());
+        assert!(!auto_serve_on());
         reset_auto_serve_for_test();
     }
 
@@ -2848,7 +2856,7 @@ mod tests {
             stash_app_call_for_test(call, 10373);
             assert!(take_app_answer().is_none());
         }
-        assert!(!app_serving_enabled());
+        assert!(!auto_serve_on());
         reset_auto_serve_for_test();
     }
 }

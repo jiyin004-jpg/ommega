@@ -506,6 +506,31 @@ fn forget_uid_keys(uid: i32) {
     }
 }
 
+/// 测试用：把本地兜底的内存态和 store 全部清掉，让“这把钥匙还没建”这类前提
+/// 在重复跑时也成立。真机上手动重跑测试时，上一遍留下的 ASK/AuthKey/墓碑会把
+/// 断言带偏（典型：期望 -6 拿到 0）。
+#[cfg(test)]
+pub(crate) fn reset_local_state_for_test() {
+    if let Some(state) = state() {
+        if let Ok(mut map) = state.asks.lock() {
+            map.clear();
+        }
+        if let Ok(mut map) = state.auth.lock() {
+            map.clear();
+        }
+        if let Ok(mut map) = state.counters.lock() {
+            map.clear();
+        }
+        if let Ok(mut set) = state.ask_built.lock() {
+            set.clear();
+        }
+    }
+    if let Ok(mut origins) = ASK_ORIGINS.lock() {
+        origins.clear();
+    }
+    let _ = std::fs::remove_file(ask_store_path());
+}
+
 /// ATTK 文件的 mtime。换文件（WebUI 写新的、用户手放）时靠它判断要不要重读。
 static ATTK_STAMP: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
 
@@ -1908,6 +1933,9 @@ mod tests {
     fn local_material_is_per_uid() {
         let (owner, work_profile) = (10490, 1_010_490);
         let alias = "SoterAuthKey";
+        // 真机上重复跑很常见，store 里可能还留着上一遍的料。先全清，
+        // 不然「工作资料没建过 AuthKey」这个前提在第二遍就跑偏了。
+        reset_local_state_for_test();
 
         let owner_ask = ask_pem(owner);
         let work_ask = ask_pem(work_profile);
