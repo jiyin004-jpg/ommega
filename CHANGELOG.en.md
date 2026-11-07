@@ -1,6 +1,6 @@
-﻿# A-side module changelog
+# A-side module changelog
 
-[涓枃](CHANGELOG.md)
+[中文](CHANGELOG.md)
 
 ## 1.7.15
 
