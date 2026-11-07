@@ -12,3 +12,4 @@
 - Fixed missing device-property attestation entries in some attestation paths.
 - Fixed the boot-state claim in certificates minted with a self-supplied attest key.
 - SOTER compatibility: no longer affected by system service interface naming differences on some devices.
+- Fixed SOTER checks failing on some devices.
