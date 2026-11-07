@@ -850,6 +850,7 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
         // 宿主发往 HAL 的那笔：把上一笔 App 面向请求的真调用者 uid 接到这笔上，
         // 转发时带给 daemon（由它翻包名、由服务端按包名白名单判）。
         call.caller_uid = borrow_app_caller(&call);
+        note_hal_activity();
     } else {
         // App 面向那笔：`tr.sender_euid` 是内核填的，调用方改不了，记下来给出站那几笔用。
         // 两处都记：本线程那份给出站那一笔用（最近、最准），进程级那份给换了线程、或者
@@ -990,6 +991,22 @@ const HOST_STATE: &str = "/data/misc/ommega/soter_host_state";
 /// 真看见宿主回 -200 之后也当它是壳（root 侧那份没写出来时的退路）。
 static HOST_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 运行期现场证据攒出来的自动接管：App 腿连着几笔请求宿主都没去碰任何我们认识的
+/// HAL 描述符，就认定这条腿在我们这儿是瞎的（描述符换了名字、或者宿主压根不走
+/// binder HAL），改由我们直接答 App 面向那一半。判据在 [`take_app_answer`] 里攒。
+static AUTO_APP_SERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 「宿主瞎」的连击计数，攒满 [`APP_AUTO_SERVE_THRESHOLD`] 才动手，给时序抖动留余地。
+static APP_BLIND_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 连着多少笔 App 请求宿主都没碰 HAL，才认定这条腿是瞎的。
+const APP_AUTO_SERVE_THRESHOLD: usize = 3;
+
+/// 最后一笔「宿主发往我们认识的 SOTER HAL 描述符」的时刻。有的宿主会把 HAL 调用
+/// 派到别的线程去，单靠本线程的记号会冤枉它，所以记进程级的时刻拿去跟 App 请求
+/// 的时刻比。
+static LAST_HAL_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// 认一个开关值：`1/true/on/stub` = 开，`0/false/off/real` = 关。
 fn switch_state_text(text: &str) -> Option<bool> {
     match text.trim().to_ascii_lowercase().as_str() {
@@ -1006,7 +1023,10 @@ fn switch_state(path: &str) -> Option<bool> {
 
 /// 这台机器上 App 面向的 SOTER 由我们答吗。
 ///
-/// 优先级：手工开关（`soter_app_serve`）→ root 侧那份宿主体检结论 → 现场见过 -200。
+/// 优先级：手工开关（`soter_app_serve`）→ 运行期攒出来的自动接管 → root 侧那份
+/// 宿主体检结论 → 现场见过 -200。手工文件是唯一能压住自动接管的口：写了 `0`
+/// 就是不接，写了 `1` 则不管现场证据一律接。体检说 `real` 只是照着 APK 里有没有
+/// HAL 服务名猜的，描述符换了名字的机型照样漏，所以排在现场证据后面。
 pub(crate) fn app_serving_enabled() -> bool {
     // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
     if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
@@ -1015,9 +1035,13 @@ pub(crate) fn app_serving_enabled() -> bool {
     {
         return on;
     }
-    switch_state(APP_SERVE_SWITCH)
-        .or_else(|| switch_state(HOST_STATE))
-        .unwrap_or_else(|| HOST_REFUSED.load(Ordering::Relaxed))
+    if let Some(on) = switch_state(APP_SERVE_SWITCH) {
+        return on;
+    }
+    if AUTO_APP_SERVE.load(Ordering::Relaxed) {
+        return true;
+    }
+    switch_state(HOST_STATE).unwrap_or_else(|| HOST_REFUSED.load(Ordering::Relaxed))
 }
 
 /// 测试用：假装本线程刚收到一笔 App 请求。
@@ -1059,6 +1083,16 @@ pub(crate) unsafe fn note_host_reply(tr: &binder_transaction_data) {
         crate::ipc::report_event(
             "event=soter host answered -200 (ERR_HAL_UNAVAILABLE)".to_string(),
         );
+    }
+}
+
+/// 测试用：把自动接管的现场证据全清零。
+#[cfg(test)]
+pub(crate) fn reset_auto_serve_for_test() {
+    AUTO_APP_SERVE.store(false, Ordering::Relaxed);
+    APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+    if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
+        *slot = None;
     }
 }
 
@@ -1108,6 +1142,55 @@ fn app_code_to_hal(code: u32) -> Option<u32> {
     })
 }
 
+/// 本线程看见宿主往我们认识的 SOTER HAL 描述符发了请求 —— 这台机器的 HAL 腿是
+/// 活的，「宿主瞎」的连击清零，自动接管也不用考虑。
+fn note_hal_activity() {
+    if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
+        *slot = Some(Instant::now());
+    }
+    APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+}
+
+/// App 腿自动兜底的判据（serving 还没开的时候走这儿）。
+///
+/// 这笔请求从进来到宿主回话之间宿主要去碰过我们认识的 HAL 描述符，那这台机器的
+/// 接管是好的，别多事；要是一笔 HAL 都没有（描述符换了名字、或者宿主压根不走
+/// binder HAL），它回给 App 的就是真 TA 的坏话 —— 这种连击攒满阈值就由我们把
+/// App 面向那一半接过来。12/13 号宿主本来就自己答（不碰 HAL），不算数。
+///
+/// 我们自己答不上（B 不在、本地又不许兜底）的时候连击清零重来，不硬接。
+fn auto_serve_probe(pending: &PendingApp) -> Option<OwnedReply> {
+    let hal_recent = LAST_HAL_ACTIVITY
+        .lock()
+        .ok()
+        .and_then(|slot| slot.map(|at| at >= pending.at))
+        .unwrap_or(false);
+    if hal_recent || app_code_to_hal(pending.call.code).is_none() {
+        APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+        return None;
+    }
+    let Some(reply) = build_app_answer(pending) else {
+        APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+        return None;
+    };
+    let streak = APP_BLIND_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak < APP_AUTO_SERVE_THRESHOLD {
+        info!(
+            "event=soter app-serve probe: host skipped the HAL leg ({streak}/{APP_AUTO_SERVE_THRESHOLD})"
+        );
+        return None;
+    }
+    AUTO_APP_SERVE.store(true, Ordering::Relaxed);
+    APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+    info!(
+        "event=soter app-serve auto-enabled after {APP_AUTO_SERVE_THRESHOLD} app calls with no HAL traffic; file {APP_SERVE_SWITCH}=0 still forces it off"
+    );
+    crate::ipc::report_event(
+        "event=soter app-serve auto-enabled (host shows no HAL traffic)".to_string(),
+    );
+    Some(reply)
+}
+
 /// 宿主要写 BC_REPLY 了：上一笔 App 请求归我们答的话，把答复 parcel 交出去，
 /// 调用方把 `data.ptr.buffer` 指到它上面。`None` = 别动，让宿主自己那份过去。
 ///
@@ -1118,7 +1201,7 @@ pub(crate) fn take_app_answer() -> Option<OwnedReply> {
         return None;
     }
     if !app_serving_enabled() {
-        return None;
+        return auto_serve_probe(&pending);
     }
     let reply = build_app_answer(&pending)?;
     let head = unsafe { std::slice::from_raw_parts(reply.data_ptr(), reply.data_size().min(16)) };
@@ -2651,5 +2734,77 @@ mod tests {
     fn no_pending_app_call_means_we_leave_the_host_answer_alone() {
         PENDING_APP.with(|slot| slot.borrow_mut().take());
         assert!(take_app_answer().is_none());
+    }
+
+    /// 自动兜底用的空别名 generateAuthKey（4 号）：走纯校验路径回 -202，不碰 daemon。
+    fn blind_app_call() -> SoterCall {
+        SoterCall {
+            hal: false,
+            hidl: false,
+            has_return_code: true,
+            code: 4,
+            wire_code: 4,
+            op: "generateAuthKey",
+            uid: Some(10373),
+            alias: Some(String::new()),
+            challenge: None,
+            session: None,
+            key: None,
+            caller_uid: Some(10373),
+            data_size: 0,
+        }
+    }
+
+    /// 宿主连着几笔请求都不碰 HAL：攒满阈值后自动接管，第三笔起由我们答。
+    #[test]
+    fn auto_app_serve_engages_after_a_blind_streak() {
+        reset_auto_serve_for_test();
+        for _ in 0..APP_AUTO_SERVE_THRESHOLD - 1 {
+            stash_app_call_for_test(blind_app_call(), 10373);
+            assert!(take_app_answer().is_none(), "没攒满不该接");
+        }
+        assert!(!app_serving_enabled(), "没攒满不该开");
+
+        // 攒满的那笔当场就用我们的答复顶掉。
+        stash_app_call_for_test(blind_app_call(), 10373);
+        let reply = take_app_answer().expect("攒满那笔必须由我们答");
+        assert!(reply.data_size() > 0);
+        assert!(app_serving_enabled(), "接管开了就一直在");
+
+        // 之后每一笔都直接答，不再攒。
+        stash_app_call_for_test(blind_app_call(), 10373);
+        assert!(take_app_answer().is_some());
+        reset_auto_serve_for_test();
+    }
+
+    /// 宿主要去碰过我们认识的 HAL 描述符，这台机器的腿就是好的，永不自动接管。
+    #[test]
+    fn recent_hal_activity_keeps_the_auto_serve_off() {
+        reset_auto_serve_for_test();
+        for _ in 0..APP_AUTO_SERVE_THRESHOLD + 1 {
+            // 请求进来之后宿主去碰了 HAL：先 stash、再记 HAL 活动，跟真机时序一致。
+            stash_app_call_for_test(blind_app_call(), 10373);
+            note_hal_activity();
+            assert!(take_app_answer().is_none(), "HAL 腿活着就不该接");
+        }
+        assert!(!app_serving_enabled());
+        reset_auto_serve_for_test();
+    }
+
+    /// 12/13 号宿主本来就自己答（不碰 HAL），不许算进「宿主瞎」的连击里。
+    #[test]
+    fn host_served_codes_do_not_count_toward_the_blind_streak() {
+        reset_auto_serve_for_test();
+        for code in [12u32, 13] {
+            let mut call = blind_app_call();
+            call.code = code;
+            call.wire_code = code;
+            call.op = "host-served";
+            call.key = Some("fingerprint_type".to_string());
+            stash_app_call_for_test(call, 10373);
+            assert!(take_app_answer().is_none());
+        }
+        assert!(!app_serving_enabled());
+        reset_auto_serve_for_test();
     }
 }
