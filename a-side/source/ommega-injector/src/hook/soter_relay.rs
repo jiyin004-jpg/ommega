@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn a_uid_call_sends_the_uid_as_a_number() {
         assert_eq!(
-            request(&call(9, Some(10490), None, None)).as_deref(),
+            request_with_table(&call(9, Some(10490), None, None), Some("")).as_deref(),
             Some("{\"op\":\"has_ask_already\",\"uid\":10490}")
         );
     }
@@ -339,7 +339,11 @@ mod tests {
     #[test]
     fn an_alias_call_keeps_the_ampersand_alias() {
         assert_eq!(
-            request(&call(10, Some(10490), Some("WechatAuthKeyPay&WANGXY0051012"), None)).as_deref(),
+            request_with_table(
+                &call(10, Some(10490), Some("WechatAuthKeyPay&WANGXY0051012"), None),
+                Some("")
+            )
+            .as_deref(),
             Some("{\"op\":\"has_auth_key\",\"uid\":10490,\"alias\":\"WechatAuthKeyPay&WANGXY0051012\"}")
         );
     }
@@ -347,7 +351,11 @@ mod tests {
     #[test]
     fn init_sign_passes_the_hex_challenge_through_undecoded() {
         assert_eq!(
-            request(&call(11, Some(10490), Some("SoterAuthKeyV2_salt11d8ba34_scene1"), Some("0a1b2c3d"))).as_deref(),
+            request_with_table(
+                &call(11, Some(10490), Some("SoterAuthKeyV2_salt11d8ba34_scene1"), Some("0a1b2c3d")),
+                Some("")
+            )
+            .as_deref(),
             Some("{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKeyV2_salt11d8ba34_scene1\",\"challenge\":\"0a1b2c3d\"}")
         );
     }
@@ -388,21 +396,24 @@ mod tests {
         );
     }
 
-    /// **不拿请求里那个 `uid` 翻包名**：那是应用填的，探测机就靠伪造它来试我们。
+    /// **请求里那个 `uid` 也拿来翻一把，但必须带 `caller_pkg_src=arg`**：那是应用填的、
+    /// 探测机会伪造。服务端只拿它做负向判断（包名不在真应用白名单就不派真机、就地
+    /// 作答），绝不能当真调用者放行 —— 所以这个标记不能丢。
     #[test]
-    fn the_request_uid_is_never_used_for_the_package_lookup() {
+    fn the_request_uid_lookup_is_marked_as_arg() {
         let call = call(11, Some(10490), Some("SoterAuthKey"), Some("0a1b"));
         assert_eq!(
             request_with_table(&call, Some("10490 com.tencent.mm\n")).as_deref(),
-            Some("{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKey\",\"challenge\":\"0a1b\"}")
+            Some("{\"op\":\"init_sign\",\"uid\":10490,\"alias\":\"SoterAuthKey\",\"challenge\":\"0a1b\",\"caller_pkg\":\"com.tencent.mm\",\"caller_pkg_src\":\"arg\"}")
         );
     }
 
-    /// 没解出调用者就一个字都不多带（旧 payload / 没有 App 侧事务时就是这个形状）。
+    /// 没解出调用者、表里也没有那个 uid，就一个字都不多带（旧 payload / 没有 App 侧
+    /// 事务时就是这个形状）。
     #[test]
     fn an_unresolved_caller_adds_no_field() {
         assert_eq!(
-            request(&call(9, Some(10490), None, None)).as_deref(),
+            request_with_table(&call(9, Some(10490), None, None), Some("")).as_deref(),
             Some("{\"op\":\"has_ask_already\",\"uid\":10490}")
         );
     }

@@ -295,6 +295,19 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
 ///
 /// 位置唯一：`/data/misc/ommega/`（`system_data_file`，app 域和 keystore 域都读得到）。
 const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
+
+/// store 路径。`OMMEGA_SOTER_ASK_STORE` 是给真机单测的隔离口：测试跟线上模块共用
+/// 同一个文件会互相踩（测试刚写的墓碑被活着的载荷用它的内存态盖掉，测试断言就随
+/// 着模块忙不忙随机挂），跑测试时把它指到 /data/local/tmp 下的临时文件。
+fn ask_store_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("OMMEGA_SOTER_ASK_STORE")
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ASK_STORE_PATH.to_string())
+    })
+    .as_str()
+}
 const ASK_SECTION: &str = "asks";
 const AUTH_SECTION: &str = "authkeys";
 /// store 里记的「这把 ASK/AuthKey 是哪把 ATTK 签的」（ATTK 公钥的 sha256）。
@@ -317,7 +330,7 @@ fn attk_fingerprint() -> Option<String> {
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
-    let path = ASK_STORE_PATH;
+    let path = ask_store_path();
     let Ok(text) = std::fs::read_to_string(path) else {
         return serde_json::Map::new();
     };
@@ -364,7 +377,7 @@ fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<S
         );
     }
     let text = serde_json::to_string_pretty(&out).ok()?;
-    let path = ASK_STORE_PATH;
+    let path = ask_store_path();
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -1840,8 +1853,13 @@ mod tests {
         let (document, signature) = split_envelope(&envelope);
         let text = String::from_utf8(document.clone()).unwrap();
 
-        // 字段名和键序照真机抓的来
-        let order: Vec<usize> = ["pub_key", "cpu_id", "counter", "uid", "rsa_pss_saltlen"]
+        // 字段名和键序照真机抓的来；盐长那格只有声明盐的platform（MTK 那套）才有，
+        // 高通机型上这份文档根本没有 rsa_pss_saltlen，不能硬要求。
+        let mut keys = vec!["pub_key", "cpu_id", "counter", "uid"];
+        if platform().declares_salt {
+            keys.push("rsa_pss_saltlen");
+        }
+        let order: Vec<usize> = keys
             .iter()
             .map(|k| text.find(&format!("\"{k}\"")).expect("key present"))
             .collect();
@@ -1869,7 +1887,11 @@ mod tests {
         let envelope = as_buffer(answer(&call(2, Some(uid), None)));
         let (document, signature) = split_envelope(&envelope);
         let text = String::from_utf8(document.clone()).unwrap();
-        assert_eq!(pem_of(&text), attk_pem, "pub_key 必须是 ATTK 自己那把");
+        assert_eq!(
+            pem_of(&text),
+            attk_pem.trim_end(),
+            "pub_key 必须是 ATTK 自己那把"
+        );
         assert!(
             verifies(&attk_pem, &document, &signature),
             "ATTK 证书是自签的"

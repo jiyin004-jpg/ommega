@@ -603,19 +603,22 @@ if [ "${OMMEGA_SKIP_LOCK:-0}" != 1 ]; then
   sleep 1
   lock_owned || exit 0
 fi
-# 宿主能不能自己干活，由 root 这边看一眼它的 APK 就能定：真宿主的 dex 里一定有 SOTER HAL 的
-# 服务名（`vendor.qti.hardware.soter@1.0::ISoter` 或 `vendor.qti.hardware.soter.ISoter`），
-# 壳子一个字节都没有。结果写一份世界可读的小文件，宿主里的载荷读它 —— 宿主进程自己按
+# 宿主能不能自己干活，由 root 这边看一眼它的 APK 就能定：dex 里认得出我们伺候的那几家
+# SOTER HAL 厂商前缀（qti / trustonic / xiaomi / microtrust）才是 real；其余一律当 stub ——
+# 壳子连 soter HAL 字样都没有，而带 HAL 词汇但厂商前缀我们不认识的机器 soterta 顶不上，
+# 真真 TA 的坏话会直达 App，只有让载荷把宿主给 App 的答复顶掉（见 hook/soter.rs 的
+# take_app_answer）。结果写一份世界可读的小文件，宿主里的载荷读它 —— 宿主进程自己按
 # /proc/self/maps 猜 APK 会猜错（那里有几十个 overlay 的 apk，自己的不在第一）。
-# 壳子意味着「它压根不发 HAL 请求」，于是只有让载荷把它给 App 的答复顶掉（见
-# `hook/soter.rs` 的 `take_app_answer`）。
 sync_soter_host_state() {
   local pkg path want prev
   pkg=com.tencent.soter.soterserver
   path=$(pm path "$pkg" 2>/dev/null | head -n 1 | sed 's/^package://')
   [ -n "$path" ] || return 0
   [ -r "$path" ] || return 0
-  if grep -a -q "hardware.soter" "$path" 2>/dev/null; then
+  # -o -E 把 dex 里出现过的 SOTER HAL 服务名逐个抓出来对名单；toybox grep 不认 \|，
+  # 所以用扩展正则。认得出我们伺候的厂商前缀才是 real，其余（壳、以及带 soter HAL
+  # 词汇但厂商前缀我们不认识的机器）一律 stub，让载荷把宿主给 App 的答复顶掉。
+  if grep -a -o -E 'vendor\.(qti|trustonic|xiaomi|microtrust)\.hardware\.soter' "$path" 2>/dev/null | grep -q .; then
     want=real
   else
     want=stub

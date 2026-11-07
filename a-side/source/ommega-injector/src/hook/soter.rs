@@ -6,9 +6,10 @@
 //! data 开头的 interface token 是那个描述符，`code` 是下面表里的号。
 //!
 //! 号码是从 APK 里 `ISoter$Stub$Proxy` 的 `transact(n, …)` 反查出来的（不是按声明
-//! 顺序猜的，声明顺序和号不一样）。它只有 11 个方法、号跳着用，2 / 6 / 14 是空号 ——
-//! 也就是这版运行时 HAL 没有 `exportAttkPublicKey`、`generateAttkKeyPair`、
-//! `verifyAttkKeyPair`，那三个在量产 provisioning 那条路上。
+//! 顺序猜的，声明顺序和号不一样）。常规那 11 个号跳着用，2 / 6 / 14 是产线 provisioning ——
+//! 也就是这版运行时 HAL 的 exportAttkPublicKey / generateAttkKeyPair / verifyAttkKeyPair
+//! 那三个在量产 provisioning 那条路上（工程模式那页的 SOTER 项就是 14 号），本地后端
+//! 同样写了实现。
 //!
 //! | code | 方法 | 入参 |
 //! |------|------|------|
@@ -991,16 +992,18 @@ const HOST_STATE: &str = "/data/misc/ommega/soter_host_state";
 /// 真看见宿主回 -200 之后也当它是壳（root 侧那份没写出来时的退路）。
 static HOST_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 运行期现场证据攒出来的自动接管：App 腿连着几笔请求宿主都没去碰任何我们认识的
+/// 运行期现场证据攒出来的自动接管：App 面向请求的答复窗口里宿主没去碰任何我们认识的
 /// HAL 描述符，就认定这条腿在我们这儿是瞎的（描述符换了名字、或者宿主压根不走
 /// binder HAL），改由我们直接答 App 面向那一半。判据在 [`take_app_answer`] 里攒。
 static AUTO_APP_SERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 「宿主瞎」的连击计数，攒满 [`APP_AUTO_SERVE_THRESHOLD`] 才动手，给时序抖动留余地。
+/// 「宿主瞎」的连击计数，攒满 [`APP_AUTO_SERVE_THRESHOLD`] 才动手。
 static APP_BLIND_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 连着多少笔 App 请求宿主都没碰 HAL，才认定这条腿是瞎的。
-const APP_AUTO_SERVE_THRESHOLD: usize = 3;
+/// 一笔首请求就接管：误接管的代价是拿我们的统一供料换掉宿主的答案（格式同原厂、
+/// 身份同源），不比宿主差；漏判的代价是检测器那轮直接判红。所以不做多重确认，
+/// 只把「本来就不该有 HAL 调用」的 12/13 号排除在外。
+const APP_AUTO_SERVE_THRESHOLD: usize = 1;
 
 /// 最后一笔「宿主发往我们认识的 SOTER HAL 描述符」的时刻。有的宿主会把 HAL 调用
 /// 派到别的线程去，单靠本线程的记号会冤枉它，所以记进程级的时刻拿去跟 App 请求
@@ -1723,13 +1726,24 @@ mod tests {
         assert_eq!(call.caller_uid, None);
     }
 
+    /// 产线 provisioning 三个号（2 / 6 / 14）现在是我们的，真正不认识的号还是不认。
+    /// 注意 2 / 6 号是 Args::Uid，空参数解析不出来，得带 uid；14 号无参。
     #[test]
-    fn reserved_codes_are_not_ours() {
-        let data = request(&|_out| {});
-        assert!(parse(&data, 2).is_none(), "code 2 is a hole in this HAL");
-        assert!(parse(&data, 6).is_none(), "code 6 is a hole in this HAL");
-        assert!(parse(&data, 14).is_none(), "code 14 is a hole in this HAL");
-        assert!(parse(&data, 99).is_none());
+    fn provisioning_codes_are_ours_but_unknown_codes_are_not() {
+        for code in [2u32, 6] {
+            let data = request(&|out| push_i32(out, 10373));
+            let call =
+                parse(&data, code).unwrap_or_else(|| panic!("provisioning code {code} must parse"));
+            assert!(
+                interceptable(&call),
+                "provisioning code {code} must be intercepted"
+            );
+        }
+        let call = parse(&request(&|_out| {}), 14).expect("verifyAttkKeyPair takes no arguments");
+        assert!(interceptable(&call), "code 14 must be intercepted");
+
+        assert!(parse(&request(&|_out| {}), 99).is_none());
+        assert!(parse(&request(&|_out| {}), 15).is_none());
     }
 
     /// 回查调用者：按同名钥先认、再按会话号、最后才是「两边都没别名」那种。
@@ -2207,10 +2221,15 @@ mod tests {
             assert!(interceptable(&call), "code {code} must be intercepted");
         }
 
-        // 2 / 6 / 14 是宿主那半边不发、我们也不认的空号
-        for code in [2u32, 6, 14] {
-            assert!(parse(&request(&|_out| {}), code).is_none());
+        // 2 / 6 / 14 是产线 provisioning（工程模式那页在用），本地后端同样答，照样拦。
+        // 2 / 6 号是 Args::Uid 要带 uid，14 号无参。
+        for code in [2u32, 6] {
+            let data = request(&|out| push_i32(out, 10373));
+            let call = parse(&data, code).unwrap_or_else(|| panic!("code {code} must parse"));
+            assert!(interceptable(&call), "code {code} must be intercepted");
         }
+        let call = parse(&request(&|_out| {}), 14).expect("code 14 must parse");
+        assert!(interceptable(&call), "code 14 must be intercepted");
     }
 
     #[test]
@@ -2614,12 +2633,28 @@ mod tests {
     }
 
     #[test]
-    fn hidl_provisioning_codes_stay_unrecognised() {
-        // 1/2/3（generateAttkKeyPair / verifyAttkKeyPair / exportAttkPublicKey）换算过去是
-        // AIDL 的 6/14/2 —— 运行时没有那三个号，所以跟 AIDL 那半边一样认不出来。
-        for code in [1u32, 2, 3] {
-            let data = hidl_token(QTI_HIDL_DESCRIPTOR);
-            assert!(parse(&data, code).is_none(), "HIDL {code} 不该认");
+    fn hidl_provisioning_codes_are_recognised_too() {
+        // 1/2/3（generateAttkKeyPair / verifyAttkKeyPair / exportAttkPublicKey）换算过去
+        // 是 AIDL 的 6/14/2 —— provisioning 三个号现在都认，本地后端也答。
+        // 6 / 2 号是 Args::Uid 要带 uid，14 号无参。
+        let with_uid = {
+            let mut data = hidl_token(QTI_HIDL_DESCRIPTOR);
+            push_i32(&mut data, 10373);
+            data
+        };
+        let plain = hidl_token(QTI_HIDL_DESCRIPTOR);
+        for (wire, internal, op, data) in [
+            (1u32, 6u32, "generateAttkKeyPair", &with_uid),
+            (2u32, 14u32, "verifyAttkKeyPair", &plain),
+            (3u32, 2u32, "exportAttkPublicKey", &with_uid),
+        ] {
+            let call = parse(data, wire).unwrap_or_else(|| panic!("HIDL {wire} must parse"));
+            assert_eq!(
+                call.code, internal,
+                "HIDL {wire} maps to internal {internal}"
+            );
+            assert_eq!(call.op, op);
+            assert!(interceptable(&call), "HIDL {wire} must be intercepted");
         }
     }
 
@@ -2755,19 +2790,22 @@ mod tests {
         }
     }
 
-    /// 宿主连着几笔请求都不碰 HAL：攒满阈值后自动接管，第三笔起由我们答。
+    /// 这三个自动接管测试共用一份进程级现场证据（AUTO_APP_SERVE / 连击计数），
+    /// 并行跑会互相清零。拿这把锁把整个测试体串行化。
+    static AUTO_SERVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 宿主没碰 HAL 的首笔请求就接管（阈值 1）：当笔就用我们的答复顶掉，之后每笔都答。
     #[test]
     fn auto_app_serve_engages_after_a_blind_streak() {
+        let _guard = AUTO_SERVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_auto_serve_for_test();
-        for _ in 0..APP_AUTO_SERVE_THRESHOLD - 1 {
-            stash_app_call_for_test(blind_app_call(), 10373);
-            assert!(take_app_answer().is_none(), "没攒满不该接");
-        }
         assert!(!app_serving_enabled(), "没攒满不该开");
 
-        // 攒满的那笔当场就用我们的答复顶掉。
+        // 首笔盲请求当场接管。
         stash_app_call_for_test(blind_app_call(), 10373);
-        let reply = take_app_answer().expect("攒满那笔必须由我们答");
+        let reply = take_app_answer().expect("首笔盲请求必须由我们答");
         assert!(reply.data_size() > 0);
         assert!(app_serving_enabled(), "接管开了就一直在");
 
@@ -2780,6 +2818,9 @@ mod tests {
     /// 宿主要去碰过我们认识的 HAL 描述符，这台机器的腿就是好的，永不自动接管。
     #[test]
     fn recent_hal_activity_keeps_the_auto_serve_off() {
+        let _guard = AUTO_SERVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_auto_serve_for_test();
         for _ in 0..APP_AUTO_SERVE_THRESHOLD + 1 {
             // 请求进来之后宿主去碰了 HAL：先 stash、再记 HAL 活动，跟真机时序一致。
@@ -2794,6 +2835,9 @@ mod tests {
     /// 12/13 号宿主本来就自己答（不碰 HAL），不许算进「宿主瞎」的连击里。
     #[test]
     fn host_served_codes_do_not_count_toward_the_blind_streak() {
+        let _guard = AUTO_SERVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_auto_serve_for_test();
         for code in [12u32, 13] {
             let mut call = blind_app_call();
