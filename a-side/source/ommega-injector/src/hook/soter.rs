@@ -1096,6 +1096,9 @@ pub(crate) fn reset_auto_serve_for_test() {
     AUTO_APP_SERVE.store(false, Ordering::Relaxed);
     APP_BLIND_STREAK.store(0, Ordering::Relaxed);
     HOST_REFUSED.store(false, Ordering::Relaxed);
+    if let Ok(mut slot) = PROBE_SILENT_UNTIL.lock() {
+        *slot = None;
+    }
     if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
         *slot = None;
     }
@@ -1149,11 +1152,44 @@ fn app_code_to_hal(code: u32) -> Option<u32> {
 
 /// 本线程看见宿主往我们认识的 SOTER HAL 描述符发了请求 —— 这台机器的 HAL 腿是
 /// 活的，「宿主瞎」的连击清零，自动接管也不用考虑。
+///
+/// 自动接管已经开着的时候看到一个活着的 HAL 腿，说明当初那个判定是误判（或者宿主
+/// 变了）：把它撤掉、静默一段，回到「只管壳宿主」那条老路。方向选的是宁可少接
+/// 一笔，也不顶着好宿主的答复不放。
 fn note_hal_activity() {
     if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
         *slot = Some(Instant::now());
     }
     APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+    if AUTO_APP_SERVE.swap(false, Ordering::Relaxed) {
+        silence_probes(AUTO_REVOKE_COOLDOWN);
+        info!(
+            "event=soter app-serve auto-disabled: the host touched the HAL leg again; backing off"
+        );
+        crate::ipc::report_event(
+            "event=soter app-serve auto-disabled (host HAL traffic resumed)".to_string(),
+        );
+    }
+}
+
+/// 我们自己答不上时的重试间隔。没这一条的话，B 端离线 + 本地不许兜底的时候，
+/// 每一笔 App 请求都要问一遍 daemon、吃满一次 relay 往返，比不接管还慢。
+const PROBE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// 自动接管被撤销之后的冷却。别让「接一笔、撤一笔」来回抖动。
+const AUTO_REVOKE_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// 静默期截止时刻（之前一律不探、直接按旧行为放过）。
+static PROBE_SILENT_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn silence_probes(for_how_long: Duration) {
+    if let Ok(mut slot) = PROBE_SILENT_UNTIL.lock() {
+        *slot = Some(Instant::now() + for_how_long);
+    }
+}
+
+/// 静默期里吗（纯函数，方便单测）。
+fn probes_silenced(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|deadline| now < deadline)
 }
 
 /// App 腿自动兜底的判据（serving 还没开的时候走这儿）。
@@ -1163,8 +1199,18 @@ fn note_hal_activity() {
 /// binder HAL），它回给 App 的就是真 TA 的坏话 —— 这种连击攒满阈值就由我们把
 /// App 面向那一半接过来。12/13 号宿主本来就自己答（不碰 HAL），不算数。
 ///
-/// 我们自己答不上（B 不在、本地又不许兜底）的时候连击清零重来，不硬接。
+/// 我们自己答不上（B 不在、本地又不许兜底）的时候连击清零、静默一分钟再来，
+/// 不硬接也不拖慢：这期间行为跟没做自动接管前一模一样。
 fn auto_serve_probe(pending: &PendingApp) -> Option<OwnedReply> {
+    let now = Instant::now();
+    let silenced = PROBE_SILENT_UNTIL
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .is_some_and(|deadline| probes_silenced(Some(deadline), now));
+    if silenced {
+        return None;
+    }
     let hal_recent = LAST_HAL_ACTIVITY
         .lock()
         .ok()
@@ -1176,6 +1222,7 @@ fn auto_serve_probe(pending: &PendingApp) -> Option<OwnedReply> {
     }
     let Some(reply) = build_app_answer(pending) else {
         APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+        silence_probes(PROBE_RETRY_AFTER);
         return None;
     };
     let streak = APP_BLIND_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1187,6 +1234,9 @@ fn auto_serve_probe(pending: &PendingApp) -> Option<OwnedReply> {
     }
     AUTO_APP_SERVE.store(true, Ordering::Relaxed);
     APP_BLIND_STREAK.store(0, Ordering::Relaxed);
+    if let Ok(mut slot) = PROBE_SILENT_UNTIL.lock() {
+        *slot = None;
+    }
     info!(
         "event=soter app-serve auto-enabled after {APP_AUTO_SERVE_THRESHOLD} app calls with no HAL traffic; file {APP_SERVE_SWITCH}=0 still forces it off"
     );
@@ -2858,5 +2908,43 @@ mod tests {
         }
         assert!(!auto_serve_on());
         reset_auto_serve_for_test();
+    }
+
+    /// 误判之后能自己退回来：接管开着的时候又看到宿主碰了我们认识的 HAL，
+    /// 就把接管撤掉并静默一段，回到旧行为。
+    #[test]
+    fn a_revoked_auto_serve_backs_off_instead_of_flapping() {
+        let _guard = AUTO_SERVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_auto_serve_for_test();
+        // 先让它接一笔，接管就开着。
+        stash_app_call_for_test(blind_app_call(), 10373);
+        assert!(take_app_answer().is_some());
+        assert!(auto_serve_on());
+
+        // 宿主腿又活了：接管被撤、并进入静默期。
+        note_hal_activity();
+        assert!(!auto_serve_on(), "看到 HAL 流量就该撤");
+        let silenced = PROBE_SILENT_UNTIL.lock().map(|slot| *slot).ok().flatten();
+        assert!(
+            probes_silenced(silenced, Instant::now()),
+            "撤掉之后要静默，否则下一笔又接、来回抖"
+        );
+
+        // 静默期里再来的盲请求不好使（等于旧行为）。
+        stash_app_call_for_test(blind_app_call(), 10373);
+        assert!(take_app_answer().is_none(), "静默期里不该接");
+        assert!(!auto_serve_on());
+        reset_auto_serve_for_test();
+    }
+
+    /// 我们自己答不上时的退避判定（纯函数）。
+    #[test]
+    fn the_probe_backoff_is_a_hard_deadline() {
+        let now = Instant::now();
+        assert!(!probes_silenced(None, now), "没设过就不静默");
+        assert!(probes_silenced(Some(now + Duration::from_secs(1)), now));
+        assert!(!probes_silenced(Some(now - Duration::from_secs(1)), now));
     }
 }
