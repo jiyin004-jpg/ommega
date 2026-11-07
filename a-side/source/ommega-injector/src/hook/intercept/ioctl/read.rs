@@ -221,7 +221,7 @@ unsafe fn handle_incoming_transaction(
     // caller, which is exactly what `observe` assumes.
     // SAFETY: the caller installed the shadow, so `tr.data.ptr.buffer` points at a readable
     // copy inside this process.
-    let _ = unsafe { crate::hook::soter::observe(tr) };
+    let _ = unsafe { crate::hook::soter::observe(tr, true) };
 
     handle_br_transaction(binder_state_key(fd), tr, caller_sid, label)
 }

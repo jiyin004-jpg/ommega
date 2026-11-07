@@ -815,7 +815,7 @@ fn pick_alias_owner(list: &[AliasOwner], alias: &str, now: Instant) -> Option<i3
 ///
 /// 调用方得保证 `tr.data.ptr.buffer` 指向 `tr.data_size` 个可读字节 —— 在
 /// `parse_write_buffer` 里，payload shadow 已经把这段换成本进程里的副本了。
-pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> {
+pub(crate) unsafe fn observe(tr: &binder_transaction_data, inbound: bool) -> Option<SoterCall> {
     let size = tr.data_size;
     if size == 0 || size > 1024 * 1024 {
         return None;
@@ -826,7 +826,11 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
     }
     // SAFETY: 见上面那条 —— 调用点保证这段字节可读。
     let data = unsafe { std::slice::from_raw_parts(buffer as *const u8, size) };
-    let mut call = match parse(data, tr.code) {
+    let mut call = match parse(data, tr.code).or_else(|| {
+        inbound
+            .then(|| parse_untokened_app(data, tr.code, tr.sender_euid))
+            .flatten()
+    }) {
         Some(call) => call,
         None => {
             // 认不出来的接口 token 里，看着像 SOTER 的记一条。
@@ -876,6 +880,159 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data) -> Option<SoterCall> 
 /// AID_APP_START：第一个“装在机器上的应用”的 uid。比它小的都是 init / system_server /
 /// root / shell 这些系统身份。
 pub(crate) const AID_APP_START: i32 = 10000;
+
+/// 本进程的 cmdline（一次读好）。放宽 App 腿时要靠它避开 keystore2。
+fn self_cmdline() -> &'static str {
+    static CMDLINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CMDLINE.get_or_init(|| {
+        std::fs::read("/proc/self/cmdline")
+            .map(|bytes| {
+                let end = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(bytes.len());
+                String::from_utf8_lossy(&bytes[..end]).into_owned()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// 能不能走「认不出接口名也把 App 面向那笔认下来」这条兜底。
+///
+/// 三条硬约束，缺一不可：
+///   1. `sender_euid` 是应用 —— 内核在事务头上填的，调用方改不了。宿主自己发往
+///      HAL 的那笔 sender 是 1000，探针也伪造不了这个值。
+///   2. 当前进程不是 keystore2 —— `IKeystoreService` 的方法号也在 1..13 里，无 token
+///      时放宽会把 keystore 的调用当成 SOTER 请求，那是真事故。
+///   3. 当前进程看着是 SOTER 那一族的（cmdline 带 soter/tencent）。注进来的 HAL 客户端
+///      （例如一加的 cryptoeng）收得到入站应用调用，但它们不是宿主，不放宽。
+fn untokened_app_allowed(sender_uid: i32, cmdline: &str) -> bool {
+    if !is_app_uid(sender_uid) {
+        return false;
+    }
+    if cmdline.contains("keystore") {
+        return false;
+    }
+    cmdline.contains("soter") || cmdline.contains("tencent")
+}
+
+/// 认不出接口名时仍然把 App 面向那笔认下来（只在入站方向用）。
+///
+/// 有的 ROM 把宿主服务的接口名整个换掉（token 对不上），但方法号还是腾讯那套、
+/// 参数形状也没变。这时候就靠 [`untokened_app_allowed`] 那三条硬约束 + 下面这层
+/// 形状校验把事情坐实：参数从哪个偏移开始并不知道（token 长度随包名变），
+/// 就把每个四字节对齐位置都当候选起点试一遍，只收「解出来像真的」那个。
+fn parse_untokened_app(data: &[u8], code: u32, sender_uid: i32) -> Option<SoterCall> {
+    let allowed = untokened_app_allowed(sender_uid, self_cmdline());
+    parse_untokened_with(data, code, sender_uid, allowed)
+}
+
+/// [`parse_untokened_app`] 的主体：`allowed` 抽出来方便单测。
+fn parse_untokened_with(
+    data: &[u8],
+    code: u32,
+    sender_uid: i32,
+    allowed: bool,
+) -> Option<SoterCall> {
+    if !allowed {
+        return None;
+    }
+    // 12/13 号（getVersion / getExtraParam）无参或只有一把 key，没有形状可验，
+    // 放宽了很容易撞上别的服务 —— 那两个宿主本来自己答，不差这一条。
+    if matches!(code, 12 | 13) {
+        return None;
+    }
+    let (op, shape) = describe(false, code)?;
+    for start in untokened_starts(data) {
+        let mut cursor = Cursor::new(data, start, false);
+        let (uid, alias, challenge, session, key) = match shape {
+            Args::Uid => (cursor.i32(), None, None, None, None),
+            Args::UidAlias => match (cursor.i32(), cursor.string()) {
+                (Some(uid), Some(alias)) => (Some(uid), Some(alias), None, None, None),
+                _ => continue,
+            },
+            Args::UidAliasChallenge => match (cursor.i32(), cursor.string(), cursor.string()) {
+                (Some(uid), Some(alias), Some(challenge)) => {
+                    (Some(uid), Some(alias), Some(challenge), None, None)
+                }
+                _ => continue,
+            },
+            Args::Session => match cursor.i64() {
+                // 会话号是毫秒级时间戳或真机开的号，不会是小整数；0 和小数往往是
+                // 别的服务在同一偏移上碰出来的垃圾。
+                Some(session) if session.unsigned_abs() > 1_000_000_000 => {
+                    (None, None, None, Some(session), None)
+                }
+                _ => continue,
+            },
+            Args::None | Args::Key => continue,
+        };
+        if !plausible_untokened(uid, alias.as_deref(), challenge.as_deref()) {
+            continue;
+        }
+        return Some(SoterCall {
+            hal: false,
+            hidl: false,
+            has_return_code: false,
+            code,
+            wire_code: code,
+            op,
+            uid,
+            alias,
+            challenge,
+            session,
+            key,
+            caller_uid: Some(sender_uid),
+            data_size: data.len(),
+        });
+    }
+    None
+}
+
+/// 候选起点：每个四字节对齐位置，而且它前面得看着是一个字段的尾巴（零填充）。
+///
+/// App 面向请求的 token 是 `[policy][worksource]['SYST'][len][字符...][0]`（或 HIDL 那种
+/// CString），终点尾巴上总有四字节的 0；不要求这一条的话，参数中间随便一个位置
+/// 都可能被当成起点，解出一堆看似合理的数字。
+fn untokened_starts(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    (8..data.len().saturating_sub(8)).filter(move |start| {
+        let start = *start;
+        start % 4 == 0 && start >= 4 && data.get(start - 4..start) == Some(&[0, 0, 0, 0][..])
+    })
+}
+
+/// 解出来的参数像不像真的。uid 落在应用号段、alias 可打印、challenge 是十六进制。
+fn plausible_untokened(uid: Option<i32>, alias: Option<&str>, challenge: Option<&str>) -> bool {
+    if let Some(uid) = uid {
+        if !(AID_APP_START..2_000_000).contains(&uid) {
+            return false;
+        }
+    } else if alias.is_none() && challenge.is_none() {
+        // 一点形状都没有的（例如只有会话号的那类）靠上一层的 session 范围把关，
+        // 这里不再重复判。
+        return true;
+    }
+    if let Some(alias) = alias {
+        if alias.is_empty() || alias.len() > 256 {
+            return false;
+        }
+        if !alias
+            .bytes()
+            .all(|byte| (0x20..0x7f).contains(&byte) || byte == b'&')
+        {
+            return false;
+        }
+    }
+    if let Some(challenge) = challenge {
+        if challenge.is_empty() || challenge.len() > 128 || challenge.len() % 2 != 0 {
+            return false;
+        }
+        if !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    true
+}
 
 /// 这个 uid 看着是不是应用（不是系统身份）。
 ///
@@ -2946,5 +3103,80 @@ mod tests {
         assert!(!probes_silenced(None, now), "没设过就不静默");
         assert!(probes_silenced(Some(now + Duration::from_secs(1)), now));
         assert!(!probes_silenced(Some(now - Duration::from_secs(1)), now));
+    }
+
+    /// 接口名被 ROM 换掉时也能把 App 面向那笔认下来：只靠 sender 是应用 +
+    /// 参数形状对得上，不要求 token 匹配。
+    #[test]
+    fn an_unknown_interface_name_still_yields_the_app_side() {
+        let mut data = interface_token("com.example.rom.soter.IRenamed");
+        push_i32(&mut data, 10490);
+        push_string(&mut data, "SoterAuthKeyV2_x_scene1");
+        assert!(
+            parse(&data, 8).is_none(),
+            "token 不认识，严格解释那里就该放过"
+        );
+        let call = parse_untokened_with(&data, 8, 10490, true).expect("放宽路径得认出来");
+        assert!(!call.hal);
+        assert_eq!(call.code, 8);
+        assert_eq!(call.op, "hasAuthKey");
+        assert_eq!(call.uid, Some(10490));
+        assert_eq!(call.alias.as_deref(), Some("SoterAuthKeyV2_x_scene1"));
+        assert_eq!(call.caller_uid, Some(10490), "调用者要用内核填的那个");
+    }
+
+    /// 放宽那三条约束，一条不满足就都不能认。
+    #[test]
+    fn the_untokened_side_needs_all_three_gates() {
+        let mut data = interface_token("com.example.rom.soter.IRenamed");
+        push_i32(&mut data, 10490);
+        push_string(&mut data, "SoterAuthKey");
+
+        assert!(!untokened_app_allowed(
+            1000,
+            "com.tencent.soter.soterserver"
+        ));
+        assert!(!untokened_app_allowed(10490, "/system/bin/keystore2"));
+        assert!(!untokened_app_allowed(10490, "vendor.example.cryptoeng"));
+        assert!(untokened_app_allowed(
+            10490,
+            "com.tencent.soter.soterserver"
+        ));
+        assert!(untokened_app_allowed(
+            99910365,
+            "vendor.qti.hardware.soter-service"
+        ));
+
+        assert!(parse_untokened_with(&data, 8, 10490, false).is_none());
+    }
+
+    /// 12/13 号没有形状可验，不放宽（那两个宿主本来自己答）。
+    #[test]
+    fn the_shapeless_codes_are_never_guessed() {
+        let mut data = interface_token("com.example.rom.soter.IRenamed");
+        push_i32(&mut data, 10490);
+        for code in [12u32, 13] {
+            assert!(
+                parse_untokened_with(&data, code, 10490, true).is_none(),
+                "code {code} 没形状可验，不能猜"
+            );
+        }
+    }
+
+    /// 解出来的参数不像真的就不认（uid 落在应用号段以外、alias 带控制字符、随机字节）。
+    #[test]
+    fn implausible_values_do_not_pass_the_shape_check() {
+        let mut data = interface_token("com.example.rom.soter.IRenamed");
+        push_i32(&mut data, 1000);
+        push_string(&mut data, "SoterAuthKey");
+        assert!(parse_untokened_with(&data, 8, 10490, true).is_none());
+
+        let mut data = interface_token("com.example.rom.soter.IRenamed");
+        push_i32(&mut data, 10490);
+        push_string(&mut data, "bad\u{1}alias");
+        assert!(parse_untokened_with(&data, 8, 10490, true).is_none());
+
+        let junk: Vec<u8> = (0..64u8).map(|byte| byte.wrapping_mul(37)).collect();
+        assert!(parse_untokened_with(&junk, 8, 10490, true).is_none());
     }
 }

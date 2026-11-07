@@ -341,7 +341,9 @@ pub(super) unsafe fn parse_write_buffer(
                                 // 阶段把它换成真回复。
                                 // SAFETY: 上面 payload shadow 已经把这段换成本进程里的
                                 // 副本，tr.data 指向 tr.data_size 个可读字节。
-                                if let Some(call) = unsafe { crate::hook::soter::observe(&tr) } {
+                                if let Some(call) =
+                                    unsafe { crate::hook::soter::observe(&tr, false) }
+                                {
                                     if crate::hook::soter::interceptable(&call) {
                                         intercept_soter_call(fd, &mut tr, &call);
                                     }
