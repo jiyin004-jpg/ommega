@@ -34,4 +34,10 @@ interface IMaintenanceService {
     // 文件，所以 WebUI 改完开关下一笔调用就按新值走。没有 caller context 要查：能走到
     // 这里的 peer 已经过了 socket 鉴权，跟 reportHookEvent 同理。
     byte[] forwardSoter(in String request);
+
+    // 把整份 SOTER 料库文本落盘。app 域的进程（SOTER 宿主是 platform_app、带 MLS
+    // 类别）读得到那个文件却写不动 —— MLS 的写约束要求主体和客体级别相等，SELinux
+    // 的类型规则放行了也没用。所以那半边只能把整份文本交给 daemon 代写。
+    // 跟 forwardSoter 同理：能走到这里的 peer 已经过了 socket 鉴权，不需要 caller context。
+    boolean writeSoterStore(in String text);
 }

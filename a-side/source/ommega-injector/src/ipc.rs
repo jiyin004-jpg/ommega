@@ -595,6 +595,23 @@ pub fn forward_soter(request: &str) -> Result<Vec<u8>> {
     })
 }
 
+/// 把整份 SOTER 料库文本交给 daemon 代写。
+///
+/// app 域的进程（SOTER 宿主是 platform_app、带 MLS 类别）读得到
+/// `/data/misc/ommega/soter_asks.json` 却写不动它：MLS 的写约束要求主体和客体级别
+/// 相等，SELinux 的类型规则放行了也没用。宿主里那份料因此只能顺着这条 RPC 落到
+/// daemon（跑在 ksu/keystore 域，级别是 s0）手里。
+///
+/// 同步等结果：调用方正在建料/签名的路上，写不进去它要退到「只在内存里」。
+pub fn write_soter_store(text: &str) -> Result<bool> {
+    ensure_process_state();
+    with_ommega_maintenance_once(|maintenance| {
+        maintenance
+            .writeSoterStore(text)
+            .context("writeSoterStore failed")
+    })
+}
+
 /// uid -> 包名解析结果的缓存时长。这层映射只在装/卸应用时变，而每笔 keystore
 /// 请求都要问一次「这个 uid 是谁」（一次跨进程 binder 往返，还占着调用方正
 /// 等着的那条 binder 线程），缓存一分钟能省掉绝大多数 RPC。

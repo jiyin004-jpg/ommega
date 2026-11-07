@@ -537,4 +537,11 @@ impl IMaintenanceService for MaintenanceManager {
         let _wp = wd::watch("IMaintenanceService::forwardSoter");
         Ok(crate::soter_relay::forward(request))
     }
+
+    /// app 域的 payload 写不动 SOTER 料库（MLS 的写约束要求级别相等），整份文本交给
+    /// 这里落盘。与 `forwardSoter` 同理：peer 已经过了 socket 鉴权，不查 caller。
+    fn writeSoterStore(&self, text: &str) -> rsbinder::status::Result<bool> {
+        let _wp = wd::watch("IMaintenanceService::writeSoterStore");
+        Ok(crate::soter_store::write(text))
+    }
 }

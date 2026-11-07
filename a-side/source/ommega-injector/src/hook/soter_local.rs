@@ -387,6 +387,21 @@ fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<S
         return Some(path.to_string());
     }
     let _ = std::fs::remove_file(&tmp);
+    // app 域（SOTER 宿主是 platform_app、带 MLS 类别）写不动这个文件：MLS 的写约束
+    // 要求主体和客体级别相等。整份文本交给 daemon 代写，它跑在 s0 上，写得进去。
+    // 测试用的临时 store（`OMMEGA_SOTER_ASK_STORE`）不走 RPC：那里根本没有 daemon。
+    if path == ASK_STORE_PATH {
+        match crate::ipc::write_soter_store(&text) {
+            Ok(true) => {
+                log::info!("event=soter ask store written by the daemon");
+                return Some(path.to_string());
+            }
+            Ok(false) => log::warn!("event=soter daemon refused to write the ask store"),
+            Err(error) => {
+                log::warn!("event=soter daemon could not write the ask store ({error:#})")
+            }
+        }
+    }
     log::warn!("soter local cannot write the ask store at {path}");
     None
 }

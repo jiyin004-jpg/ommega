@@ -41,6 +41,7 @@ pub mod selinux;
 pub mod soter_cpu_id;
 pub mod soter_host_health;
 pub mod soter_relay;
+pub mod soter_store;
 pub mod utils;
 pub mod watchdog;
 
