@@ -649,6 +649,12 @@ while true; do
     sync_foreground
   fi
   tick=$((tick + 1))
+  # 开机早期 `pm` 还没就绪（那时 `pm path` 拿不到路径，判定会直接放过），所以不能只在
+  # 启动时判一次：文件没写出来就接着重试，写出来之后每 60 个 tick 再校对一遍（宿主
+  # 换版本时也能跟上）。
+  if [ ! -s "$SOTER_HOST_STATE_OUT" ] || [ $((tick % 60)) -eq 0 ]; then
+    sync_soter_host_state
+  fi
   sync_soter_attk
   sync_soter_cpu_id
   if [ "$soter_attk_changed" = "1" ]; then
