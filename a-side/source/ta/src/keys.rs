@@ -1368,26 +1368,46 @@ fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::Bo
     let text = remote_identity_text()?;
     let mut locked: Option<i32> = None;
     let mut state: Option<i32> = None;
-    let mut digest: Option<Vec<u8>> = None;
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("device_locked=") {
             locked = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("verified_boot_state=") {
             state = v.trim().parse().ok();
-        } else if let Some(v) = line.strip_prefix("vbmeta_digest=") {
-            digest = hex_to_bytes(v.trim());
         }
     }
     let locked = locked?;
     let state = state?;
+    let from_remote = keymint::VerifiedBootState::try_from(state)
+        .unwrap_or(keymint::VerifiedBootState::Unverified);
+    // 只允许往「更严格」的方向抬。remote_identity 可能是很久以前写的（旧版本写的
+    // unlocked / Unverified，或者来自 B 真机那条链），拿它去盖掉本机已经锁定的说法，
+    // 链就会说「已解锁」而 daemon 早把 ro.boot.vbmeta.device_state / verifiedbootstate
+    // 锁成 locked / green 了 —— 自相矛盾，应用一看就见红。
+    let boot_state = if boot_state_rank(from_remote) > boot_state_rank(fallback.verified_boot_state)
+    {
+        fallback.verified_boot_state
+    } else {
+        from_remote
+    };
     Some(keymint::BootInfo {
         verified_boot_key: fallback.verified_boot_key.clone(),
-        device_boot_locked: locked != 0,
-        verified_boot_state: keymint::VerifiedBootState::try_from(state)
-            .unwrap_or(keymint::VerifiedBootState::Unverified),
-        verified_boot_hash: digest.unwrap_or_else(|| fallback.verified_boot_hash.clone()),
+        device_boot_locked: locked != 0 || fallback.device_boot_locked,
+        verified_boot_state: boot_state,
+        // 摘要一律用本机的：ro.boot.vbmeta.digest 是只读 boot 属性，resetprop 改不动，
+        // 链里写别人的摘要就是自相矛盾（应用会判「Verified Boot 摘要不匹配」）。
+        verified_boot_hash: fallback.verified_boot_hash.clone(),
         boot_patchlevel: fallback.boot_patchlevel,
     })
+}
+
+/// boot 状态越好越靠前（0 = verified 最好，3 = failed 最差）。
+fn boot_state_rank(state: keymint::VerifiedBootState) -> i32 {
+    match state {
+        keymint::VerifiedBootState::Verified => 0,
+        keymint::VerifiedBootState::SelfSigned => 1,
+        keymint::VerifiedBootState::Unverified => 2,
+        keymint::VerifiedBootState::Failed => 3,
+    }
 }
 
 /// 读 `remote_identity` 的文本内容，存 5 秒。
@@ -1415,20 +1435,6 @@ fn remote_identity_text() -> Option<String> {
         *guard = Some((text.clone(), std::time::Instant::now()));
     }
     Some(text)
-}
-
-fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) || text.is_empty() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 2);
-    let bytes = text.as_bytes();
-    for pair in bytes.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-    }
-    Some(out)
 }
 
 /// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写（避免触发重启循环）。
@@ -1470,23 +1476,22 @@ fn persist_remote_identity(leaf_der: &[u8]) {
             out.push('\n');
         }
     }
-    // boot 锁定状态：走远程时证书里的 RootOfTrust 是 B 端真机的（多半
-    // unlocked / Unverified），本机那套 locked / Verified 跟它一对就不一致。
+    // boot 锁定状态：统一按我们对外宣称的 locked / Verified 写，不跟远端链的值走。
     //
-    // 这里改用 `parse_remote_root_of_trust`：它是给子证书续链用的那条路径，
-    // 已经处理过 EAT/CBOR 和 [704] 的包装；复用 `parse_remote_device_identity`
-    // 里那份解析时拿到的是错位后的值（曾经写出 locked=1 / state=0，
-    // 而证书里明明是 0 / 2）。
+    // 这个文件是本地签（ATTEST_KEY 子钥）唯一的 ROT 来源，而 daemon 的
+    // `lock_down_boot_state` 早把 ro.boot.vbmeta.device_state / verifiedbootstate 锁成
+    // locked / green 了。跟远端链写 unlocked / Unverified 的话，链跟属性就两个说法
+    // （应用会报「引导加载程序已解锁」）。远端那条链自己就是 unlocked 的情况（旧版本
+    // 写的，或 B 真机那条），也不该传染到我们本地签的链上。
+    out.push_str("device_locked=1\n");
+    out.push_str("verified_boot_state=0\n");
     if let Ok(Some(rot)) = crate::cert::parse_remote_root_of_trust(leaf_der) {
-        out.push_str(if rot.device_locked {
-            "device_locked=1\n"
-        } else {
-            "device_locked=0\n"
-        });
-        out.push_str(&format!(
-            "verified_boot_state={}\n",
+        // 只记一笔，不采用：见上。排障时能看出远端到底声称了什么。
+        log::debug!(
+            "remote ROT claims locked={} state={} (ignored, local claim wins)",
+            rot.device_locked,
             rot.verified_boot_state
-        ));
+        );
     }
     if let Some(patch) = identity.boot_patchlevel {
         out.push_str(&format!("boot_patchlevel={patch}\n"));
