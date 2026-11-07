@@ -1533,7 +1533,15 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
         soter_local::answer(&hal_call)
     } else {
         crate::hook::soter_relay::answer(&hal_call)
-    }?;
+    };
+    let Some(answer) = answer else {
+        // 宿主里文件日志是哑的；答不出来这件事只能顺 RPC 让 daemon 记下来。
+        crate::ipc::report_event(format!(
+            "event=soter app answer none code={} hal_code={hal_code} caller_uid={caller_uid} local_session={local_session}",
+            call.code
+        ));
+        return None;
+    };
     Some(match (call.code, answer) {
         (1 | 4 | 5 | 7, Answer::Code(code)) => AppAnswer::Int(code),
         // App 那边的 `has*` 是布尔：语义是「我们答成功了吗」。

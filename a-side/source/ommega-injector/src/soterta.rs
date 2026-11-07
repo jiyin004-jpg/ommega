@@ -590,6 +590,13 @@ pub fn serve(driver: &str) -> anyhow::Result<()> {
         "event=soterta registered {service} on {driver} (descriptor={descriptor} return_code={})",
         has_return_code()
     );
+    // 本地兜底那条路的 cpu_id 得给 app 域那份 payload 备好：宿主是 platform_app，
+    // exec `getprop` 被 SELinux 拒、直接读属性区也拿不到序列号。这里跑在 root 里，
+    // 算一次落盘，宿主那边直接读文件。
+    let local_cpu_id = crate::hook::soter_local::device_id();
+    if !local_cpu_id.is_empty() {
+        crate::hook::soter_local::publish_local_cpu_id(&local_cpu_id);
+    }
     // 连 daemon 的 RPC 放后台：它要等 socket 就绪（最长几十秒），不能挡着注册
     // —— soterta.sh 在启动后一秒就看服务名在不在，迟一步就被当成失败回滚掉。
     std::thread::spawn(|| match crate::ipc::install_direct_rpc_session() {

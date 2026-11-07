@@ -691,7 +691,7 @@ pub(crate) fn device_id() -> String {
 
 /// 本地兜底这条路该报的 cpu_id。
 ///
-/// 只认**本地这份身份自己的号**，顺序就两级：
+/// 只认**本地这份身份自己的号**：
 ///   1. `soter_cpu_id.force` —— 这份 ATTK 自带的号（导入 WebUI 时 `cpu_id:` 那一行被 daemon
 ///      落成它；拿别台设备的 ATTK 重放时也靠它对齐）；
 ///   2. 本机序列号派生的号 —— 本地 ATTK 是我们自己现造的那把，它的身份就是这台机器。
@@ -701,16 +701,45 @@ pub(crate) fn device_id() -> String {
 /// 但 ATTK/ASK/AuthKey 对不上那个号 —— 三处文档里声明的 cpu_id 必须跟签字那把钥匙是同一个
 /// 身份。两边各报各的才对；测器觉得两处不一样，那是因为它们本来就不是同一台。
 ///
+/// 派生号算不出来时读 [`LOCAL_CPU_ID_PATH`]：app 域（SOTER 宿主是 platform_app）里
+/// fork `getprop` 被 SELinux 拒、直接读属性区在 ColorOS 上也读不到序列号
+/// （HA2B9D1W 实测 `serial=None`），只能让跑得动的进程算一次落盘。
+///
 /// 一个来源都拿不到就报空串：这层宁可不答，也不编一个号（编出来的一眼假）。
 fn cpu_id() -> String {
     let forced = std::fs::read_to_string(CPU_ID_OVERRIDE).ok();
-    match local_cpu_id(forced.as_deref(), device_info().derived_cpu_id.as_deref()) {
+    let derived = device_info().derived_cpu_id.as_deref();
+    match local_cpu_id(forced.as_deref(), derived) {
         (value, "forced") => {
             log::info!("event=soter cpu_id forced by {CPU_ID_OVERRIDE}");
-            value
+            return value;
         }
-        (value, _) => value,
+        (value, "derived") if !value.is_empty() => {
+            publish_local_cpu_id(&value);
+            return value;
+        }
+        _ => {}
     }
+    read_local_cpu_id().unwrap_or_default()
+}
+
+/// 本机派生 cpu_id 的落盘位置。`system_data_file`，宿主那份 payload 读得到。
+const LOCAL_CPU_ID_PATH: &str = "/data/misc/ommega/soter_local_cpu_id";
+
+/// 把算出来的派生号落盘给 app 域的 payload 用（best effort，内容没变就不写）。
+pub(crate) fn publish_local_cpu_id(value: &str) {
+    if value.is_empty() || read_local_cpu_id().as_deref() == Some(value) {
+        return;
+    }
+    let line = format!("soter_cpu_id: {value}\n");
+    if std::fs::write(LOCAL_CPU_ID_PATH, line).is_ok() {
+        log::info!("event=soter published local cpu_id to {LOCAL_CPU_ID_PATH}");
+    }
+}
+
+fn read_local_cpu_id() -> Option<String> {
+    let text = std::fs::read_to_string(LOCAL_CPU_ID_PATH).ok()?;
+    kmr_common::soter_relay::parse_cpu_id(&text)
 }
 
 /// `cpu_id()` 里跟文件读写无关的那半（测试要拿假输入跑）。
@@ -742,6 +771,10 @@ extern "C" {
 /// 读不到（NX721J：shell 里 `getprop ro.boot.serialno` 能拿到序列号，payload 里
 /// `__system_property_get` 返回 0，静默当成“没这条属性”）。签名这条路径每毫秒都算数，
 /// 但多 fork 一次 `getprop` 换“真能读到”比省那点开销值。
+///
+/// 更麻烦的是 app 域（SOTER 宿主是 platform_app）里连 fork 都不行：exec
+/// `/system/bin/getprop` 会被 SELinux 直接拒（HA2B9D1W / ColorOS 实测）。那种进程靠
+/// [`LOCAL_CPU_ID_PATH`] 那份缓存，见 [`cpu_id`]。
 #[cfg(target_os = "android")]
 pub(crate) fn prop(name: &str) -> Option<String> {
     let output = std::process::Command::new("/system/bin/getprop")
@@ -957,10 +990,17 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
             status,
             session
         ),
-        None => log::info!(
-            "event=soter local answer op={} = none (passthrough)",
-            call.code
-        ),
+        None => {
+            log::info!(
+                "event=soter local answer op={} = none (passthrough)",
+                call.code
+            );
+            // app 域进程里文件日志是哑的，本地这条路答不出来时只能顺 RPC 报给 daemon。
+            crate::ipc::report_event(format!(
+                "event=soter local answer op={} = none (passthrough)",
+                call.code
+            ));
+        }
     }
     result
 }
@@ -983,11 +1023,21 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         }
         _ => {}
     }
-    let state = state()?;
+    let Some(state) = state() else {
+        crate::ipc::report_event(format!(
+            "event=soter local bail op={} reason=no-attk",
+            call.code
+        ));
+        return None;
+    };
     // 没有任何真实来源（daemon 那份没读到、本机序列号也读不到）时，这台机器没有可报的
     // 身份。不许编一个（编出来的号在业务侧一眼假），这一笔干脆不答，让上层去透传。
     if cpu_id().is_empty() {
         log::warn!("event=soter local has no real cpu_id; not answering this call locally");
+        crate::ipc::report_event(format!(
+            "event=soter local bail op={} reason=empty-cpu-id",
+            call.code
+        ));
         return None;
     }
     match call.code {
