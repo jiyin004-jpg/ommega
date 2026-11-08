@@ -118,9 +118,11 @@ pub struct ApiTokenRow {
     pub created_at: String,
     pub last_ip: String,
     pub last_used_at: String,
-    /// 配对组 id：同组的 A/B 才能互通。空 = 老卡密（不参与配对，仍任意互通）。
+    /// 配对组 id：同组的 A/B 才能互通（仅对非 public 卡生效）。空 = 未填组，
+    /// 非 public 卡之间视为无约束；public 卡仍只与 public 卡互通。
     pub pair_id: String,
-    /// `"pair"`（专用配对）/ `"public"`（公开测试）/ 空（老卡密）。
+    /// `"pair"`（专用配对，绑定设备）/ `"public"`（公开测试，不绑）/ 空
+    /// （老卡密，不绑，但配对时按私卡的 `pair_id` 规则处理）。
     pub kind: String,
     /// 首次激活时绑定的设备序列号（`ro.serialno`）。空 = 还没绑定。
     pub bound_serial: String,
@@ -755,9 +757,9 @@ impl Db {
 
     /// 首次给卡密绑设备（只写还没绑的那行）。返回 true = 本次真的写进去了。
     ///
-    /// 用 `WHERE bound_serial IS NULL` 做乐观锁，两台设备同时首次请求时只有
-    /// 一台能绑上，另一台下次请求就会被按「不匹配」拒掉 —— 这正是想要的：
-    /// 卡密跟着第一台设备走。
+    /// 用 `WHERE bound_serial IS NULL OR bound_serial = ''` 做乐观锁，两台设备
+    /// 同时首次请求时只有一台能绑上；另一台会拿到 `Ok(false)`，由调用方回库
+    /// 复核并按「不匹配」当场拒绝 —— 这正是想要的：卡密跟着第一台设备走。
     pub fn bind_token_device(&self, token: &str, serial: &str, sn: &str) -> anyhow::Result<bool> {
         let mut conn = self.conn()?;
         conn.exec_drop(

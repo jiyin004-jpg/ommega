@@ -370,9 +370,14 @@ impl AuthState {
 
     /// Token 身份：配对组 + 类型，供「A/B 必须配对才能走通」的判断用。
     ///
-    /// - `kind = "pair"`：专用配对卡密，只有同一 `pair_id` 的 A 与 B 才能互通。
-    /// - `kind = "public"`：公开/测试卡密，能访问任意另一端（不管对方是不是配对卡）。
-    /// - 其它（空）：老卡密或静态 env token，按历史行为任意互通。
+    /// - `kind = "pair"`：专用配对卡密，只有同一 `pair_id` 的 A 与 B 才能互通；
+    ///   `pair_id` 任一方为空视为无约束。
+    /// - `kind = "public"`：公开/测试卡密，只能与同为 `public` 的另一端互通，
+    ///   不能指挥私机。
+    /// - `kind` 为空（老卡密）：走私卡分支，按 `pair_id` 规则判断。
+    ///
+    /// 静态 env token / 未配置 token 时 [`Self::token_meta`] 返回 `None`，调用方
+    /// 按历史行为放行，不进入这里的配对判断。
     pub fn token_meta(&self, header: Option<&str>) -> Option<TokenMeta> {
         let token = header.unwrap_or("");
         if token.is_empty() || self.check_static_token(Some(token)) {
@@ -399,8 +404,9 @@ impl AuthState {
     /// request is authorized. Also activates the token on first use and records
     /// the client IP.
     ///
-    /// `fp`: 设备指纹（`ro.serialno` / `ro.boot.serialno`）。A 端私卡用它做
-    /// 首次绑定与后续一致性校验；B 端几百台共用一把 token，不参与绑定。
+    /// `fp`: 设备指纹（`ro.serialno` / `ro.boot.serialno`）。显式私卡
+    /// （`pair` / `private`）用它做首次绑定与后续一致性校验，A、B 两端都绑；
+    /// 公开卡和 `kind` 为空的老卡不参与绑定。
     pub fn check_token(
         &self,
         header: Option<&str>,
@@ -436,7 +442,7 @@ impl AuthState {
                     // 卡店卖出去的那些 B 卡换台机器照样能用。公开卡照旧不绑。
                     if role.is_some()
                         && Self::is_private_card(&row)
-                        && !Self::device_binding_ok(db, &row, fp)
+                        && !self.device_binding_ok(db, &row, fp)
                     {
                         tracing::warn!(
                             "check_token: device mismatch token={} bound=({},{}) got=({},{})",
@@ -505,7 +511,13 @@ impl AuthState {
     /// 两个细节：
     /// - 两者都空时只绑定不检查（不传指纹的老 A 端仍能用，但永远绑不上）；
     /// - 旧库里可能只记了其中一项，那就只比非空的那项。
+    ///
+    /// 绑定用 `bind_token_device` 的乐观锁做仲裁：返回 `Ok(false)` 说明另一台
+    /// 设备已经先绑上了。以前这里无视返回值直接放行，第二台设备还能借着 10 秒
+    /// 鉴权缓存继续用；现在必须回库确认库里记的确实是自己的指纹才放行。写绑定
+    /// 失败也按不通过处理，别让一次数据库异常把私卡退化成不绑定。
     fn device_binding_ok(
+        &self,
         db: &Arc<Db>,
         row: &crate::db::ApiTokenRow,
         fp: Option<&DeviceFp>,
@@ -514,19 +526,58 @@ impl AuthState {
         let bound_sn = row.bound_sn.trim();
 
         if bound_serial.is_empty() && bound_sn.is_empty() {
-            if let Some(fp) = fp {
-                if !fp.is_empty() {
-                    if let Err(e) = db.bind_token_device(&row.token, &fp.serial, &fp.sn) {
-                        tracing::warn!("bind_token_device failed token={} err={e}", row.token);
+            let Some(fp) = fp else { return true };
+            if fp.is_empty() {
+                return true;
+            }
+            match db.bind_token_device(&row.token, &fp.serial, &fp.sn) {
+                Ok(true) => {
+                    // 把缓存更新成已绑定：本机在这 10 秒里再请求时不会拿旧行
+                    // 去撞自己的绑定，也就不会被误判成“抢输了”。
+                    let mut bound = row.clone();
+                    bound.bound_serial = fp.serial.clone();
+                    bound.bound_sn = fp.sn.clone();
+                    self.remember_token(&row.token, &bound);
+                    true
+                }
+                Ok(false) => {
+                    // 缓存的还是绑定前的行，而库里已经有主了：以库里的最新
+                    // 绑定为准（直接查库，绕过可能仍然陈旧的缓存）。
+                    match db.get_api_token(&row.token) {
+                        Ok(Some(fresh)) => {
+                            let ok = Self::bounds_match(&fresh.bound_serial, &fresh.bound_sn, fp);
+                            if ok {
+                                self.remember_token(&row.token, &fresh);
+                            }
+                            ok
+                        }
+                        Ok(None) => false,
+                        Err(e) => {
+                            tracing::warn!(
+                                "check_token: re-read after losing bind race failed token={} err={e}",
+                                row.token
+                            );
+                            false
+                        }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!("bind_token_device failed token={} err={e}", row.token);
+                    false
+                }
             }
-            return true;
-        }
-
-        let Some(fp) = fp else { return false };
-        if fp.is_empty() {
+        } else {
             // 已绑定的卡却不报指纹：只能当不匹配，不然换个客户端不带 header 就绕过了。
+            fp.is_some_and(|fp| Self::bounds_match(bound_serial, bound_sn, fp))
+        }
+    }
+
+    /// 已绑定行与本次上报的指纹是否一致。只比非空项；两边都空视为不命中，
+    /// 绝不把“没有指纹”当成匹配。
+    fn bounds_match(bound_serial: &str, bound_sn: &str, fp: &DeviceFp) -> bool {
+        let bound_serial = bound_serial.trim();
+        let bound_sn = bound_sn.trim();
+        if (bound_serial.is_empty() && bound_sn.is_empty()) || fp.is_empty() {
             return false;
         }
         let serial_ok = bound_serial.is_empty() || fp.serial.trim() == bound_serial;
@@ -794,5 +845,37 @@ mod allows_tests {
         assert!(meta("pair", "x").allows(&meta("", "")));
         // 但如果它带上了 pair_id，就按私卡严格比
         assert!(!meta("", "x").allows(&meta("pair", "y")));
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::{AuthState, DeviceFp};
+
+    fn fp(serial: &str, sn: &str) -> DeviceFp {
+        DeviceFp {
+            serial: serial.to_string(),
+            sn: sn.to_string(),
+        }
+    }
+
+    /// 绑定后只认同一台设备；旧行只有一项时只比那一项。
+    #[test]
+    fn bound_fingerprint_matches_field_wise() {
+        let current = fp("SN1", "SN2");
+        assert!(AuthState::bounds_match("SN1", "SN2", &current));
+        assert!(AuthState::bounds_match("SN1", "", &current));
+        assert!(AuthState::bounds_match("", "SN2", &current));
+        assert!(!AuthState::bounds_match("SN1", "OTHER", &current));
+        assert!(!AuthState::bounds_match("OTHER", "SN2", &current));
+    }
+
+    /// 未绑定行、以及已绑定卡不带指纹的请求，都必须判为不匹配：
+    /// 前者不能在这个分支里被当成命中，后者不能靠省略 header 绕过。
+    #[test]
+    fn empty_side_never_matches() {
+        let current = fp("SN1", "SN2");
+        assert!(!AuthState::bounds_match("", "", &current));
+        assert!(!AuthState::bounds_match("SN1", "SN2", &fp("", "")));
     }
 }

@@ -52,13 +52,14 @@ static SESSION_CAP_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 
 /// Where server_keybox sessions (leaf private key + chain) are persisted so a
 /// relay restart does not orphan the A-side's `KeyMaterial::Remote` keys.
-/// The A-side derives the session alias deterministically from the attestation
-/// challenge, but the private key lives here — if it is lost (e.g. a restart),
-/// the app's "use attestation key" flow cannot sign child certs and hangs.
+/// The A-side allocates the session alias as an independent 128-bit random
+/// `ommega-remote-*` identity per remote key, but the private key lives here —
+/// if it is lost (e.g. a restart), the app's "use attestation key" flow cannot
+/// sign child certs and hangs.
 ///
 /// Sessions are keyed by the A-side's `ommega-remote-*` alias ALONE (not by
-/// device_id): the alias is derived from (challenge, serial) on the A-side and
-/// is independent of device_id. Keying by (device_id, alias) meant that any
+/// device_id): the alias is independent of device_id. Keying by
+/// (device_id, alias) meant that any
 /// device_id change (or a B-side identity re-upload under a new id) orphaned
 /// every previously stored attestation key and forced a manual app reset. With
 /// alias-keying, a sign request for a known alias always resolves to the same

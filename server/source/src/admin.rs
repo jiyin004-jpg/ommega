@@ -542,8 +542,9 @@ pub struct TokenGenBody {
     pub role: String, // "a" | "b"
     pub duration_seconds: i64,
     pub note: Option<String>,
-    /// 卡类型：`pair`（私卡，要和另一端的同 pair_id 配对）/ `public`（公开测试卡，
-    /// 能访问任意另一端）/ 空（老卡密，任意互通）。
+    /// 卡类型：`pair`（私卡，要和另一端的同 pair_id 配对，并绑定设备）/
+    /// `public`（公开测试卡，只能与同为 public 的另一端互通，不绑设备）/
+    /// 空（老卡密，不绑设备，配对时按私卡的 pair_id 规则处理）。
     #[serde(default)]
     pub kind: Option<String>,
     /// 私卡的配对组；**可以留空**，之后再在列表里编辑补上。
@@ -603,8 +604,8 @@ pub struct TokenUnbindBody {
 
 /// POST /api/admin/token_unbind/ — 控制台里给私卡解绑设备。
 ///
-/// 只清设备指纹，不动激活时间与有效期；公开卡/配对卡不参与绑定，调了也只是
-/// 返回“本来就没绑”。
+/// 只清设备指纹，不动激活时间与有效期；公开卡和 `kind` 为空的老卡不绑定，
+/// 调了只会返回“本来就没绑”；配对卡清除后下次使用会重新绑定。
 pub async fn admin_token_unbind(
     State(state): State<AppState>,
     headers: HeaderMap,

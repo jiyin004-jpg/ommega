@@ -1276,10 +1276,12 @@ impl TaskStore {
                 }
             }
             // 归属校验：认领过设备 id 的任务，只认那个设备报上来的结果，
-            // 免得共享 B token 下另一台设备把结果顶掉。任一侧为空
-            // （尚未认领 / 老客户端不带 device_id）时不拦。
+            // 免得共享 B token 下另一台设备把结果顶掉。空 device_id 同样
+            // 不认——以前放行空 id，等于谁都能用空 id 顶掉在飞任务。
+            // 尚未认领（Pending 且 assigned 为空）的任务不拦，分配超时回收后
+            // 原设备的晚到结果依旧有效。
             if let Some(assigned) = task.assigned_device_id.as_deref() {
-                if !assigned.is_empty() && !device_id.is_empty() && assigned != device_id {
+                if !assigned.is_empty() && assigned != device_id {
                     return Err("device mismatch".to_string());
                 }
             }
@@ -1630,13 +1632,16 @@ impl TaskStore {
 
     /// 记下这台 B 上线时用的 token 身份（配对组 + 类型）。
     ///
-    /// 只是给「A/B 必须配对」的判断用；没登记过的设备（老客户端 / 老卡密 / 静态 token）
-    /// 一律按历史行为「任意 A 都能用」。
+    /// 只给「A/B 必须配对」的判断用；没有 token、静态 env token、或查不到/已停用
+    /// 的卡不会登记，调用方拿不到 `Some`，按历史行为「任意 A 都能用」。
     ///
     /// 换组要过一道闸（见 [`TOKEN_META_REBIND_AFTER_MS`]）：设备还在心跳时，只有同一组的
     /// token 能更新，别的组、或者把组洗成空，一律不认。不拦的话，任意一张 B 卡对别人的
     /// device_id 心跳一笔，就能把它认领进自己组（或者反过来把约束洗掉），配对检查随之
     /// 放行别人的 A。
+    ///
+    /// 闸门只比较 `pair_id`：公开卡和 `kind` 为空的老卡都没有组，彼此都算同组，公开池
+    /// 内部按设计互通；同一空组下 `kind` 仍可能被后到的心跳覆盖。
     ///
     /// 设备真换了卡（离线超过窗口再回来）照样能改，只是多等一个在线窗口 —— 换卡本来
     /// 就要重装/重启，那段时间自然就过了。
@@ -3019,6 +3024,40 @@ mod result_watch_tests {
         );
         assert_eq!(received, result);
     }
+
+    /// 认领过的任务必须带回认领它的 device_id；空 id 不能顶掉在飞结果。
+    #[tokio::test]
+    async fn assigned_task_rejects_empty_device_id() {
+        let store = TaskStore::new(30, 60, 100, 60, false);
+        let id = store.create_task("sign", Value::Null, "dev").await;
+        let popped = store
+            .pop_for_b("dev", "M", DeviceCaps::default(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(popped.task_id, id);
+
+        let err = store
+            .complete_task(&id, serde_json::json!({"ok": true}), "")
+            .await
+            .unwrap_err();
+        assert_eq!(err, "device mismatch");
+        assert_eq!(
+            store.inner.lock().await.tasks[&id].status,
+            TaskStatus::Assigned,
+            "被拒的空 id 不能终结任务"
+        );
+
+        // 原设备带正确 device_id 的晚到结果仍然有效。
+        store
+            .complete_task(&id, serde_json::json!({"ok": true}), "dev")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.inner.lock().await.tasks[&id].status,
+            TaskStatus::Completed
+        );
+    }
+
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
