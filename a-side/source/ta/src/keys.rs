@@ -495,17 +495,41 @@ impl crate::KeyMintTa {
             if let Some(result) = self.generate_key_remote(params, remote_issuer.as_ref())? {
                 return Ok(result);
             }
-            // 显式委派不能回退：本地软件 keybox 签出来的子证书与调用方那把证明
-            // 密钥没有任何关系，回落等于交出一张无关的链。
-            if remote_issuer.is_some()
-                || !self.dev.remote.as_ref().is_some_and(|r| r.fallback_local())
-            {
+            // 远程不可用时不再因为「调用方自带证明密钥」就硬失败：那把 key 的私钥在 B 端
+            // （KeyMaterial::Remote），本地拿不到，直接抛 UnknownError 的话应用侧只能看到
+            // 一个没头没脑的 -1000（2026-11-08 PKX110 实测：KeyAttestation 的「App Attest
+            // Key」就是这么挂在 security_level.rs:880 的）。只要 fallback_local 开着，
+            // 就落本地：忽略那把远程证明密钥，用本地 keybox 出证，链自洽，只是 issuer 与
+            // 调用方指定的那把不同。
+            if !self.dev.remote.as_ref().is_some_and(|r| r.fallback_local()) {
                 return Err(km_err!(
                     UnknownError,
                     "remote attest unavailable and fallback disabled"
                 ));
             }
+            log::warn!("remote attest unavailable; minting locally with the local keybox");
         }
+        // 走到这里就是本地出证。调用方自带的那把证明密钥要先看私钥在不在本机：
+        // 远程模式下它可能是 B 端的（KeyMaterial::Remote），本地模式下用到的也可能是
+        // 以前远程留下的同一把 —— 交给 finish_keyblob_creation 只会在签名那步抛
+        // IncompatiblePurpose。只有私钥在本机的才留着用。
+        let attestation_key = match attestation_key {
+            None => None,
+            Some(info) => {
+                let (blob, _) =
+                    self.keyblob_parse_decrypt(&info.key_blob, &info.attest_key_params)?;
+                match blob.key_material {
+                    KeyMaterial::Remote(_) => {
+                        log::warn!(
+                            "dropping caller-supplied attestation key (its private key lives on \
+                             the B side); signing with the local keybox instead"
+                        );
+                        None
+                    }
+                    _ => Some(info),
+                }
+            }
+        };
         let (key_material, chars) = self.generate_key_material(params)?;
         self.finish_keyblob_creation(
             params,

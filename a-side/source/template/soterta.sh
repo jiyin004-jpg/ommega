@@ -54,9 +54,34 @@ fi
 # initSign 落在 A 进程、finishSign 落到 B 进程就回 -1000 —— 检测器的 T12 每轮必挂，
 # App 那边表现为要反复验指纹。抢不到锁的直接退出，让拿到锁的那一轮去 converge。
 LOCKFILE=$RUN_DIR/soterta.lock
-exec 9>"$LOCKFILE" 2>/dev/null || true
+# 单实例锁。flock 不是到处都能用：SKRoot 上 toybox 的 flock 对任何 fd 都回 EBADF
+# （不是「被别人占」，是真的用不了），老写法 `flock -n 9 || exit 0` 在这种环境里
+# 等于脚本每一轮都静默退出 —— 2026-11-08 PKX110 实测：SOTER 一次都没接管过，
+# 工程模式的 SOTER key 一直是失败。所以先拿临时 fd 试一下 flock 能不能用，
+# 能用就按它判归属，不能用退回 mkdir 锁（目录创建是原子的，效果一样）。
+_flock_ok=0
 if command -v flock >/dev/null 2>&1; then
+  if exec 8>"$LOCKFILE.probe" 2>/dev/null; then
+    flock -n 8 2>/dev/null && _flock_ok=1
+    exec 8>&- 2>/dev/null
+  fi
+  rm -f "$LOCKFILE.probe" 2>/dev/null
+fi
+if [ "$_flock_ok" = "1" ]; then
+  exec 9>"$LOCKFILE" 2>/dev/null || true
   flock -n 9 || exit 0
+else
+  LOCKDIR=$LOCKFILE.d
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    _oldpid=$(cat "$LOCKDIR/pid" 2>/dev/null)
+    if [ -n "$_oldpid" ] && kill -0 "$_oldpid" 2>/dev/null; then
+      exit 0
+    fi
+    rm -rf "$LOCKDIR" 2>/dev/null
+    mkdir "$LOCKDIR" 2>/dev/null || exit 0
+  fi
+  printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null
+  trap 'rm -rf "$LOCKDIR" 2>/dev/null' EXIT
 fi
 # 服务名和 init 服务名都不写死：各厂商的 SOTER HAL 叫什么的都有（高通
 # `vendor.qti.hardware.soter`、小米 `vendor.xiaomi.hardware.soterservice`、联发科

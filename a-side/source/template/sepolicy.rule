@@ -137,3 +137,15 @@ allow shell default_android_service service_manager find
 # Modify: Fail」）。只补这一个权限，use_dev_id 那些更宽的一个都不给。
 # 没有这个域的机型上 kernel 会直接跳过这行，不影响别家。
 allow engineermode_app keystore keystore2_key { gen_unique_id }
+
+# ---- SOTER 软件 TA 注册服务名（2026-11-08 PKX110 / Android 16 实测）----
+# soterta.sh 拉起的 ommega-inject --soterta-serve 跑在 shell 域，要往 AIDL
+# servicemanager 注册 vendor.qti.hardware.soter.ISoter/default。这个名字在
+# /vendor/etc/selinux/vendor_service_contexts 里映射到 vendor_hal_soteraidl_service。
+# 缺第一条时 servicemanager 回 "SELinux denied for service."；缺 servicemanager
+# 读 /proc/<pid>/attr/current 那几条时同样回这一句（getpidcon 失败 -> 空 sid），
+# permissive 下也一样，很容易误判成策略没生效。
+allow shell vendor_hal_soteraidl_service service_manager { add find }
+allow shell vendor_hal_soter_hwservice hwservice_manager { add find }
+allow servicemanager shell file { read open getattr }
+allow servicemanager shell dir { search getattr }
