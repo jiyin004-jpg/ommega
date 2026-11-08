@@ -28,6 +28,9 @@ PIDFILE=$RUN_DIR/soterta.pid
 KICKED_FILE=$RUN_DIR/soterta.host.kicked
 # 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。
 TAKEOVER_PID=$RUN_DIR/soterta.takeover.pid
+# 原厂 HAL 停不掉的环境（SKRoot 拦 `setprop ctl.stop`）落这个标记，之后每轮不再
+# 反复尝试停它，只看我们自己的 AIDL 名字还在不在。
+STOCK_UNSTOPPABLE=$RUN_DIR/soterta.stock_unstoppable
 # 日志统一写 daemon.log（跟 service.sh / daemon-injector / adbr 共用一份）。
 LOG=/data/misc/ommega/logs/daemon.log
 # 解析结果缓存 + 静默开关。service.sh 的 keep-alive 和 daemon-injector 的
@@ -340,6 +343,14 @@ take_over() {
     log "stopping stock SOTER HAL"
     setprop ctl.stop "$HAL" 2>/dev/null
     sleep 1
+    # 有的环境里 ctl.stop 写不进去（SKRoot 上 `setprop ctl.stop` 直接回
+    # "Failed to set property"，原厂 HAL 停不了）。那就不再每轮重试：我们的
+    # AIDL 名字能注册、工程模式能查到就行，原厂继续给 HIDL 客户端服务。
+    if [ "$(hal_state)" = "running" ]; then
+      log "stock SOTER HAL did not stop; keeping it and registering our AIDL name alongside"
+      stop_stock=0
+      : > "$STOCK_UNSTOPPABLE" 2>/dev/null
+    fi
   fi
   if [ -z "$(daemon_pid)" ]; then
     start_daemon
@@ -419,7 +430,7 @@ hold() {
   # running，拿它当「被抢回去」的判据等于每轮都空跑一次 take_over：MEIZU 20 Pro
   # （391QYGDJ2244E）实测 53 分钟写了 236 次，把日志冲得没法看。这种机器只看
   # 我们的 AIDL 名字还在不在。
-  if soter_hal_is_hidl; then
+  if soter_hal_is_hidl || [ -f "$STOCK_UNSTOPPABLE" ]; then
     if ! service_present; then
       log "our AIDL name vanished; re-taking over"
       take_over && return 0
