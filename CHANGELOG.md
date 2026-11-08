@@ -2,6 +2,14 @@
 
 [English](CHANGELOG.en.md)
 
+## 1.7.16
+
+- 远程不可用而调用方自带证明密钥时不再直接返回 `UnknownError(-1000)`：`fallback_local` 开着就落本地、用本地 keybox 出证。
+- 本地模式统一先看调用方那把证明密钥的私钥在不在本机：`KeyMaterial::Remote` 的直接丢弃，不再拿它去本地签名（否则报 `IncompatiblePurpose`）。
+- `sepolicy_apply.sh`：模块自带的 `ommega-policy` 改成永远第一优先（自带 → ksud → magiskpolicy，每步复核）。不依赖管理器的返回值——它自己写 `/sys/fs/selinux/load`，写完能自己验。
+- `soterta.sh`：单实例锁先探测 `flock` 能不能用，不能用退回 `mkdir` 目录锁；原厂 HAL 停不掉时不再每轮重试。
+- `sepolicy.rule`：补 SOTER 软件 TA 注册服务名所需权限。
+
 ## 1.7.15
 
 - SOTER 增加「服务端密钥模式」：用上传的 ATTK 身份出料，按请求设备选身份，不再占用 B 端。

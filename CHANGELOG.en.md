@@ -2,6 +2,14 @@
 
 [中文](CHANGELOG.md)
 
+## 1.7.16
+
+- When the relay is unavailable and the caller supplied its own attestation key, stop failing with `UnknownError(-1000)`: with `fallback_local` on, mint locally with the local keybox instead.
+- The local path now checks where that attestation key's private key lives first: `KeyMaterial::Remote` ones are dropped instead of being used to sign locally.
+- `sepolicy_apply.sh`: the module's own `ommega-policy` is now always tried first (bundled → ksud → magiskpolicy, each step verified). It does not depend on the manager's return value: it writes `/sys/fs/selinux/load` itself and can verify the result.
+- `soterta.sh`: the single-instance lock probes whether `flock` actually works and falls back to a `mkdir` lock; a stock HAL that will not stop is no longer retried every cycle.
+- `sepolicy.rule`: add the permissions the software SOTER TA needs to register its service name.
+
 ## 1.7.15
 
 - SOTER gains a server-key mode: material is minted from an uploaded ATTK identity, picked per requesting device, without occupying the B device.
