@@ -158,14 +158,37 @@ ommega_apply_sepolicy() {
     return 1
   fi
 
+  # 0) 模块自带那份永远是第一选择，不看当前是哪个管理器。
+  #    理由不是「自家的好用」，而是它不依赖任何管理器的返回值：它自己写
+  #    /sys/fs/selinux/load，写完还能用 `--check` 自己复核一遍真正进没进内核。
+  #    管理器的工具靠不住是实测过的：
+  #      - SKRoot（sevenk 那层）的 `ksud sepolicy apply` 回 0 但一条规则都不落；
+  #      - KernelSU 1.4.5 上同样出现过「apply 完 avc 照旧」（见下面第 1 步的注释）。
+  #    2026-11-08 一加 PKX110 / Android 16：走 ksud 时 payload 在 keystore2 里连自己的
+  #    日志都写不进（EACCES），出证请求全透传给系统 keymint，应用侧拿 -74。换自带那份
+  #    立刻正常。所以顺序改成「先试自带的，不行才回落管理器工具」。
+  for _ommega_cand in $(_ommega_policy_bundled_candidates); do
+    _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
+    if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
+      if [ "$(ommega_sepolicy_rule_state "$_OMMEGA_POLICY_RULE")" != "missing" ]; then
+        _ommega_policy_log "ok $_ommega_tool --live --apply (bundled)"
+        printf '%s\n' "$_ommega_tool --live --apply"
+        return 0
+      fi
+      _ommega_policy_log "bundled applied but rules still missing; falling through"
+    else
+      _ommega_policy_log "fail $_ommega_tool --live --apply (bundled)"
+    fi
+  done
+
   # 1) KernelSU 系：整份文件一次 apply（ksud 自己的解析器按行读，列表长度有上限，
   #    sepolicy.rule 里已经按它的上限拆好了）。
-  #    ksud 的 rc=0 只说明「解析没报错」，不保证写进内核：PKG110 上 KernelSU 1.4.5
-  #    实测 apply 完 avc 照旧、`--check` 仍报缺。所以有自带那份就拿它复核一次，
-  #    真缺就继续往下走 —— 下一级是直接写 /sys/fs/selinux/load，那是真的。
   for _ommega_cand in $(_ommega_policy_ksud_candidates); do
     _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
     if _ommega_policy_exec "$_ommega_tool" sepolicy apply "$_OMMEGA_POLICY_RULE"; then
+      # ksud 的 rc=0 只说明「解析没报错」，不保证写进内核：PKG110 上 KernelSU 1.4.5
+      # 实测 apply 完 avc 照旧、`--check` 仍报缺。所以有自带那份就拿它复核一次，
+      # 真缺就继续往下走 —— 下一级是直接写 /sys/fs/selinux/load，那是真的。
       if [ "$(ommega_sepolicy_rule_state "$_OMMEGA_POLICY_RULE")" = "missing" ]; then
         _ommega_policy_log "ksud reported ok but rules still missing; falling through"
         continue
@@ -188,22 +211,13 @@ ommega_apply_sepolicy() {
     _ommega_policy_log "fail $_ommega_tool --live --apply"
   done
 
-  # 3) 模块自带的那份：跟 magiskpolicy 一个 CLI（`--live --apply`），但走的是我们
-  # 自己那份 libsepol（vendor/policy/ommega_policy.c）。
-  for _ommega_cand in $(_ommega_policy_bundled_candidates); do
-    _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
-    if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
-      _ommega_policy_log "ok $_ommega_tool --live --apply (bundled)"
-      printf '%s\n' "$_ommega_tool --live --apply"
-      return 0
-    fi
-    _ommega_policy_log "fail $_ommega_tool --live --apply (bundled)"
-  done
-
-  # 一个能用的工具都没有。这家管理器既不在 KernelSU 那条路上，也没给 magiskpolicy 的
-  # 入口（改过二进制名、或者压根不带工具），模块自带的那份也没拷进来。规则这时候
-  # 只能靠管理器自己开机重放 —— Magisk / APatch 会，KernelSU 不会。这行日志就是为
-  # 这种情况留的。
+  # 3) 到这儿说明自带的和管理器的都没把规则弄进去。不再拿自带那份重试一遍 ——
+  #    第 0 步已经试过并复核过了，重复 apply 只会多写一次 /sys/fs/selinux/load。
+  #
+  #    一个能用的工具都没有的情况：管理器既不在 KernelSU 那条路上，也没给
+  #    magiskpolicy 的入口（改过二进制名、或者压根不带工具），自带那份也没拷进来。
+  #    规则这时只能靠管理器自己开机重放 —— Magisk / APatch 会，KernelSU 不会。
+  #    这行日志就是为这种情况留的。
   _ommega_policy_report_candidates
   return 1
 }
