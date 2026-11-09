@@ -480,9 +480,15 @@ hold() {
       log "our AIDL name vanished; re-taking over"
       take_over && return 0
     fi
-  elif [ "$(hal_state)" = "running" ] || ! service_present; then
-    log "stock HAL came back or our service vanished; re-taking over"
+  elif ! service_present; then
+    log "our service name vanished; re-taking over"
     take_over && return 0
+  elif [ "$(hal_state)" = "running" ]; then
+    # 原厂 HAL 又被 init 拉起来了。只要服务名还在我们手上，就不该去动它：以前这里
+    # 把「hal_state=running」当成「被抢回去了」，每轮巡检都跑一次 take_over（停原厂、
+    # 重启 TA）—— 注册稍慢一点就变成每 30 秒重建一次 TA，内存里的 ASK / 签名会话
+    # 全丢。现在只认服务名；原厂 running 只记一行，方便以后查。
+    log "stock SOTER HAL is running again but our name is intact; leaving it"
   fi
   # 服务名和守护都正常，但 TA 实例可能已经换过了（被重新拉起）：那也得重踢。
   kick_host
