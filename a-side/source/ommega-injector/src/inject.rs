@@ -109,6 +109,27 @@ fn persist_remote_payload_state(pid: Pid, payload_identifier: &str) -> Result<()
     Ok(())
 }
 
+/// KeyMint 服务是不是跑在 keystore2 进程里（`/data/misc/ommega/inproc`，默认开）。
+fn inproc_mode() -> bool {
+    match std::fs::read_to_string("/data/misc/ommega/inproc") {
+        Ok(text) => text.trim() != "0",
+        Err(_) => true,
+    }
+}
+
+/// 这个 pid 是不是 keystore2（cmdline 是 `/system/bin/keystore2`，按 basename 认）。
+fn is_keystore2(pid: Pid) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| {
+            cmdline
+                .split('\0')
+                .next()
+                .map(|path| path.rsplit('/').next().unwrap_or(path) == "keystore2")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 fn write_daemon_peer_state(body: &str) {
     let path = Path::new(DAEMON_PEER_STATE_PATH);
     match std::fs::write(path, body) {
@@ -121,7 +142,17 @@ fn write_daemon_peer_state(body: &str) {
     }
 }
 
-fn wait_for_rpc_socket() -> Result<()> {
+fn wait_for_rpc_socket(pid: Pid) -> Result<()> {
+    // 进程内模式下服务是 payload 自己在 keystore2 里起的：还没注进去的时候当然没
+    // socket，等下去就是死锁（实测卡 30 秒后报 "RPC endpoint did not become reachable"）。
+    // 其他目标（SOTER 宿主这类）仍旧等，它们本来就靠别人提供的 socket。
+    if inproc_mode() && is_keystore2(pid) {
+        debug!(
+            "in-process keymint enabled; not waiting for the RPC socket before injecting keystore2"
+        );
+        return Ok(());
+    }
+
     let start = Instant::now();
     // Whether we already warned about the stat error, so a persistent
     // permission/traversal denial (e.g. SELinux on newer Android blocking the
@@ -158,7 +189,7 @@ fn wait_for_rpc_socket() -> Result<()> {
 }
 
 pub fn inject_library(pid: Pid) -> Result<()> {
-    wait_for_rpc_socket()?;
+    wait_for_rpc_socket(pid)?;
 
     let self_path = utils::current_exe_path()?;
 

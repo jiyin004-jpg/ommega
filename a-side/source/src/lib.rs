@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 // 分配器不在这里定：这个 crate 同时被 keymint 二进制和 keystore2 里的 payload 链接，
-// payload 跑在别人的进程里，不能替宿主换分配器。mimalloc 在 src/main.rs 里。
+// payload 跑在别人的进程里，不能替宿主换分配器（mimalloc 在 src/main.rs 里）。
 
 use anyhow::{Context, Result};
 use std::panic;
@@ -42,6 +42,7 @@ pub mod soter_cpu_id;
 pub mod soter_host_health;
 pub mod soter_relay;
 pub mod soter_store;
+pub mod stealth;
 pub mod utils;
 pub mod watchdog;
 
@@ -125,7 +126,14 @@ fn prepare_android_storage() {
     // logs 必须是 1777 而不是 0777：注入到 app 域（SOTER 宿主不是 keystore uid）的
     // payload 得往这里落日志，光靠 group 写不够。sticky 位拦住「删掉/改名别人的
     // 日志文件」和拿软链顶替已有日志那条路，写内容还是允许的。
-    for (dir, mode) in [(root_path!(), 0o771), (root_path!("logs"), 0o1777)] {
+    for (dir, mode) in [
+        (root_path!(), 0o771),
+        (root_path!("logs"), 0o1777),
+        // 密钥材料目录（数据库、rpc.sock）的**父目录**也得处理：它以前只给 keystore
+        // 用，是 0770 keystore，而 HAL 现在跑在 system(1000) —— 进不去就报
+        // 「unable to open database」，一笔出证都做不了。
+        (secret_path!(), 0o771),
+    ] {
         if let Err(e) = std::fs::create_dir_all(dir) {
             storage_warn(format!("Failed to create ommega directory {dir}: {e:?}"));
             continue;
@@ -296,17 +304,14 @@ fn create_rpc_server(bind: RpcBind) -> Result<Arc<RpcServer>> {
     if matches!(bind, RpcBind::FileSocket) {
         std::fs::set_permissions(rpc::SOCKET, std::fs::Permissions::from_mode(0o660))
             .context("failed to chmod ommega RPC socket")?;
+        // socket 的属主得是 keystore：这个进程现在跑在 system(1000)，而连它的是
+        // 注入进 keystore2 里的载荷（uid 1017）—— 0660 + 属主 1000 的话那边会被拒。
+        // 这里还在降权之前，能 chown。
+        chown_path(rpc::SOCKET, KEYSTORE_UID, KEYSTORE_GID)
+            .context("failed to chown ommega RPC socket")?;
     }
 
-    server.set_authorizer(rpc_authorizer(bind));
-
-    Ok(server)
-}
-
-/// RPC 接入的准入判斷。file socket 只给 keystore uid（我们自己 payload）；抽象 socket
-/// 还要放 root（软件 SOTER TA）和被注入过的进程（SOTER 宿主）。
-fn rpc_authorizer(bind: RpcBind) -> impl Fn(&PeerIdentity) -> bool + Send + Sync + 'static {
-    move |peer| {
+    server.set_authorizer(move |peer| {
         let allowed = match peer {
             PeerIdentity::Local { uid, .. } if *uid == KEYSTORE_UID => true,
             // 软件 SOTER TA（soterta.sh 拉起的 `ommega-inject --soterta-serve`）跑在
@@ -326,9 +331,17 @@ fn rpc_authorizer(bind: RpcBind) -> impl Fn(&PeerIdentity) -> bool + Send + Sync
             (false, _) => warn!("rejected ommega RPC peer {peer}"),
         }
         allowed
-    }
+    });
+
+    Ok(server)
 }
 
+/// 降到 keystore uid 跑。
+///
+/// 试过改 system(1000)（跟真 keymint HAL 一致，`ps -A` 按 uid 筛就查不出来了），
+/// 但那样 HAL 打不开数据库、载荷连不上 rpc.sock，出证直接废 —— 这条路暂时不通，
+/// 先保持 keystore。真正要消掉「多一个 uid=keystore 进程」得把 keymint 逻辑并进
+/// keystore2 进程里，而不是换个 uid。
 fn set_keystore_identity() -> Result<()> {
     let failed = unsafe { libc::setgid(KEYSTORE_GID) != 0 || libc::setuid(KEYSTORE_UID) != 0 };
     if failed {
@@ -371,10 +384,55 @@ fn install_module_info_bundle_if_available() -> Result<()> {
 }
 
 pub fn cli_main() {
+    // `--exec-hidden <真身> <伪装名> [参数...]`：替 shell 把 ELF 从 memfd 起成伪装进程。
+    // 比自举早处理：这条路上的本进程只是个启动器，处理完就变成目标程序了。
+    if let Some(pos) = std::env::args().position(|arg| arg == "--exec-hidden") {
+        let rest: Vec<String> = std::env::args().skip(pos + 1).collect();
+        if rest.len() >= 2 {
+            let real = rest[0].clone();
+            let fake = rest[1].clone();
+            let extra = rest[2..].to_vec();
+            if stealth::exec_hidden(&real, &fake, &extra) {
+                unreachable!("exec_hidden only returns on failure");
+            }
+        }
+        std::process::exit(1);
+    }
+
+    // `--exec-script <脚本> <伪装名> [参数...]`：脚本也塞进 memfd，`sh -s` 从标准输入
+    // 读，cmdline 里不会出现模块目录。
+    if let Some(pos) = std::env::args().position(|arg| arg == "--exec-script") {
+        let rest: Vec<String> = std::env::args().skip(pos + 1).collect();
+        if rest.len() >= 2 {
+            let script = rest[0].clone();
+            let fake = rest[1].clone();
+            let extra = rest[2..].to_vec();
+            let moddir = std::path::Path::new(&script)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if stealth::exec_script_hidden(&script, &fake, &extra, &moddir) {
+                unreachable!("exec_script_hidden only returns on failure");
+            }
+        }
+        std::process::exit(1);
+    }
+
+    // 第一件事：把自己换成「系统二进制名字 + 内存里的本体」。
+    // 成功的话这一行不会返回（fexecve 换掉了整个映像），pid 不变。
+    // 失败就静默降级成普通启动 —— 藏不住可以，起不来不行。
+    stealth::bootstrap("daemon", &["hal", "helper", "soterta", "injector", "adbr"]);
+
+    // 兜底：不管是怎么进来的（自举成功与否、手动跑、旧路径），cwd 都不该停在
+    // 模块目录 —— `/proc/<pid>/cwd` 一读就是 module.prop / keybox_tee.xml 那一堆。
+    let _ = std::env::set_current_dir("/");
+
     // 守护模式：`keymint --daemon` 直接进守护循环（替掉原来的 `template/daemon`
     // shell 脚本）。放在最前面，连日志初始化都不需要 —— 守护只在「启用调试日志」
     // 开着时自己落文件，跟 shell 版一致。
-    if std::env::args().any(|arg| arg == "--daemon") {
+    //
+    // 参数已经被自举换成环境变量（`--daemon` 留在 cmdline 里等于自报家门）。
+    if stealth::daemon_mode() || std::env::args().any(|arg| arg == "--daemon") {
         let extra: Vec<String> = std::env::args()
             .skip(1)
             .filter(|arg| arg != "--daemon")

@@ -243,8 +243,31 @@ fn bind_app_rpc() -> Result<Arc<rsbinder::rpc::RpcServer>> {
             )
             .context("failed to bind in-process app RPC socket")?;
             server.set_android13plus(kmr_common::rpc::WIRE_MAX_VERSION);
-            server.set_authorizer(crate::rpc_authorizer(crate::RpcBind::Abstract));
+            server.set_authorizer(app_authorizer());
             Ok(server)
         }
+    }
+}
+
+/// 抽象 socket 的准入判断，跟 lib 里那份一样（file socket 那套在本域名里用不了，
+/// 所以这里是单独一份）：keystore 自己、root（软件 SOTER TA）、被注入过的进程。
+fn app_authorizer() -> impl Fn(&rsbinder::rpc::PeerIdentity) -> bool + Send + Sync + 'static {
+    move |peer| {
+        let allowed = match peer {
+            rsbinder::rpc::PeerIdentity::Local { uid, .. }
+                if *uid == kmr_common::consts::KEYSTORE_UID =>
+            {
+                true
+            }
+            rsbinder::rpc::PeerIdentity::Local { uid: 0, .. } => true,
+            rsbinder::rpc::PeerIdentity::Local { pid, .. } => crate::peer_is_injected(*pid),
+            _ => false,
+        };
+        if allowed {
+            info!("accepted app RPC peer {peer}");
+        } else {
+            warn!("rejected app RPC peer {peer}");
+        }
+        allowed
     }
 }
