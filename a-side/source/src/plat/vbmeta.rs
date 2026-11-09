@@ -84,19 +84,39 @@ pub(crate) fn write_runtime_security_patch(desired: &str, previous: Option<&str>
     )
 }
 
-/// daemon 通过环境变量传进来的 verified-boot hash（`OMMEGA_BOOT_HASH`）。
+/// daemon 落的 `run/keymint.env` 里的值（出证要用的几个属性）。
+///
+/// 先读文件，再退回真环境变量 —— 手动启动、旧 daemon 时还能用。
+pub(crate) fn value_from_file_or_env(name: &str) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string("/data/adb/ommega/run/keymint.env") {
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == name {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    std::env::var(name).ok()
+}
+
+/// daemon 传进来的 verified-boot hash（`OMMEGA_BOOT_HASH`）。
 ///
 /// 为什么需要它：keymint 进程里 `rsproperties` 读属性区不可靠（读不到时不报错，
 /// 静默退回「从原机 vbmeta 分区算出来的值」），而 daemon 是 shell 域，
 /// `getprop` 拿到的一定是检测器也能看到的那一份。开机解析 config 和出证上报都用它。
 pub(crate) fn boot_hash_from_env() -> Option<[u8; 32]> {
-    let raw = std::env::var("OMMEGA_BOOT_HASH").ok()?;
+    let raw = value_from_file_or_env("OMMEGA_BOOT_HASH")?;
     parse_hex_32(raw.trim()).ok()
 }
 
 /// 同理，vbmeta 公钥摘要。
 pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
-    let raw = std::env::var("OMMEGA_BOOT_KEY").ok()?;
+    let raw = value_from_file_or_env("OMMEGA_BOOT_KEY")?;
     parse_hex_32(raw.trim()).ok()
 }
 
@@ -112,7 +132,7 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
 ///
 /// daemon 是 shell 域，`getprop` 读得到真实值，开机时传进来。
 fn boot_patchlevel_from_env() -> Option<String> {
-    let raw = std::env::var("OMMEGA_PATCH_BOOT").ok()?;
+    let raw = value_from_file_or_env("OMMEGA_PATCH_BOOT")?;
     let value = raw.trim().to_string();
     (!value.is_empty()).then_some(value)
 }

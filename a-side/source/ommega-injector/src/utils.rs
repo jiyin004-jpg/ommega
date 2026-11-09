@@ -39,7 +39,13 @@ pub fn build_git_sha() -> &'static str {
 
 pub fn current_exe_path() -> Result<PathBuf> {
     // 自举之后 /proc/self/exe 指向 memfd（`/memfd:xxx (deleted)`），拿它算模块根、
-    // 算自身身份都会算到空。启动器把真身路径放在这个环境变量里。
+    // 算自身身份都会算到空。真身路径在自举前写进这个文件（不用环境变量）。
+    if let Ok(text) = std::fs::read_to_string("/data/adb/ommega/run/injector.self") {
+        let path = PathBuf::from(text.trim());
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
     if let Some(path) = std::env::var_os("OMMEGA_SELF_PATH").map(PathBuf::from) {
         if !path.as_os_str().is_empty() {
             return Ok(path);

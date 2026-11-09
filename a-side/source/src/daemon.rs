@@ -106,6 +106,10 @@ pub fn run(extra: Vec<String>) -> ! {
         };
         stop_stale_instances(&target);
 
+        // 出证要用的几个属性提前落成文件（而不是塞环境变量）：进程 environ 是
+        // root 一条命令就能看的东西，`OMMEGA_BOOT_HASH` 那种名字太直白。
+        write_env_file(&target);
+
         let mut child = match spawn_keymint(&target, &extra) {
             Ok(child) => child,
             Err(error) => {
@@ -682,7 +686,6 @@ fn stop_stale_instances(target: &Path) {
 }
 
 fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
-    // 有伪装名就 memfd 跑：子进程的 exe 从此不指向模块目录。
     // 没有（table 没挑出来）就老样子直接从模块目录 exec —— 难看但能跑。
     let fake = crate::stealth::cached_name("hal").unwrap_or_default();
     let mut memfd = None;
@@ -698,19 +701,11 @@ fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
     } else {
         Command::new(target)
     };
-    // 出证要用的几个属性：daemon 读好经环境变量交给 keymint，省掉它自己去读
-    // （`rsproperties` 在静态进程里拿不到属性区，兜底要 fork 一次 resetprop）。
-    for name in KEYMINT_ENV {
-        if let Some(value) = resetprop::read_string_property(name) {
-            let env_name = env_name_for(name);
-            command.env(env_name, value);
-        }
-    }
+    // 出证要用的属性不走环境变量了（见 write_env_file）。
     command
         .args(extra)
-        // 守护自己的模式标记不能传给 HAL：子进程继承环境变量的话会以为自己是
-        // 第二个守护，又去拿单实例锁、又去 spawn 一个 HAL，无限套娃。
-        .env_remove("OMMEGA_STEALTH_DAEMON")
+        // 守护自己的模式标记不能传给 HAL：子进程继承之后会以为自己是第二个守护。
+        .env_remove("DAEMON_MODE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -835,16 +830,35 @@ fn spawn_script(role: &str, script: &str, args: &[&str]) -> std::io::Result<Chil
         // 不加的话 sh 会把它当自己的选项。
         .arg("--")
         .args(args)
-        .env("OMMEGA_MODDIR", MODDIR)
-        // 这两个是「本进程已经在 memfd 里」的标记，不能漏给脚本：
-        // 它拉起来的注入器会被骗到，以为已经藏好了。
+        // 环境里不带我们的名字（脚本自己知道模块在哪里）。
+        .env_remove("DAEMON_MODE")
+        .env_remove("OMMEGA_MODDIR")
         .env_remove("OMMEGA_STEALTH")
         .env_remove("OMMEGA_SELF_PATH")
-        .env_remove("OMMEGA_STEALTH_DAEMON")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command.spawn()
+}
+
+/// 把出证要用的几个属性写进 `run/keymint.env`，HAL 启动时自己读。
+///
+/// 不用环境变量：`/proc/<pid>/environ` 是 root 一句 `tr` 就能看的东西，
+/// 里面出现 `OMMEGA_BOOT_HASH` 这种名字等于把菜单贴在门上。
+fn write_env_file(_target: &Path) {
+    let mut text = String::new();
+    for name in KEYMINT_ENV {
+        if let Some(value) = resetprop::read_string_property(name) {
+            text.push_str(env_name_for(name));
+            text.push('=');
+            text.push_str(&value);
+            text.push('\n');
+        }
+    }
+    let path = format!("{RUN_DIR}/keymint.env");
+    if fs::write(&path, text).is_ok() {
+        let _ = fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+    }
 }
 
 fn env_name_for(prop: &str) -> &'static str {

@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 # 软件 SOTER TA 的开关与守护。
 #
 # 原厂 `vendor.qti.hardware.soter.ISoter/default` 只是 TEE 里那个 applet 的薄代理，
@@ -16,7 +16,7 @@
 # 映射，lsplt 一个 GOT 都认不下来（commit 全失败）。接管服务名跟注入无关，客户端
 # 一行都不用改。
 
-MODDIR=${OMMEGA_MODDIR:-${0%/*}}
+MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 STATE_DIR=/data/adb/ommega
 
 # 进程身份：/proc/<pid>/stat 第 22 字段（启动时刻）。pid 会被复用，启动时刻不会。
@@ -339,7 +339,10 @@ launch_daemon() {
   km=
   [ -n "$abi" ] && [ -x "$MODDIR/libs/$abi/keymint" ] && km=$MODDIR/libs/$abi/keymint
   fake=$(stealth_name)
-  export OMMEGA_SOTER_SERVICE="$SERVICE"
+  # 服务名走文件（不用环境变量：environ 是 root 一句 tr 就能看的）。
+  mkdir -p "${RUN_DIR}" 2>/dev/null
+  printf '%s\n' "$SERVICE" > "$RUN_DIR/soterta.service" 2>/dev/null
+  chmod 0644 "$RUN_DIR/soterta.service" 2>/dev/null
   if [ -n "$km" ] && [ -n "$fake" ]; then
     "$km" --exec-hidden "$BIN" "$fake" --soterta-serve >>"$LOG" 2>&1 9>&- &
   else
@@ -421,7 +424,11 @@ start_daemon() {
   fi
   # 只留一个实例：两份就是两套内存态会话表，init 落在其中一个、finish 落到另一个上
   # 就是 -204（NX721J 实测过两个实例同时在跑）。
+  # 但不能把 pidfile 里那个健康的 TA 也当残留杀了 —— pidfile 刚被清、或者 starttime
+  # 对不上时，以前会把正在服务的那个 kill 掉再起新的，现象是 SOTER 每几十秒重建一次。
+  cur=$(daemon_pid)
   for p in $(stale_daemon_pids); do
+    [ -n "$cur" ] && [ "$p" = "$cur" ] && continue
     kill -9 "$p" 2>/dev/null
   done
   log "starting software SOTER TA: $BIN (service=$SERVICE)"

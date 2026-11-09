@@ -13,8 +13,6 @@ use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 
-const MARK_ENV: &str = "OMMEGA_STEALTH";
-const SELF_ENV: &str = "OMMEGA_SELF_PATH";
 const NAMES_FILE: &str = "/data/misc/ommega/conf/stealth.names";
 
 fn name_for(role: &str) -> Option<String> {
@@ -72,6 +70,13 @@ pub fn hide_self(role: &str) {
     if !real.is_file() {
         return;
     }
+    // 真身路径落文件：自举之后 `/proc/self/exe` 就是 memfd 了，而注入器还得靠
+    // 这个路径把自己映射进目标进程。不用环境变量 —— environ 是 root 一句 tr 就能看的东西。
+    let _ = fs::create_dir_all("/data/adb/ommega/run");
+    let _ = fs::write(
+        "/data/adb/ommega/run/injector.self",
+        real.to_string_lossy().as_bytes(),
+    );
     let base = Path::new(&fake)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -107,13 +112,11 @@ pub fn hide_self(role: &str) {
     argv.push(std::ptr::null());
 
     let mut env: Vec<CString> = std::env::vars()
-        .filter(|(key, _)| key != MARK_ENV && key != SELF_ENV)
+        // 环境里不留 `_`（shell 填的可执行路径）和 OMMEGA_* 前缀。
+        .filter(|(key, _)| key != "_" && !key.starts_with("OMMEGA_"))
         .filter_map(|(key, value)| CString::new(format!("{key}={value}")).ok())
         .collect();
-    for item in [
-        format!("{MARK_ENV}=1"),
-        format!("{SELF_ENV}={}", real.to_string_lossy()),
-    ] {
+    for item in [String::new()] {
         if let Ok(value) = CString::new(item) {
             env.push(value);
         }

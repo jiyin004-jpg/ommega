@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 # Ommega A-side: load the bundled PathMask kernel module and decide whether
 # /system/priv-app/SoterService should be masked.
 #
@@ -31,7 +31,7 @@
 #   pathmask_target=...     path to mask (default /system/priv-app/SoterService)
 #   pathmask_takeover=1     take over an already-loaded foreign instance
 
-MODDIR=${OMMEGA_MODDIR:-${0%/*}}
+MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 
 STATE_DIR=${KMOD_STATE_DIR:-/data/adb/ommega}
 BIN_DIR=$STATE_DIR/bin

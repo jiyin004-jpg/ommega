@@ -47,6 +47,13 @@ fn descriptor_of(service: &str) -> &'static str {
 }
 
 fn service_name() -> String {
+    // 服务名由 soterta.sh 写到文件里（不再走环境变量：environ 是 root 一句 tr 就能看的）。
+    if let Ok(text) = std::fs::read_to_string("/data/adb/ommega/run/soterta.service") {
+        let value = text.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
     std::env::var(SERVICE_ENV)
         .ok()
         .map(|value| value.trim().to_string())

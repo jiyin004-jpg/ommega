@@ -1295,8 +1295,7 @@ fn base64_encode(data: &[u8]) -> String {
 ///
 /// 环境变量没传（手动启动、旧 daemon）就退回真实读属性。
 fn patch_property(env: &str, prop: &str) -> Option<String> {
-    std::env::var(env)
-        .ok()
+    crate::plat::vbmeta::value_from_file_or_env(env)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .or_else(|| crate::plat::resetprop::read_string_property(prop))

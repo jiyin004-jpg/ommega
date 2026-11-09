@@ -1,4 +1,4 @@
-#!/system/bin/sh
+﻿#!/system/bin/sh
 
 # adbrd 监管脚本 —— A / B 两端共用同一份，用参数选读哪份配置：
 #
@@ -22,7 +22,7 @@ case "$1" in
   *) echo "[adbr] 用法: sh adbr-daemon.sh --a" >&2; exit 2 ;;
 esac
 
-MODDIR=${OMMEGA_MODDIR:-${0%/*}}
+MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 STATE_DIR=/data/adb/ommega
 BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf

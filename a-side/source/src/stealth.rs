@@ -1,4 +1,4 @@
-//! 进程隐身。
+﻿//! 进程隐身。
 //!
 //! 目标：`ps` / `/proc` 里翻出来，看到的是一台正常 Android 机器该有的东西，
 //! 而不是 `/data/adb/modules/ommega/libs/arm64-v8a/keymint` 这种一眼就认出来的路径。
@@ -28,14 +28,17 @@ use std::path::{Path, PathBuf};
 
 /// 名字表：`role=路径`，一行一个。
 const NAMES_FILE: &str = "/data/misc/ommega/conf/stealth.names";
-/// 标记「这个进程已经重生过了」，防止 exec 循环。
-const MARK_ENV: &str = "OMMEGA_STEALTH";
-/// 真实二进制路径。memfd 重生后 `/proc/self/exe` 不再是它，但有些逻辑
-/// （注入器算自身身份）要的是真身，从这里读。
-const SELF_ENV: &str = "OMMEGA_SELF_PATH";
 /// daemon 模式标记：原来的 `--daemon` 参数会和伪装名一起出现在 cmdline 里，
-/// 挪到环境变量上，参数表就只剩一个干净的系统路径。
-const DAEMON_ENV: &str = "OMMEGA_STEALTH_DAEMON";
+/// 挪到环境变量上。名字故意取得通用 —— root 看 environ 时 `OMMEGA_*` 那种前缀
+/// 等于自报家门。
+const DAEMON_ENV: &str = "DAEMON_MODE";
+/// 历史标记（现在靠 /proc/self/exe 是不是 memfd 就能判断自己藏过没）。
+#[allow(dead_code)]
+const MARK_ENV: &str = "OMMEGA_STEALTH";
+/// 真实二进制路径。memfd 重生后 `/proc/self/exe` 不再是它。
+/// （不再通过环境变量传：注入器改成读 `run/injector.self`。）
+#[allow(dead_code)]
+const SELF_ENV: &str = "OMMEGA_SELF_PATH";
 
 /// 按「看起来最无关紧要」排的优先级。命中越靠前越像正经厂商 HAL。
 const PREFERRED: [&str; 18] = [
@@ -153,11 +156,6 @@ pub fn already_hidden() -> bool {
 /// 真实二进制路径：环境变量优先（memfd 重生后 /proc/self/exe 就不是真身了），
 /// 其次才读 /proc/self/exe。读到的还是 memfd 就返回 None —— 调用方自己看着办。
 pub fn self_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(SELF_ENV).map(PathBuf::from) {
-        if !path.as_os_str().is_empty() {
-            return Some(path);
-        }
-    }
     let path = fs::read_link("/proc/self/exe").ok()?;
     if path.to_string_lossy().starts_with("/memfd:") {
         return None;
@@ -390,8 +388,12 @@ fn read_names() -> HashMap<String, String> {
 
 /// 写名字表。用 tmp + rename，别让别的进程读到半截。
 fn write_names(map: &HashMap<String, String>) {
+    use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = Path::new(NAMES_FILE).parent() {
         let _ = fs::create_dir_all(dir);
+        // 降权后的进程（HAL 的 resetprop 辅助进程跑在 keystore uid）也要读得到，
+        // 否则它拿不到自己的伪装名，comm 就只能跟着父进程走（两个同名进程）。
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
     }
     let mut roles: Vec<&String> = map.keys().collect();
     roles.sort();
@@ -405,6 +407,7 @@ fn write_names(map: &HashMap<String, String>) {
     let tmp = format!("{NAMES_FILE}.tmp");
     if let Ok(mut file) = fs::File::create(&tmp) {
         if file.write_all(text.as_bytes()).is_ok() {
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644));
             let _ = fs::rename(&tmp, NAMES_FILE);
         }
     }
@@ -516,7 +519,14 @@ fn exec_from(fd: RawFd, argv0: &str, extra_args: &[String], extra_env: &[(&str, 
     ptrs.push(std::ptr::null());
 
     let mut env: Vec<CString> = std::env::vars()
-        .filter(|(key, _)| !extra_env.iter().any(|(name, _)| name == key))
+        // 进程环境是 root 一条命令就能看的东西（`tr '\0' '\n' < /proc/pid/environ`），
+        // 里面不能出现我们的名字：`_` 是 shell 填的可执行路径，OMMEGA_* 一看就知道
+        // 是什么。需要传给新进程的值全部走 `run/keymint.env` 那种数据文件。
+        .filter(|(key, _)| {
+            key != "_"
+                && !key.starts_with("OMMEGA_")
+                && !extra_env.iter().any(|(name, _)| name == key)
+        })
         .filter_map(|(key, value)| CString::new(format!("{key}={value}")).ok())
         .collect();
     for (key, value) in extra_env {
@@ -548,8 +558,7 @@ pub fn exec_hidden(real: &str, argv0: &str, extra_args: &[String]) -> bool {
     let Some(fd) = memfd_from(Path::new(real), &basename(argv0)) else {
         return false;
     };
-    let env = [(MARK_ENV, "1".to_string()), (SELF_ENV, real.to_string())];
-    if exec_from(fd, argv0, extra_args, &env) {
+    if exec_from(fd, argv0, extra_args, &[]) {
         return true;
     }
     unsafe { libc::close(fd) };
@@ -559,9 +568,9 @@ pub fn exec_hidden(real: &str, argv0: &str, extra_args: &[String]) -> bool {
 /// 把一段 shell 脚本从 memfd 起成伪装进程：`/system/bin/sh -s` 从标准输入读脚本，
 /// 于是 cmdline 里只剩伪装名和 `-s`，看不到模块里的脚本路径。
 ///
-/// `$0` 变成 "sh"，脚本里靠 `$0` 推模块目录的地方要改成读 `OMMEGA_MODDIR`
-/// （几个守护脚本开头已经改成 `${OMMEGA_MODDIR:-${0%/*}}`）。
-pub fn exec_script_hidden(script: &str, argv0: &str, extra_args: &[String], moddir: &str) -> bool {
+/// `$0` 变成 "sh"，脚本里靠 `$0` 推模块目录的地方已经改成 `${OMMEGA_MODDIR:-固定路径}`，
+/// 所以这里不需要再往环境里塞变量。
+pub fn exec_script_hidden(script: &str, argv0: &str, extra_args: &[String], _moddir: &str) -> bool {
     let Some(fd) = memfd_from(Path::new(script), &basename(argv0)) else {
         return false;
     };
@@ -596,16 +605,11 @@ pub fn exec_script_hidden(script: &str, argv0: &str, extra_args: &[String], modd
     let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
     ptrs.push(std::ptr::null());
 
-    let mut env: Vec<CString> = std::env::vars()
-        // `OMMEGA_STEALTH` / `OMMEGA_SELF_PATH` 是「本进程已经在 memfd 里」的标记，
-        // 不能漏给脚本：脚本拉起来的子进程（注入器、adbrd）会被这个标记骗到，
-        // 以为自己已经藏好了，于是原样带着模块路径跑。
-        .filter(|(key, _)| key != "OMMEGA_MODDIR" && key != MARK_ENV && key != SELF_ENV)
+    let env: Vec<CString> = std::env::vars()
+        // 同 exec_from：环境里不保留 `_` 和 OMMEGA_* 这种一眼就认出来的东西。
+        .filter(|(key, _)| key != "_" && !key.starts_with("OMMEGA_"))
         .filter_map(|(key, value)| CString::new(format!("{key}={value}")).ok())
         .collect();
-    if let Ok(item) = CString::new(format!("OMMEGA_MODDIR={moddir}")) {
-        env.push(item);
-    }
     let mut envp: Vec<*const libc::c_char> = env.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
 
@@ -622,9 +626,8 @@ pub fn exec_script_hidden(script: &str, argv0: &str, extra_args: &[String], modd
 /// 两道判断防重入：HAL 是 daemon 用同一个 memfd 拉起来的，进来就已经是 memfd 了。
 pub fn bootstrap(role: &str, extra_roles: &[&str]) {
     note(&format!(
-        "bootstrap role={role} hidden={} mark={:?}",
-        already_hidden(),
-        std::env::var(MARK_ENV).ok()
+        "bootstrap role={role} hidden={}",
+        already_hidden()
     ));
     if already_hidden() {
         // memfd 起的进程，内核把 comm 设成了执行路径的 basename —— 而那个路径是
@@ -634,9 +637,6 @@ pub fn bootstrap(role: &str, extra_roles: &[&str]) {
                 set_comm(&basename(&arg0));
             }
         }
-        return;
-    }
-    if std::env::var(MARK_ENV).as_deref() == Ok("1") {
         return;
     }
     let Some(real) = self_path() else {
@@ -654,10 +654,7 @@ pub fn bootstrap(role: &str, extra_roles: &[&str]) {
     };
 
     let mut keep: Vec<String> = Vec::new();
-    let mut env: Vec<(&str, String)> = vec![
-        (MARK_ENV, "1".to_string()),
-        (SELF_ENV, real.to_string_lossy().into_owned()),
-    ];
+    let mut env: Vec<(&str, String)> = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--daemon" {
             env.push((DAEMON_ENV, "1".to_string()));
@@ -687,13 +684,8 @@ pub fn command_from_memfd(fd: RawFd, argv0: &str) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new(format!("/proc/self/fd/{fd}"));
     command.arg0(argv0);
-    command.env(STATE_ALREADY_HIDDEN, "1");
-    command.env(SELF_ENV, argv0);
     command
 }
-
-/// 已经跑在 memfd 上的子进程，进来这一条就够判断了。
-const STATE_ALREADY_HIDDEN: &str = MARK_ENV;
 
 /// 一个 fd 是不是 memfd（诊断用）。
 pub fn is_memfd(file: &fs::File) -> bool {
