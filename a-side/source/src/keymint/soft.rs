@@ -33,12 +33,30 @@ pub struct Keys {
 impl Keys {
     /// Creates a new `Keys` instance with the given seeds.
     pub fn new(root_kek_seed: [u8; 32], kak_seed: [u8; 32]) -> Self {
+        // 留一个指纹：两个进程（独立 HAL / 进程内）用的种子不一样时，root_kek 就不一样，
+        // 旧 blob 一律 INVALID_KEY_BLOB(-33)。排障时靠它一眼看出是不是这个原因。
+        let fp = format!(
+            "root_kek={:02x}{:02x}{:02x}{:02x} kak={:02x}{:02x}{:02x}{:02x}",
+            root_kek_seed[0],
+            root_kek_seed[1],
+            root_kek_seed[2],
+            root_kek_seed[3],
+            kak_seed[0],
+            kak_seed[1],
+            kak_seed[2],
+            kak_seed[3]
+        );
+        let _ = SEED_FP.set(fp.clone());
+        log::info!("crypto seed fingerprint: {fp} (pid {})", std::process::id());
         Self {
             root_kek_seed,
             kak_seed,
         }
     }
 }
+
+/// 种子指纹（前 4 字节 hex），给报错路径引用。
+pub static SEED_FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 impl RetrieveKeyMaterial for Keys {
     fn root_kek(&self, _context: &[u8]) -> Result<crypto::OpaqueOr<crypto::hmac::Key>, Error> {

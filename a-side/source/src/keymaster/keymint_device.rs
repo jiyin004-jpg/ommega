@@ -391,7 +391,7 @@ impl KeyMintDevice {
                 });
 
             if let Some(key_blob_vec) = key_blob {
-                let (key_characteristics, key_blob) = self
+                let upgraded = self
                     .upgrade_keyblob_if_required_with(
                         db,
                         &key_id_guard,
@@ -406,10 +406,47 @@ impl KeyMintDevice {
                             })
                         },
                     )
-                    .context(err!("calling getKeyCharacteristics"))?;
+                    .map_err(|error| {
+                        // 解不开内部钥匙时把种子指纹一并打出来：种子换了（升级前后不是同一份）
+                        // 就是 INVALID_KEY_BLOB，靠这行能直接认出来。
+                        if key_desc.nspace == AID_KEYSTORE as i64 {
+                            log::warn!(
+                                "internal key blob unreadable ({}): {error:?}",
+                                crate::keymint::soft::SEED_FP
+                                    .get()
+                                    .map(String::as_str)
+                                    .unwrap_or("?")
+                            );
+                        }
+                        error
+                    });
 
-                if validate_characteristics(&key_characteristics) {
-                    return Ok((key_id_guard, key_blob));
+                // 内部钥匙（boot level key 这种）解不开，基本都是 root_kek 换了：blob 是
+                // 升级前用旧种子铸的。这种情况不重建的话，进程内那条路会永久起不来
+                // （错误码 INVALID_KEY_BLOB = -33，真机实测）。丢掉重建，跟 km_uuid
+                // 对不上时那条路一样处理。
+                let unreadable_internal = key_desc.nspace == AID_KEYSTORE as i64
+                    && upgraded.as_ref().err().is_some_and(|error| {
+                        matches!(
+                            error.downcast_ref::<Error>(),
+                            Some(Error::Km(code)) if code.0 == ErrorCode::INVALID_KEY_BLOB.0
+                        )
+                    });
+
+                if unreadable_internal {
+                    log::warn!("dropping undecryptable internal key {key_desc:?} and regenerating");
+                    drop(key_id_guard);
+                    let _ =
+                        db.unbind_key(key_desc, key_type, AppUid(AID_KEYSTORE as i64), |_, _| {
+                            Ok(())
+                        });
+                } else {
+                    let (key_characteristics, key_blob) =
+                        upgraded.context(err!("calling getKeyCharacteristics"))?;
+
+                    if validate_characteristics(&key_characteristics) {
+                        return Ok((key_id_guard, key_blob));
+                    }
                 }
 
                 // If this point is reached the existing key is considered outdated or corrupted

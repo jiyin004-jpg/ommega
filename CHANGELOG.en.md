@@ -13,6 +13,7 @@
 - SOTER takeover now decides on the service name alone, so a stock HAL coming back no longer rebuilds the TA repeatedly.
 - If the in-process service goes quiet, it now falls back to a standalone process instead of failing silently.
 - When the in-process path cannot start on this device (the reason is recorded), it now goes straight to the standalone process instead of waiting out the boot grace period.
+- Internal keys that can no longer be decrypted after an upgrade are rebuilt automatically instead of leaving the in-process path permanently down.
 
 ## 1.7.15
 
