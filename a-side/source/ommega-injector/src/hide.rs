@@ -124,6 +124,10 @@ pub fn hide_self(role: &str) {
     envp.push(std::ptr::null());
 
     unsafe {
+        // cwd 也得换回根：从模块脚本 fork 出来的进程 cwd 就是模块目录，
+        // `/proc/<pid>/cwd` 一读就把 daemon-injector、keybox_*.xml 全露了。
+        let root = CString::new("/").unwrap();
+        libc::chdir(root.as_ptr());
         // `fexecve` 也是 API 30+，走 /proc/self/fd（exec 时 fd 还在，路径才解析）。
         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         if let Ok(path) = CString::new(format!("/proc/self/fd/{fd}")) {

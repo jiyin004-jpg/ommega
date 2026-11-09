@@ -64,6 +64,8 @@ const KEYMINT_ENV: [&str; 6] = [
 
 /// 守护进程入口。`extra` 是原始参数里除 `--daemon` 以外的部分，原样交给 keymint。
 pub fn run(extra: Vec<String>) -> ! {
+    // 同上：守护自己也不能把 cwd 留在模块目录里。
+    let _ = std::env::set_current_dir("/");
     // 单实例靠内核锁（flock）：锁在我手上就到死不放，进程一死内核自动释放。
     // 以前那套「mkdir 锁目录 + pid/starttime 校验」有两个实例同时认领陈锁的竞态，
     // 实测会真的起两份守护 —— 两边每轮都把对方的 HAL 当残留杀掉，现象是 HAL 每两秒
@@ -715,6 +717,8 @@ fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
         .args(extra)
         // 守护自己的模式标记不能传给 HAL：子进程继承之后会以为自己是第二个守护。
         .env_remove("DAEMON_MODE")
+        // cwd 不能是模块目录：`/proc/<pid>/cwd` 一读就露出所有模块文件。
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -873,6 +877,8 @@ fn spawn_script(role: &str, script: &str, args: &[&str]) -> std::io::Result<Chil
         // KernelSU 给模块脚本塞的，直接把模块名写在环境里。
         .env_remove("KSU_MODULE")
         .env("PWD", "/")
+        // 同上：脚本守护的 cwd 也必须在根目录。
+        .current_dir("/")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
         .stderr(Stdio::null());

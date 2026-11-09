@@ -543,6 +543,11 @@ fn exec_from(fd: RawFd, argv0: &str, extra_args: &[String], extra_env: &[(&str, 
     };
     unsafe {
         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        // 工作目录也必须换掉：从模块脚本 fork 出来的进程 cwd 就是模块目录，
+        // `/proc/<pid>/cwd` 一读就是 daemon-injector / keybox_tee.xml 那一堆，
+        // 比进程名还有说服力（实测有人就是看 cwd 定位的）。
+        let root = CString::new("/").unwrap();
+        libc::chdir(root.as_ptr());
         libc::execve(path.as_ptr(), ptrs.as_ptr(), envp.as_ptr());
     }
     false
@@ -613,6 +618,9 @@ pub fn exec_script_hidden(script: &str, argv0: &str, extra_args: &[String], _mod
 
     let shell = CString::new("/system/bin/sh").unwrap();
     unsafe {
+        // cwd 同理：不能把模块目录带进去。
+        let root = CString::new("/").unwrap();
+        libc::chdir(root.as_ptr());
         libc::execve(shell.as_ptr(), ptrs.as_ptr(), envp.as_ptr());
     }
     false
