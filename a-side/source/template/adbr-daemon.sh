@@ -1,4 +1,4 @@
-﻿#!/system/bin/sh
+#!/system/bin/sh
 
 # adbrd 监管脚本 —— A / B 两端共用同一份，用参数选读哪份配置：
 #

@@ -1,4 +1,4 @@
-﻿#!/system/bin/sh
+#!/system/bin/sh
 # Ommega A-side: load the bundled PathMask kernel module and decide whether
 # /system/priv-app/SoterService should be masked.
 #

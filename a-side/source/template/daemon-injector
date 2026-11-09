@@ -1,4 +1,4 @@
-﻿#!/system/bin/sh
+#!/system/bin/sh
 
 MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 
