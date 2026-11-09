@@ -27,8 +27,10 @@ MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 # 同 injector：把自己 comm 改成伪装名，守护靠 comm 就能判断「我已经在跑」。
 _adbr_tag=$(sed -n 's/^adbr=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
 if [ -n "$_adbr_tag" ]; then
-  # 同 injector：只能用内建 echo 写 comm。
-  echo "${_adbr_tag##*/}" > /proc/$$/comm 2>/dev/null
+  # 用 echo -n：echo 会把换行一起写进 comm，名字短于 15 字符时换行不会被截掉，
+  # /proc/<pid>/stat 就会被撑成两行，后面算 starttime 全错，锁里写出坏格式。
+  # printf / dd 直接写这个文件会回 EINVAL（实测），只有内建 echo 能用。
+  echo -n "${_adbr_tag##*/}" > /proc/$$/comm 2>/dev/null
 fi
 STATE_DIR=/data/adb/ommega
 BIN_DIR=$STATE_DIR/bin
@@ -62,7 +64,9 @@ esac
 # 读脚本，/proc 里看不到脚本路径），只有启动时刻是唯一且不会变的。
 proc_start_time() {
   [ -r "/proc/$1/stat" ] || return 1
-  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+  # 先把换行去掉再切：comm 里万一夹着换行（echo 写 comm 带 \n），stat 会变两行，
+  # awk 拿到的 $20 就不是 starttime 了。
+  tr -d '\n' < "/proc/$1/stat" 2>/dev/null | sed 's/^.*) //' | awk '{print $20}'
 }
 
 owner_stamp() { printf '%s %s\n' "$$" "$(proc_start_time $$)"; }
@@ -70,8 +74,12 @@ owner_stamp() { printf '%s %s\n' "$$" "$(proc_start_time $$)"; }
 holder_is_us() {
   local p=$1 s=$2  [ -n "$p" ] || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  [ -z "$s" ] || [ "$s" = 0 ] && return 0
-  [ "$(proc_start_time "$p")" = "$s" ]
+  if [ -n "$s" ] && [ "$s" != 0 ]; then
+    [ "$(proc_start_time "$p")" = "$s" ]
+    return
+  fi
+  # 旧锁没 starttime：只能拿 comm 认——pid 被复用时 comm 不会刚好是我们的伪装名。
+  [ -n "$_adbr_tag" ] && [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "${_adbr_tag##*/}" ]
 }
 
 # 同 daemon 那层：抢锁有竞态，拿到之后要再核一次归属；退出只删自己的锁。

@@ -7,9 +7,11 @@ MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 # 结果每 5 秒又拉一个（实测摞到五个，两个各烧了几十秒 CPU）。改完 ps 里也好看了。
 _inj_tag=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
 if [ -n "$_inj_tag" ]; then
-  # 只能用内建 echo：printf / cut / tr 往 /proc/$$/comm 写会回 EINVAL（实测），
+  # 只能用内建 echo：printf / dd 往 /proc/$$/comm 写会回 EINVAL（实测），
   # comm 改不了，守护按 comm 认人就认不出来，会反复重拉。
-  echo "${_inj_tag##*/}" > /proc/$$/comm 2>/dev/null
+  # 必须带 -n：不带的话换行进 comm，名字短于 15 字符时换行不会被截掉，
+  # /proc/<pid>/stat 就被撑成两行，starttime 算不出来，锁也就不可靠了。
+  echo -n "${_inj_tag##*/}" > /proc/$$/comm 2>/dev/null
 fi
 STATE_DIR=/data/adb/ommega
 CONF_DIR=$STATE_DIR/conf
@@ -583,7 +585,7 @@ PID_FILE=$RUN_DIR/injector-daemon.pid
 # 从标准输入读（启动器给的 memfd），/proc 里根本看不到脚本路径；启动时刻则不会变。
 proc_start_time() {
   [ -r "/proc/$1/stat" ] || return 1
-  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+  tr -d '\n' < "/proc/$1/stat" 2>/dev/null | sed 's/^.*) //' | awk '{print $20}'
 }
 
 owner_stamp() { printf '%s %s\n' "$$" "$(proc_start_time $$)"; }
@@ -592,10 +594,12 @@ holder_is_us() {
   local p=$1 s=$2
   [ -n "$p" ] || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  if [ -z "$s" ] || [ "$s" = 0 ]; then
-    return 0
+  if [ -n "$s" ] && [ "$s" != 0 ]; then
+    [ "$(proc_start_time "$p")" = "$s" ]
+    return
   fi
-  [ "$(proc_start_time "$p")" = "$s" ]
+  # 旧锁没 starttime：拿 comm 认，pid 被复用时 comm 对不上就不会误判。
+  [ -n "$_inj_tag" ] && [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "${_inj_tag##*/}" ]
 }
 
 # 同 daemon 那层：抢锁有竞态，拿到之后要再核一次归属；退出只删自己的锁。

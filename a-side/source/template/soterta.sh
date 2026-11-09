@@ -22,7 +22,8 @@ STATE_DIR=/data/adb/ommega
 # 进程身份：/proc/<pid>/stat 第 22 字段（启动时刻）。pid 会被复用，启动时刻不会。
 proc_start_time() {
   [ -r "/proc/$1/stat" ] || return 1
-  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+  # 先去掉换行：comm 里夹换行时 stat 会变两行，$20 就不是启动时刻了。
+  tr -d '\n' < "/proc/$1/stat" 2>/dev/null | sed 's/^.*) //' | awk '{print $20}'
 }
 
 BIN_DIR=$STATE_DIR/bin

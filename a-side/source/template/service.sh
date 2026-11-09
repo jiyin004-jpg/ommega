@@ -64,7 +64,9 @@ update_status() {
 # （启动时刻）」：pid 会被复用，启动时刻不会。
 proc_start_time() {
   [ -r "/proc/$1/stat" ] || return 1
-  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+  # 先把换行去掉：comm 里夹换行时（脚本用 echo 写 comm 会带 \n），stat 会变两行，
+  # awk 拿到的 $20 就不是 starttime 了。
+  tr -d '\n' < "/proc/$1/stat" 2>/dev/null | sed 's/^.*) //' | awk '{print $20}'
 }
 
 # pidfile 统一是 `pid starttime` 两列；老格式只有 pid，那就只能看它还在不在。

@@ -924,6 +924,10 @@ fn comm_running(want: &str) -> bool {
 }
 
 /// pidfile 里是 `pid starttime`；两列都对得上才算活着。
+///
+/// 没有 starttime 就不认：光看 pid 是会被复用骗过去的（一个复活成内核线程的 pid
+/// 能让这里永远返回「活着」，监管就再也不重拉了）。陈格式的 pidfile 宁肯重拉一次，
+/// 脚本自己会抢锁，多拉一份也不会真起两份。
 fn pidfile_stamp_alive(path: &str) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
@@ -932,15 +936,14 @@ fn pidfile_stamp_alive(path: &str) -> bool {
     let Some(pid) = parts.next().and_then(|v| v.parse::<u32>().ok()) else {
         return false;
     };
-    let stamp = parts
-        .next()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+    let Some(stamp) = parts.next().and_then(|v| v.parse::<u64>().ok()) else {
+        return false;
+    };
+    if stamp == 0 {
         return false;
     }
-    if stamp == 0 {
-        return true;
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
     }
     start_time(pid) == Some(stamp)
 }
