@@ -19,7 +19,9 @@ pub mod sys;
 pub mod tracker;
 pub mod utils;
 
-include!(concat!(env!("OUT_DIR"), "/aidl.rs"));
+// AIDL 绑定跟 keymint 主体共用一份（由 ommega lib 生成），否则进程内那个本地对象
+// 对不上具体类型，FromIBinder 只能走远端代理。
+pub use ommega::{android, top, vendor};
 
 /// 主目标：KeyMint 的客户端进程，这个注不进去就算启动失败。
 const KEYSTORE_PROCESS: &str = "keystore2";
@@ -91,8 +93,28 @@ fn in_soter_host() -> bool {
         .unwrap_or(false)
 }
 
-/// 装完 hook 之后，自己对着 SOTER HAL 打一条只读调用，给 write 侧那条观察路径
-/// 制造一次真实流量。
+/// 宿主是不是 keystore2。它的 cmdline 是 `/system/bin/keystore2`，按 basename 认。
+fn in_keystore2_host() -> bool {
+    std::fs::read_to_string("/proc/self/cmdline")
+        .map(|cmdline| {
+            cmdline
+                .split('\0')
+                .next()
+                .map(|path| path.rsplit('/').next().unwrap_or(path) == "keystore2")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 进程内 KeyMint 的开关：默认开，`/data/misc/ommega/inproc` 写 `0` 才关（回到走 RPC
+/// 的那套：单独一个 HAL 进程）。留这个开关是为了出事能一条命令退回去。
+fn inproc_keymint_enabled() -> bool {
+    match std::fs::read_to_string("/data/misc/ommega/inproc") {
+        Ok(text) => text.trim() != "0",
+        Err(_) => true,
+    }
+}
+
 ///
 /// 为什么非得自己造：宿主平时根本没人喊 —— 淘宝和 QQ音乐只 bind 上、从不调用，
 /// 宿主自己的 Java 日志一条都没有。没有流量，`parse_write_buffer` 里那个
@@ -587,6 +609,12 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string()),
     );
+    // keystore2 里就地把 KeyMint 主体拉起来：调用改走本地对象，不再多一个进程、
+    // 不多一跳 RPC。起不来就还是走原来那条路（hook 装不装不受影响）。
+    if in_keystore2_host() && inproc_keymint_enabled() {
+        ipc::enable_inproc_keymint();
+        ommega::inproc::request_start();
+    }
     // RPC 会话不通不代表 hook 没用：SOTER 那条观察路径完全不碰网络，而 KeyMint
     // 那条路每次请求本来就会在 ommega 不可用时回退到系统服务（rewrite 里有那套
     // 判断）。所以这里只记日志，照样把 hook 装上。

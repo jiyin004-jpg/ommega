@@ -100,7 +100,28 @@ pub fn run(extra: Vec<String>) -> ! {
     // 搬到守护里之后，那一层就彻底没有了。
     std::thread::spawn(supervisor_loop);
 
+    let mut last_sync = std::time::Instant::now();
+    let mut hal_stopped = false;
     loop {
+        // KeyMint 主体跑在 keystore2 里了（进程内），这里就不再拉独立 HAL：
+        // 少一个 uid 1017 的进程，也少一跳 RPC。AAID 表和身份同步照旧。
+        if inproc_keymint_enabled() {
+            if !hal_stopped {
+                if let Some(target) = find_keymint() {
+                    stop_stale_instances(&target);
+                }
+                log("in-process keymint enabled; not starting the standalone HAL");
+                hal_stopped = true;
+            }
+            if last_sync.elapsed() >= SYNC_INTERVAL {
+                last_sync = std::time::Instant::now();
+                sync_remote_identity();
+            }
+            sleep(TICK);
+            continue;
+        }
+        hal_stopped = false;
+
         let Some(target) = find_keymint() else {
             log("keymint binary not found");
             sleep(Duration::from_secs(5));
@@ -122,7 +143,7 @@ pub fn run(extra: Vec<String>) -> ! {
         };
         log(&format!("keymint started (pid {})", child.id()));
 
-        let mut last_sync = std::time::Instant::now();
+        last_sync = std::time::Instant::now();
         loop {
             if take_restart_request() {
                 log("restart requested");
@@ -153,6 +174,15 @@ pub fn run(extra: Vec<String>) -> ! {
 // ---------------------------------------------------------------------------
 // 日志
 // ---------------------------------------------------------------------------
+
+/// KeyMint 主体是不是跑在 keystore2 里（`/data/misc/ommega/inproc`，默认开）。
+/// 写 `0` 就回到老路子：单独拉一个 HAL 进程。
+fn inproc_keymint_enabled() -> bool {
+    match fs::read_to_string("/data/misc/ommega/inproc") {
+        Ok(text) => text.trim() != "0",
+        Err(_) => true,
+    }
+}
 
 /// 只在面板开了「调试日志」时才落文件 —— 开关每轮现读，跟 shell 版一致。
 fn log(message: &str) {

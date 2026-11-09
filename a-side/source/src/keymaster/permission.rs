@@ -550,6 +550,12 @@ pub fn check_key_permission(
 }
 
 fn forwarding_transport_is_trusted(caller: Option<Caller>) -> bool {
+    // KeyMint 主体跑在 keystore2 进程里的时候，调方就是我们自己的 payload：
+    // 同一进程里直接调本地对象，没有 binder 事务可看，`calling_caller()` 是 None。
+    // 这个对象只发给本进程的 payload（`inproc::SERVICES`），外部拿不到引用。
+    if caller.is_none() && crate::inproc::ready() {
+        return true;
+    }
     match caller {
         Some(Caller::Kernel { uid, sid, .. }) => {
             uid == AID_KEYSTORE && sid.as_ref().is_some_and(|sid| trusted_forwarding_sid(sid))

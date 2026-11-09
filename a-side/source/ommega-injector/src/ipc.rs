@@ -40,6 +40,19 @@ thread_local! {
 }
 
 static PROCESS_STATE_INIT: Once = Once::new();
+
+/// KeyMint 服务跑在本进程里（keystore2 内）？开了之后就不该再回落到 RPC：
+/// 两个进程各自持一份解锁材料，同一个钥匙库两边都用会碰「设备已锁定」。
+static INPROC_KEYMINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 标记本进程走进程内 KeyMint（由 payload 入口在启动时就定下）。
+pub fn enable_inproc_keymint() {
+    INPROC_KEYMINT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn inproc_keymint_requested() -> bool {
+    INPROC_KEYMINT.load(std::sync::atomic::Ordering::Relaxed)
+}
 static RPC_CACHE: Mutex<RpcCacheState> = Mutex::new(RpcCacheState {
     generation: 0,
     cache: None,
@@ -303,6 +316,24 @@ fn get_rpc_binder<T>(
 where
     T: FromIBinder + ?Sized + 'static,
 {
+    // 进程内那份先看：起了就地服务的时候，这一手直接拿到本地对象，不建会话、
+    // 不过 socket。refresh 对本地对象没意义，拿到就用。
+    if inproc_keymint_requested() {
+        // 起服务要开库、建证书链，头几笔请求可能撞在它没起来之前。
+        // 等一等，不要立刻回落到 RPC：两套服务同时写一个钥匙库是错的。
+        if !ommega::inproc::wait_ready(Duration::from_secs(15)) {
+            warn!("in-process KeyMint is not ready; this call falls back to the RPC service");
+        }
+    }
+    if let Some(binder) = ommega::inproc::service(service_name) {
+        match <T as FromIBinder>::try_from(binder) {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                warn!("in-process {service_name} binder rejected: {error:#}");
+            }
+        }
+    }
+
     let mut reconnected = false;
     loop {
         ensure_rpc_cache(connect_context)?;

@@ -1,17 +1,5 @@
 use std::{fs, path::PathBuf, process::Command};
 
-fn add_all_aidl_sources(builder: rsbinder_aidl::Builder, dir: &str) -> rsbinder_aidl::Builder {
-    let mut builder = builder;
-    let entries = fs::read_dir(dir).unwrap();
-    for entry in entries {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|s| s.to_str()) == Some("aidl") {
-            builder = builder.source(path);
-        }
-    }
-    builder
-}
-
 fn ensure_soter_attk() {
     let path = PathBuf::from("assets/soter_attk.pem");
     println!("cargo:rerun-if-changed={}", path.display());
@@ -67,45 +55,5 @@ fn main() {
     println!("cargo:rustc-env=INJECTOR_BUILD_GIT_SHA={git_sha}");
     println!("cargo:rustc-env=INJECTOR_BUILD_ID={build_id}");
 
-    let aidl_dirs = [
-        "../aidl/android/system/keystore2",
-        "../aidl/android/hardware/security/keymint",
-        "../aidl/android/hardware/security/secureclock",
-        "../aidl/android/security/authorization",
-        "../aidl/android/security/maintenance",
-        "../aidl/android/security/keystore",
-        "../aidl/top/jiyin004/ommega",
-        "../aidl/vendor/qti/hardware/soter",
-    ];
-    let mut aidl = rsbinder_aidl::Builder::new();
-    for dir in aidl_dirs {
-        aidl = aidl.include_dir(PathBuf::from(dir));
-    }
-    let mut aidl = aidl.output(PathBuf::from("aidl.rs"));
-    for dir in aidl_dirs {
-        aidl = add_all_aidl_sources(aidl, dir);
-    }
-
-    aidl.generate().unwrap();
-
-    let generated_path = PathBuf::from(format!("{}/aidl.rs", std::env::var("OUT_DIR").unwrap()));
-    let content = fs::read_to_string(&generated_path).unwrap();
-    // rsbinder-aidl only puts `#[allow(clippy::all)]` on the first package tree it
-    // emits, so the later ones (`top`, `vendor`) trip `clippy -- -D warnings` on
-    // generated code we do not own (`identity_op` on `FIRST_CALL_TRANSACTION + 0`
-    // for the first method of an interface, for one).  Give each of them the same
-    // allow; this only ever rewrites the freshly generated file.
-    let mut patched_content = content;
-    for module in ["android", "top", "vendor"] {
-        patched_content = patched_content.replace(
-            &format!("\npub mod {module} {{"),
-            &format!("\n#[allow(clippy::all)]\n#[allow(unused_imports)]\npub mod {module} {{"),
-        );
-    }
-    let patched_content = patched_content.replace(
-        "fn build_parcel_getNumberOfEntries(&self, _arg_domain: super::Domain::Domain, _arg_nspace: i64) -> rsbinder::Result<rsbinder::Parcel>",
-        "pub(crate) fn build_parcel_getNumberOfEntries(&self, _arg_domain: super::Domain::Domain, _arg_nspace: i64) -> rsbinder::Result<rsbinder::Parcel>",
-    );
-
-    fs::write(&generated_path, &patched_content).unwrap();
+    // AIDL 绑定统一在 ommega-aidl 里生成一次，见该 crate 的 build.rs。
 }

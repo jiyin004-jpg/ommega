@@ -149,3 +149,14 @@ allow shell vendor_hal_soteraidl_service service_manager { add find }
 allow shell vendor_hal_soter_hwservice hwservice_manager { add find }
 allow servicemanager shell file { read open getattr }
 allow servicemanager shell dir { search getattr }
+# 进程内 KeyMint：keymint 主体搬进 keystore2 之后，远程出证和 SOTER 转发是 keystore
+# 域自己发起的 TCP+TLS，名字解析走 netd 的 unix socket。拆成短行，ksud 每行的
+# 名字/权限列表都有上限（一条写满会被整行丢掉）。
+allow keystore self tcp_socket { create ioctl };
+allow keystore self tcp_socket { getattr setopt };
+allow keystore self tcp_socket { connect bind };
+allow keystore self tcp_socket { read write shutdown };
+allow keystore node tcp_socket { tcp_send tcp_recv };
+allow keystore node tcp_socket { recvfrom sendto };
+allow keystore netd unix_stream_socket { connectto };
+allow keystore netd unix_stream_socket { getattr read write };
