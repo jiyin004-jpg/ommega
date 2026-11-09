@@ -9,7 +9,8 @@
 - `sepolicy_apply.sh`: the module's own `ommega-policy` is now always tried first (bundled → ksud → magiskpolicy, each step verified). It does not depend on the manager's return value: it writes `/sys/fs/selinux/load` itself and can verify the result.
 - `soterta.sh`: the single-instance lock probes whether `flock` actually works and falls back to a `mkdir` lock; a stock HAL that will not stop is no longer retried every cycle.
 - `sepolicy.rule`: add the permissions the software SOTER TA needs to register its service name.
-- Background services now appear as system services in the process list.
+- Background services now appear as system services in the process list, without module details in their environment.
+- SOTER takeover now decides on the service name alone, so a stock HAL coming back no longer rebuilds the TA repeatedly.
 
 ## 1.7.15
 
