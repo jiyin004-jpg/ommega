@@ -20,7 +20,8 @@
 //! `--repeat` exists for the observer's sake: this process can be injected like any other
 //! target, and the injector needs requests to keep arriving while it attaches.
 
-include!(concat!(env!("OUT_DIR"), "/aidl.rs"));
+// AIDL 绑定跟着注入器本体走：生成在 ommega lib 里，这里直接复用同一份。
+pub use ommega::{android, top, vendor};
 
 use anyhow::{Context, Result};
 use rsbinder::{FromIBinder, Strong};
