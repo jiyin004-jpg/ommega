@@ -567,19 +567,29 @@ esac
 # 单实例：同 daemon 那层 —— service.sh 的看门循环可能同时存在多份，每份 fork 一个
 # 注入器；多份并存时每轮都会 pkill 掉对方正在用的 keystore2/注入进程。抢不到锁就退。
 LOCK_DIR=$RUN_DIR/injector-daemon.lock
+PID_FILE=$RUN_DIR/injector-daemon.pid
 
-# 同 daemon 那层：pid 复用会让锁看着「一直有人」，光 kill -0 不够，还要确认是本脚本。
+# 锁里记 `pid starttime`。以前靠 cmdline 里有没有 `sh <脚本>` 认人，但脚本现在可以
+# 从标准输入读（启动器给的 memfd），/proc 里根本看不到脚本路径；启动时刻则不会变。
+proc_start_time() {
+  [ -r "/proc/$1/stat" ] || return 1
+  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+
+owner_stamp() { printf '%s %s\n' "$$" "$(proc_start_time $$)"; }
+
 holder_is_us() {
-  p=$1
-  s=$2
+  local p=$1 s=$2
   [ -n "$p" ] || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  [ -r "/proc/$p/cmdline" ] || return 1
-  tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -F "sh $s " >/dev/null 2>&1
+  if [ -z "$s" ] || [ "$s" = 0 ]; then
+    return 0
+  fi
+  [ "$(proc_start_time "$p")" = "$s" ]
 }
 
 # 同 daemon 那层：抢锁有竞态，拿到之后要再核一次归属；退出只删自己的锁。
-lock_owned() { [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; }
+lock_owned() { [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$(owner_stamp)" ]; }
 release_lock() { lock_owned && rm -rf "$LOCK_DIR" 2>/dev/null; return 0; }
 
 if [ "${OMMEGA_SKIP_LOCK:-0}" = 1 ]; then
@@ -589,9 +599,9 @@ if [ "${OMMEGA_SKIP_LOCK:-0}" = 1 ]; then
 elif mkdir "$LOCK_DIR" 2>/dev/null; then
   :
 else
-  holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
-  if holder_is_us "$holder" "$0"; then
-    log "[injector-daemon] another instance (pid $holder) is running; exiting"
+  set -- $(cat "$LOCK_DIR/pid" 2>/dev/null)
+  if holder_is_us "${1:-}" "${2:-}"; then
+    log "[injector-daemon] another instance (pid ${1:-}) is running; exiting"
     exit 0
   fi
   rm -rf "$LOCK_DIR" 2>/dev/null
@@ -599,9 +609,11 @@ else
 fi
 # 只有自己真的是持锁者才写 pid：--once 模式（watchdog 持锁）写了会把别人的锁偷走。
 if [ "${OMMEGA_SKIP_LOCK:-0}" != 1 ]; then
-  echo $$ > "$LOCK_DIR/pid"
+  owner_stamp > "$LOCK_DIR/pid"
   sleep 1
   lock_owned || exit 0
+  # 给 service.sh 的巡检看：pidfile 是 `pid starttime`，它不认名字只认启动时刻。
+  owner_stamp > "$PID_FILE"
 fi
 # 宿主能不能自己干活，由 root 这边看一眼它的 APK 就能定：dex 里认得出我们伺候的那几家
 # SOTER HAL 厂商前缀（qti / trustonic / xiaomi / microtrust）才是 real；其余一律当 stub ——
@@ -609,6 +621,41 @@ fi
 # 真真 TA 的坏话会直达 App，只有让载荷把宿主给 App 的答复顶掉（见 hook/soter.rs 的
 # take_app_answer）。结果写一份世界可读的小文件，宿主里的载荷读它 —— 宿主进程自己按
 # /proc/self/maps 猜 APK 会猜错（那里有几十个 overlay 的 apk，自己的不在第一）。
+# 杀软件 SOTER TA（我们自己的那个）。名字表里 soterta= 那条是它的伪装路径，
+# 再配上「exe 指向 memfd」就不会误杀同名的真系统服务。
+kill_software_ta() {
+  kt_name=$(sed -n 's/^soterta=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+  [ -n "$kt_name" ] || return 0
+  for p in $(ls /proc | grep -E '^[0-9]+$'); do
+    [ -r "/proc/$p/cmdline" ] || continue
+    kt_cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+    [ "${kt_cmd%% *}" = "$kt_name" ] || continue
+    case "$(readlink "/proc/$kt_p/exe" 2>/dev/null)" in
+      /memfd:*) kill -9 "$kt_p" 2>/dev/null ;;
+    esac
+  done
+  return 0
+}
+
+# 反向保活：keymint 守护被系统清掉时拉它一把（守护也会反过来保活注入器）。
+# 两个常驻进程互相看着，就不需要第三个看门狗进程了 —— 以前那个是 service.sh 里的
+# 常驻 shell 循环，进程列表里一个带模块路径的 busybox。
+ensure_keymint_daemon() {
+  ekd_pid=$(awk 'NR==1{print $1}' "$RUN_DIR/keymint-daemon.pid" 2>/dev/null)
+  ekd_stamp=$(awk 'NR==1{print $2}' "$RUN_DIR/keymint-daemon.pid" 2>/dev/null)
+  if [ -n "$ekd_pid" ] && kill -0 "$ekd_pid" 2>/dev/null; then
+    if [ -z "$ekd_stamp" ] || [ "$ekd_stamp" = 0 ] || [ "$(proc_start_time "$ekd_pid")" = "$ekd_stamp" ]; then
+      return 0
+    fi
+  fi
+  ekd_abi=$(device_abi)
+  ekd_km=$MODDIR/libs/$ekd_abi/keymint
+  [ -x "$ekd_km" ] || return 0
+  log "[injector-daemon] keymint daemon looks dead; restarting it"
+  "$ekd_km" --daemon >/dev/null 2>&1 &
+  return 0
+}
+
 sync_soter_host_state() {
   local pkg path want prev
   pkg=com.tencent.soter.soterserver
@@ -640,6 +687,9 @@ while true; do
   # Config and target list live in the single data location
   # (/data/misc/ommega/); the webroot UI writes them through the
   # ommegadata symlink, so no copy/sync is needed here.
+
+  # 先确保 keymint 守护在（它挂了的话，下面所有注入都白做）。
+  ensure_keymint_daemon
 
   LOG_ON=0
   debug_logging_enabled && LOG_ON=1
@@ -676,7 +726,8 @@ while true; do
     done
     log "[injector-daemon] ATTK changed; cleared soter_status of $_cleared app(s)"
     # 软件 TA 是独立进程，内存里那份 ASK 也得跟着没（它自己不会去读文件）。
-    pkill -f 'soterta-ta --soterta-serve' 2>/dev/null
+    # 它现在跑在 memfd 里、名字是伪装的系统服务，pidof 认不出来 —— 按名字表 + memfd 找。
+    kill_software_ta
     # ASK/ATTK 换了：keystore2 里那份 payload 的 state（ATTK 与已加载的 ASK）是启动时
     # 一次性加载的，只踢 SOTER 宿主不会重读，必须让 keystore2 重新注入一次。
     : > "$RESTART_FILE"

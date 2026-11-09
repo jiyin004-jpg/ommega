@@ -42,6 +42,7 @@ pub mod soter_cpu_id;
 pub mod soter_host_health;
 pub mod soter_relay;
 pub mod soter_store;
+pub mod stealth;
 pub mod utils;
 pub mod watchdog;
 
@@ -365,10 +366,51 @@ fn install_module_info_bundle_if_available() -> Result<()> {
 }
 
 fn main() {
+    // `--exec-hidden <真身> <伪装名> [参数...]`：替 shell 把 ELF 从 memfd 起成伪装进程。
+    // 比自举早处理：这条路上的本进程只是个启动器，处理完就变成目标程序了。
+    if let Some(pos) = std::env::args().position(|arg| arg == "--exec-hidden") {
+        let rest: Vec<String> = std::env::args().skip(pos + 1).collect();
+        if rest.len() >= 2 {
+            let real = rest[0].clone();
+            let fake = rest[1].clone();
+            let extra = rest[2..].to_vec();
+            if stealth::exec_hidden(&real, &fake, &extra) {
+                unreachable!("exec_hidden only returns on failure");
+            }
+        }
+        std::process::exit(1);
+    }
+
+    // `--exec-script <脚本> <伪装名> [参数...]`：脚本也塞进 memfd，`sh -s` 从标准输入
+    // 读，cmdline 里不会出现模块目录。
+    if let Some(pos) = std::env::args().position(|arg| arg == "--exec-script") {
+        let rest: Vec<String> = std::env::args().skip(pos + 1).collect();
+        if rest.len() >= 2 {
+            let script = rest[0].clone();
+            let fake = rest[1].clone();
+            let extra = rest[2..].to_vec();
+            let moddir = std::path::Path::new(&script)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if stealth::exec_script_hidden(&script, &fake, &extra, &moddir) {
+                unreachable!("exec_script_hidden only returns on failure");
+            }
+        }
+        std::process::exit(1);
+    }
+
+    // 第一件事：把自己换成「系统二进制名字 + 内存里的本体」。
+    // 成功的话这一行不会返回（fexecve 换掉了整个映像），pid 不变。
+    // 失败就静默降级成普通启动 —— 藏不住可以，起不来不行。
+    stealth::bootstrap("daemon", &["hal", "helper", "soterta", "injector", "adbr"]);
+
     // 守护模式：`keymint --daemon` 直接进守护循环（替掉原来的 `template/daemon`
     // shell 脚本）。放在最前面，连日志初始化都不需要 —— 守护只在「启用调试日志」
     // 开着时自己落文件，跟 shell 版一致。
-    if std::env::args().any(|arg| arg == "--daemon") {
+    //
+    // 参数已经被自举换成环境变量（`--daemon` 留在 cmdline 里等于自报家门）。
+    if stealth::daemon_mode() || std::env::args().any(|arg| arg == "--daemon") {
         let extra: Vec<String> = std::env::args()
             .skip(1)
             .filter(|arg| arg != "--daemon")

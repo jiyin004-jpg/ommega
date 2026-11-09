@@ -16,8 +16,15 @@
 # 映射，lsplt 一个 GOT 都认不下来（commit 全失败）。接管服务名跟注入无关，客户端
 # 一行都不用改。
 
-MODDIR=${0%/*}
+MODDIR=${OMMEGA_MODDIR:-${0%/*}}
 STATE_DIR=/data/adb/ommega
+
+# 进程身份：/proc/<pid>/stat 第 22 字段（启动时刻）。pid 会被复用，启动时刻不会。
+proc_start_time() {
+  [ -r "/proc/$1/stat" ] || return 1
+  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+
 BIN_DIR=$STATE_DIR/bin
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
@@ -28,9 +35,6 @@ PIDFILE=$RUN_DIR/soterta.pid
 KICKED_FILE=$RUN_DIR/soterta.host.kicked
 # 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。
 TAKEOVER_PID=$RUN_DIR/soterta.takeover.pid
-# 原厂 HAL 停不掉的环境（SKRoot 拦 `setprop ctl.stop`）落这个标记，之后每轮不再
-# 反复尝试停它，只看我们自己的 AIDL 名字还在不在。
-STOCK_UNSTOPPABLE=$RUN_DIR/soterta.stock_unstoppable
 # 日志统一写 daemon.log（跟 service.sh / daemon-injector / adbr 共用一份）。
 LOG=/data/misc/ommega/logs/daemon.log
 # 解析结果缓存 + 静默开关。service.sh 的 keep-alive 和 daemon-injector 的
@@ -56,36 +60,30 @@ fi
 # 同时起两个 `--soterta-serve`（实测 6212/6213 并存一个多小时）。会话号存在进程内存里，
 # initSign 落在 A 进程、finishSign 落到 B 进程就回 -1000 —— 检测器的 T12 每轮必挂，
 # App 那边表现为要反复验指纹。抢不到锁的直接退出，让拿到锁的那一轮去 converge。
-LOCKFILE=$RUN_DIR/soterta.lock
-# 单实例锁。flock 不是到处都能用：SKRoot 上 toybox 的 flock 对任何 fd 都回 EBADF
-# （不是「被别人占」，是真的用不了），老写法 `flock -n 9 || exit 0` 在这种环境里
-# 等于脚本每一轮都静默退出 —— 2026-11-08 PKX110 实测：SOTER 一次都没接管过，
-# 工程模式的 SOTER key 一直是失败。所以先拿临时 fd 试一下 flock 能不能用，
-# 能用就按它判归属，不能用退回 mkdir 锁（目录创建是原子的，效果一样）。
-_flock_ok=0
-if command -v flock >/dev/null 2>&1; then
-  if exec 8>"$LOCKFILE.probe" 2>/dev/null; then
-    flock -n 8 2>/dev/null && _flock_ok=1
-    exec 8>&- 2>/dev/null
-  fi
-  rm -f "$LOCKFILE.probe" 2>/dev/null
-fi
-if [ "$_flock_ok" = "1" ]; then
-  exec 9>"$LOCKFILE" 2>/dev/null || true
-  flock -n 9 || exit 0
-else
-  LOCKDIR=$LOCKFILE.d
-  if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    _oldpid=$(cat "$LOCKDIR/pid" 2>/dev/null)
-    if [ -n "$_oldpid" ] && kill -0 "$_oldpid" 2>/dev/null; then
+#
+# 用目录锁而不是 flock：SKRoot 上 toybox 的 flock 对任何 fd 都回 EBADF（不是「被占」，
+# 是真的用不了），`flock -n 9 || exit 0` 这种写法在那类环境里等于脚本每轮都静默退出
+# （2026-11-08 PKX110 实测：SOTER 一次都没接管过）；普通环境里 toybox 的 flock 也只认
+# `flock FILE COMMAND`、不认数字 fd。目录锁两边都能用，再加 pid+启动时刻防 pid 复用。
+LOCKDIR=$RUN_DIR/soterta.lock.d
+lock_owner() { printf '%s %s\n' "$$" "$(proc_start_time $$)"; }
+release_lock() {
+  [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$(lock_owner)" ] && rm -rf "$LOCKDIR" 2>/dev/null
+  return 0
+}
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  lock_pid=$(awk 'NR==1{print $1}' "$LOCKDIR/pid" 2>/dev/null)
+  lock_stamp=$(awk 'NR==1{print $2}' "$LOCKDIR/pid" 2>/dev/null)
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    if [ -z "$lock_stamp" ] || [ "$lock_stamp" = 0 ] || [ "$(proc_start_time "$lock_pid")" = "$lock_stamp" ]; then
       exit 0
     fi
-    rm -rf "$LOCKDIR" 2>/dev/null
-    mkdir "$LOCKDIR" 2>/dev/null || exit 0
   fi
-  printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null
-  trap 'rm -rf "$LOCKDIR" 2>/dev/null' EXIT
+  rm -rf "$LOCKDIR" 2>/dev/null
+  mkdir "$LOCKDIR" 2>/dev/null || exit 0
 fi
+lock_owner > "$LOCKDIR/pid" 2>/dev/null
+trap 'release_lock' EXIT INT TERM HUP
 # 服务名和 init 服务名都不写死：各厂商的 SOTER HAL 叫什么的都有（高通
 # `vendor.qti.hardware.soter`、小米 `vendor.xiaomi.hardware.soterservice`、联发科
 # `vendor.trustonic.soter`……），写死一个就得每台机器改一次。运行时解析，见 resolve_hal。
@@ -113,6 +111,7 @@ enabled() {
 }
 
 device_abi() {
+  local abi
   abi=$(getprop ro.product.cpu.abi 2>/dev/null)
   case "$abi" in
     arm64*|aarch64*) echo arm64-v8a ;;
@@ -295,14 +294,60 @@ hidl_platform() {
 }
 
 daemon_pid() {
+  local pid stamp
   [ -f "$PIDFILE" ] || return 1
-  pid=$(cat "$PIDFILE" 2>/dev/null)
+  set -- $(cat "$PIDFILE" 2>/dev/null)
+  local pid=${1:-}
+  local stamp=${2:-}
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
   kill -0 "$pid" 2>/dev/null || return 1
-  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'soterta-serve' || return 1
+  # 守护现在是 memfd + 伪装名起的，cmdline 里既没有 soterta-serve 也没有自家路径，
+  # 只能认「pid + 启动时刻」。
+  if [ -n "$stamp" ] && [ "$stamp" != 0 ]; then
+    [ "$(proc_start_time "$pid")" = "$stamp" ] || return 1
+  fi
   echo "$pid"
+}
+
+# 伪装名字（daemon 开机时挑好写进名字表）。读不到就返回 1。
+stealth_name() {
+  sed -n 's/^soterta=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1
+}
+
+# 残留的守护：pidof 已经找不到了（进程名换了），按名字表 + exe 是 memfd 认人。
+stale_daemon_pids() {
+  local name p cmd
+  name=$(stealth_name)
+  [ -n "$name" ] || return 0
+  for p in $(ls /proc | grep -E '^[0-9]+$'); do
+    [ -r "/proc/$p/cmdline" ] || continue
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+    [ "${cmd%% *}" = "$name" ] || continue
+    case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+      /memfd:*) echo "$p" ;;
+    esac
+  done
+}
+
+# 起守护。能用 memfd 就用：进程的 exe / cmdline 里不会再有 /data/adb/ommega/bin。
+# 起不来就退回普通启动 —— 接管不上比露一下严重得多。
+launch_daemon() {
+  local abi km fake pid
+  abi=$(device_abi)
+  km=
+  [ -n "$abi" ] && [ -x "$MODDIR/libs/$abi/keymint" ] && km=$MODDIR/libs/$abi/keymint
+  fake=$(stealth_name)
+  export OMMEGA_SOTER_SERVICE="$SERVICE"
+  if [ -n "$km" ] && [ -n "$fake" ]; then
+    "$km" --exec-hidden "$BIN" "$fake" --soterta-serve >>"$LOG" 2>&1 9>&- &
+  else
+    "$BIN" --soterta-serve >>"$LOG" 2>&1 9>&- &
+  fi
+  pid=$!
+  printf '%s %s\n' "$pid" "$(proc_start_time "$pid")" > "$PIDFILE.tmp" 2>/dev/null
+  mv -f "$PIDFILE.tmp" "$PIDFILE" 2>/dev/null
 }
 
 stop_daemon() {
@@ -343,14 +388,6 @@ take_over() {
     log "stopping stock SOTER HAL"
     setprop ctl.stop "$HAL" 2>/dev/null
     sleep 1
-    # 有的环境里 ctl.stop 写不进去（SKRoot 上 `setprop ctl.stop` 直接回
-    # "Failed to set property"，原厂 HAL 停不了）。那就不再每轮重试：我们的
-    # AIDL 名字能注册、工程模式能查到就行，原厂继续给 HIDL 客户端服务。
-    if [ "$(hal_state)" = "running" ]; then
-      log "stock SOTER HAL did not stop; keeping it and registering our AIDL name alongside"
-      stop_stock=0
-      : > "$STOCK_UNSTOPPABLE" 2>/dev/null
-    fi
   fi
   if [ -z "$(daemon_pid)" ]; then
     start_daemon
@@ -384,17 +421,14 @@ start_daemon() {
   fi
   # 只留一个实例：两份就是两套内存态会话表，init 落在其中一个、finish 落到另一个上
   # 就是 -204（NX721J 实测过两个实例同时在跑）。
-  for p in $(pidof soterta-ta 2>/dev/null); do
+  for p in $(stale_daemon_pids); do
     kill -9 "$p" 2>/dev/null
   done
   log "starting software SOTER TA: $BIN (service=$SERVICE)"
   # 服务名和描述符只能运行时定（各家接口名不一样），由脚本从 VINTF 读出来传进去。
   # `9>&-` 不能省：顶上那个 flock 挂在 fd 9 上，这个 fd 如果被 TA 继承，锁就永远
   # 不会释放 —— 之后每次 `flock -n 9` 都失败，脚本静默 exit 0，接管/释放/巡检全停。
-  OMMEGA_SOTER_SERVICE="$SERVICE" "$BIN" --soterta-serve >>"$LOG" 2>&1 9>&- &
-  pid=$!
-  echo "$pid" > "$PIDFILE.tmp" 2>/dev/null
-  mv -f "$PIDFILE.tmp" "$PIDFILE" 2>/dev/null
+  launch_daemon
   sleep 1
 }
 
@@ -430,7 +464,7 @@ hold() {
   # running，拿它当「被抢回去」的判据等于每轮都空跑一次 take_over：MEIZU 20 Pro
   # （391QYGDJ2244E）实测 53 分钟写了 236 次，把日志冲得没法看。这种机器只看
   # 我们的 AIDL 名字还在不在。
-  if soter_hal_is_hidl || [ -f "$STOCK_UNSTOPPABLE" ]; then
+  if soter_hal_is_hidl; then
     if ! service_present; then
       log "our AIDL name vanished; re-taking over"
       take_over && return 0

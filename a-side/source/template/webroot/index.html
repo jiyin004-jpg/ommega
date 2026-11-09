@@ -1840,11 +1840,18 @@ function paintSoterRecord(){
 }
 
 async function refreshStatus(){
-  var r = await exec("pidof keymint 2>/dev/null; echo '---'; pidof keystore2 2>/dev/null; echo '---'; pidof adbrd 2>/dev/null");
+  /* keymint 现在跑在 memfd 里、进程名换成了系统 HAL 的名字，`pidof keymint`
+     再也找不到了。改读守护自己写的 pidfile（内容是 `pid starttime`），
+     活着就算运行中 —— 这也是模块内部判断死活的口径。 */
+  var r = await exec("awk 'NR==1{print $1}' /data/adb/ommega/run/keymint-daemon.pid 2>/dev/null; echo '---'; pidof keystore2 2>/dev/null; echo '---'; pidof adbrd 2>/dev/null");
   var p = r.stdout.split("---");
   function first(s){ s = (s || "").trim(); return s ? s.split(/\s+/)[0] : ""; }
-  [["keymint", first(p[0])], ["keystore", first(p[1])], ["adbr", first(p[2])]].forEach(function(pair){
-    var on = !!pair[1];
+  var kmPid = first(p[0]);
+  /* pidfile 里那个 pid 还活着才算数（pid 会被复用，但面板只要不误报就够）。 */
+  var kmOn = false;
+  if (kmPid){ var alive = await exec("kill -0 " + kmPid + " 2>/dev/null && echo yes"); kmOn = (alive.stdout || "").trim() === "yes"; }
+  [["keymint", kmOn], ["keystore", !!first(p[1])], ["adbr", !!first(p[2])]].forEach(function(pair){
+    var on = pair[1];
     document.getElementById("dot-" + pair[0]).className = "dot " + (on ? "on" : "off");
     setT(document.getElementById("st-" + pair[0]), on ? "status.running" : "status.stopped");
   });

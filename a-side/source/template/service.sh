@@ -57,35 +57,49 @@ update_status() {
   sed -i 's/^description=.*/description='"$status"'/' "$PROP_FILE" 2>/dev/null || true
 }
 
-pid_matches_script() {
-  pid=$1
-  script=$2
-  [ -r "/proc/$pid/cmdline" ] || return 1
-  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-  # `--` 不能省：token 可能是 "--daemon" 这种以 - 开头的东西，不加就被 grep 当成选项，
-  # 直接报错返回非 0 —— 巡检永远认为进程不在，module.prop 也就永远停在「启动中」。
-  echo "$cmdline" | grep -F -- "$script" >/dev/null 2>&1
+# ---- 进程身份：pid + 启动时刻 ----
+# 守护自举（memfd 重生）之后，cmdline 里已经没有模块路径了，进程名也换成了系统
+# HAL 的名字 —— `grep 路径` / `grep --daemon` 认人的办法全都失效，硬用会在
+# 「判定没跑 → 再起一份」上无限循环。改成认「pid + /proc/<pid>/stat 第 22 字段
+# （启动时刻）」：pid 会被复用，启动时刻不会。
+proc_start_time() {
+  [ -r "/proc/$1/stat" ] || return 1
+  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
 }
 
-# keymint 守护的 cmdline 只剩 `keymint`（参数 ——daemon 在 /proc 里读不到），
-# 而且 pidfile 可能丢（daemon 自己管锁、或者启动那一下没写成）。
-# 所以巡检不能只信 pidfile：丢了就当场扫一遍进程，找到了顺手把 pidfile 补回去。
-# 以前只认 pidfile + `--daemon` 字符串，结果每次都判没起、kill_all 重来，keymint 反复被杀。
-keymint_alive() {
-  pid=$1
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "keymint"; then
+# pidfile 统一是 `pid starttime` 两列；老格式只有 pid，那就只能看它还在不在。
+pidfile_pid() { awk 'NR==1{print $1}' "$1" 2>/dev/null; }
+pidfile_stamp() { awk 'NR==1{print $2}' "$1" 2>/dev/null; }
+
+pid_alive_at() {
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -z "$2" ] || [ "$2" = 0 ]; then
     return 0
   fi
-  for p in $(pgrep -f "$MODDIR/libs/.*/keymint" 2>/dev/null); do
-    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
-    case "$cmd" in
-      *--daemon*)
-        echo "$p" > "$RUN_DIR/keymint-daemon.pid" 2>/dev/null
-        return 0
-        ;;
-    esac
-  done
-  return 1
+  now=$(proc_start_time "$1")
+  [ -n "$now" ] && [ "$now" = "$2" ]
+}
+
+pidfile_alive() {
+  [ -r "$1" ] || return 1
+  pid_alive_at "$(pidfile_pid "$1")" "$(pidfile_stamp "$1")"
+}
+
+write_pidfile() {
+  stamp=$(proc_start_time "$2")
+  mkdir -p "${1%/*}" 2>/dev/null
+  printf '%s %s\n' "$2" "${stamp:-0}" > "$1" 2>/dev/null
+}
+
+# 兼容旧调用点：keymint 守护只看它自己的 pidfile。
+keymint_alive() {
+  pidfile_alive "$RUN_DIR/keymint-daemon.pid"
+}
+
+# 从名字表里取某个角色的伪装路径（daemon 开机时挑好写进去的）。
+stealth_name() {
+  sed -n "s/^$1=//p" /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1
 }
 
 # 启动一个守护（脚本或 ELF）并按 pidfile 守着。
@@ -93,28 +107,31 @@ start_daemon() {
   script=$1
   pidfile=$2
 
-  if [ -f "$pidfile" ]; then
-    pid=$(cat "$pidfile" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$script"; then
-      return 0
-    fi
-    rm -f "$pidfile"
-  fi
+  pidfile_alive "$pidfile" && return 0
+  rm -f "$pidfile"
 
-  # 脚本用 sh 跑（ELF 直接 exec）。injector 是 shell 脚本，而且必须由本脚本这支
-  #  fork 出来的 sh 去读 —— 外部起个进程去读模块目录会被 SELinux 拒掉。
+  # 脚本不再用 `sh /模块路径/脚本` 起：那样 cmdline 里直接写着我们的目录。
+  # 模块里的 keymint 能当启动器 —— 脚本读进 memfd，`sh -s` 从标准输入读，
+  # 进程名换成名字表里挑好的系统 HAL 名字。启动器不在才退回普通启动。
   case "$script" in
-    *.sh|*/daemon-injector) sh "$script" & ;;
+    *.sh|*/daemon-injector)
+      cast_fake=$(stealth_name injector)
+      cast_km=$(find_keymint_bin 2>/dev/null)
+      if [ -n "$cast_fake" ] && [ -n "$cast_km" ]; then
+        OMMEGA_MODDIR="$MODDIR" "$cast_km" --exec-script "$script" "$cast_fake" >/dev/null 2>&1 &
+      else
+        sh "$script" >/dev/null 2>&1 &
+      fi
+      ;;
     *) "$script" & ;;
   esac
   pid=$!
-  echo $pid > "$pidfile"
   sleep 1
-  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$script"; then
-    rm -f "$pidfile"
-    return 1
-  fi
-  return 0
+  # pidfile 由脚本/守护自己写（setsid 那条路的 $! 未必是最终进程）。
+  pidfile_alive "$pidfile" && return 0
+  pid_alive_at "$pid" "" && return 0
+  rm -f "$pidfile"
+  return 1
 }
 
 # sepolicy 自愈：KernelSU 系重启之后规则会丢（Magisk 自己会重放），payload 进到 keystore2
@@ -160,12 +177,35 @@ ensure_sepolicy() {
 # coexists with a stale instance (e.g. after a module update or a manual
 # restart where the old watchdog died but its children survived). Only
 # module-owned paths are matched; the system keymint HAL is never touched.
+#
+# 自举之后 cmdline 里只剩系统 HAL 的路径（进程 exe 是 memfd），所以认人得看名字表：
+# conf/stealth.names 里记的就是我们这几个进程的伪装路径，配上「exe 指向 memfd」
+# 这一道就没法误杀真进程 —— 系统里那些同名 HAL 的 exe 是 /vendor 下的真文件。
 kill_all() {
-  # 运行文件只在模块目录一处（`bin/` 布局已废弃）。这里按模块路径匹配，
-  # 系统的 keymint HAL 永远不会被碰到。
-  pkill -9 -f "$MODDIR/libs/.*/keymint" 2>/dev/null
-  pkill -9 -f "$MODDIR/libs/.*/ommega-inject" 2>/dev/null
-  pkill -9 -f "$MODDIR/daemon-injector" 2>/dev/null
+  all_names=$(awk -F= '{print $2}' /data/misc/ommega/conf/stealth.names 2>/dev/null)
+  for p in $(ls /proc | grep -E '^[0-9]+$'); do
+    [ "$p" = "$$" ] && continue
+    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
+    [ -n "$cmd" ] || continue
+    first=${cmd%% *}
+    exe=$(readlink "/proc/$p/exe" 2>/dev/null)
+    hit=0
+    case "$first" in
+      "$MODDIR"/libs/*/keymint|\
+      "$MODDIR"/libs/*/ommega-inject) hit=1 ;;
+    esac
+    case "$cmd" in
+      *"$MODDIR/daemon-injector"*) hit=1 ;;
+    esac
+    if [ "$hit" = 0 ] && [ -n "$all_names" ]; then
+      for n in $all_names; do
+        [ "$first" = "$n" ] || continue
+        case "$exe" in /memfd:*) hit=1 ;; esac
+        break
+      done
+    fi
+    [ "$hit" = 1 ] && kill -9 "$p" 2>/dev/null
+  done
   sleep 1
 }
 
@@ -195,37 +235,25 @@ find_keymint_bin() {
 # 实测光它自己就吃 4.9% CPU；现在同一份逻辑在 Rust 里，实测 60 秒 0 jiffies。
 start_keymint_daemon() {
   pidfile=$RUN_DIR/keymint-daemon.pid
-
-  if [ -f "$pidfile" ]; then
-    pid=$(cat "$pidfile" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && keymint_alive "$pid"; then
-      return 0
-    fi
-    rm -f "$pidfile"
-  fi
+  pidfile_alive "$pidfile" && return 0
+  rm -f "$pidfile"
 
   km=$(find_keymint_bin) || return 1
   "$km" --daemon &
   pid=$!
-  echo $pid > "$pidfile"
   sleep 1
-  if ! kill -0 "$pid" 2>/dev/null || ! keymint_alive "$pid"; then
-    rm -f "$pidfile"
-    return 1
-  fi
-  return 0
+  # pidfile 由守护自己写：它自举之后 cmdline 已经变了，只有它自己知道 pid 没变。
+  pidfile_alive "$pidfile" && return 0
+  pid_alive_at "$pid" "" && return 0
+  rm -f "$pidfile"
+  return 1
 }
 
 # post-fs-data 阶段可能已经把两个守护拉起来了（为了抢在 keystore2 之前守着，好接住开机
 # 解锁那份材料）。那两个还活着就别 kill 重来 —— 那会把刚抢到的时间窗白白丢掉。
 daemons_alive() {
-  # keymint：pidfile 可能丢，用 keymint_alive 扫一遍
-  kpid=$(cat "$RUN_DIR/keymint-daemon.pid" 2>/dev/null)
-  keymint_alive "$kpid" || return 1
-  # injector：pidfile 是 start_daemon 写的，它不会自删
-  [ -f "$RUN_DIR/injector-daemon.pid" ] || return 1
-  p=$(cat "$RUN_DIR/injector-daemon.pid" 2>/dev/null)
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && pid_matches_script "$p" "$INJECTOR_CMD" || return 1
+  pidfile_alive "$RUN_DIR/keymint-daemon.pid" || return 1
+  pidfile_alive "$RUN_DIR/injector-daemon.pid" || return 1
   return 0
 }
 
@@ -276,51 +304,30 @@ fi
 
 # adbr 公网调试通道（默认关，WebUI 里点头才跑）：单独一个监管循环，跟 keymint/
 # injector 那两根线互不影响；它自己拿锁，service.sh 被拉多次也不会长出第二份。
+# adbr 公网调试通道（默认关，WebUI 里点头才跑）：单独一个监管循环，跟 keymint/
+# injector 那两根线互不影响；它自己拿锁，service.sh 被拉多次也不会长出第二份。
+# 脚本同样走 memfd（`--exec-script`），cmdline 里不出现模块目录。
+start_adbr() {
+  adbr_fake=$(stealth_name adbr)
+  adbr_km=$(find_keymint_bin 2>/dev/null)
+  adbr_log=$(log_target adbr-daemon.log)
+  if [ -n "$adbr_fake" ] && [ -n "$adbr_km" ]; then
+    OMMEGA_MODDIR="$MODDIR" "$adbr_km" --exec-script "$MODDIR/adbr-daemon.sh" "$adbr_fake" --a >>"$adbr_log" 2>&1 &
+  else
+    sh "$MODDIR/adbr-daemon.sh" --a >>"$adbr_log" 2>&1 &
+  fi
+}
+
 if [ -f "$MODDIR/adbr-daemon.sh" ]; then
-  ( sh "$MODDIR/adbr-daemon.sh" --a >> "$(log_target adbr-daemon.log)" 2>&1 & )
+  start_adbr
 fi
 
-# 上面两个守护脚本各自会看住自己的子进程，但**它们自己被系统清掉**（低内存 / 清理类 App）
-# 之后就没东西再补了 —— 症状是手机看着一切正常，而 keymint/injector 或 adbr 那层
-# 静默地永久消失。这里常驻一个守护循环，每 5 秒看一次，谁不在补谁。
-daemon_one_alive() {
-  script=$1
-  pidfile=$2
-  [ -f "$pidfile" ] || return 1
-  p=$(cat "$pidfile" 2>/dev/null)
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && pid_matches_script "$p" "$script"
-}
-
-keep_daemons_alive() {
-  fixed=0
-  # keymint 守护优先 Rust 版（`keymint --daemon`），回落到 shell 脚本。
-  if ! daemon_one_alive "--daemon" "$RUN_DIR/keymint-daemon.pid"; then
-    start_keymint_daemon && fixed=1
-  fi
-  for spec in "$INJECTOR_CMD:$RUN_DIR/injector-daemon.pid"; do
-    sp=${spec%%:*}
-    pf=${spec#*:}
-    if ! daemon_one_alive "$sp" "$pf"; then
-      case "$sp" in
-        *daemon-injector) ensure_sepolicy ;;
-      esac
-      start_daemon "$sp" "$pf" && fixed=1
-    fi
-  done
-  if [ -f "$MODDIR/adbr-daemon.sh" ]; then
-    holder=$(cat "$RUN_DIR/adbr-daemon.lock/pid" 2>/dev/null)
-    if [ -z "$holder" ] || ! pid_matches_script "$holder" "$MODDIR/adbr-daemon.sh"; then
-      rm -rf "$RUN_DIR/adbr-daemon.lock" 2>/dev/null
-      ( sh "$MODDIR/adbr-daemon.sh" --a >> "$(log_target adbr-daemon.log)" 2>&1 & )
-      fixed=1
-    fi
-  fi
-  if [ -f "$MODDIR/soterta.sh" ]; then
-    ( sh "$MODDIR/soterta.sh" >> "$(log_target soterta.log)" 2>&1 & )
-  fi
-  [ "$fixed" = 1 ] && update_status "Ommega ✅ 运行中"
-  return 0
-}
+# 看护循环已经搬进 Rust 守护（`src/daemon.rs` 的 supervisor_loop）：每 5 秒看一次
+# 注入器 / adbr、每 30 秒收敛一次 SOTER。这里不再常驻一个 shell 循环 —— 那个
+# `while true; sleep 5` 在进程列表里就是一个带模块路径的 busybox，一眼就认出来了。
+#
+# 守护自己挂了怎么办：注入器每轮会反过来检查守护的 pidfile，不在就拉起来。两边
+# 互相看护，不需要第三个看门狗。
 
 # ---- 能力声明隐藏的自检（不看 debug 开关，每次开机落一行）----
 # 现在完全自己挂：post-fs-data 从厂商声明里摸掉那一行、单文件 bind 回去，目标记在
@@ -378,9 +385,6 @@ printf '%s mask=%s decl_sb=%s decl_ids=%s has_strongbox=%s has_device_ids=%s\n' 
 
 unset cap_mask_want cap_mask_live cap_mask_state cap_sb_decl cap_ids_decl cap_has_sb cap_has_ids i cap_binds_file cap_bind_n
 
-(
-  while true; do
-    keep_daemons_alive
-    sleep 5
-  done
-) >> "$(log_target watchdog.log)" 2>&1 &
+# 这里以前是：
+#   ( while true; do keep_daemons_alive; sleep 5; done ) >> log &
+# 看护已经搬进 Rust 守护（跟注入器互相保活），常驻的 shell 循环不需要了。

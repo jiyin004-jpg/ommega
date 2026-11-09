@@ -544,47 +544,76 @@ unset mask_state_file mask_sb mask_ids me_name me_enabled me_state me_pat me_val
 # 进 keystore2 的话，这份解锁材料就永久丢了，影子 keystore 会一直 LOCKED 到下一次解锁。
 # service.sh 里还有一份同样的启动（这里失败/被杀就靠它兑底），它会先看这两个 pid 文件，
 # 活着就不重复启。
-pid_matches_script() {
-  p=$1
-  s=$2
-  [ -r "/proc/$p/cmdline" ] || return 1
-  tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -F "$s" >/dev/null 2>&1
+# ---- 进程身份：pid + 启动时刻 ----
+# 与 service.sh 同一套：守护自举之后 cmdline 里没有模块路径了，名字也不能拿来认人，
+# 只能比「pid + 启动时刻」。start 先核一遍，失败就交给 service 阶段重试。
+proc_start_time() {
+  [ -r "/proc/$1/stat" ] || return 1
+  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+
+pidfile_pid() { awk 'NR==1{print $1}' "$1" 2>/dev/null; }
+pidfile_stamp() { awk 'NR==1{print $2}' "$1" 2>/dev/null; }
+
+pid_alive_at() {
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -z "$2" ] || [ "$2" = 0 ]; then
+    return 0
+  fi
+  now=$(proc_start_time "$1")
+  [ -n "$now" ] && [ "$now" = "$2" ]
+}
+
+pidfile_alive() {
+  [ -r "$1" ] || return 1
+  pid_alive_at "$(pidfile_pid "$1")" "$(pidfile_stamp "$1")"
 }
 
 start_daemon_early() {
   script=$1
   extra=$2
   pidfile=$3
-  check=${extra:-$script}
-  if [ -f "$pidfile" ]; then
-    pid=$(cat "$pidfile" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pid_matches_script "$pid" "$check"; then
-      return 0
-    fi
-    rm -f "$pidfile"
+  if pidfile_alive "$pidfile"; then
+    return 0
   fi
-  # 脚本用 sh 跑（ELF 直接 exec）。injector 是 shell 脚本，必须由本脚本（magiskd 域）
-  # fork 出来的 sh 去读：模块目录的标签是 magisk_file，ksu 域读不了。
-  # setsid 是为了离开 post-fs-data 阶段后子进程不被收走（没有就退回普通后台）。
-  if command -v setsid >/dev/null 2>&1; then
-    case "$script" in
-      *.sh|*/daemon-injector) setsid sh "$script" $extra >/dev/null 2>&1 & ;;
-      *) setsid "$script" $extra >/dev/null 2>&1 & ;;
-    esac
-  else
-    case "$script" in
-      *.sh|*/daemon-injector) sh "$script" $extra >/dev/null 2>&1 & ;;
-      *) "$script" $extra >/dev/null 2>&1 & ;;
-    esac
-  fi
+  rm -f "$pidfile"
+  # 脚本不再用 `sh /模块路径/脚本` 起：cmdline 里会直接写着我们的目录。
+  # 模块里的 keymint 能当启动器（脚本进 memfd，`sh -s` 从标准输入读）。
+  # 名字表是 keymint 守护自举时生成的，所以本函数里 keymint 要先启动。
+  case "$script" in
+    *.sh|*/daemon-injector)
+      # 启动器把目标 ELF 读进 memfd 再换成伪装名执行，和 --exec-script 两回事。
+      fake=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+      km_bin=$MODDIR/libs/$pf_abi/keymint
+      if [ -n "$fake" ] && [ -x "$km_bin" ]; then
+        if command -v setsid >/dev/null 2>&1; then
+          OMMEGA_MODDIR="$MODDIR" setsid "$km_bin" --exec-script "$script" "$fake" $extra >/dev/null 2>&1 &
+        else
+          OMMEGA_MODDIR="$MODDIR" "$km_bin" --exec-script "$script" "$fake" $extra >/dev/null 2>&1 &
+        fi
+      elif command -v setsid >/dev/null 2>&1; then
+        setsid sh "$script" $extra >/dev/null 2>&1 &
+      else
+        sh "$script" $extra >/dev/null 2>&1 &
+      fi
+      ;;
+    *)
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "$script" $extra >/dev/null 2>&1 &
+      else
+        "$script" $extra >/dev/null 2>&1 &
+      fi
+      ;;
+  esac
   pid=$!
-  echo $pid > "$pidfile"
   sleep 1
-  if ! kill -0 "$pid" 2>/dev/null || ! pid_matches_script "$pid" "$check"; then
-    rm -f "$pidfile"
-    return 1
-  fi
-  return 0
+  # pidfile 由守护/脚本自己写（setsid 那条路的 $! 未必是最终进程），
+  # 还没写出来就退一步看 $! 还在不在。
+  pidfile_alive "$pidfile" && return 0
+  pid_alive_at "$pid" "" && return 0
+  rm -f "$pidfile"
+  return 1
 }
 
 pf_abi=$(getprop ro.product.cpu.abi 2>/dev/null)

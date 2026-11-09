@@ -6,6 +6,7 @@ use nix::unistd::Pid;
 pub mod config;
 pub mod filter;
 pub mod forward;
+pub mod hide;
 pub mod hook;
 pub mod identify;
 pub mod inject;
@@ -166,6 +167,15 @@ fn discover_soter_hal_processes() -> Vec<String> {
             || lower.contains("soterta-ta")
             || lower.contains("ommega-inject")
         {
+            continue;
+        }
+        // 我们自己的进程现在是 memfd + 伪装成厂商 HAL 的名字（daemon / HAL / 软件 TA），
+        // cmdline 和 comm 看着就是 `/vendor/...` 的服务，不排掉会把自己当目标注进去。
+        // 真 HAL 的 exe 是 /vendor 下的真文件，不会指向 memfd。
+        let self_memfd = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|path| path.to_string_lossy().starts_with("/memfd:"))
+            .unwrap_or(false);
+        if self_memfd {
             continue;
         }
         let Some(name) = utils::process_name(pid) else {
@@ -362,6 +372,10 @@ fn log_runtime_identity(role: &str) {
 }
 
 fn main() {
+    // 第一件事：把自己换成 memfd + 系统 HAL 名字的版本（名字表由 keymint 守护生）。
+    // 成功的话这里不会返回。
+    hide::hide_self("injector");
+
     /* 自检模式：给面板一个「加载就有的结论」—— 用当前生效的 ASK 签一段固定文本
     再验一遍。纯本地密码学（微秒级，不碰网络也不碰 TEE），所以不会挡任何签名路径。 */
     if let Some(arg) = std::env::args().find(|arg| arg.starts_with("--soterta-serve")) {

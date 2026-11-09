@@ -30,7 +30,18 @@ pkill -9 -f "$MODDIR/libs/.*/ommega-inject" 2>/dev/null
 pkill -9 -f "$MODDIR/daemon-injector" 2>/dev/null
 pkill -9 -f "$MODDIR/soterta.sh" 2>/dev/null
 pkill -9 -f "$MODDIR/kmod-loader.sh" 2>/dev/null
-pkill -9 -x soterta-ta 2>/dev/null
+# 自举之后 keymint / 软件 TA 的路径和名字都换过了，上面那些 pkill 一个都匹配不上，
+# 得按名字表（伪装路径）+「exe 指向 memfd」再清一遍，否则卸了模块进程还在跑。
+for _n in $(awk -F= '{print $2}' /data/misc/ommega/conf/stealth.names 2>/dev/null); do
+  for _d in /proc/[0-9]*; do
+    [ -r "$_d/cmdline" ] || continue
+    _c=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null)
+    [ "${_c%% *}" = "$_n" ] || continue
+    case "$(readlink "$_d/exe" 2>/dev/null)" in
+      /memfd:*) kill -9 "${_d#/proc/}" 2>/dev/null ;;
+    esac
+  done
+done
 
 # adbr 公网调试通道：先停监管循环（那个进程是 sh 在跑我们的 adbr-daemon.sh，按路径认），
 # 再按进程名停 adbrd 本身（-x 是 comm 精确匹配，不会误伤监管脚本）。

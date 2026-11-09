@@ -64,16 +64,39 @@ const KEYMINT_ENV: [&str; 6] = [
 
 /// 守护进程入口。`extra` 是原始参数里除 `--daemon` 以外的部分，原样交给 keymint。
 pub fn run(extra: Vec<String>) -> ! {
-    if !acquire_singleton() {
+    // 单实例靠内核锁（flock）：锁在我手上就到死不放，进程一死内核自动释放。
+    // 以前那套「mkdir 锁目录 + pid/starttime 校验」有两个实例同时认领陈锁的竞态，
+    // 实测会真的起两份守护 —— 两边每轮都把对方的 HAL 当残留杀掉，现象是 HAL 每两秒
+    // 被 SIGKILL 一次，证书全失败。
+    let singleton = acquire_flock();
+    if singleton.is_none() || !acquire_singleton() {
         log("another instance is running; exiting");
         std::process::exit(0);
     }
+    // 锁也会失效（锁目录被清、两轮自己的 pid 对不上时双方都以为自己抢到了）。
+    // 同名守护就是两份内存态：两边每轮都会把对方的 HAL 当残留杀掉，实际现象是
+    // HAL 每两秒被 SIGKILL 一次、证书请求全失败。这里按「名字 + memfd + pid 更小」
+    // 再兜一道：只要看到比自己早起的同名实例就退。
+    if let Some(name) = crate::stealth::cached_name("daemon") {
+        if let Some(old) = older_same_name(&name) {
+            log(&format!("older daemon pid {old} is alive; exiting"));
+            std::process::exit(0);
+        }
+    }
+    // pidfile 由守护自己写：自举（memfd 重生）会把 cmdline 换掉，shell 那边
+    // 拿 `$!` 记的 pid 也可能是 setsid 的中间进程，靠它判断死活不再可靠。
+    // 格式是 `pid starttime`，判活就比 starttime —— pid 被复用了也对不上。
+    write_pidfile();
     log("keymint daemon started");
     // 伪装参数只在开机（或本守护重启）时算一次：面板保存只写 props.conf，
     // 不会即时改运行时；这样属性和证书永远是同一份，不会一边新一边旧。
     normalize_all();
     // AAID 兜底表：悄悄跑着，不让它拖住主循环（里面会 fork 一次 `pm`）。
     std::thread::spawn(aaid_sync_loop);
+    // 看护线程：注入器和 adbr 以前是 service.sh 里那个 `while true; sleep 5`
+    // （一个常驻的 busybox sh，进程列表里一眼就是「模块自带的脚本」）。
+    // 搬到守护里之后，那一层就彻底没有了。
+    std::thread::spawn(supervisor_loop);
 
     loop {
         let Some(target) = find_keymint() else {
@@ -467,16 +490,31 @@ fn le_u32(buf: &[u8], at: usize) -> Option<u32> {
 // 单实例
 // ---------------------------------------------------------------------------
 
+/// 内核级排他锁。返回的 File 要活到进程结束（drop 就释放锁）。
+fn acquire_flock() -> Option<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let dir = Path::new(RUN_DIR);
+    fs::create_dir_all(dir).ok()?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join("keymint-daemon.flock"))
+        .ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return None;
+    }
+    Some(file)
+}
+
 fn acquire_singleton() -> bool {
+    let _ = fs::create_dir_all(STATE_DIR);
     let _ = fs::create_dir_all(STATE_DIR);
     let _ = fs::create_dir_all(RUN_DIR);
     let lock = Path::new(LOCK_DIR);
 
     if fs::create_dir(lock).is_err() {
-        let holder = fs::read_to_string(lock.join("pid"))
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok());
-        if holder.is_some_and(holder_is_daemon) {
+        if lock_holder().is_some_and(|(pid, start)| holder_is_daemon(pid, start)) {
             return false;
         }
         // 陈锁（进程没了，或那个 pid 早被别的进程复用）：清掉重抢。
@@ -485,23 +523,83 @@ fn acquire_singleton() -> bool {
             return false;
         }
     }
-    let _ = fs::write(lock.join("pid"), format!("{}", std::process::id()));
+    let me = owner_stamp();
+    let _ = fs::write(lock.join("pid"), &me);
     // 抢锁有竞态：两个实例同时认定「这是陈锁」时，先清后建的那份会把对方刚建的
     // 删掉。拿到之后隔一秒再核一次归属，确认还是自己才算数。
     sleep(Duration::from_secs(1));
     fs::read_to_string(lock.join("pid"))
         .ok()
-        .is_some_and(|text| text.trim() == std::process::id().to_string())
+        .is_some_and(|text| text.trim() == me)
+}
+
+/// 锁里记的身份：`pid starttime`。
+fn owner_stamp() -> String {
+    let pid = std::process::id();
+    format!("{pid} {}", start_time(pid).unwrap_or(0))
+}
+
+/// `/proc/<pid>/stat` 第 22 个字段（进程启动时刻，单位 jiffies）。
+fn start_time(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm 里可能带空格和括号，按最后一个 ')' 切才不会错位。
+    let rest = &text[text.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn write_pidfile() {
+    let _ = fs::create_dir_all(RUN_DIR);
+    let _ = fs::write(format!("{RUN_DIR}/keymint-daemon.pid"), owner_stamp());
+}
+
+/// 有没有比自己早起的同名守护（cmdline 首参就是那个伪装名、exe 在 memfd 里）。
+fn older_same_name(name: &str) -> Option<u32> {
+    let me = std::process::id();
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || pid > me {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let first = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+        if first != name.as_bytes() {
+            continue;
+        }
+        let hid = matches!(fs::read_link(entry.path().join("exe")), Ok(exe) if exe.to_string_lossy().starts_with("/memfd:"));
+        if hid {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn lock_holder() -> Option<(u32, u64)> {
+    let text = fs::read_to_string(Path::new(LOCK_DIR).join("pid")).ok()?;
+    let mut parts = text.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let start = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    Some((pid, start))
 }
 
 /// 锁里记的 pid 现在跑的确实是本守护（而不是内核线程或别的程序复用了这个号）。
-fn holder_is_daemon(pid: u32) -> bool {
-    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    if cmdline.is_empty() {
+fn holder_is_daemon(pid: u32, start: u64) -> bool {
+    let Some(now) = start_time(pid) else {
         return false;
+    };
+    // 老格式的锁没记 starttime，那时候只能看进程还在不在了。
+    if start == 0 {
+        return true;
     }
-    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-    args.iter().any(|arg| *arg == b"--daemon")
+    now == start
 }
 
 // ---------------------------------------------------------------------------
@@ -528,12 +626,23 @@ fn find_keymint() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// 杀掉所有跑着 `target` 的残留实例（只匹配这个确切路径，不碰系统 HAL）。
+/// 杀掉所有跑着 `target` 的残留实例。
+///
+/// 自举之后 cmdline 里已经没有模块路径了，所以两头都认：伪装名（本机名字表里
+/// 记的，包括上一轮留下来的）和原本的完整路径（没自举成功的旧进程）。
+/// 名字表里那些路径全是系统分区里的真文件，不会误杀 —— 那些进程本来就在跑。
 fn stop_stale_instances(target: &Path) {
     let Ok(entries) = fs::read_dir("/proc") else {
         return;
     };
     let target = target.to_string_lossy().to_string();
+    // 只认 HAL 那一个名字：名字表里还有 daemon / soterta / injector / adbr，
+    // 全拿来匹配的话每重启一次 HAL 就顺手把软件 TA 也杀了。
+    let mut names: Vec<String> = Vec::new();
+    if let Some(hal) = crate::stealth::cached_name("hal") {
+        names.push(hal);
+    }
+    names.push(target.clone());
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -550,20 +659,45 @@ fn stop_stale_instances(target: &Path) {
             continue;
         }
         let first = cmdline.split(|b| *b == 0).next().unwrap_or_default();
-        if first == target.as_bytes() {
-            let _ = Command::new("/system/bin/kill")
-                .args(["-KILL", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let first = String::from_utf8_lossy(first);
+        if !names.iter().any(|name| name == first.as_ref()) {
+            continue;
         }
+        // 只杀自己人：真的系统进程也在跑同名路径时，它的 comm 与路径对得上；
+        // 我们的进程 exe 是 memfd。没自举成功的那种确实是模块路径，也认。
+        let exe = fs::read_link(entry.path().join("exe"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ours = exe.starts_with("/memfd:") || exe == target || first == target;
+        if !ours {
+            continue;
+        }
+        let _ = Command::new("/system/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
     sleep(Duration::from_secs(1));
 }
 
 fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
-    let mut command = Command::new(target);
-    command.args(extra);
+    // 有伪装名就 memfd 跑：子进程的 exe 从此不指向模块目录。
+    // 没有（table 没挑出来）就老样子直接从模块目录 exec —— 难看但能跑。
+    let fake = crate::stealth::cached_name("hal").unwrap_or_default();
+    let mut memfd = None;
+    let mut command = if fake.starts_with('/') {
+        let base = fake.rsplit('/').next().unwrap_or("hal").to_string();
+        match crate::stealth::memfd_from(target, &base) {
+            Some(fd) => {
+                memfd = Some(fd);
+                crate::stealth::command_from_memfd(fd, &fake)
+            }
+            None => Command::new(target),
+        }
+    } else {
+        Command::new(target)
+    };
     // 出证要用的几个属性：daemon 读好经环境变量交给 keymint，省掉它自己去读
     // （`rsproperties` 在静态进程里拿不到属性区，兜底要 fork 一次 resetprop）。
     for name in KEYMINT_ENV {
@@ -573,10 +707,144 @@ fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
         }
     }
     command
+        .args(extra)
+        // 守护自己的模式标记不能传给 HAL：子进程继承环境变量的话会以为自己是
+        // 第二个守护，又去拿单实例锁、又去 spawn 一个 HAL，无限套娃。
+        .env_remove("OMMEGA_STEALTH_DAEMON")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .inspect(|_| {
+            // 子进程已经拿到自己那份 fd，父进程这份要关掉，不然每轮重启漏一个。
+            if let Some(fd) = memfd {
+                unsafe { libc::close(fd) };
+            }
+        })
+}
+
+// ---------------------------------------------------------------------------
+// 看护（以前在 service.sh 的 keep-alive 循环里）
+// ---------------------------------------------------------------------------
+
+/// 每 5 秒看一眼：注入器和 adbr 的监管脚本还在不在？不在就用「memfd + 伪装名」
+/// 那个启动方式（`sh -s`，脚本从标准输入读）重新拉起来。
+fn supervisor_loop() {
+    let mut last_soterta = std::time::Instant::now();
+    loop {
+        sleep(Duration::from_secs(5));
+        ensure_script("injector", &format!("{MODDIR}/daemon-injector"), &[]);
+        let adbr = format!("{MODDIR}/adbr-daemon.sh");
+        // 关着的时候不要去拉：adbr-daemon.sh 启动后发现自己被关会立即退出，
+        // 每 5 秒拉一次就是每 5 秒一个短命进程，白白多出一串痕迹。
+        if Path::new(&adbr).is_file() && config_flag("adbr") {
+            ensure_script("adbr", &adbr, &["--a"]);
+        }
+        // SOTER 接管状态每 30 秒收敛一次（这个脚本跑一两秒就退）。
+        if last_soterta.elapsed() >= Duration::from_secs(30) {
+            last_soterta = std::time::Instant::now();
+            let script = format!("{MODDIR}/soterta.sh");
+            if Path::new(&script).is_file() {
+                reap_later(spawn_script("soterta", &script, &[]));
+            }
+        }
+    }
+}
+
+/// 拉起来的子进程必须有人 wait，否则退出后会留一堆僵尸 —— 而这个线程不 wait，
+/// 所以每个子进程配一个等待线程（它退出后线程自然结束）。
+fn reap_later(child: std::io::Result<Child>) {
+    match child {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => log(&format!("spawn failed: {error}")),
+    }
+}
+
+/// 平铺 config 里的开关（`key: 1/true/on`）。读不到就当关。
+fn config_flag(key: &str) -> bool {
+    let Ok(text) = fs::read_to_string(CONF_PATH) else {
+        return false;
+    };
+    for line in text.lines() {
+        let Some((left, right)) = line.split_once(':') else {
+            continue;
+        };
+        if !left.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let value = right.trim().to_ascii_lowercase();
+        return matches!(value.as_str(), "1" | "true" | "yes" | "on");
+    }
+    false
+}
+
+fn ensure_script(role: &str, script: &str, args: &[&str]) {
+    let pidfile = match role {
+        "injector" => format!("{RUN_DIR}/injector-daemon.pid"),
+        _ => format!("{RUN_DIR}/adbr-daemon.lock/pid"),
+    };
+    if pidfile_stamp_alive(&pidfile) {
+        return;
+    }
+    log(&format!("{role} not running; respawning"));
+    reap_later(spawn_script(role, script, args));
+}
+
+/// pidfile 里是 `pid starttime`；两列都对得上才算活着。
+fn pidfile_stamp_alive(path: &str) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut parts = text.split_whitespace();
+    let Some(pid) = parts.next().and_then(|v| v.parse::<u32>().ok()) else {
+        return false;
+    };
+    let stamp = parts
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    if stamp == 0 {
+        return true;
+    }
+    start_time(pid) == Some(stamp)
+}
+
+/// 脚本也走 memfd：内容读进内存，`sh -s` 从标准输入读，cmdline 里就只剩一个
+/// 伪装过的系统服务名。
+fn spawn_script(role: &str, script: &str, args: &[&str]) -> std::io::Result<Child> {
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let fake = crate::stealth::cached_name(role).unwrap_or_default();
+    let base = fake.rsplit('/').next().unwrap_or("hal").to_string();
+    let fd = crate::stealth::memfd_from(Path::new(script), &base)
+        .ok_or_else(|| std::io::Error::other("memfd failed"))?;
+    let stdin = unsafe { fs::File::from_raw_fd(fd) };
+    let mut command = Command::new("/system/bin/sh");
+    command
+        .arg0(&fake)
+        .arg("-s")
+        // `--` 后面才是脚本自己的参数（adbr-daemon.sh 收 `--a`），
+        // 不加的话 sh 会把它当自己的选项。
+        .arg("--")
+        .args(args)
+        .env("OMMEGA_MODDIR", MODDIR)
+        // 这两个是「本进程已经在 memfd 里」的标记，不能漏给脚本：
+        // 它拉起来的注入器会被骗到，以为已经藏好了。
+        .env_remove("OMMEGA_STEALTH")
+        .env_remove("OMMEGA_SELF_PATH")
+        .env_remove("OMMEGA_STEALTH_DAEMON")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn()
 }
 
 fn env_name_for(prop: &str) -> &'static str {

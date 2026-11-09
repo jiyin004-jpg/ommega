@@ -38,6 +38,13 @@ pub fn build_git_sha() -> &'static str {
 }
 
 pub fn current_exe_path() -> Result<PathBuf> {
+    // 自举之后 /proc/self/exe 指向 memfd（`/memfd:xxx (deleted)`），拿它算模块根、
+    // 算自身身份都会算到空。启动器把真身路径放在这个环境变量里。
+    if let Some(path) = std::env::var_os("OMMEGA_SELF_PATH").map(PathBuf::from) {
+        if !path.as_os_str().is_empty() {
+            return Ok(path);
+        }
+    }
     std::fs::read_link("/proc/self/exe").context("Failed to read link /proc/self/exe")
 }
 
