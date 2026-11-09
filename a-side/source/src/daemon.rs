@@ -102,16 +102,36 @@ pub fn run(extra: Vec<String>) -> ! {
 
     let mut last_sync = std::time::Instant::now();
     let mut hal_stopped = false;
+    // 抽象 socket 多久没人听着就认为「进程内没起来」，把独立 HAL 补回来。
+    let mut rpc_missing_ticks = 0u32;
+    // 补过一次就不要再抢回来（否则每轮先把刚拉起的 HAL 又杀掉）。
+    let mut inproc_gave_up = false;
     loop {
         // KeyMint 主体跑在 keystore2 里了（进程内），这里就不再拉独立 HAL：
         // 少一个 uid 1017 的进程，也少一跳 RPC。AAID 表和身份同步照旧。
-        if inproc_keymint_enabled() {
+        if inproc_keymint_enabled() && !inproc_gave_up {
             if !hal_stopped {
                 if let Some(target) = find_keymint() {
                     stop_stale_instances(&target);
                 }
                 log("in-process keymint enabled; not starting the standalone HAL");
                 hal_stopped = true;
+                rpc_missing_ticks = 0;
+            }
+            // 安全网：启动那一下 keystore2 可能还没把服务挂上，但若一直没人听这个
+            // 抽象 socket，就是进程内那条路没起来 —— 把 HAL 补回来，不把手机拖成
+            // 出不了链。反向切换只需要把 inproc 写成 0。
+            if app_rpc_served() {
+                rpc_missing_ticks = 0;
+            } else {
+                rpc_missing_ticks += 1;
+                if rpc_missing_ticks >= 20 {
+                    log("nothing serves the app RPC socket; falling back to the standalone HAL");
+                    inproc_gave_up = true;
+                    hal_stopped = false;
+                    rpc_missing_ticks = 0;
+                    continue;
+                }
             }
             if last_sync.elapsed() >= SYNC_INTERVAL {
                 last_sync = std::time::Instant::now();
@@ -121,6 +141,7 @@ pub fn run(extra: Vec<String>) -> ! {
             continue;
         }
         hal_stopped = false;
+        rpc_missing_ticks = 0;
 
         let Some(target) = find_keymint() else {
             log("keymint binary not found");
@@ -180,6 +201,17 @@ pub fn run(extra: Vec<String>) -> ! {
 fn inproc_keymint_enabled() -> bool {
     match fs::read_to_string("/data/misc/ommega/inproc") {
         Ok(text) => text.trim() != "0",
+        Err(_) => true,
+    }
+}
+
+/// 抽象 socket 上有人在听吗（进程内服务、或者回退后的独立 HAL）。
+fn app_rpc_served() -> bool {
+    match fs::read_to_string("/proc/net/unix") {
+        Ok(table) => table
+            .lines()
+            .any(|line| line.ends_with("@ommega.soter.rpc")),
+        // 读不到就别乱判定，当成正常，免得反过来把 HAL 拉起来抢名字。
         Err(_) => true,
     }
 }

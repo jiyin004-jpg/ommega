@@ -11,7 +11,7 @@
 //! AAID 不靠 packages.list，读 daemon 落的那份表；改属性（resetprop）仍旧归 helper。
 
 use std::collections::HashMap;
-use std::sync::{Condvar, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -165,9 +165,13 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
 /// 绑定失败最常见的理由是名字被单独跑的 HAL 占着（切过来的那段过渡期），
 /// 所以这里是个带退避的循环，不把它当错误。
 fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
+    // HAL 还占着名字的时候绑不上，这是预期情况；只在原因变化时记一笔，
+    // 否则每 3 秒一行会把真正有用的日志淡掉。
+    let mut last_error = String::new();
     loop {
-        match crate::create_rpc_server(crate::RpcBind::Abstract) {
+        match bind_app_rpc() {
             Ok(server) => {
+                last_error.clear();
                 let mut ok = true;
                 for (name, binder) in &services {
                     if let Err(error) = server.add_service(name, binder.clone()) {
@@ -185,8 +189,35 @@ fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
                     }
                 }
             }
-            Err(error) => log::debug!("in-process RPC not bound yet: {error:#}"),
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message != last_error {
+                    log::debug!("in-process RPC not bound yet: {message}");
+                    last_error = message;
+                }
+            }
         }
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
+fn bind_app_rpc() -> Result<Arc<rsbinder::rpc::RpcServer>> {
+    match crate::create_rpc_server(crate::RpcBind::Abstract) {
+        Ok(server) => Ok(server),
+        Err(error) => {
+            // keystore 域写不了 /proc/self/attr/sockcreate（那份权限是给 root 起的 HAL
+            // 用的）。不设也行：socket 会继承本进程的 u:r:keystore:s0，跟 HAL 当初设的
+            // 是同一个值，接入判断照样按 uid 走。
+            log::debug!(
+                "sockcreate context unavailable in this domain ({error:#}); binding directly"
+            );
+            let server = rsbinder::rpc::RpcServer::setup_unix_server_abstract(
+                crate::consts::RPC_ABSTRACT_NAME,
+            )
+            .context("failed to bind in-process app RPC socket")?;
+            server.set_android13plus(kmr_common::rpc::WIRE_MAX_VERSION);
+            server.set_authorizer(crate::rpc_authorizer(crate::RpcBind::Abstract));
+            Ok(server)
+        }
     }
 }
