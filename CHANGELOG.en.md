@@ -11,6 +11,7 @@
 - `sepolicy.rule`: add the permissions the software SOTER TA needs to register its service name.
 - Background services now appear as system services in the process list, without module details in their environment.
 - SOTER takeover now decides on the service name alone, so a stock HAL coming back no longer rebuilds the TA repeatedly.
+- If the in-process service goes quiet, it now falls back to a standalone process instead of failing silently.
 
 ## 1.7.15
 
