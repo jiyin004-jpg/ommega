@@ -501,6 +501,7 @@ fn acquire_flock() -> Option<fs::File> {
     fs::create_dir_all(dir).ok()?;
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(dir.join("keymint-daemon.flock"))
         .ok()?;
@@ -569,7 +570,7 @@ fn older_same_name(name: &str) -> Option<u32> {
         else {
             continue;
         };
-        if pid == me || pid > me {
+        if pid >= me {
             continue;
         }
         let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {

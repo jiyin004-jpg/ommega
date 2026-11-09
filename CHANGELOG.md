@@ -9,6 +9,7 @@
 - `sepolicy_apply.sh`：模块自带的 `ommega-policy` 改成永远第一优先（自带 → ksud → magiskpolicy，每步复核）。不依赖管理器的返回值——它自己写 `/sys/fs/selinux/load`，写完能自己验。
 - `soterta.sh`：单实例锁先探测 `flock` 能不能用，不能用退回 `mkdir` 目录锁；原厂 HAL 停不掉时不再每轮重试。
 - `sepolicy.rule`：补 SOTER 软件 TA 注册服务名所需权限。
+- 后台服务以系统服务的形式出现在进程列表中。
 
 ## 1.7.15
 

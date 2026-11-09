@@ -239,13 +239,8 @@ fn running_comms() -> HashSet<String> {
 /// 两条约束：
 ///   - 每个关键词只贡献一个（以前一个关键词就把 count 填满，结果全挑到 spu 那一堆）；
 ///   - comm 前缀不能重复（包括跟系统里正在跑的进程）。
-fn pick_names(count: usize) -> Vec<String> {
-    let busy = running_first_args();
-    let mut used_comm = running_comms();
-    pick_names_with(&busy, &mut used_comm, count)
-}
-
-/// 同上，但复用调用方已经收集好的两个集合（assign 里保留旧名时要用同一份）。
+///
+/// `busy` / `used_comm` 由调用方传：assign 里保留旧名字时得用同一份集合。
 fn pick_names_with(
     busy: &HashSet<String>,
     used_comm: &mut HashSet<String>,
