@@ -719,8 +719,8 @@ pub fn initialize() -> Result<()> {
     reload_from_disk_inner(false)?;
     KEYBOX_WATCHER.get_or_init(|| {
         for (label, path) in [
-            ("ommega-keybox-watch", KEYBOX_PATH),
-            ("ommega-keybox-sb-watch", STRONGBOX_KEYBOX_PATH),
+            ("keybox-watch", KEYBOX_PATH),
+            ("keybox-sb-watch", STRONGBOX_KEYBOX_PATH),
         ] {
             // watcher 把回调活到进程结束：move 进去的 'static 引用才算数。
             match kmr_common::runtime::file_watch::spawn_path_watcher(

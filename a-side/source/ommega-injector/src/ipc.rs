@@ -575,7 +575,7 @@ pub fn report_event(message: String) {
     }
     EVENT_THREAD.call_once(|| {
         if let Err(error) = thread::Builder::new()
-            .name("ommega-event".to_string())
+            .name("bus-event".to_string())
             .spawn(event_sender_loop)
         {
             warn!("failed to start the hook event sender: {error}");

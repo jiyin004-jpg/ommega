@@ -111,7 +111,7 @@ fn spawn_switch_watcher() {
     static WATCHER: OnceLock<()> = OnceLock::new();
     WATCHER.get_or_init(|| {
         let spawned = std::thread::Builder::new()
-            .name("ommega-log-switch".to_string())
+            .name("log-switch".to_string())
             .spawn(|| loop {
                 std::thread::sleep(std::time::Duration::from_secs(SWITCH_POLL_SECS));
                 refresh_switch();

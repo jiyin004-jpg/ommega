@@ -167,7 +167,7 @@ pub fn start() {
         return;
     }
     let spawned = std::thread::Builder::new()
-        .name("ommega-soter-health".to_string())
+        .name("soter-health".to_string())
         .spawn(|| loop {
             std::thread::sleep(TICK);
             let verdict = {

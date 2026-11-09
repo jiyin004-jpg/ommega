@@ -465,7 +465,7 @@ pub(in crate::hook) fn start_mirror_recovery_worker() -> Result<(), String> {
     let worker = MIRROR_RECOVERY_WORKER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
-            .name("ommega-mirror-recovery".to_string())
+            .name("mirror-recovery".to_string())
             .spawn(move || mirror_recovery_worker(receiver))
             .map_err(|error| format!("failed to start mirror recovery worker: {error}"))?;
         Ok(sender)

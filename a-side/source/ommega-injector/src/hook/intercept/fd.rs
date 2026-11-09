@@ -51,7 +51,7 @@ pub(in crate::hook) fn wake_operation_publication_worker() {
 pub(in crate::hook) fn start_operation_publication_worker() -> Result<(), String> {
     match OPERATION_PUBLICATION_WORKER.get_or_init(|| {
         std::thread::Builder::new()
-            .name("ommega-binder-publication".to_string())
+            .name("binder-publication".to_string())
             .spawn(operation_publication_worker)
             .map(|_| ())
             .map_err(|error| format!("failed to start operation publication worker: {error}"))

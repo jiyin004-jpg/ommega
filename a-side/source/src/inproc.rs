@@ -61,7 +61,7 @@ pub fn service(name: &str) -> Option<SIBinder> {
 pub fn request_start() {
     STARTED.call_once(|| {
         std::thread::Builder::new()
-            .name("ommega-inproc".to_string())
+            .name("inproc-start".to_string())
             .spawn(|| {
                 let result = start();
                 let mut state = STATE.lock().expect("inproc state poisoned");
@@ -160,13 +160,13 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
     // 只能靠这条路找过来。HAL 还在的时候名字被它占着，这里就一直重试，等它退了我们接手。
     let for_rpc: HashMap<&'static str, SIBinder> = services.clone();
     std::thread::Builder::new()
-        .name("ommega-inproc-rpc".to_string())
+        .name("inproc-rpc".to_string())
         .spawn(move || serve_app_rpc(for_rpc))
         .ok();
 
     // 心跳：daemon 靠它判断「进程内还在不在」，不看 socket 归属（回退的 HAL 也绑同一个名字）。
     std::thread::Builder::new()
-        .name("ommega-inproc-beat".to_string())
+        .name("inproc-beat".to_string())
         .spawn(|| loop {
             let rpc = if RPC_READY.load(Ordering::Relaxed) {
                 1
@@ -192,7 +192,7 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
 /// 所以这里是个带退避的循环，不把它当错误。
 fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
     // HAL 还占着名字的时候绑不上，这是预期情况；只在原因变化时记一笔，
-    // 否则每 3 秒一行会把真正有用的日志淡掉。
+    // 否则每轮一行会把真正有用的日志淡掉。
     let mut last_error = String::new();
     loop {
         match bind_app_rpc() {
@@ -215,8 +215,13 @@ fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
                         warn!("in-process RPC stopped: {error:#}");
                     }
                 }
+                // 心跳里的 rpc 字段跟着服务一起改口：这一轮要么没挂全、要么 run() 已经
+                // 返回，就说明 app 域那边没人应答了。不回 false 的话，daemon 会一直认为
+                // 进程内健康、不去拉独立 HAL，SOTER 宿主那条路就一直空着。
+                RPC_READY.store(false, Ordering::Relaxed);
             }
             Err(error) => {
+                RPC_READY.store(false, Ordering::Relaxed);
                 let message = format!("{error:#}");
                 if message != last_error {
                     log::debug!("in-process RPC not bound yet: {message}");

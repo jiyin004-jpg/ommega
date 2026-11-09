@@ -261,7 +261,7 @@ fn note_churn_and_maybe_heal(value: &Value, op: &str) {
     );
     let pkg_for_thread = pkg.clone();
     std::thread::Builder::new()
-        .name("ommega-soter-selfheal".to_string())
+        .name("soter-selfheal".to_string())
         .spawn(move || {
             if let Err(error) = heal_soter_slot(&pkg_for_thread, uid) {
                 log::warn!("event=soter selfheal failed pkg={pkg_for_thread} uid={uid}: {error:#}");

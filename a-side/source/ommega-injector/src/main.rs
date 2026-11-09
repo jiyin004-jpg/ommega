@@ -124,7 +124,7 @@ fn inproc_keymint_enabled() -> bool {
 /// 的栈上等于 hook 还没装完就自己撞自己。
 fn spawn_soter_selfcheck() {
     let thread = std::thread::Builder::new()
-        .name("ommega-soter-selfcheck".to_string())
+        .name("soter-selfcheck".to_string())
         .spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(2000));
             for (service, interface) in SOTER_HAL_CANDIDATES {

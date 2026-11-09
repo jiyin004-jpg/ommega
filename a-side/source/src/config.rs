@@ -454,7 +454,7 @@ fn start_config_watcher() -> Result<()> {
     }
 
     file_watch::spawn_path_watcher(
-        "ommega-config-watch",
+        "config-watch",
         PathBuf::from(CONFIG_PATH),
         reload_runtime_config,
     )?;
@@ -465,7 +465,7 @@ fn start_config_watcher() -> Result<()> {
     // inside Config::from_file(). Watch the parent dir, so a missing file is
     // picked up when it first appears.
     file_watch::spawn_path_watcher(
-        "ommega-clienta-config-watch",
+        "clienta-config-watch",
         PathBuf::from(CLIENTA_CONFIG_PATH),
         reload_runtime_config,
     )?;
