@@ -178,6 +178,10 @@ if debug_logging_enabled; then
 fi
 mkdir -p "$STATE_DIR"
 rm -f "$RUN_DIR/keymint-daemon.pid" "$RUN_DIR/injector-daemon.pid"
+# 单实例锁也一并清：它们靠 pid 判活，而上一次开机的 pid 很可能已经被别的进程复用，
+# 不清就会「看着有人持有」→ 新实例直接退出，整条注入链路开机就哑掉（实测过一次）。
+rm -rf "$RUN_DIR/keymint-daemon.lock" "$RUN_DIR/injector-daemon.lock" 2>/dev/null
+rm -f "$RUN_DIR/inproc.heartbeat" 2>/dev/null
 
 # 只落文件，不再往 stdout 打（那会进管理器的日志，也是系统日志）。
 log_line() {

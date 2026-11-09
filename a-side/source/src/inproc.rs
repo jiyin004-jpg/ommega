@@ -11,6 +11,7 @@
 //! AAID 不靠 packages.list，读 daemon 落的那份表；改属性（resetprop）仍旧归 helper。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,12 @@ use crate::keymaster::maintenance::MaintenanceManager;
 use crate::keymaster::metrics::Metrics;
 use crate::keymaster::service::KeystoreService;
 use crate::top::jiyin004::ommega::IKeymintService::BnKeymintService;
+
+/// 心跳文件：告诉 daemon「进程内这套还活着、RPC 也挂上了」。
+/// 判定放在 daemon 侧（`src/daemon.rs:inproc_healthy`），这里只负责刷。
+const HEARTBEAT_PATH: &str = "/data/misc/ommega/inproc.heartbeat";
+/// 抽象 socket 是否已经绑上（心跳里的 `rpc=` 字段）。
+static RPC_READY: AtomicBool = AtomicBool::new(false);
 
 struct State {
     /// 服务名 -> 本地对象。空表示还没起完。
@@ -157,6 +164,25 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
         .spawn(move || serve_app_rpc(for_rpc))
         .ok();
 
+    // 心跳：daemon 靠它判断「进程内还在不在」，不看 socket 归属（回退的 HAL 也绑同一个名字）。
+    std::thread::Builder::new()
+        .name("ommega-inproc-beat".to_string())
+        .spawn(|| loop {
+            let rpc = if RPC_READY.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let body = format!("pid={} ts={ts} rpc={rpc}\n", std::process::id());
+            let _ = std::fs::write(HEARTBEAT_PATH, body);
+            std::thread::sleep(Duration::from_secs(30));
+        })
+        .ok();
+
     Ok(services)
 }
 
@@ -180,6 +206,7 @@ fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
                     }
                 }
                 if ok {
+                    RPC_READY.store(true, Ordering::Relaxed);
                     info!(
                         "in-process RPC serving {}",
                         String::from_utf8_lossy(crate::consts::RPC_ABSTRACT_NAME)

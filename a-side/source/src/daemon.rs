@@ -101,47 +101,31 @@ pub fn run(extra: Vec<String>) -> ! {
     std::thread::spawn(supervisor_loop);
 
     let mut last_sync = std::time::Instant::now();
-    let mut hal_stopped = false;
-    // 抽象 socket 多久没人听着就认为「进程内没起来」，把独立 HAL 补回来。
-    let mut rpc_missing_ticks = 0u32;
-    // 补过一次就不要再抢回来（否则每轮先把刚拉起的 HAL 又杀掉）。
-    let mut inproc_gave_up = false;
+    let started = std::time::Instant::now();
+    // 心跳一直不新鲜就计数，连着 20 拍就认为进程内没起来。
+    let mut missing_ticks = 0u32;
     loop {
-        // KeyMint 主体跑在 keystore2 里了（进程内），这里就不再拉独立 HAL：
-        // 少一个 uid 1017 的进程，也少一跳 RPC。AAID 表和身份同步照旧。
-        if inproc_keymint_enabled() && !inproc_gave_up {
-            if !hal_stopped {
-                if let Some(target) = find_keymint() {
-                    stop_stale_instances(&target);
-                }
-                log("in-process keymint enabled; not starting the standalone HAL");
-                hal_stopped = true;
-                rpc_missing_ticks = 0;
+        let inproc_wanted = inproc_keymint_enabled();
+        let healthy = inproc_wanted && inproc_healthy();
+
+        if inproc_wanted {
+            if healthy {
+                missing_ticks = 0;
+                idle_tick(&mut last_sync);
+                continue;
             }
-            // 安全网：启动那一下 keystore2 可能还没把服务挂上，但若一直没人听这个
-            // 抽象 socket，就是进程内那条路没起来 —— 把 HAL 补回来，不把手机拖成
-            // 出不了链。反向切换只需要把 inproc 写成 0。
-            if app_rpc_served() {
-                rpc_missing_ticks = 0;
-            } else {
-                rpc_missing_ticks += 1;
-                if rpc_missing_ticks >= 20 {
-                    log("nothing serves the app RPC socket; falling back to the standalone HAL");
-                    inproc_gave_up = true;
-                    hal_stopped = false;
-                    rpc_missing_ticks = 0;
-                    continue;
-                }
+            let in_grace = started.elapsed() < INPROC_GRACE;
+            if !in_grace {
+                missing_ticks += 1;
             }
-            if last_sync.elapsed() >= SYNC_INTERVAL {
-                last_sync = std::time::Instant::now();
-                sync_remote_identity();
+            if in_grace || missing_ticks < 20 {
+                idle_tick(&mut last_sync);
+                continue;
             }
-            sleep(TICK);
-            continue;
+            log("in-process KeyMint is not coming up; starting the standalone HAL");
+            missing_ticks = 0;
+            // 落到下面：拉独立 HAL。
         }
-        hal_stopped = false;
-        rpc_missing_ticks = 0;
 
         let Some(target) = find_keymint() else {
             log("keymint binary not found");
@@ -172,6 +156,13 @@ pub fn run(extra: Vec<String>) -> ! {
                 let _ = child.wait();
                 break;
             }
+            // HAL 跑着的时候也盯着心跳：进程内要是起来了，就把 HAL 退掉。
+            if inproc_keymint_enabled() && inproc_healthy() {
+                log("in-process KeyMint came up; stopping the standalone HAL");
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
             if last_sync.elapsed() >= SYNC_INTERVAL {
                 last_sync = std::time::Instant::now();
                 sync_remote_identity();
@@ -188,13 +179,19 @@ pub fn run(extra: Vec<String>) -> ! {
                 }
             }
         }
-        sleep(Duration::from_secs(2));
     }
 }
 
 // ---------------------------------------------------------------------------
 // 日志
 // ---------------------------------------------------------------------------
+
+/// 进程内服务的「活着」凭据：payload 每 30 秒刷一次，带 pid / 时间戳 / RPC 是否已绑。
+const HEARTBEAT_PATH: &str = "/data/misc/ommega/inproc.heartbeat";
+/// 开机之后这么长时间内不算「没起来」——keystore2 注入 + 起服务本来就慢一点。
+const INPROC_GRACE: Duration = Duration::from_secs(90);
+/// 心跳超过这么久没刷就当作进程内已经不在了。
+const HEARTBEAT_TTL: u64 = 90;
 
 /// KeyMint 主体是不是跑在 keystore2 里（`/data/misc/ommega/inproc`，默认开）。
 /// 写 `0` 就回到老路子：单独拉一个 HAL 进程。
@@ -205,15 +202,51 @@ fn inproc_keymint_enabled() -> bool {
     }
 }
 
-/// 抽象 socket 上有人在听吗（进程内服务、或者回退后的独立 HAL）。
-fn app_rpc_served() -> bool {
-    match fs::read_to_string("/proc/net/unix") {
-        Ok(table) => table
-            .lines()
-            .any(|line| line.ends_with("@ommega.soter.rpc")),
-        // 读不到就别乱判定，当成正常，免得反过来把 HAL 拉起来抢名字。
-        Err(_) => true,
+/// 进程内那套还在、而且 RPC 已经挂上了吗。
+///
+/// 用 payload 自己刷的心跳，而不是去看 `/proc/net/unix`：socket 上有人在听并不能说明
+/// 是我们的进程内服务（回退后的独立 HAL 也在听同一个名字）。
+fn inproc_healthy() -> bool {
+    let Ok(text) = fs::read_to_string(HEARTBEAT_PATH) else {
+        return false;
+    };
+    let mut pid = 0u32;
+    let mut ts = 0u64;
+    let mut rpc = false;
+    for field in text.split_whitespace() {
+        if let Some(value) = field.strip_prefix("pid=") {
+            pid = value.parse().unwrap_or(0);
+        } else if let Some(value) = field.strip_prefix("ts=") {
+            ts = value.parse().unwrap_or(0);
+        } else if let Some(value) = field.strip_prefix("rpc=") {
+            rpc = value == "1";
+        }
     }
+    if !rpc || pid == 0 || ts == 0 {
+        return false;
+    }
+    let now = unix_now();
+    if now == 0 || now.saturating_sub(ts) > HEARTBEAT_TTL {
+        return false;
+    }
+    // pid 还活着：心跳文件残留（payload 挂了但文件还在）也算不健康。
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 空转一拍：到点就同步一次远端的身份，然后睡一个 TICK。
+fn idle_tick(last_sync: &mut std::time::Instant) {
+    if last_sync.elapsed() >= SYNC_INTERVAL {
+        *last_sync = std::time::Instant::now();
+        sync_remote_identity();
+    }
+    sleep(TICK);
 }
 
 /// 只在面板开了「调试日志」时才落文件 —— 开关每轮现读，跟 shell 版一致。
