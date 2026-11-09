@@ -316,17 +316,21 @@ stealth_name() {
   sed -n 's/^soterta=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1
 }
 
-# 残留的守护：pidof 已经找不到了（进程名换了），按名字表 + exe 是 memfd 认人。
+# 残留的守护：按 `--soterta-serve` 认人，不按名字。
+#
+# 名字表可能重新分配过（旧实例还用着上一轮的名字），按名字匹配会漏掉上一轮的 TA ——
+# 两个实例同时跑，initSign 落在 A、finishSign 落到 B，就是 -204 / -1000。
 stale_daemon_pids() {
-  local name p cmd
-  name=$(stealth_name)
-  [ -n "$name" ] || return 0
+  local p cmd
   for p in $(ls /proc | grep -E '^[0-9]+$'); do
-    [ -r "/proc/$p/cmdline" ] || continue
-    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
-    [ "${cmd%% *}" = "$name" ] || continue
+    # 先按 exe 筛：只有我们自己的才在 memfd 里，这样只对几个进程读 cmdline。
     case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
-      /memfd:*) echo "$p" ;;
+      /memfd:*) ;;
+      *) continue ;;
+    esac
+    cmd=$(timeout 2 cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ')
+    case "$cmd" in
+      *--soterta-serve*) echo "$p" ;;
     esac
   done
 }

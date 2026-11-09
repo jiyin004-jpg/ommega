@@ -1,4 +1,4 @@
-﻿//! 进程隐身。
+//! 进程隐身。
 //!
 //! 目标：`ps` / `/proc` 里翻出来，看到的是一台正常 Android 机器该有的东西，
 //! 而不是 `/data/adb/modules/ommega/libs/arm64-v8a/keymint` 这种一眼就认出来的路径。
@@ -178,35 +178,18 @@ pub fn set_comm(name: &str) {
 // 名字表
 // ---------------------------------------------------------------------------
 
-/// 当前所有进程的 argv[0]，用来避开已经在用的名字。
+/// 已经在用的名字，拿 comm 算（不读 cmdline）。
 ///
-/// exe 指向 memfd 的不算：那是我们自己上一轮的进程。重启时它们还活着，要是把它们
-/// 当成「占用了」，每次重启都会换一套名字，清理残留和跨进程共用名字就全乱了。
+/// 读别人的 `/proc/pid/cmdline` 会阻塞：目标进程卡在 D 状态时，内核那边拿不到 mm 锁，
+/// 调用方就一直等。实测设备上三个这种 tr 各吃 100% CPU 跑了半个多小时，load 拉到 12。
+/// comm 在 task_struct 里，读它不会卡；而我们的伪装名本来就是按 comm 前缀去重的。
 fn running_first_args() -> HashSet<String> {
-    let mut seen = HashSet::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return seen;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if matches!(fs::read_link(path.join("exe")), Ok(exe) if exe.to_string_lossy().starts_with("/memfd:"))
-        {
-            continue;
-        }
-        let Ok(cmdline) = fs::read(path.join("cmdline")) else {
-            continue;
-        };
-        if let Some(first) = cmdline.split(|b| *b == 0).next() {
-            if !first.is_empty() {
-                seen.insert(String::from_utf8_lossy(first).into_owned());
-            }
-        }
-    }
-    seen
+    running_comms()
 }
 
 fn usable_name(path: &str, busy: &HashSet<String>) -> bool {
-    if busy.contains(path) {
+    // busy 里是 comm，不是路径。
+    if busy.contains(&comm_of(path)) {
         return false;
     }
     let lower = path.to_ascii_lowercase();
@@ -259,6 +242,15 @@ fn running_comms() -> HashSet<String> {
 fn pick_names(count: usize) -> Vec<String> {
     let busy = running_first_args();
     let mut used_comm = running_comms();
+    pick_names_with(&busy, &mut used_comm, count)
+}
+
+/// 同上，但复用调用方已经收集好的两个集合（assign 里保留旧名时要用同一份）。
+fn pick_names_with(
+    busy: &HashSet<String>,
+    used_comm: &mut HashSet<String>,
+    count: usize,
+) -> Vec<String> {
     let mut picked: Vec<String> = Vec::with_capacity(count);
     note(&format!(
         "pick start count={count} busy={} comms={}",
@@ -266,9 +258,9 @@ fn pick_names(count: usize) -> Vec<String> {
         used_comm.len()
     ));
     for dir in VENDOR_DIRS {
-        match fs::read_dir(dir) {
-            Ok(entries) => note(&format!("dir {dir} entries={}", entries.count())),
-            Err(error) => note(&format!("dir {dir} err={error}")),
+        if let Ok(entries) = fs::read_dir(dir) {
+            let n = entries.count();
+            note(&format!("dir {dir} entries={n}"));
         }
     }
 
@@ -319,13 +311,7 @@ fn pick_names(count: usize) -> Vec<String> {
             names.sort();
             let mut done = false;
             for name in names {
-                if take(
-                    format!("{dir}/{name}"),
-                    count,
-                    &busy,
-                    &mut picked,
-                    &mut used_comm,
-                ) {
+                if take(format!("{dir}/{name}"), count, busy, &mut picked, used_comm) {
                     done = true;
                     break;
                 }
@@ -354,13 +340,7 @@ fn pick_names(count: usize) -> Vec<String> {
             if picked.len() >= count {
                 break;
             }
-            take(
-                format!("{dir}/{name}"),
-                count,
-                &busy,
-                &mut picked,
-                &mut used_comm,
-            );
+            take(format!("{dir}/{name}"), count, busy, &mut picked, used_comm);
         }
     }
 
@@ -413,25 +393,43 @@ fn write_names(map: &HashMap<String, String>) {
     }
 }
 
-/// 给这一组角色分配名字。`roles[0]` 是调用方自己，其余是后续会由它拉起来的进程。
+/// 为角色分配名字。
 ///
-/// 表里已经有一整套（而且那些路径现在都没被别人占用）就直接用，否则重新挑一份覆盖。
+/// 表里的各条**优先保留** —— 名字一换，上一轮还在跑的进程就成孤儿了（清理逻辑按
+/// 新名字找，找不着），实测会出现两个 SOTER TA 同时存活。只给「路径没了」或
+/// 「被别的进程占了」的那几条重新挑。
 fn assign(roles: &[&str]) -> HashMap<String, String> {
     let existing = read_names();
     let busy = running_first_args();
-    let complete = roles.iter().all(|role| {
-        existing
-            .get(*role)
-            .is_some_and(|path| Path::new(path).is_file() && usable_name(path, &busy))
-    });
-    if complete {
-        return existing;
+    let mut used_comm = running_comms();
+
+    let mut map = existing.clone();
+    let mut need: Vec<&str> = Vec::new();
+    for role in roles {
+        let keep = existing.get(*role).is_some_and(|path| {
+            Path::new(path).is_file()
+                && usable_name(path, &busy)
+                && !used_comm.contains(&comm_of(path))
+        });
+        match existing.get(*role) {
+            Some(path) if keep => {
+                used_comm.insert(comm_of(path));
+            }
+            _ => need.push(role),
+        }
+    }
+    if need.is_empty() && roles.iter().all(|role| map.contains_key(*role)) {
+        return map;
     }
 
-    let mut map = existing;
-    let picked = pick_names(roles.len());
-    note(&format!("assign roles={roles:?} picked={picked:?}"));
-    for (role, path) in roles.iter().zip(picked.iter()) {
+    // 已经用掉的名字（保留的那些）不能再分给别的角色。
+    let mut busy_all = busy.clone();
+    for path in map.values() {
+        busy_all.insert(comm_of(path));
+    }
+    let picked = pick_names_with(&busy_all, &mut used_comm, need.len());
+    note(&format!("assign fill roles={need:?} picked={picked:?}"));
+    for (role, path) in need.iter().zip(picked.iter()) {
         map.insert((*role).to_string(), path.clone());
     }
     write_names(&map);
@@ -713,7 +711,7 @@ mod tests {
     #[test]
     fn busy_names_are_rejected() {
         let mut busy = HashSet::new();
-        busy.insert("/vendor/bin/hw/qconfigservice".to_string());
+        busy.insert(comm_of("/vendor/bin/hw/qconfigservice"));
         assert!(!usable_name("/vendor/bin/hw/qconfigservice", &busy));
     }
 }

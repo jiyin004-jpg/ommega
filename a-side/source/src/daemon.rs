@@ -556,9 +556,10 @@ fn write_pidfile() {
     let _ = fs::write(format!("{RUN_DIR}/keymint-daemon.pid"), owner_stamp());
 }
 
-/// 有没有比自己早起的同名守护（cmdline 首参就是那个伪装名、exe 在 memfd 里）。
+/// 有没有比自己早起的同名守护（comm 就是这个伪装名的前 15 字节、exe 在 memfd 里）。
 fn older_same_name(name: &str) -> Option<u32> {
     let me = std::process::id();
+    let want = comm_prefix(name);
     let entries = fs::read_dir("/proc").ok()?;
     for entry in entries.flatten() {
         let Some(pid) = entry
@@ -571,11 +572,10 @@ fn older_same_name(name: &str) -> Option<u32> {
         if pid == me || pid > me {
             continue;
         }
-        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+        let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
             continue;
         };
-        let first = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
-        if first != name.as_bytes() {
+        if comm.trim() != want {
             continue;
         }
         let hid = matches!(fs::read_link(entry.path().join("exe")), Ok(exe) if exe.to_string_lossy().starts_with("/memfd:"));
@@ -630,23 +630,24 @@ fn find_keymint() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// 杀掉所有跑着 `target` 的残留实例。
+/// 杀掉跑着 HAL 名字的残留实例。
 ///
-/// 自举之后 cmdline 里已经没有模块路径了，所以两头都认：伪装名（本机名字表里
-/// 记的，包括上一轮留下来的）和原本的完整路径（没自举成功的旧进程）。
-/// 名字表里那些路径全是系统分区里的真文件，不会误杀 —— 那些进程本来就在跑。
+/// 按 **comm** 认人，不读 cmdline：读一个卡在 D 状态的进程的 `/proc/pid/cmdline`
+/// 会把调用方一起卡住（实测设备 load 被三个这样的 tr 拉到 12，每个吃 100% CPU
+/// 跑了几十分钟）。comm 存在 task_struct 里，读它不会阻塞；而我们的伪装名本来就
+/// 是按 comm 前缀去重挑的，拿它认人够用。
 fn stop_stale_instances(target: &Path) {
+    let me = std::process::id();
+    let mut wanted: Vec<String> = Vec::new();
+    if let Some(hal) = crate::stealth::cached_name("hal") {
+        wanted.push(comm_prefix(&hal));
+    }
+    // 没自举成功的老进程 comm 就还是 keymint。
+    wanted.push("keymint".to_string());
+
     let Ok(entries) = fs::read_dir("/proc") else {
         return;
     };
-    let target = target.to_string_lossy().to_string();
-    // 只认 HAL 那一个名字：名字表里还有 daemon / soterta / injector / adbr，
-    // 全拿来匹配的话每重启一次 HAL 就顺手把软件 TA 也杀了。
-    let mut names: Vec<String> = Vec::new();
-    if let Some(hal) = crate::stealth::cached_name("hal") {
-        names.push(hal);
-    }
-    names.push(target.clone());
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -655,24 +656,21 @@ fn stop_stale_instances(target: &Path) {
         else {
             continue;
         };
-        if pid == std::process::id() {
+        if pid == me {
             continue;
         }
-        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
-        if cmdline.is_empty() {
+        let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        let comm = comm.trim();
+        if !wanted.iter().any(|name| name == comm) {
             continue;
         }
-        let first = cmdline.split(|b| *b == 0).next().unwrap_or_default();
-        let first = String::from_utf8_lossy(first);
-        if !names.iter().any(|name| name == first.as_ref()) {
-            continue;
-        }
-        // 只杀自己人：真的系统进程也在跑同名路径时，它的 comm 与路径对得上；
-        // 我们的进程 exe 是 memfd。没自举成功的那种确实是模块路径，也认。
+        // 只杀自己人：exe 是 memfd，或者就是模块里那个二进制。
         let exe = fs::read_link(entry.path().join("exe"))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let ours = exe.starts_with("/memfd:") || exe == target || first == target;
+        let ours = exe.starts_with("/memfd:") || Path::new(&exe) == target;
         if !ours {
             continue;
         }
@@ -683,6 +681,16 @@ fn stop_stale_instances(target: &Path) {
             .status();
     }
     sleep(Duration::from_secs(1));
+}
+
+/// 伪装路径的 comm（basename 前 15 字节，跟内核一致）。
+fn comm_prefix(path: &str) -> String {
+    let base = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bytes = base.as_bytes();
+    String::from_utf8_lossy(&bytes[..bytes.len().min(15)]).into_owned()
 }
 
 fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
@@ -728,6 +736,10 @@ fn supervisor_loop() {
     let mut last_soterta = std::time::Instant::now();
     loop {
         sleep(Duration::from_secs(5));
+        // 先把 pidfile 刷一遍：它可能被清理脚本删了（旧版本只在启动时写一次），
+        // 而看护/注入器/面板都拿它判断死活。文件不在就会被当成「守护挂了」，
+        // 每 5 秒重拉一个（每个都要把 8MB 二进制读进 memfd），白白烧 CPU。
+        write_pidfile();
         ensure_script("injector", &format!("{MODDIR}/daemon-injector"), &[]);
         let adbr = format!("{MODDIR}/adbr-daemon.sh");
         // 关着的时候不要去拉：adbr-daemon.sh 启动后发现自己被关会立即退出，
@@ -778,6 +790,13 @@ fn config_flag(key: &str) -> bool {
 }
 
 fn ensure_script(role: &str, script: &str, args: &[&str]) {
+    // 先按 comm 认人：脚本启动后会把 comm 改成伪装名，比 pidfile 可靠（
+    // pidfile 会被清理/被上一次运行时覆盖，判错就会每 5 秒重拉一个）。
+    if let Some(name) = crate::stealth::cached_name(role) {
+        if comm_running(&comm_prefix(&name)) {
+            return;
+        }
+    }
     let pidfile = match role {
         "injector" => format!("{RUN_DIR}/injector-daemon.pid"),
         _ => format!("{RUN_DIR}/adbr-daemon.lock/pid"),
@@ -787,6 +806,21 @@ fn ensure_script(role: &str, script: &str, args: &[&str]) {
     }
     log(&format!("{role} not running; respawning"));
     reap_later(spawn_script(role, script, args));
+}
+
+/// 有没有进程的 comm 就是这个名字（comm 读取不会阻塞）。
+fn comm_running(want: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Ok(comm) = fs::read_to_string(entry.path().join("comm")) {
+            if comm.trim() == want {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// pidfile 里是 `pid starttime`；两列都对得上才算活着。

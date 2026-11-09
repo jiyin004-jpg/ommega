@@ -1,6 +1,14 @@
 ﻿#!/system/bin/sh
 
 MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
+
+# 把自己 comm 改成伪装名：injector 的 exe 是系统 sh，comm 默认也是 sh，跟系统里
+# 几百个 sh 混在一起没法认 —— 守护就没办法靠 comm 判断「我已经在跑了」，
+# 结果每 5 秒又拉一个（实测摞到五个，两个各烧了几十秒 CPU）。改完 ps 里也好看了。
+_inj_tag=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+if [ -n "$_inj_tag" ]; then
+  printf '%s' "${_inj_tag##*/}" | cut -c1-15 > /proc/$$/comm 2>/dev/null
+fi
 STATE_DIR=/data/adb/ommega
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
@@ -599,6 +607,14 @@ if [ "${OMMEGA_SKIP_LOCK:-0}" = 1 ]; then
 elif mkdir "$LOCK_DIR" 2>/dev/null; then
   :
 else
+  # 给对方一个写 pid 的窗口：刚 mkdir 成功的那一方可能还没写进来，读到空就立刻
+  # 删锁重抢会造成两个实例同时跑（实测两个 injector 一起注入，各烧几十秒 CPU）。
+  lock_i=0
+  while [ "$lock_i" -lt 6 ]; do
+    [ -s "$LOCK_DIR/pid" ] && break
+    sleep 0.5
+    lock_i=$((lock_i + 1))
+  done
   set -- $(cat "$LOCK_DIR/pid" 2>/dev/null)
   if holder_is_us "${1:-}" "${2:-}"; then
     log "[injector-daemon] another instance (pid ${1:-}) is running; exiting"
@@ -624,14 +640,17 @@ fi
 # 杀软件 SOTER TA（我们自己的那个）。名字表里 soterta= 那条是它的伪装路径，
 # 再配上「exe 指向 memfd」就不会误杀同名的真系统服务。
 kill_software_ta() {
-  kt_name=$(sed -n 's/^soterta=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
-  [ -n "$kt_name" ] || return 0
+  local p kt_cmd
   for p in $(ls /proc | grep -E '^[0-9]+$'); do
-    [ -r "/proc/$p/cmdline" ] || continue
-    kt_cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
-    [ "${kt_cmd%% *}" = "$kt_name" ] || continue
-    case "$(readlink "/proc/$kt_p/exe" 2>/dev/null)" in
-      /memfd:*) kill -9 "$kt_p" 2>/dev/null ;;
+    # 先按 exe 筛（只有我们自己的才在 memfd 里），再读 cmdline —— 不能对全系统的
+    # 进程读 cmdline，碰到卡在 D 状态的目标会把调用方一起卡死。
+    case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+      /memfd:*) ;;
+      *) continue ;;
+    esac
+    kt_cmd=$(timeout 2 cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ')
+    case "$kt_cmd" in
+      *--soterta-serve*) kill -9 "$p" 2>/dev/null ;;
     esac
   done
   return 0
@@ -647,6 +666,20 @@ ensure_keymint_daemon() {
     if [ -z "$ekd_stamp" ] || [ "$ekd_stamp" = 0 ] || [ "$(proc_start_time "$ekd_pid")" = "$ekd_stamp" ]; then
       return 0
     fi
+  fi
+  # pidfile 可能被清理脚本删了：再按名字表里的 comm 找一遍（exe 必须是 memfd，
+  # 否则可能是同名的真系统进程）。不然每 5 秒重拉一个守护，每个都要把 8MB
+  # 二进制读进 memfd，白白烧 CPU。
+  ekd_name=$(sed -n 's/^daemon=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+  if [ -n "$ekd_name" ]; then
+    ekd_comm=$(echo "$ekd_name" | sed 's|.*/||' | cut -c1-15)
+    for ekd_d in /proc/[0-9]*; do
+      case "$(readlink "$ekd_d/exe" 2>/dev/null)" in
+        /memfd:*) ;;
+        *) continue ;;
+      esac
+      [ "$(cat "$ekd_d/comm" 2>/dev/null)" = "$ekd_comm" ] && return 0
+    done
   fi
   ekd_abi=$(device_abi)
   ekd_km=$MODDIR/libs/$ekd_abi/keymint

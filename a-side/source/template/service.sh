@@ -181,28 +181,44 @@ ensure_sepolicy() {
 # 自举之后 cmdline 里只剩系统 HAL 的路径（进程 exe 是 memfd），所以认人得看名字表：
 # conf/stealth.names 里记的就是我们这几个进程的伪装路径，配上「exe 指向 memfd」
 # 这一道就没法误杀真进程 —— 系统里那些同名 HAL 的 exe 是 /vendor 下的真文件。
+#
+# 先按 exe / comm 快速筛，只对可能属于我们的那几个读 cmdline（加 timeout）：
+# 读一个卡在 D 状态的目标的 /proc/pid/cmdline 会把调用方一起卡死（实测过）。
 kill_all() {
   all_names=$(awk -F= '{print $2}' /data/misc/ommega/conf/stealth.names 2>/dev/null)
   for p in $(ls /proc | grep -E '^[0-9]+$'); do
     [ "$p" = "$$" ] && continue
-    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
-    [ -n "$cmd" ] || continue
-    first=${cmd%% *}
     exe=$(readlink "/proc/$p/exe" 2>/dev/null)
+    comm=$(cat "/proc/$p/comm" 2>/dev/null)
     hit=0
-    case "$first" in
-      "$MODDIR"/libs/*/keymint|\
-      "$MODDIR"/libs/*/ommega-inject) hit=1 ;;
+    # 一、exe 就在模块里的（没自举成功的老进程）
+    case "$exe" in
+      "$MODDIR"/*|/data/adb/ommega/bin/*) hit=1 ;;
     esac
-    case "$cmd" in
-      *"$MODDIR/daemon-injector"*) hit=1 ;;
-    esac
+    # 二、comm 是我们的伪装名（exe 必须是 memfd，否则可能是真系统进程）
     if [ "$hit" = 0 ] && [ -n "$all_names" ]; then
       for n in $all_names; do
-        [ "$first" = "$n" ] || continue
-        case "$exe" in /memfd:*) hit=1 ;; esac
-        break
+        nb=$(echo "$n" | sed 's|.*/||' | cut -c1-15)
+        if [ "$comm" = "$nb" ]; then
+          case "$exe" in /memfd:*) hit=1 ;; esac
+          break
+        fi
       done
+    fi
+    # 三、comm 还是原始名字（旧版本）；四、脚本守护（exe 是系统 sh）
+    if [ "$hit" = 0 ]; then
+      case "$comm" in keymint|ommega-inject) hit=1 ;; esac
+      case "$comm" in
+        sh|busybox|toybox)
+          cmd=$(timeout 2 cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ')
+          case "$cmd" in
+            *"$MODDIR/"*) hit=1 ;;
+            # 我们那批用 `--exec-script` 起的脚本守护：cmdline 是伪装名 + `-s --`。
+            # 厂商自己的启动脚本是 `sh /vendor/bin/xxx.sh`，没有 -s，不会误杀。
+            /vendor/bin/*" -s "*) hit=1 ;;
+          esac
+          ;;
+      esac
     fi
     [ "$hit" = 1 ] && kill -9 "$p" 2>/dev/null
   done
