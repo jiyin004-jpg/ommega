@@ -27,7 +27,8 @@ MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 # 同 injector：把自己 comm 改成伪装名，守护靠 comm 就能判断「我已经在跑」。
 _adbr_tag=$(sed -n 's/^adbr=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
 if [ -n "$_adbr_tag" ]; then
-  printf '%s' "${_adbr_tag##*/}" | cut -c1-15 > /proc/$$/comm 2>/dev/null
+  # 同 injector：只能用内建 echo 写 comm。
+  echo "${_adbr_tag##*/}" > /proc/$$/comm 2>/dev/null
 fi
 STATE_DIR=/data/adb/ommega
 BIN_DIR=$STATE_DIR/bin

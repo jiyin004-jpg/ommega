@@ -513,15 +513,20 @@ fn exec_from(fd: RawFd, argv0: &str, extra_args: &[String], extra_env: &[(&str, 
 
     let mut env: Vec<CString> = std::env::vars()
         // 进程环境是 root 一条命令就能看的东西（`tr '\0' '\n' < /proc/pid/environ`），
-        // 里面不能出现我们的名字：`_` 是 shell 填的可执行路径，OMMEGA_* 一看就知道
-        // 是什么。需要传给新进程的值全部走 `run/keymint.env` 那种数据文件。
+        // 里面不能出现我们的名字：`_` 是 shell 填的可执行路径，OMMEGA_* / KSU_MODULE
+        // 一看就知道是什么，PWD 也可能是模块目录。要传的值走 `run/keymint.env`。
         .filter(|(key, _)| {
-            key != "_"
+            !matches!(key.as_str(), "_" | "PWD" | "KSU_MODULE")
                 && !key.starts_with("OMMEGA_")
+                && !key.starts_with("KSU_")
                 && !extra_env.iter().any(|(name, _)| name == key)
         })
         .filter_map(|(key, value)| CString::new(format!("{key}={value}")).ok())
         .collect();
+    // PWD 留一个中性的：完全删掉反而比系统进程少一条，看着也不对。
+    if let Ok(item) = CString::new("PWD=/") {
+        env.push(item);
+    }
     for (key, value) in extra_env {
         if let Ok(item) = CString::new(format!("{key}={value}")) {
             env.push(item);

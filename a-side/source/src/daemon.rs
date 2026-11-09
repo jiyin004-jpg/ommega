@@ -870,6 +870,9 @@ fn spawn_script(role: &str, script: &str, args: &[&str]) -> std::io::Result<Chil
         .env_remove("OMMEGA_MODDIR")
         .env_remove("OMMEGA_STEALTH")
         .env_remove("OMMEGA_SELF_PATH")
+        // KernelSU 给模块脚本塞的，直接把模块名写在环境里。
+        .env_remove("KSU_MODULE")
+        .env("PWD", "/")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
         .stderr(Stdio::null());

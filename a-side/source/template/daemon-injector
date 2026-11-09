@@ -7,7 +7,9 @@ MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 # 结果每 5 秒又拉一个（实测摞到五个，两个各烧了几十秒 CPU）。改完 ps 里也好看了。
 _inj_tag=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
 if [ -n "$_inj_tag" ]; then
-  printf '%s' "${_inj_tag##*/}" | cut -c1-15 > /proc/$$/comm 2>/dev/null
+  # 只能用内建 echo：printf / cut / tr 往 /proc/$$/comm 写会回 EINVAL（实测），
+  # comm 改不了，守护按 comm 认人就认不出来，会反复重拉。
+  echo "${_inj_tag##*/}" > /proc/$$/comm 2>/dev/null
 fi
 STATE_DIR=/data/adb/ommega
 CONF_DIR=$STATE_DIR/conf

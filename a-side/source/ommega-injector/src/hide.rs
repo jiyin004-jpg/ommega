@@ -108,11 +108,18 @@ pub fn hide_self(role: &str) {
     let mut argv: Vec<*const libc::c_char> = args.iter().map(|s| s.as_ptr()).collect();
     argv.push(std::ptr::null());
 
-    let env: Vec<CString> = std::env::vars()
-        // 环境里不留 `_`（shell 填的可执行路径）和 OMMEGA_* 前缀。
-        .filter(|(key, _)| key != "_" && !key.starts_with("OMMEGA_"))
+    let mut env: Vec<CString> = std::env::vars()
+        // 环境里不留 `_`（shell 填的可执行路径）、PWD、OMMEGA_*、KSU_*。
+        .filter(|(key, _)| {
+            !matches!(key.as_str(), "_" | "PWD" | "KSU_MODULE")
+                && !key.starts_with("OMMEGA_")
+                && !key.starts_with("KSU_")
+        })
         .filter_map(|(key, value)| CString::new(format!("{key}={value}")).ok())
         .collect();
+    if let Ok(item) = CString::new("PWD=/") {
+        env.push(item);
+    }
     let mut envp: Vec<*const libc::c_char> = env.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
 
