@@ -164,7 +164,7 @@ allow keystore node tcp_socket { recvfrom sendto };
 allow keystore port tcp_socket { name_connect };
 # remote.rs 先试「绑到具体网口」的那条路：它要看路由表和网口状态。
 allow keystore proc_net file { getattr open read };
-allow keystore sysfs_net dir { search };
+allow keystore sysfs_net dir { search read };
 allow keystore sysfs_net file { getattr open read };
 # 私卡按 ro.serialno / ro.boot.serialno 绑设备，读不到就发空指纹，服务端直接 401。
 allow keystore serialno_prop file { getattr open read map };
