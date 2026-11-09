@@ -114,17 +114,31 @@ pub fn run(extra: Vec<String>) -> ! {
                 idle_tick(&mut last_sync);
                 continue;
             }
-            let in_grace = started.elapsed() < INPROC_GRACE;
-            if !in_grace {
-                missing_ticks += 1;
+            // payload 已经明确报错（比如 boot key 在进程内找不到）：别再等 90 秒
+            // 宽限 + 20 拍，直接退到独立 HAL，否则开机这段时间 keystore 完全接不上。
+            if let Ok(reason) = fs::read_to_string(INPROC_FAILED_PATH) {
+                let reason = reason.trim();
+                if !reason.is_empty() {
+                    log(&format!(
+                        "in-process KeyMint gave up ({reason}); starting the standalone HAL"
+                    ));
+                }
+                let _ = fs::remove_file(INPROC_FAILED_PATH);
+                missing_ticks = 0;
+                // 落到下面：拉独立 HAL。
+            } else {
+                let in_grace = started.elapsed() < INPROC_GRACE;
+                if !in_grace {
+                    missing_ticks += 1;
+                }
+                if in_grace || missing_ticks < 20 {
+                    idle_tick(&mut last_sync);
+                    continue;
+                }
+                log("in-process KeyMint is not coming up; starting the standalone HAL");
+                missing_ticks = 0;
+                // 落到下面：拉独立 HAL。
             }
-            if in_grace || missing_ticks < 20 {
-                idle_tick(&mut last_sync);
-                continue;
-            }
-            log("in-process KeyMint is not coming up; starting the standalone HAL");
-            missing_ticks = 0;
-            // 落到下面：拉独立 HAL。
         }
 
         let Some(target) = find_keymint() else {
@@ -188,6 +202,9 @@ pub fn run(extra: Vec<String>) -> ! {
 
 /// 进程内服务的「活着」凭据：payload 每 30 秒刷一次，带 pid / 时间戳 / RPC 是否已绑。
 const HEARTBEAT_PATH: &str = "/data/misc/ommega/inproc.heartbeat";
+/// payload 起服务失败时落的标记（理由写在里面）。存在即说明这台机器上进程内那条路
+/// 跑不了，不用等心跳超时，直接拉独立 HAL。
+const INPROC_FAILED_PATH: &str = "/data/misc/ommega/inproc.failed";
 /// 开机之后这么长时间内不算「没起来」——keystore2 注入 + 起服务本来就慢一点。
 const INPROC_GRACE: Duration = Duration::from_secs(90);
 /// 心跳超过这么久没刷就当作进程内已经不在了。
