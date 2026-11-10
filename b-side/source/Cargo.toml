@@ -38,10 +38,8 @@ incremental = true
 
 [profile.release]
 opt-level = 3
-# 同 A 端：thin LTO + 多代码生成单元，换构建速度。B 端主体是转发回路，
-# 瓶颈在网络和 TEE 往返，fat LTO 那点收益看不见。
-lto = "thin"
-codegen-units = 16
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
 panic = 'abort'     # Abort on panic
 strip = true        # Strip symbols from binary*
 debug = 0           # Disable debug info
