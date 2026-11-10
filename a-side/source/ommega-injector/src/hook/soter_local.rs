@@ -498,6 +498,11 @@ fn mark_gone(key: &str) {
     store_pem(GONE_SECTION, key, "1");
 }
 
+/// 这个 uid / alias 删过（墓碑）。
+///
+/// 导出和「存不存在」现在都只认料本身（真机删除会真删料），所以枚举时不再拿墓碑
+/// 当闸门；墓碑还照写，因为它是盘上那份格式的一部分（运维和以后要查“删过没”就靠它）。
+#[allow(dead_code)]
 fn is_gone(key: &str) -> bool {
     read_store_pem(GONE_SECTION, key).is_some()
 }
