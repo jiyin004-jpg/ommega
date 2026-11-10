@@ -1188,25 +1188,47 @@ fn switch_state(path: &str) -> Option<bool> {
 
 /// 这台机器上 App 面向的 SOTER 由我们答吗。
 ///
-/// 优先级：手工开关（`soter_app_serve`）→ 运行期攒出来的自动接管 → root 侧那份
-/// 宿主体检结论 → 现场见过 -200。手工文件是唯一能压住自动接管的口：写了 `0`
-/// 就是不接，写了 `1` 则不管现场证据一律接。体检说 `real` 只是照着 APK 里有没有
-/// HAL 服务名猜的，描述符换了名字的机型照样漏，所以排在现场证据后面。
-pub(crate) fn app_serving_enabled() -> bool {
+/// 手工开关（环境变量或文件）写的什么，`None` = 没写。
+fn manual_switch() -> Option<bool> {
     // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
     if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
         .ok()
         .and_then(|value| switch_state_text(&value))
     {
-        return on;
+        return Some(on);
     }
-    if let Some(on) = switch_state(APP_SERVE_SWITCH) {
+    switch_state(APP_SERVE_SWITCH)
+}
+
+/// 优先级：手工开关（`soter_app_serve`）→ 运行期攒出来的自动接管 → root 侧那份
+/// 宿主体检结论 → 现场见过 -200。手工文件是唯一能压住自动接管的口：写了 `0`
+/// 就是不接，写了 `1` 则不管现场证据一律接。体检说 `real` 只是照着 APK 里有没有
+/// HAL 服务名猜的，描述符换了名字的机型照样漏，所以排在现场证据后面。
+pub(crate) fn app_serving_enabled() -> bool {
+    if let Some(on) = manual_switch() {
         return on;
     }
     if AUTO_APP_SERVE.load(Ordering::Relaxed) {
         return true;
     }
     switch_state(HOST_STATE).unwrap_or_else(|| HOST_REFUSED.load(Ordering::Relaxed))
+}
+
+/// 「读我们造的料」的那几笔：2 = `getAppSecureKey`、6 = `getAuthKey`。
+/// ASK/AuthKey 都是我们 HAL 腿里现造的，原生宿主自己缓存里根本没有，问它只会回空。
+fn reads_our_material(code: u32) -> bool {
+    matches!(code, 2 | 6)
+}
+
+/// 这一笔 App 面向的请求归不归我们答。
+///
+/// 手工写了 `0` 就一律不答（那是唯一能压住我们的口）；除此之外，要我们回答有两类理由：
+/// 接管本来就开着，或者这一笔读的是我们自己造的料 —— 后一条不看接管开关，默认就答。
+fn app_reply_ours(code: u32, manual: Option<bool>, serving_enabled: bool) -> bool {
+    match manual {
+        Some(false) => false,
+        _ => serving_enabled || reads_our_material(code),
+    }
 }
 
 /// 测试用：假装本线程刚收到一笔 App 请求。
@@ -1417,7 +1439,9 @@ pub(crate) fn take_app_answer() -> Option<OwnedReply> {
     if pending.at.elapsed() > APP_REPLY_WINDOW {
         return None;
     }
-    if !app_serving_enabled() {
+    // 料是我们造的、导出却交给宿主，本身就是自相矛盾（检测器那个 askModel 就卡在
+    // 宿主回空上），所以 2/6 号默认本地答，只有手工写 `0` 才让出去。
+    if !app_reply_ours(pending.call.code, manual_switch(), app_serving_enabled()) {
         return auto_serve_probe(&pending);
     }
     let reply = build_app_answer(&pending)?;
@@ -1444,7 +1468,7 @@ pub(crate) fn take_app_answer() -> Option<OwnedReply> {
 pub(crate) enum AppAnswer {
     /// 只有返回值的（`generate*` / `has*` / `remove*` / `getVersion`）。
     Int(i32),
-    /// `SoterExportResult`：`[非空标记][resultCode][byte[]][dataLength]`。
+    /// `SoterExportResult`：`[resultCode][byte[]][dataLength]`。
     Export { code: i32, data: Option<Vec<u8>> },
     /// `SoterSessionResult`：`[session][resultCode]`。
     Session { session: i64, code: i32 },
@@ -2950,13 +2974,12 @@ mod tests {
             std::slice::from_raw_parts(reply.data_ptr(), reply.data_size()).to_vec()
         };
 
-        // SoterExportResult：Status + 非空标记 + resultCode + byte[] + dataLength
+        // SoterExportResult：Status + resultCode + byte[] + dataLength
         let with_data = build_app_export_reply(0, Some(&[1, 2, 3, 4])).unwrap();
         assert_eq!(
             raw(&with_data),
             vec![
                 0, 0, 0, 0, // Status ok
-                1, 0, 0, 0, // 非空标记
                 0, 0, 0, 0, // resultCode
                 4, 0, 0, 0, 1, 2, 3, 4, // byte[]
                 4, 0, 0, 0, // dataLength
@@ -2966,17 +2989,13 @@ mod tests {
         let empty = build_app_export_reply(-6, None).unwrap();
         assert_eq!(
             raw(&empty),
-            vec![
-                0, 0, 0, 0, 1, 0, 0, 0, 0xfa, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,
-            ]
+            vec![0, 0, 0, 0, 0xfa, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,]
         );
         // SoterSessionResult：session 在前、resultCode 在后（跟 HAL 那份相反）。
         let session = build_app_session_reply(0x1122_3344_5566_7788, 0).unwrap();
         assert_eq!(
             raw(&session),
-            vec![
-                0, 0, 0, 0, 1, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0,
-            ]
+            vec![0, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0,]
         );
         // SoterExtraParam：非空标记 + writeValue(Integer) 的类型标 + 值。
         let extra = build_app_extra_param_reply(2).unwrap();
@@ -3020,6 +3039,18 @@ mod tests {
     /// `app_serving_enabled()` 的事，本组要验的是兜底逻辑本身）。
     fn auto_serve_on() -> bool {
         AUTO_APP_SERVE.load(Ordering::Relaxed)
+    }
+
+    /// 2/6 号读的是我们自己造的料，默认就归我们答，不看接管开关；
+    /// 手工写 0 仍然能把它压住，别的号照旧看开关。
+    #[test]
+    fn reads_our_material_is_served_by_default() {
+        assert!(app_reply_ours(2, None, false));
+        assert!(app_reply_ours(6, None, false));
+        assert!(!app_reply_ours(4, None, false));
+        assert!(app_reply_ours(4, Some(true), false));
+        assert!(!app_reply_ours(2, Some(false), true));
+        assert!(!app_reply_ours(6, Some(false), true));
     }
 
     /// 宿主没碰 HAL 的首笔请求就接管（阈值 1）：当笔就用我们的答复顶掉，之后每笔都答。

@@ -425,15 +425,15 @@ pub fn build_app_int_reply(value: i32) -> Result<OwnedReply> {
     build_plain_reply(&value)
 }
 
-/// App 面向的 `SoterExportResult`：`[Status][非空标记=1][resultCode][byte[]][dataLength]`。
+/// App 面向的 `SoterExportResult`：`[Status][resultCode][byte[]][dataLength]`。
 ///
-/// `data = None` 照宿主自己的写法（`writeByteArray(null)` 是 `-1` + 长度 0），别写成空数组：
-/// 客户端 `createByteArray()` 看到 -1 才回 null，看到 0 是「长度为 0 的数组」，两者在
-/// 检测器眼里不一样（`exportData == null` 的那几条判据）。
+/// 不能再多写一个非空标记：客户端 soter-core 的 `SoterExportResult.createFromParcel`
+/// 读的就是 `resultCode → createByteArray → length` 三格，多写 4 字节会把
+/// `createByteArray` 的长度读成上一个字段（0），`exportData` 就成了空数组，
+/// `getAppGlobalSecureKeyModel()` 直接返 null（检测器的 SOTER 项就是这么红的）。
 pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
-    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
     parcel.write(&code)?;
     match data {
         Some(bytes) => {
@@ -453,7 +453,6 @@ pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedRep
 pub fn build_app_session_reply(session: i64, code: i32) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
-    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
     parcel.write(&session)?;
     parcel.write(&code)?;
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))

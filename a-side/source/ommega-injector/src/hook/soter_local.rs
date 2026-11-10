@@ -1059,20 +1059,28 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // exportAskPublicKey(uid) —— 这个 uid 的 ASK 自描述，由 ATTK 签（ATTK 是 ASK 的根）
         1 => {
             let uid = call.uid?;
-            // 删过就不再现造（墓碑），跟真机一样“删了就是没了”。
-            if is_gone(&ask_gone_key(uid)) {
+            // 有料就导出，墓碑只挡「真的没有料」的那种。以前一看到墓碑就回空，
+            // 结果 hasAskAlready 答有、导出却是空 —— 检测器就卡在 askModel 上
+            // （UnifiedAudit 的 SOTER 项就是这么红的）。存在性与导出必须同源。
+            let Some(ask) = ask_for(state, uid) else {
                 return Some(Answer::Buffer {
                     code: NOT_FOUND,
                     data: None,
                 });
-            }
+            };
+            clear_gone(&ask_gone_key(uid));
             let counter = bump_counter(state, uid);
-            let ask = ask_for(state, uid)?;
             let document = ask_json(&ask.pem, uid, counter).ok()?;
             let signature = current_attk()?.sign(&document)?;
+            let data = envelope(&document, &signature);
+            log::info!(
+                "soter local export ASK uid={uid} document={} envelope={}",
+                document.len(),
+                data.len()
+            );
             Some(Answer::Buffer {
                 code: OK,
-                data: Some(envelope(&document, &signature)),
+                data: Some(data),
             })
         }
         // exportAuthKeyPublicKey(uid, alias) —— 回的是 AuthKey 的自描述信封，
@@ -1210,15 +1218,15 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 服务端 `soter_mint` 那两层同一个毛病，已一并改掉）。
         // 答 NOT_FOUND 之后应用会老实重新生成并上报；真机那条路一回来就能走通。
         9 => {
-            // 本地这把 ASK 一直在（内置或自定义），但「这个 uid 上报过没有」得按 5 号
-            // 的真实建料记录答，否则 App 永远在「建完→问→没有」之间循环。
+            // 本地这把 ASK 一直在（内置或自定义），「这个 uid 有没有料」就看内存/盘上
+            // 真有没有，不能只看本会话建没建过：只看 `ask_built` 会出现「答没有、但
+            // 导出却有料」的反向不一致，检测器那边同样是 keyPrep 失败。
             let uid = call.uid?;
-            let built = state
-                .ask_built
-                .lock()
-                .map(|set| set.contains(&uid))
-                .unwrap_or(false);
-            Some(Answer::Code(if built { OK } else { NOT_FOUND }))
+            Some(Answer::Code(if ask_exists(state, uid) {
+                OK
+            } else {
+                NOT_FOUND
+            }))
         }
         // hasAuthKey(uid, alias)
         10 => {
