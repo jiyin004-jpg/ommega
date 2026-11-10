@@ -382,9 +382,17 @@ fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<S
         let _ = std::fs::create_dir_all(dir);
     }
     // 写临时文件再 rename：中途掉电也不会留个半个 json。
+    // 落盘统一 0666：这份 store 是几个域一起写的（keystore 域的 payload、hal_soter、
+    // system_app 宿主）。谁把 tmp 用默认 0644 rename 上去，另外几家就写不动了。
     let tmp = format!("{path}.tmp");
-    if std::fs::write(&tmp, text.as_bytes()).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-        return Some(path.to_string());
+    if std::fs::write(&tmp, text.as_bytes()).is_ok() {
+        let _ = std::fs::set_permissions(
+            &tmp,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o666),
+        );
+        if std::fs::rename(&tmp, path).is_ok() {
+            return Some(path.to_string());
+        }
     }
     let _ = std::fs::remove_file(&tmp);
     // app 域（SOTER 宿主是 platform_app、带 MLS 类别）写不动这个文件：MLS 的写约束
@@ -1087,30 +1095,26 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 拿 ASK 私钥签（App 先有 ASK 公钥，验的就是这把）。
         3 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
-            // AuthKey 自己删过，或者整个 uid 删过（ASK 都没了）—— 都不能现造。
-            if is_gone(&auth_gone_key(uid, alias)) || is_gone(&ask_gone_key(uid)) {
+            // 有料就导出，跟 ASK 那条（1 号）一个口径：**存在性与导出必须同源**。
+            // 以前先看墓碑，而墓碑得靠写盘才清得掉；store 写不动的时候 `ask:<uid>` 那条
+            // 墓碑就永远在，于是 hasAuthKey 答有、导出却恒 -6（检测器卡在 authModel 上）。
+            let Some(key) = auth_key(state, uid, alias) else {
                 return Some(Answer::Buffer {
                     code: AUTH_KEY_NOT_READY,
                     data: None,
                 });
-            }
-            match auth_key(state, uid, alias) {
-                Some(key) => {
-                    let counter = bump_counter(state, uid);
-                    let document = auth_json(&key, uid, counter);
-                    // 这层必须用 **该 uid 的 ASK** 签：App 手里只有这个 uid 的 ASK 公钥。
-                    // （ASK 自己那一层才是 ATTK 签的，两者别搞混。）
-                    let signature = ask_for(state, uid)?.sign(&document)?;
-                    Some(Answer::Buffer {
-                        code: OK,
-                        data: Some(envelope(&document, &signature)),
-                    })
-                }
-                None => Some(Answer::Buffer {
-                    code: AUTH_KEY_NOT_READY,
-                    data: None,
-                }),
-            }
+            };
+            clear_gone(&auth_gone_key(uid, alias));
+            clear_gone(&ask_gone_key(uid));
+            let counter = bump_counter(state, uid);
+            let document = auth_json(&key, uid, counter);
+            // 这层必须用 **该 uid 的 ASK** 签：App 手里只有这个 uid 的 ASK 公钥。
+            // （ASK 自己那一层才是 ATTK 签的，两者别搞混。）
+            let signature = ask_for(state, uid)?.sign(&document)?;
+            Some(Answer::Buffer {
+                code: OK,
+                data: Some(envelope(&document, &signature)),
+            })
         }
         // finishSign(session) —— 签的是那段 JSON 原文（不是 challenge 的字节），
         // 拿 AuthKey 签，回「JSON + 签名」的信封。

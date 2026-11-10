@@ -25,25 +25,51 @@ pub fn write(text: &str) -> bool {
 }
 
 fn write_at(path: &str, text: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // 保留原来的权限：这个文件本来是 0666（几个写者都靠 other 那一档），rename 会把
-    // 临时文件自己的 0644 带上去，后来者就写不动了。
-    let keep_mode = std::fs::metadata(path).map(|meta| meta.permissions()).ok();
+    // 这个文件是几个域一起写的：keystore 域里的 payload、hal_soter、还有 system_app
+    // 宿主。以前这里「保留原权限」，只要哪一次留下 0644，后面**不属同一 uid 的写者**
+    // 就全哑了，而且 rename 会把 0644 一直带下去 —— 实测到的症状就是 ASK/AuthKey 只
+    // 活在内存里、墓碑永远清不掉（导出 AuthKey 恒 -6）。所以落盘完统一 0666。
     let tmp = format!("{path}.rpc.tmp");
-    let written = std::fs::write(&tmp, text.as_bytes()).is_ok();
-    if written {
-        if let Some(permissions) = keep_mode {
-            let _ = std::fs::set_permissions(&tmp, permissions);
+    let mut fail = None;
+    match std::fs::write(&tmp, text.as_bytes()) {
+        Ok(()) => {
+            if let Err(error) =
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666))
+            {
+                fail = Some(format!("chmod {tmp}: {error}"));
+            }
+            if fail.is_none() {
+                if let Err(error) = std::fs::rename(&tmp, path) {
+                    fail = Some(format!("rename {tmp} -> {path}: {error}"));
+                }
+            }
         }
-        if std::fs::rename(&tmp, path).is_ok() {
-            return true;
+        Err(error) => fail = Some(format!("write {tmp}: {error}")),
+    }
+    if fail.is_none() {
+        return true;
+    }
+    // 目录不可写（只有文件本身可写）时改回就地把内容盖掉：掉电可能留半个 json，
+    // 但总比「一个字都落不下去」强。
+    let _ = std::fs::remove_file(&tmp);
+    match std::fs::write(path, text.as_bytes()) {
+        Ok(()) => {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "failed to write the soter ask store at {path}: {}; in-place: {error}",
+                fail.unwrap_or_default()
+            );
+            false
         }
     }
-    let _ = std::fs::remove_file(&tmp);
-    log::warn!("failed to write the soter ask store at {path}");
-    false
 }
 
 #[cfg(all(test, unix))]
@@ -52,13 +78,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn writes_the_text_and_keeps_the_old_mode() {
+    fn writes_the_text_and_leaves_the_file_writable_for_every_domain() {
         let dir = std::env::temp_dir().join(format!("ommega-store-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.json");
         std::fs::write(&path, b"{\"old\":1}").unwrap();
+        // 别的写者留下的 0644 不能一直带下去，否者 uid 不同的那几家就写不动了。
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o666);
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
         std::fs::set_permissions(&path, permissions).unwrap();
 
         let path_text = path.to_str().unwrap().to_string();

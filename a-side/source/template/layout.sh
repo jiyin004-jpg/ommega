@@ -34,3 +34,10 @@ chmod 0771 "$DATA_ROOT" 2>/dev/null
 # logs 用 sticky：app 域（SOTER 宿主不是 keystore uid）的 payload 要往这里写日志，
 # 不开 other 写它就落不下档；sticky 位拦住删掉 / 改名别人的文件。
 chmod 1777 "$DATA_ROOT/logs" 2>/dev/null
+# SOTER 料库（ASK / AuthKey / 墓碑）是几个域一起写的：keystore 域的 payload、
+# hal_soter、system_app 宿主。这个文件一旦被写成 0644，不属同一 uid 的那几家就
+# 只能读不能写，ASK/AuthKey 于是只活在内存里、重启即丢（导出 AuthKey 恒 -6）。
+# 开机正一次，写的那一侧（soter_store）也已经统一落盘 0666。
+if [ -f "$DATA_ROOT/soter_asks.json" ]; then
+  chmod 0666 "$DATA_ROOT/soter_asks.json" 2>/dev/null
+fi
