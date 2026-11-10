@@ -137,6 +137,23 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
     });
     boot_level_cache.context("failed to initialize boot-level key cache")?;
 
+    // early boot 结束的重放必须放在 boot level key 铸完之后：那把 key 本身是
+    // EARLY_BOOT_ONLY 的，TA 还在 early boot 里才铸得出来。反过来先重放就会变成
+    // 「boot level cache 初始化失败 → 进程内那套起不来」。
+    //
+    // 根侧（daemon-injector）在 sys.boot_completed=1 后落 boot_done；这里只看它，
+    // 不去读属性（payload 是静态链接的，read_string_property 会退到 exec resetprop）。
+    if crate::global::boot_completed()
+        || std::path::Path::new("/data/misc/ommega/boot_done").exists()
+    {
+        match crate::keymaster::maintenance::replay_early_boot_ended() {
+            Ok(()) => info!("in-process early boot ended replay done"),
+            Err(error) => {
+                warn!("failed to replay earlyBootEnded in-process: {error:#}");
+            }
+        }
+    }
+
     crate::keybox::initialize().context("failed to initialize keybox runtime")?;
     crate::repair_ommega_data_files();
     crate::keymaster::metrics_store::update_keystore_crash_count();

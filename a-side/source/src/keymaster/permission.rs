@@ -661,14 +661,29 @@ fn check_android_permission_with_manager(
     permission: &str,
     permission_denied: KsError,
 ) -> anyhow::Result<()> {
-    let binder = hub::try_get_service(PERMISSION_MANAGER_SERVICE)
-        .ok()
-        .flatten()
-        .ok_or_else(KsError::sys)
-        .context(format!("service {PERMISSION_MANAGER_SERVICE} unavailable"))?;
+    // 拿不到 permissionmgr 一律按「没有这个权限」拒绝，不能报内部错误：
+    // SYSTEM_ERROR 映射到调用方就是 ResponseCode(4)，检测器（UnifiedAudit 的
+    // UNIQUE_ID_CONSISTENCY）会当成意外异常；PERMISSION_DENIED 才是普通 app
+    // 不持 REQUEST_UNIQUE_ID_ATTESTATION 时应得的那一个。
+    // 顺手把真实原因写进日志：以前 `.ok()` 一吞，现场只剩「unavailable」。
+    let binder = match hub::try_get_service(PERMISSION_MANAGER_SERVICE) {
+        Ok(Some(binder)) => binder,
+        Ok(None) => {
+            log::warn!("permissionmgr is not registered; denying {permission} for uid {uid}");
+            return Err(KsError::perm())
+                .context(format!("service {PERMISSION_MANAGER_SERVICE} unavailable"));
+        }
+        Err(error) => {
+            log::warn!(
+                "permissionmgr lookup failed ({error:#}); denying {permission} for uid {uid}"
+            );
+            return Err(KsError::perm())
+                .context(format!("service {PERMISSION_MANAGER_SERVICE} unavailable"));
+        }
+    };
     let proxy = binder
         .as_proxy()
-        .ok_or_else(KsError::sys)
+        .ok_or_else(KsError::perm)
         .context("permissionmgr binder was unexpectedly local")?;
     let mut data = proxy
         .prepare_transact(true)
@@ -690,7 +705,7 @@ fn check_android_permission_with_manager(
         .read()
         .context("failed to decode permissionmgr reply status")?;
     if !status.is_ok() {
-        return Err(KsError::sys()).context(format!(
+        return Err(KsError::perm()).context(format!(
             "permissionmgr checkUidPermission returned non-ok status: {status}"
         ));
     }

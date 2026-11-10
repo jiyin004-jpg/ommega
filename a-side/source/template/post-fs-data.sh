@@ -17,6 +17,10 @@ STATE_DIR=/data/adb/ommega
 CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
+# 上一次开机落的「boot 已完成」标记：keymint/payload 靠它的存在判断 early boot
+# 已经结束（静态链接读不到属性，见 daemon-injector 里那段注释）。每次开机先清，
+# 由 daemon-injector 看到 sys.boot_completed=1 后再写。
+rm -f "$TARGET_DIR/boot_done" 2>/dev/null
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 
 # keystore 域要读 /data/misc/ommega，规则得在 keystore2 起来之前就在内核里。

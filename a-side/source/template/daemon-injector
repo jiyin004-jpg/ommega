@@ -721,6 +721,13 @@ sync_soter_host_state() {
 
 trap 'release_lock' EXIT INT TERM HUP
 
+# 「开机已完成」标记：keymint/payload 是静态链接的，读不到属性区
+# （`read_string_property` 会退到 exec 模块里的 resetprop，而在注入过 payload 的
+# keystore2 里 fork/exec 会把进程内启动卡死）。所以这件事由这里（root，exec
+# getprop 没问题）落成文件，包那侧只 stat。post-fs-data 每次开机先删掉。
+BOOT_DONE_OUT=/data/misc/ommega/boot_done
+boot_done_written=0
+
 sync_soter_host_state
 while true; do
   # Config and target list live in the single data location
@@ -729,6 +736,10 @@ while true; do
 
   # 先确保 keymint 守护在（它挂了的话，下面所有注入都白做）。
   ensure_keymint_daemon
+
+  if [ "$boot_done_written" != "1" ] && [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
+    : > "$BOOT_DONE_OUT" 2>/dev/null && boot_done_written=1
+  fi
 
   LOG_ON=0
   debug_logging_enabled && LOG_ON=1

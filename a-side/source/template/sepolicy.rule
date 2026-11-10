@@ -128,6 +128,12 @@ allow { hal_cryptoeng_oplus } tmpfs file { write getattr read execute map }
 allow { magisk ksu su system_file } default_android_service service_manager { add find }
 
 allow keystore default_android_service service_manager find
+# keystore2 查「调用方能不能 include unique id / attest device id」时要问 system_server
+# 的 permissionmgr（service_contexts 里标 permissionmgr_service，不在 default_android_service
+# 那个通配里）。缺这两条时进程内模式下 INCLUDE_UNIQUE_ID 一律回 SYSTEM_ERROR(4)，
+# 检测器（UnifiedAudit UNIQUE_ID_CONSISTENCY）显示成 INCONCLUSIVE。
+allow keystore permissionmgr_service:service_manager { find }
+allow keystore permissionmgr_service:binder { call transfer }
 allow shell default_android_service service_manager find
 
 # 一加/OPPO 工程模式的「Attestation 全量功能测试」页：App 拿 setUniqueIdIncluded()
