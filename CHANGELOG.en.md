@@ -6,5 +6,6 @@
 
 - Fixed several detection points.
 - Fixed fingerprint capability being reported incorrectly in some apps.
+- Fixed enabling fingerprint payment in WeChat failing.
 - Stability and compatibility improvements.
 - Everyday usage polish.
