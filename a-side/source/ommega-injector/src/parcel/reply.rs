@@ -425,15 +425,26 @@ pub fn build_app_int_reply(value: i32) -> Result<OwnedReply> {
     build_plain_reply(&value)
 }
 
-/// App 面向的 `SoterExportResult`：`[Status][resultCode][byte[]][dataLength]`。
+/// App 面向的 `SoterExportResult`：`[Status][非空标记=1][resultCode][byte[]][dataLength]`。
 ///
-/// 不能再多写一个非空标记：客户端 soter-core 的 `SoterExportResult.createFromParcel`
-/// 读的就是 `resultCode → createByteArray → length` 三格，多写 4 字节会把
-/// `createByteArray` 的长度读成上一个字段（0），`exportData` 就成了空数组，
-/// `getAppGlobalSecureKeyModel()` 直接返 null（检测器的 SOTER 项就是这么红的）。
+/// 那个非空标记**不能省**。客户端拿到的是 AIDL 生成代码，`getAppSecureKey` / `getAuthKey`
+/// 的代理里第一步是 `obtain2.readInt() != 0 ? CREATOR.createFromParcel(obtain2) : null`
+/// （老版生成器写的是同一句 `if (_reply.readInt() != 0)`，只是不叫 `_Parcel`）。少写这
+/// 4 字节，客户端读到的「标记」正好是 resultCode，成功时它是 0，于是整个 parcelable 被
+/// 判成 **null** —— `getAppGlobalSecureKeyModel()` 里 `.exportData` 直接 NPE，被 catch
+/// 掉就成了 `askModel=false` / Duck 的 1003，跟「料在不在」完全无关。
+///
+/// 这里踩过一次来回：`2d85e557` 按「客户端只读三格」的口径把这个标记删了，结果两头
+/// 都空。反过来的实证在 Duck 自带的那份 soter-core 里也看得到（`ISoterService$Proxy`
+/// 里 `readInt() != 0 ? SoterExportResult.CREATOR.createFromParcel`），别再删。
+///
+/// `data = None` 照宿主自己的写法（`writeByteArray(null)` 是 `-1` + 长度 0），别写成空数组：
+/// 客户端 `createByteArray()` 看到 -1 才回 null，看到 0 是「长度为 0 的数组」，两者在
+/// 检测器眼里不一样（`exportData == null` 的那几条判据）。
 pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
     parcel.write(&code)?;
     match data {
         Some(bytes) => {
@@ -450,9 +461,15 @@ pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedRep
 
 /// App 面向的 `SoterSessionResult`：`[Status][非空标记=1][session i64][resultCode i32]`。
 /// 注意字段顺序跟 HAL 那份 `SoterInitReturn` 相反（那边是 status 在前）。
+///
+/// 非空标记跟 `SoterExportResult` 那条同源：`initSigh` 的代理也是先 `readInt() != 0`。
+/// 少写的话客户端拿 session 的高 32 位当标记 —— 我们自己发的会话号从 1 往上加，高位恒 0，
+/// 于是必然判成 null；`initSigh` 回 null 之后微信那套直接当失败，或者拿一个凑不上的号去
+/// `finishSign`，回来就是服务端的 `-204`。
 pub fn build_app_session_reply(session: i64, code: i32) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
+    parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
     parcel.write(&session)?;
     parcel.write(&code)?;
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))

@@ -2997,12 +2997,13 @@ mod tests {
             std::slice::from_raw_parts(reply.data_ptr(), reply.data_size()).to_vec()
         };
 
-        // SoterExportResult：Status + resultCode + byte[] + dataLength
+        // SoterExportResult：Status + 非空标记 + resultCode + byte[] + dataLength
         let with_data = build_app_export_reply(0, Some(&[1, 2, 3, 4])).unwrap();
         assert_eq!(
             raw(&with_data),
             vec![
                 0, 0, 0, 0, // Status ok
+                1, 0, 0, 0, // 非空标记（客户端 `readTypedObject` 先读这一格）
                 0, 0, 0, 0, // resultCode
                 4, 0, 0, 0, 1, 2, 3, 4, // byte[]
                 4, 0, 0, 0, // dataLength
@@ -3012,13 +3013,25 @@ mod tests {
         let empty = build_app_export_reply(-6, None).unwrap();
         assert_eq!(
             raw(&empty),
-            vec![0, 0, 0, 0, 0xfa, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,]
+            vec![
+                0, 0, 0, 0, // Status ok
+                1, 0, 0, 0, // 非空标记
+                0xfa, 0xff, 0xff, 0xff, // resultCode -6
+                0xff, 0xff, 0xff, 0xff, // null 数组
+                0, 0, 0, 0, // dataLength
+            ]
         );
-        // SoterSessionResult：session 在前、resultCode 在后（跟 HAL 那份相反）。
+        // SoterSessionResult：session 在前、resultCode 在后（跟 HAL 那份相反），
+        // 前面同样得有一个非空标记。
         let session = build_app_session_reply(0x1122_3344_5566_7788, 0).unwrap();
         assert_eq!(
             raw(&session),
-            vec![0, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0,]
+            vec![
+                0, 0, 0, 0, // Status ok
+                1, 0, 0, 0, // 非空标记
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // session
+                0, 0, 0, 0, // resultCode
+            ]
         );
         // SoterExtraParam：非空标记 + writeValue(Integer) 的类型标 + 值。
         let extra = build_app_extra_param_reply(2).unwrap();

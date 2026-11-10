@@ -436,6 +436,62 @@ fn hidl_soter_buffer_reply_keeps_a_long_payload_intact() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// App 面向（`com.tencent.soter.soterserver.ISoterService`）那半边
+// ---------------------------------------------------------------------------
+//
+// 客户端是 AIDL 生成的代理，parcelable 返回值一律先读一个「非空标记」：
+// `obtain2.readInt() != 0 ? CREATOR.createFromParcel(obtain2) : null`。下面几条
+// 就是照这个读法读的 —— 标记丢了的话客户端不会报错，只会拿到 null。
+
+#[test]
+fn app_export_reply_starts_with_the_non_null_flag() {
+    let payload = vec![0x5au8; 805];
+    let mut reply = build_app_export_reply(0, Some(&payload)).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    // Status + 非空标记 + resultCode + array 长 + 数据（补到 4）+ dataLength
+    assert_eq!(
+        bytes.len(),
+        16 + ((payload.len() + 3) & !3),
+        "got {}",
+        bytes.len()
+    );
+    assert_eq!(le_i32(&bytes, 0), 0, "Status::ok");
+    assert_eq!(le_i32(&bytes, 4), 1, "非空标记：0 就是 null，客户端直接丢");
+    assert_eq!(le_i32(&bytes, 8), 0, "resultCode");
+    assert_eq!(le_i32(&bytes, 12), payload.len() as i32, "array 长");
+    let tail = bytes.len() - 4;
+    assert_eq!(le_i32(&bytes, tail), payload.len() as i32, "dataLength");
+    assert_eq!(&bytes[16..16 + payload.len()], &payload[..]);
+}
+
+#[test]
+fn app_export_reply_without_data_still_carries_the_flag() {
+    // `data = None` 要写成宿主那种 `writeByteArray(null)`：`-1` + 0。
+    let mut reply = build_app_export_reply(-6, None).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    assert_eq!(bytes.len(), 20, "got {}", bytes.len());
+    assert_eq!(le_i32(&bytes, 4), 1, "非空标记");
+    assert_eq!(le_i32(&bytes, 8), -6, "resultCode");
+    assert_eq!(le_i32(&bytes, 12), -1, "null 数组是 -1");
+    assert_eq!(le_i32(&bytes, 16), 0, "dataLength 0");
+}
+
+#[test]
+fn app_session_reply_puts_the_flag_before_the_session() {
+    let mut reply = build_app_session_reply(0x1122334455667788, 0).unwrap();
+    let bytes = soter_bytes(&mut reply);
+    assert_eq!(bytes.len(), 20, "got {}", bytes.len());
+    assert_eq!(le_i32(&bytes, 0), 0, "Status::ok");
+    assert_eq!(le_i32(&bytes, 4), 1, "非空标记");
+    assert_eq!(
+        i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        0x1122334455667788,
+        "session 得从偏移 8 起，标记占掉前面 4 字节"
+    );
+    assert_eq!(le_i32(&bytes, 16), 0, "resultCode");
+}
+
 #[test]
 fn hidl_soter_init_reply_carries_error_then_session() {
     let mut reply = build_hidl_soter_init_reply(-5, 0x1122334455667788).unwrap();
