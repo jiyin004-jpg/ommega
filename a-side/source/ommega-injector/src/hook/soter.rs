@@ -1188,23 +1188,34 @@ fn switch_state(path: &str) -> Option<bool> {
 
 /// 这台机器上 App 面向的 SOTER 由我们答吗。
 ///
-/// 手工开关（环境变量或文件）写的什么，`None` = 没写。
+/// 手工开关（环境变量或文件）写的什么，`None` = 没写。进程起来只读一次：开关的意思是
+/// 「开机时要不要接管」，运行期再跟着文件变，就成了同一台机器一会儿接一会儿不接。
 fn manual_switch() -> Option<bool> {
-    // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
-    if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
-        .ok()
-        .and_then(|value| switch_state_text(&value))
-    {
-        return Some(on);
-    }
-    switch_state(APP_SERVE_SWITCH)
+    static CACHE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
+        if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
+            .ok()
+            .and_then(|value| switch_state_text(&value))
+        {
+            return Some(on);
+        }
+        switch_state(APP_SERVE_SWITCH)
+    })
 }
 
-/// 优先级：手工开关（`soter_app_serve`）→ 运行期攒出来的自动接管 → root 侧那份
-/// 宿主体检结论 → 现场见过 -200。手工文件是唯一能压住自动接管的口：写了 `0`
+/// 接管在我们这边成立了（已经替宿主答过「读我们造的料」那几笔）。
+/// 一旦成立就不再回头：开关、宿主体检结论、现场证据全不用看了。
+static MATERIAL_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 优先级：接管已成立 → 手工开关（`soter_app_serve`）→ 运行期攒出来的自动接管 → root 侧
+/// 那份宿主体检结论 → 现场见过 -200。手工文件是唯一能压住自动接管的口：写了 `0`
 /// 就是不接，写了 `1` 则不管现场证据一律接。体检说 `real` 只是照着 APK 里有没有
 /// HAL 服务名猜的，描述符换了名字的机型照样漏，所以排在现场证据后面。
 pub(crate) fn app_serving_enabled() -> bool {
+    if MATERIAL_ENGAGED.load(Ordering::Relaxed) {
+        return true;
+    }
     if let Some(on) = manual_switch() {
         return on;
     }
@@ -1222,12 +1233,14 @@ fn reads_our_material(code: u32) -> bool {
 
 /// 这一笔 App 面向的请求归不归我们答。
 ///
-/// 手工写了 `0` 就一律不答（那是唯一能压住我们的口）；除此之外，要我们回答有两类理由：
-/// 接管本来就开着，或者这一笔读的是我们自己造的料 —— 后一条不看接管开关，默认就答。
+/// 接管成立（`serving_enabled`）就一律归我们，开关不再参与；还没成立时，手工开关是
+/// 开机时的意见（写了 `0` 就是不接），没写的话 2/6 号默认归我们 —— 它们是读我们自己
+/// 造的料，让给宿主只会回空。
 fn app_reply_ours(code: u32, manual: Option<bool>, serving_enabled: bool) -> bool {
-    match manual {
-        Some(false) => false,
-        _ => serving_enabled || reads_our_material(code),
+    match (serving_enabled, manual) {
+        (true, _) => true,
+        (false, Some(on)) => on,
+        (false, None) => reads_our_material(code),
     }
 }
 
@@ -1278,6 +1291,7 @@ pub(crate) unsafe fn note_host_reply(tr: &binder_transaction_data) {
 #[cfg(test)]
 pub(crate) fn reset_auto_serve_for_test() {
     AUTO_APP_SERVE.store(false, Ordering::Relaxed);
+    MATERIAL_ENGAGED.store(false, Ordering::Relaxed);
     APP_BLIND_STREAK.store(0, Ordering::Relaxed);
     HOST_REFUSED.store(false, Ordering::Relaxed);
     if let Ok(mut slot) = PROBE_SILENT_UNTIL.lock() {
@@ -1440,11 +1454,20 @@ pub(crate) fn take_app_answer() -> Option<OwnedReply> {
         return None;
     }
     // 料是我们造的、导出却交给宿主，本身就是自相矛盾（检测器那个 askModel 就卡在
-    // 宿主回空上），所以 2/6 号默认本地答，只有手工写 `0` 才让出去。
+    // 宿主回空上），所以 2/6 号默认由我们答；答成了就等于接管成立，之后不再看开关。
     if !app_reply_ours(pending.call.code, manual_switch(), app_serving_enabled()) {
         return auto_serve_probe(&pending);
     }
     let reply = build_app_answer(&pending)?;
+    if reads_our_material(pending.call.code) && !MATERIAL_ENGAGED.swap(true, Ordering::Relaxed) {
+        log::info!(
+            "event=soter app-serve engaged by material read code={}",
+            pending.call.code
+        );
+        crate::ipc::report_event(
+            "event=soter app-serve engaged (reads our own ASK/AuthKey)".to_string(),
+        );
+    }
     let head = unsafe { std::slice::from_raw_parts(reply.data_ptr(), reply.data_size().min(16)) };
     let hex: String = head.iter().map(|byte| format!("{byte:02x}")).collect();
     info!(
@@ -3041,16 +3064,18 @@ mod tests {
         AUTO_APP_SERVE.load(Ordering::Relaxed)
     }
 
-    /// 2/6 号读的是我们自己造的料，默认就归我们答，不看接管开关；
-    /// 手工写 0 仍然能把它压住，别的号照旧看开关。
+    /// 2/6 号读的是我们自己造的料，没写过开关时默认就归我们答；手工写了 `0` 还是不接；
+    /// 接管一旦成立，开关就不参与判断了。
     #[test]
     fn reads_our_material_is_served_by_default() {
         assert!(app_reply_ours(2, None, false));
         assert!(app_reply_ours(6, None, false));
         assert!(!app_reply_ours(4, None, false));
-        assert!(app_reply_ours(4, Some(true), false));
-        assert!(!app_reply_ours(2, Some(false), true));
-        assert!(!app_reply_ours(6, Some(false), true));
+        assert!(app_reply_ours(4, None, true));
+        assert!(app_reply_ours(2, Some(true), false));
+        assert!(!app_reply_ours(2, Some(false), false));
+        // 接管成立以后手工开关不再参与
+        assert!(app_reply_ours(4, Some(false), true));
     }
 
     /// 宿主没碰 HAL 的首笔请求就接管（阈值 1）：当笔就用我们的答复顶掉，之后每笔都答。
