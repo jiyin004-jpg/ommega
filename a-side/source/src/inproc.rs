@@ -111,6 +111,21 @@ pub fn wait_ready(timeout: Duration) -> bool {
     state.services.is_some()
 }
 
+/// 根侧落的「开机已完成」标记。
+const BOOT_DONE_PATH: &str = "/data/misc/ommega/boot_done";
+
+fn boot_done_present() -> bool {
+    crate::global::boot_completed() || std::path::Path::new(BOOT_DONE_PATH).exists()
+}
+
+/// 把 early boot 结束重放给 KeyMint，幂等。
+fn replay_early_boot_ended() {
+    match crate::keymaster::maintenance::replay_early_boot_ended() {
+        Ok(()) => info!("in-process early boot ended replay done"),
+        Err(error) => warn!("failed to replay earlyBootEnded in-process: {error:#}"),
+    }
+}
+
 fn start() -> Result<HashMap<&'static str, SIBinder>> {
     let config_file = crate::config::bootstrap_config_file().context("bootstrap config")?;
 
@@ -136,23 +151,6 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
         )
     });
     boot_level_cache.context("failed to initialize boot-level key cache")?;
-
-    // early boot 结束的重放必须放在 boot level key 铸完之后：那把 key 本身是
-    // EARLY_BOOT_ONLY 的，TA 还在 early boot 里才铸得出来。反过来先重放就会变成
-    // 「boot level cache 初始化失败 → 进程内那套起不来」。
-    //
-    // 根侧（daemon-injector）在 sys.boot_completed=1 后落 boot_done；这里只看它，
-    // 不去读属性（payload 是静态链接的，read_string_property 会退到 exec resetprop）。
-    if crate::global::boot_completed()
-        || std::path::Path::new("/data/misc/ommega/boot_done").exists()
-    {
-        match crate::keymaster::maintenance::replay_early_boot_ended() {
-            Ok(()) => info!("in-process early boot ended replay done"),
-            Err(error) => {
-                warn!("failed to replay earlyBootEnded in-process: {error:#}");
-            }
-        }
-    }
 
     crate::keybox::initialize().context("failed to initialize keybox runtime")?;
     crate::repair_ommega_data_files();
@@ -186,6 +184,36 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
         .name("inproc-rpc".to_string())
         .spawn(move || serve_app_rpc(for_rpc))
         .ok();
+
+    // early boot 结束的重放放在最后一步：它要建一个 KeyMint wrapper（内部会走
+    // init_keymint_ta，用到 keybox 和 boot level cache），所以必须在
+    // boot_level_cache 和 keybox 都就绪之后 —— 放前面不但会因 boot level key
+    // 还没铸出来而让整条启动失败，也会因 keybox 未初始化而让重放自己失败。
+    //
+    // 根侧（daemon-injector）在 sys.boot_completed=1 后落 boot_done；这里只看它，
+    // 不去读属性（payload 是静态链接的，read_string_property 会退到 exec resetprop）。
+    if boot_done_present() {
+        replay_early_boot_ended();
+    } else {
+        // 开机时 keystore2 往往比注入器守护先起（实测 13:30:13 vs 13:31），这一刻
+        // boot_done 还没落。等它出现再重放，否则 early boot 状态会一直不更新，
+        // EARLY_BOOT_ONLY 的钥匙开机之后仍然能 import。
+        let spawned = std::thread::Builder::new()
+            .name("inproc-boot-wait".to_string())
+            .spawn(|| {
+                for _ in 0..300 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    if boot_done_present() {
+                        replay_early_boot_ended();
+                        return;
+                    }
+                }
+                warn!("boot_done never appeared; skipping early boot ended replay");
+            });
+        if let Err(error) = spawned {
+            warn!("failed to spawn in-process boot wait: {error}");
+        }
+    }
 
     // 心跳：daemon 靠它判断「进程内还在不在」，不看 socket 归属（回退的 HAL 也绑同一个名字）。
     std::thread::Builder::new()
