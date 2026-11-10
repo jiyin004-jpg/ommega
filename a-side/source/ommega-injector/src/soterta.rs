@@ -67,27 +67,31 @@ fn service_name() -> String {
 /// 回复的字节完全可控，没有 libbinder 自己的异常包装夹在中间。拿来对「真机 HAL 回的
 /// 长什么样」和「我们回的有没有对上」最直接。
 pub fn probe(service: &str, code: u32) -> anyhow::Result<String> {
-    use rsbinder::Parcel;
-    rsbinder::ProcessState::init("/dev/binder", 15)
-        .map_err(|error| anyhow::anyhow!("binder init failed: {error}"))?;
-    let binder = rsbinder::hub::check_service(service)
-        .ok_or_else(|| anyhow::anyhow!("service {service} not found"))?;
-    let descriptor = descriptor_of(service);
-    let mut data = Parcel::new();
-    data.write(&descriptor.to_string())?;
-    let mut reply = Parcel::new();
-    let transactable = binder
-        .as_transactable()
-        .ok_or_else(|| anyhow::anyhow!("service {service} is not transactable"))?;
-    transactable.transact(code, &mut data, &mut reply)?;
-    let status = reply.read::<i32>().unwrap_or(-999);
-    let flag = reply.read::<i32>().unwrap_or(-999);
-    let total = reply.read::<i32>().unwrap_or(-999);
-    let next = reply.read::<i32>().unwrap_or(-999);
-    Ok(format!(
-        "status={status} flag={flag} total={total} next={next} avail={}",
-        reply.data_avail()
-    ))
+    // 直接借系统自带的 `service call` 发这一笔。
+    //
+    // 为什么不在进程里自己搭 transact：两个坑都踩过 —— 原先用 `as_transactable()`，
+    // 那个在 rsbinder 里只对**本进程的 Native** 返回 Some，远程 proxy 恒 None，于是
+    // 对着活的好服务也永远报 “is not transactable”（SOTER 明明可用的机器上一样）；
+    // 改用 `as_remote()` 确实发出去了，但拿回来的是 UNKNOWN_TRANSACTION，而同一个
+    // 服务名用 `service call … 8` 就能拿到正常的 device_id。interface 头、稳定性标记、
+    // 域权限这些 `service call` 已经按 AOSP 的做法处理好了，探针只是诊断用的一次性
+    // 命令，没必要再自己复现一遍。
+    let out = std::process::Command::new("/system/bin/service")
+        .arg("call")
+        .arg(service)
+        .arg(code.to_string())
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to run service call: {error}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(anyhow::anyhow!(
+            "service call {service} {code} produced no output ({}, stderr={stderr})",
+            out.status
+        ));
+    }
+    // `service call` 打的是多行 parcel dump，拼成一行好放进日志。
+    Ok(text.lines().map(str::trim).collect::<Vec<_>>().join(" "))
 }
 
 /// 原厂 HAL 声明的 14 个号码。

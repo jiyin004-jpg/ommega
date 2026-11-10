@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use std::panic;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{ffi::CString, os::unix::fs::PermissionsExt, path::Path};
 
 use kmr_common::consts::{KEYSTORE_GID, KEYSTORE_UID};
@@ -283,6 +284,64 @@ fn peer_is_injected(pid: i32) -> bool {
             false
         }
     }
+}
+
+/// 这个错误是不是“会合点已经有人在服务了”（`EADDRINUSE`）。
+///
+/// 绑定失败的类型是 `rsbinder::StatusCode::Errno`，底下也可能包一层 io::Error，
+/// 两种都认一下。
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(rsbinder::StatusCode::Errno(errno)) =
+            cause.downcast_ref::<rsbinder::StatusCode>()
+        {
+            return *errno == libc::EADDRINUSE;
+        }
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// 抽象会合点（`ommega.soter.rpc`）一次只能有一个主人：独立 HAL 和 keystore2 里的
+/// payload 都来绑同一名字。谁先绑上谁服务，后到的那份以前直接 fatal 退出 ——
+/// keystore2 先注入了 payload 之后，keymint 就再也起不来了（实测 a1bbb566：
+/// `failed to bind ommega RPC abstract socket: Errno(-98)`，之后再也没起过）。
+/// 现在后到的那份只是不绑（app 域那边已经有人应答），主流程照跑。
+fn create_app_rpc_server() -> Result<Option<Arc<RpcServer>>> {
+    // 先给“上一份还在退出”的窗口：守护重启 keymint 时旧进程可能还没放掉这个名字。
+    const RETRIES: u32 = 20;
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+    let mut waited = false;
+    for attempt in 0..RETRIES {
+        match create_rpc_server(RpcBind::Abstract) {
+            Ok(server) => {
+                if waited {
+                    info!(
+                        "ommega RPC abstract socket came free after {} ms",
+                        attempt * 250
+                    );
+                }
+                return Ok(Some(server));
+            }
+            Err(error) if is_addr_in_use(&error) => {
+                if !waited {
+                    info!(
+                        "ommega RPC abstract socket is held by someone else; waiting up to {} ms",
+                        RETRIES * 250
+                    );
+                    waited = true;
+                }
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    info!(
+        "ommega RPC abstract socket stays held by the in-process payload; \
+         this HAL will not serve that rendezvous"
+    );
+    Ok(None)
 }
 
 fn create_rpc_server(bind: RpcBind) -> Result<Arc<RpcServer>> {
@@ -579,7 +638,7 @@ fn run() -> Result<()> {
     // keystore，而 SKRoot 的 avc 只对 root-like 放行 —— 降权后再绑会被拒，
     // 表现就是 payload 一直报 “trying the abstract socket” 却连不上。
     // 服务（add_service）仍然在降权后添加，这里只先占住 listen 端。
-    let app_server = create_rpc_server(RpcBind::Abstract)?;
+    let app_server = create_app_rpc_server()?;
     if std::env::var("OMMEGA_KEEP_ROOT").as_deref() != Ok("1") {
         set_keystore_identity()?;
     } else {
@@ -632,21 +691,25 @@ fn run() -> Result<()> {
     // the file socket (0700 keystore dir), so it connects here instead. Served by
     // its own accept loop, same wire version, same services, narrower authorizer.
     // （绑定已在降权前完成，见上面 app_server。）
-    for (name, binder) in &services {
-        app_server
-            .add_service(name, binder.clone())
-            .with_context(|| format!("failed to add ommega app RPC service {name}"))?;
-    }
-    let app_runner = Arc::clone(&app_server);
-    std::thread::spawn(move || {
-        if let Err(error) = app_runner.run() {
-            error!("ommega app RPC server stopped: {error:#}");
+    // 抽象会合点已经有主人（keystore2 里的 payload）时这里就是 None：那些服务它已经
+    // 挂上了，这一份不用重复挂。
+    if let Some(app_server) = app_server.as_ref() {
+        for (name, binder) in &services {
+            app_server
+                .add_service(name, binder.clone())
+                .with_context(|| format!("failed to add ommega app RPC service {name}"))?;
         }
-    });
-    info!(
-        "serving ommega app RPC abstract socket={}",
-        String::from_utf8_lossy(consts::RPC_ABSTRACT_NAME)
-    );
+        let app_runner = Arc::clone(app_server);
+        std::thread::spawn(move || {
+            if let Err(error) = app_runner.run() {
+                error!("ommega app RPC server stopped: {error:#}");
+            }
+        });
+        info!(
+            "serving ommega app RPC abstract socket={}",
+            String::from_utf8_lossy(consts::RPC_ABSTRACT_NAME)
+        );
+    }
 
     info!("serving ommega RPC socket={}", rpc::SOCKET);
     server.run().context("ommega RPC server stopped")?;
