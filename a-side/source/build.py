@@ -647,8 +647,8 @@ def build_combined_package(
 
         # Different ABIs land in disjoint target/<triple>/ directories with their
         # own cargo build locks, so they are safe to compile at the same time.
-        # With lto=true + codegen-units=1 the final link of each binary is
-        # single-threaded, so running the ABIs concurrently is where the wall
+        # Each ABI is still a full rebuild of the crate graph plus a link, so on
+        # a multi-core runner running the ABIs concurrently is where the wall
         # time actually goes.  Everything below (staging, zip) stays serial
         # because it writes into one shared stage directory.
         if len(abis) > 1 and not serial:

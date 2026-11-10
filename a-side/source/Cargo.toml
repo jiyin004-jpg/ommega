@@ -59,8 +59,12 @@ incremental = true
 
 [profile.release]
 opt-level = 3
-lto = true          # Enable link-time optimization
-codegen-units = 1   # Reduce number of codegen units to increase optimizations
+# 改成 thin LTO + 多代码生成单元：链接能并行，产物也能被增量复用。
+# 以前是 fat LTO + 单个生成单元，改一行就要把整张调用图重做一次链接
+# （A 端单次近两分钟，CI 四个 ABI 里大半时间都耗在这）。我们是“一次开证几十毫秒”
+# 的 HAL，抹平的那点运行时收益没意义，构建时间才是真钱。
+lto = "thin"
+codegen-units = 16
 panic = 'abort'     # Abort on panic
 strip = true        # Strip symbols from binary*
 debug = 0           # Disable debug info
