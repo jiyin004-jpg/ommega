@@ -169,6 +169,8 @@ struct Store {
     next_session: Mutex<i64>,
     /// 会话号 -> 这一次要签的挑战
     sessions: Mutex<HashMap<i64, SignSession>>,
+    /// 刚签完的会话 -> 那次签出来的信封（短存留，见 `FinishedSession`）。
+    finished: Mutex<HashMap<i64, FinishedSession>>,
     /// `{device}|{uid}` -> 这个槽位归哪一层（带时间戳，见 `SlotPin`）。
     slots: Mutex<HashMap<String, SlotPin>>,
     /// `{device}|{uid}` -> 上一次把「最近见到」刷进库的时间（节流用）。
@@ -226,17 +228,109 @@ struct SignSession {
     raw: String,
 }
 
+/// 刚签完的会话。
+///
+/// 会话本身是一次性的（`finish_sign` 一签就从 `sessions` 里拿掉），但真实世界里有两种
+/// “同一张会话再问一遍”：检测器先 init 两张会话再回头逐个 finish；客户端超时重试。
+/// 以前这种第二笔会在 handlers 那一层被判 -204（`session_expired`），App 看到就是
+/// “签名失败”，而它拿的明明是刚才那张合法会话。
+///
+/// 所以签完的答复在这里短存一份：同一张会话再问，**原样把上次那串信封还回去**
+/// —— 不重签、也不推 counter，所以不是“多签了一次”，只是幂等。过了存留期就真没了。
+struct FinishedSession {
+    requested: String,
+    device: String,
+    layer: String,
+    attk_id: Option<i64>,
+    /// 签完的时刻（毫秒）。
+    at_ms: i64,
+    /// 上次那笔的完整答复（含签名信封）。
+    reply: Value,
+}
+
+/// 签完的会话留多久。一轮开通流程里 init/finish 相隔几秒，30 秒给得够宽，
+/// 又短到不会让很久以前的会话重新“活”过来。
+const FINISHED_TTL_MS: i64 = 30 * 1000;
+/// 最多同时留几张。够了就照最旧的丢（它们已经过了正常重试窗口）。
+const FINISHED_MAX: usize = 256;
+
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// 把过期/超额的“签完会话”清一迵。调用方已经持有锁。
+fn purge_finished(map: &mut HashMap<i64, FinishedSession>, now: i64) {
+    map.retain(|_, s| now - s.at_ms <= FINISHED_TTL_MS);
+    while map.len() > FINISHED_MAX {
+        let Some(oldest) = map.iter().min_by_key(|(_, s)| s.at_ms).map(|(id, _)| *id) else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+/// 这张会话刚签过吗：命中就把它那次那串信封原样还回去。
+///
+/// 不重签也不推 counter，所以不是「多签一次」而是幂等重放。设备/层也得对得上，
+/// 同一张会话号在别的设备上问不到东西。
+fn replay_finished(session: i64, requested: &str, device_id: &str, layer: &str) -> Option<Value> {
+    let mut map = store().finished.lock().ok()?;
+    purge_finished(&mut map, now_millis());
+    let owner = map.get(&session)?;
+    (owner.requested == requested && owner.device == device_id && owner.layer == layer)
+        .then(|| owner.reply.clone())
+}
+
+/// 把这张会话签出来的答复记一笔，后面同一张会话再问就照这个还。
+fn remember_finished(
+    session: i64,
+    device_id: &str,
+    layer: &str,
+    attk_id: Option<i64>,
+    requested: &str,
+    reply: &Value,
+) {
+    let Ok(mut map) = store().finished.lock() else {
+        return;
+    };
+    let now = now_millis();
+    purge_finished(&mut map, now);
+    map.insert(
+        session,
+        FinishedSession {
+            requested: requested.to_string(),
+            device: device_id.to_string(),
+            layer: layer.to_string(),
+            attk_id,
+            at_ms: now,
+            reply: reply.clone(),
+        },
+    );
+}
+
 /// Only an exact requested-device/session owner may route a server finish.
 pub fn session_layer(requested: &str, session: i64) -> Option<String> {
     let sessions = store().sessions.lock().ok()?;
-    let owner = sessions.get(&session)?;
+    if let Some(owner) = sessions.get(&session) {
+        return (owner.requested == requested).then(|| owner.layer.clone());
+    }
+    drop(sessions);
+    let finished = store().finished.lock().ok()?;
+    let owner = finished.get(&session)?;
     (owner.requested == requested).then(|| owner.layer.clone())
 }
 
 /// 这张会话当初是哪把 ATTK 开的（`attk` 层之外的会话回 `None`）。
 pub fn session_attk(requested: &str, session: i64) -> Option<i64> {
     let sessions = store().sessions.lock().ok()?;
-    let owner = sessions.get(&session)?;
+    if let Some(owner) = sessions.get(&session) {
+        return (owner.requested == requested)
+            .then_some(owner.attk_id)
+            .flatten();
+    }
+    drop(sessions);
+    let finished = store().finished.lock().ok()?;
+    let owner = finished.get(&session)?;
     (owner.requested == requested)
         .then_some(owner.attk_id)
         .flatten()
@@ -277,6 +371,7 @@ fn store() -> &'static Store {
         counters: Mutex::new(HashMap::new()),
         next_session: Mutex::new(chrono::Utc::now().timestamp_millis()),
         sessions: Mutex::new(HashMap::new()),
+        finished: Mutex::new(HashMap::new()),
         slots: Mutex::new(load_slots()),
         owner_touch: Mutex::new(HashMap::new()),
     })
@@ -1252,13 +1347,14 @@ pub fn run_layer(
             }
             "finish_sign" => {
                 let session = body.get("session").and_then(Value::as_i64).unwrap_or(0);
+                // 请求里点名的设备（没带就用本次解析出来的那台）。init 和 finish 都要用它。
+                let requested_now = body
+                    .get("device_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(device_id);
                 let sign_session = match store().sessions.lock().ok().and_then(|mut m| {
-                    let requested = body
-                        .get("device_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or(device_id);
                     let owner = m.get(&session)?;
-                    if owner.requested != requested
+                    if owner.requested != requested_now
                         || owner.device != device_id
                         || owner.layer != layer
                     {
@@ -1267,7 +1363,12 @@ pub fn run_layer(
                     m.remove(&session)
                 }) {
                     Some(s) => s,
-                    None => return Ok(code_result(op, SESSION_UNKNOWN)),
+                    // 这张会话刚签过：检测器会连开两张再回头逐个 finish，客户端也会超时
+                    // 重试，都是同一张合法会话再问一遍。把上次那串信封原样还回去，不重签。
+                    None => match replay_finished(session, requested_now, device_id, layer) {
+                        Some(reply) => return Ok(reply),
+                        None => return Ok(code_result(op, SESSION_UNKNOWN)),
+                    },
                 };
                 // 会话里记着它当初由哪把身份开出来，这里按同一个 scope 取 AuthKey。
                 let session_scope = moment_scope(layer, sign_session.attk_id);
@@ -1292,7 +1393,18 @@ pub fn run_layer(
                     layer,
                 )?;
                 match key.sign(&document) {
-                    Ok(signature) => Ok(envelope_result(op, &document, &signature)?),
+                    Ok(signature) => {
+                        let reply = envelope_result(op, &document, &signature)?;
+                        remember_finished(
+                            session,
+                            device_id,
+                            layer,
+                            sign_session.attk_id,
+                            &sign_session.requested,
+                            &reply,
+                        );
+                        Ok(reply)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -2538,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_session_owner_is_exact_and_finish_cannot_steal_it() {
+    fn a_finished_session_still_answers_the_retry_with_the_same_envelope() {
         let device = "fallback-session-owner-test";
         run(
             "self_signed",
@@ -2556,23 +2668,54 @@ mod tests {
         assert_eq!(session_layer("other", session), None);
         assert_eq!(session_layer(device, -987654321), None);
         let finish = json!({"device_id": device, "op": "finish_sign", "session": session});
+        // 别的设备不能把这张会话拿走
         assert_eq!(
             run("self_signed", "other", &finish, None).unwrap()["error_code"],
             json!(SESSION_UNKNOWN)
         );
+        let first = run("self_signed", device, &finish, None).unwrap();
+        assert_eq!(first["error_code"], json!(0));
+        // 签完还认得：客户端重试、检测器连开两张再回头逐个收尾，都要拿到同一串信封。
+        // 这条以前是 -1000（会话一签就从表里拿掉），检测器的 T12 就这么红的。
         assert_eq!(
             session_layer(device, session).as_deref(),
             Some("self_signed")
         );
-        assert_eq!(
-            run("self_signed", device, &finish, None).unwrap()["error_code"],
-            json!(0)
+        let again = run("self_signed", device, &finish, None).unwrap();
+        assert_eq!(again, first, "重放要给同一串，不能重签、不能推 counter");
+        // 层对不上仍然拿不到签名（会话本身是自签层开的）
+        let foreign = run("keybox", device, &finish, None).unwrap();
+        assert_ne!(
+            foreign.get("error_code").and_then(Value::as_i64),
+            Some(0),
+            "别的层不该拿到签名: {foreign}"
         );
-        assert_eq!(session_layer(device, session), None);
-        assert_eq!(
-            run("self_signed", device, &finish, None).unwrap()["error_code"],
-            json!(SESSION_UNKNOWN)
-        );
+    }
+
+    #[test]
+    fn purge_finished_drops_expired_ones_and_respects_the_cap() {
+        let now = 1_700_000_000_000i64;
+        let make = |at_ms: i64| FinishedSession {
+            requested: "d".into(),
+            device: "d".into(),
+            layer: "self_signed".into(),
+            attk_id: None,
+            at_ms,
+            reply: json!({"error_code": 0}),
+        };
+        let mut map = HashMap::new();
+        map.insert(1, make(now - FINISHED_TTL_MS - 1));
+        map.insert(2, make(now - 1_000));
+        purge_finished(&mut map, now);
+        assert!(!map.contains_key(&1), "过了存留期就该真没了");
+        assert!(map.contains_key(&2));
+
+        for i in 0..(FINISHED_MAX as i64 + 10) {
+            map.insert(100 + i, make(now - i));
+        }
+        purge_finished(&mut map, now);
+        assert!(map.len() <= FINISHED_MAX, "得按条数封顶");
+        assert!(map.contains_key(&100), "丢最旧的，最新的要留着");
     }
 
     #[test]
