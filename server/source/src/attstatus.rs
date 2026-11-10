@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn chain_serials_are_decimal() {
         // 一条自签的假链，序列号是随机生的 —— 只验它转出来的是纯数字
-        let id = crate::cert::generate_self_signed("ec").unwrap();
+        let id = crate::cert::generate_self_signed("ec", 1).unwrap();
         let serials = chain_serials(&id.certificate_chain_pem);
         assert!(!serials.is_empty());
         for s in serials {

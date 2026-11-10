@@ -37,7 +37,8 @@ const OID_ORG_NAME: &[u64] = &[2, 5, 4, 10];
 const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
 /// Google keybox 那两张「TEE」中间证书用的两个属性。真机链是
 /// (title, serialNumber)，2019 年流出的公开 keybox 是反的 —— 见 `RdnShape`。
-#[cfg(test)]
+/// `title` 现在两边都用：解析时认级别（`chain_security_levels`），自签链铸链时
+/// 也靠它把级别写进中间证书。
 const OID_TITLE: &[u64] = &[2, 5, 4, 12];
 #[cfg(test)]
 const OID_SERIAL_NUMBER: &[u64] = &[2, 5, 4, 5];
@@ -1384,17 +1385,27 @@ pub struct SelfSignedIdentity {
 /// - `ec`  -> P-256 SEC1 key, self-signed ECDSA-with-SHA256 cert.
 /// - `rsa` -> 2048-bit RSA PKCS#8 key, self-signed sha256WithRSAEncryption cert.
 ///
-/// The returned chain is a single leaf certificate (subject == issuer), so it
-/// can be fed through `build_attested_chain`-style signing like a stored
-/// identity's leaf key.
-pub fn generate_self_signed(algorithm: &str) -> anyhow::Result<SelfSignedIdentity> {
+/// `level` 是这次请求的 `attestationSecurityLevel`（0 软件 / 1 TEE / 2
+/// StrongBox），会写进中间证书的 `title`。真机的链没有一条是「叶子说
+/// StrongBox、中间证书什么都不说」的；不写就等于把级别藏在叶子里，看链
+/// 的那一侧只能猜。
+pub fn generate_self_signed(algorithm: &str, level: i64) -> anyhow::Result<SelfSignedIdentity> {
     match algorithm.to_ascii_lowercase().as_str() {
-        "rsa" => generate_self_signed_rsa(),
-        _ => generate_self_signed_ec(),
+        "rsa" => generate_self_signed_rsa(level),
+        _ => generate_self_signed_ec(level),
     }
 }
 
-fn generate_self_signed_ec() -> anyhow::Result<SelfSignedIdentity> {
+/// 级别 → 中间证书 `title` 的字面值。0（软件）不标，跟 AOSP 的软件链一致。
+fn level_title(level: i64) -> Option<&'static [u8]> {
+    match level {
+        2 => Some(b"StrongBox"),
+        1 => Some(b"TEE"),
+        _ => None,
+    }
+}
+
+fn generate_self_signed_ec(level: i64) -> anyhow::Result<SelfSignedIdentity> {
     use p256::elliptic_curve::rand_core::OsRng;
 
     // Generate intermediate CA key (this will be the stored identity's key)
@@ -1406,7 +1417,7 @@ fn generate_self_signed_ec() -> anyhow::Result<SelfSignedIdentity> {
     let root_secret = p256::SecretKey::random(&mut OsRng);
     let root_key = KeyMaterial::Ec(EcKey::P256(root_secret));
 
-    let chain_pem = build_self_signed_chain(&intermediate_key, &root_key)?;
+    let chain_pem = build_self_signed_chain(&intermediate_key, &root_key, level)?;
     Ok(SelfSignedIdentity {
         private_key_pem: intermediate_pem.to_string(),
         certificate_chain_pem: chain_pem,
@@ -1414,7 +1425,7 @@ fn generate_self_signed_ec() -> anyhow::Result<SelfSignedIdentity> {
     })
 }
 
-fn generate_self_signed_rsa() -> anyhow::Result<SelfSignedIdentity> {
+fn generate_self_signed_rsa(level: i64) -> anyhow::Result<SelfSignedIdentity> {
     use pkcs8::EncodePrivateKey;
     let mut rng = rand::rngs::OsRng;
 
@@ -1427,7 +1438,7 @@ fn generate_self_signed_rsa() -> anyhow::Result<SelfSignedIdentity> {
     let root_private = rsa::RsaPrivateKey::new(&mut rng, 2048)?;
     let root_key = KeyMaterial::Rsa(Box::new(root_private));
 
-    let chain_pem = build_self_signed_chain(&intermediate_key, &root_key)?;
+    let chain_pem = build_self_signed_chain(&intermediate_key, &root_key, level)?;
     Ok(SelfSignedIdentity {
         private_key_pem: intermediate_pem.to_string(),
         certificate_chain_pem: chain_pem,
@@ -1450,6 +1461,7 @@ fn generate_self_signed_rsa() -> anyhow::Result<SelfSignedIdentity> {
 fn build_self_signed_chain(
     intermediate_key: &KeyMaterial,
     root_key: &KeyMaterial,
+    level: i64,
 ) -> anyhow::Result<String> {
     let now = chrono::Utc::now();
     let not_before = now.format("%y%m%d%H%M%SZ").to_string(); // precise now, matches Django's _generate_self_signed_cert_chain
@@ -1465,12 +1477,18 @@ fn build_self_signed_chain(
         (OID_ORG_NAME, b"Android"),
         (OID_COMMON_NAME, b"Android Root CA"),
     ]);
-    // Intermediate: C=US, O=Android, CN=Android Intermediate CA
-    let ca_name = make_name(&[
+    // Intermediate: C=US, O=Android, CN=Android Intermediate CA[, title=TEE|StrongBox]
+    // 级别只标在中间证书上：根是共用的 `Android Root CA`，真机 keybox 的根
+    // （`f92009e853b6b045`）也不带 title。
+    let mut ca_attrs: Vec<(&[u64], &[u8])> = vec![
         (OID_COUNTRY_NAME, b"US"),
         (OID_ORG_NAME, b"Android"),
         (OID_COMMON_NAME, b"Android Intermediate CA"),
-    ]);
+    ];
+    if let Some(title) = level_title(level) {
+        ca_attrs.push((OID_TITLE, title));
+    }
+    let ca_name = make_name(&ca_attrs);
 
     // ---- KeyUsage DER for CA certs (digitalSignature + keyCertSign + cRLSign) ----
     let ca_ku_der = {
@@ -2420,17 +2438,17 @@ mod bench {
 
         // --- EC key generation ---
         run_bench("EC P-256 keygen", || {
-            let _ = generate_self_signed_ec().unwrap();
+            let _ = generate_self_signed_ec(1).unwrap();
         });
 
         // --- RSA key generation ---
         run_bench("RSA 2048 keygen", || {
-            let _ = generate_self_signed_rsa().unwrap();
+            let _ = generate_self_signed_rsa(1).unwrap();
         });
 
         // --- Pre-generated keys for signing benchmarks ---
-        let ec_identity = generate_self_signed_ec().unwrap();
-        let rsa_identity = generate_self_signed_rsa().unwrap();
+        let ec_identity = generate_self_signed_ec(1).unwrap();
+        let rsa_identity = generate_self_signed_rsa(1).unwrap();
         let ec_key = parse_private_key(ec_identity.private_key_pem.as_bytes()).unwrap();
         let rsa_key = parse_private_key(rsa_identity.private_key_pem.as_bytes()).unwrap();
         let test_data = b"benchmark test data for signing operation 1234567890";
@@ -2593,6 +2611,46 @@ mod tests {
         assert_eq!(name_rdn_shape(&default_name()), None);
         assert_eq!(chain_rdn_shape(MOCK_LEAF), RdnShape::Unknown);
         assert!(!RdnShape::Unknown.is_legacy());
+    }
+
+    /// 自签链的中间证书要带上请求的级别。叶子写着 StrongBox、中间证书什么都不
+    /// 说，看链的那一侧就只能当它没标（真机的链从来没有这个形状）；库里的身份
+    /// 也因为这条而按错级别被挑来用。
+    #[test]
+    fn self_signed_chain_stamps_the_requested_level() {
+        let tee = generate_self_signed("ec", 1).unwrap();
+        assert_eq!(chain_security_level(&tee.certificate_chain_pem), Some(1));
+        assert_eq!(
+            chain_security_levels(&tee.certificate_chain_pem),
+            vec!["TEE".to_string()]
+        );
+
+        let sb = generate_self_signed("rsa", 2).unwrap();
+        assert_eq!(chain_security_level(&sb.certificate_chain_pem), Some(2));
+        assert_eq!(
+            chain_security_levels(&sb.certificate_chain_pem),
+            vec!["StrongBox".to_string()]
+        );
+
+        // 软件级（0）不标，跟 AOSP 的软件链一致。
+        let sw = generate_self_signed("ec", 0).unwrap();
+        assert_eq!(chain_security_level(&sw.certificate_chain_pem), None);
+        assert!(chain_security_levels(&sw.certificate_chain_pem).is_empty());
+
+        // 直接看中间证书的 subject DER，不经我们自己的 OID 过滤：标题真的写进去了。
+        let ders = parse_chain_pem(&sb.certificate_chain_pem).unwrap();
+        let (_, ca) = x509_parser::parse_x509_certificate(&ders[0]).unwrap();
+        assert!(
+            ca.subject().as_raw().windows(9).any(|w| w == b"StrongBox"),
+            "中间证书的 subject 里没有 StrongBox"
+        );
+        // 根不标级别（真机 keybox 的根也不带 title）。
+        let (_, root) = x509_parser::parse_x509_certificate(&ders[1]).unwrap();
+        assert!(!root
+            .subject()
+            .as_raw()
+            .windows(9)
+            .any(|w| w == b"StrongBox"));
     }
 
     /// 链上标的级别（title 属性）→ KeyMint 数字，没标就是 None。
@@ -3227,7 +3285,7 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
 
     #[test]
     fn chain_dispatch_reads_the_asn1_extension() {
-        let identity = generate_self_signed("ec").unwrap();
+        let identity = generate_self_signed("ec", 1).unwrap();
         let params = AttestationParams {
             challenge: vec![0x01, 0x02],
             root_of_trust: Some(RootOfTrust {
@@ -3408,7 +3466,7 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
 
     #[test]
     fn asn1_chain_exposes_the_attestation_application_id() {
-        let identity = generate_self_signed("ec").unwrap();
+        let identity = generate_self_signed("ec", 1).unwrap();
         let with_aaid = AttestationParams {
             challenge: vec![0x01],
             app_id: Some(aaid_der("org.ommega.deviceb", 12)),

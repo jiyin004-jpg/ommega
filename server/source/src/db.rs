@@ -319,8 +319,11 @@ impl Db {
     ///
     /// 兜底专用。以前兜底走 `get_any_usable_identity`，不看级别：库里既存了 TEE
     /// 的一份又存了 StrongBox 的一份时，TEE 请求可能拿到 StrongBox 的链，级别就
-    /// 串了（实测 level=1 请求返回 `O=StrongBox`）。没标级别的链（软件 / 自签 / 老
-    /// keybox）也算 TEE，跟 AOSP 语义一致。
+    /// 串了（实测 level=1 请求返回 `O=StrongBox`）。
+    ///
+    /// 没标级别的链（软件链 / 自签链 / 老 keybox）现在**排在后面**：它是软件
+    /// 级的东西，配一把写着 TEE 的叶子自己就矛盾，所以只有库里真的没有标了
+    /// 同级别的身份时才拿它顶（老行为是直接当 TEE 用）。
     ///
     /// 排序跟 `get_any_usable_identity` 一样（自动采集的优先、新的优先），只是多
     /// 了一道级别过滤；同一份库里挑到的结果稳定。
@@ -336,13 +339,35 @@ impl Db {
              ORDER BY (machine_id LIKE 'auto%') DESC, created_at DESC, device_id",
             (),
         )?;
+        let mut untagged: Option<DeviceIdentity> = None;
         for r in rows {
             let mut d = Self::device_identity_from_row(r)?;
-            let is_strongbox =
-                crate::cert::chain_security_level(&d.certificate_chain_pem) == Some(2);
-            if is_strongbox != want_strongbox {
-                continue;
+            match crate::cert::chain_security_level(&d.certificate_chain_pem) {
+                Some(2) => {
+                    if !want_strongbox {
+                        continue;
+                    }
+                }
+                Some(_) => {
+                    if want_strongbox {
+                        continue;
+                    }
+                }
+                None => {
+                    if want_strongbox {
+                        continue;
+                    }
+                    if untagged.is_none() {
+                        untagged = Some(d);
+                    }
+                    continue;
+                }
             }
+            d.private_key_pem_cipher =
+                crate::crypto::decrypt_private_pem(&d.private_key_pem_cipher);
+            return Ok(Some(d));
+        }
+        if let Some(mut d) = untagged {
             d.private_key_pem_cipher =
                 crate::crypto::decrypt_private_pem(&d.private_key_pem_cipher);
             return Ok(Some(d));

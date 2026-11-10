@@ -159,10 +159,10 @@ pub struct Fulfill {
     /// One generation gate per logical alias, shared across device/request
     /// snapshots and fallback layers. Weak entries do not retain idle gates.
     attest_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    /// Cache of generated self-signed identities per (device_id, algorithm) so
-    /// a device without a stored identity doesn't regenerate a fresh key (RSA
-    /// keygen is slow) on every attestation.
-    self_signed_cache: Mutex<HashMap<(String, String), DeviceIdentity>>,
+    /// Cache of generated self-signed identities per (device_id, algorithm, level)
+    /// so a device without a stored identity doesn't regenerate a fresh key (RSA
+    /// keygen is slow) on every attestation. 级别进键是因为链上标的级别不同。
+    self_signed_cache: Mutex<HashMap<(String, String, i64), DeviceIdentity>>,
     pub db: Option<Arc<Db>>,
     /// 要长期保留的状态全在这一个 SQLite 文件里（会话语义今天还是内存 map 权威，
     /// 这里只做写穿 + 启动装载）。
@@ -1051,16 +1051,24 @@ impl Fulfill {
             .collect()
     }
 
-    /// Generate (and cache per device+algorithm) a server self-signed identity.
-    /// Used as the extreme-case layer-3 fallback when neither a B device nor a
-    /// stored identity can fulfil a request.
-    fn self_signed_for(&self, device_id: &str, algorithm: &str) -> Option<DeviceIdentity> {
-        let key = (device_id.to_string(), algorithm.to_string());
+    /// Generate (and cache per device+algorithm+level) a server self-signed
+    /// identity.  Used as the extreme-case layer-3 fallback when neither a B
+    /// device nor a stored identity can fulfil a request.
+    ///
+    /// 缓存键里带了级别：同一台设备先要 TEE 再要 StrongBox，两条链的中间证书
+    /// 标的级别不一样，共用一份就会把级别串掉。
+    fn self_signed_for(
+        &self,
+        device_id: &str,
+        algorithm: &str,
+        level: i64,
+    ) -> Option<DeviceIdentity> {
+        let key = (device_id.to_string(), algorithm.to_string(), level);
         let mut cache = crate::util::mu(&self.self_signed_cache);
         if let Some(id) = cache.get(&key) {
             return Some(id.clone());
         }
-        let generated = crate::cert::generate_self_signed(algorithm).ok()?;
+        let generated = crate::cert::generate_self_signed(algorithm, level).ok()?;
         let id = DeviceIdentity {
             device_id: device_id.to_string(),
             algorithm: generated.algorithm,
@@ -1216,22 +1224,29 @@ impl Fulfill {
             // 兜底那一步（`get_any_usable_identity`）以前不看级别：库里同时有 TEE 和
             // StrongBox 两份时，TEE 请求会拿到 StrongBox 的链，级别就串了。这里拦一道：
             // 拿到的是 StrongBox 就不用它，换一份同级别（无标 / TEE）的；换不到就报错。
-            let wrong_level = found
+            // 反方向也要拦：没标级别的链（软件链 / 自签链）绝不能配一把写着 StrongBox 的叶子。
+            let want_strongbox = level >= 2;
+            let got_level = found
                 .as_ref()
-                .map(|i| cert::chain_security_level(&i.certificate_chain_pem) == Some(2))
-                .unwrap_or(false);
+                .map(|i| cert::chain_security_level(&i.certificate_chain_pem).unwrap_or(0));
+            let wrong_level = matches!(got_level, Some(l) if (l == 2) != want_strongbox);
             if wrong_level {
+                let want = if want_strongbox { "StrongBox" } else { "TEE" };
                 tracing::warn!(
-                    "server_keybox: level={level} 挑中的身份是 StrongBox 级别，改挑一份 TEE 的（请求 device={device_id}）"
+                    "server_keybox: level={level} 挑中的身份级别是 {got_level:?}，改挑一份 {want} 的（请求 device={device_id}）"
                 );
-                match self.identity_any_for_level(false) {
+                match self.identity_any_for_level(want_strongbox) {
                     Some(alt) => alt,
                     None => {
                         return Some(json!({
                             "error": format!(
-                                "server_keybox: level={level} 需要 TEE 身份，但库里没有同级别的（请求 device={lookup_id}）"
+                                "server_keybox: level={level} 需要 {want} 身份，但库里没有同级别的（请求 device={lookup_id}）"
                             ),
-                            "relay_error_kind": "tee_identity_missing",
+                            "relay_error_kind": if want_strongbox {
+                                "strongbox_identity_missing"
+                            } else {
+                                "tee_identity_missing"
+                            },
                         }));
                     }
                 }
@@ -1259,7 +1274,13 @@ impl Fulfill {
             .cloned()
             .unwrap_or(Value::Null);
         let algorithm = Self::ctx_algorithm_str(&ctx);
-        let identity = match self.self_signed_for(device_id, &algorithm) {
+        // 自签链的中间证书要跟着请求的级别走，否则一条叶子写 StrongBox、
+        // 中间证书什么级别都不写的链，看链的那一侧只能当它没标。
+        let level = ctx
+            .get("attestation_security_level")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let identity = match self.self_signed_for(device_id, &algorithm, level) {
             Some(id) => id,
             None => {
                 return Some(json!({
@@ -1926,7 +1947,7 @@ mod tests {
     fn cached_leaf_algorithm_mismatch_is_rejected_without_replacement() {
         let f = fulfill();
         for (cached, requested) in [("ec", cert::KM_ALG_RSA), ("rsa", cert::KM_ALG_EC)] {
-            let material = cert::generate_self_signed(cached).unwrap();
+            let material = cert::generate_self_signed(cached, 1).unwrap();
             let mut original = session(&material.private_key_pem);
             original.chain_pem = material.certificate_chain_pem;
             crate::util::mu(&f.inner)
@@ -1964,7 +1985,7 @@ mod tests {
             // Matching private-key algorithm alone is insufficient: the chain
             // leaf must match that key too.
             let other =
-                cert::generate_self_signed(if cached == "ec" { "rsa" } else { "ec" }).unwrap();
+                cert::generate_self_signed(if cached == "ec" { "rsa" } else { "ec" }, 1).unwrap();
             crate::util::mu(&f.inner)
                 .sessions
                 .get_mut("legacy-alias")
@@ -1986,7 +2007,7 @@ mod tests {
     #[test]
     fn loaded_session_is_reused_and_expired_session_is_recreated() {
         let f = fulfill();
-        let material = cert::generate_self_signed("ec").unwrap();
+        let material = cert::generate_self_signed("ec", 1).unwrap();
         let mut old = session(&material.private_key_pem);
         old.chain_pem = material.certificate_chain_pem;
         old.created_epoch_ms -= 1000;
@@ -2036,8 +2057,8 @@ mod tests {
     #[test]
     fn cached_session_is_rebuilt_when_the_level_changes() {
         let f = fulfill();
-        // 用真实链：自签链没标级别，按 TEE 算（跟 AOSP 语义一致）。
-        let material = cert::generate_self_signed("ec").unwrap();
+        // 用真实链。
+        let material = cert::generate_self_signed("ec", 1).unwrap();
         let tee_chain = material.certificate_chain_pem.clone();
         let mut tee = session(&material.private_key_pem);
         tee.chain_pem = tee_chain.clone();
@@ -2068,7 +2089,7 @@ mod tests {
     #[test]
     fn cold_session_is_read_back_from_the_db_and_touched() {
         let f = fulfill();
-        let material = cert::generate_self_signed("ec").unwrap();
+        let material = cert::generate_self_signed("ec", 1).unwrap();
         // 10 分钟前用过：没到 7 天 TTL，但超出「顶时间」的节流窗，能被看出去
         let old = Utc::now().timestamp_millis() as u64 - 10 * 60 * 1000;
         let row = crate::statedb::SessionRow {
