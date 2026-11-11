@@ -16,6 +16,51 @@ const IMEI_PROPERTIES: &[&str] = &[
     "persist.vendor.radio.imei1",
 ];
 
+/// IMEI1 专用的属性名（比 `IMEI_PROPERTIES` 更精确：那张表里可能拿到 IMEI2）。
+const IMEI1_PROPERTIES: &[&str] = &[
+    "persist.radio.imei1",
+    "ro.ril.oem.imei1",
+    "ro.vendor.oem.imei1",
+    "persist.vendor.radio.imei1",
+    "ro.ril.miui.imei0",
+];
+
+/// 私卡绑定用的 IMEI1。
+///
+/// 为什么要它：序列号（`ro.serialno`）是伪装层会改写的可写属性，而 IMEI1 是硬件
+/// 写死、几乎改不动的 —— 服务端拿它当私卡的第二个稳定指标，两个里任意一个对得上
+/// 就算同一台机器。
+///
+/// 先读属性（快、不碰 binder），拿不到再问 telephony；两边都没有就返回空串，
+/// 服务端会把空项当“这次没报”，不会当成不匹配。
+pub fn imei1() -> String {
+    for name in IMEI1_PROPERTIES
+        .iter()
+        .chain(IMEI_PROPERTIES.iter())
+        .copied()
+    {
+        if let Some(value) = read_string_property(name) {
+            let value = value.trim();
+            if is_usable_identifier(value) {
+                return value.to_string();
+            }
+        }
+    }
+    match runtime_get_imei_for_slot(0) {
+        Ok(Some(value)) if is_usable_identifier(value.trim()) => value.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 能当绑定材料用吗：去掉 AOSP 读不到时给的占位值，并限定为 8~24 位 ASCII
+/// 字母数字（IMEI 15 位数字，MEID 十四位十六进制，部分 ROM 会带后缀）。
+fn is_usable_identifier(value: &str) -> bool {
+    if value.is_empty() || value.eq_ignore_ascii_case("unknown") || value == "0" {
+        return false;
+    }
+    (8..=24).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 const IMEI2_PROPERTIES: &[&str] = &[
     "ro.ril.oem.imei2",
     "persist.radio.imei2",

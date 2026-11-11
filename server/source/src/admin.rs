@@ -580,6 +580,7 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
                     "pair_id": t.pair_id,
                     "bound_serial": t.bound_serial,
                     "bound_sn": t.bound_sn,
+                    "bound_imei": t.bound_imei,
                     "bound_at": t.bound_at,
                 })
             })
@@ -630,14 +631,15 @@ pub async fn admin_token_unbind(
             .ok_or("token not found")?;
         db2.unbind_token_device(&token2)
             .map_err(|e| format!("db error: {e}"))?;
-        Ok::<_, String>((row.bound_serial, row.bound_sn))
+        Ok::<_, String>((row.bound_serial, row.bound_sn, row.bound_imei))
     })
     .await;
     match result {
-        Ok(Ok((serial, sn))) => Json(json!({
+        Ok(Ok((serial, sn, imei))) => Json(json!({
             "status": "ok",
             "released_serial": serial,
             "released_sn": sn,
+            "released_imei": imei,
         }))
         .into_response(),
         Ok(Err(e)) => json_err(StatusCode::NOT_FOUND, &e),

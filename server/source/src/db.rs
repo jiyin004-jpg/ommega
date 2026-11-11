@@ -128,6 +128,9 @@ pub struct ApiTokenRow {
     pub bound_serial: String,
     /// 首次激活时绑定的设备 SN（`ro.boot.serialno`）。空 = 还没绑定。
     pub bound_sn: String,
+    /// 首次激活时绑定的 IMEI1。硬件写死、基本改不动，跟 `bound_sn` 互为兵备；
+    /// 任意一项对得上就算同一台机器。空 = 当时没读到。
+    pub bound_imei: String,
     /// 绑定的时间（北京时间字符串）。
     pub bound_at: String,
 }
@@ -703,6 +706,7 @@ impl Db {
             kind: row_str(&row, "kind"),
             bound_serial: row_str(&row, "bound_serial"),
             bound_sn: row_str(&row, "bound_sn"),
+            bound_imei: row_str(&row, "bound_imei"),
             bound_at: row_str(&row, "bound_at"),
         })
     }
@@ -751,7 +755,7 @@ impl Db {
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
                     created_at, last_ip, last_used_at, pair_id, kind,
-                    bound_serial, bound_sn, bound_at
+                    bound_serial, bound_sn, bound_imei, bound_at
              FROM api_token ORDER BY id DESC",
             (),
         )?;
@@ -768,7 +772,7 @@ impl Db {
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
                     created_at, last_ip, last_used_at, pair_id, kind,
-                    bound_serial, bound_sn, bound_at
+                    bound_serial, bound_sn, bound_imei, bound_at
              FROM api_token WHERE token = :token LIMIT 1",
             params! {
                 "token" => token,
@@ -785,15 +789,22 @@ impl Db {
     /// 用 `WHERE bound_serial IS NULL OR bound_serial = ''` 做乐观锁，两台设备
     /// 同时首次请求时只有一台能绑上；另一台会拿到 `Ok(false)`，由调用方回库
     /// 复核并按「不匹配」当场拒绝 —— 这正是想要的：卡密跟着第一台设备走。
-    pub fn bind_token_device(&self, token: &str, serial: &str, sn: &str) -> anyhow::Result<bool> {
+    pub fn bind_token_device(
+        &self,
+        token: &str,
+        serial: &str,
+        sn: &str,
+        imei: &str,
+    ) -> anyhow::Result<bool> {
         let mut conn = self.conn()?;
         conn.exec_drop(
             "UPDATE api_token
-                SET bound_serial = :serial, bound_sn = :sn, bound_at = NOW()
+                SET bound_serial = :serial, bound_sn = :sn, bound_imei = :imei, bound_at = NOW()
               WHERE token = :token AND (bound_serial IS NULL OR bound_serial = '')",
             params! {
                 "serial" => serial,
                 "sn" => sn,
+                "imei" => imei,
                 "token" => token,
             },
         )?;
@@ -805,7 +816,7 @@ impl Db {
         let mut conn = self.conn()?;
         conn.exec_drop(
             "UPDATE api_token
-                SET bound_serial = NULL, bound_sn = NULL, bound_at = NULL
+                SET bound_serial = NULL, bound_sn = NULL, bound_imei = NULL, bound_at = NULL
               WHERE token = :token",
             params! { "token" => token },
         )?;
@@ -818,15 +829,22 @@ impl Db {
     /// `props.conf` 重写；`ro.boot.serialno`（`sn`）是只读的，鉴权以它为准。
     /// `sn` 对得上、`serial` 变了时只更新指纹，不动 `activated_at`、有效期和
     /// `bound_at`（第一次绑定的时间保持原样）。
-    pub fn refresh_token_device(&self, token: &str, serial: &str, sn: &str) -> anyhow::Result<()> {
+    pub fn refresh_token_device(
+        &self,
+        token: &str,
+        serial: &str,
+        sn: &str,
+        imei: &str,
+    ) -> anyhow::Result<()> {
         let mut conn = self.conn()?;
         conn.exec_drop(
             "UPDATE api_token
-                SET bound_serial = :serial, bound_sn = :sn
+                SET bound_serial = :serial, bound_sn = :sn, bound_imei = :imei
               WHERE token = :token",
             params! {
                 "serial" => serial,
                 "sn" => sn,
+                "imei" => imei,
                 "token" => token,
             },
         )?;
@@ -851,6 +869,10 @@ impl Db {
             (
                 "bound_sn",
                 "ALTER TABLE api_token ADD COLUMN bound_sn VARCHAR(64) NULL",
+            ),
+            (
+                "bound_imei",
+                "ALTER TABLE api_token ADD COLUMN bound_imei VARCHAR(64) NULL",
             ),
             (
                 "bound_at",

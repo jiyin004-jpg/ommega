@@ -37,13 +37,16 @@ pub struct TokenMeta {
 pub struct DeviceFp {
     pub serial: String,
     pub sn: String,
+    /// IMEI1（`persist.radio.imei1` 一类）。硬件写死、改不动，比序列号更适合作绑定材料。
+    pub imei: String,
 }
 
 impl DeviceFp {
-    /// 两项都读不到（或只有 AOSP 的占位值）才算没有指纹。
+    /// 三项都读不到（或只有 AOSP 的占位值）才算没有指纹。
     pub fn is_empty(&self) -> bool {
         AuthState::fingerprint_part(&self.serial).is_empty()
             && AuthState::fingerprint_part(&self.sn).is_empty()
+            && AuthState::fingerprint_part(&self.imei).is_empty()
     }
 }
 
@@ -453,12 +456,14 @@ impl AuthState {
                         && !self.device_binding_ok(db, &row, fp)
                     {
                         tracing::warn!(
-                            "check_token: device mismatch token={} bound=({},{}) got=({},{})",
+                            "check_token: device mismatch token={} bound=({},{},{}) got=({},{},{})",
                             token,
                             row.bound_serial,
                             row.bound_sn,
+                            row.bound_imei,
                             fp.map(|f| f.serial.as_str()).unwrap_or("-"),
-                            fp.map(|f| f.sn.as_str()).unwrap_or("-")
+                            fp.map(|f| f.sn.as_str()).unwrap_or("-"),
+                            fp.map(|f| f.imei.as_str()).unwrap_or("-")
                         );
                         return false;
                     }
@@ -532,19 +537,21 @@ impl AuthState {
     ) -> bool {
         let bound_serial = row.bound_serial.trim();
         let bound_sn = row.bound_sn.trim();
+        let bound_imei = row.bound_imei.trim();
 
-        if bound_serial.is_empty() && bound_sn.is_empty() {
+        if bound_serial.is_empty() && bound_sn.is_empty() && bound_imei.is_empty() {
             let Some(fp) = fp else { return true };
             if fp.is_empty() {
                 return true;
             }
-            match db.bind_token_device(&row.token, &fp.serial, &fp.sn) {
+            match db.bind_token_device(&row.token, &fp.serial, &fp.sn, &fp.imei) {
                 Ok(true) => {
                     // 把缓存更新成已绑定：本机在这 10 秒里再请求时不会拿旧行
                     // 去撞自己的绑定，也就不会被误判成“抢输了”。
                     let mut bound = row.clone();
                     bound.bound_serial = fp.serial.clone();
                     bound.bound_sn = fp.sn.clone();
+                    bound.bound_imei = fp.imei.clone();
                     self.remember_token(&row.token, &bound);
                     true
                 }
@@ -553,7 +560,12 @@ impl AuthState {
                     // 绑定为准（直接查库，绕过可能仍然陈旧的缓存）。
                     match db.get_api_token(&row.token) {
                         Ok(Some(fresh)) => {
-                            let ok = Self::bounds_match(&fresh.bound_serial, &fresh.bound_sn, fp);
+                            let ok = Self::bounds_match(
+                                &fresh.bound_serial,
+                                &fresh.bound_sn,
+                                &fresh.bound_imei,
+                                fp,
+                            );
                             if ok {
                                 self.remember_token(&row.token, &fresh);
                             }
@@ -576,38 +588,47 @@ impl AuthState {
             }
         } else {
             // 已绑定的卡却不报指纹：只能当不匹配，不然换个客户端不带 header 就绕过了。
-            let Some(fp) = fp.filter(|fp| Self::bounds_match(bound_serial, bound_sn, fp)) else {
+            let Some(fp) =
+                fp.filter(|fp| Self::bounds_match(bound_serial, bound_sn, bound_imei, fp))
+            else {
                 return false;
             };
-            // 指纹对上了，但可写的那一半（`ro.serialno`）跟绑定时的值不一样：说明是
-            // 同一台机器（`ro.boot.serialno` 没变）重启后换了伪装串号。把库里的记录
-            // 跟到当前值 —— 否则控制台和 /card 页面会一直显示第一次绑定的旧串号，
-            // 用户以为卡被别人占了。某项这次没报（空）就保留库里原来的值，别把
-            // 唯一的稳定项抹掉。
+            // 指纹对上了，但上报值跟库里不完全一样：把**库里缺的那几项补上**。
+            // `serial`（`ro.serialno`）是可写的伪装串号，跟到当前值；`sn` / `imei`
+            // 是硬件项，只补空、不拿新值盖旧值（同 sn 装过不同设备的 sim 模块不常见，
+            // 但真碰上时宁可保留首次绑定的那个）。
             let new_serial = if fp.serial.trim().is_empty() {
                 bound_serial.to_string()
             } else {
                 fp.serial.clone()
             };
-            let new_sn = if fp.sn.trim().is_empty() {
-                bound_sn.to_string()
-            } else {
+            let new_sn = if bound_sn.is_empty() {
                 fp.sn.clone()
+            } else {
+                bound_sn.to_string()
             };
-            if new_serial != bound_serial || new_sn != bound_sn {
-                match db.refresh_token_device(&row.token, &new_serial, &new_sn) {
+            let new_imei = if bound_imei.is_empty() {
+                fp.imei.clone()
+            } else {
+                bound_imei.to_string()
+            };
+            if new_serial != bound_serial || new_sn != bound_sn || new_imei != bound_imei {
+                match db.refresh_token_device(&row.token, &new_serial, &new_sn, &new_imei) {
                     Ok(()) => {
                         let mut current = row.clone();
                         current.bound_serial = new_serial;
                         current.bound_sn = new_sn;
+                        current.bound_imei = new_imei;
                         self.remember_token(&row.token, &current);
                         tracing::info!(
-                            "check_token: refreshed device fingerprint token={} was=({},{}) now=({},{})",
+                            "check_token: refreshed device fingerprint token={} was=({},{},{}) now=({},{},{})",
                             row.token,
                             bound_serial,
                             bound_sn,
+                            bound_imei,
                             current.bound_serial.trim(),
-                            current.bound_sn.trim()
+                            current.bound_sn.trim(),
+                            current.bound_imei.trim()
                         );
                     }
                     Err(e) => {
@@ -624,30 +645,33 @@ impl AuthState {
 
     /// 已绑定行与本次上报的指纹是否一致。
     ///
-    /// **稳定项优先**：两边都有 `sn`（`ro.boot.serialno`，只读）时只比 `sn`，
-    /// `serial` 变了也不拦。A 端开机后会用 `remote_identity` / `props.conf` 重写
-    /// `ro.serialno`，以前两个字段都要求相等，等于每次重启都把私卡判成「换了设备」，
-    /// 运营只能手动解绑再让用户重绑 —— 也就是看到的「重启后从绑定变成未绑定」。
+    /// **任一稳定项对得上就算同一台**：`sn`（`ro.boot.serialno`，只读）和
+    /// `imei`（IMEI1，硬件写死）任意一项相等就放行 —— IMEI 基本改不动，是私卡
+    /// 最适合的绑定材料；序列号在部分机器上会被伪装层改写，两者互为兵备。
+    /// 可写的 `serial`（`ro.serialno`）只在前两项都拿不到时倒背。
     ///
-    /// 退回规则：
-    /// - 旧行没记 `sn`，或这台机器读不到 `ro.boot.serialno`：比可写的 `serial`；
-    /// - 两边都空（或只有占位值 `unknown`）：绝不命中，没有指纹不能当匹配。
-    fn bounds_match(bound_serial: &str, bound_sn: &str, fp: &DeviceFp) -> bool {
-        let bound_serial = Self::fingerprint_part(bound_serial);
-        let bound_sn = Self::fingerprint_part(bound_sn);
-        let serial = Self::fingerprint_part(&fp.serial);
-        let sn = Self::fingerprint_part(&fp.sn);
-        if (bound_serial.is_empty() && bound_sn.is_empty()) || (serial.is_empty() && sn.is_empty())
-        {
-            return false;
-        }
-        if !bound_sn.is_empty() && !sn.is_empty() {
-            return sn == bound_sn;
-        }
-        if !bound_serial.is_empty() && !serial.is_empty() {
-            return serial == bound_serial;
-        }
-        false
+    /// 旧行只记了其中一项、或者这台机器只报得出一项时，就按“两边都非空的那些项”
+    /// 比：有一项相等就过。两边没有任何可比项（包括全空、或只有占位值
+    /// `unknown`）绝不命中 —— 没有指纹不能当匹配。
+    fn bounds_match(bound_serial: &str, bound_sn: &str, bound_imei: &str, fp: &DeviceFp) -> bool {
+        let pairs = [
+            (
+                Self::fingerprint_part(bound_sn),
+                Self::fingerprint_part(&fp.sn),
+            ),
+            (
+                Self::fingerprint_part(bound_imei),
+                Self::fingerprint_part(&fp.imei),
+            ),
+            (
+                Self::fingerprint_part(bound_serial),
+                Self::fingerprint_part(&fp.serial),
+            ),
+        ];
+        // 两边都非空的项里，有任意一对相等就算命中。
+        pairs
+            .iter()
+            .any(|(bound, got)| !bound.is_empty() && !got.is_empty() && bound == got)
     }
 
     /// 指纹里的一项去掉空白，顺手把 AOSP 读不到序列号时给的占位值当空处理 ——
@@ -928,45 +952,70 @@ mod allows_tests {
 mod binding_tests {
     use super::{AuthState, DeviceFp};
 
-    fn fp(serial: &str, sn: &str) -> DeviceFp {
+    fn fp(serial: &str, sn: &str, imei: &str) -> DeviceFp {
         DeviceFp {
             serial: serial.to_string(),
             sn: sn.to_string(),
+            imei: imei.to_string(),
         }
     }
 
-    /// 绑定后只认同一台设备：稳定项（`ro.boot.serialno`）对得上就算同一台，
+    /// 绑定后只认同一台设备：`sn` / `imei` 任意一项对得上就算同一台，
     /// 可写项（`ro.serialno`）被伪装改掉也不拦；旧行只记了一项时只比那一项。
     #[test]
     fn bound_fingerprint_matches_field_wise() {
-        let current = fp("SN1", "SN2");
-        assert!(AuthState::bounds_match("SN1", "SN2", &current));
-        assert!(AuthState::bounds_match("SN1", "", &current));
-        assert!(AuthState::bounds_match("", "SN2", &current));
-        // 重启后 ro.serialno 换了值，ro.boot.serialno 没变：同一台机器，放行。
-        assert!(AuthState::bounds_match("OLD", "SN2", &current));
-        // 换了设备：boot serial 变了就必须拒绝，哪怕可写项碰巧一样。
-        assert!(!AuthState::bounds_match("SN1", "OTHER", &current));
-        assert!(!AuthState::bounds_match("OTHER", "OTHER", &current));
-        // 旧行没有 sn 时退回比 serial。
-        assert!(!AuthState::bounds_match("OLD", "", &current));
+        let current = fp("SN1", "BOOT1", "860000000000001");
+        assert!(AuthState::bounds_match(
+            "SN1",
+            "BOOT1",
+            "860000000000001",
+            &current
+        ));
+        // 只记了可写串号：比串号
+        assert!(AuthState::bounds_match("SN1", "", "", &current));
+        // 只记了 boot serial：比 boot serial
+        assert!(AuthState::bounds_match("", "BOOT1", "", &current));
+        // 只记了 IMEI：比 IMEI（硬件项，重启/伪装都不变）
+        assert!(AuthState::bounds_match("", "", "860000000000001", &current));
+        // 重启后 ro.serialno 换了值，boot serial 没变：同一台机器，放行。
+        assert!(AuthState::bounds_match("OLD", "BOOT1", "", &current));
+        // 换了设备：没有任何一项对得上就必须拒绕。
+        assert!(!AuthState::bounds_match(
+            "OTHER",
+            "OTHERBOOT",
+            "860000000000999",
+            &current
+        ));
+        // boot serial 变了但 IMEI 没变：还是同一台（任一稳定项对得上即可）。
+        assert!(AuthState::bounds_match(
+            "",
+            "OTHERBOOT",
+            "860000000000001",
+            &current
+        ));
     }
 
     /// 未绑定行、以及已绑定卡不带指纹的请求，都必须判为不匹配：
     /// 前者不能在这个分支里被当成命中，后者不能靠省略 header 绕过。
     #[test]
     fn empty_side_never_matches() {
-        let current = fp("SN1", "SN2");
-        assert!(!AuthState::bounds_match("", "", &current));
-        assert!(!AuthState::bounds_match("SN1", "SN2", &fp("", "")));
+        let current = fp("SN1", "BOOT1", "860000000000001");
+        assert!(!AuthState::bounds_match("", "", "", &current));
+        assert!(!AuthState::bounds_match(
+            "SN1",
+            "BOOT1",
+            "860000000000001",
+            &fp("", "", "")
+        ));
         // AOSP 读不到序列号时的占位值不能当指纹用，否则两台都报 unknown 的
         // 机器会互相命中。
         assert!(DeviceFp::default().is_empty());
-        assert!(fp("unknown", " unknown ").is_empty());
+        assert!(fp("unknown", " unknown ", "0").is_empty());
         assert!(!AuthState::bounds_match(
             "unknown",
             "unknown",
-            &fp("unknown", "unknown")
+            "unknown",
+            &fp("unknown", "unknown", "unknown")
         ));
     }
 }

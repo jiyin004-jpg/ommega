@@ -56,6 +56,7 @@ fn device_fp_from_headers(headers: &HeaderMap) -> crate::auth::DeviceFp {
     crate::auth::DeviceFp {
         serial: get("x-device-serial"),
         sn: get("x-device-sn"),
+        imei: get("x-device-imei"),
     }
 }
 

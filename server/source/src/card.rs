@@ -596,6 +596,7 @@ pub async fn card_lookup(
         "duration_seconds": row.duration_seconds,
         "bound_serial": row.bound_serial,
         "bound_sn": row.bound_sn,
+        "bound_imei": row.bound_imei,
         "bound_at": row.bound_at,
         "last_ip": row.last_ip,
         "last_used_at": row.last_used_at,
@@ -629,7 +630,7 @@ pub async fn card_unbind(
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "卡密不存在"),
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
     };
-    if row.bound_serial.is_empty() && row.bound_sn.is_empty() {
+    if row.bound_serial.is_empty() && row.bound_sn.is_empty() && row.bound_imei.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "这张卡还没有绑定设备");
     }
     match db.unbind_token_device(token) {
@@ -638,6 +639,7 @@ pub async fn card_unbind(
             "message": "已解绑，下次使用会绑定到新的设备",
             "released_serial": row.bound_serial,
             "released_sn": row.bound_sn,
+            "released_imei": row.bound_imei,
         }))
         .into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
