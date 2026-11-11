@@ -27,6 +27,12 @@ pub struct TokenMeta {
 ///
 /// A 端私卡首次成功鉴权时把这两个值写进 `api_token`，之后每次请求
 /// 必须跟已绑定的一致，换设备就过不去（要换机器得先在 /card 页面解绑）。
+///
+/// 两者稳定性不同，鉴权时以 `sn` 为准：
+/// - `ro.boot.serialno`（`sn`）是 bootloader 传下来的只读属性，重启、模块重装、
+///   伪装身份重刷都不会变；
+/// - `ro.serialno`（`serial`）是可写属性，A 端开机后会被 `remote_identity` /
+///   `props.conf` 改写，同一台机器前后能报出两个值。
 #[derive(Debug, Clone, Default)]
 pub struct DeviceFp {
     pub serial: String,
@@ -34,8 +40,10 @@ pub struct DeviceFp {
 }
 
 impl DeviceFp {
+    /// 两项都读不到（或只有 AOSP 的占位值）才算没有指纹。
     pub fn is_empty(&self) -> bool {
-        self.serial.trim().is_empty() && self.sn.trim().is_empty()
+        AuthState::fingerprint_part(&self.serial).is_empty()
+            && AuthState::fingerprint_part(&self.sn).is_empty()
     }
 }
 
@@ -568,21 +576,89 @@ impl AuthState {
             }
         } else {
             // 已绑定的卡却不报指纹：只能当不匹配，不然换个客户端不带 header 就绕过了。
-            fp.is_some_and(|fp| Self::bounds_match(bound_serial, bound_sn, fp))
+            let Some(fp) = fp.filter(|fp| Self::bounds_match(bound_serial, bound_sn, fp)) else {
+                return false;
+            };
+            // 指纹对上了，但可写的那一半（`ro.serialno`）跟绑定时的值不一样：说明是
+            // 同一台机器（`ro.boot.serialno` 没变）重启后换了伪装串号。把库里的记录
+            // 跟到当前值 —— 否则控制台和 /card 页面会一直显示第一次绑定的旧串号，
+            // 用户以为卡被别人占了。某项这次没报（空）就保留库里原来的值，别把
+            // 唯一的稳定项抹掉。
+            let new_serial = if fp.serial.trim().is_empty() {
+                bound_serial.to_string()
+            } else {
+                fp.serial.clone()
+            };
+            let new_sn = if fp.sn.trim().is_empty() {
+                bound_sn.to_string()
+            } else {
+                fp.sn.clone()
+            };
+            if new_serial != bound_serial || new_sn != bound_sn {
+                match db.refresh_token_device(&row.token, &new_serial, &new_sn) {
+                    Ok(()) => {
+                        let mut current = row.clone();
+                        current.bound_serial = new_serial;
+                        current.bound_sn = new_sn;
+                        self.remember_token(&row.token, &current);
+                        tracing::info!(
+                            "check_token: refreshed device fingerprint token={} was=({},{}) now=({},{})",
+                            row.token,
+                            bound_serial,
+                            bound_sn,
+                            current.bound_serial.trim(),
+                            current.bound_sn.trim()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "check_token: refresh_token_device failed token={} err={e}",
+                            row.token
+                        );
+                    }
+                }
+            }
+            true
         }
     }
 
-    /// 已绑定行与本次上报的指纹是否一致。只比非空项；两边都空视为不命中，
-    /// 绝不把“没有指纹”当成匹配。
+    /// 已绑定行与本次上报的指纹是否一致。
+    ///
+    /// **稳定项优先**：两边都有 `sn`（`ro.boot.serialno`，只读）时只比 `sn`，
+    /// `serial` 变了也不拦。A 端开机后会用 `remote_identity` / `props.conf` 重写
+    /// `ro.serialno`，以前两个字段都要求相等，等于每次重启都把私卡判成「换了设备」，
+    /// 运营只能手动解绑再让用户重绑 —— 也就是看到的「重启后从绑定变成未绑定」。
+    ///
+    /// 退回规则：
+    /// - 旧行没记 `sn`，或这台机器读不到 `ro.boot.serialno`：比可写的 `serial`；
+    /// - 两边都空（或只有占位值 `unknown`）：绝不命中，没有指纹不能当匹配。
     fn bounds_match(bound_serial: &str, bound_sn: &str, fp: &DeviceFp) -> bool {
-        let bound_serial = bound_serial.trim();
-        let bound_sn = bound_sn.trim();
-        if (bound_serial.is_empty() && bound_sn.is_empty()) || fp.is_empty() {
+        let bound_serial = Self::fingerprint_part(bound_serial);
+        let bound_sn = Self::fingerprint_part(bound_sn);
+        let serial = Self::fingerprint_part(&fp.serial);
+        let sn = Self::fingerprint_part(&fp.sn);
+        if (bound_serial.is_empty() && bound_sn.is_empty()) || (serial.is_empty() && sn.is_empty())
+        {
             return false;
         }
-        let serial_ok = bound_serial.is_empty() || fp.serial.trim() == bound_serial;
-        let sn_ok = bound_sn.is_empty() || fp.sn.trim() == bound_sn;
-        serial_ok && sn_ok
+        if !bound_sn.is_empty() && !sn.is_empty() {
+            return sn == bound_sn;
+        }
+        if !bound_serial.is_empty() && !serial.is_empty() {
+            return serial == bound_serial;
+        }
+        false
+    }
+
+    /// 指纹里的一项去掉空白，顺手把 AOSP 读不到序列号时给的占位值当空处理 ——
+    /// 不然两台都报 `unknown` 的机器会互相命中。
+    fn fingerprint_part(value: &str) -> &str {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("unknown") || value == "0" {
+            ""
+        } else {
+            value
+        }
     }
     /// Returns true if the request is allowed.
     /// Sliding-window rate limit. `key` 就是客户端 IP（见 check_auth）。
@@ -859,15 +935,21 @@ mod binding_tests {
         }
     }
 
-    /// 绑定后只认同一台设备；旧行只有一项时只比那一项。
+    /// 绑定后只认同一台设备：稳定项（`ro.boot.serialno`）对得上就算同一台，
+    /// 可写项（`ro.serialno`）被伪装改掉也不拦；旧行只记了一项时只比那一项。
     #[test]
     fn bound_fingerprint_matches_field_wise() {
         let current = fp("SN1", "SN2");
         assert!(AuthState::bounds_match("SN1", "SN2", &current));
         assert!(AuthState::bounds_match("SN1", "", &current));
         assert!(AuthState::bounds_match("", "SN2", &current));
+        // 重启后 ro.serialno 换了值，ro.boot.serialno 没变：同一台机器，放行。
+        assert!(AuthState::bounds_match("OLD", "SN2", &current));
+        // 换了设备：boot serial 变了就必须拒绝，哪怕可写项碰巧一样。
         assert!(!AuthState::bounds_match("SN1", "OTHER", &current));
-        assert!(!AuthState::bounds_match("OTHER", "SN2", &current));
+        assert!(!AuthState::bounds_match("OTHER", "OTHER", &current));
+        // 旧行没有 sn 时退回比 serial。
+        assert!(!AuthState::bounds_match("OLD", "", &current));
     }
 
     /// 未绑定行、以及已绑定卡不带指纹的请求，都必须判为不匹配：
@@ -877,5 +959,14 @@ mod binding_tests {
         let current = fp("SN1", "SN2");
         assert!(!AuthState::bounds_match("", "", &current));
         assert!(!AuthState::bounds_match("SN1", "SN2", &fp("", "")));
+        // AOSP 读不到序列号时的占位值不能当指纹用，否则两台都报 unknown 的
+        // 机器会互相命中。
+        assert!(DeviceFp::default().is_empty());
+        assert!(fp("unknown", " unknown ").is_empty());
+        assert!(!AuthState::bounds_match(
+            "unknown",
+            "unknown",
+            &fp("unknown", "unknown")
+        ));
     }
 }

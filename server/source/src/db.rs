@@ -812,6 +812,27 @@ impl Db {
         Ok(conn.affected_rows() > 0)
     }
 
+    /// 同一台设备换了伪装串号后，把绑定记录跟到当前指纹。
+    ///
+    /// `ro.serialno`（`serial`）是可写属性，A 端开机后会按 `remote_identity` /
+    /// `props.conf` 重写；`ro.boot.serialno`（`sn`）是只读的，鉴权以它为准。
+    /// `sn` 对得上、`serial` 变了时只更新指纹，不动 `activated_at`、有效期和
+    /// `bound_at`（第一次绑定的时间保持原样）。
+    pub fn refresh_token_device(&self, token: &str, serial: &str, sn: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "UPDATE api_token
+                SET bound_serial = :serial, bound_sn = :sn
+              WHERE token = :token",
+            params! {
+                "serial" => serial,
+                "sn" => sn,
+                "token" => token,
+            },
+        )?;
+        Ok(())
+    }
+
     /// 旧库补列：线上 `api_token` 是手工建的，没有 DDL 文件，升级时要能自己补上。
     /// 用 information_schema 先查再加（MySQL 8 的 `ADD COLUMN IF NOT EXISTS` 只在
     /// MariaDB 有，不能直接用）。
