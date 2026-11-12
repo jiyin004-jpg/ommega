@@ -158,12 +158,17 @@ allow servicemanager shell dir { search getattr }
 # 进程内 KeyMint：keymint 主体搬进 keystore2 之后，远程出证和 SOTER 转发是 keystore
 # 域自己发起的 TCP+TLS，名字解析走 netd 的 unix socket。拆成短行，ksud 每行的
 # 名字/权限列表都有上限（一条写满会被整行丢掉）。
-allow keystore self tcp_socket { create ioctl };
-allow keystore self tcp_socket { getattr setopt };
-allow keystore self tcp_socket { getopt shutdown };
-allow keystore self tcp_socket { connect bind };
-allow keystore self tcp_socket { read write };
-allow keystore self tcp_socket { sendto recvfrom };
+#
+# target 一栏必须写具体类型名，不能写 self：KernelSU 侧 add_rule 是拿 target 去
+# p_types 里查（kernel/selinux/sepolicy.c），查不到就整条丢掉；policy 里没有叫
+# self 的类型，写了等于这六行一条都没落地（2026-11-12 PKX110 实测：keystore 域
+# tcp_socket create 一直被拒，远程出证全落回本地 keybox）。
+allow keystore keystore tcp_socket { create ioctl };
+allow keystore keystore tcp_socket { getattr setopt };
+allow keystore keystore tcp_socket { getopt shutdown };
+allow keystore keystore tcp_socket { connect bind };
+allow keystore keystore tcp_socket { read write };
+allow keystore keystore tcp_socket { sendto recvfrom };
 allow keystore node tcp_socket { read write };
 allow keystore node tcp_socket { recvfrom sendto };
 # connect() 要到具体端口时还要 name_connect；这里给的是通用 port 类型。
