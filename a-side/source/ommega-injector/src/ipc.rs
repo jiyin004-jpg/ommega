@@ -25,6 +25,16 @@ const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
 const PM_SERVICE: &str = "sec_key_att_app_id_provider";
 
+// 进程内那份起不来（这台机器上很常见：开机 key 是独立 HAL 铸的，进程内那套开库就卡住），
+// 头一笔等满 15 秒是值得的 —— 两套服务同时写一个钥匙库是错的。但等过一次就说明它这条
+// 路上暂时没戏，之后每一笔再干等 15 秒就是纯浪费：实测 keystore2 到 HAL 的每笔
+// generateKey 都被拖成 15000ms，检测器一轮下来就是十几分钟。
+// 所以只等第一笔。之后只做非阻塞的 `ready()` 判断：它自己的启动线程该完就会完，
+// 完了一瞬间就能看见，不用我们在这里陪等。
+static INPROC_WAIT_GAVE_UP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const INPROC_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Second rendezvous point for app-domain callers, on the abstract namespace.
 ///
 /// It has to match `consts::RPC_ABSTRACT_NAME` on the daemon side (the two crates
@@ -308,6 +318,28 @@ fn ensure_rpc_cache(connect_context: &'static str) -> Result<()> {
     }
 }
 
+/// 等进程内那份就绪，但只等一次。
+///
+/// 头一笔等满 `INPROC_WAIT_TIMEOUT`；等不到就记下“已经放弃”，之后的调用只看
+/// 非阻塞的 `ready()`，直接走 RPC。它在后台自己起来了会立刻被看见。
+fn wait_inproc_once_in_a_while() {
+    use std::sync::atomic::Ordering;
+
+    if ommega::inproc::ready() {
+        INPROC_WAIT_GAVE_UP.store(false, Ordering::Relaxed);
+        return;
+    }
+    if INPROC_WAIT_GAVE_UP.load(Ordering::Relaxed) {
+        return;
+    }
+    if ommega::inproc::wait_ready(INPROC_WAIT_TIMEOUT) {
+        INPROC_WAIT_GAVE_UP.store(false, Ordering::Relaxed);
+    } else {
+        warn!("in-process KeyMint is not ready; this call falls back to the RPC service");
+        INPROC_WAIT_GAVE_UP.store(true, Ordering::Relaxed);
+    }
+}
+
 fn get_rpc_binder<T>(
     service_name: &'static str,
     connect_context: &'static str,
@@ -319,11 +351,7 @@ where
     // 进程内那份先看：起了就地服务的时候，这一手直接拿到本地对象，不建会话、
     // 不过 socket。refresh 对本地对象没意义，拿到就用。
     if inproc_keymint_requested() {
-        // 起服务要开库、建证书链，头几笔请求可能撞在它没起来之前。
-        // 等一等，不要立刻回落到 RPC：两套服务同时写一个钥匙库是错的。
-        if !ommega::inproc::wait_ready(Duration::from_secs(15)) {
-            warn!("in-process KeyMint is not ready; this call falls back to the RPC service");
-        }
+        wait_inproc_once_in_a_while();
     }
     if let Some(binder) = ommega::inproc::service(service_name) {
         match <T as FromIBinder>::try_from(binder) {

@@ -133,7 +133,20 @@ fn is_keystore2(pid: Pid) -> bool {
 fn write_daemon_peer_state(body: &str) {
     let path = Path::new(DAEMON_PEER_STATE_PATH);
     match std::fs::write(path, body) {
-        Ok(()) => debug!("refreshed the daemon peer state {}", path.display()),
+        Ok(()) => {
+            // 读这张表的是 keystore2 里的 payload（keystore uid），而这个文件是我们（root）
+            // 写出来的，默认 0600 root —— 它读不了，于是 app 域的 RPC 连接全被当成“没注过”
+            // 拒掉。实测后果：SOTER 宿主每笔调用重试到超时（30 秒）、检测器一轮十几分钟。
+            // 跟 keystore 目录对齐：属主换成这个目录的属主，只给它自己读。
+            if let Ok(dir) = std::fs::metadata("/data/misc/keystore") {
+                use std::os::unix::fs::MetadataExt;
+                let _ = std::os::unix::fs::chown(path, Some(dir.uid()), Some(dir.gid()));
+            }
+            #[allow(unused_imports)]
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            debug!("refreshed the daemon peer state {}", path.display());
+        }
         Err(error) => debug!(
             "cannot write the daemon peer state {} ({error}); an app-domain target of this \
              injection will not be accepted by the RPC server",
