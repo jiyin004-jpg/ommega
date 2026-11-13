@@ -193,10 +193,7 @@ fn usable_name(path: &str, busy: &HashSet<String>) -> bool {
         return false;
     }
     let lower = path.to_ascii_lowercase();
-    if AVOID.iter().any(|bad| lower.contains(bad)) {
-        return false;
-    }
-    true
+    !AVOID.iter().any(|bad| lower.contains(bad))
 }
 
 /// comm 是 basename 的前 15 个字节（内核硬截）。光路径不同不够：
