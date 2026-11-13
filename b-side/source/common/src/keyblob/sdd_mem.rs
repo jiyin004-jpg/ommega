@@ -65,15 +65,17 @@ impl<const N: usize> SecureDeletionSecretManager for InMemorySlotManager<N> {
         rng: &mut dyn crypto::Rng,
         _purpose: SlotPurpose,
     ) -> Result<(SecureDeletionSlot, SecureDeletionData), Error> {
-        for idx in 0..N {
-            if self.slots[idx].is_none() {
+        // 先挑空槽再动它：`get_or_create_factory_reset_secret` 要 &mut self，
+        // 抠着 slots 的迭代器不放会借冲突。
+        match self.slots.iter().position(|slot| slot.is_none()) {
+            Some(idx) => {
                 let mut sdd = self.get_or_create_factory_reset_secret(rng)?;
                 rng.fill_bytes(&mut sdd.secure_deletion_secret[..]);
                 self.slots[idx] = Some(sdd.clone());
-                return Ok((SecureDeletionSlot(idx as u32), sdd));
+                Ok((SecureDeletionSlot(idx as u32), sdd))
             }
+            None => Err(km_err!(RollbackResistanceUnavailable, "full")),
         }
-        Err(km_err!(RollbackResistanceUnavailable, "full"))
     }
 
     fn get_secret(&self, slot: SecureDeletionSlot) -> Result<SecureDeletionData, Error> {
@@ -96,8 +98,8 @@ impl<const N: usize> SecureDeletionSecretManager for InMemorySlotManager<N> {
 
     fn delete_all(&mut self) {
         self.factory_secret = None;
-        for idx in 0..N {
-            self.slots[idx] = None;
+        for slot in self.slots.iter_mut() {
+            *slot = None;
         }
     }
 }
