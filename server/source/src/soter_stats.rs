@@ -104,7 +104,7 @@ pub async fn page_handler() -> Html<String> {
     let mut body = String::new();
     if rows.is_empty() {
         body.push_str(
-            "<tr><td colspan=\"3\" class=\"empty\">这 24 小时内还没有 SOTER 请求</td></tr>",
+            "<tr><td colspan=\"4\" class=\"empty\">这 24 小时内还没有 SOTER 请求</td></tr>",
         );
     } else {
         for (index, (pkg, count)) in rows.iter().enumerate() {
@@ -148,8 +148,6 @@ pub async fn page_handler() -> Html<String> {
   td.pkg {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }}
   td.dim {{ color: color-mix(in srgb, CanvasText 50%, transparent); }}
   td.empty {{ text-align: center; color: color-mix(in srgb, CanvasText 50%, transparent); padding: 28px 0; }}
-  .note {{ margin-top: 18px; font-size: 12px; color: color-mix(in srgb, CanvasText 50%, transparent); }}
-  .note code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
 </style>
 </head>
 <body>
@@ -162,7 +160,6 @@ pub async fn page_handler() -> Html<String> {
 {body}
     </tbody>
   </table>
-  <div class="note">进程内统计，<code>relay_rs</code> 重启后清零；原始数据在 <code>/api/soter_stats/</code>，逐笔明细看 <code>/opt/relay/relay.out.log</code>。</div>
 </div>
 </body>
 </html>
