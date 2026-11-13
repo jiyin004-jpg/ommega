@@ -1848,6 +1848,9 @@ async fn run_soter_task_inner(
     let caller_pkg_arg = body
         .get(crate::soter_probe::CALLER_PKG_FIELD)
         .and_then(Value::as_str);
+    // 计一笔“包名 → 24 小时请求次数”（页面在 /soter）。放这里而不是等到分支里：
+    // 后面这道探针闸门会把探测机直接打回本地，那些也算请求，得统计。
+    crate::soter_stats::record(caller_pkg_arg.unwrap_or_default());
     let probe_verdict = if op == "get_device_id" {
         crate::soter_probe::get_device_id_side(
             &state.cfg,

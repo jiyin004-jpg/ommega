@@ -26,6 +26,7 @@ pub mod soter_mint;
 pub mod soter_policy;
 pub mod soter_probe;
 pub mod soter_sign_sessions;
+pub mod soter_stats;
 pub mod statedb;
 pub mod strongbox;
 pub mod util;

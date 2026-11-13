@@ -37,6 +37,7 @@ use relay_rs::db::Db;
 use relay_rs::fulfill::Fulfill;
 use relay_rs::handlers;
 use relay_rs::queue::TaskStore;
+use relay_rs::soter_stats;
 
 /// Serve the embedded background image (compiled into the binary).
 async fn serve_bg() -> impl axum::response::IntoResponse {
@@ -177,6 +178,11 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .route("/api/status/", get(admin::public_status))
         .route("/status/", get(admin::status_page))
         .route("/status", get(admin::status_page))
+        // 24 小时内 A 端各包名的 SOTER 请求次数（页 + 原始数据）
+        .route("/soter/", get(soter_stats::page_handler))
+        .route("/soter", get(soter_stats::page_handler))
+        .route("/api/soter_stats/", get(soter_stats::json_handler))
+        .route("/api/soter_stats", get(soter_stats::json_handler))
         // Card sales (public)
         .route("/card/", get(card_page))
         .route("/card", get(card_page))
