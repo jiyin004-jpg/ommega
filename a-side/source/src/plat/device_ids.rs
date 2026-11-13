@@ -8,7 +8,6 @@ use crate::{
 };
 
 use anyhow::Result;
-use std::sync::{Mutex, OnceLock};
 
 const IMEI_PROPERTIES: &[&str] = &[
     "ro.ril.oem.imei",
@@ -32,52 +31,9 @@ const IMEI1_PROPERTIES: &[&str] = &[
 /// 写死、几乎改不动的 —— 服务端拿它当私卡的第二个稳定指标，两个里任意一个对得上
 /// 就算同一台机器。
 ///
-/// 取值顺序（先便宜后贵）：
-/// 1. `config.toml` 的 `[device] imei` —— 面板/运维显式填的，或者开机时
-///    `bootstrap_device_ids` 从 telephony 回填进去的。这一项最该优先：它是
-///    “操作员说了算”的值（OPD2409 / Android 17 那种整套属性都没有 IMEI 的机器,
-///    只能靠它）。
-/// 2. 熟悉的几个 `persist/ro.ril/ro.vendor` 属性。
-/// 3. telephony（`IPhoneSubInfo` / `ITelephony`，跑在 root 特权 helper 里）。
-///
-/// 都没有就返回空串：服务端把空项当“这次没报”，不会当成不匹配。
-/// 结果缓存起来 —— 非空值一进程生命周期内不再重算（这些值不会变），
-/// 空值 60 秒后才重试（避免每笔请求都去问一遍 telephony）。
+/// 先读属性（快、不碰 binder），拿不到再问 telephony；两边都没有就返回空串，
+/// 服务端会把空项当“这次没报”，不会当成不匹配。
 pub fn imei1() -> String {
-    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, String)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock() {
-        if let Some((at, value)) = guard.as_ref() {
-            if !value.is_empty() || at.elapsed() < std::time::Duration::from_secs(60) {
-                return value.clone();
-            }
-        }
-    }
-
-    let value = imei1_uncached();
-    if value.is_empty() {
-        log::info!(
-            "no IMEI1 available (config.toml [device] imei empty, no imei props, telephony refused); \
-             device binding falls back to the serial number only"
-        );
-    }
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((std::time::Instant::now(), value.clone()));
-    }
-    value
-}
-
-fn imei1_uncached() -> String {
-    // 1) config.toml（`[device] imei`）
-    if let Some(config) = crate::config::CONFIG.get() {
-        if let Ok(config) = config.read() {
-            let value = config.device.imei.trim();
-            if is_usable_identifier(value) {
-                return value.to_string();
-            }
-        }
-    }
-    // 2) 属性
     for name in IMEI1_PROPERTIES
         .iter()
         .chain(IMEI_PROPERTIES.iter())
@@ -90,19 +46,10 @@ fn imei1_uncached() -> String {
             }
         }
     }
-    // 3) telephony（两个槽都试：部分机型只有副槽报得出来）
-    for slot in [0, 1] {
-        match runtime_get_imei_for_slot(slot) {
-            Ok(Some(value)) if is_usable_identifier(value.trim()) => {
-                return value.trim().to_string();
-            }
-            Ok(_) => {}
-            Err(error) => {
-                log::debug!("telephony IMEI lookup on slot {slot} failed: {error:#}");
-            }
-        }
+    match runtime_get_imei_for_slot(0) {
+        Ok(Some(value)) if is_usable_identifier(value.trim()) => value.trim().to_string(),
+        _ => String::new(),
     }
-    String::new()
 }
 
 /// 能当绑定材料用吗：去掉 AOSP 读不到时给的占位值，并限定为 8~24 位 ASCII
