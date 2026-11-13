@@ -1,7 +1,7 @@
-[package]
+﻿[package]
 name = "ommega"
 authors = ["jiyin004"]
-version = "1.7.16"
+version = "1.7.17"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
@@ -82,11 +82,8 @@ members = [
 ]
 
 [patch.crates-io]
-# rsbinder 用 vendor/rsbinder 这份带补丁的副本：依赖里直接写 path，不靠 [patch.crates-io]。
-# （以前写成 patch，而且那行被注释吞掉了，结果 injector 一直链的是 crates.io 原版。）
-# 补丁改的是 AIDL parcelable 的存在标记：AOSP 只判 != 0，上游只认 1。
-# 改动点在 vendor/rsbinder/src/{parcelable,macros}.rs。
-kmr-derive = { path = "derive" }
+# rsbinder 鐢?vendor/rsbinder 杩欎唤甯﹁ˉ涓佺殑鍓湰锛氫緷璧栭噷鐩存帴鍐?path锛屼笉闈?[patch.crates-io]銆?# 锛堜互鍓嶅啓鎴?patch锛岃€屼笖閭ｈ琚敞閲婂悶鎺変簡锛岀粨鏋?injector 涓€鐩撮摼鐨勬槸 crates.io 鍘熺増銆傦級
+# 琛ヤ竵鏀圭殑鏄?AIDL parcelable 鐨勫瓨鍦ㄦ爣璁帮細AOSP 鍙垽 != 0锛屼笂娓稿彧璁?1銆?# 鏀瑰姩鐐瑰湪 vendor/rsbinder/src/{parcelable,macros}.rs銆?kmr-derive = { path = "derive" }
 kmr-common = { path = "common" }
 kmr-crypto-ommega = { path = "crypto" }
 kmr-ta = { path = "ta" }
