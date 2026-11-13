@@ -338,7 +338,21 @@ impl crypto::EmittingOperation for OmmegaAesGcmDecryptOperation {
         let split = self.data.len() - self.tag_len;
         let ciphertext = &self.data[..split];
         let tag = &self.data[split..];
-        gcm_decrypt(&self.key, &self.nonce, &self.aad, ciphertext, tag)
+        // 解不开时把参数形状记一笔：tag 长度对不上、AAD 没跟上、密文被截断这几类
+        // 在日志里长得一模一样，不给长度就只能靠猜。
+        match gcm_decrypt(&self.key, &self.nonce, &self.aad, ciphertext, tag) {
+            Ok(plain) => Ok(plain),
+            Err(error) => {
+                log::info!(
+                    "AES-GCM decrypt rejected: key={}B tag={}B ciphertext={}B aad={}B ({error:?})",
+                    self.key.len(),
+                    self.tag_len,
+                    ciphertext.len(),
+                    self.aad.len()
+                );
+                Err(error)
+            }
+        }
     }
 }
 

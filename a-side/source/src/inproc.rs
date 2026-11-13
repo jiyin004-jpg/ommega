@@ -88,6 +88,36 @@ pub fn request_start() {
                 STATE_READY.notify_all();
             })
             .ok();
+
+        // 看门狗：过了宽限期还没结论（成或败都没有），就判它起不来。
+        // 不这么做的后果是所有调用方每笔都干等 15 秒（见 injector 的 ipc.rs），
+        // 实测能把检测器一整轮拖到十几分钟。
+        std::thread::Builder::new()
+            .name("inproc-gate".to_string())
+            .spawn(|| {
+                for _ in 0..START_TIMEOUT.as_secs() {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let decided = STATE
+                        .lock()
+                        .map(|state| state.services.is_some() || state.failed.is_some())
+                        .unwrap_or(true);
+                    if decided {
+                        return;
+                    }
+                }
+                warn!(
+                    "in-process KeyMint did not come up within {}s; treating it as unavailable",
+                    START_TIMEOUT.as_secs()
+                );
+                let _ = std::fs::write(FAILED_PATH, "startup timed out\n");
+                if let Ok(mut state) = STATE.lock() {
+                    if state.failed.is_none() && state.services.is_none() {
+                        state.failed = Some("startup timed out".to_string());
+                    }
+                }
+                STATE_READY.notify_all();
+            })
+            .ok();
     });
 }
 
@@ -113,6 +143,11 @@ pub fn wait_ready(timeout: Duration) -> bool {
 
 /// 根侧落的「开机已完成」标记。
 const BOOT_DONE_PATH: &str = "/data/misc/ommega/boot_done";
+
+/// 进程内那套从开始到有结论的宽限期。开库那一步在“另一个进程占着库”的时候会
+/// 一直睡下去（上游就是这么写的，把重试改成有超时反而会把整个 keystore2 abort 掉，
+/// 实测），所以不能靠它自己回来，得有东西替它下结论。
+const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn boot_done_present() -> bool {
     crate::global::boot_completed() || std::path::Path::new(BOOT_DONE_PATH).exists()
