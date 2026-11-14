@@ -31,6 +31,9 @@ allow keystore keystore file { execute map }
 # 注入器（root 域）替别的目标建的 memfd，标签是它自己的域（ColorOS 上实测落在
 # system_file）。目标进程要能执行，不然 soterserver 那种宿主同样注不进去。
 allow { system_app platform_app priv_app } system_file memfd_file { open read write map execute getattr }
+# 宿主那侧也有自己建 memfd 再 dlopen 的路（payload fd 是目标进程自己开的，标签就是它自己的域）。
+# 目标域里没有 untrusted_app：普通应用根本不在注入名单里。
+allow { system_app platform_app priv_app } { system_app platform_app priv_app } memfd_file { open read write map execute getattr }
 
 # 递 payload 的那条 dgram：target 侧收，注入器那侧发。发送方域可能落在
 # system_file（ColorOS 上实测就是这个）、ksu、magisk 这些里，列全了不吃亏。
