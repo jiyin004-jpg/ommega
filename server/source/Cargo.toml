@@ -71,3 +71,7 @@ cargo-husky = { version = "1.5.0", default-features = false, features = ["user-h
 
 [profile.release]
 opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
+debug = 0
