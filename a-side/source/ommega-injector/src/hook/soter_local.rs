@@ -903,21 +903,37 @@ fn fid_from(serial: Option<&str>) -> String {
     (1_000_000_000u64 + n as u64).to_string()
 }
 
-/// 指纹厂商。ZTE/nubia 把型号写在 feature 开关里，认不出来就看 `ro.hardware.fingerprint`。
+/// 指纹厂商。厂商名归一成原厂那几种拼法（真机上就是 `FPC` / `Goodix` 这种），
+/// 认不出来就用平台默认 —— 不要报 `unknown`，那跟报自己名字一个性质：一眼壳。
 fn fingerprint_name() -> String {
     if prop("ro.vendor.feature.zte_fingerprint_default_goodix_g7_aidl").is_some()
         || prop("ro.vendor.feature.zte_fingerprint_default_goodix_gf96xx_g7_cali").is_some()
     {
         return "Goodix".to_string();
     }
-    prop("ro.hardware.fingerprint").unwrap_or_else(|| "unknown".to_string())
+    let hardware = prop("ro.hardware.fingerprint")
+        .unwrap_or_default()
+        .to_lowercase();
+    for (needle, name) in [
+        ("fpc", "FPC"),
+        ("goodix", "Goodix"),
+        ("silead", "Silead"),
+        ("egis", "Egis"),
+        ("qbt", "QBT"),
+    ] {
+        if hardware.contains(needle) {
+            return name.to_string();
+        }
+    }
+    platform().fp_n.to_string()
 }
 
-/// 指纹固件版本。有真版本号就用真的，没有就退回传感器型号。
+/// 指纹固件版本。有真版本号就用真的，没有就用平台默认。
 fn fingerprint_version() -> String {
     for name in [
         "persist.vendor.fingerprint.fw_version",
         "vendor.fingerprint.fw_version",
+        "ro.vendor.fingerprint.fw_version",
         "persist.goodix.fw_version",
     ] {
         if let Some(value) = prop(name) {
@@ -927,30 +943,19 @@ fn fingerprint_version() -> String {
     if prop("ro.vendor.feature.zte_fingerprint_default_goodix_gf96xx_g7_cali").is_some() {
         return "GF96xx".to_string();
     }
-    "unknown".to_string()
+    platform().fp_v.to_string()
 }
 
-/// TEE 名字。A 端这批是 QTI 平台，跑的是 QSEE。
+/// TEE 名字。真机上就是 TA 报的那个名字（高通 QSEE / MTK Kinibi），所以照平台报原厂那套，
+/// 别把 `ro.hardware` 这种半成品拼法或我们自己的名字写进去。
 fn tee_name() -> String {
-    match prop("ro.soc.manufacturer").as_deref() {
-        Some("QTI") | Some("Qualcomm") | Some("Qualcomm Technologies, Inc") => "QSEE".to_string(),
-        _ => prop("ro.hardware").unwrap_or_else(|| "unknown".to_string()),
-    }
+    platform().tee_n.to_string()
 }
 
-/// TEE 版本。真机上是 TA 报的版本串，本地拿不到 —— 拿本机的 SoC 型号加安全补丁拼
-/// 一个：都是真的、每台机器不一样、也不会变来变去。
+/// TEE 版本。真版本串只有 TA 有，拿不到就按平台报原厂那个号（高通 `5` / Kinibi `10018`）。
+/// 以前拿“SoC 型号 + 安全补丁”拼了个从没见过的格式，检测器一问就露。
 fn tee_version() -> String {
-    let soc = prop("ro.soc.model").unwrap_or_default();
-    let patch = prop("ro.vendor.build.security_patch")
-        .or_else(|| prop("ro.build.version.security_patch"))
-        .unwrap_or_default();
-    match (soc.is_empty(), patch.is_empty()) {
-        (false, false) => format!("{soc}-{patch}"),
-        (false, true) => soc,
-        (true, false) => patch,
-        (true, true) => "unknown".to_string(),
-    }
+    platform().tee_v.to_string()
 }
 
 /// 后端给出来的一笔应答。
@@ -1513,6 +1518,12 @@ struct Platform {
     device_id_ascii: bool,
     declares_salt: bool,
     generate_rotates: bool,
+    /// 签名文档（`sign_json`）里报的 TEE / 指纹身份：真机上这四格是 TA 报的原厂值，
+    /// 本地拿不到真值时就按平台报原厂那套，别写我们自己的名字和版本。
+    tee_n: &'static str,
+    tee_v: &'static str,
+    fp_n: &'static str,
+    fp_v: &'static str,
 }
 
 fn platform() -> &'static Platform {
@@ -1529,6 +1540,10 @@ fn platform() -> &'static Platform {
                 device_id_ascii: true,
                 declares_salt: true,
                 generate_rotates: false,
+                tee_n: "Kinibi",
+                tee_v: "10018",
+                fp_n: "FPC",
+                fp_v: "1",
             }
         } else {
             Platform {
@@ -1536,6 +1551,10 @@ fn platform() -> &'static Platform {
                 device_id_ascii: false,
                 declares_salt: false,
                 generate_rotates: true,
+                tee_n: "QSEE",
+                tee_v: "5",
+                fp_n: "fingerprint",
+                fp_v: "1",
             }
         }
     })
@@ -2151,6 +2170,27 @@ mod tests {
         assert!(!info.fp_v.is_empty());
         assert!(!info.tee_n.is_empty());
         assert!(!info.tee_v.is_empty());
+        // 这四格是检测器（SoterChecker C8）直接摊给人看的，只能像原厂报的那样：
+        // 不能出现我们自己的名字、版本号，也不要 `unknown` 这种一看就是壳的占位。
+        for value in [&info.tee_n, &info.tee_v, &info.fp_n, &info.fp_v] {
+            assert!(
+                !value.eq_ignore_ascii_case("unknown"),
+                "占位值不能进文档: {value}"
+            );
+            assert!(
+                !value.to_lowercase().contains("ommega"),
+                "不能报自己的名字: {value}"
+            );
+            assert!(
+                !value.contains(env!("CARGO_PKG_VERSION")),
+                "不能报自己的版本号: {value}"
+            );
+        }
+        assert!(
+            info.tee_n == "QSEE" || info.tee_n == "Kinibi",
+            "tee_n 得是原厂拼法: {}",
+            info.tee_n
+        );
         assert!(info.fid.len() >= 10, "fid 像真机那样是十位数字");
         assert!(info.fid.chars().all(|c| c.is_ascii_digit()));
     }

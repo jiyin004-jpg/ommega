@@ -1385,13 +1385,7 @@ pub fn run_layer(
                 // 签的是那段 JSON 原文，不是 challenge 的字节；回「JSON + 签名」的信封
                 let counter =
                     counter_for(&counter_key(&session_scope, device_id, sign_session.uid));
-                let document = sign_doc(
-                    &product,
-                    sign_session.uid,
-                    &sign_session.raw,
-                    counter,
-                    layer,
-                )?;
+                let document = sign_doc(&product, sign_session.uid, &sign_session.raw, counter)?;
                 match key.sign(&document) {
                     Ok(signature) => {
                         let reply = envelope_result(op, &document, &signature)?;
@@ -1571,6 +1565,12 @@ fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
 struct Platform {
     declares_salt: bool,
     device_id_ascii: bool,
+    /// 签名文档里报的 TEE 身份，用原厂那套拼法。
+    tee_n: &'static str,
+    tee_v: &'static str,
+    /// 指纹身份。
+    fp_n: &'static str,
+    fp_v: &'static str,
 }
 
 fn profile_of(cpu_id: &str) -> Platform {
@@ -1578,11 +1578,19 @@ fn profile_of(cpu_id: &str) -> Platform {
         Platform {
             declares_salt: true,
             device_id_ascii: true,
+            tee_n: "Kinibi",
+            tee_v: "10018",
+            fp_n: "FPC",
+            fp_v: "1",
         }
     } else {
         Platform {
             declares_salt: false,
             device_id_ascii: false,
+            tee_n: "QSEE",
+            tee_v: "5",
+            fp_n: "fingerprint",
+            fp_v: "1",
         }
     }
 }
@@ -1603,21 +1611,25 @@ fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result
 }
 
 /// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
-/// 都不能少 —— App 会把它们存下来当设备指纹。服务端两层是虚拟设备，指纹和 TEE
-/// 这几个字段没有真值，用固定值加这台设备派生的 fid 填，稳定可复现就行。
-fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64, layer: &str) -> Result<Vec<u8>> {
+/// 都不能少 —— App 会把它们存下来当设备指纹。
+///
+/// `tee_n` / `tee_v` / `fp_n` / `fp_v` 这四格只有真机 TA 有，服务端这两层按设备的平台
+/// 报原厂那套（高通 `QSEE`/`5`、MTK `Kinibi`/`10018`），**不报我们自己的名字和版本**：
+/// 那等于白送检测器一条口供（`tee_n` 写着 ommega、`tee_v` 写着自己的发版号）。
+fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64) -> Result<Vec<u8>> {
+    let profile = profile_of(cpu_id);
     let mut doc = json!({
         "raw": raw,
         "fid": fid_of(cpu_id),
         "counter": counter,
-        "tee_n": "ommega-server-soter",
-        "tee_v": env!("CARGO_PKG_VERSION"),
-        "fp_n": "server",
-        "fp_v": layer,
+        "tee_n": profile.tee_n,
+        "tee_v": profile.tee_v,
+        "fp_n": profile.fp_n,
+        "fp_v": profile.fp_v,
         "cpu_id": cpu_id,
         "uid": uid.to_string(),
     });
-    if profile_of(cpu_id).declares_salt {
+    if profile.declares_salt {
         doc["rsa_pss_saltlen"] = json!(ASK_SALT_LEN);
     }
     serde_json::to_vec(&doc).context("failed to serialize the sign document")
@@ -2567,6 +2579,19 @@ mod tests {
         assert!(
             text.contains("\"raw\":\"0a1b2c3d\""),
             "raw 得是挑战原文，不是解出来的字节: {text}"
+        );
+        // 这四格是检测器 C8 直接摊出来给人看的，报自己的名字和版本就是自曝。
+        assert!(
+            !text.contains("ommega"),
+            "签名文档里不能出现我们自己的名字: {text}"
+        );
+        assert!(
+            !text.contains(env!("CARGO_PKG_VERSION")),
+            "签名文档里不能出现服务端版本号: {text}"
+        );
+        assert!(
+            text.contains("\"tee_n\":\"QSEE\"") || text.contains("\"tee_n\":\"Kinibi\""),
+            "tee_n 得是原厂拼法: {text}"
         );
 
         // 拿导出的 AuthKey 公钥验这段 JSON —— 验得过才叫闭环
