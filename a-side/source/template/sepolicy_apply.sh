@@ -147,6 +147,39 @@ ommega_sepolicy_rule_state() {
   printf 'unknown\n'
 }
 
+# 过滤掉策略里不存在的域的 permissive 行：写不存在的类型会在策略里留下悬空项，
+# 自带工具（libsepol）连整份 policy 都读不出来，就只剩管理器工具一条路了。
+# stdout 打过滤后的规则文件路径；没有 permissive 行时直接返回原文件。
+_ommega_policy_filtered_rule() {
+  _src=$1
+  grep -q '^permissive ' "$_src" 2>/dev/null || {
+    printf '%s\n' "$_src"
+    return 0
+  }
+  _dst=/data/adb/ommega/run/sepolicy.filtered
+  [ -d /data/adb/ommega/run ] || _dst=/data/local/tmp/ommega-sepolicy.filtered
+  _types=
+  if [ -r /sys/fs/selinux/policy ] && command -v strings >/dev/null 2>&1; then
+    _types=$_dst.types
+    strings /sys/fs/selinux/policy >"$_types" 2>/dev/null || _types=
+  fi
+  while IFS= read -r _line; do
+    case "$_line" in
+      permissive\ *)
+        _dom=${_line#permissive }
+        _dom=${_dom%%[[:space:]]*}
+        if [ -n "$_types" ] && ! grep -qx "$_dom" "$_types"; then
+          _ommega_policy_log "skip permissive $_dom (not in this policy)"
+          continue
+        fi
+        ;;
+    esac
+    printf '%s\n' "$_line"
+  done <"$_src" >"$_dst"
+  [ -n "$_types" ] && rm -f "$_types"
+  printf '%s\n' "$_dst"
+}
+
 ommega_apply_sepolicy() {
   _OMMEGA_POLICY_RULE=$1
   _OMMEGA_POLICY_LOG=$2
@@ -157,6 +190,7 @@ ommega_apply_sepolicy() {
     _ommega_policy_log "no rule file: ${_OMMEGA_POLICY_RULE:-<empty>}"
     return 1
   fi
+  _OMMEGA_POLICY_RULE=$(_ommega_policy_filtered_rule "$_OMMEGA_POLICY_RULE")
 
   # 0) 模块自带那份永远是第一选择，不看当前是哪个管理器。
   #    理由不是「自家的好用」，而是它不依赖任何管理器的返回值：它自己写
