@@ -1,30 +1,22 @@
 /*
- * ommega-policy —— 把 allow 规则打进内核正在用的 SELinux policy。
+ * ommega-policy —— 把 allow / permissive 语句打进内核正在用的 SELinux policy。
  *
- * 为什么要有它：模块的 sepolicy.rule 得进内核，各家 root 管理器给的工具还不一样
- * （KernelSU 系是 ksud、Magisk/APatch 是 magiskpolicy）。碰上一个既没有 ksud 也没有
- * magiskpolicy 的环境，我们自己就得有个能用的：读 /sys/fs/selinux/policy → 插规则 →
- * 单次 write 到 /sys/fs/selinux/load。
+ * 读 /sys/fs/selinux/policy → 改 policydb → 单次 write 到 /sys/fs/selinux/load。
  *
- * 语法只认 sepolicy.rule 里用到的那几种：
+ * 语法：
  *     allow <类型>{集合} <类型>{集合} <类> <权限>{集合}|*
  *     permissive <类型>{集合}
- * 集合可以写成单个名字，也可以写成 `{ a b c }`；目标写 `self` 表示源类型自己。
- * 规则的子集，不追求通用：不认 dontaudit / type_transition / 属性（attribute）展开。
- *
- * 依赖 AOSP 的 libsepol（LGPL-2.1，见 libsepol/LICENSE），只用了它的 core：
- * policydb 读写 + avtab 插入。CIL 那部分不用，所以也不需要 flex/bison。
+ * 集合可以写单个名字或 `{ a b c }`；目标写 `self` 表示源类型自己。类型/类/权限在
+ * 策略里不存在时跳过该名字，不算错。
  *
  * 用法：
- *   ommega-policy --live --apply /path/sepolicy.rule
- *   ommega-policy --check --apply /path/sepolicy.rule   # 只看有没有缺规则，不写
- *   ommega-policy --save out.policy              # 只落盘，不动内核（自测用）
- *   ommega-policy --load in.policy --live        # 换一份输入
+ *   ommega-policy --live --apply FILE            # 改完写回内核
+ *   ommega-policy --check --apply FILE           # 只判缺不缺，不写
+ *   ommega-policy --save OUT --apply FILE        # 只落盘
+ *   ommega-policy --load IN --live --apply FILE  # 换输入
  *
- * `--check` 的退出码：0 = 规则已经全在（不用动内核），3 = 缺规则（该 apply 了），
- * 1 = 出错。这么定是因为「定期重新 apply 一遍」会把整份 policy 重新加载一次 ——
- * 语义不变，但 /sys/fs/selinux/policy 的字节会跟着变（ksud apply 一次就换一种排序），
- * 没必要为了「确认」每几分钟刷一次。
+ * `--check` 退出码：0 = 规则已全在，3 = 缺规则，1 = 出错。
+ * 依赖 AOSP libsepol 的 core（policydb 读写 + avtab / ebitmap）。
  */
 
 #define _GNU_SOURCE

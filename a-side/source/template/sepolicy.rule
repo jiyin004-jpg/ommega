@@ -1,13 +1,12 @@
 # ommega A 端 SELinux 规则。
 #
-# 注入目标有三类：keystore2、SOTER 宿主（system_app / platform_app / priv_app）、SOTER HAL。
-# 注入器把 payload 的 fd 用 unix dgram 递进目标进程，目标进程再连 daemon 的抽象 unix
-# socket 取答复，并往 system_data_file / system_app_data_file 落日志。
+# 注入目标：keystore2、SOTER 宿主（system_app / platform_app / priv_app）、SOTER HAL。
+# 注入器用 unix dgram 把 payload 的 fd 递进目标进程，目标进程连 daemon 的抽象 socket
+# 取答复并落日志。
 #
-# 域名随 ROM 变，kernel 遇到策略里没有的域名会跳过那一行。一行一个域：列表写法
-# `{ a b c }` 会被解析器静默丢弃。
+# 域名随 ROM 变，kernel 跳过策略里不存在的域名。一行一个域：列表写法会被解析器丢弃。
 
-# 注入与兜底真正落地的域：整域放宽，不再逐条 allow。
+# 注入与兜底落地的域整域放宽。
 permissive keystore
 permissive system_app
 permissive platform_app
@@ -21,34 +20,23 @@ permissive hal_soter_service
 permissive vendor_hal_soteraidl_service
 permissive hal_cryptoeng_oplus
 
-# 递 payload 的 dgram：发送方是注入器（域随根实现变），接收方在上面放宽的域里。
+# 递 payload 的 dgram：发送方是注入器（域随根实现变）。
 allow { system_file ksu magisk su } keystore unix_dgram_socket sendto
 allow { system_file ksu magisk su } { system_app platform_app priv_app } unix_dgram_socket sendto
 allow { system_file ksu magisk su } { hal_soter hal_soter_default hal_soter_qti } unix_dgram_socket sendto
 allow { system_file ksu magisk su } { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } unix_dgram_socket sendto
 allow { system_file ksu magisk su } { hal_cryptoeng_oplus } unix_dgram_socket sendto
 
-# payload 从 memfd 里 dlopen：memfd_file 是 Android 12+ 独立的类，缺 execute 就是
-# `couldn't map "/memfd:…" segment 3: Permission denied`。各域自己建、root 域代建都有。
-allow keystore keystore memfd_file { open read write map execute getattr }
-allow keystore keystore file { execute map }
-allow { system_app platform_app priv_app } system_file memfd_file { open read write map execute getattr }
-allow { system_app platform_app priv_app } { system_app platform_app priv_app } memfd_file { open read write map execute getattr }
-allow { hal_soter hal_soter_default hal_soter_qti } tmpfs memfd_file { open read write map execute getattr }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs memfd_file { open read write map execute getattr }
-allow { hal_cryptoeng_oplus } tmpfs memfd_file { open read write map execute getattr }
-
-# 软件 SOTER TA（soterta.sh 拉起的 ommega-inject --soterta-serve）注册 SOTER 服务名，
-# 它的运行域是 shell 或 root。
+# 软件 SOTER TA 注册服务名（运行域是 shell 或 root）。
 allow { magisk ksu su system_file } default_android_service service_manager { add find }
 allow shell vendor_hal_soteraidl_service service_manager { add find }
 allow shell vendor_hal_soter_hwservice hwservice_manager { add find }
-# 注册时 servicemanager 要读调用方的 SELinux 上下文。
+# 注册时 servicemanager 读调用方的 SELinux 上下文。
 allow servicemanager shell file { read open getattr }
 allow servicemanager shell dir { search getattr }
 
-# keystore2 崩溃时 crash_dump 要读它的进程。
+# keystore2 崩溃时 crash_dump 读它的进程。
 allow crash_dump keystore process *
 
-# 工程模式带 ID attestation 建钥时，keystore2 检查调用方的 keystore2_key gen_unique_id。
+# 工程模式建 ID attestation 钥匙时检查调用方的 gen_unique_id。
 allow engineermode_app keystore keystore2_key { gen_unique_id }

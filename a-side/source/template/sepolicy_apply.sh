@@ -1,22 +1,13 @@
-# 把模块目录里的 sepolicy.rule 打进内核。post-fs-data.sh 和 service.sh 都 source 这个文件，
-# 免得同一段逻辑抄两遍又各自跑偏（以前 post-fs-data 那侧会重试三次、service 那侧只认 ksud）。
+# 把模块目录里的 sepolicy.rule 打进内核。post-fs-data.sh 和 service.sh 都 source 这个文件。
 #
-# 各家 root 管理器的工具和语法都不一样，这里按能力依次试：
-#   - KernelSU 系（KernelSU / KernelSU-Next / SukiSU / ReSukiSU）：`ksud sepolicy apply <file>`。
-#     ksud 在 /data/adb/ksu/bin 下，不在 PATH 里（个别 fork 会放进 PATH，也认）。
-#   - Magisk 系（Magisk / Delta / Alpha）：`magiskpolicy --live --apply <file>`，
-#     `--apply` 是 24.0 之后才有的选项，正好也是本模块要求的最低版本附近。
-#   - APatch：`/data/adb/ap/bin/magiskpolicy` 是 `/data/adb/apd` 的软链（apd 的多命令入口），
-#     CLI 跟 Magisk 一致，`--live --apply` 同样能用。
-#
-# 还要说清楚一件事：Magisk 和 APatch 开机时都会自己把模块目录里的 sepolicy.rule 读一遍
-# （Magisk 的 sepolicy 模块、APatch 的 `apd/src/module.rs:load_sepolicy_rule`），只有
-# KernelSU 系重放这件事从来不做 —— 这正是这段自愈逻辑存在的原因。所以另外两家即使这里
-# 一条都打不进去，功能上也过得去；日志会写明白到底找没找到工具。
+# 依次试三种工具：
+#   - 自带 `ommega-policy`：不依赖管理器，写完后自己用 `--check` 复核。
+#   - KernelSU 系：`ksud sepolicy apply <file>`（在 /data/adb/ksu/bin 下，也在 PATH 里找）。
+#   - Magisk / APatch：`magiskpolicy --live --apply <file>`。
 #
 # 用法：ommega_apply_sepolicy <rule 文件> [日志文件]
 #   返回 0 时 stdout 打一行「用了哪个工具」，失败返回 1 且 stdout 为空。
-#   日志一行一笔，失败时把每个候选路径的存在情况也记下来，方便现场反馈该补哪个位置。
+#   日志一行一笔；失败时记下每个候选路径的存在情况。
 
 _ommega_policy_log() {
   [ -n "$_OMMEGA_POLICY_LOG" ] || return 0
@@ -192,15 +183,8 @@ ommega_apply_sepolicy() {
   fi
   _OMMEGA_POLICY_RULE=$(_ommega_policy_filtered_rule "$_OMMEGA_POLICY_RULE")
 
-  # 0) 模块自带那份永远是第一选择，不看当前是哪个管理器。
-  #    理由不是「自家的好用」，而是它不依赖任何管理器的返回值：它自己写
-  #    /sys/fs/selinux/load，写完还能用 `--check` 自己复核一遍真正进没进内核。
-  #    管理器的工具靠不住是实测过的：
-  #      - SKRoot（sevenk 那层）的 `ksud sepolicy apply` 回 0 但一条规则都不落；
-  #      - KernelSU 1.4.5 上同样出现过「apply 完 avc 照旧」（见下面第 1 步的注释）。
-  #    2026-11-08 一加 PKX110 / Android 16：走 ksud 时 payload 在 keystore2 里连自己的
-  #    日志都写不进（EACCES），出证请求全透传给系统 keymint，应用侧拿 -74。换自带那份
-  #    立刻正常。所以顺序改成「先试自带的，不行才回落管理器工具」。
+  # 0) 先用自带工具：它直接写 /sys/fs/selinux/load，写后用 --check 复核是否真进内核，
+  #    不依赖管理器的返回码。
   for _ommega_cand in $(_ommega_policy_bundled_candidates); do
     _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
     if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
