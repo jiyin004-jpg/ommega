@@ -1,45 +1,24 @@
-//! 服务端侧的两层 SOTER：keybox 层（用服务端存的那把设备身份）和自签层（现
-//! 生成、进程内复用）。
+//! 服务端侧的三层 SOTER：`keybox`（服务端存的设备身份）、`attk`（控制台上传的 ATTK）、
+//! `self_signed`（现生成、进程内复用），另有 `builtin` 供探测机就地作答。
 //!
-//! SOTER 的"证书"不是 X.509，是 `[i32 le JSON 长度][JSON][256 字节 RSA-PSS
-//! 签名]`，JSON 长这样（键序就是现场抓到的键序，字段名别改）：
+//! SOTER 的"证书"不是 X.509，是 `[i32 le JSON 长度][JSON][256 字节 RSA-PSS 签名]`，
+//! 签名用 RSA-PSS-SHA256、盐长 32。JSON 键序即现场抓到的顺序，字段名不能改：
 //!
 //! ```json
 //! {"pub_key":"<ASK 公钥 PEM>","cpu_id":"<32 位十六进制>","counter":<数字>,
 //!  "uid":"<字符串>","rsa_pss_saltlen":32}
 //! ```
 //!
-//! 签名用 ATTK 私钥做 RSA-PSS-SHA256，盐长 32。也就是说：手里只要有（或者现
-//! 生成）一对 RSA 密钥，就能造出一份"ASK 的签名拿这把 ATTK 公钥验得过"的自洽
-//! 产物 —— 这正是这两层要干的事。腾讯那边认不认是另一回事（SOTER 的根在腾讯，
-//! 谁也没有），这两层的意义是让 A 端的本地流程先能闭环，跟认证那边 keybox /
-//! self_signed 两层是一个道理。
+//! 层与层的分工：`keybox` 只在自己那把身份是 RSA 时能处理；`attk` 用上传的那把 ATTK
+//! （身份就是它的 `cpu_id`，A 端转来的真机号在这层不作数）；`self_signed` 服务重启即换
+//! 身份，A 端需重新取 ATTK 公钥。
 //!
-//! 层与层的分工：
-//!   - `keybox`：用服务端数据库里这台设备名下的身份私钥。只有它带的是 RSA 才
-//!     能干 SOTER（keybox 里常见的是 EC，那就这层处理不了，回退下一层）。
-//!   - `attk`：服务端密钥模式专用。用控制台上传的那把 ATTK（RSA 私钥 + 它自己的
-//!     `cpu_id`）铸料 —— 身份就是那把 ATTK 的，A 端转过来的真机号在这儿不作数。
-//!     多个 ATTK 时选哪把由 `crate::soter_policy` 的身份规则决定。
-//!   - `self_signed`：现生成一把 RSA-2048，进程内复用；服务端一重启就等于换了
-//!     一把新身份，A 端要重新取 ATTK 公钥。
+//! 物料按身份隔离：缓存键前面带 `scope`（见 `material_scope`），换 ATTK 就是换整套
+//! 钥匙，不会拿旧的 ASK 配新的 AuthKey。
 //!
-//! 物料是按「身份」隔离的：ASK / AuthKey 的缓存键前面都带一层 `scope`
-//! （见 `material_scope`）。换了 ATTK 就等于换了一整套钥匙，不会拿 A 的 ASK 去配
-//! B 的 AuthKey —— 那种状态下 App 导出的公钥和签名用的私钥对不上，会自己把该 uid
-//! 下的钥匙全删掉重来。
-//!
-//! 处理不了的 op 会返回带 `error` 的对象，调用方据此回退下一层。
-//!
-//! 换层是策略（没物料 / 超时 / 不认这个 op 就往下换），但**同一个槽位的材料
-//! 必须只出自一层**：一半是 B 的 ASK、一半是 keybox 的 AuthKey，App 手里就是
-//! 自相矛盾的状态（`hasAuthKey` 一会儿有一会儿没，导出的公钥和签名的私钥也
-//! 对不上）。所以：
-//!
-//!   - 谁来服务这个槽位就把它钉在谁身上（`pin_layer`，落盘不丢），下次先问它；
-//!   - 它真不灵了再换（换层仍是策略），换成了钉子跟着挪；
-//!   - 每层自己也得把整个流程走完：ASK 自描述、AuthKey 自描述、签名现场，
-//!     三份信封一个不少，签名的那把钥匙和导出的公钥对得上。
+//! 处理不了的 op 返回带 `error` 的对象，调用方据此回退下一层。**同一槽位的材料只能
+//! 出自一层**（一半 B 的 ASK、一半 keybox 的 AuthKey 会让 App 自相矛盾），因此服务
+//! 它的那层会被钉住（`pin_layer`，落盘），层失效时才换、钉子跟着挪。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -230,13 +209,9 @@ struct SignSession {
 
 /// 刚签完的会话。
 ///
-/// 会话本身是一次性的（`finish_sign` 一签就从 `sessions` 里拿掉），但真实世界里有两种
-/// “同一张会话再问一遍”：检测器先 init 两张会话再回头逐个 finish；客户端超时重试。
-/// 以前这种第二笔会在 handlers 那一层被判 -204（`session_expired`），App 看到就是
-/// “签名失败”，而它拿的明明是刚才那张合法会话。
-///
-/// 所以签完的答复在这里短存一份：同一张会话再问，**原样把上次那串信封还回去**
-/// —— 不重签、也不推 counter，所以不是“多签了一次”，只是幂等。过了存留期就真没了。
+/// 会话是一次性的，但「同一张会话再问一遍」两种情形都真实存在：检测器先 init 两张再
+/// 逐个 finish，客户端也会超时重试。签完的答复在这里短存一份，再问就原样还回去 ——
+/// 不重签、不推 counter。过了存留期就真没了。
 struct FinishedSession {
     requested: String,
     device: String,
@@ -502,13 +477,10 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
 
 /// 这一层的 ASK（按需生成、进程内缓存）。
 ///
-/// 键里带 **uid**：真机的 ASK 是 per-user、per-uid 的（`generateAskKeyPair(uid)` 建的就是
-/// 那个 uid 的 ASK），`exportAskPublicKey(uid)` 吐的是那个 uid 的公钥。以前这里只按
-/// 设备缓存，同设备上所有应用拿到同一把 ASK —— 真机上永远不会出现的形状，多用户下
-/// 更糟：工作资料的应用会拿到机主那把的公钥。
+/// 键里必须带 **uid**：真机的 ASK 是 per-uid 的（`generateAskKeyPair(uid)`），同一
+/// 设备上所有应用共用一把 ASK 在真机上不存在，多用户下还会把机主的公钥发给工作资料。
 ///
-/// 跟 ATTK 分开存：真机上这两把公钥永远不相等，`exportAskPublicKey` 和
-/// `exportAttkPublicKey` 吐同一把会让 App 把该 uid 下的钥匙全删掉重来。
+/// 跟 ATTK 分开存：真机上这两把公钥从不相等，吐同一把会让 App 把该 uid 下的钥匙删掉重来。
 fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     let id = format!("{scope}|{uid}|{layer}");
     // 先在锁里看一眼；生成 RSA 放到锁外。
@@ -827,19 +799,9 @@ fn purge_owners_if_due() {
 // 这个槽位上一个账号还是好几个
 // ---------------------------------------------------------------------------
 //
-// 为什么要数：SOTER 的钥匙在 TA 里按 uid 存一包，`remove_all_uid_key`（HAL 12 /
-// AIDL 7 `removeAppGlobalSecureKey`）清的是整包 —— ASK 加上这个 uid 上**每一个**
-// 账号的 AuthKey。而微信自己就会打这一枪，逆向 classes13.dex 看得很清楚：
-//
-//   - `d36/p0.a(false)`：ASK 公钥上传腾讯校验失败 → `q26.a.r()` 当场清；
-//   - `d36/m0`（Soter.TaskInit）：`WechatASK` 状态非 0（含「从没写过」的默认 -1）
-//     并且 ASK 存在 → 清；
-//   - `d36/q0.f()`：ASK 生成被取消 → 清。
-//
-// 真机上微信一个 uid 只有一个号，清的是自己；我们这里十几个号挤一个 uid（实测一台
-// B 端最多 28 个 `WechatAuthKeyPay&<微信号>`）。一枪下去，同 uid 上别人的开通记录
-// 一起没了 —— 私钥只在 TA 里，重建出来是新的，腾讯那边存着的公钥对不上，之后
-// 指纹支付就一直失败。所以要数清楚，好把这一枪拦下来（见 `handlers::soter`）。
+// `remove_all_uid_key` 清的是 uid 一包（ASK + 该 uid 每个账号的 AuthKey），而我们一台
+// 设备上会挂多个微信号。一枪下去同 uid 别人的开通记录一起没，私钥只在 TA 里重建即新，
+// 腾讯存着的公钥就对不上了。所以要数清楚，好把这一枪拦下来（见 `handlers::soter`）。
 
 /// 一个槽位里每一族最多记几个账号指纹（跟 `statedb::OWNER_FAMILY_CAP` 同一口径）。
 ///
@@ -853,14 +815,12 @@ const OWNER_TOUCH_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 /// 从别名里抠出「这是谁的钥匙」。
 ///
-/// 微信一个账号会留下三族别名，而且盐各不相同 —— 同一个账号的旧盐是 `md5(微信号)`、
-/// 新盐是 `md5(uin)`，所以本来就得按族分开数：
+/// 一个微信号会留三族别名，盐不同（旧盐 `md5(微信号)`、新盐 `md5(uin)`），所以按族分开数：
+///   - `WechatAuthKeyPay&<微信号>`
+///   - `SoterAuthKeyV2_salt<md5(uin)[0:8]>_sceneN`
+///   - `SoterAuthKey_salt<md5(微信号)[0:8]>_sceneN`
 ///
-///   - `WechatAuthKeyPay&<微信号>`（scene1 的旧名字）
-///   - `SoterAuthKeyV2_salt<md5(uin)[0:8]>_sceneN`（现在的名字）
-///   - `SoterAuthKey_salt<md5(微信号)[0:8]>_sceneN`（旧名字，迁移时被删）
-///
-/// 别的别名（工具自己造的）不算，免得一份探针流量把槽位看成「共用」。
+/// 其它别名不算，免得探针流量把槽位看成「共用」。
 fn owner_token(alias: &str) -> Option<String> {
     if let Some(pos) = alias.find("WechatAuthKeyPay&") {
         let account = alias[pos + "WechatAuthKeyPay&".len()..].trim();
@@ -1036,13 +996,8 @@ pub fn scope_wipe_enabled() -> bool {
 
 /// 跑一层服务端 SOTER。
 ///
-/// 返回 `None` 表示"这一层不认识这个 op"，`Some` 里带 `error` 表示这层试过但没
-/// 成 —— 两种情况调用方都该继续回退下一层。成功就是一份跟 B 端形状一致的应答。
-///
-/// 层名三选一：`keybox`（服务端存的设备身份）、`self_signed`（极端兜底）、`builtin`
-/// （探测机就地作答专用，见 `crate::soter_probe`）。`builtin` 的料是自己一把、永不
-/// 轮换，就是不想让探测流量一直换全局 ASK、把别人正跑着的槽位劈成两半。
-/// 这两层认得的 op；不认得的直接让下一层试，连物料都不用取。
+/// `None` = 这层不认这个 op；`Some` 里带 `error` = 试过但没成 —— 两种调用方都继续回退。
+/// `builtin` 层的料自己一把、永不轮换，专供探测机就地作答（见 `crate::soter_probe`）。
 const KNOWN_OPS: &[&str] = &[
     "probe",
     "get_device_id",
@@ -1164,18 +1119,11 @@ pub fn run_layer(
                 ask_result(op, layer, &scope, &ask, &key, &product, uid)
             }
             // `has_ask_already`：
-            //
-            //   - `attk` 层（服务端密钥模式）：**如实回答**。这一层的 ASK 是用上传的
-            //     那把真 ATTK 签的，App 拿着它能走完上报，所以它跟自签层不是一回事：
-            //     一直答 -5 的话 App 每轮都判「没有 ASK」，建一把、导一把、上报、
-            //     清掉重来，永远走不到下一步（2026-11-06 微信实测就是这个圈）。
-            //     为不然重启就换身份，ASK/AuthKey 跟计数器都是落盘的。
-            //
-            //   - 自签 / keybox 两层：**不许声称「ASK 已存在」**（2026-10-11 实测的
-            //     毒化根源）。它们现造的 ASK 腾讯永远不会认，照答 OK 会让 App 跳过
-            //     上报、拿着假 ASK 去建 AuthKey，被拒了再自删重试 —— B 不在线时兑
-            //     一次底就把该槽位永久毒化。现在答 `NOT_FOUND`（「没有」），App 会
-            //     老实地重新生成并**上报**，真机一回来就能走通。
+            //   - `attk` 层：如实回答。这层的 ASK 是上传的那把真 ATTK 签的，App 能拿它
+            //     走完上报；一直答 -5 会让它每轮「建→导→上报→清」循环，走不到下一步。
+            //   - 自签 / keybox 层：不许声称「ASK 已存在」。现造的 ASK 腾讯永远不认，答 OK
+            //     会让 App 跳过上报、拿假 ASK 建 AuthKey，被拒后自删重试，把槽位永久毒化。
+            //     答 `NOT_FOUND` 它才会老实重新生成并上报。
             "has_ask_already" => {
                 if layer != "attk" {
                     return Ok(code_result(op, NOT_FOUND));
@@ -1553,14 +1501,11 @@ fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
     format!("{scope}|{device_id}|{uid}")
 }
 
-/// 真机形状是按平台分的（两台实测）：
-///   - 高通（SM8635）：`cpu_id` 以 `00000000` 开头、getDeviceId 回 16 字节 raw、
-///     文档里**不带** `rsa_pss_saltlen` 字段；
-///   - MTK（MT6991 / Kinibi）：`cpu_id` 以 `09000000` 开头、getDeviceId 回 32 ASCII + NUL、
-///     文档带 `rsa_pss_saltlen:32`。
+/// 真机形状按平台分：
+///   - 高通：`cpu_id` 以 `00000000` 开头、getDeviceId 回 16 字节 raw、无 `rsa_pss_saltlen`；
+///   - MTK：`cpu_id` 以 `09000000` 开头、getDeviceId 回 32 ASCII + NUL、带 `rsa_pss_saltlen:32`。
 ///
-/// 服务端拿不到 A/B 的 SoC，但 `cpu_id` 本身带着平台前缀 —— 自己造的时候按它选形状，
-/// 跟转发过来的那个真机号保持一致。
+/// 服务端拿不到 A/B 的 SoC，按 `cpu_id` 前缀选形状，跟转发过来的真机号保持一致。
 #[derive(Clone, Copy)]
 struct Platform {
     declares_salt: bool,

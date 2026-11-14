@@ -382,15 +382,10 @@ struct Inner {
     load_balance_index: usize,
     /// Sticky substitute per requested-but-offline device_id: `(target, chosen_at_ms)`.
     ///
-    /// A B device's identity is its keybox chain, and the A-side app sees that
-    /// chain. EC and RSA attestation for one app are two separate requests, so
-    /// letting the balancer round-robin them onto different B端 hands the app two
-    /// chains with different intermediates / issuers for the same device - which
-    /// self-check apps report as an RSA/EC attestation profile mismatch
-    /// (TrustAttestor: `hardware.attestation.algorithm_differential`). Keeping an
-    /// offline requested device on one substitute for [`SUBSTITUTE_TTL_MS`] makes
-    /// consecutive requests agree while still allowing a re-pick once that
-    /// substitute disappears.
+    /// EC and RSA attestation are separate requests; letting the balancer round-robin
+    /// them onto different B devices hands the app two chains with different issuers
+    /// for the same device (reported as an RSA/EC profile mismatch). Pinning the
+    /// substitute for [`SUBSTITUTE_TTL_MS`] keeps consecutive requests consistent.
     substitutes: HashMap<String, (String, u64)>,
     /// SOTER identities must stay on one TEE across generate/export/sign steps.
     /// Kept separate from KeyMint substitutes, with the same bounded TTL.
@@ -630,15 +625,11 @@ impl TaskStore {
     /// Returns None after `timeout` elapsed with no match.
     /// B 端连上来时问一句：按当前在线情况，这台排得上名额吗？
     ///
-    /// **无状态实现**：不维护任何 `accepted` 占位标记，每次 poll 现场把在线设备
-    /// 排一遍，看本设备排在不在前 `max` 名里。之前用标记 + 清理 + 补位那套，
-    /// 三者互相打脸（掉线释放的名额被新人补上、老人回来又放行），实测一路涨到 217。
+    /// **无状态实现**：不维护占位标记，每次 poll 现场把在线设备排一遍，看本设备在不在
+    /// 前 `max` 名。排序：固定的默认设备优先，其次按质量（锁定+可信启动），同质量按
+    /// 最近活跃。掉线超过 120 秒的不参与排名。
     ///
-    /// 排序：固定的默认设备（`pinned`）优先，其次按「锁定+可信启动」的质量，
-    /// 同质量按最近活跃时间。掉线超过 120 秒的不参与排名，名额自然腾出来。
-    ///
-    /// 拒绝时**不更新**任何状态，所以被拒的设备 120 秒后自然掉出在线列表，
-    /// 面板上的"在线 B 端"也就不会虚高。
+    /// 拒绝时不更新任何状态，被拒的设备 120 秒后自然掉出在线列表。
     pub async fn allow_poll(&self, device_id: &str, max: usize) -> Result<(), String> {
         if max == 0 {
             // 只在第一次提醒（无限制是默认值，也可能说明配置文件没读上）
@@ -915,12 +906,9 @@ impl TaskStore {
         let mut deferred: Vec<String> = Vec::new();
         let mut cancelled: Vec<String> = Vec::new();
         if let Some(q) = inner.pending_by_device.get_mut(device_id) {
-            // 按优先级挑，同优先级里仍是先来后到。
-            //
-            // 为什么不直接 pop_front：B 端一次只做一条，attest / sign / soter 全排
-            // 同一条队。RKP / attest 这一路是远端一跳，Duck Detector 拿它跟本地
-            // attest 的 13ms 比延迟（delta >= 120ms 就红），排在几十条别的活后面
-            // 必然红。soter 那些 op 本来就有短 TTL 合并，晚几毫秒无所谓。
+            // 按优先级挑，同优先级里先后到。不能直接 pop_front：远端一跳要跟本地
+            // attest 比延迟，排在几十条别的活后面必红；soter 那些 op 有短 TTL 合并，
+            // 晚几毫秒无所谓。
             // 原地清掉失效引用，能力变化后做不了的定向任务收集起来终结，
             // 不迁移身份。无需克隆整条队列再按 id 查找/删除一次。
             q.retain(|id| {
@@ -1229,14 +1217,11 @@ impl TaskStore {
             .and_then(|t| t.payload.get("selfcheck"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // 同一条叶子证书上再取一次 AAID：启动信息只说明"设备处于什么状态"，
-        // AAID 才说明"这条链是谁的身份出的"，两个都要落到状态页上。
+        // 同一条叶子证书上再取一次 AAID：启动信息说的是「设备处于什么状态」，AAID 说的
+        // 是「这条链是谁的身份」，两个都要上状态页。
         //
-        // 这里**只把 leaf 抄出来，不当场解析**。解析是两次纯 CPU 的 DER/CBOR
-        // 遍历，而这段还在 `inner` 锁里 —— 解析完才轮到下面的任务落库，才轮到
-        // 末尾的 notify_waiters，也就是说等这条结果的 A 端请求要陪着一起等。
-        // 状态页那份设备记录晚几十微秒更新没有任何人受影响，A 端的响应延迟却是
-        // 整条链路的关键路径。所以顺序反过来：先把结果放给 A 端，再解析、再落表。
+        // 这里只抄 leaf、不当场解析：解析是两次 DER/CBOR 遍历，而这段还在 `inner` 锁里，
+        // 会把等结果的 A 端请求一起拖住。先把结果发出去，再解析、再落表。
         let leaf =
             if task_type == "attest" && result.get("error").is_none() && !device_id.is_empty() {
                 result
@@ -1632,23 +1617,15 @@ impl TaskStore {
 
     /// 记下这台 B 上线时用的 token 身份（配对组 + 类型）。
     ///
-    /// 只给「A/B 必须配对」的判断用；没有 token、静态 env token、或查不到/已停用
-    /// 的卡不会登记，调用方拿不到 `Some`，按历史行为「任意 A 都能用」。
+    /// 只给「A/B 必须配对」的判断用；没有 token、静态 env token、查不到或已停用的卡
+    /// 不登记，调用方拿不到 `Some`，按「任意 A 都能用」处理。
     ///
-    /// 换组要过一道闸（见 [`TOKEN_META_REBIND_AFTER_MS`]）：设备还在心跳时，只有同一组的
-    /// token 能更新，别的组、或者把组洗成空，一律不认。不拦的话，任意一张 B 卡对别人的
-    /// device_id 心跳一笔，就能把它认领进自己组（或者反过来把约束洗掉），配对检查随之
-    /// 放行别人的 A。
+    /// 换组要过一道闸（[`TOKEN_META_REBIND_AFTER_MS`]）：设备还在心跳时只有同组 token
+    /// 能更新，别组或把组洗空一律不认 —— 否则任意一张 B 卡对别人的 device_id 心跳一笔，
+    /// 就能把它认领进自己组。闸门只比 `pair_id`，公开卡与老卡（`kind` 为空）都算同组。
+    /// 设备真换卡（离线超过窗口再回来）照样能改。
     ///
-    /// 闸门只比较 `pair_id`：公开卡和 `kind` 为空的老卡都没有组，彼此都算同组，公开池
-    /// 内部按设计互通；同一空组下 `kind` 仍可能被后到的心跳覆盖。
-    ///
-    /// 设备真换了卡（离线超过窗口再回来）照样能改，只是多等一个在线窗口 —— 换卡本来
-    /// 就要重装/重启，那段时间自然就过了。
-    ///
-    /// 返回 `false` = 这次心跳不被认（有人拿别人的 device_id 在心跳）。调用方据此
-    /// 决定要不要写这台设备的属性（机型串、skip 名单、版本号）—— 那些字段直接决定
-    /// A 端拿到的伪装参数和派发策略，没被认的心跳一律不写。
+    /// 返回 `false` = 这次心跳不被认，调用方不要写该设备的机型串 / skip 名单 / 版本号。
     pub async fn set_device_token_meta(&self, device_id: &str, pair_id: &str, kind: &str) -> bool {
         let mut inner = self.inner.lock().await;
         let now = Self::now_ms();

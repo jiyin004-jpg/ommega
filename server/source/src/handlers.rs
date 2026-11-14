@@ -588,22 +588,13 @@ fn strongbox_b_kind(v: &Value) -> Option<&'static str> {
 /// Smart (middle) StrongBox mode: serve a StrongBox attestation from the
 /// strongest honest source available.
 ///
-///   1. server_keybox mode mints from the stored per-device identity first
-///      (an uploaded identity means the operator wants local server out-证 to
-///      win when it can).
-///   2. Otherwise ask the B device for its real StrongBox:
-///        - success (real StrongBox chain)         -> return as-is (branch 3);
-///        - present-but-broken StrongBox (attestation keys not provisioned /
-///          hardware type unavailable)             -> return the B error verbatim
-///          with a `relay_error_kind` marker so the A-side surfaces it to the
-///          calling app (branch 2);
-///        - anything else (no StrongBox HAL / timeout / empty chain / foreign
-///          error text)                            -> continue to the keybox step.
-///   3. In physical mode, fall back to the stored per-device keybox identity,
-///      which mints a StrongBox-tagged chain (branch 1).
-///   4. Nothing left -> error so the A-side's local software keybox generates a
-///      StrongBox-level chain itself (branch 4). `self_signed` is deliberately
-///      never used for a StrongBox request.
+///   1. server_keybox mode mints from the stored per-device identity first.
+///   2. Otherwise ask the B device for its real StrongBox: success -> return it;
+///      present-but-broken (keys not provisioned / no hardware type) -> return
+///      the B error with a `relay_error_kind` marker; anything else -> next step.
+///   3. In physical mode, fall back to the stored keybox identity.
+///   4. Nothing left -> error, so the A-side generates a StrongBox-level chain
+///      locally. `self_signed` is never used for a StrongBox request.
 async fn run_smart_strongbox_attest(
     state: &AppState,
     device_id: &str,
@@ -1060,17 +1051,10 @@ async fn run_a_side_task(
     //     device has none it returns an error and the next layer is attempted.
     // Only when every layer fails does the request error, letting the A-side
     // fall back to its local software keybox.
-    // 远程 attested 链只要真机在线就先让真机出：`attest` 的层序固定 B 端设备优先，
-    // 不管物理模式还是 serverbox 模式。
-    //
-    // 理由：serverbox 模式的密钥层用的是服务端存的身份（往往是别的机器，甚至是
-    // 管理台上传的占位身份），叶子上的 device properties 又是调用方的，两者拼在
-    // 一起就是一张四不像的链 —— 调用方想看的「真机可信证明」也没了。所以这一层
-    // 只在真机不可用（离线 / 没有这个 alias / StrongBox 不支）时当兜底。
-    // sign/decrypt 等其它请求仍按模式层序（否则会和已铸出的 keyblob 对不上）：
-    // 真机铸的 alias 在密钥层没有 session，会自然落到 B 那层。
-    // 层序：默认跟随模式（本地出证 → keybox 先；物理 → 真机先），两个策略开关只在
-    // 排障时强制换一下。`auto` 时没有任何特判。
+    // 远程 attested 链只要真机在线就先让真机出：层序固定 B 端设备优先（物理模式与
+    // serverbox 模式都一样）。serverbox 的密钥层用的是服务端存的身份，叶子上的 device
+    // properties 却是调用方的，拼起来是四不像；所以这一层只当真机不可用时的兜底。
+    // sign/decrypt 仍按模式层序（否则会和已铸出的 keyblob 对不上）。
     let order: &[&str] = attest_layer_order(task_type, body, serverbox);
 
     let mut last_error: Option<String> = None;
@@ -1490,21 +1474,12 @@ const REPAIR_ATTEMPTS: u32 = 2;
 /// 两次补签之间等多久。
 const REPAIR_RETRY_GAP: Duration = Duration::from_millis(150);
 
-/// `finish_sign` 回 -204 时的补救：拿 init 时缓存的参数重开一张会话，再签一次。
+/// `finish_sign` 回 -204 时的补救：拿 init 时缓存的参数重开一张会话再签一次。
 ///
-/// -204（`SOTER_ERROR_OPERATEID_NULL`）在设备上就一个意思：这张会话被后来的一笔
-/// `init_sign` 顶掉了 —— TA 一台设备只保留一个会话，跟槽位是谁的无关（2026-10-01 实测
-/// 见 `soter_sign_sessions` 的模块注释）。App 手上只有它自己那一张 session，没牌可打，
-/// 所以服务端替它重开：用同一个 uid / 别名 / challenge 再 `init_sign` 一次，拿新会话把
-/// 同一个 challenge 签了。同一把钥匙、同一个挑战 —— 签名值是等价的，App 那边就是一次
-/// 正常成功。
+/// -204 的意思是这张会话被后来的一笔 `init_sign` 顶掉了（一台 TA 只保留一个会话）。
+/// 用同一个 uid / 别名 / challenge 重开一次，签出来的值是等价的，App 看到的是一次正常成功。
 ///
-/// 只试 [`REPAIR_ATTEMPTS`] 次（中间隔 [`REPAIR_RETRY_GAP`]）；试不出来（拿不到新会话、
-/// 或者补签本身也失败）就返回 `None`，外面照旧把原来的 -204 还回去。
-///
-/// 为什么要试第二次：失败那几次看下来多半不是「会话抢不到」，而是设备层那一瞬答不出来
-/// （没有在线的 B、转发超时）。这种是瞬时的，隔一百多毫秒再来一次就够了；第一次已经
-/// 拿到签名就直接回，正常路径不因为重试多花一点时间。
+/// 只试 [`REPAIR_ATTEMPTS`] 次（间隔 [`REPAIR_RETRY_GAP`]），试不出来就把原来的 -204 还回去。
 async fn repair_clobbered_finish(
     state: &AppState,
     body: &Value,
@@ -1699,20 +1674,15 @@ fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Val
     out
 }
 
-/// SOTER 转发：跟认证共用同一套三层链，差别只在三层的实现。
+/// SOTER 转发：跟认证共用同一套三层链，差别在三层的实现。
 ///
-/// 层序（`physical` / `serverbox` 两种模式只差优先级）：
-///   physical:   B 端设备层 -> 服务端密钥层(keybox) -> 服务端自签层
-///   serverbox:  服务端密钥层 -> B 端设备层 -> 服务端自签层
-/// 哪一层没做成（没物料、没能力、请求失败）就回退下一层，三层都不行才把错误回
-/// 给 A 端；A 端据此用本地密钥，本地也不行就透原生。
+/// 层序（两种模式只差优先级）：
+///   physical:  B 端设备层 -> 服务端密钥层(keybox) -> 服务端自签层
+///   serverbox: 服务端密钥层 -> B 端设备层 -> 服务端自签层
+/// 哪层没做成（没物料 / 没能力 / 失败）就回退下一层，三层都不行才回错给 A 端。
 ///
-/// B 端层在线点名时不换设备；离线点名且没有已登记的签名会话路由时才按能力
-/// 和负载选设备。finish 保留 init 的实际设备，无法使用原设备时走原来的回退层，
-/// 不在另一台设备上拿同号句柄补签。
-///
-/// 服务端两层（见 `soter_mint`）用服务端自己的 RSA 物料现造一份自洽的 ASK，让
-/// A 端本地流程先闭环；腾讯那边的根谁也拿不到，这两层不假装自己是腾讯认得的东西。
+/// B 端层在线点名时不换设备；离线点名且没有已登记的会话路由时才按能力和负载选。
+/// finish 保留 init 的实际设备，不在另一台设备上拿同号句柄补签。
 async fn run_soter_task_inner(
     state: &AppState,
     body: &Value,
