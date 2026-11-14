@@ -28,6 +28,9 @@ allow keystore system_file file { execute getattr map read receive }
 # 然后模块一直显示启动失败、daemon 轮回去也起不来。
 allow keystore keystore memfd_file { open read write map execute getattr }
 allow keystore keystore file { execute map }
+# 注入器（root 域）替别的目标建的 memfd，标签是它自己的域（ColorOS 上实测落在
+# system_file）。目标进程要能执行，不然 soterserver 那种宿主同样注不进去。
+allow { system_app platform_app priv_app } system_file memfd_file { open read write map execute getattr }
 
 # 递 payload 的那条 dgram：target 侧收，注入器那侧发。发送方域可能落在
 # system_file（ColorOS 上实测就是这个）、ksu、magisk 这些里，列全了不吃亏。
@@ -99,6 +102,9 @@ allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file file { 
 # payload 是从一个 memfd 里 dlopen 起来的，memfd 落在 tmpfs 上、标签就是 tmpfs，它要
 # 往那个镜像里写。实测缺这条会吃 `tmpfs:file write` 拒绝。
 allow { hal_soter hal_soter_default hal_soter_qti } tmpfs file { write getattr read execute map }
+# 执行 memfd 本体（Android 12+ 单开了 memfd_file 这个类）。不给就是
+# `dlopen failed: couldn't map "/memfd:lib….so" segment 3: Permission denied`。
+allow { hal_soter hal_soter_default hal_soter_qti } tmpfs memfd_file { open read write map execute getattr }
 
 # H2 = vendor_hal_soter_qti（一加 13 / ColorOS 16 实测就是这个）、hal_soter_trustonic
 #      （一加 PLC110 / 联发科 Trustonic）、hal_soter_service（联发科那套里另一个名字）
@@ -112,6 +118,7 @@ allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_
 allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file file { open read write create append getattr setattr rename unlink }
 # 同上：memfd 镜像的写入。这个域（一加 13 / 努比亚 Z60 Ultra 实测）就是它卡的。
 allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs file { write getattr read execute map }
+allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs memfd_file { open read write map execute getattr }
 
 # H3 = hal_cryptoeng_oplus（一加 PGP110 / 安卓 15 实测）：oplus 的 cryptoeng HAL 是工程
 # 模式那页到 HIDL soter 的中间人（cryptoeng → vendor.qti.hardware.soter@1.0::ISoter），
@@ -126,6 +133,7 @@ allow { hal_cryptoeng_oplus } system_data_file file { open read write create app
 allow { hal_cryptoeng_oplus } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
 allow { hal_cryptoeng_oplus } system_app_data_file file { open read write create append getattr setattr rename unlink }
 allow { hal_cryptoeng_oplus } tmpfs file { write getattr read execute map }
+allow { hal_cryptoeng_oplus } tmpfs memfd_file { open read write map execute getattr }
 
 # 软件 SOTER TA（soterta.sh 拉起的 `ommega-inject --soterta-serve`）：它要把
 # `vendor.qti.hardware.soter.ISoter/default` 注册到 servicemanager，客户端（宿主、
