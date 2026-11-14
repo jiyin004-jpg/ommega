@@ -1,201 +1,54 @@
-# ommega A 端的 SELinux 放行规则。
+# ommega A 端 SELinux 规则。
 #
-# 注入目标一共三类进程：keystore2（keymint 那边）、SOTER 宿主
-# （com.tencent.soter.soterserver）、SOTER HAL 服务进程。东西只有两条路走：注入器（root）
-# 把 payload 镜像的 fd 通过 unix dgram socket 递进目标进程；目标进程带着 payload 去连
-# daemon 开的抽象 unix socket（套接字算在 keystore 域）拿答复，顺带把日志落文件。
+# 注入目标有三类：keystore2、SOTER 宿主（system_app / platform_app / priv_app）、SOTER HAL。
+# 注入器把 payload 的 fd 用 unix dgram 递进目标进程，目标进程再连 daemon 的抽象 unix
+# socket 取答复，并往 system_data_file / system_app_data_file 落日志。
 #
-# 麻烦的地方在于**域名各个 ROM 不一样**：宿主在一加 PLC110 上是 platform_app、AOSP 上是
-# system_app；SOTER HAL 在骁龙 ColorOS 上是 vendor_hal_soter_qti、联发科 Trustonic 上是
-# hal_soter_trustonic、按 AOSP 惯例命名的 AIDL HAL 一般叫 hal_soter_default。以前只写
-# 一组，换台机器就变成「注进去了但日志写不出来、RPC 也连不上」。
-#
-# 所以这里把可能的名字都列进列表里：**policy 里不存在的域名，kernel 会直接跳过那条规则**
-# （实测一加 PLC110 的 policy 里既没有 hal_soter 也没有 system_app，整份文件照样生效），
-# 宁滥勿缺。以后碰到新域名，往下面几个列表里加个名字就行，规则形状不用动。
-#
-# 一个坑：ksud 的规则解析器**一个列表最多 5 个名字**，写 6 个整行会被丢掉（check 报
-# parse 失败、apply 里直接跳过），所以 HAL 那几个域分成了 H1 / H2 两组，加名字时挑
-# 没满 5 个的那组放。
+# 域名随 ROM 变，kernel 遇到策略里没有的域名会跳过那一行。一行一个域：列表写法
+# `{ a b c }` 会被解析器静默丢弃。
 
-# keystore2：payload 进去之后它得能 dlopen 我们镜像里的库。
-allow keystore system_file unix_dgram_socket { getattr read recvfrom }
-allow keystore system_file file { execute getattr map read receive }
-# 进程内那份的 payload 是从 keystore2 自己建的 memfd 里 dlopen 的（tclass=memfd_file，
-# tcontext 就是 keystore）。有的 ROM（Redmi/小米 PYB110、Android 17 实测）不给 keystore
-# 执行 memfd 的权限，注入就报
-#   dlopen failed: couldn't map "/memfd:lib….so" segment 3: Permission denied
-# 然后模块一直显示启动失败、daemon 轮回去也起不来。
+# 注入与兜底真正落地的域：整域放宽，不再逐条 allow。
+permissive keystore
+permissive system_app
+permissive platform_app
+permissive priv_app
+permissive hal_soter
+permissive hal_soter_default
+permissive hal_soter_qti
+permissive vendor_hal_soter_qti
+permissive hal_soter_trustonic
+permissive hal_soter_service
+permissive vendor_hal_soteraidl_service
+permissive hal_cryptoeng_oplus
+
+# 递 payload 的 dgram：发送方是注入器（域随根实现变），接收方在上面放宽的域里。
+allow { system_file ksu magisk su } keystore unix_dgram_socket sendto
+allow { system_file ksu magisk su } { system_app platform_app priv_app } unix_dgram_socket sendto
+allow { system_file ksu magisk su } { hal_soter hal_soter_default hal_soter_qti } unix_dgram_socket sendto
+allow { system_file ksu magisk su } { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } unix_dgram_socket sendto
+allow { system_file ksu magisk su } { hal_cryptoeng_oplus } unix_dgram_socket sendto
+
+# payload 从 memfd 里 dlopen：memfd_file 是 Android 12+ 独立的类，缺 execute 就是
+# `couldn't map "/memfd:…" segment 3: Permission denied`。各域自己建、root 域代建都有。
 allow keystore keystore memfd_file { open read write map execute getattr }
 allow keystore keystore file { execute map }
-# 注入器（root 域）替别的目标建的 memfd，标签是它自己的域（ColorOS 上实测落在
-# system_file）。目标进程要能执行，不然 soterserver 那种宿主同样注不进去。
 allow { system_app platform_app priv_app } system_file memfd_file { open read write map execute getattr }
-# 宿主那侧也有自己建 memfd 再 dlopen 的路（payload fd 是目标进程自己开的，标签就是它自己的域）。
-# 目标域里没有 untrusted_app：普通应用根本不在注入名单里。
 allow { system_app platform_app priv_app } { system_app platform_app priv_app } memfd_file { open read write map execute getattr }
-
-# 递 payload 的那条 dgram：target 侧收，注入器那侧发。发送方域可能落在
-# system_file（ColorOS 上实测就是这个）、ksu、magisk 这些里，列全了不吃亏。
-allow { system_file ksu magisk su } { keystore } unix_dgram_socket sendto
-
-# 注入目标是普通 app 域的那些（SOTER 宿主以及以后另外的 apk 宿主）。
-# system_app = AOSP，platform_app = 一加/ColorOS 实测，priv_app = 系统特权 app。
-allow { system_app platform_app priv_app } system_file unix_dgram_socket { getattr read recvfrom }
-allow { system_file ksu magisk su } { system_app platform_app priv_app } unix_dgram_socket sendto
-allow { system_app platform_app priv_app } system_file file { execute getattr map read receive }
-
-# 宿主进不去 /data/misc/keystore（0700 keystore），所以 daemon 另开了一个抽象 unix
-# socket 当第二会合点：不落文件，DAC 管不着，能不能连上就只看这条规则了。
-allow { system_app platform_app priv_app } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-
-# 宿主自己要落日志：payload 只走文件、不走 logcat，它得进得去那个目录。
-# 实测系统只放行了 file 的 read（读 log_flag 够了），目录本身的 open/read 和建文件
-# 全被拒，所以 dir 那一侧得补齐。unlink 和 dir 的 setattr 是后补的：日志涨到轮转阈值
-# 要删旧件、改目录时间戳，少这两个词就吃一串 avc。
-allow { system_app platform_app priv_app } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { system_app platform_app priv_app } system_data_file file { open read write create append getattr setattr rename unlink }
-# 日志目录另外会被 daemon 打成 system_app_data_file，这个标签也得放行。
-allow { system_app platform_app priv_app } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { system_app platform_app priv_app } system_app_data_file file { open read write create append getattr setattr rename unlink }
-
-allow crash_dump keystore process *
-
-# 数据根放到了 /data/misc/ommega（system_data_file）：SOTER 宿主（system_app 等）在上面
-# 已经放行，但没有给 keystore 域 —— 只放了 system_file（dlopen payload）。
-# keymint 和 daemon 都在 keystore 域，要读写这里的 config / keybox 之外的共享数据
-# （config、remote_identity、logs、injector.toml），所以补这两条。
-#
-# 代价要说清楚：keystore 域能读写 system_data_file，等于把这块数据对高价值目标打开。
-# 换来的是「一份数据一个位置」，不再有 keystore / misc 两份副本各自漂移。
-#
-# 必须拆成多条短规则：ksud 的解析器对**每行的权限列表**也有上限（跟名字列表一样 5 个），
-# 一条写 10 个权限整行会被默默丢弃 —— 之前就是这么踩的，avc 一直刷但规则文件看着是对的。
-allow keystore system_data_file dir { getattr open read search }
-allow keystore system_data_file dir { write add_name remove_name }
-allow keystore system_data_file dir { rename setattr lock }
-allow keystore system_data_file file { open read getattr }
-allow keystore system_data_file file { write create append }
-allow keystore system_data_file file { setattr rename unlink }
-
-# logs 目录被 daemon-injector 主动 chcon 成 system_app_data_file（SOTER 宿主跑在
-# system_app 域，只有这个标签写得动 injector.log）。可 payload 自己就跑在 keystore 域，
-# 写的也是同一份 ── 只放行 system_data_file 的话，payload 的日志探测一直
-# Permission denied，replay 那个模块一条日志都落不下来。
-allow keystore system_app_data_file dir { getattr open read search }
-allow keystore system_app_data_file dir { write add_name remove_name }
-allow keystore system_app_data_file dir { rename setattr lock }
-allow keystore system_app_data_file file { open read getattr }
-allow keystore system_app_data_file file { write create append }
-allow keystore system_app_data_file file { setattr rename unlink }
-
-# SOTER HAL 服务进程本身也是注入目标（宿主不在时，`service call` 那种直连只有注进
-# HAL 才看得见）。它跟宿主一样要收 payload、连 RPC socket、写日志，所以上面那组
-# 一条不落再来两份，只是域换成 HAL 的几种叫法。
-# H1 = hal_soter（高通 AOSP）、hal_soter_default（AOSP AIDL 惯例命名）、
-#      hal_soter_qti（高通自家命名）
-allow { hal_soter hal_soter_default hal_soter_qti } system_file unix_dgram_socket { getattr read recvfrom }
-allow { system_file ksu magisk su } { hal_soter hal_soter_default hal_soter_qti } unix_dgram_socket sendto
-allow { hal_soter hal_soter_default hal_soter_qti } system_file file { execute getattr map read receive }
-allow { hal_soter hal_soter_default hal_soter_qti } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow { hal_soter hal_soter_default hal_soter_qti } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { hal_soter hal_soter_default hal_soter_qti } system_data_file file { open read write create append getattr setattr rename unlink }
-allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { hal_soter hal_soter_default hal_soter_qti } system_app_data_file file { open read write create append getattr setattr rename unlink }
-# payload 是从一个 memfd 里 dlopen 起来的，memfd 落在 tmpfs 上、标签就是 tmpfs，它要
-# 往那个镜像里写。实测缺这条会吃 `tmpfs:file write` 拒绝。
-allow { hal_soter hal_soter_default hal_soter_qti } tmpfs file { write getattr read execute map }
-# 执行 memfd 本体（Android 12+ 单开了 memfd_file 这个类）。不给就是
-# `dlopen failed: couldn't map "/memfd:lib….so" segment 3: Permission denied`。
 allow { hal_soter hal_soter_default hal_soter_qti } tmpfs memfd_file { open read write map execute getattr }
-
-# H2 = vendor_hal_soter_qti（一加 13 / ColorOS 16 实测就是这个）、hal_soter_trustonic
-#      （一加 PLC110 / 联发科 Trustonic）、hal_soter_service（联发科那套里另一个名字）
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_file unix_dgram_socket { getattr read recvfrom }
-allow { system_file ksu magisk su } { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } unix_dgram_socket sendto
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_file file { execute getattr map read receive }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_data_file file { open read write create append getattr setattr rename unlink }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_data_file file { open read write create append getattr setattr rename unlink }
-# 同上：memfd 镜像的写入。这个域（一加 13 / 努比亚 Z60 Ultra 实测）就是它卡的。
-allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs file { write getattr read execute map }
 allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs memfd_file { open read write map execute getattr }
-
-# H3 = hal_cryptoeng_oplus（一加 PGP110 / 安卓 15 实测）：oplus 的 cryptoeng HAL 是工程
-# 模式那页到 HIDL soter 的中间人（cryptoeng → vendor.qti.hardware.soter@1.0::ISoter），
-# 想拦它那条 verifyAttkKeyPair 就得注进它。它跟上面那几组一样：收 payload、写 memfd
-# 镜像、连 daemon 的 RPC socket、落日志。
-allow { hal_cryptoeng_oplus } system_file unix_dgram_socket { getattr read recvfrom }
-allow { system_file ksu magisk su } { hal_cryptoeng_oplus } unix_dgram_socket sendto
-allow { hal_cryptoeng_oplus } system_file file { execute getattr map read receive }
-allow { hal_cryptoeng_oplus } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
-allow { hal_cryptoeng_oplus } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { hal_cryptoeng_oplus } system_data_file file { open read write create append getattr setattr rename unlink }
-allow { hal_cryptoeng_oplus } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
-allow { hal_cryptoeng_oplus } system_app_data_file file { open read write create append getattr setattr rename unlink }
-allow { hal_cryptoeng_oplus } tmpfs file { write getattr read execute map }
 allow { hal_cryptoeng_oplus } tmpfs memfd_file { open read write map execute getattr }
 
-# 软件 SOTER TA（soterta.sh 拉起的 `ommega-inject --soterta-serve`）：它要把
-# `vendor.qti.hardware.soter.ISoter/default` 注册到 servicemanager，客户端（宿主、
-# oplus 的 cryptoeng）按名字 + 接口名去拿。find 不够，得能 add。
-# 起它的域跟着根实现走：Magisk 是 magisk/su、KernelSU 是 ksu，脚本本体常常落
-# system_file；三个都列上。
+# 软件 SOTER TA（soterta.sh 拉起的 ommega-inject --soterta-serve）注册 SOTER 服务名，
+# 它的运行域是 shell 或 root。
 allow { magisk ksu su system_file } default_android_service service_manager { add find }
-
-allow keystore default_android_service service_manager find
-# keystore2 查「调用方能不能 include unique id / attest device id」时要问 system_server
-# 的 permissionmgr（service_contexts 里标 permissionmgr_service，不在 default_android_service
-# 那个通配里）。缺这两条时进程内模式下 INCLUDE_UNIQUE_ID 一律回 SYSTEM_ERROR(4)，
-# 检测器（UnifiedAudit UNIQUE_ID_CONSISTENCY）显示成 INCONCLUSIVE。
-allow keystore permissionmgr_service:service_manager { find }
-allow keystore permissionmgr_service:binder { call transfer }
-allow shell default_android_service service_manager find
-
-# 一加/OPPO 工程模式的「Attestation 全量功能测试」页：App 拿 setUniqueIdIncluded()
-# 建带 ID attestation 的钥匙时，keystore2 要检查调用方对 keystore2_key 有没有
-# gen_unique_id。系统源码策略里这条只给了 gmscore_app，engineermode_app 一律被拒
-# （PKG110 / Android 16 实测：avc denied gen_unique_id → 页面「Attestation Key ID
-# Modify: Fail」）。只补这一个权限，use_dev_id 那些更宽的一个都不给。
-# 没有这个域的机型上 kernel 会直接跳过这行，不影响别家。
-allow engineermode_app keystore keystore2_key { gen_unique_id }
-
-# ---- SOTER 软件 TA 注册服务名（2026-11-08 PKX110 / Android 16 实测）----
-# soterta.sh 拉起的 ommega-inject --soterta-serve 跑在 shell 域，要往 AIDL
-# servicemanager 注册 vendor.qti.hardware.soter.ISoter/default。这个名字在
-# /vendor/etc/selinux/vendor_service_contexts 里映射到 vendor_hal_soteraidl_service。
-# 缺第一条时 servicemanager 回 "SELinux denied for service."；缺 servicemanager
-# 读 /proc/<pid>/attr/current 那几条时同样回这一句（getpidcon 失败 -> 空 sid），
-# permissive 下也一样，很容易误判成策略没生效。
 allow shell vendor_hal_soteraidl_service service_manager { add find }
 allow shell vendor_hal_soter_hwservice hwservice_manager { add find }
+# 注册时 servicemanager 要读调用方的 SELinux 上下文。
 allow servicemanager shell file { read open getattr }
 allow servicemanager shell dir { search getattr }
-# 进程内 KeyMint：keymint 主体搬进 keystore2 之后，远程出证和 SOTER 转发是 keystore
-# 域自己发起的 TCP+TLS，名字解析走 netd 的 unix socket。拆成短行，ksud 每行的
-# 名字/权限列表都有上限（一条写满会被整行丢掉）。
-#
-# target 一栏必须写具体类型名，不能写 self：KernelSU 侧 add_rule 是拿 target 去
-# p_types 里查（kernel/selinux/sepolicy.c），查不到就整条丢掉；policy 里没有叫
-# self 的类型，写了等于这六行一条都没落地（2026-11-12 PKX110 实测：keystore 域
-# tcp_socket create 一直被拒，远程出证全落回本地 keybox）。
-allow keystore keystore tcp_socket { create ioctl };
-allow keystore keystore tcp_socket { getattr setopt };
-allow keystore keystore tcp_socket { getopt shutdown };
-allow keystore keystore tcp_socket { connect bind };
-allow keystore keystore tcp_socket { read write };
-allow keystore keystore tcp_socket { sendto recvfrom };
-allow keystore node tcp_socket { read write };
-allow keystore node tcp_socket { recvfrom sendto };
-# connect() 要到具体端口时还要 name_connect；这里给的是通用 port 类型。
-allow keystore port tcp_socket { name_connect };
-# remote.rs 先试「绑到具体网口」的那条路：它要看路由表和网口状态。
-allow keystore proc_net file { getattr open read };
-allow keystore sysfs_net dir { search read };
-allow keystore sysfs_net file { getattr open read };
-# 私卡按 ro.serialno / ro.boot.serialno 绑设备，读不到就发空指纹，服务端直接 401。
-allow keystore serialno_prop file { getattr open read map };
-allow keystore netd unix_stream_socket { connectto };
-allow keystore netd unix_stream_socket { getattr read write };
+
+# keystore2 崩溃时 crash_dump 要读它的进程。
+allow crash_dump keystore process *
+
+# 工程模式带 ID attestation 建钥时，keystore2 检查调用方的 keystore2_key gen_unique_id。
+allow engineermode_app keystore keystore2_key { gen_unique_id }
