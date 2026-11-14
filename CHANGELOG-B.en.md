@@ -2,6 +2,6 @@
 
 [中文](CHANGELOG-B.md)
 
-## 1.7.15
+## 1.7.17
 
 - Released alongside the A side; no functional changes.
