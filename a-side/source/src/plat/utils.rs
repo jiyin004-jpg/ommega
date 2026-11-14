@@ -1,21 +1,17 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex;
 
 use der::asn1::SetOfVec;
 use der::Encode;
 use kmr_common::crypto::Sha256;
 use kmr_crypto_ommega::sha256::OmmegaSha256;
 use log::{debug, error};
-use rsbinder::DeathRecipient;
 
 use crate::android::apex::IApexService::IApexService;
 use crate::android::security::keystore::IKeyAttestationApplicationIdProvider::IKeyAttestationApplicationIdProvider;
 use crate::android::security::keystore::KeyAttestationApplicationId::KeyAttestationApplicationId;
 use crate::android::security::keystore::KeyAttestationPackageInfo::KeyAttestationPackageInfo;
 use crate::android::security::keystore::Signature::Signature;
-use crate::android::system::keystore2::{
-    IKeystoreService::IKeystoreService, ResponseCode::ResponseCode,
-};
+use crate::android::system::keystore2::ResponseCode::ResponseCode;
 use crate::err;
 use crate::keymaster::apex::ApexModuleInfo;
 use crate::keymaster::error::KsError;
@@ -23,49 +19,6 @@ use crate::keymaster::utils::get_interface_once;
 
 thread_local! {
     static PM: Mutex<Option<rsbinder::Strong<dyn IKeyAttestationApplicationIdProvider>>> = Mutex::new(None);
-}
-
-const KEYSTORE_SERVICE: &str = "android.system.keystore2.IKeystoreService/default";
-
-static KEYSTORE_CACHE: OnceLock<Mutex<KeystoreServiceCache>> = OnceLock::new();
-static KEYSTORE_INIT: OnceLock<Mutex<()>> = OnceLock::new();
-static KEYSTORE_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Default)]
-struct KeystoreServiceCache {
-    service: Option<rsbinder::Strong<dyn IKeystoreService>>,
-    death_recipient: Option<Arc<dyn DeathRecipient>>,
-    generation: u64,
-}
-
-fn keystore_cache() -> &'static Mutex<KeystoreServiceCache> {
-    KEYSTORE_CACHE.get_or_init(Default::default)
-}
-
-fn keystore_init_lock() -> &'static Mutex<()> {
-    KEYSTORE_INIT.get_or_init(|| Mutex::new(()))
-}
-
-fn keystore_service_is_alive(service: &rsbinder::Strong<dyn IKeystoreService>) -> bool {
-    service.as_binder().ping_binder().is_ok()
-}
-
-struct KeystoreDeathRecipient {
-    died: AtomicBool,
-    generation: u64,
-}
-
-impl rsbinder::DeathRecipient for KeystoreDeathRecipient {
-    fn binder_died(&self, _who: &rsbinder::WIBinder) {
-        self.died.store(true, Ordering::Release);
-        let mut guard = keystore_cache().lock().unwrap();
-        if guard.generation != self.generation {
-            return;
-        }
-        guard.service = None;
-        guard.death_recipient = None;
-        debug!("system keystore binder died; cleared cached instance");
-    }
 }
 
 fn get_pm() -> anyhow::Result<rsbinder::Strong<dyn IKeyAttestationApplicationIdProvider>> {
@@ -98,51 +51,6 @@ fn reset_pm() {
         *p.lock().unwrap() = None;
     });
     debug!("reset cached PM instance to None");
-}
-
-pub fn get_keystore_service() -> anyhow::Result<rsbinder::Strong<dyn IKeystoreService>> {
-    let _init_guard = keystore_init_lock().lock().unwrap();
-    let cached = keystore_cache().lock().unwrap().service.clone();
-    if let Some(service) = cached {
-        if keystore_service_is_alive(&service) {
-            return Ok(service);
-        }
-
-        let mut guard = keystore_cache().lock().unwrap();
-        guard.service = None;
-        guard.death_recipient = None;
-    }
-
-    let service: rsbinder::Strong<dyn IKeystoreService> = get_interface_once(KEYSTORE_SERVICE)
-        .map_err(|error| anyhow::anyhow!("failed to connect to {KEYSTORE_SERVICE}: {error:?}"))?;
-    let generation = KEYSTORE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let recipient = Arc::new(KeystoreDeathRecipient {
-        died: AtomicBool::new(false),
-        generation,
-    });
-    let death_recipient: Arc<dyn DeathRecipient> = recipient.clone();
-    service
-        .as_binder()
-        .link_to_death(Arc::downgrade(&death_recipient))?;
-    if recipient.died.load(Ordering::Acquire) || !keystore_service_is_alive(&service) {
-        return Err(anyhow::anyhow!(
-            "connected to {KEYSTORE_SERVICE} but binder died during initialization"
-        ));
-    }
-
-    let mut guard = keystore_cache().lock().unwrap();
-    guard.death_recipient = Some(death_recipient);
-    guard.service = Some(service.clone());
-    guard.generation = generation;
-    if recipient.died.load(Ordering::Acquire) {
-        guard.service = None;
-        guard.death_recipient = None;
-        return Err(anyhow::anyhow!(
-            "connected to {KEYSTORE_SERVICE} but binder died during initialization"
-        ));
-    }
-
-    Ok(service)
 }
 
 pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
@@ -618,11 +526,6 @@ pub fn multiuser_get_user_id(uid: u32) -> u32 {
 /// Gets the app id from a uid.
 pub fn multiuser_get_app_id(uid: u32) -> u32 {
     uid % AID_USER_OFFSET
-}
-
-/// Extracts the android user from the given uid.
-pub fn uid_to_android_user(uid: u32) -> u32 {
-    multiuser_get_user_id(uid)
 }
 
 #[cfg(test)]

@@ -13,9 +13,8 @@ use crate::android::system::keystore2::KeyEntryResponse::KeyEntryResponse;
 use crate::android::system::keystore2::KeyParameters::KeyParameters;
 use crate::android::system::keystore2::OperationChallenge::OperationChallenge;
 use crate::hook::binder::{
-    binder_object_header, flat_binder_object, flat_binder_object_handle_or_ptr,
-    NativeBinderRetirement, BINDER_BUFFER_FLAG_HAS_PARENT, BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE,
-    BINDER_TYPE_PTR, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE,
+    flat_binder_object, NativeBinderRetirement, BINDER_BUFFER_FLAG_HAS_PARENT, BINDER_TYPE_BINDER,
+    BINDER_TYPE_HANDLE, BINDER_TYPE_PTR, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE,
 };
 
 use super::parcel_from_ipc_parts;
@@ -171,16 +170,6 @@ pub unsafe fn extract_create_operation_reply_carrier(
     )
 }
 
-pub fn build_get_security_level_reply(
-    binder: Strong<dyn IKeystoreSecurityLevel>,
-) -> Result<OwnedReply> {
-    let mut parcel = Parcel::new();
-    parcel.write(&Status::from(StatusCode::Ok))?;
-    let binder_offset = parcel.data_position();
-    parcel.write(&binder)?;
-    Ok(owned_reply_from_parcel(parcel, [binder_offset]))
-}
-
 pub fn build_get_security_level_reply_with_carrier_bytes(
     carrier_bytes: &[u8],
     carrier_is_object: bool,
@@ -231,31 +220,6 @@ pub fn build_null_binder_reply() -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     <rsbinder::SIBinder as SerializeOption>::serialize_option(None, &mut parcel)?;
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
-}
-
-pub fn build_local_binder_carrier_bytes(
-    ptr: libc::c_ulong,
-    cookie: libc::c_ulong,
-    flags: u32,
-    stability: i32,
-) -> Vec<u8> {
-    let object = flat_binder_object {
-        hdr: binder_object_header {
-            type_: BINDER_TYPE_BINDER,
-        },
-        flags,
-        handle_or_ptr: flat_binder_object_handle_or_ptr { binder: ptr },
-        cookie,
-    };
-    let mut bytes = vec![0u8; size_of::<flat_binder_object>() + size_of::<i32>()];
-    unsafe {
-        std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut flat_binder_object, object);
-        std::ptr::write_unaligned(
-            bytes.as_mut_ptr().add(size_of::<flat_binder_object>()) as *mut i32,
-            stability,
-        );
-    }
-    bytes
 }
 
 fn build_sized_parcelable_reply(

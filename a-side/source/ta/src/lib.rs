@@ -18,7 +18,7 @@
 
 use core::mem::size_of;
 use core::{cell::RefCell, convert::TryFrom};
-use device::{DiceInfo, RetrieveCertSigningInfo};
+use device::DiceInfo;
 use kmr_common::{
     crypto::{self, hmac, OpaqueOr},
     get_bool_tag_value,
@@ -646,12 +646,6 @@ impl KeyMintTa {
         Ok(())
     }
 
-    /// Check if HAL-derived information has been set. This is used as an
-    /// indication that we are past the boot stage.
-    pub fn is_hal_info_set(&self) -> bool {
-        self.hal_info.is_some()
-    }
-
     /// Configure the HAL-derived information, learnt from the userspace
     /// operating system.
     pub fn set_hal_info(&mut self, hal_info: HalInfo) {
@@ -768,17 +762,6 @@ impl KeyMintTa {
             }
         }
         self.attestation_id_info.borrow().as_ref().cloned()
-    }
-
-    /// Allow an implementation of the [`RetrieveCertSigningInfo`] trait to be provided
-    /// after TA startup.
-    pub fn set_sign_info(&mut self, sign_info: Option<Box<dyn RetrieveCertSigningInfo>>) {
-        if self.dev.sign_info.is_some() {
-            error!("Attempt to set attestation sign info when already set");
-        } else {
-            warn!("Setting attestation sign info after startup");
-            self.dev.sign_info = sign_info;
-        }
     }
 
     /// Retrieve the DICE info for the device, if available.

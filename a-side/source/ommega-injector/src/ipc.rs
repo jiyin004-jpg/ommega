@@ -712,11 +712,26 @@ pub fn resolve_packages_for_uid(uid: u32) -> PackageResolution {
 }
 
 fn resolve_package_names_for_uid(uid: u32) -> Result<Vec<String>> {
-    if crate::legacy::should_use_aaid_provider() {
-        crate::legacy::resolve_package_names_for_uid(uid)
-    } else {
-        resolve_package_names_for_uid_once(uid)
+    if !ommega::plat::legacy::should_use_aaid_provider() {
+        return resolve_package_names_for_uid_once(uid);
     }
+    match legacy_package_names(uid) {
+        Err(error) if is_dead_object_error(&error) => {
+            ommega::plat::legacy::clear_provider_cache();
+            legacy_package_names(uid)
+        }
+        other => other,
+    }
+}
+
+fn legacy_package_names(uid: u32) -> Result<Vec<String>> {
+    let app_id = ommega::plat::legacy::get_application_id(uid)?;
+    Ok(app_id
+        .packageInfos
+        .into_iter()
+        .map(|pkg| pkg.packageName)
+        .filter(|name| !name.is_empty())
+        .collect())
 }
 
 fn resolve_package_names_for_uid_once(uid: u32) -> Result<Vec<String>> {

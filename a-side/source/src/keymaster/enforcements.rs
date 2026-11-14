@@ -403,16 +403,6 @@ pub struct Enforcements {
 }
 
 impl Enforcements {
-    /// Install the confirmation token receiver. The enforcement module will try to get a
-    /// confirmation token from this channel whenever an operation that requires confirmation
-    /// finishes.
-    pub fn install_confirmation_token_receiver(
-        &self,
-        confirmation_token_receiver: Receiver<Vec<u8>>,
-    ) {
-        *self.confirmation_token_receiver.lock().unwrap() = Some(confirmation_token_receiver);
-    }
-
     /// Checks if a create call is authorized, given key parameters and operation parameters.
     /// It returns an optional immediate auth token which can be presented to begin, and an
     /// AuthInfo object which stays with the authorized operation and is used to obtain

@@ -462,11 +462,6 @@ impl DateTime {
         ))
     }
 
-    /// Constructs a new DateTime object from milliseconds.
-    pub fn from_millis_epoch(millis: i64) -> Self {
-        Self(millis)
-    }
-
     /// Returns unix epoch time in milliseconds.
     pub fn to_millis_epoch(self) -> i64 {
         self.0
@@ -712,20 +707,6 @@ impl<'a> BlobInfo<'a> {
             blob,
             metadata,
             superseded_blob: None,
-        }
-    }
-
-    /// Create a new instance of blob info with blob and corresponding metadata
-    /// as well as superseded blob info.
-    pub fn new_with_superseded(
-        blob: &'a [u8],
-        metadata: &'a BlobMetaData,
-        superseded_blob: Option<(&'a [u8], &'a BlobMetaData)>,
-    ) -> Self {
-        Self {
-            blob,
-            metadata,
-            superseded_blob,
         }
     }
 }

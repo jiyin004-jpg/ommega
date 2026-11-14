@@ -720,25 +720,6 @@ fn uplink_rank(name: &str) -> u8 {
     }
 }
 
-/// Minimal HTTP(S) request helper backed by reqwest.
-///
-/// Returns `(status, body)`.  HTTP error responses (4xx / 5xx) are returned as
-/// `Ok` with the corresponding status code — only transport-level failures
-/// produce `Err`.  `post_json` 现在直接拿 `get_client()` / `unbound_client()`
-/// 构造好的两个客户端发请求（这样才能分清「绑定的接口」和「OS 默认路由」
-/// 两条路各自的结果），所以这个便捷函数暂无用偶。保留着，后面还有别的调用点时
-/// 直接用，不用再想到底绑不绑。
-#[allow(dead_code)]
-fn http_request(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: Option<&[u8]>,
-) -> Result<(u16, Vec<u8>)> {
-    let client = get_client()?;
-    http_request_with(&client, method, url, headers, body)
-}
-
 fn http_request_with(
     client: &Client,
     method: &str,

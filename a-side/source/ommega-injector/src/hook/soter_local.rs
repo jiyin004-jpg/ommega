@@ -498,15 +498,6 @@ fn mark_gone(key: &str) {
     store_pem(GONE_SECTION, key, "1");
 }
 
-/// 这个 uid / alias 删过（墓碑）。
-///
-/// 导出和「存不存在」现在都只认料本身（真机删除会真删料），所以枚举时不再拿墓碑
-/// 当闸门；墓碑还照写，因为它是盘上那份格式的一部分（运维和以后要查“删过没”就靠它）。
-#[allow(dead_code)]
-fn is_gone(key: &str) -> bool {
-    read_store_pem(GONE_SECTION, key).is_some()
-}
-
 fn clear_gone(key: &str) {
     forget_pem(GONE_SECTION, key);
 }
@@ -855,25 +846,6 @@ fn device_info() -> &'static DeviceInfo {
             fid: fid_from(serial.as_deref()),
         }
     })
-}
-
-/// 32 字符 hex 转 16 字节。历史形状（早期真机的 getDeviceId 出二进制），现在答复跟
-/// 真机实测走 ASCII 了；留着是因为总有人问“能不能给成二进制”。
-#[allow(dead_code)]
-fn hex_bytes(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16)?;
-        let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Some(out)
 }
 
 /// 一台像真机的设备号：平台前缀（高通 `00000000` / MTK `09000000`）+ 12 字节十六进制。
@@ -1601,6 +1573,23 @@ fn ask_json(pub_pem: &str, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
     Ok(document.into_bytes())
 }
 
+/// 32 个 hex 字符转 16 字节。
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 /// `getDeviceId` 的答复字节：高通回 16 字节 raw，MTK 回 32 个 ASCII hex + NUL。
 fn device_id_reply(cpu: &str) -> Vec<u8> {
     if platform().device_id_ascii {
@@ -1663,7 +1652,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn as_buffer_code(answer: Option<Answer>) -> i32 {
         match answer {
             Some(Answer::Buffer { code, .. }) => code,

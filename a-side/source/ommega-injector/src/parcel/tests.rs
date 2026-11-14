@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::identify::{KEYSTORE_AUTHORIZATION_INTERFACE, KEYSTORE_SERVICE_INTERFACE};
+
 #[test]
 fn request_interface_peek_uses_header_token_only() {
     let mut request = Parcel::new();

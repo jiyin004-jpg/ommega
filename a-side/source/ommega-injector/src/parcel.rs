@@ -4,10 +4,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use rsbinder::{Parcel, StatusCode};
 
 use crate::hook::binder::{flat_binder_object, BINDER_TYPE_FD};
-use crate::identify::{
-    KEYSTORE_AUTHORIZATION_INTERFACE, KEYSTORE_MAINTENANCE_INTERFACE, KEYSTORE_OPERATION_INTERFACE,
-    KEYSTORE_SECURITY_LEVEL_INTERFACE, KEYSTORE_SERVICE_INTERFACE,
-};
 
 mod reply;
 mod request;
@@ -27,22 +23,6 @@ pub unsafe fn peek_request_interface(
 ) -> Result<String> {
     let mut parcel = parcel_from_ipc_parts(data, data_size, offsets, offsets_size);
     read_request_interface(&mut parcel)
-}
-
-/// # Safety
-///
-/// `data`/`data_size` and `offsets`/`offsets_size` must describe a readable
-/// Binder transaction parcel for the duration of this call.
-pub unsafe fn parse_no_arg_request_interface(
-    data: *mut u8,
-    data_size: usize,
-    offsets: *mut usize,
-    offsets_size: usize,
-) -> Result<String> {
-    let mut parcel = parcel_from_ipc_parts(data, data_size, offsets, offsets_size);
-    let interface = read_request_interface(&mut parcel)?;
-    ensure_no_request_trailing_data(&parcel, "AIDL metadata")?;
-    Ok(interface)
 }
 
 /// # Safety
@@ -112,26 +92,6 @@ pub unsafe fn validate_dump_request(
     Ok(())
 }
 
-pub fn contains_keystore_authorization_interface(parcel: &[u8]) -> bool {
-    contains_utf16_token(parcel, KEYSTORE_AUTHORIZATION_INTERFACE)
-}
-
-pub fn contains_keystore_maintenance_interface(parcel: &[u8]) -> bool {
-    contains_utf16_token(parcel, KEYSTORE_MAINTENANCE_INTERFACE)
-}
-
-pub fn contains_keystore_service_interface(parcel: &[u8]) -> bool {
-    contains_utf16_token(parcel, KEYSTORE_SERVICE_INTERFACE)
-}
-
-pub fn contains_keystore_security_level_interface(parcel: &[u8]) -> bool {
-    contains_utf16_token(parcel, KEYSTORE_SECURITY_LEVEL_INTERFACE)
-}
-
-pub fn contains_keystore_operation_interface(parcel: &[u8]) -> bool {
-    contains_utf16_token(parcel, KEYSTORE_OPERATION_INTERFACE)
-}
-
 pub fn contains_known_keystore_interface(parcel: &[u8]) -> bool {
     crate::identify::KNOWN_KEYSTORE_INTERFACES
         .iter()
@@ -150,14 +110,6 @@ fn read_request_interface_for_check(parcel: &mut Parcel) -> Result<Option<String
         return Ok(None);
     }
     parcel.read().context("missing interface token").map(Some)
-}
-
-fn ensure_no_request_trailing_data(parcel: &Parcel, interface_name: &str) -> Result<()> {
-    let remaining = parcel.data_avail();
-    if remaining != 0 {
-        bail!("{interface_name} request has {remaining} trailing bytes");
-    }
-    Ok(())
 }
 
 struct RequestEnvelope {

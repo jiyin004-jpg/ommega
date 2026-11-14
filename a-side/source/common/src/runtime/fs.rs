@@ -21,8 +21,6 @@ use std::os::{
 };
 use std::path::Path;
 
-use anyhow::Context;
-
 pub fn atomic_replace_preserving_metadata(
     path: &Path,
     contents: &[u8],
@@ -72,52 +70,4 @@ pub fn atomic_replace_preserving_metadata(
         let _ = fs::remove_file(temp_path);
     }
     result
-}
-
-pub fn backup_file_with_reason(
-    path: &Path,
-    backup: &Path,
-    reason_header: &str,
-    reason: &str,
-    allow_copy_fallback: bool,
-) -> anyhow::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if backup.exists() {
-        fs::remove_file(backup)
-            .with_context(|| format!("failed to remove stale backup {}", backup.display()))?;
-    }
-
-    if let Err(rename_error) = fs::rename(path, backup) {
-        if !allow_copy_fallback {
-            return Err(rename_error)
-                .with_context(|| format!("failed to move invalid file to {}", backup.display()));
-        }
-
-        fs::copy(path, backup)
-            .with_context(|| {
-                format!(
-                    "failed to copy invalid file to backup {} after rename error {rename_error}",
-                    backup.display()
-                )
-            })
-            .and_then(|_| {
-                fs::remove_file(path)
-                    .with_context(|| format!("failed to remove original file {}", path.display()))
-            })
-            .with_context(|| format!("failed to move invalid file to {}", backup.display()))?;
-    }
-
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(backup)
-        .with_context(|| format!("failed to open backup {}", backup.display()))?;
-    writeln!(file)?;
-    writeln!(file, "# {reason_header}:")?;
-    for line in reason.lines() {
-        writeln!(file, "# {line}")?;
-    }
-    Ok(())
 }

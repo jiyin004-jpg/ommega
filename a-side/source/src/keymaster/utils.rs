@@ -25,7 +25,6 @@ use crate::android::hardware::security::keymint::{
 };
 use crate::android::system::keystore2::{
     Authorization::Authorization, Domain::Domain, KeyDescriptor::KeyDescriptor,
-    ResponseCode::ResponseCode,
 };
 use crate::err as ks_err;
 use crate::keymaster::crypto::{aes_gcm_decrypt, aes_gcm_encrypt, ZVec};
@@ -55,9 +54,6 @@ use rsbinder::{
 };
 use std::iter::IntoIterator;
 use std::sync::OnceLock;
-use std::thread::sleep;
-use std::time::Duration;
-
 #[cfg(test)]
 mod tests;
 
@@ -200,27 +196,6 @@ pub fn check_unique_id_attestation_permissions() -> anyhow::Result<()> {
     check_android_permission(
         "android.permission.REQUEST_UNIQUE_ID_ATTESTATION",
         Error::Km(ErrorCode::CANNOT_ATTEST_IDS),
-    )
-}
-
-/// This function checks whether the calling app has the Android permissions needed to manage
-/// users. Only callers that can manage users are allowed to get a list of apps affected
-/// by a user's SID changing.
-/// It throws an error if the permissions cannot be verified or if the caller doesn't
-/// have the right permissions. Otherwise it returns silently.
-pub fn check_get_app_uids_affected_by_sid_permissions() -> anyhow::Result<()> {
-    check_android_permission(
-        "android.permission.MANAGE_USERS",
-        Error::Km(ErrorCode::CANNOT_ATTEST_IDS),
-    )
-}
-
-/// This function checks whether the calling app has the Android permission needed to dump
-/// Keystore state to logcat.
-pub fn check_dump_permission() -> anyhow::Result<()> {
-    check_android_permission(
-        "android.permission.DUMP",
-        Error::Rc(ResponseCode::PERMISSION_DENIED),
     )
 }
 
@@ -1171,36 +1146,6 @@ pub(crate) fn get_interface_once<T: FromIBinder + ?Sized>(
         .flatten()
         .ok_or(StatusCode::NameNotFound)?;
     FromIBinder::try_from(binder)
-}
-
-/// Get the Binder interface identified by `name`, retrying any failures up to the given
-/// `retry_count`.
-pub fn retry_get_interface<T: FromIBinder + ?Sized>(
-    name: &str,
-    retry_count: usize,
-) -> Result<Strong<T>, StatusCode> {
-    let mut attempts = 0;
-    let mut wait_time = Duration::from_secs(1);
-    loop {
-        let err = match get_interface_once(name) {
-            Ok(res) => {
-                if attempts > 1 {
-                    info!("Success on get_interface({name}) after {attempts} failures!");
-                }
-                return Ok(res);
-            }
-            Err(e) => e,
-        };
-        attempts += 1;
-        error!("Failed (attempt {attempts} of {retry_count}) to get_interface {name}: {err:?}");
-        if attempts >= retry_count {
-            error!("Give up retrying after {attempts} failures, return final error: {err:?}");
-            return Err(err);
-        }
-        info!("Blocking wait {wait_time:?} before retry of get_interface({name})");
-        sleep(wait_time);
-        wait_time *= 2;
-    }
 }
 
 /// Information about a specific app.

@@ -23,22 +23,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
 /// 名字表：`role=路径`，一行一个。
 const NAMES_FILE: &str = "/data/misc/ommega/conf/stealth.names";
-/// daemon 模式标记：原来的 `--daemon` 参数会和伪装名一起出现在 cmdline 里，
-/// 挪到环境变量上。名字故意取得通用 —— root 看 environ 时 `OMMEGA_*` 那种前缀
+/// daemon 模式标记。名字故意取得通用 —— root 看 environ 时 `OMMEGA_*` 那种前缀
 /// 等于自报家门。
 const DAEMON_ENV: &str = "DAEMON_MODE";
-/// 历史标记（现在靠 /proc/self/exe 是不是 memfd 就能判断自己藏过没）。
-#[allow(dead_code)]
-const MARK_ENV: &str = "OMMEGA_STEALTH";
-/// 真实二进制路径。memfd 重生后 `/proc/self/exe` 不再是它。
-/// （不再通过环境变量传：注入器改成读 `run/injector.self`。）
-#[allow(dead_code)]
-const SELF_ENV: &str = "OMMEGA_SELF_PATH";
 
 /// 按「看起来最无关紧要」排的优先级。命中越靠前越像正经厂商 HAL。
 const PREFERRED: [&str; 18] = [
@@ -434,11 +426,6 @@ pub fn cached_name(role: &str) -> Option<String> {
     read_names().get(role).cloned()
 }
 
-/// 名字表里所有伪装路径。清理残留进程时按这份清单认人。
-pub fn all_names() -> HashMap<String, String> {
-    read_names()
-}
-
 /// 取某个角色的伪装路径。`extra_roles` 是「接下来可能还要用名字」的角色，
 /// 一起参与分配，免得后起的进程拿到跟自己重复的名字。
 pub fn name_for(role: &str, extra_roles: &[&str]) -> Option<String> {
@@ -688,12 +675,6 @@ pub fn command_from_memfd(fd: RawFd, argv0: &str) -> std::process::Command {
     let mut command = std::process::Command::new(format!("/proc/self/fd/{fd}"));
     command.arg0(argv0);
     command
-}
-
-/// 一个 fd 是不是 memfd（诊断用）。
-pub fn is_memfd(file: &fs::File) -> bool {
-    let raw = file.as_raw_fd();
-    matches!(fs::read_link(format!("/proc/self/fd/{raw}")), Ok(path) if path.to_string_lossy().starts_with("/memfd:"))
 }
 
 #[cfg(test)]

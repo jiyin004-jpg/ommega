@@ -179,10 +179,6 @@ fn last_dl_error() -> String {
     }
 }
 
-// 明确表个态：这个模块只发只读调用，别被以后顺手加进来的写操作带偏。
-#[allow(dead_code)]
-const READ_ONLY_CODES: [u32; 1] = [8];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,10 +190,5 @@ mod tests {
         // 拿不到库就直接放过：这个测试的目的只是保证 dlopen/dlsym 那段的
         // 字符串和签名没写反，不是验证系统行为。
         let _ = load();
-    }
-
-    #[test]
-    fn only_read_only_codes_are_meant_to_go_through_here() {
-        assert_eq!(READ_ONLY_CODES, [8]);
     }
 }

@@ -184,10 +184,6 @@ pub fn map_ks_error(e: Error) -> BinderStatus {
     }
 }
 
-pub fn map_ks_result<T>(r: Result<T, Error>) -> Result<T, BinderStatus> {
-    r.map_err(map_ks_error)
-}
-
 /// Convert an [`anyhow::Error`] to a [`binder::Status`], logging the value
 /// along the way (except if it is `KEY_NOT_FOUND`).
 pub fn into_logged_binder(e: anyhow::Error) -> BinderStatus {
