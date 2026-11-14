@@ -688,7 +688,7 @@ ensure_keymint_daemon() {
     done
   fi
   ekd_abi=$(device_abi)
-  ekd_km=$MODDIR/libs/$ekd_abi/keymint
+  ekd_km=$MODDIR/libs/$ekd_abi/ommega-inject
   [ -x "$ekd_km" ] || return 0
   log "[injector-daemon] keymint daemon looks dead; restarting it"
   "$ekd_km" --daemon >/dev/null 2>&1 &
