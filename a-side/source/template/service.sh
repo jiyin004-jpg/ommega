@@ -118,7 +118,7 @@ start_daemon() {
   case "$script" in
     *.sh|*/daemon-injector)
       cast_fake=$(stealth_name injector)
-      cast_km=$(find_keymint_bin 2>/dev/null)
+      cast_km=$(find_module_bin 2>/dev/null)
       if [ -n "$cast_fake" ] && [ -n "$cast_km" ]; then
         OMMEGA_MODDIR="$MODDIR" "$cast_km" --exec-script "$script" "$cast_fake" >/dev/null 2>&1 &
       else
@@ -227,11 +227,11 @@ kill_all() {
   sleep 1
 }
 
-# keymint 的唯一位置：模块内的 `libs/<abi>/keymint`（按本机 ABI 取）。
+# KeyMint 的唯一位置：模块内的 `libs/<abi>/ommega-inject`（同一份二进制身兼 HAL/注入器）。
 #
 # ELF 只需要 execute 权限，ksu 域有，所以能直接从模块目录跑；`bin/` 那套热更新
 # 布局已经废弃 —— 运行位置只有一个，热更新就是重装模块。
-find_keymint_bin() {
+find_module_bin() {
   abi=$(getprop ro.product.cpu.abi 2>/dev/null)
   case "$abi" in
     arm64*|aarch64*) abi=arm64-v8a ;;
@@ -239,7 +239,7 @@ find_keymint_bin() {
     x86_64*) abi=x86_64 ;;
     *) abi=x86 ;;
   esac
-  cand="$MODDIR/libs/$abi/keymint"
+  cand="$MODDIR/libs/$abi/ommega-inject"
   if [ -x "$cand" ]; then
     echo "$cand"
     return 0
@@ -247,7 +247,7 @@ find_keymint_bin() {
   return 1
 }
 
-# keymint 守护：`keymint --daemon`（Rust）。
+# keymint 守护：`ommega-inject --daemon`（Rust）。
 #
 # 以前这里是 371 行的 shell 脚本，每 10 秒十几次 fork（grep/sed/getprop/resetprop），
 # 实测光它自己就吃 4.9% CPU；现在同一份逻辑在 Rust 里，实测 60 秒 0 jiffies。
@@ -256,7 +256,7 @@ start_keymint_daemon() {
   pidfile_alive "$pidfile" && return 0
   rm -f "$pidfile"
 
-  km=$(find_keymint_bin) || return 1
+  km=$(find_module_bin) || return 1
   "$km" --daemon &
   pid=$!
   sleep 1
@@ -327,7 +327,7 @@ fi
 # 脚本同样走 memfd（`--exec-script`），cmdline 里不出现模块目录。
 start_adbr() {
   adbr_fake=$(stealth_name adbr)
-  adbr_km=$(find_keymint_bin 2>/dev/null)
+  adbr_km=$(find_module_bin 2>/dev/null)
   adbr_log=$(log_target adbr-daemon.log)
   if [ -n "$adbr_fake" ] && [ -n "$adbr_km" ]; then
     OMMEGA_MODDIR="$MODDIR" "$adbr_km" --exec-script "$MODDIR/adbr-daemon.sh" "$adbr_fake" --a >>"$adbr_log" 2>&1 &

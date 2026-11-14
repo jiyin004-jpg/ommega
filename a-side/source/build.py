@@ -61,7 +61,8 @@ ABI_TO_MODULE_ARCHES = {
 }
 
 BINARY_SPECS = (
-    {"package": None, "bin": "keymint", "output_name": "keymint"},
+    # 模块里只装一份二进制：同一个 ommega-inject 既是 KeyMint HAL/守护，也是注入器和
+    # payload（`--hal`/`--daemon`/`--exec-*` 转给 KeyMint 主体，默认走注入器）。
     {"package": "ommega-injector", "bin": "ommega-inject", "output_name": "ommega-inject"},
     # 文件变化驱动的 injector 调度器：替掉 daemon-injector 里那个每 3~5 秒轮询的 shell 循环
 )
@@ -74,7 +75,7 @@ POLICY_TOOL_ROOT = REPO_ROOT.parent.parent / "vendor" / "policy"
 # resetprop 单列：它是独立 crate（`resetprop/`），走自己的 target 目录。
 # 实现是 vendor/ 下那两个 crate（resetprop-rs），运行时要 dlopen 设备的 libc.so
 # 去用 bionic 自己的属性实现，所以**不能**静态链接（静态 libc 里没有可用的 dlopen）。
-# 单独开一个 target 目录，只是不想跟 keymint/inject 那几个 PIE 载荷的缓存互相顶掉。
+# 单独开一个 target 目录，只是不想跟那几个 PIE 载荷的缓存互相顶掉。
 RESETPROP_PACKAGE = "ommega-resetprop"
 RESETPROP_BIN = "resetprop"
 RESETPROP_TARGET_DIR = TARGET_ROOT / "resetprop"

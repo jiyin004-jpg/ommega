@@ -342,7 +342,7 @@ launch_daemon() {
   local abi km fake pid
   abi=$(device_abi)
   km=
-  [ -n "$abi" ] && [ -x "$MODDIR/libs/$abi/keymint" ] && km=$MODDIR/libs/$abi/keymint
+  [ -n "$abi" ] && [ -x "$MODDIR/libs/$abi/ommega-inject" ] && km=$MODDIR/libs/$abi/ommega-inject
   fake=$(stealth_name)
   # 服务名走文件（不用环境变量：environ 是 root 一句 tr 就能看的）。
   mkdir -p "${RUN_DIR}" 2>/dev/null

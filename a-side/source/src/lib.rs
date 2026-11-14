@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
-// 分配器不在这里定：这个 crate 同时被 keymint 二进制和 keystore2 里的 payload 链接，
-// payload 跑在别人的进程里，不能替宿主换分配器（mimalloc 在 src/main.rs 里）。
+// 分配器不在这里定：这个 crate 会被注入进 keystore2 的 payload 链接，payload 跑在别人的
+// 进程里，不能替宿主换分配器。
 
 use anyhow::{Context, Result};
 use std::panic;

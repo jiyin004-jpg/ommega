@@ -593,7 +593,7 @@ start_daemon_early() {
     *.sh|*/daemon-injector)
       # 启动器把目标 ELF 读进 memfd 再换成伪装名执行，和 --exec-script 两回事。
       fake=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
-      km_bin=$MODDIR/libs/$pf_abi/keymint
+      km_bin=$MODDIR/libs/$pf_abi/ommega-inject
       if [ -n "$fake" ] && [ -x "$km_bin" ]; then
         if command -v setsid >/dev/null 2>&1; then
           OMMEGA_MODDIR="$MODDIR" setsid "$km_bin" --exec-script "$script" "$fake" $extra >/dev/null 2>&1 &
@@ -631,7 +631,7 @@ case "$pf_abi" in
   x86_64*) pf_abi=x86_64 ;;
   *) pf_abi=x86 ;;
 esac
-km_bin=$MODDIR/libs/$pf_abi/keymint
+km_bin=$MODDIR/libs/$pf_abi/ommega-inject
 if [ -x "$km_bin" ]; then
   if start_daemon_early "$km_bin" --daemon "$RUN_DIR/keymint-daemon.pid"; then
     log_line "ommega: keymint daemon started early in post-fs-data"

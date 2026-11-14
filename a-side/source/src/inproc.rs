@@ -155,8 +155,25 @@ fn replay_early_boot_ended() {
     }
 }
 
+/// 播种 config.toml：走临时文件 + rename，要求 `/data/misc/ommega` 可写。目录还没被
+/// chown 给 keystore 时最多等 5 秒，等不到就把错误交回调用方。
+fn seed_config_with_retry() -> Result<crate::config::ConfigFile> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::config::bootstrap_config_file() {
+            Ok(config) => return Ok(config),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 fn start() -> Result<HashMap<&'static str, SIBinder>> {
-    let config_file = crate::config::bootstrap_config_file().context("bootstrap config")?;
+    let config_file = seed_config_with_retry().context("bootstrap config")?;
 
     // 日志归宿主：payload 已装自己的 logger，`log` 的 max_level 是全局的，
     // 这里再调一次会把 payload 自己的日志一起关掉。

@@ -5,17 +5,11 @@ version = "1.7.17"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
-[[bin]]
-name = "keymint"
-path = "src/main.rs"
-
 [lib]
 name = "ommega"
 path = "src/lib.rs"
 
-
 [dependencies]
-mimalloc = { version = "0.1", default-features = false }
 syscalls = "0.8.1"
 kmr-derive = { path = "derive" }
 kmr-common = { path = "common" }

@@ -3,7 +3,7 @@
 //! 配置与属性值全部直接读文件比较，只有真要写属性时才 exec 一次。
 //!
 //!   - 单实例（flock + `run/keymint-daemon.lock` 的 pid/starttime 校验，防 PID 复用）；
-//!   - 定位 keymint 二进制（模块内 `libs/<abi>/keymint`）；
+//!   - 定位 KeyMint 二进制（模块内 `libs/<abi>/ommega-inject`）；
 //!   - 干掉残留实例、导出出证要用的几个属性、拉起 keymint、盯着它；
 //!   - 每 10 秒把 `remote_identity` 里的身份/哈希/boot 补丁同步到本机属性（幂等）；
 //!   - `run/restart.keymint` 出现就重启 keymint（面板操作 / watchdog 触发）。
@@ -127,7 +127,7 @@ pub fn run(extra: Vec<String>) -> ! {
             }
         }
 
-        let Some(target) = find_keymint() else {
+        let Some(target) = find_module_bin() else {
             log("keymint binary not found");
             sleep(Duration::from_secs(5));
             continue;
@@ -705,9 +705,10 @@ fn holder_is_daemon(pid: u32, start: u64) -> bool {
 // keymint 生命周期
 // ---------------------------------------------------------------------------
 
-/// keymint 的唯一位置：模块内 `libs/<abi>/keymint`。
-fn find_keymint() -> Option<PathBuf> {
-    // ELF 只要能 execute（ksu 域有），不需要 read。ABI 用编译期常量，不读属性。
+/// KeyMint 的位置：模块内 `libs/<abi>/ommega-inject`。同一份文件既是 HAL 也是
+/// 注入器/payload，模块里只装一份。ELF 只要 ksu 域能 execute 即可，不需要 read。
+fn find_module_bin() -> Option<PathBuf> {
+    // ABI 用编译期常量，不读属性。
     let abi_dir = if cfg!(target_arch = "aarch64") {
         "arm64-v8a"
     } else if cfg!(target_arch = "arm") {
@@ -717,7 +718,7 @@ fn find_keymint() -> Option<PathBuf> {
     } else {
         "x86"
     };
-    let path = PathBuf::from(format!("{MODDIR}/libs/{abi_dir}/keymint"));
+    let path = PathBuf::from(format!("{MODDIR}/libs/{abi_dir}/ommega-inject"));
     path.is_file().then_some(path)
 }
 
@@ -799,7 +800,9 @@ fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
         Command::new(target)
     };
     // 出证要用的属性不走环境变量了（见 write_env_file）。
+    // 这份二进制默认是注入器，`--hal` 才是 KeyMint 本体，不加会把 HAL 子进程带成注入器。
     command
+        .args(["--hal"])
         .args(extra)
         // 守护自己的模式标记不能传给 HAL：子进程继承之后会以为自己是第二个守护。
         .env_remove("DAEMON_MODE")

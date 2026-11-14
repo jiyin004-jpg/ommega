@@ -23,7 +23,6 @@ KS_DIR=/data/misc/keystore/ommega
 #    Only paths under the module / hot-update dirs are matched so the system's
 #    own keymint HAL process is never touched.
 # ---------------------------------------------------------------------------
-pkill -9 -f "$MODDIR/libs/.*/keymint" 2>/dev/null
 pkill -9 -f "$MODDIR/libs/.*/ommega-inject" 2>/dev/null
 # 壳脚本守护（cmdline 里没有 libs/，上两条抓不到）：daemon-injector 每拍都会把载荷
 # 重新写回 keystore2，不杀它的话卸完之后仍然在注入。

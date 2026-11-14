@@ -366,6 +366,21 @@ fn log_runtime_identity(role: &str) {
 }
 
 fn main() {
+    // 独立 HAL / 守护 / 启动器模式：转给 KeyMint 本体。必须在 hide_self 之前判，
+    // 那边会自举成 injector 的名字。自举后 `--daemon` 只在环境变量里，
+    // 所以判据还要带上 `daemon_mode()`。
+    if ommega::stealth::daemon_mode()
+        || std::env::args().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--hal" | "--daemon" | "--exec-hidden" | "--exec-script"
+            )
+        })
+    {
+        ommega::cli_main();
+        return;
+    }
+
     // 第一件事：把自己换成 memfd + 系统 HAL 名字的版本（名字表由 keymint 守护生）。
     // 成功的话这里不会返回。
     hide::hide_self("injector");
