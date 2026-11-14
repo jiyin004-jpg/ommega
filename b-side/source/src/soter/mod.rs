@@ -1,14 +1,6 @@
 //! SOTER forwarding for the B-side relay agent.
 //!
-//! SOTER is the Trustonic "secure keystore" HAL that Tencent (WeChat / QQ)
-//! and Alipay use for app signing keys: the private keys live in the TEE and
-//! the HAL exposes "create / export public key / sign / delete" operations for
-//! them.  The A-side asks the relay for an operation with a task payload, we
-//! run it against the *real* HAL on the B-side phone, and the answer goes back
-//! as JSON — the same shape as the existing `attest` / `sign` / `decrypt`
-//! forwarding.
-//!
-//! Task payload:
+//! 任务载荷：
 //!
 //! ```json
 //! { "op": "export_attk_public_key" }
@@ -16,14 +8,8 @@
 //! { "op": "init_sign", "uid": 10373, "alias": "SoterAuthKey", "challenge": "..." }
 //! ```
 //!
-//! `op` defaults to `probe`, which only reports whether this device can serve
-//! SOTER at all (so the caller can decide to fall back).  Every other op fails
-//! with a descriptive error when the HAL is missing, which is how the existing
-//! forwarding path signals "this backing device cannot do that".
-//!
-//! The ops that create or remove keys change real device state (they touch the
-//! payment-key store), so they stay disabled unless the operator opts in via
-//! `OMMEGA_RELAY_SOTER_MUTATION=1` in `relay.conf`.
+//! `op` 缺省是 `probe`，只报这台设备能不能做 SOTER；HAL 不在时其它 op 都返回描述性错误。
+//! 会改设备状态的 op（建 / 删钥匙）需要 `OMMEGA_RELAY_SOTER_MUTATION=1` 才放行。
 //!
 //! See [`hal`] for the wire format (it is hand-marshalled and verified against
 //! captured replies, see [`fixtures`]).
@@ -180,26 +166,15 @@ static SIGN_GUARD: Mutex<sign_guard::SignGuard> = Mutex::new(sign_guard::SignGua
 
 /// SOTER 进 HAL 的排队：全局有上限 + 同一个 uid 串行。
 ///
-/// 2026-10-03 在 PLC110 上实测：Trustonic 的 `tlTeeSOTER`（TA 镜像
-/// `/odm/vendor/app/mcRegistry/070f0000000000000000000000000a0a.tlbin`）把 RPMB
-/// session 3 打开之后不释放，之后每一次 `EXPORT_PUB_KEY` 都开不了会话 —— 驱动
-/// 日志 `rpmb session 3 is already opened by 070f0000-...-a0a0` 449/449 全是它
-/// 自己，`Open session failed crSession = 0xffffffff` 452 次，
-/// `read counter failed (258)` 451 次。TA 从此读不到自己的持久存储，于是
-/// `export_*` / `generate_*` 一律回 -5，而 `has_*` 照旧回 0（它不走 RPMB）——
-/// 对外就是「说存在、却导不出来、也建不了」。踢 Android 侧的 HAL 服务没用
-/// （持有者在 TEE 里），只有重启整机能松开。
+/// RPMB 会话是独占资源：TA 一旦漏释放，后续 `export_*` / `generate_*` 全部 -5，只有重启
+/// 能松开。所以这里是有上限的并行：
 ///
-/// 所以这里不是「放开并发」，是**有上限的并行**，两条规矩：
+///   1. 全局同时在飞不超过 `max`（`relay.conf` 的 `soter_concurrency`，默认 2），留出
+///      空位给系统自己那条路；
+///   2. 同一个 uid 严格串行，不同 uid 之间并行。
 ///
-///   1. 全局同时在飞不超过 `max`（`relay.conf` 的 `soter_concurrency`，默认 2）。
-///      RPMB 会话是独占资源，我们自己占得越少，机器自己那条路（系统 / 微信在真机上
-///      直接调 TA）就越有空位 —— 留出来的那点空间是给它的，不是给我们堆吞吐的。
-///   2. 同一个 uid 严格串行。一个 uid 上的 export / rebuild / 签名 互相插队，正是把
-///      槽位搅成半成品、再喂给 TA 一堆 -5 的来路；不同 uid 之间才并行。
-///
-/// 真撞上那个楔子也不慌：`hal_restart` 里有「连续 258 → 自动重启」兜底。
-/// KeyMint / attest 那条路不经过这里，照旧并发。
+/// 真撞上卡死的 TA 由 `hal_restart` 的「连续 258 → 自动重启」兜底。KeyMint / attest
+/// 不经过这里。
 const SOTER_CONCURRENCY_MIN: u32 = 1;
 const SOTER_CONCURRENCY_MAX: u32 = 4;
 /// 默认上限（`DEFAULT_SOTER_CONCURRENCY` 的库内镜像，见 `bin/relay.rs`）。
@@ -635,31 +610,17 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
             );
             let mut guard = SIGN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            // 这里以前会拿「别人还有一张会话没收尾」把这一笔拒掉，回 -9。
-            //
-            // 2026-10-03 在 PLC110 上实测到后果：A 端微信开通指纹支付时，设备上还挂着
-            // 一笔 chunqiu/duckdetector 探针的 init（探针不发 finish），租约要 60 秒才
-            // 过期，期间 App 每一笔 init 都吃 -9，soterserver 给微信的 SoterSessionResult
-            // 里 session=0，App 连指纹圈都弹不出来就自删重来 —— 下一轮又撞在同一个窗里。
-            // 那天 09 时全部 13 笔成功 init 的别名都是探针，一笔真 App 都没有。
-            //
-            // 服务端 2026-10-02 踩过同一个坑（见 `handlers.rs` 里 init 那段注释：
-            // 「抢不到租约不再直接回 -9：那会让 A 端连指纹圈都弹不出来」）。这边照同一个
-            // 口径改：不拒，让它去顶掉旧会话；被顶掉的那笔在 finish 上吃 -204，由服务端
-            // 的补签路径收尾。租约本身留着挡探针（`probe_allowed`）。
+            // 抢不到租约不拒：拒了（回 -9）会让 App 连指纹圈都弹不出来，还会把探针的
+            // 旧会话一直挂到租约过期。让它去顶掉旧会话，被顶掉的那笔在 finish 上吃
+            // -204，由服务端补签收尾；租约只用来挡探针（`probe_allowed`）。
             guard.activity(now);
             let soter = open_soter(op)?;
             let mut session = soter.init_sign(uid, &alias, &challenge)?;
-            // 这台机器上没有这批材料：就地在原地补齐再签一次。
+            // 这台机器上没有这批材料：原地补齐再签一次。
             //
-            // 背景（PLC110 2026-09-30 实测）：A 端 App 的 AuthKey/SoterAuthKey 是
-            // 在 A 端本地建的，B 端手上不一定有，TA 会回 -5（ASK 没就绪）/ -6
-            // （AuthKey 没就绪）。以前这里原样递上去，服务端只能拿自签的假料顶上，
-            // App 一验不过，整个 SOTER 支付流程就炸。
-            // 用户规矩：指定的那台 B 说没有，就在原地重建，不换机器、也不退回自签。
-            //
-            // 只认「没料」这三个码（-5 / -6 / -65528）：-18（安全通道不通）、-8 这些是 TA
-            // 自己的结构性毛病，材料没问题，重建既没用、还会把人家真钥匙重铸掉。
+            // 只对「没料」的三个码重建：-5（ASK 未就绪）/ -6（AuthKey 未就绪）/
+            // -65528。-18（安全通道不通）、-8 这类是 TA 的结构性问题，重建没用，还会把
+            // 真钥匙重铸掉。
             if matches!(
                 session.error_code,
                 SOTER_ASK_NOT_READY_CODE
@@ -1050,14 +1011,8 @@ mod tests {
 
     #[test]
     fn a_sign_failure_does_not_take_the_slot_off_this_device() {
-        // 以前这里会记下 uid、24 小时不服务这个槽位。现在没有了：`handle()` 里
-        // 对 `has_auth_key` 这种 op 的回包必须是 TA 自己的答复，不是我们编的。
-        //
-        // 真机（有 SOTER HAL）上跑也成立：那时候 HAL 自己会回一个 `error_code`，
-        // 同样不能带我们编的那句。原来这里写死 `expect_err`（默认跑测试的机器没
-        // 有 HAL），在一台真有 HAL 的机器上就变成必红，跟代码对错无关。
-        // 这台机器上真有 HAL：先进 binder，不然 rsbinder 直接 panic
-        // `ProcessState is not initialized!`（跟被测逻辑无关，纯测试自己的事）。
+        // 回包必须是 TA 自己的答复，不能带我们编的 error；真有 HAL 的机器上要先进 binder，
+        // 不然 rsbinder 会 panic（`ProcessState is not initialized!`）。
         crate::init_binder();
         let uid = 900001;
         let payload = json!({ "op": "has_auth_key", "uid": uid, "alias": "whatever" });

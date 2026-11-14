@@ -1,39 +1,22 @@
 //! A 端本地的 SOTER 后端（自签兜底）。
 //!
-//! 这台机器的 SOTER TA 是没 provisioning 的 —— 实测 `generateAskKeyPair` 直接回
-//! -20，key 一把都建不出来，所以本地真 HAL 这条腿是瘸的。这个模块补的就是那一
-//! 块：拿编译进来的 ATTK（构建时现生成的那把自签 RSA）签 ASK 的认证信封，
-//! ASK 本身按 uid 用到才现生成、落盘复用。
-//!
-//! 形状跟服务端 `soter_mint.rs` 一模一样（那边的测试验过：ASK 的签名拿导出的
-//! ATTK 公钥验得过）。要吐信封的三处都是同一个形状：
+//! 用编译进来的 ATTK 签 ASK 的认证信封；ASK 按 uid 现生成、落盘复用。三种返回同一个形状
+//!（与服务端 `soter_mint.rs` 一致）：
 //!
 //! ```text
 //! [i32 le JSON 长度][JSON][256 字节 RSA-PSS-SHA256 签名]
 //! ```
 //!
-//! - `exportAskPublicKey`：JSON 是这个 uid 的 ASK 自描述（`pub_key` 就是那把 ASK 公钥），
-//!   **拿 ATTK 私钥签** —— 真机上 ASK 证书就是 ATTK 签的（ATTK 是这条链的根）；
-//! - `exportAuthKeyPublicKey`：JSON 是 AuthKey 的自描述，**拿 ASK 私钥签**。App 是
-//!   先拿到 ASK 公钥、再拿它验这个信封的，签错了它验不过；
-//! - `finishSign`：JSON 是这次签名的现场（`raw` / `fid` / `counter` / `tee_*` /
-//!   `fp_*` / `cpu_id` / `uid`），**拿 AuthKey 签那段 JSON 原文**。真机签的不是
-//!   challenge 的字节，而是这段 JSON（B 端实测：App 验的也是 JSON 原文）。
+//! - `exportAskPublicKey`：ASK 自描述，用 ATTK 私钥签；
+//! - `exportAuthKeyPublicKey`：AuthKey 自描述，用 ASK 私钥签（App 拿 ASK 公钥验它）；
+//! - `finishSign`：签名现场 JSON，用 AuthKey 签**原文**，不是 challenge 的字节。
 //!
-//! 键序全照真机现场抓到的来，字段名一个都别改，`uid` 是字符串不是数字。
+//! 键序和字段名照真机现场，`uid` 是字符串。设备信息（`cpu_id` / `fid` / `tee_*` / `fp_*`）
+//! 按本机属性推：`cpu_id` 只认本地这份身份（ATTK force 号，否则按序列号派生），不用转发
+//! 链路学来的 B 端号。
 //!
-//! 设备信息（`cpu_id` / `fp_n` / `fp_v` / `tee_n` / `tee_v` / `fid`）按本机属性推：
-//! `cpu_id` 只认这份本地身份自己的号（ATTK 自带的 force 号，没有就按 `ro.boot.serialno`
-//! 派生）；**不拿转发链路跟 B 学来的真机号**，那是另一份身份的数字。指纹和 TEE 也从属性读，
-//! 读不到才退回兜底值。
-//! 不要把它写成编死的常量 —— 那样装过这套的机器全是同一个设备，业务侧一眼假。
-//!
-//! 心里得有数的边界：自签的链**骗得过 App 本地**（它拿我们给的公钥验我们签的
-//! 东西，当然验得过），**骗不过业务服务端的证书链校验**。私钥就编在 binary 里，
-//! 谁扒出来都能用 —— 这是兜底，不是安全方案。
-//!
-//! 参数校验、错误码这些都跟着真机宿主那套走（-5 是"这把钥匙不在这台设备上"，
-//! 实测宿主也是这么回的），这样上层看不出区别。
+//! 边界：自签链只在本机自洽，过不了业务服务端的证书校验；私钥就编在 binary 里 —— 这是
+//! 兜底，不是安全方案。错误码跟真机宿主一致（-5 = 钥匙不在这台设备上）。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -438,12 +421,8 @@ fn read_store_pem(section: &str, key: &str) -> Option<String> {
     }
 }
 
-/// AUTH 段最多留这么多把 AuthKey（每把约 1.7KB PEM）。
-///
-/// 不设上限的话，探测机 / 异常流程每轮铸一个新别名、签完不收尾，这份 JSON 就只涨
-/// 不降 —— 内存、磁盘、以及每次重读的解析成本会一起涨。超过之后按「挤掉一批」处理：
-/// 被挤掉的那把下次 `has_auth_key` 会回 false，App 自己重签，这正是设计好的路径
-/// （跟换了 ATTK 之后旧 AuthKey 作废一个道理）。
+/// AUTH 段最多留这么多把 AuthKey（每把约 1.7KB PEM）。超过之后挤掉最早的一批：
+/// 被挤掉的那把下次 `has_auth_key` 回 false，App 自己重签。
 const MAX_AUTH_KEYS: usize = 1024;
 const AUTH_KEYS_KEEP: usize = MAX_AUTH_KEYS * 3 / 4;
 /// 未完成的 initSign 会话最多留这么多条，超了整表清。
@@ -726,21 +705,13 @@ pub(crate) fn device_id() -> String {
     cpu_id()
 }
 
-/// 本地兜底这条路该报的 cpu_id。
+/// 本地兜底报的 cpu_id。
 ///
-/// 只认**本地这份身份自己的号**：
-///   1. `soter_cpu_id.force` —— 这份 ATTK 自带的号（导入 WebUI 时 `cpu_id:` 那一行被 daemon
-///      落成它；拿别台设备的 ATTK 重放时也靠它对齐）；
-///   2. 本机序列号派生的号 —— 本地 ATTK 是我们自己现造的那把，它的身份就是这台机器。
+/// 1. `soter_cpu_id.force`：这份 ATTK 自带的号；
+/// 2. 本机序列号派生：本地 ATTK 是现造的，身份就是这台机器。
 ///
-/// **不读** `/data/misc/ommega/soter_cpu_id`：那是转发链路跟 B 学来的真机号，属于 B 的身份。
-/// 本地兜底是另一份身份（另一把 ATTK），硬把 B 的号拿过来只是“两处数字一样”而已，
-/// 但 ATTK/ASK/AuthKey 对不上那个号 —— 三处文档里声明的 cpu_id 必须跟签字那把钥匙是同一个
-/// 身份。两边各报各的才对；测器觉得两处不一样，那是因为它们本来就不是同一台。
-///
-/// 派生号算不出来时读 [`LOCAL_CPU_ID_PATH`]：app 域（SOTER 宿主是 platform_app）里
-/// fork `getprop` 被 SELinux 拒、直接读属性区在 ColorOS 上也读不到序列号
-/// （HA2B9D1W 实测 `serial=None`），只能让跑得动的进程算一次落盘。
+/// 不读 `/data/misc/ommega/soter_cpu_id`（那是转发链路学来的 B 端号）。序列号在部分域
+/// 读不到，这时用 [`LOCAL_CPU_ID_PATH`] 那份缓存。
 ///
 /// 一个来源都拿不到就报空串：这层宁可不答，也不编一个号（编出来的一眼假）。
 fn cpu_id() -> String {
@@ -804,14 +775,8 @@ extern "C" {
 
 /// 读一条系统属性。
 ///
-/// 走 `getprop` 命令而不是 `__system_property_get`：后者在 dlopen 进来的 payload 里实测
-/// 读不到（NX721J：shell 里 `getprop ro.boot.serialno` 能拿到序列号，payload 里
-/// `__system_property_get` 返回 0，静默当成“没这条属性”）。签名这条路径每毫秒都算数，
-/// 但多 fork 一次 `getprop` 换“真能读到”比省那点开销值。
-///
-/// 更麻烦的是 app 域（SOTER 宿主是 platform_app）里连 fork 都不行：exec
-/// `/system/bin/getprop` 会被 SELinux 直接拒（HA2B9D1W / ColorOS 实测）。那种进程靠
-/// [`LOCAL_CPU_ID_PATH`] 那份缓存，见 [`cpu_id`]。
+/// 走 `getprop` 命令：payload 里 `__system_property_get` 拿不到值。app 域（SOTER 宿主）
+/// 连 fork 都会被拒，那种进程只能靠 [`LOCAL_CPU_ID_PATH`] 的缓存，见 [`cpu_id`]。
 #[cfg(target_os = "android")]
 pub(crate) fn prop(name: &str) -> Option<String> {
     let output = std::process::Command::new("/system/bin/getprop")
@@ -1155,15 +1120,11 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 None => None,
             }
         }
-        // generateAskKeyPair(uid) —— 平台两条路：
-        //   - 高通（实测 SM8635）：每次重铸、回 0（前后两次 ASK 公钥指纹确实不同）
-        //   - MTK（实测 MT6991）：已有就回 -5、不重铸；但跨进程第一次仍回 0（见下）
-        //
-        // MTK 那个偏差是有意的：9 号（hasAskAlready）在上报过之前一律答「没有」
-        // （2026-10-11 毒化事故后的定论），5 号如果也直接 -5，应用就会
-        // 「问→没有→建→-5→删→再问」锁死。所以只在**本会话已经建过/碰过**
-        // （`ask_built`）之后才回 -5；同一进程连调两次的应答跟真机一致。
-        // **不要重置 counter**：重置就回退了，App 会当重放把钥匙删掉。
+        // generateAskKeyPair(uid) 按平台分两种：
+        //   高通：每次重铸、回 0；MTK：已有就回 -5、不重铸。
+        // MTK 只在本会话建过/碰过（`ask_built`）后才回 -5：9 号在上报之前一直答“没有”，
+        // 5 号也直接 -5 的话应用会「问→没有→建→-5→删→再问」锁死。
+        // counter 不能重置 —— 回退会被 App 当重放。
         5 => {
             let uid = call.uid?;
             clear_gone(&ask_gone_key(uid));
@@ -1211,20 +1172,14 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         }
         // getDeviceId()
         //
-        // 真机那套 TA 回的是 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（实测 PLC110：33 字节），
-        // 不是 16 字节二进制。这里跟着真机来：形状一致，文本比较的那类检测器看到的就是
-        // 它熟悉的那个串。
+        // 真机回 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（33 字节），不是 16 字节二进制；
+        // 形状要跟真机一致。
         8 => Some(Answer::Buffer {
             code: OK,
             data: Some(device_id_reply(&device_id())),
         }),
-        // hasAskAlready(uid) —— 兜底层**必须**答「没有」。
-        //
-        // 我们这把 ASK 是本地自签的，腾讯那边永远不认；而应用只在「没有 ASK」时才把它
-        // 上报腾讯。以前这里答 OK（= 有），应用于是跳过上报、拿着假 ASK 去建 AuthKey，
-        // 被腾讯拒了再自删重试 —— 一次本地兜底就把这个槽位毒化了（2026-10-11 实测；
-        // 服务端 `soter_mint` 那两层同一个毛病，已一并改掉）。
-        // 答 NOT_FOUND 之后应用会老实重新生成并上报；真机那条路一回来就能走通。
+        // hasAskAlready(uid) 必须答「没有」：本地 ASK 是自签的，腾讯不认；而应用只在
+        // 「没有 ASK」时才上报。答「有」会让它跳过上报、拿假 ASK 建 AuthKey → 被拒 → 自删重试。
         9 => {
             // 本地这把 ASK 一直在（内置或自定义），「这个 uid 有没有料」就看内存/盘上
             // 真有没有，不能只看本会话建没建过：只看 `ask_built` 会出现「答没有、但
@@ -1379,14 +1334,10 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
 }
 
 fn bump_counter(state: &State, uid: i32) -> u64 {
-    // counter 必须单调递增，而且**重启不能回退**：App 会记着上次看到的值，
-    // 小回去就当成重放，把本地钥匙删了重来。
+    // counter 必须单调递增、重启不能回退：App 记着上次看到的值，小回去就当重放删钥匙。
     //
-    // 所有 App 共用一个文件（每行 `uid=counter`）。以前是 `soter_counter.<uid>`
-    // 平铺在目录根下，装十几个 App 就是一屏垃圾文件。
-    //
-    // 读-改-写放在文件锁里：injector 会同时跑在 keystore 和 SOTER 宿主几个进程里，
-    // 不加锁会互相覆盖。计数器就是这条 `uid=counter` 的唯一来源。
+    // 所有 App 共用一个文件（每行 `uid=counter`），读-改-写放在文件锁里：injector 同时跑在
+    // keystore 和 SOTER 宿主几个进程里，不加锁会互相覆盖。
     const PATH: &str = "/data/misc/ommega/soter_counter";
 
     let mem = state
@@ -1407,15 +1358,8 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            // 换了 ATTK = 新身份（新 cpu_id），腾讯那边也是新记录，counter 从 1 开始。
-            // 前提是 App 侧的开通状态也清了（daemon 会删 soter_status.xml）——
-            // 否则 App 记着旧 counter，看到 1 就当回退，得连按好几次才追上来。
-            // 文件里没这个 uid 就从 1 开始。
-            //
-            // 这不是“能优化”的地方：文件没了要么是刚换 ATTK（新 ASK、新身份，
-            // App 的开通状态也被清了，1 就是正确起点），要么是别的 uid 写回时
-            // 重排了文件——不管哪种，从 1 重新开始都比“凭空接一个几万”合理。
-            // 这里刻意不拿内存里的 mem 去接。
+            // 文件里没这个 uid 就从 1 开始：换 ATTK 就是新身份（新 ASK、新 cpu_id），
+            // App 侧开通状态也一并清了，1 是正确起点；不接内存里的旧值。
             let next = match counter_for(&text, uid) {
                 Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
                 None => COUNTER_BASE,
@@ -1495,18 +1439,15 @@ fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
     .into_bytes()
 }
 
-/// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
-/// 都不能少 —— App 会把它们存下来当设备指纹。
-/// 真机在这几处是按平台分的（两台实测）：
+/// 签名现场那份 JSON。字段名和键序照真机：`raw` 在最前，一个字段都不能少 ——App 会
+/// 把它们存下来当设备指纹。形状按平台分：
 ///
-/// | | 高通（SM8635 / peridot） | MTK（MT6991 / Kinibi） |
+/// | | 高通 | MTK |
 /// |---|---|---|
 /// | `cpu_id` | `00000000…` | `09000000…` |
-/// | `getDeviceId` | 16 字节 raw | 32 个 ASCII hex + NUL（33 字节） |
-/// | 文档里的盐长字段 | **没有**这个字段 | `rsa_pss_saltlen:32` |
+/// | `getDeviceId` | 16 字节 raw | 32 个 ASCII hex + NUL |
+/// | 盐长字段 | 无 | `rsa_pss_saltlen:32` |
 /// | 已有料时 `generate` | 重铸、回 0 | 回 -5、不重铸 |
-///
-/// 所以本地兜底不能写死一套形状，按本机 SoC 选一。认不出来（含开发机）按高通算。
 struct Platform {
     cpu_prefix: &'static str,
     device_id_ascii: bool,
