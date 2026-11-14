@@ -562,7 +562,7 @@ mod tests {
     fn maps_os_version_to_release_string() {
         assert_eq!(release_value(160000).as_deref(), Some("16"));
         assert_eq!(release_value(150000).as_deref(), Some("15"));
-        assert_eq!(release_value(161000).as_deref(), Some("16.1"));
+        assert_eq!(release_value(160100).as_deref(), Some("16.1"));
         // 越界的不采信（老客户端发 7 之类的值）。
         assert_eq!(release_value(7), None);
         assert_eq!(release_value(0), None);

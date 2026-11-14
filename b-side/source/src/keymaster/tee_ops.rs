@@ -1808,16 +1808,23 @@ mod tests {
     /// 不再偷偷改成免认证。
     #[test]
     fn relay_adds_no_auth_required_only_when_the_app_is_silent() {
-        for user_auth in [vec![], vec![(506, 1)], vec![(509, 1)], vec![(505, 30_000)]] {
-            assert_eq!(
-                relay_authorization_params(&user_auth).unwrap(),
-                vec![KeyParam::NoAuthRequired]
-            );
-        }
-        // 只带 509 的请求：补 503 之外仍保留 509
+        // 没提认证策略：补一个。
+        assert_eq!(
+            relay_authorization_params(&[]).unwrap(),
+            vec![KeyParam::NoAuthRequired]
+        );
+        // 只有附加约束（505/506/509）：补上 NoAuthRequired，它们照发。
+        assert_eq!(
+            relay_authorization_params(&[(506, 1)]).unwrap(),
+            vec![KeyParam::NoAuthRequired, KeyParam::AllowWhileOnBody]
+        );
         assert_eq!(
             relay_authorization_params(&[(509, 1)]).unwrap(),
             vec![KeyParam::NoAuthRequired, KeyParam::UnlockedDeviceRequired]
+        );
+        assert_eq!(
+            relay_authorization_params(&[(505, 30_000)]).unwrap(),
+            vec![KeyParam::NoAuthRequired, KeyParam::AuthTimeout(30_000)]
         );
     }
 

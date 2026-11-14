@@ -479,14 +479,9 @@ mod tests {
             classify_bind_iface("wlan0"),
             BindChoice::Named("wlan0".to_string())
         );
-    }
-
-    #[test]
-    fn a_literal_name_is_taken_at_face_value() {
-        // 写死的名字不探、不改：能不能用是内核的事。
         assert_eq!(
-            desired_iface("ccmni0", "http://1.2.3.4:10886"),
-            Some("ccmni0".to_string())
+            classify_bind_iface("ccmni0"),
+            BindChoice::Named("ccmni0".to_string())
         );
     }
 
