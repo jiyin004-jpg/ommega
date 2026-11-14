@@ -21,6 +21,13 @@
 # keystore2：payload 进去之后它得能 dlopen 我们镜像里的库。
 allow keystore system_file unix_dgram_socket { getattr read recvfrom }
 allow keystore system_file file { execute getattr map read receive }
+# 进程内那份的 payload 是从 keystore2 自己建的 memfd 里 dlopen 的（tclass=memfd_file，
+# tcontext 就是 keystore）。有的 ROM（Redmi/小米 PYB110、Android 17 实测）不给 keystore
+# 执行 memfd 的权限，注入就报
+#   dlopen failed: couldn't map "/memfd:lib….so" segment 3: Permission denied
+# 然后模块一直显示启动失败、daemon 轮回去也起不来。
+allow keystore keystore memfd_file { open read write map execute getattr }
+allow keystore keystore file { execute map }
 
 # 递 payload 的那条 dgram：target 侧收，注入器那侧发。发送方域可能落在
 # system_file（ColorOS 上实测就是这个）、ksu、magisk 这些里，列全了不吃亏。
