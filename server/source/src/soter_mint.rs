@@ -1,7 +1,7 @@
 //! 服务端侧的三层 SOTER：`keybox`（服务端存的设备身份）、`attk`（控制台上传的 ATTK）、
 //! `self_signed`（现生成、进程内复用），另有 `builtin` 供探测机就地作答。
 //!
-//! SOTER 的"证书"不是 X.509，是 `[i32 le JSON 长度][JSON][256 字节 RSA-PSS 签名]`，
+//! SOTER 的"证书"是 `[i32 le JSON 长度][JSON][256 字节 RSA-PSS 签名]`，
 //! 签名用 RSA-PSS-SHA256、盐长 32。JSON 键序即现场抓到的顺序，字段名不能改：
 //!
 //! ```json
@@ -9,16 +9,11 @@
 //!  "uid":"<字符串>","rsa_pss_saltlen":32}
 //! ```
 //!
-//! 层与层的分工：`keybox` 只在自己那把身份是 RSA 时能处理；`attk` 用上传的那把 ATTK
-//! （身份就是它的 `cpu_id`，A 端转来的真机号在这层不作数）；`self_signed` 服务重启即换
-//! 身份，A 端需重新取 ATTK 公钥。
+//! `keybox` 只在身份是 RSA 时处理；`attk` 的身份是上传 ATTK 的 `cpu_id`；`self_signed`
+//! 服务重启即换身份。
 //!
-//! 物料按身份隔离：缓存键前面带 `scope`（见 `material_scope`），换 ATTK 就是换整套
-//! 钥匙，不会拿旧的 ASK 配新的 AuthKey。
-//!
-//! 处理不了的 op 返回带 `error` 的对象，调用方据此回退下一层。**同一槽位的材料只能
-//! 出自一层**（一半 B 的 ASK、一半 keybox 的 AuthKey 会让 App 自相矛盾），因此服务
-//! 它的那层会被钉住（`pin_layer`，落盘），层失效时才换、钉子跟着挪。
+//! 物料按身份隔离：缓存键前缀是 `scope`（见 `material_scope`）。
+//! 处理不了的 op 返回带 `error` 的对象。同一槽位的材料只出自一层（`pin_layer`）。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -35,17 +30,15 @@ use sha2::{Digest, Sha256};
 
 use crate::statedb;
 
-/// SOTER 的成功码。
+/// SOTER 成功码。
 const OK: i32 = 0;
-/// "这把钥匙不在这台设备上"。`hasAskAlready` 查不到时返回它。
+/// ASK 不在这台设备上（`hasAskAlready` 查不到时返回）。
 const NOT_FOUND: i32 = -5;
-/// AuthKey 还没建（`has_auth_key` / `export_auth_key_public_key` 查不到时）。
-/// 真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成「ASK 没建」。
+/// AuthKey 还没建（-6，`AUTH_KEY_NOT_READY`）。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// `finish_sign` 拿到一个不存在的 session。真机 TA 用 -1000，不是 -5。
+/// `finish_sign` 拿到一个不存在的 session（真机 TA 的 -1000）。
 const SESSION_UNKNOWN: i32 = -1000;
-/// ASK 里写死的盐长。真机（MTK Kinibi）三份文档都写 32、签名也是 32：
-/// 声明和签名必须一致，否则验签方验不过。
+/// ASK 文档声明、签名时用的盐长（32）。
 const ASK_SALT_LEN: i32 = 32;
 
 // ---------------------------------------------------------------------------
@@ -94,9 +87,7 @@ impl MintKey {
             .to_string())
     }
 
-    /// RSA-PSS-SHA256，盐长必须显式写 `ASK_SALT_LEN`：`PssSigningKey::new` 用的是
-    /// 摘要长度（与常量同为 32），但验签方（App / openssl `rsa_pss_saltlen:32`）按 JSON
-    /// 里声明的值严卡盐长，改常量时必须同步签名。
+    /// RSA-PSS-SHA256 签名，盐长 `ASK_SALT_LEN`（与文档里的 `rsa_pss_saltlen` 一致）。
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let signing = PssSigningKey::<Sha256>::new_with_salt_len(
             (*self.private).clone(),
@@ -122,22 +113,14 @@ struct Store {
     /// 专给探测机作答的那一把（见 `crate::soter_probe`），自己一份、永不轮换。
     builtin: Mutex<Option<Arc<MintKey>>>,
     /// `soter_attk` 行 id -> 这把 ATTK 解出来的物料（服务端密钥模式）。
-    /// 按 id 缓存：控制台删掉再传就是新的一行，不会串。
     attk: Mutex<HashMap<i64, Arc<MintKey>>>,
-    /// `{device}|{layer}` -> 这一层的 ASK。
-    ///
-    /// 真机的 SOTER 里 ATTK 和 ASK 是两把钥匙：ASK 证书用 ATTK 签、AuthKey 证书用
-    /// ASK 签、finishSign 用 AuthKey 签。两把公钥不能相等，否则 App 会把该 uid 下的
-    /// 钥匙全删掉重来（见 a-side `soter_local.rs`）。
+    /// `{device}|{layer}` -> 这一层的 ASK。ASK 证书由 ATTK 签，AuthKey 证书由 ASK 签。
     ask: Mutex<HashMap<String, Arc<MintKey>>>,
     /// `{device}|{uid}|{alias}` -> AuthKey
     auth: Mutex<HashMap<String, Arc<MintKey>>>,
     /// `{device}|{uid}` -> 签名计数器
     counters: Mutex<HashMap<String, u64>>,
-    /// 删过的 ASK 墓碑：`{scope}|{device}|{uid}`。
-    ///
-    /// 真机的删除是黏的：`remove_all_uid_key` 之后 `export*` 不能现造一把新的顶上。
-    /// 墓碑同时落库（`statedb`），重启后依旧算删过。
+    /// 删过的 ASK 墓碑：`{scope}|{device}|{uid}`（落库，重启后仍然算删过）。
     gone_ask: Mutex<HashSet<String>>,
     /// `{device}|{uid}` -> 下一次会话号
     next_session: Mutex<i64>,
@@ -151,36 +134,27 @@ struct Store {
     owner_touch: Mutex<HashMap<String, i64>>,
 }
 
-/// 钉在槽位上的那一层，带时间戳。
-///
-/// 时间戳是给过期用的：B 端一次抖动就可能让 keybox 抢答并钉住槽位（假链腾讯不认），
-/// 钉子若永不过期，后续重试就永远回不到 B 的真料。一轮流程内继续钉保证不自相矛盾，
-/// 过期后重新评层。
+/// 钉在槽位上的那一层，带时间戳（过期后重新评层）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SlotPin {
     layer: String,
     at_millis: i64,
-    /// 这个槽位上认出来的账号指纹（`owner_token` 给出来的）。`layer` 为空、只有
-    /// 这个字段的记录表示「还没服务过这个槽位，只知道上面有谁」。
+    /// 这个槽位上认出来的账号指纹（`owner_token` 给出来的）；`layer` 为空表示只记了账号。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     owners: Vec<Owner>,
 }
 
-/// 槽位上记着的一个账号指纹 + 最后一次见到它的时间。
-///
-/// 时间给两条缓存规矩用：同族满了按它做 LRU（换掉最久没见的），久了没见则按 TTL 丢掉。
+/// 槽位上的一个账号指纹 + 最后一次见到它的时间（LRU 与 TTL 的判据）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Owner {
     token: String,
     last_seen_ms: i64,
 }
 
-/// 钉子活多久。取 30 分钟：比一轮开启流程长得多，又短到不至于把一次抖动变成
-/// 永久失败（`cpu_id` 变了微信会自己重走一轮流程，跨层也能自愈）。
+/// 钉子 TTL：30 分钟。
 const SLOT_PIN_TTL_MILLIS: i64 = 30 * 60 * 1000;
 
-/// 账号指纹活多久（按最后一次见到算）。比会话的 7 天长得多：它只是「这个槽位上有
-/// 几个号」的判据，攒着不占地方，过早忘掉会让连坐拦截失手。
+/// 账号指纹 TTL（按最后一次见到算）：30 天。
 const OWNER_TTL_MILLIS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// 账号指纹过期清理的节流间隔（扫一遍是 O(槽位数)）。
@@ -191,18 +165,15 @@ struct SignSession {
     requested: String,
     device: String,
     layer: String,
-    /// `attk` 层开出来的会话归哪一把 ATTK。finish 得用同一把签，否则验不过。
+    /// `attk` 层开出来的会话归哪一把 ATTK（finish 用同一把签）。
     attk_id: Option<i64>,
     uid: i32,
     alias: String,
-    /// 挑战原文。真机把这段原文写进签名 JSON 的 `raw` 里，不是解出来的字节。
+    /// 挑战原文，写进签名 JSON 的 `raw`。
     raw: String,
 }
 
-/// 刚签完的会话。
-///
-/// 会话是一次性的，但同一张会话再问一遍确实会发生：检测器先 init 两张再逐个 finish，
-/// 客户端也会超时重试。签完的答复短存一份，再问原样还回去 —— 不重签、不推 counter。
+/// 刚签完的会话：同一张会话再问一遍时原样还回去。
 struct FinishedSession {
     requested: String,
     device: String,
@@ -214,10 +185,9 @@ struct FinishedSession {
     reply: Value,
 }
 
-/// 签完的会话留多久。一轮开通流程里 init/finish 相隔几秒，30 秒给得够宽，
-/// 又短到不会让很久以前的会话重新“活”过来。
+/// 签完的会话留 30 秒。
 const FINISHED_TTL_MS: i64 = 30 * 1000;
-/// 最多同时留几张。够了就照最旧的丢（它们已经过了正常重试窗口）。
+/// 最多同时留 256 张，超了丢最旧的。
 const FINISHED_MAX: usize = 256;
 
 fn now_millis() -> i64 {
@@ -235,10 +205,7 @@ fn purge_finished(map: &mut HashMap<i64, FinishedSession>, now: i64) {
     }
 }
 
-/// 这张会话刚签过吗：命中就把它那次那串信封原样还回去。
-///
-/// 不重签也不推 counter，是幂等重放；设备/层也得对得上，同一张会话号在别的设备上
-/// 问不到东西。
+/// 这张会话刚签过吗：命中就把那次签出来的信封原样还回去（幂等重放）。
 fn replay_finished(session: i64, requested: &str, device_id: &str, layer: &str) -> Option<Value> {
     let mut map = store().finished.lock().ok()?;
     purge_finished(&mut map, now_millis());
@@ -311,8 +278,7 @@ pub struct AttkMaterial {
     pub pem: String,
 }
 
-/// 手写 `Debug`：`pem` 就是私钥，日志里 `?attk` 一下也不能把它吐到 stdout。
-/// 这把钥匙永不对外暴露（控制台只有元数据、`/api/status` 不带它、A 端只拿公钥）。
+/// 手写 `Debug`：`pem`（私钥）一律打印成 `<redacted>`。
 impl std::fmt::Debug for AttkMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttkMaterial")
@@ -342,8 +308,7 @@ fn store() -> &'static Store {
     })
 }
 
-/// 取这一层的物料。`key_pem` 只有 keybox 层才需要（服务端存的那把设备身份私钥），
-/// `attk` 只有服务端密钥模式才需要。
+/// 取这一层的物料。`key_pem` 只有 keybox 层用，`attk` 只有服务端密钥模式用。
 fn material(
     layer: &str,
     key_pem: Option<&str>,
@@ -374,11 +339,7 @@ fn material(
     self_signed_key()
 }
 
-/// 这一层的物料挂在哪份身份下。
-///
-/// ASK / AuthKey 的缓存键都以它打头：`attk` 层按 ATTK 行 id 分（换一把就是换一整套），
-/// 其余三层各是各的。不这么分，换 ATTK 后旧 AuthKey 会配上新 ASK，导出的公钥和
-/// 签名用的私钥对不上。
+/// 这一层的物料挂在哪份身份下，ASK / AuthKey 缓存键的前缀。
 fn material_scope(layer: &str, attk: Option<&AttkMaterial>) -> String {
     match layer {
         "attk" => attk
@@ -421,14 +382,12 @@ pub fn forget_attk(id: i64) {
     if let Err(e) = statedb::shared().clear_gone_ask_prefix(&prefix) {
         tracing::warn!("soter: 按身份清墓碑失败（{prefix}）：{e:#}");
     }
-    // 落盘的那份也得跟着走，不然重启后旧 ATTK 铸的 ASK 又回来了。
     if let Err(e) = statedb::shared().mint_key_delete_prefix(&prefix) {
         tracing::warn!("soter: 按身份清落盘料失败（{prefix}）：{e:#}");
     }
 }
 
-/// 探测机专用的那把 ASK。跟自签层分开，是因为探测流量会一直让 `generate_ask_key_pair`
-/// 换钥匙 —— 换的是全局那一把，会把钉在那一层上、正跑着一轮的槽位劈成两半。
+/// 探测机专用的那把 ASK，跟自签层分开存。
 fn builtin_key() -> Result<Arc<MintKey>> {
     let mut guard = store()
         .builtin
@@ -465,16 +424,9 @@ fn rotate_self_signed_key() -> Result<Arc<MintKey>> {
     Ok(fresh)
 }
 
-/// 这一层的 ASK（按需生成、进程内缓存）。
-///
-/// 键里必须带 **uid**：真机的 ASK 是 per-uid 的（`generateAskKeyPair(uid)`），同一
-/// 设备上所有应用共用一把 ASK 在真机上不存在，多用户下还会把机主的公钥发给工作资料。
-///
-/// 跟 ATTK 分开存：真机上这两把公钥从不相等，吐同一把会让 App 把该 uid 下的钥匙删掉重来。
+/// 这一层的 ASK（按需生成、进程内缓存），键带 uid 与层名。
 fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     let id = format!("{scope}|{uid}|{layer}");
-    // 先在锁里看一眼；RSA 生成（2048 位，几十到上百毫秒）放到锁外，
-    // 否则一个新建 ASK 会把别的设备、别的 uid 的请求一起串在同一把锁上。
     if let Some(existing) = store()
         .ask
         .lock()
@@ -484,7 +436,7 @@ fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     {
         return Ok(existing);
     }
-    // 进程重启后内存是空的，但库里那把还是用户的 ASK —— 先把它捞回来，不能现造一把。
+    // 先从库里捞回上次落盘的那把。
     if let Some(loaded) = load_persisted_key(&id, persists(scope)) {
         if let Ok(mut map) = store().ask.lock() {
             map.insert(id, loaded.clone());
@@ -496,7 +448,7 @@ fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
         .ask
         .lock()
         .map_err(|_| anyhow!("ask material lock poisoned"))?;
-    // 两个请求同时给同一个 uid 建料：先进去的算数，后到的用它的（不能各建一把）。
+    // 并发下先进去的算数。
     if let Some(existing) = map.get(&id) {
         return Ok(existing.clone());
     }
@@ -506,10 +458,7 @@ fn layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKey>> {
     Ok(fresh)
 }
 
-/// 哪些层的料落盘。
-///
-/// 只落 `attk` 层：它是「服务端自己出一整套身份」那条路，重启换一把 ASK 就跟 App
-/// 缓存的公钥对不上（验不过就自删重来）。自签层不动：一次性的假身份，重启换一把更干净。
+/// 哪些层的料落盘：只落 `attk` 层。
 fn persists(scope: &str) -> bool {
     scope.starts_with("attk:")
 }
@@ -526,7 +475,6 @@ fn load_persisted_key(slot: &str, persisted: bool) -> Option<Arc<MintKey>> {
             return None;
         }
     };
-    // 跟 `sessions.leaf_key_pem` 一个口径：加密是在写的时候做的，这里解得回来才算数。
     let pem = crate::crypto::decrypt_private_pem(&cipher);
     match MintKey::from_pem(&pem) {
         Ok(key) => Some(Arc::new(key)),
@@ -583,13 +531,12 @@ fn mark_ask_gone(scope: &str, device_id: &str, uid: i32) {
     if let Ok(mut set) = store().gone_ask.lock() {
         set.insert(key.clone());
     }
-    // 真机删了就是删了，重启也得算数 —— 墓碑落库。
     if let Err(e) = statedb::shared().mark_gone_ask(&key) {
         tracing::warn!("soter: 墓碑落库失败（{key}）：{e:#}，只能先记在内存");
     }
 }
 
-/// 启动时把墓碑从库里读回来。库读不出来就当空（宁可多给一次机会，也不要卡住服务）。
+/// 启动时把墓碑从库里读回来（读不出来按空算）。
 fn load_gone_asks() -> HashSet<String> {
     match statedb::shared().gone_asks() {
         Ok(rows) => rows.into_iter().collect(),
@@ -614,8 +561,7 @@ fn rotate_layer_ask_key(scope: &str, uid: i32, layer: &str) -> Result<Arc<MintKe
     Ok(fresh)
 }
 
-/// ATTK 换了以后旧的 ASK 证书就废了（ASK 证书是 ATTK 签的），这个身份下所有 uid 的
-/// ASK 缓存要一并丢掉。
+/// 丢掉这个身份下所有 uid 的 ASK 缓存（ASK 证书由 ATTK 签，换 ATTK 即失效）。
 fn drop_layer_ask_keys(scope: &str) {
     let prefix = format!("{scope}|");
     if let Ok(mut map) = store().ask.lock() {
@@ -637,7 +583,7 @@ fn slot_id(device_id: &str, uid: i32) -> String {
     format!("{device_id}|{uid}")
 }
 
-/// 启动时把槽位表整个装进内存；读路径之后一个 DB 查询都不加。
+/// 启动时把槽位表整个装进内存。
 fn load_slots() -> HashMap<String, SlotPin> {
     let snap = match statedb::shared().slots_snapshot() {
         Ok(snap) => snap,
@@ -688,10 +634,9 @@ pub fn pinned_layer(device_id: &str, uid: i32) -> Option<String> {
     (!pin.layer.is_empty() && pin_is_fresh(pin.at_millis, now)).then(|| pin.layer.clone())
 }
 
-/// 把槽位钉在某一层上。第一次服务这个槽位、或者换层之后都要调。
+/// 把槽位钉在某一层上。
 pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
     if device_id.is_empty() {
-        // 请求里没点名设备（route 到哪台都可能）时钉子没有意义，不钉。
         return;
     }
     let now = chrono::Utc::now().timestamp_millis();
@@ -704,7 +649,7 @@ pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
             return;
         }
     }
-    // 换层时这个槽位上认出来的账号得留着：那是连坐判断的判据（`note_owner`）。
+    // 换层时保留已有的账号记录。
     let owners = map.get(&id).map(|p| p.owners.clone()).unwrap_or_default();
     map.insert(
         id.clone(),
@@ -720,9 +665,7 @@ pub fn pin_layer(device_id: &str, uid: i32, layer: &str) {
     }
 }
 
-/// 槽位的钥匙被清掉了（`remove_all_uid_key`），钉子也拔掉：下一次走什么层都行。
-///
-/// 只拔钉子，账号记录留着：它是「这个槽位上原本有几个号」的判据，连它一起删就答不出来了。
+/// 槽位的钥匙被清掉了（`remove_all_uid_key`），拔掉钉子、保留账号记录。
 pub fn unpin_layer(device_id: &str, uid: i32) {
     let id = slot_id(device_id, uid);
     let Ok(mut map) = store().slots.lock() else {
@@ -738,8 +681,7 @@ pub fn unpin_layer(device_id: &str, uid: i32) {
     }
 }
 
-/// 太久没见到的账号记录按 TTL 丢掉（内存和库一起）。看一眼是 O(槽位数) 的，
-/// 节流到 `OWNER_PURGE_INTERVAL_MS`。
+/// 按 TTL 丢掉太久没见到的账号记录（内存和库一起），节流到 `OWNER_PURGE_INTERVAL_MS`。
 fn purge_owners_if_due() {
     let now = chrono::Utc::now().timestamp_millis();
     let last = LAST_OWNER_PURGE.load(Ordering::Relaxed);
@@ -755,14 +697,13 @@ fn purge_owners_if_due() {
         let mut swept = 0usize;
         for pin in map.values_mut() {
             let before = pin.owners.len();
-            // 时间戳 0 的不清：那是「不知道什么时候见的」，不是「很久没见」。
+            // 时间戳 0 表示不知道什么时候见的，不清。
             pin.owners
                 .retain(|o| o.last_seen_ms == 0 || o.last_seen_ms >= cutoff);
             swept += before - pin.owners.len();
         }
-        // layer 空的槽位本来就只是「账号登记」，账号清完了整条就可以扔掉。
+        // 账号清空且没钉过层的槽位整条删掉。
         map.retain(|_, pin| !pin.layer.is_empty() || !pin.owners.is_empty());
-        // owner_touch 只是节流用的时间戳，槽位没了就跟着丢。
         if let Ok(mut touch) = store().owner_touch.lock() {
             touch.retain(|id, _| map.contains_key(id));
         }
@@ -783,28 +724,15 @@ fn purge_owners_if_due() {
 // ---------------------------------------------------------------------------
 // 这个槽位上一个账号还是好几个
 // ---------------------------------------------------------------------------
-//
-// `remove_all_uid_key` 清的是整个 uid（ASK + 该 uid 每个账号的 AuthKey），而一台设备
-// 上会挂多个微信号：一枪下去同 uid 别人的开通记录一起没，腾讯存着的公钥就对不上了。
-// 所以要数清楚，好把这一枪拦下来（见 `handlers::soter`）。
 
-/// 一个槽位里每一族最多记几个账号指纹（跟 `statedb::OWNER_FAMILY_CAP` 同一口径）。
-///
-/// 按族封顶而不是三族合计几十条：单个 uid 上一个号就可能留下三条指纹，线上一个 uid
-/// 堆到上百个号完全可能，截断只会漏保护。
+/// 一个槽位里每一族最多记几个账号指纹（`statedb::OWNER_FAMILY_CAP`）。
 const OWNER_CAP: usize = statedb::OWNER_FAMILY_CAP;
 
-/// 同一族里已经记过的账号没必要每次请求都刷一遍「最近见到」，一个槽位一小时一次就够。
+/// 同一族已记过的账号刷「最近见到」的节流间隔：一小时。
 const OWNER_TOUCH_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
-/// 从别名里抠出「这是谁的钥匙」。
-///
-/// 一个微信号会留三族别名，盐不同（旧盐 `md5(微信号)`、新盐 `md5(uin)`），所以按族分开数：
-///   - `WechatAuthKeyPay&<微信号>`
-///   - `SoterAuthKeyV2_salt<md5(uin)[0:8]>_sceneN`
-///   - `SoterAuthKey_salt<md5(微信号)[0:8]>_sceneN`
-///
-/// 其它别名不算，免得探针流量把槽位看成「共用」。
+/// 从别名里抠出「这是谁的钥匙」，分 `wx` / `v1` / `v2` 三族：
+/// `WechatAuthKeyPay&<微信号>`、`SoterAuthKeyV2_salt<盐>_sceneN`、`SoterAuthKey_salt<盐>_sceneN`。
 fn owner_token(alias: &str) -> Option<String> {
     if let Some(pos) = alias.find("WechatAuthKeyPay&") {
         let account = alias[pos + "WechatAuthKeyPay&".len()..].trim();
@@ -836,7 +764,7 @@ pub fn owners_of(device_id: &str, uid: i32) -> Vec<String> {
             map.get(&slot_id(device_id, uid)).map(|p| {
                 p.owners
                     .iter()
-                    // 0 = 不知道什么时候见的，按「还有效」算（`purge` 那边也不清它）。
+                    // 0 = 不知道什么时候见的，按有效算。
                     .filter(|o| o.last_seen_ms == 0 || now - o.last_seen_ms <= OWNER_TTL_MILLIS)
                     .map(|o| o.token.clone())
                     .collect()
@@ -845,8 +773,7 @@ pub fn owners_of(device_id: &str, uid: i32) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 这个槽位上有几个账号（取各族指纹数的最大值）。一个账号在每一族里最多只有一个
-/// 指纹，所以「同族两个」就是「两个账号」，也不会把同一账号的旧盐新盐算成两个人。
+/// 这个槽位上有几个账号（取各族指纹数的最大值）。
 pub fn owner_count(device_id: &str, uid: i32) -> usize {
     let mut wx = std::collections::HashSet::new();
     let mut v1 = std::collections::HashSet::new();
@@ -868,7 +795,7 @@ pub fn owner_count(device_id: &str, uid: i32) -> usize {
     wx.len().max(v1.len()).max(v2.len())
 }
 
-/// 记下这个槽位上一个账号的指纹。请求里没点名设备（route 到哪台都行）时不记。
+/// 记下这个槽位上一个账号的指纹（没点名设备时不记）。
 pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
     if device_id.is_empty() {
         return;
@@ -876,7 +803,6 @@ pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
     let Some(token) = owner_token(alias) else {
         return;
     };
-    // 拆出来的两段要活到后面，所以拷一份，别把 `token` 借住（push 的时候要 move 它）。
     let (family, value) = match token.split_once(':') {
         Some((f, v)) => (f.to_string(), v.to_string()),
         None => return,
@@ -891,15 +817,14 @@ pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
         at_millis: 0,
         owners: Vec::new(),
     });
-    // 记过的只把「最近见到」顶到当下（内存里每次都顶；库里节流，见 touch_owner）。
+    // 记过的只把「最近见到」顶到当下。
     if let Some(o) = entry.owners.iter_mut().find(|o| o.token == token) {
         o.last_seen_ms = now;
         drop(map);
         touch_owner(&id, &family, &value);
         return;
     }
-    // 同一族按条数封顶，不是三族合计：满了就把这一族最久没见到的那条换出去（LRU），
-    // 已经在用的号不会被新号挤掉。
+    // 同一族按条数封顶，满了换出这一族最久没见到的那条（LRU）。
     let family_prefix = format!("{family}:");
     let in_family = entry
         .owners
@@ -927,7 +852,6 @@ pub fn note_owner(device_id: &str, uid: i32, alias: &str) {
     match statedb::shared().add_owner(&id, &family, &value, now, OWNER_CAP) {
         Ok(add) => {
             if add.inserted {
-                // 这行日志就是线上「一个 uid 挤了几个号」的读数。
                 tracing::info!(
                     "soter: 槽位 {device_id}|{uid} 上认到第 {} 个账号指纹（{family}）",
                     add.family_count
@@ -959,10 +883,7 @@ fn touch_owner(slot_id: &str, family: &str, value: &str) {
     }
 }
 
-/// uid 级全清要不要降级成「只答成功、不真清」（`RELAY_SOTER_SCOPE_WIPE=1` 才开）。
-///
-/// 默认不降级（真清）：接口说删就得删，答成功却没删，应用唯一的自救路径就失效了 ——
-/// 答 0 之后 `has_ask_already` 还是 0，微信会一直重建。
+/// uid 级全清要不要降级成「只答成功、不真清」（`RELAY_SOTER_SCOPE_WIPE=1` 才开，默认真清）。
 fn scope_wipe_from(value: Option<&str>) -> bool {
     matches!(value, Some("1") | Some("true") | Some("yes") | Some("on"))
 }
@@ -975,10 +896,7 @@ pub fn scope_wipe_enabled() -> bool {
 // 入口
 // ---------------------------------------------------------------------------
 
-/// 跑一层服务端 SOTER。
-///
-/// `None` = 这层不认这个 op；`Some` 里带 `error` = 试过但没成 —— 两种调用方都继续回退。
-/// `builtin` 层的料自己一把、永不轮换，专供探测机就地作答（见 `crate::soter_probe`）。
+/// 服务端认得的 SOTER op。
 const KNOWN_OPS: &[&str] = &[
     "probe",
     "get_device_id",
@@ -997,6 +915,7 @@ const KNOWN_OPS: &[&str] = &[
     "verify_attk_key_pair",
 ];
 
+/// 跑一层服务端 SOTER：`None` = 这层不认这个 op，`Some` 里带 `error` = 试过但没成。
 pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) -> Option<Value> {
     run_layer(layer, device_id, body, key_pem, None)
 }
@@ -1009,15 +928,10 @@ pub fn run_layer(
     key_pem: Option<&str>,
     attk: Option<&AttkMaterial>,
 ) -> Option<Value> {
-    // 账号指纹的 TTL 清理：节流在里面，不会拖慢请求。
     purge_owners_if_due();
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
-    // 身份号（cpu_id）从哪来：
-    //   - `attk` 层：就是上传那把 ATTK 的 cpu_id。A 端转过来的真机号在这儿不作数 ——
-    //     ASK 证书是这把 ATTK 签的，签的是一台机器、App 却按另一台去验，谁也验不过。
-    //   - 其余三层：A 端把真机的 cpu_id 一起转过来了就用它的。同一台设备上，本地兜底
-    //     那条路、服务端这几层、还有 B 端 TEE 必须报同一个号，否则「两次 cpuid 不一致」
-    //     的检测项就亮红。没给（老 A 端）或者给得不成样子才回落到按时间现造的虚拟号。
+    // 身份号（cpu_id）：`attk` 层用上传 ATTK 自己的；其余层用 A 端转来的真机号，
+    // 没给或形状不对时按当前时间现造。
     let product = if layer == "attk" {
         let own = attk.map(|a| a.cpu_id.trim()).unwrap_or("");
         if is_soter_cpu_id(own) {
@@ -1037,8 +951,7 @@ pub fn run_layer(
                     body.get(CPU_ID_FIELD)
                 );
             }
-            // 老 A 端不带 cpu_id：按当时的年月日时分现造一个，同一分钟内稳定，
-            // 一轮 ASK/AuthKey 流程能对上。不用按设备名派生的号，免得处处同一个值。
+            // 按当前年月日时分现造，同一分钟内稳定。
             time_device_id()
         })
     };
@@ -1047,7 +960,6 @@ pub fn run_layer(
         return None;
     }
 
-    // 物料按身份分家（见 `material_scope`），换 ATTK 不会拿旧 AuthKey 顶上。
     let scope = material_scope(layer, attk);
 
     let key = match material(layer, key_pem, attk) {
@@ -1071,10 +983,7 @@ pub fn run_layer(
                 "device_id": product,
             })),
             "get_device_id" => {
-                // 带上层名：A 端要靠它分辨这个号是真机报的还是服务端自己造的（只有
-                // 真机那个值能当设备身份转出去，见 `docs_cpu_id`）。
-                // 形状跟平台：高通回 16 字节 raw（hex 出来就是 cpu_id），MTK 回
-                // 32 个 ASCII 十六进制字符 + `\0`（33 字节）。
+                // 带上层名。形状：高通 16 字节 raw，MTK 32 个 ASCII 十六进制字符 + `\0`。
                 let profile = profile_of(&product);
                 let raw = if profile.device_id_ascii {
                     let mut bytes = product.as_bytes().to_vec();
@@ -1088,7 +997,7 @@ pub fn run_layer(
                 Ok(out)
             }
             "export_attk_public_key" => Ok(data_result(op, OK, key.attk_pem.as_bytes())),
-            // 导出的是 **ASK** 的公钥（跟 ATTK 是两把），文档用 ATTK 签 —— 与真机一致。
+            // 导出 ASK 公钥（跟 ATTK 是两把），文档用 ATTK 签。
             "export_ask_public_key" => {
                 let uid = uid_of(body)?;
                 // 删过就不再现造（墓碑）：真机删了就是没了。
@@ -1098,12 +1007,7 @@ pub fn run_layer(
                 let ask = layer_ask_key(&scope, uid, layer)?;
                 ask_result(op, layer, &scope, &ask, &key, &product, uid)
             }
-            // `has_ask_already`：
-            //   - `attk` 层：如实回答。这层的 ASK 是上传的那把真 ATTK 签的，App 能拿它
-            //     走完上报；一直答 -5 会让它每轮「建→导→上报→清」循环，走不到下一步。
-            //   - 自签 / keybox 层：不许声称「ASK 已存在」。现造的 ASK 腾讯永远不认，答 OK
-            //     会让 App 跳过上报、拿假 ASK 建 AuthKey，被拒后自删重试，把槽位永久毒化。
-            //     答 `NOT_FOUND` 它才会老实重新生成并上报。
+            // `has_ask_already`：只有 `attk` 层如实回答，其余层一律 `NOT_FOUND`。
             "has_ask_already" => {
                 if layer != "attk" {
                     return Ok(code_result(op, NOT_FOUND));
@@ -1135,9 +1039,7 @@ pub fn run_layer(
                 },
             )),
             "export_auth_key_public_key" => match auth_key(device_id, &scope, body) {
-                // 回的是「AuthKey 的自描述 + 签名」的信封，签名用 **ASK** 私钥 ——
-                // 真机上 AuthKey 证书就是 ASK 签的，App 拿 exportAskPublicKey 的
-                // 公钥验这一份（用 ATTK 签就验不过）。
+                // 回「AuthKey 自描述 + 签名」的信封，签名用 ASK 私钥。
                 Some(auth) => {
                     if ask_is_gone(&scope, device_id, uid_of(body)?) {
                         return Ok(code_result(op, AUTH_KEY_NOT_READY));
@@ -1181,7 +1083,7 @@ pub fn run_layer(
                 if let Ok(mut map) = store().auth.lock() {
                     map.retain(|k, _| !k.starts_with(&prefix));
                 }
-                // ASK 的槽位串里没带设备名（`{scope}|{uid}|ask`），单独按它删。
+                // ASK 的槽位串不带设备名，单独按它删。
                 let ask_id = format!("{scope}|{uid}|{layer}");
                 if let Ok(mut map) = store().ask.lock() {
                     map.remove(&ask_id);
@@ -1195,14 +1097,11 @@ pub fn run_layer(
                         tracing::warn!("soter: 删落盘的 AuthKey 失败（{prefix}）：{e:#}");
                     }
                 }
-                // 不能靠“缓存没了就现造”顶上去：盖个墓碑，等 generate 才解。
                 mark_ask_gone(&scope, device_id, uid);
-                // 钥匙没了，槽位的钉子也跟着拔：下次哪一层服务它都算从头来。
                 unpin_layer(device_id, uid);
                 Ok(code_result(op, OK))
             }
-            // 重建 ASK：只换 ASK，不动 ATTK（两把）。AuthKey 是 ASK 签的，
-            // 换了 ASK 它们也就验不过了，App 会自己重新生成。
+            // 重建 ASK：只换 ASK，不动 ATTK。
             "generate_ask_key_pair" => {
                 clear_ask_gone(&scope, device_id, uid_of(body)?);
                 rotate_layer_ask_key(&scope, uid_of(body)?, layer)?;
@@ -1210,9 +1109,7 @@ pub fn run_layer(
                 Ok(code_result(op, OK))
             }
             "generate_attk_key_pair" => {
-                // 自签层换一把新 ATTK；keybox 层这把是服务端存的身份，轮换不了
-                // —— 但也不能回错误：一报错调用方就往下换层，这个槽位的材料立刻
-                // 劈成两半。它的 ATTK 本来就在，回成功，让流程留在这层里。
+                // 自签层换一把新 ATTK；keybox 层的 ATTK 轮换不了，但仍回成功。
                 if layer == "self_signed" {
                     rotate_self_signed_key()?;
                 } else if layer == "keybox" {
@@ -1229,8 +1126,7 @@ pub fn run_layer(
                 let uid = uid_of(body)?;
                 let alias = alias_of(body)?;
                 if auth_key(device_id, &scope, body).is_none() {
-                    // AuthKey 没建就是没建，真机这里答 -6（AUTH_KEY_NOT_READY）；
-                    // 答 -5 会被上层当成「ASK 还没准备好」。
+                    // AuthKey 没建，答 -6（真机口径）。
                     return Ok(code_result(op, AUTH_KEY_NOT_READY));
                 }
                 let raw = body
@@ -1275,7 +1171,7 @@ pub fn run_layer(
             }
             "finish_sign" => {
                 let session = body.get("session").and_then(Value::as_i64).unwrap_or(0);
-                // 请求里点名的设备（没带就用本次解析出来的那台）。init 和 finish 都要用它。
+                // 请求里点名的设备（没带就用本次解析出来的那台）。
                 let requested_now = body
                     .get("device_id")
                     .and_then(Value::as_str)
@@ -1291,14 +1187,13 @@ pub fn run_layer(
                     m.remove(&session)
                 }) {
                     Some(s) => s,
-                    // 这张会话刚签过：检测器会连开两张再回头逐个 finish，客户端也会超时
-                    // 重试，都是同一张合法会话再问一遍。把上次那串信封原样还回去，不重签。
+                    // 这张会话刚签过：把上次那串信封原样还回去。
                     None => match replay_finished(session, requested_now, device_id, layer) {
                         Some(reply) => return Ok(reply),
                         None => return Ok(code_result(op, SESSION_UNKNOWN)),
                     },
                 };
-                // 会话里记着它当初由哪把身份开出来，这里按同一个 scope 取 AuthKey。
+                // 按会话当初的身份取 AuthKey。
                 let session_scope = moment_scope(layer, sign_session.attk_id);
                 let key = match store().auth.lock().ok().and_then(|m| {
                     m.get(&format!(
@@ -1310,7 +1205,6 @@ pub fn run_layer(
                     Some(key) => key,
                     None => return Ok(code_result(op, NOT_FOUND)),
                 };
-                // 签的是那段 JSON 原文，不是 challenge 的字节；回「JSON + 签名」的信封
                 let counter =
                     counter_for(&counter_key(&session_scope, device_id, sign_session.uid));
                 let document = sign_doc(&product, sign_session.uid, &sign_session.raw, counter)?;
@@ -1372,7 +1266,7 @@ fn auth_key(device_id: &str, scope: &str, body: &Value) -> Option<Arc<MintKey>> 
     if let Some(hit) = store().auth.lock().ok()?.get(&id).cloned() {
         return Some(hit);
     }
-    // 重启后内存是空的：库里那把还是用户的 AuthKey，捞回来接着用。
+    // 内存里没有就从库里捞。
     let loaded = load_persisted_key(&id, persists(scope))?;
     if let Ok(mut map) = store().auth.lock() {
         map.insert(id, loaded.clone());
@@ -1380,25 +1274,21 @@ fn auth_key(device_id: &str, scope: &str, body: &Value) -> Option<Arc<MintKey>> 
     Some(loaded)
 }
 
-/// 请求里那个「真机 cpu_id」的字段名。A 端转发时带上，B 端不带（B 自己也改不了它）。
+/// 请求里真机 `cpu_id` 的字段名（A 端转发时带上）。
 pub(crate) const CPU_ID_FIELD: &str = "cpu_id";
 
 /// A 端转过来的真机 `cpu_id`，形状对（32 个十六进制字符）就照抄。
-///
-/// SOTER 的身份就是 `(cpu_id, uid)`：`get_device_id`、ASK 文档、AuthKey 文档、签名
-/// 现场四处必须报同一个号，否则会被判成「设备换了」/「两次 cpuid 不一致」。
 fn docs_cpu_id(body: &Value) -> Option<String> {
     let text = body.get(CPU_ID_FIELD)?.as_str()?.trim();
     is_soter_cpu_id(text).then(|| text.to_string())
 }
 
-/// 真机 cpu_id 的形状：32 个十六进制字符（真机的都是 `09000000` 打头，但不拿前缀卡死，
-/// 以后换代次也不用改）。
+/// 真机 cpu_id 的形状：32 个十六进制字符（真机都以 `09000000` 打头）。
 fn is_soter_cpu_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// 32 字符 hex 转 16 字节（高通平台的 getDeviceId 形状；现在只偶尔用来对一下号）。
+/// 32 字符 hex 转 16 字节（高通 getDeviceId 的形状）。
 #[allow(dead_code)]
 fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
@@ -1416,11 +1306,8 @@ fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 请求里没带 cpu_id 时现造一个设备号：`09000000` +
-/// `sha256("ommega-server-soter-time:" + YYYYMMDDHHMM)` 前 12 字节。
-///
-/// 按分钟：同一分钟的 ASK / AuthKey / 签名现场报同一个号，不会一轮流程中途换身份；
-/// 又不会跟别的设备、别的时间撞成同一串值。
+/// 现造的设备号：`09000000` + `sha256("ommega-server-soter-time:" + YYYYMMDDHHMM)` 前 12 字节。
+/// 按分钟稳定。
 fn time_device_id() -> String {
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M").to_string();
     let mut hasher = Sha256::new();
@@ -1434,8 +1321,7 @@ fn time_device_id() -> String {
     out
 }
 
-/// 按设备名派生的虚拟 SOTER 设备号。已不作兜底（兜底是 [`time_device_id`]），
-/// 只留给测试当「跟按时间造的绝不是同一个」的对照组。
+/// 按设备名派生的虚拟 SOTER 设备号（仅测试用，当对照组）。
 #[cfg(test)]
 fn virtual_device_id(device_id: &str) -> String {
     let mut hasher = Sha256::new();
@@ -1454,7 +1340,7 @@ fn counter_for(key: &str) -> u64 {
     let Ok(mut map) = store().counters.lock() else {
         return 1;
     };
-    // 重启后计数器不能从 1 重新数：App 会看它（真机上同一个 uid 只增不减）。
+    // 重启后计数器从库里接着数。
     if !map.contains_key(key) && persisted {
         if let Ok(Some(value)) = statedb::shared().mint_counter_get(key) {
             map.insert(key.to_string(), value.max(0) as u64);
@@ -1472,8 +1358,7 @@ fn counter_for(key: &str) -> u64 {
     value
 }
 
-/// 签名计数器的键：身份 + 设备 + uid。身份也得算进去，否则同一台设备换一把 ATTK
-/// 后计数器继续从旧值走，真机上「同一个 uid 的计数器只增不减」那个规律就对不上了。
+/// 签名计数器的键：身份 + 设备 + uid。
 fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
     format!("{scope}|{device_id}|{uid}")
 }
@@ -1481,8 +1366,6 @@ fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
 /// 真机形状按平台分：
 ///   - 高通：`cpu_id` 以 `00000000` 开头、getDeviceId 回 16 字节 raw、无 `rsa_pss_saltlen`；
 ///   - MTK：`cpu_id` 以 `09000000` 开头、getDeviceId 回 32 ASCII + NUL、带 `rsa_pss_saltlen:32`。
-///
-/// 服务端拿不到 A/B 的 SoC，按 `cpu_id` 前缀选形状，跟转发过来的真机号保持一致。
 #[derive(Clone, Copy)]
 struct Platform {
     declares_salt: bool,
@@ -1517,8 +1400,8 @@ fn profile_of(cpu_id: &str) -> Platform {
     }
 }
 
-/// 一份自描述文档（ASK 或 AuthKey 的都用它）。键序照现场抓到的来：`pub_key` /
-/// `cpu_id` / `counter` / `uid`（+ MTK 那套的 `rsa_pss_saltlen`），`uid` 是字符串。
+/// 一份自描述文档（ASK / AuthKey 共用）。键序 `pub_key` / `cpu_id` / `counter` / `uid`，
+/// `uid` 是字符串。
 fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result<Vec<u8>> {
     let mut doc = json!({
         "pub_key": pub_key_pem,
@@ -1532,11 +1415,8 @@ fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result
     serde_json::to_vec(&doc).context("failed to serialize the key document")
 }
 
-/// 签名现场那份 JSON。字段名和键序照 B 端 TEE 现场抓的来（`raw` 在最前），一个
-/// 都不能少 —— App 会把它们存下来当设备指纹。
-///
-/// `tee_n` / `tee_v` / `fp_n` / `fp_v` 只有真机 TA 有，服务端按平台报原厂那套
-/// （高通 `QSEE`/`5`、MTK `Kinibi`/`10018`），**不能报我们自己的名字和版本**。
+/// 签名现场那份 JSON，`raw` 在最前。`tee_n` / `tee_v` / `fp_n` / `fp_v` 按平台报原厂值
+/// （高通 `QSEE`/`5`、MTK `Kinibi`/`10018`）。
 fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64) -> Result<Vec<u8>> {
     let profile = profile_of(cpu_id);
     let mut doc = json!({
@@ -1566,8 +1446,7 @@ fn fid_of(cpu_id: &str) -> String {
     (1_000_000_000u64 + n as u64).to_string()
 }
 
-/// 信封应答：`[i32 le JSON 长度][JSON][256 字节签名]` —— 跟 B 端一个形状，
-/// A 端那一套解析就能直接用。
+/// 信封应答：`[i32 le JSON 长度][JSON][256 字节签名]`。
 fn envelope_result(op: &str, document: &[u8], signature: &[u8]) -> Result<Value> {
     let mut data = Vec::with_capacity(4 + document.len() + signature.len());
     data.extend_from_slice(&(document.len() as i32).to_le_bytes());
@@ -1580,8 +1459,7 @@ fn envelope_result(op: &str, document: &[u8], signature: &[u8]) -> Result<Value>
     Ok(out)
 }
 
-/// ASK 的自描述文档：`pub_key` 是 **ASK 的公钥**，签名用 **ATTK** —— 真机上 ASK 证书
-/// 就是 ATTK 签的，App 先拿 exportAttkPublicKey 再验这一份。
+/// ASK 的自描述文档：`pub_key` 是 ASK 的公钥，签名用 ATTK。
 fn ask_result(
     op: &str,
     layer: &str,

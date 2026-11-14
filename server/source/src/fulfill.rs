@@ -24,8 +24,6 @@ use crate::cert::{self, AttestationParams, RootOfTrust};
 use crate::db::{Db, DeviceIdentity};
 
 /// AOSP keymint::kMaxChallengeSize = 128 bytes.
-/// Larger attestation challenges are rejected; oversized challenges are
-/// flagged by verifiers.
 const MAX_CHALLENGE_SIZE: usize = 128;
 
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -34,12 +32,10 @@ const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 避免落到 self_signed 自签链。
 const AUTO_PUBLIC_SLOT: &str = "device-b-2";
 
-/// 「最后使用」写库的节流窗：每个 alias 最多每 5 分钟写一次。TTL/LRU 按小时级
-/// 窗口判定，分钟级误差不影响语义。
+/// 「最后使用」写库的节流窗（毫秒，每个 alias 最多写一次）。
 const SESSION_TOUCH_MIN_MS: u64 = 5 * 60 * 1000;
 
-/// 过期会话清理的节流间隔（1 分钟）。清理是 O(会话数)，不必每个 sign/decrypt
-/// 请求都扫一遍；过期会话在查表时本来也取不到。
+/// 过期会话清理的节流间隔（毫秒）。
 const PURGE_INTERVAL_MS: u64 = 60 * 1000;
 /// 一次清理最多执行几批删除。每批上限见 `statedb::DELETE_BATCH`；积压多时分多轮推进。
 const PURGE_BATCH_ROUNDS: usize = 5;
@@ -49,43 +45,25 @@ static LAST_PURGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// 「超上限但没有可淘汰会话」这条告警上次打印的时间，用于限频。
 static SESSION_CAP_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Where server_keybox sessions (leaf private key + chain) are persisted so a
-/// relay restart does not orphan the A-side's `KeyMaterial::Remote` keys.
-/// The A-side allocates the session alias as an independent 128-bit random
-/// `ommega-remote-*` identity per remote key, but the private key lives here:
-/// if it is lost, the app's "use attestation key" flow cannot sign child
-/// certs and hangs.
+/// Server_keybox 会话：叶子私钥 + 链，按 A 端的 `ommega-remote-*` alias 键存。
 ///
-/// Sessions are keyed by the A-side's `ommega-remote-*` alias ALONE (not by
-/// device_id): the alias is independent of device_id. Keying by
-/// (device_id, alias) would orphan stored attestation keys whenever the
-/// device_id changes or a B-side identity is re-uploaded under a new id. With
-/// alias-keying, a sign request for a known alias always resolves to the same
-/// leaf key, across server restarts, device_id changes and identity rotation.
-///
-/// 落盘在 `sessions` 表（见 `crate::statedb`）。`data/sessions.json` 只在库为空时
-/// 由 `statedb` 导入一次，之后不再写入，原样保留作回滚源。
+/// 落盘在 `sessions` 表（见 `crate::statedb`）；`data/sessions.json` 只在库为空时
+/// 由 `statedb` 导入一次。
 #[derive(Debug, Clone)]
 struct Session {
     chain_pem: String,
     leaf_key_pem: String,
-    /// 解析好的叶子私钥，惰性缓存。`parse_leaf_key`（PEM 解码 + EC/RSA 大整数）
-    /// 开销大，且发生在 A 端全局锁的占用窗口内，因此只解析一次。Arc 让 Session
-    /// 被 clone 后仍共享同一份。
+    /// 解析好的叶子私钥，惰性缓存（只解析一次，`Arc` 共享）。
     cached_key: Arc<OnceLock<Arc<LeafKey>>>,
-    /// 落盘用的 Fernet 密文。`put_session` 构造时算一次，之后每次写盘直接复用，
-    /// 不重新加密。
+    /// 落盘用的 Fernet 密文，`put_session` 算一次后复用。
     leaf_key_cipher: String,
     created_epoch_ms: u64,
-    /// 最后一次被取用的时间。TTL 和 LRU 都按它算，不按 `created_epoch_ms`：
-    /// 创建早但一直有人在用的会话必须保留。
+    /// 最后一次被取用的时间（毫秒）；TTL 和 LRU 都按它算。
     used_epoch_ms: u64,
 }
 
-/// On-disk form of a session: the leaf private key is encrypted with the same
-/// Fernet cipher used for the DB identities (see `crypto::encrypt_private_pem`)
-/// instead of being persisted in plaintext. `decrypt_private_pem` falls back to
-/// the input verbatim, so legacy plaintext rows keep loading.
+/// On-disk form of a session: leaf key encrypted with the same Fernet cipher as
+/// the DB identities (see `crypto::encrypt_private_pem`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SessionFile {
     chain_pem: String,
@@ -138,7 +116,6 @@ impl Session {
             return Ok(k.clone());
         }
         let parsed = Arc::new(parse_leaf_key(&self.leaf_key_pem)?);
-        // 并发下可能已被别人先写入；同一份 PEM 解析结果相同，谁先写入都行。
         let _ = self.cached_key.set(parsed.clone());
         Ok(self.cached_key.get().cloned().unwrap_or(parsed))
     }
@@ -153,17 +130,12 @@ struct Inner {
 pub struct Fulfill {
     inner: Mutex<Inner>,
     enabled: AtomicBool,
-    /// One generation gate per logical alias, shared across device/request
-    /// snapshots and fallback layers. Weak entries do not retain idle gates.
+    /// One generation gate per logical alias（Weak 项不保留空闲闸门）。
     attest_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    /// Cache of generated self-signed identities per (device_id, algorithm, level)
-    /// so a device without a stored identity doesn't regenerate a fresh key (RSA
-    /// keygen is slow) on every attestation. Level is part of the key because the
-    /// chain's declared security level differs.
+    /// Cache of generated self-signed identities per (device_id, algorithm, level).
     self_signed_cache: Mutex<HashMap<(String, String, i64), DeviceIdentity>>,
     pub db: Option<Arc<Db>>,
-    /// 长期保留的状态都在这个 SQLite 文件里。内存 map 是会话的读写入口，这里负责
-    /// 写穿与启动装载。
+    /// 长期保留的状态（SQLite）：内存 map 写穿到这里，启动时从这里装载。
     state: Arc<crate::statedb::StateDb>,
 }
 
@@ -173,7 +145,6 @@ impl Fulfill {
 
     pub fn new(enabled: bool, db: Option<Arc<Db>>) -> Arc<Self> {
         let state = crate::statedb::shared();
-        // 持久化的值优先于启动配置：否则重启会退回 .env 里的启动值，而非界面设置。
         let enabled = match state.get_meta(Self::MODE_KEY) {
             Ok(Some(v)) => v == "1",
             Ok(None) => enabled,
@@ -195,14 +166,12 @@ impl Fulfill {
     }
 
     /// Runtime switch: whether `server_keybox` local fulfilment is active.
-    /// A-side requests fall back to the physical (A/B queue) path when off.
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
-        // 写穿到 statedb：重启后按它恢复，而不是回到 .env 里的启动值。
         if let Err(e) = self
             .state
             .set_meta(Self::MODE_KEY, if on { "1" } else { "0" })
@@ -219,8 +188,7 @@ impl Fulfill {
         now_ms.saturating_sub(s.used_epoch_ms) > SESSION_TTL.as_millis() as u64
     }
 
-    /// 内存只保留最近使用的 `SESSION_MEMORY_HOT` 条。超出的从 map 移除，库里那条
-    /// 仍在，下次用到时按 alias 单查回来（见 `get_session`）。
+    /// 内存只保留最近使用的 `SESSION_MEMORY_HOT` 条（库里那条仍在）。
     fn enforce_memory_cap(map: &mut HashMap<String, Session>) {
         while map.len() > crate::statedb::SESSION_MEMORY_HOT {
             let oldest = map
@@ -246,8 +214,7 @@ impl Fulfill {
         LAST_PURGE.store(now_ms, Ordering::Relaxed);
         map.retain(|_, s| !Self::session_expired_at(s, now_ms));
         let cutoff_ms = now_ms.saturating_sub(SESSION_TTL.as_millis() as u64) as i64;
-        // 单条 `DELETE` 已按 `statedb::DELETE_BATCH` 限量，所以这里多打几轮推进积压；
-        // 每轮控制在小块内，避免长时间持有写锁。
+        // 单条 `DELETE` 已按 `statedb::DELETE_BATCH` 限量，这里多打几轮推进积压。
         for _ in 0..PURGE_BATCH_ROUNDS {
             match self.state.delete_sessions_expired_before(cutoff_ms) {
                 Ok(0) => break,
@@ -294,10 +261,7 @@ impl Fulfill {
     }
 
     /// 启动时从库里把最近用过的会话装进内存（过期的不装）。
-    ///
-    /// 内存是热缓存、库是权威：只装 `SESSION_MEMORY_HOT` 条，其余留在库里，取用时
-    /// 按 alias 单查（见 `get_session`）。`data/sessions.json` 只由 `statedb` 导入
-    /// 一次，这里只读库。
+    /// 只装 `SESSION_MEMORY_HOT` 条，其余取用时按 alias 单查（见 `get_session`）。
     fn load_sessions(&self) {
         let rows = match self
             .state
@@ -338,16 +302,12 @@ impl Fulfill {
             used_epoch_ms: session.used_epoch_ms,
         };
         if let Err(e) = self.state.upsert_session(alias, &row) {
-            // 写失败会导致重启后 A 端 `KeyMaterial::Remote` 的密钥全部失效，所以用 error。
             tracing::error!("sessions: {alias} 没写进 state db：{e:#}");
         }
     }
 
     /// 取一条会话：先查内存热缓存，未命中再回库单查一条。
-    ///
-    /// 热的那批在启动时装进内存，冷的那批不占内存、用到时再查回来。每次取用都会
-    /// 更新「最后使用」（内存每次都更新，库里按 `SESSION_TOUCH_MIN_MS` 节流），
-    /// TTL 与 LRU 都按这个时间算。
+    /// 每次取用都更新「最后使用」（库里按 `SESSION_TOUCH_MIN_MS` 节流）。
     fn get_session(&self, alias: &str) -> Option<Session> {
         let now_ms = Utc::now().timestamp_millis() as u64;
         let cached = {
@@ -402,8 +362,7 @@ impl Fulfill {
         Some(session)
     }
 
-    /// 忘掉一个 alias 的会话：B 端真机可能用同一 alias 重新铸过密钥（私钥在它那边），
-    /// 本地这条与 App 持有的叶证书不再配对，留着会签错。
+    /// 忘掉一个 alias 的会话（B 端可能用同一 alias 重新铸过密钥）。
     pub fn forget_session(&self, alias: &str) {
         let mut inner = crate::util::mu(&self.inner);
         inner.sessions.remove(alias);
@@ -439,12 +398,9 @@ impl Fulfill {
     }
 
     /// Serialize check -> generate -> publish for the alias, not globally.
-    /// A cancelled HTTP waiter cannot cancel its spawn_blocking worker: retries
-    /// must wait for that worker and reuse its key instead of replacing it.
     ///
-    /// 缓存只在同一安全级别内复用。`want_level` 是请求的
-    /// `attestation_security_level`（1 = TEE、2 = StrongBox）：缓存的链级别与它不符
-    /// 就丢掉重建，否则链的级别会与请求不符。
+    /// `want_level` 是请求的 `attestation_security_level`（1 = TEE、2 = StrongBox）；
+    /// 缓存的链级别与它不符就丢掉重建。
     fn session_or_generate(
         &self,
         alias: &str,
@@ -477,21 +433,14 @@ impl Fulfill {
         Ok((session, true))
     }
 
-    /// 缓存的链与请求的安全级别是否匹配。
-    ///
-    /// 未标级别（软件链 / 自签链 / 老 keybox）按 TEE 处理：软件级证书不能被当成
-    /// StrongBox。
+    /// 缓存的链与请求的安全级别是否匹配（未标级别按 TEE 处理）。
     fn session_level_matches(chain_pem: &str, want_level: i64) -> bool {
         let cached_strongbox = cert::chain_security_level(chain_pem) == Some(2);
         cached_strongbox == (want_level >= 2)
     }
 
-    /// Algorithm string implied by an A-side attest context ("ec" | "rsa"),
-    /// kept in sync with `parse_ctx` below.
-    ///
-    /// The A-side (`remote.rs`) sends `key_algorithm` as an int (1=RSA, 3=EC)
-    /// inside `device_attest_context`, NOT an `algorithm` string. We read the
-    /// int first, and fall back to a JCA-style `algorithm` string when present.
+    /// Algorithm string implied by an A-side attest context ("ec" | "rsa").
+    /// `key_algorithm` int (1=RSA, 3=EC) 优先，其次 `algorithm` 串。
     fn ctx_algorithm_str(ctx: &Value) -> String {
         if let Some(ka) = ctx.get("key_algorithm").and_then(Value::as_i64) {
             return if ka == 1 { "rsa" } else { "ec" }.to_string();
@@ -510,18 +459,8 @@ impl Fulfill {
     }
 
     /// Lookup a stored identity for `(device_id, algorithm)`.
-    ///
-    /// 顺序：`prefer_slot` 为真（请求被黑名单打下来）时先取槽位 `device-b-2`，
-    /// 再按请求的 device id；都没有就挑一条能用的（见 `identity_for_id` /
-    /// `get_any_usable_identity`）。serverbox 正常流程和普通失败后的兜底都不传
-    /// `prefer_slot`，即「先按请求的 id」。
-    ///
-    /// 身份按**设备**选、不按算法选：一台真设备的 EC / RSA 两条认证共用同一份
-    /// keybox 链，取到不同身份会让中间证书 / 签发者不一致（检测方会报
-    /// `hardware.attestation.algorithm_differential`）。叶子算法与签发者密钥类型
-    /// 无关，一份身份可以同时铸 EC 和 RSA 叶子。
-    ///
-    /// `algorithm` 只用在退一步的那条查询上（整台设备的行都不 active 时）。
+    /// `prefer_slot` 为真时先取槽位 `device-b-2`，再按请求的 device id，
+    /// 都没有就挑一条能用的；`algorithm` 只用在退一步的那条查询上。
     fn identity_for(
         &self,
         device_id: &str,
@@ -610,9 +549,7 @@ impl Fulfill {
                 p.algorithm = cert::KM_ALG_EC;
             }
         }
-        // Honor the A-side's requested key size / EC curve so the minted
-        // leaf's public key matches the size/curve declared in the attestation
-        // extension (a mismatch is flagged as a tampered key by verifiers).
+        // Honour the A-side's requested key size / EC curve.
         if let Some(size) = ctx.get("key_size").and_then(Value::as_i64) {
             p.key_size = size;
         }
@@ -636,11 +573,8 @@ impl Fulfill {
                 p.ec_curve = Some(cert::KM_EC_CURVE_P_256);
             }
         }
-        // teeEnforced authorization list: forward the A-side's requested
-        // purposes/digests/paddings so the attestation extension reflects the
-        // key's actual authorization (AOSP conformance) instead of the
-        // defaults. The A-side sends these as integer arrays inside
-        // `device_attest_context` (see ommegaclient-a `remote.rs::attest`).
+        // teeEnforced authorization list: purposes/digests/paddings from the
+        // A-side's integer arrays in `device_attest_context`.
         if let Some(purposes) = ctx.get("purpose").and_then(Value::as_array) {
             let vals: Vec<i64> = purposes.iter().filter_map(Value::as_i64).collect();
             if !vals.is_empty() {
@@ -723,12 +657,7 @@ impl Fulfill {
             p.subject_name = Some(v);
         }
         // Device properties / ID attestation (710..=717, plus 723 for the second
-        // IMEI), forwarded by the A-side as `[tag, base64(value)]` pairs. A real
-        // device includes these in
-        // the leaf's tee-enforced list whenever the caller asked for them, so
-        // dropping them here is what makes a server-minted chain look like it has
-        // no device properties at all (TrustAttestor:
-        // `hardware.attestation.device_properties`).
+        // IMEI), forwarded by the A-side as `[tag, base64(value)]` pairs.
         if let Some(pairs) = ctx.get("attestation_ids").and_then(Value::as_array) {
             p.attestation_ids = pairs
                 .iter()
@@ -744,10 +673,7 @@ impl Fulfill {
                 })
                 .collect();
         }
-        // MODULE_HASH (KeyMint tag 724): the A-side forwards the APEX module-info
-        // digest it already receives through `SetAdditionalAttestationInfo`.
-        // Emitting it keeps the minted leaf consistent with
-        // `getSupplementaryAttestationInfo(MODULE_HASH)` on the device.
+        // MODULE_HASH (KeyMint tag 724): the A-side forwards the APEX module-info digest.
         p.module_hash = ctx
             .get("module_hash")
             .and_then(Value::as_str)
@@ -766,12 +692,8 @@ impl Fulfill {
             None => tracing::info!("attest: no module_hash forwarded"),
         }
         // User-authentication / authorization-list entries ([tag, value] pairs,
-        // tags 502..=509) — the policy the app asked for. Dropping them is what
-        // makes a server-minted leaf claim `NO_AUTH_REQUIRED` for an auth-bound
-        // key (TrustAttestor: `hardware.attestation.user_auth_metadata` and
-        // `hardware.attestation.user_auth_policy`). 502 is kept in the list so
-        // the B-side layer can use it; `write_auth_list` skips it when writing
-        // the leaf (AOSP emits the SID for `importWrappedKey()` only).
+        // tags 502..=509). 502 is kept in the list for the B-side layer;
+        // `write_auth_list` skips it when writing the leaf.
         if let Some(pairs) = ctx.get("user_auth").and_then(Value::as_array) {
             p.user_auth = pairs
                 .iter()
@@ -834,14 +756,11 @@ impl Fulfill {
             .and_then(Value::as_i64)
             .unwrap_or(p.attestation_version);
 
-        // verified_boot_key / verified_boot_hash 必须是 32 字节。A 端没带、解不出
-        // 32 字节、或全零时，用「设备 + 用途 + 当前小时」派生一个 32 字节值：同一
-        // 小时内稳定，换小时 / 换设备 / 换用途就变。正常路径是 A 端伪装参数解出来的
-        // 哈希，直接用它。
+        // verified_boot_key / verified_boot_hash 必须是 32 字节；缺失或全零时按
+        // 「设备 + 用途 + 当前小时」派生。
         let stamp = crate::cert::current_hour_stamp();
         let stamp = stamp.as_str();
-        // 全零也当没传：A 端属性读不到时会发 32 字节全零，照收会把「未签名 / 异常」
-        // 的特征写进证书，Play Integrity 会拒。
+        // 全零也当没传。
         let vb_key = match b64("verified_boot_key") {
             Some(k) if k.len() == 32 && k.iter().any(|b| *b != 0) => k,
             _ => boot_value_seed(device_id, "bootkey", stamp).to_vec(),
@@ -874,8 +793,7 @@ impl Fulfill {
     }
 
     /// 请求带了证明密钥 `attestation_key`，但本层没有那把密钥的 session。
-    ///
-    /// 返回 `false` 表示：没带证明密钥（普通链），或者带了而且找得到（可以委派）。
+    /// 没带证明密钥，或带了而且找得到（可以委派）时返回 `false`。
     pub fn attest_issuer_missing(&self, ctx: &Value) -> bool {
         let Some(alias) = ctx
             .get("attestation_key")
@@ -890,10 +808,7 @@ impl Fulfill {
         self.get_session(alias).is_none()
     }
 
-    /// 找出请求指定的那把「服务端自持」的证明密钥。
-    ///
-    /// 返回 `Ok(None)` 表示这把 key 不在本端（在 B 端真机）：本层不处理，交给
-    /// 下一层用真 TEE 签。
+    /// 找出请求指定的那把「服务端自持」的证明密钥；`Ok(None)` = 不在本端（在 B 端真机）。
     fn server_issuer(&self, ctx: &Value) -> anyhow::Result<Option<(String, String)>> {
         let Some(reference) = ctx.get("attestation_key") else {
             return Ok(None);
