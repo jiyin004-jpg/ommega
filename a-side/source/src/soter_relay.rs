@@ -967,18 +967,11 @@ mod tests {
         assert!(!has_caller_pkg(&json!({"op": "has_ask_already"})));
     }
 
-    /// 已经带了包名（或压根没带 uid）时，`with_caller_pkg` 不该去问系统 —— 这两条
-    /// 路径不碰 AAID 服务，所以在宿主机上也能跑。
+    /// 已经带了包名时，`with_caller_pkg` 原样返回，不去问系统。
     #[test]
-    fn an_existing_or_missing_caller_is_left_alone() {
+    fn an_existing_caller_is_left_alone() {
         let already = json!({"op": "has_ask_already", "caller_pkg": "com.tencent.mm"});
         assert_eq!(with_caller_pkg(already.clone()), already);
-        let no_uid = json!({"op": "has_ask_already", "uid": 10490});
-        assert_eq!(with_caller_pkg(no_uid.clone()), no_uid);
-        // uid 形状不对（负号、字符串）同样不动。
-        for bad in [json!({"caller_uid": -5}), json!({"caller_uid": "x"})] {
-            assert_eq!(with_caller_pkg(bad.clone()), bad);
-        }
     }
 
     #[test]

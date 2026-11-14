@@ -955,18 +955,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_private_key_and_certificate_chain() {
+    fn rejects_a_chain_that_does_not_match_the_private_key() {
         let keybox = KeyBox::from_xml_str(BUNDLED_KEYBOX_XML).unwrap();
-        let rsa_cert = encode_pem_block(
-            "CERTIFICATE",
-            &keybox.rsa_info.as_ref().unwrap().chain[0].encoded_certificate,
-        );
-        let ec_cert = encode_pem_block(
-            "CERTIFICATE",
-            &keybox.ec_info.as_ref().unwrap().chain[0].encoded_certificate,
-        );
-        let modified_xml = BUNDLED_KEYBOX_XML.replacen(&rsa_cert, &ec_cert, 1);
-        assert!(KeyBox::from_xml_str(&modified_xml).is_err());
+        let rsa_key = keybox.rsa_info.as_ref().unwrap().key.clone();
+        let ec_leaf = keybox.ec_info.as_ref().unwrap().chain[0].clone();
+        assert!(validate_chain_matches_key(
+            &rsa_key,
+            std::slice::from_ref(&ec_leaf),
+            KeyAlgorithm::Rsa
+        )
+        .is_err());
     }
 
     #[test]

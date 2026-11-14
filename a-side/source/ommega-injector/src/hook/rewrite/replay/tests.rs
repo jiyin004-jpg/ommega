@@ -10,12 +10,17 @@ fn caller(uid: i64) -> CallerInfo {
     }
 }
 
-fn reset() {
+/// 这批测试共用 `DEVICE_UNLOCK` 和 `SYNCED_GENERATION`，并行跑会互相清。
+static REPLAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reset() -> std::sync::MutexGuard<'static, ()> {
+    let guard = REPLAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     DEVICE_UNLOCK
         .lock()
         .expect("ommega device unlock cache poisoned")
         .clear();
     SYNCED_GENERATION.store(UNSYNCED_GENERATION, Ordering::SeqCst);
+    guard
 }
 
 fn cached_password(user_id: i32) -> Option<Option<Vec<u8>>> {
@@ -36,7 +41,7 @@ fn cached_caller_uid(user_id: i32) -> Option<i64> {
 
 #[test]
 fn remembers_the_latest_material_per_user() {
-    reset();
+    let _guard = reset();
     remember_device_unlock(0, Some(b"first"), &caller(1000));
     assert_eq!(cached_password(0), Some(Some(b"first".to_vec())));
 
@@ -54,7 +59,7 @@ fn remembers_the_latest_material_per_user() {
 
 #[test]
 fn a_null_follow_up_keeps_the_material_we_already_hold() {
-    reset();
+    let _guard = reset();
     // The framework sends onDeviceUnlocked carrying the password and then a second one
     // without it (and every fingerprint unlock is one without it). The null one must
     // not throw away what the first one gave us, or a shadow restart replays nothing.
@@ -66,14 +71,14 @@ fn a_null_follow_up_keeps_the_material_we_already_hold() {
 
 #[test]
 fn keeps_the_original_caller_for_the_replay() {
-    reset();
+    let _guard = reset();
     remember_device_unlock(0, None, &caller(1000));
     assert_eq!(cached_caller_uid(0), Some(1000));
 }
 
 #[test]
 fn forget_drops_only_that_user() {
-    reset();
+    let _guard = reset();
     remember_device_unlock(0, Some(b"zero"), &caller(1000));
     remember_device_unlock(10, Some(b"ten"), &caller(1000));
 
@@ -84,7 +89,7 @@ fn forget_drops_only_that_user() {
 
 #[test]
 fn remembering_counts_as_feeding_the_current_generation() {
-    reset();
+    let _guard = reset();
     let generation = ipc::rpc_generation();
     remember_device_unlock(0, Some(b"pw"), &caller(1000));
     assert_eq!(SYNCED_GENERATION.load(Ordering::SeqCst), generation);
@@ -92,7 +97,7 @@ fn remembering_counts_as_feeding_the_current_generation() {
 
 #[test]
 fn an_empty_cache_marks_the_generation_fed_without_touching_ommega() {
-    reset();
+    let _guard = reset();
     // Nothing cached means nothing to replay, so this must not attempt a connection
     // (a unit test has no shadow to talk to and would block in the connect timeout).
     sync_ommega_state_after_reconnect();
@@ -137,7 +142,7 @@ fn temp_state_path(name: &str) -> PathBuf {
 
 #[test]
 fn the_mirror_survives_a_payload_restart() {
-    reset();
+    let _guard = reset();
     let path = temp_state_path("round-trip");
 
     // One user with an LSKF and one without: `onDeviceUnlocked` without a password is
@@ -170,7 +175,7 @@ fn the_mirror_survives_a_payload_restart() {
 
 #[test]
 fn forgetting_the_last_user_removes_the_mirror() {
-    reset();
+    let _guard = reset();
     let path = temp_state_path("forget");
     remember_device_unlock_at(Some(&path), 0, Some(b"zero"), &caller(1000));
     assert!(path.exists());
@@ -205,7 +210,7 @@ fn a_corrupt_or_foreign_mirror_only_means_nothing_to_replay() {
 
 #[test]
 fn without_a_mirror_the_material_stays_in_memory() {
-    reset();
+    let _guard = reset();
     remember_device_unlock_at(None, 0, Some(b"only-memory"), &caller(1000));
     assert_eq!(cached_password(0), Some(Some(b"only-memory".to_vec())));
 

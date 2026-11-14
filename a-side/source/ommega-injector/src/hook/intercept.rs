@@ -600,8 +600,7 @@ fn synchronize_binder_fd_generation(fd: c_int) -> Result<BinderFdToken, BinderFd
 }
 
 #[cfg(test)]
-static SYNTHETIC_REPLY_TEST_LOCK: Mutex<()> = Mutex::new(());
-
+pub(crate) use crate::hook::soter::AUTO_SERVE_TEST_LOCK as SYNTHETIC_REPLY_TEST_LOCK;
 #[cfg(test)]
 fn reset_binder_fd_for_test(fd: c_int) {
     let retired = invalidate_binder_fd_token(binder_fd_token(fd));

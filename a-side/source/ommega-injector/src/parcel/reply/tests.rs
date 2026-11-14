@@ -452,7 +452,7 @@ fn app_export_reply_starts_with_the_non_null_flag() {
     // Status + 非空标记 + resultCode + array 长 + 数据（补到 4）+ dataLength
     assert_eq!(
         bytes.len(),
-        16 + ((payload.len() + 3) & !3),
+        20 + ((payload.len() + 3) & !3),
         "got {}",
         bytes.len()
     );

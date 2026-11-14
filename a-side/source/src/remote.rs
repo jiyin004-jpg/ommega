@@ -1657,14 +1657,9 @@ mod iface_choice_tests {
             classify_bind_iface("offload0"),
             BindChoice::Named("offload0".to_string())
         );
-    }
-
-    /// A literal name is used as given, valid or not — the kernel's call.
-    #[test]
-    fn a_literal_name_is_taken_at_face_value() {
         assert_eq!(
-            desired_iface("ccmni0", "http://1.2.3.4:10886"),
-            Some("ccmni0".to_string())
+            classify_bind_iface("ccmni0"),
+            BindChoice::Named("ccmni0".to_string())
         );
     }
 

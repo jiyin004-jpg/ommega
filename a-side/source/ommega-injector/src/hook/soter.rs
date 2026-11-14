@@ -1162,6 +1162,17 @@ static AUTO_APP_SERVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// 「宿主瞎」的连击计数，攒满 [`APP_AUTO_SERVE_THRESHOLD`] 才动手。
 static APP_BLIND_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// 这几个全局是进程级的，并行跑的测试会互相踩，碰它们的测试靠这把锁串行。
+#[cfg(test)]
+pub(crate) static AUTO_SERVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn auto_serve_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    AUTO_SERVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// 一笔首请求就接管：误接管的代价是拿我们的统一供料换掉宿主的答案（格式同原厂、
 /// 身份同源），不比宿主差；漏判的代价是检测器那轮直接判红。所以不做多重确认，
 /// 只把「本来就不该有 HAL 调用」的 12/13 号排除在外。
@@ -1186,22 +1197,30 @@ fn switch_state(path: &str) -> Option<bool> {
     switch_state_text(&std::fs::read_to_string(path).ok()?)
 }
 
+/// `manual_switch` 的进程内缓存：开关只读一次。
+static MANUAL_SWITCH: std::sync::Mutex<Option<Option<bool>>> = std::sync::Mutex::new(None);
+
 /// 这台机器上 App 面向的 SOTER 由我们答吗。
 ///
 /// 手工开关（环境变量或文件）写的什么，`None` = 没写。进程起来只读一次：开关的意思是
 /// 「开机时要不要接管」，运行期再跟着文件变，就成了同一台机器一会儿接一会儿不接。
 fn manual_switch() -> Option<bool> {
-    static CACHE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
-        if let Some(on) = std::env::var("OMMEGA_SOTER_APP_SERVE")
-            .ok()
-            .and_then(|value| switch_state_text(&value))
-        {
-            return Some(on);
-        }
-        switch_state(APP_SERVE_SWITCH)
-    })
+    let mut cached = MANUAL_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = *cached {
+        return value;
+    }
+    // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
+    let value = std::env::var("OMMEGA_SOTER_APP_SERVE")
+        .ok()
+        .and_then(|value| switch_state_text(&value))
+        .or_else(|| switch_state(APP_SERVE_SWITCH));
+    *cached = Some(value);
+    value
+}
+
+#[cfg(test)]
+pub(crate) fn reset_manual_switch_for_test() {
+    *MANUAL_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 接管在我们这边成立了（已经替宿主答过「读我们造的料」那几笔）。
@@ -1300,6 +1319,10 @@ pub(crate) fn reset_auto_serve_for_test() {
     if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
         *slot = None;
     }
+    // libtest 的测试线程会复用，本线程上一把留下的待答请求也要清。
+    PENDING_APP.with(|slot| slot.borrow_mut().take());
+    reset_manual_switch_for_test();
+    std::env::remove_var("OMMEGA_SOTER_APP_SERVE");
 }
 
 /// 宿主刚收进来的那笔 App 请求，留着跟它的答复对号。
@@ -3044,7 +3067,8 @@ mod tests {
     /// 没东西可答（没有待答请求 / 不在窗口内）就什么都不动 —— 宿主自己那份答复照旧过去。
     #[test]
     fn no_pending_app_call_means_we_leave_the_host_answer_alone() {
-        PENDING_APP.with(|slot| slot.borrow_mut().take());
+        let _guard = auto_serve_test_lock();
+        reset_auto_serve_for_test();
         assert!(take_app_answer().is_none());
     }
 
@@ -3069,7 +3093,7 @@ mod tests {
 
     /// 这三个自动接管测试共用一份进程级现场证据（AUTO_APP_SERVE / 连击计数），
     /// 并行跑会互相清零。拿这把锁把整个测试体串行化。
-    static AUTO_SERVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::auto_serve_test_lock;
 
     /// 自动接管开了没有。只看进程内那个标记，不渗文件/环境变量那头（那是
     /// `app_serving_enabled()` 的事，本组要验的是兜底逻辑本身）。
@@ -3094,9 +3118,7 @@ mod tests {
     /// 宿主没碰 HAL 的首笔请求就接管（阈值 1）：当笔就用我们的答复顶掉，之后每笔都答。
     #[test]
     fn auto_app_serve_engages_after_a_blind_streak() {
-        let _guard = AUTO_SERVE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = auto_serve_test_lock();
         reset_auto_serve_for_test();
         assert!(!auto_serve_on(), "还没接管");
 
@@ -3115,9 +3137,7 @@ mod tests {
     /// 宿主要去碰过我们认识的 HAL 描述符，这台机器的腿就是好的，永不自动接管。
     #[test]
     fn recent_hal_activity_keeps_the_auto_serve_off() {
-        let _guard = AUTO_SERVE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = auto_serve_test_lock();
         reset_auto_serve_for_test();
         for _ in 0..APP_AUTO_SERVE_THRESHOLD + 1 {
             // 请求进来之后宿主去碰了 HAL：先 stash、再记 HAL 活动，跟真机时序一致。
@@ -3132,9 +3152,7 @@ mod tests {
     /// 12/13 号宿主本来就自己答（不碰 HAL），不许算进「宿主瞎」的连击里。
     #[test]
     fn host_served_codes_do_not_count_toward_the_blind_streak() {
-        let _guard = AUTO_SERVE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = auto_serve_test_lock();
         reset_auto_serve_for_test();
         for code in [12u32, 13] {
             let mut call = blind_app_call();
@@ -3153,9 +3171,7 @@ mod tests {
     /// 就把接管撤掉并静默一段，回到旧行为。
     #[test]
     fn a_revoked_auto_serve_backs_off_instead_of_flapping() {
-        let _guard = AUTO_SERVE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = auto_serve_test_lock();
         reset_auto_serve_for_test();
         // 先让它接一笔，接管就开着。
         stash_app_call_for_test(blind_app_call(), 10373);
