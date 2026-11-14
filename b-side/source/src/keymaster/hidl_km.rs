@@ -1,16 +1,14 @@
 //! HIDL 版 Keymaster 4.x 客户端（`android.hardware.keymaster@4.x::IKeymasterDevice`）。
 //!
-//! [`super::relay_tee`] 走的 AIDL KeyMint（`android.hardware.security.keymint`）是
-//! Android 12 才进来的东西，而且**只有新出厂设备强制要求**。Android 11 出厂、后来
-//! 升到 12/13 的机器（天玑 1200 / MT6893 就是这一类）仍然只有 HIDL 的
-//! `android.hardware.keymaster@4.x`，`servicemanager` 里根本不存在
-//! `...IKeyMintDevice/default` 这个名字，`getService` 只会回 `NameNotFound`。
-//! 模块要在这类机器上跑本地真 TEE 兜底，就必须自己会说 HIDL。
+//! [`super::relay_tee`] 走的 AIDL KeyMint（`android.hardware.security.keymint`）自
+//! Android 12 起才有，且只有新出厂设备强制要求。Android 11 出厂、升级到 12/13 的
+//! 设备仍然只有 HIDL `android.hardware.keymaster@4.x`：`servicemanager` 里不存在
+//! `...IKeyMintDevice/default`，`getService` 只回 `NameNotFound`。这类设备要做本地
+//! 真 TEE 兜底，就必须自己会说 HIDL。
 //!
-//! 这里不引 C++、也不引 `hidl-gen` 生成的绑定：HIDL 的传输层
-//! （`/dev/hwbinder` + `hwservicemanager` + buffer object 那套）在
-//! [`crate::soter::hwbinder`] 里已经有一份经过 SOTER 验证的实现，本模块只负责
-//! 把 `IKeymasterDevice` 这一层的「事务号 + 参数形状」叠上去。
+//! 不引 C++、也不引 `hidl-gen` 生成的绑定：HIDL 传输层（`/dev/hwbinder` +
+//! `hwservicemanager` + buffer object）由 [`crate::soter::hwbinder`] 提供，本模块只叠
+//! `IKeymasterDevice` 这一层的「事务号 + 参数形状」。
 //!
 //! # 事务号
 //!
@@ -30,28 +28,26 @@
 //! 10 exportKey
 //! ```
 //!
-//! `@4.1` 是 `extends @4.0::IKeymasterDevice`，所以在 4.1 上上面 1..19 号**一个都
-//! 没变**，4.1 自己新加的 `deviceLocked` / `earlyBootEnded` 顺延成 20 / 21。
+//! `@4.1` 是 `extends @4.0::IKeymasterDevice`，所以 1..19 号**一个都没变**，4.1 新增
+//! 的 `deviceLocked` / `earlyBootEnded` 顺延成 20 / 21。
 //!
 //! # 4.0 把 `generateKey` 拆成了两步
 //!
-//! KeyMint 的 `generateKey(keyParams, attestKeyParams)` 在 Keymaster 4.0/4.1 里
-//! **没有 `attestKeyParams` 这个形参**（签名是 `generateKey(vec<KeyParameter> keyParams)`），
-//! 认证链要走单独的 `attestKey(keyToAttest, attestParams)`，返回 `vec<vec<uint8_t>>`。
-//! 也就是说从 KeyMint 语义落到 KM4 上，一次 `generateKey` 要变成
-//! `generateKey` + `attestKey` 两次事务，拿到的 keyblob 是两次调用的中间产物。
-//! 这不是可以靠「换个服务名」绕过去的差异，见 [`Self::generate_key`]。
+//! Keymaster 4.0/4.1 的 `generateKey(vec<KeyParameter> keyParams)` **没有
+//! `attestKeyParams` 形参**；认证链要走单独的 `attestKey(keyToAttest, attestParams)`，
+//! 返回 `vec<vec<uint8_t>>`。一次 KeyMint 语义的 `generateKey` 落到 KM4 上就是
+//! `generateKey` + `attestKey` 两次事务，keyblob 是两次调用的中间产物 —— 不能靠换个
+//! 服务名绕过去，见 [`Self::generate_key`]。
 //!
 //! # 结构体布局
 //!
 //! HIDL 的 struct 形参在 parcel 里是**一整块 buffer object，内容是 C++ ABI 的内存
-//! 镜像**（`libhwbinder` 的 `Parcel::write(const T&)` 就是 `writeBuffer(sizeof(T), &val)`），
-//! 里面的 `vec` / `string` 成员则是嵌在结构体里的 16 字节头，再各自挂一个
-//! `HAS_PARENT` 的子 buffer object。所以每个结构体的字段偏移必须算准。
+//! 镜像**（`Parcel::write(const T&)` 即 `writeBuffer(sizeof(T), &val)`）；里面的
+//! `vec` / `string` 成员是嵌在结构体里的 16 字节头，各自再挂一个 `HAS_PARENT` 子
+//! buffer object。字段偏移必须算准。
 //!
-//! `KeyParameter` 在 `types.hal` 里被 AOSP 特意摊平过（原文注释：
-//! "Hidl does not support anonymous unions, so we have to name it"），没有 union
-//! 判别符 —— `Tag` 自己就是判别符：
+//! `KeyParameter` 在 `types.hal` 里被摊平过，**没有 union 判别符** —— `Tag` 自己就是
+//! 判别符：
 //!
 //! ```text
 //! struct KeyParameter {
@@ -61,9 +57,9 @@
 //! };                        // 共 32 字节，对齐 8
 //! ```
 //!
-//! `hidl_vec<T>` / `hidl_string` 的 16 字节头是 `{u64 指针, u32 长度, u8 自有标志, 3 字节补位}`
-//! —— 这一点由 [`crate::soter::hwbinder`] 里已经跑通的 `write_hidl_string` 定死，
-//! 本模块沿用同一套。
+//! `hidl_vec<T>` / `hidl_string` 的 16 字节头是
+//! `{u64 指针, u32 长度, u8 自有标志, 3 字节补位}`，与
+//! [`crate::soter::hwbinder`] 的 `write_hidl_string` 一致。
 
 use anyhow::{bail, Context, Result};
 
@@ -101,8 +97,7 @@ const HWSERVICEMANAGER_HANDLE: u32 = 0;
 // `IKeymasterDevice@4.0` 的事务号（= `.hal` 声明顺序）。
 // ---------------------------------------------------------------------------
 
-// 全部 `pub`：这张表本身就是协议契约，留着给调用方/探针核对，也算「已核对过
-// 声明顺序」的书面记录。
+// 全部 `pub`：这张表是协议契约，供调用方/探针核对。
 pub const TX_GET_HARDWARE_INFO: u32 = 1;
 pub const TX_GET_HMAC_SHARING_PARAMETERS: u32 = 2;
 pub const TX_COMPUTE_SHARED_HMAC: u32 = 3;
@@ -342,10 +337,7 @@ pub struct KmBeginResult {
 
 /// `sizeof(KeyParameter)`。
 pub const KM_PARAM_SIZE: usize = 32;
-/// `offsetof(KeyParameter, value.<标量成员>)`。
-///
-/// `KeyParameterValue` 在 `types.hal` 里被 AOSP 摊平过，**线上没有联合体判别符**
-/// （`Tag` 自己就是判别符），所以标量那一格和 `blob` 头不重合。
+/// `offsetof(KeyParameter, value.<标量成员>)`：标量那一格和 `blob` 头不重合。
 const KM_PARAM_F_OFF: usize = 8;
 /// `offsetof(KeyParameter, value.blob)`：16 字节的 `hidl_vec` 头。
 const KM_PARAM_BLOB_OFF: usize = 16;
@@ -478,10 +470,10 @@ impl HidlKeymaster {
     // 1. getHardwareInfo
     // -----------------------------------------------------------------------
 
-    /// 只用来验证「连接、事务号、回包解码」这条链路是通的：返回值里除了一个
-    /// `SecurityLevel` 全是字符串，不碰任何结构体布局，所以它通了才轮到后面那些。
-    ///
     /// 返回 `(security_level, keymaster_name, author_name)`。
+    ///
+    /// 回包是一个 `SecurityLevel` 加两个 `hidl_string`，不碰结构体布局，因此也用作
+    /// interface descriptor 自检的探针。
     pub fn get_hardware_info(&self) -> Result<(u32, String, String)> {
         let reply = self.call(TX_GET_HARDWARE_INFO, |_| {})?;
         let mut r = ReplyReader::new(&self.conn, &reply);
@@ -493,21 +485,19 @@ impl HidlKeymaster {
     }
 
     // -----------------------------------------------------------------------
-    // 2/3. HMAC 共享参数 —— 故意不实现
+    // 2/3. HMAC 共享参数 —— 不实现
     // -----------------------------------------------------------------------
     //
-    // `getHmacSharingParameters()` / `computeSharedHmac()` 是 Android 启动时用来让
-    // TEE 和 StrongBox 两个实例协商共享 HMAC 键的，relay 这条链路上没有任何调用点。
-    // 它回的是 `HmacSharingParameters`（`vec<uint8_t> seed` + 内联 `uint8_t[32]`），
-    // 解码路径跟本模块其它方法都不一样；没有调用点就不带着它一起交付 —— 需要的时候
-    // 照着 `types.hal` 的字段顺序补，别照抄这里的 `vec` 解码。
+    // `getHmacSharingParameters()` / `computeSharedHmac()` 用于让 TEE 和 StrongBox
+    // 两个实例协商共享 HMAC 键，relay 链路上没有调用点，故不实现。
+    // 回包是 `HmacSharingParameters`（`vec<uint8_t> seed` + 内联 `uint8_t[32]`），
+    // 解码形状与其它方法不同：要补就按 `types.hal` 字段顺序写，别套用 `vec` 解码。
 
     // -----------------------------------------------------------------------
     // 5. addRngEntropy
     // -----------------------------------------------------------------------
 
-    /// `addRngEntropy(vec<uint8_t>)`：只带一个 `vec<uint8_t>` 形参，同样不碰结构体
-    /// 布局，是「带参数的调用」里最好验的一个。
+    /// `addRngEntropy(vec<uint8_t>)`：只带一个顶层 `vec<uint8_t>` 形参，不碰结构体布局。
     pub fn add_rng_entropy(&self, entropy: &[u8]) -> Result<()> {
         let reply = self.call(TX_ADD_RNG_ENTROPY, |p| {
             p.write_hidl_vec_u8(entropy);
@@ -614,7 +604,8 @@ impl HidlKeymaster {
     // 16..19. 操作
     // -----------------------------------------------------------------------
 
-    /// `begin(KeyPurpose purpose, vec<uint8_t> keyBlob, vec<KeyParameter> inParams, HardwareAuthToken authToken)`.
+    /// `begin(KeyPurpose purpose, vec<uint8_t> keyBlob, vec<KeyParameter> inParams,
+    /// HardwareAuthToken authToken)`.
     ///
     /// `purpose` 是 `enum : uint32_t`，在 parcel 里是内联的 u32。
     pub fn begin(
@@ -641,7 +632,8 @@ impl HidlKeymaster {
         })
     }
 
-    /// `update(...)` → `(ErrorCode, uint32_t inputConsumed, vec<KeyParameter> outParams, vec<uint8_t> output)`。
+    /// `update(...)` → `(ErrorCode, uint32_t inputConsumed, vec<KeyParameter> outParams,
+    /// vec<uint8_t> output)`。
     pub fn update(
         &self,
         operation_handle: u64,
@@ -787,16 +779,14 @@ fn descriptor_answers(conn: &HwBinder, handle: u32, version: Km4Version) -> Resu
 /// 问出对端真正接受的 interface descriptor，并据此定版本。
 ///
 /// 正常情况下它就是请求服务时用的那个全名，所以先试它。但**厂商实现会两张皮**：
-/// 这台天玑 1200 上，keymaster 二进制被以 `@4.1` 的名字注册进了 hwservicemanager
-/// （`lshal` 能看到 `@4.1::IKeymasterDevice/default`），可它 `onTransact` 里
-/// `enforceInterface` 校验的是 `@4.0` 的 descriptor —— 于是
-/// `getService("@4.1")` 拿到的句柄发 `@4.1` 的 token 会被 `BAD_TYPE`
-/// （`0x80000001` = `-2147483647`）拒掉，只有 `@4.0` 的 token 能通。更麻烦的是
-/// `get("@4.1")` 和 `get("@4.0")` 返回的是**同一个句柄**，光看句柄发现不了。
+/// 服务以 `@4.1` 之名注册进 hwservicemanager，`onTransact` 里 `enforceInterface`
+/// 校验的却是 `@4.0` 的 descriptor —— 发 `@4.1` 的 token 会被 `BAD_TYPE`
+/// （`0x80000001` = `-2147483647`）拒掉，只有 `@4.0` 的 token 能通；而
+/// `get("@4.1")` 和 `get("@4.0")` 返回**同一个句柄**，光看句柄发现不了。
 ///
-/// 所以版本必须自检，不能由注册名推。认哪个 descriptor 就按哪个版本算 ——
-/// 这也顺带保证 4.1 独有的 `deviceLocked`/`earlyBootEnded` 不会被发到 4.0
-/// 的实现上去（那会得到 `UNKNOWN_TRANSACTION`）。
+/// 所以版本必须自检，不能由注册名推。认哪个 descriptor 就按哪个版本算，这样 4.1
+/// 独有的 `deviceLocked` / `earlyBootEnded` 不会被发到只实现 4.0 的对端（那会得到
+/// `UNKNOWN_TRANSACTION`）。
 fn accepted_version(
     conn: &HwBinder,
     handle: u32,
@@ -900,9 +890,9 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
         let field_off = i * KM_PARAM_SIZE + KM_PARAM_BLOB_OFF;
         match &p.value {
             KmValue::Blob(b) if !b.is_empty() => {
-                // 非空 blob 一定有地址（`lash` 的返回值）。真出现 None 只能是本
-                // 编码器自己矛盾：退回空子对象，让 HAL 走参数错误，而不是 panic
-                // 掉整条守护进程 —— 这个函数不返回 Result，没别的上报路径。
+                // 非空 blob 一定有地址；出现 None 说明编码器自身矛盾：退回空子对象，
+                // 让 HAL 走参数错误，不能 panic —— 本函数不返回 Result，没有别的
+                // 上报路径。
                 let addr = blob_addrs[i].unwrap_or(0);
                 parcel.write_buffer_object(
                     addr,
@@ -914,11 +904,10 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
                 );
             }
             _ => {
-                // 标量参数和空 blob 也必须挂一个空子对象。HIDL 的读取端对
-                // `KeyParameterValue` 里那个 `vec<uint8_t> blob` 成员是无条件读的，
+                // 标量参数和空 blob 也必须挂一个空子对象：HIDL 读取端对
+                // `KeyParameterValue` 里的 `vec<uint8_t> blob` 成员是无条件读的，
                 // 判别式不参与决定「要不要读」。少一个子对象，读序列就错位，
-                // 服务端 `onTransact` 直接回 BAD_VALUE(-22) —— 这一点是在真机上
-                // 一个元素一个元素试出来的，不是推出来的。
+                // 服务端 `onTransact` 回 BAD_VALUE(-22)。
                 parcel.write_buffer_object(
                     0,
                     0,
@@ -1060,12 +1049,11 @@ fn write_empty_verification_token(parcel: &mut Parcel) {
 // 解码：读回包。
 // ---------------------------------------------------------------------------
 
-/// 解析应答的游标。所有方法都是「先一个 `hardware::Status`，再方法自己的字段」。
-/// 回包读取要用到的唯一一项 binder 能力：把对象里的地址读出来。
+/// 回包读取子系统：解析应答的游标（所有方法都是「先一个 `hardware::Status`，再方法
+/// 自己的字段」）+ 唯一的 binder 能力：把对象里的地址读出来。
 ///
-/// 抽成 trait 只是为了能在单测里塞一块假的「映射区」—— 真机上它就是 `HwBinder`。
-/// 回包对象的形状是本模块最容易读错的地方（`vec<T>` 有没有独立的 16 字节头），
-/// 没有单测就只能靠真机一次次试。
+/// 抽成 trait 是为了让单测能注入假映射区；真机上它就是 `HwBinder`。
+/// 回包对象的形状是最容易读错的地方：`vec<T>` 有没有独立的 16 字节头。
 trait MappedSource {
     fn read_mapped(&self, addr: usize, len: usize) -> Option<Vec<u8>>;
 }
@@ -1129,9 +1117,8 @@ impl<'a> ReplyReader<'a> {
     /// HIDL 里 `hardware::Status` 是个 i32：0 就是没事。
     ///
     /// 非 0 时回包长度很关键：**只有 4 字节**说明这是一条 `TF_STATUS_CODE` 应答 ——
-    /// 服务端的 `onTransact` 拒绝了这笔事务，回包的整个内容就是它自己的返回值，
-    /// 根本不是方法的应答体。这种情况报成「HIDL status 非 0」会把人引到 binder
-    /// 传输层上去查，而真正的原因几乎总在那里写的 interface descriptor 上。
+    /// 服务端的 `onTransact` 拒绝了这笔事务，整个回包就是它自己的返回值，不是方法
+    /// 的应答体。此时问题几乎总在 interface descriptor 上，不是 binder 传输层。
     fn status(&mut self) -> Result<()> {
         let code = self.i32()?;
         if code != 0 {
@@ -1149,8 +1136,6 @@ impl<'a> ReplyReader<'a> {
     }
 
     /// 诊断用：把游标后面的对象按线格式逐条打出来，游标原样恢复。
-    ///
-    /// 回包对不上时用它把真实的对象序列钉死 —— 猜一次不如打一遍。
     fn dump_objects(&mut self) -> String {
         let saved = self.at;
         // 从 status/errorCode 两个标量之后开始，也就是第一个对象。
@@ -1192,8 +1177,8 @@ impl<'a> ReplyReader<'a> {
     /// `vec<KeyParameter>` 是 32 字节一个、`vec<vec<uint8_t>>` 是 16 字节一个，
     /// 拿「个数」当字节数去读会把数组截断成 1/32 或 1/16。
     ///
-    /// 头对象后面紧跟数据对象，地址必须对得上 —— 对不上说明我们把对象顺序读反了，
-    /// 宁可报错也不猜。
+    /// 头对象后面紧跟数据对象，地址必须对得上 —— 对不上说明对象顺序读反了，宁可报错
+    /// 也不猜。
     fn embedded_head(&mut self) -> Result<(usize, usize, usize)> {
         let (_ty, head_addr, head_len) = self.buffer_object()?;
         if head_len != HIDL_STRUCT_SIZE {
@@ -1279,13 +1264,10 @@ impl<'a> ReplyReader<'a> {
         String::from_utf8(bytes).context("hidl_string is not valid UTF-8")
     }
 
-    /// `begin` / `update` / `finish` 的 `outParams`：**顶层形参**，所以线上是一个
-    /// 完整的 `hidl_vec<KeyParameter>` —— 16 字节头对象（指针 + 元素个数）+ 元素区
-    /// 对象 + 每个元素的子对象。
-    ///
-    /// 以前这里错用了「嵌在结构体里」那种读法（没有头对象），把 16 字节的头当成元素
-    /// 数组：16 % 32 ≠ 0，于是每次 `begin()` 都会在这儿报错。形状要按形参是顶层还是
-    /// 内嵌分开读，`vec<uint8_t>`（`generateKey` 的 keyBlob）走的也是头 + 元素。
+    /// `begin` / `update` / `finish` 的 `outParams`：**顶层形参**，线上是一个完整的
+    /// `hidl_vec<KeyParameter>` —— 16 字节头对象（指针 + 元素个数）+ 元素区对象 +
+    /// 每个元素的子对象。形状必须按形参是顶层还是内嵌分开读（见 [`Self::key_params`]），
+    /// `vec<uint8_t>`（`generateKey` 的 keyBlob）走的也是头 + 元素。
     fn key_params_top_level(&mut self) -> Result<Vec<KmParam>> {
         let (elems_addr, count, bytes_len) = self.embedded_head()?;
         if count == 0 {
@@ -1346,8 +1328,8 @@ impl<'a> ReplyReader<'a> {
             size_raw.copy_from_slice(&chunk[KM_PARAM_BLOB_OFF + 8..KM_PARAM_BLOB_OFF + 12]);
             let blob_len = u32::from_le_bytes(size_raw) as usize;
 
-            // 每个元素都对应一个子对象 —— 标量参数的也是空的。这一点是量出来的：
-            // 少一个子对象，对端读参数时整条序列就会错位并回 BAD_VALUE。
+            // 每个元素都对应一个子对象，标量参数的也是空的：少一个子对象，对端读
+            // 参数时整条序列就会错位并回 BAD_VALUE。
             let (_ty, data_addr, data_len) = self.buffer_object()?;
 
             let value = if is_blob {
@@ -1490,17 +1472,16 @@ impl<'a> ReplyReader<'a> {
 /// uapi 在 64 位下的布局是 `type@0, flags@4, union{binder: u64 | handle: u32}@8,
 /// cookie@16`，一共 24 字节。句柄是 union 那格的低 4 字节，也就是**偏移 8**。
 ///
-/// 偏移 12 **不是**句柄：那只是 union 内部的对齐补位，对远程句柄恒为 0。读那里会
-/// 得到 handle 0，而 0 是 hwservicemanager —— 于是 `getService` 之后的每一笔事务都
-/// 打在上下文管理器上，被它的 `enforceInterface` 以 `BAD_TYPE`(0x80000001，
-/// 也就是 `-2147483647`) 拒掉，看着像 binder 传输层坏了，其实是敲错了门。
+/// 偏移 12 **不是**句柄：那是 union 内部的对齐补位，对远程句柄恒为 0。读那里会得到
+/// handle 0，而 0 是 hwservicemanager —— 之后每一笔事务都会打在上下文管理器上，被
+/// 它的 `enforceInterface` 以 `BAD_TYPE`(0x80000001，即 `-2147483647`) 拒掉。
 fn binder_handle_at(data: &[u8], object_at: usize) -> Result<u32> {
     let object = data
         .get(object_at..object_at + 24)
         .with_context(|| format!("truncated binder object at {object_at}"))?;
     let ty = u32::from_le_bytes([object[0], object[1], object[2], object[3]]);
-    // 本地对象（passthrough 的 HAL 就在自己进程里）和远程句柄都接受，
-    // 跟 [`crate::soter::hidl`] 里那份已经跑通的判断保持一致。
+    // 本地对象（passthrough 的 HAL 在自己进程里）和远程句柄都接受，
+    // 与 [`crate::soter::hidl`] 的判断保持一致。
     match ty {
         BINDER_TYPE_HANDLE
         | BINDER_TYPE_BINDER
@@ -1515,9 +1496,8 @@ fn binder_handle_at(data: &[u8], object_at: usize) -> Result<u32> {
 
 /// 服务端 `onTransact` 拒绝事务时回的两个状态值。
 ///
-/// 两个数都是在天玑 1200 上实测的：换掉 interface descriptor 得到第一个，换掉
-/// 事务号得到第二个。它们**是不同的数**，所以能据此区分「敲错门」和「敲门的方式
-/// 不对」—— 这一点在排查时很值钱。
+/// interface descriptor 不对回第一个，事务号不存在回第二个。两者**是不同的数**，
+/// 可据此区分「敲错门」和「敲门的方式不对」。
 const BINDER_BAD_TYPE: i32 = -2_147_483_647;
 const BINDER_UNKNOWN_TRANSACTION: i32 = -74;
 
@@ -1722,9 +1702,8 @@ mod tests {
 
     /// 64 位下 `flat_binder_object` 就是 `type@0, flags@4, handle@8, cookie@16`。
     ///
-    /// 这个测试盯着**偏移 8**：曾经写成 12（union 里的对齐补位），结果句柄恒为 0
-    /// = hwservicemanager，`getService` 之后每笔事务都被 `BAD_TYPE` 拒掉。真机上的
-    /// 表现是 `getHardwareInfo` 报 `-2147483647`，看着像 binder 传输层坏了。
+    /// 这个测试盯着**偏移 8**：写成 12（union 里的对齐补位）会得到句柄 0 =
+    /// hwservicemanager，之后每笔事务都被 `BAD_TYPE` 拒掉。
     #[test]
     fn binder_object_handle_is_at_offset_eight() {
         let mut data = Vec::new();
@@ -1753,8 +1732,8 @@ mod tests {
 
     /// descriptor 自检的判据：真应答体 vs 4 字节裸状态。
     ///
-    /// 这两个形状是在天玑 1200 上实测到的 —— 对端认 descriptor 时
-    /// `getHardwareInfo` 回 168 字节，不认时回 4 字节 `BAD_TYPE`。
+    /// 两个形状：认 descriptor 时 `getHardwareInfo` 回 168 字节，不认时回 4 字节
+    /// `BAD_TYPE`。
     #[test]
     fn descriptor_probe_distinguishes_a_body_from_a_bare_status() {
         let body = Reply {
@@ -1784,7 +1763,7 @@ mod tests {
     }
 
     /// 自检必须把「另一个版本」也试到：以 `@4.1` 之名注册、却只认 `@4.0`
-    /// descriptor 的实现，就是靠这一步救回来的。
+    /// descriptor 的实现只有这一步能认出来。
     #[test]
     fn descriptor_self_check_falls_back_to_the_other_version() {
         assert_eq!(Km4Version::V41.other(), Km4Version::V40);
@@ -2012,8 +1991,8 @@ mod tests {
 
     /// 顶层形参 `vec<KeyParameter>`：头对象 + 元素区 + 每元素一个子对象。
     ///
-    /// 这是 `begin/update/finish` 的 `outParams` 的真实形状。以前用「内嵌」那种读法
-    /// （把 16 字节头当元素数组）会直接 bail —— 这条测试就是钉这个的。
+    /// 这是 `begin/update/finish` 的 `outParams` 的真实形状。用「内嵌」读法（把
+    /// 16 字节头当元素数组）会直接 bail。
     #[test]
     fn top_level_out_params_have_a_head_object() {
         const HEAD: usize = 0x1000;

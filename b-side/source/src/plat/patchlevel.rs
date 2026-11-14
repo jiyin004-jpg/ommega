@@ -1,12 +1,11 @@
 //! 让本机真 TEE 按 A 端声明的补丁日期出链。
 //!
-//! KeyMint HAL 只在进程启动那一刻读一次 `ro.build.version.security_patch` /
-//! `ro.vendor.build.security_patch`（打包成 tag 705/706/718 一次性交给 TEE），之后就
-//! 再也不看属性。所以「让链上的日期跟着 A 端走」必须两步：先 resetprop 改属性，再让
-//! HAL 重读；只改属性链上不会变（2026-10-15 在 PLC110 / Trustonic 上实测过）。
+//! KeyMint HAL 只在进程启动时读一次 `ro.build.version.security_patch` /
+//! `ro.vendor.build.security_patch`（打包成 tag 705/706/718 交给 TEE），之后不再看属性。
+//! 所以必须两步：先 resetprop 改属性，再让 HAL 重读；只改属性链上不会变。
 //!
-//! 默认关闭，relay.conf 里开 `OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A=true`。
-//! 只在请求真带了日期、且与本机当前值不一致时才动，平时一分一秒都不多花。
+//! 默认关闭，relay.conf 里开 `OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A=true`；只在请求带了日期
+//! 且与本机值不一致时才动。
 
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -19,23 +18,21 @@ use serde_json::Value;
 use crate::keymaster::attest_proxy::{SYSTEM_KEYMINT_DEFAULT, SYSTEM_KEYMINT_STRONGBOX};
 use crate::keymaster::relay_tee::clear_system_keymint;
 
-/// 开关是 relay.conf 的 `OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A`（由 `RelayConfig` 热重载，
-/// 改完不用重启进程）。
+/// 开关，由 `RelayConfig` 热重载，改完不用重启进程。
 pub const FOLLOW_KEY: &str = "OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A";
 
-/// 这些包**不**跟随（黑名单，逗号分隔，匹配 tag 709 里的包名）：碰到它们就不动
-/// 属性、不重启 HAL，直接拿本机现在的值出链。
-/// **留空 = 全都跟**（旧行为）。
+/// 不跟随的包（黑名单，逗号分隔，匹配 tag 709 里的包名）：命中就不动属性、不重启 HAL，
+/// 直接拿本机现在的值出链。**留空 = 全都跟**。
 pub const FOLLOW_PKGS_KEY: &str = "OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS";
 
 const OS_PROP: &str = "ro.build.version.security_patch";
 const VENDOR_PROP: &str = "ro.vendor.build.security_patch";
 
-/// TEE 把 `os_version` 算成「主版本*10000 + 次版本*100」，而它读的是这几个字符串属性
-/// （不同厂商的 TA 读的不是同一个，所以能读到的都同步一份）。
+/// TEE 把 `os_version` 算成「主版本*10000 + 次版本*100」，读的是这几个字符串属性
+/// （不同厂商的 TA 读的不是同一个，能读到的都同步一份）。
 ///
-/// `ro.build.version.sdk` 故意不动：那里是 36 这种整数，拿去算会变成 360000；
-/// 而且改它会让本机所有应用看到的 API 级别跟着变，影响面远超这一条链。
+/// `ro.build.version.sdk` 故意不动：那里是 36 这种整数，拿去算会变成 360000，
+/// 而且会改变本机所有应用看到的 API 级别。
 const RELEASE_PROPS: &[&str] = &[
     "ro.build.version.release",
     "ro.build.version.release_or_codename",
@@ -63,9 +60,8 @@ const BASELINE_FILE: &str = "/data/adb/ommega-b/conf/baseline.props";
 /// 用户存储（CE）是否已就绪。`true` 等于「开机后至少解过一次锁」。
 const CE_AVAILABLE_PROP: &str = "sys.user.0.ce_available";
 
-/// 没解锁就不许动 TEE：keystore2 在「开机后还没解过锁」的状态下被重启，解锁流程依赖
-/// 的认证绑定会失效 —— 密码输对了也解不开（2026-10-17 在 PLC110 上实测）。所以这两项
-/// 是能不能切补丁日期（会连带重启 keymint HAL + keystore2）的前置条件。
+/// 没解锁就不许动 TEE：keystore2 在还没解过锁的状态下被重启，解锁流程依赖的认证绑定
+/// 会失效（密码对了也解不开）。这是切补丁日期（会连带重启 keymint HAL + keystore2）的前置。
 fn user_storage_unlocked() -> bool {
     ce_unlocked_from_prop(getprop(CE_AVAILABLE_PROP).ok().as_deref())
 }
@@ -75,8 +71,8 @@ fn ce_unlocked_from_prop(value: Option<&str>) -> bool {
     matches!(value, Some("true"))
 }
 
-/// 找 resetprop：模块目录、KernelSU、APatch、Magisk 都试一遍，最后再靠 PATH。
-/// 不同 root 管理器的位置就是不一样，只认一个等于「换了管理器这功能就没了」。
+/// resetprop 的候选路径：模块目录、KernelSU、APatch、Magisk 各一份，最后靠 PATH。
+/// 只认一个等于「换了管理器这功能就没了」。
 const RESETPROP_CANDIDATES: &[&str] = &[
     "/data/adb/ommega-b/bin/resetprop",
     "/data/adb/ksu/bin/resetprop",
@@ -87,12 +83,10 @@ const RESETPROP_CANDIDATES: &[&str] = &[
 
 static KNOWN_SERVICE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-/// 本机原始的三个值（第一次跟着改之前记下来）。
+/// 本机原始值（第一次跟着改之前记下来）：属性名 → 原始值。
 ///
-/// 为什么要记：跟完之后属性会一直是 A 的值，本机所有应用看到的系统版本/补丁日期
-/// 都变成别人的。所以每笔出完链必须自己回原值 —— 用这份基线，而不是「上一笔的值」：
-/// 上一笔可能已经是 A 的，拿它当基线就永远回不去了。
-/// 三个补丁相关属性的名字 -> 原始值。
+/// 回滚必须用这份基线，不能用「上一笔的值」：上一笔可能已经是 A 的，拿它当基线
+/// 就永远回不去了。
 type Baseline = Vec<(String, String)>;
 
 static BASELINE: OnceLock<Mutex<Option<Baseline>>> = OnceLock::new();
@@ -118,8 +112,7 @@ fn remember_baseline(props: &[&str]) {
             }
         }
     }
-    // 落一份到磁盘：面板的「停止模块 / 恢复并重启」要拿它把真机原值写回去，
-    // 而面板是另一个进程、拿不到这里的内存。
+    // 落一份到磁盘：面板是另一个进程，拿不到这里的内存，恢复时要靠它把原值写回去。
     let mut text = String::new();
     for (k, v) in &pairs {
         text.push_str(k);
@@ -145,9 +138,8 @@ static ATTEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// 把「按 A 端日期对齐」和「铸钥匙」两步锁在一起。
 ///
-/// 开了跟随开关之后每一笔 attest 都要拿这把锁：两个请求各自改了属性、各自弹了 HAL
-/// 再出链，中间一交叉，铸出来的链就不是它自己声明的值了（2026-10-15 在 PLC110 上
-/// 实测到过：另一台 A 的请求插进来把值翻了回去）。
+/// 开了跟随开关之后每一笔 attest 都要拿这把锁：两个请求各自改属性、各自弹 HAL 再出链，
+/// 中间一交叉，铸出来的链就不是它自己声明的值了。
 pub fn lock() -> std::sync::MutexGuard<'static, ()> {
     ATTEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -235,7 +227,7 @@ fn base64_decode(raw: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 这个请求的 AAID 包名是否命中了黑名单。命中了就不跟随。
+/// 这个请求的 AAID 包名是否命中黑名单；命中就不跟随。
 pub fn package_blocked(payload: &Value, blocked: &[String]) -> bool {
     if blocked.is_empty() {
         return false;
@@ -248,8 +240,8 @@ pub fn package_blocked(payload: &Value, blocked: &[String]) -> bool {
         .any(|p| !p.is_empty() && aaid.contains(p.as_str()))
 }
 
-/// 从 1.7.0 起 A 端才会在请求里带自己的版本号。低于这个版本的（或者压根没带
-/// `client_version` 的旧客户端）不跟随：它们上报的日期格式也还是旧的 YYYYMM。
+/// 1.7.0 起 A 端才在请求里带 `client_version`。更低的（或没带的）不跟随：
+/// 它们上报的日期格式还是旧的 YYYYMM。
 const FOLLOW_MIN_VERSION: (u32, u32, u32) = (1, 7, 0);
 
 fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
@@ -277,24 +269,20 @@ pub fn client_version_ok(payload: &Value) -> bool {
         .is_some_and(|v| v >= FOLLOW_MIN_VERSION)
 }
 
-/// 这个值要不要动：和**本机原值**（开机时的真实值）比，一样就不动。
-///
-/// 之所以要拿基线比而不是「当前属性值」：上一次搞脏了（比如还原失败）之后属性已经不
-/// 是本机原值了，拿它当参照会把本该改的回合当成「已经匹配」。
+/// 是否要改：目标值与本机值一致就不动，避免为一笔请求重启 HAL 和 keystore2。
 fn value_matches(_prop: &str, base: &str, want: &str) -> bool {
     base.trim() == want.trim()
 }
 
 /// 把 A 端在 `device_attest_context` 里声明的版本号/补丁日期落到本机 TEE 上。
 ///
-/// 返回 `Some(说明)` 表示这次真动了属性（并让 HAL 重读了）；`None` 表示不用动——
-/// 开关没开、请求里没带、或者**跟本机原值一样**（A 端已经同步成全一致时就是这样，
-/// 这时候不该为了一笔请求去折腾 HAL 和 keystore2）。
+/// 返回 `Some(说明)` 表示这次真动了属性（并让 HAL 重读）；`None` 表示不用动：
+/// 开关没开、请求没带、或跟本机值一样。
 pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
     if !on {
         return None;
     }
-    // 字段可能在顶层，也可能在 `device_attest_context` 里（server 两种都发过）。
+    // 字段可能在顶层，也可能在 `device_attest_context` 里，两种都要认。
     let ctx = payload.get("device_attest_context").unwrap_or(payload);
     let want_os = ctx
         .get("os_patch_level")
@@ -313,8 +301,8 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
         return None;
     }
 
-    // 锁屏期不动：这笔直接按本机当前值出链（跟「不带日期的老客户端」同一条降级路），
-    // 等解锁后的下一笔再切。否则会出现「输对密码进不了桌面」。
+    // 锁屏期不动：这笔按本机当前值出链（跟不带日期的老客户端同一条降级路），
+    // 等解锁后的下一笔再切，否则会出现「输对密码进不了桌面」。
     if !user_storage_unlocked() {
         log::info!("patchlevel follow: 设备还没解锁（CE 未就绪），这笔跳过、不改补丁日期");
         return None;
@@ -325,8 +313,8 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
     baseline_props.extend_from_slice(RELEASE_PROPS);
     remember_baseline(&baseline_props);
 
-    // 这轮要落哪些属性。os_version 不直接对应某个属性：它要拆成主/次版本，写到
-    // release 那一族字符串属性上；只写本机本来就有的，不凭空造新属性。
+    // os_version 不直接对应某个属性：拆成主/次版本写到 release 那一族字符串属性上，
+    // 只写本机本来就有的，不凭空造新属性。
     let mut targets: Vec<(String, String)> = Vec::new();
     if let Some(want) = want_os {
         targets.push((OS_PROP.to_string(), want));
@@ -359,10 +347,8 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
                 continue;
             }
         };
-        // 只以**当前值**为准：值一致就不动、不弹 HAL；不一致（包括从上次的 A1
-        // 改回本机原值）就写回去再重读。以前这里先拿 baseline（第一次记下的本机
-        // 原值）比 want，一旦 want 又回到原值就直接 continue —— 但那时 current
-        // 还是上一次写进去的 A1，属性/HAL 就停在旧值上了。
+        // 只以当前值为准：一致就不动、不弹 HAL；不一致（包括改回本机原值）就写回去
+        // 再重读。不能拿 baseline 比 want，否则 want 回到原值时属性会停在旧值上。
         if value_matches(prop, &current, &want) {
             continue;
         }
@@ -382,8 +368,8 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
             // 老句柄跟着进程一起没了，清掉缓存让下一笔重新连。
             clear_system_keymint(SYSTEM_KEYMINT_DEFAULT);
             clear_system_keymint(SYSTEM_KEYMINT_STRONGBOX);
-            // keystore2 手里那个旧句柄不会自己重连，不换掉它，本机 App 的密钥操作
-            // 就全废（见 restart_keystore2 的注释）。
+            // keystore2 手里的旧句柄不会自己重连，不换掉它本机 App 的密钥操作全废
+            // （见 `restart_keystore2`）。
             match restart_keystore2() {
                 Ok(k) => {
                     note.push_str("; ");
@@ -407,8 +393,8 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
     ))
 }
 
-/// 上一次找到的 keymint 服务名。扫描不能每次都成：上一笔刚 `ctl.restart`、现在正卡在
-/// `restarting/stopped` 那一下，就扫不到了 —— 那时候只能靠记住的名字继续弹它。
+/// 上一次找到的 keymint 服务名。上一笔刚 `ctl.restart` 时服务处于 `restarting/stopped`，
+/// 扫不到，只能靠记住的名字继续弹。
 fn known_service() -> Option<String> {
     KNOWN_SERVICE
         .get_or_init(|| Mutex::new(None))
@@ -450,8 +436,8 @@ fn running_keymint_services() -> Vec<String> {
 }
 
 /// 重启 init 管的 keymint HAL：它启动时会重读属性、重新 `TEE_Configure`。
-/// 服务名各机型不同（PLC110 是 `vendor.keymint-trustonic`，NX721J 是
-/// `vendor.keymint-qti`），所以从 `init.svc.*` 里现找。
+/// 服务名各机型不同（如 `vendor.keymint-trustonic` / `vendor.keymint-qti`），
+/// 所以从 `init.svc.*` 里现找。
 fn restart_keymint_hal() -> Result<String> {
     let mut services = running_keymint_services();
     if services.is_empty() {
@@ -508,13 +494,8 @@ fn restart_keymint_hal() -> Result<String> {
 
 /// 重启 keystore2。弹完 KeyMint HAL 必须跟着做这一步。
 ///
-/// 为什么：HAL 被 `ctl.restart` 换掉之后，keystore2 手里那个句柄就是死的，它不会自己
-/// 重连 —— 之后本机所有 App 的生成/签名都回 `SYSTEM_ERROR(4)`（keystore2 日志里是
-/// `Binder exception code TRANSACTION_FAILED, 0`），密钥认证这类 App 直接报「无法认证」。
-/// 2026-10-15 在 PLC110 上实测：只弹 HAL 不加这一步，之后 keygen 一直失败；把
-/// keystore2 一重启立刻恢复（连测两次 GenerateKey 都成功）。
-///
-/// 只在本笔真改过属性、真弹过 HAL 的时候跑，平时一分一毫都不多花。
+/// HAL 被 `ctl.restart` 换掉之后 keystore2 手里的句柄就死了，不会自己重连，之后本机
+/// 所有 App 的生成/签名都回 `SYSTEM_ERROR(4)`。只在本笔真改过属性、真弹过 HAL 时跑。
 fn restart_keystore2() -> Result<String> {
     const SVC: &str = "keystore2";
     const PID_PROP: &str = "init.svc_debug_pid.keystore2";
@@ -576,7 +557,7 @@ mod tests {
         assert_eq!(vendor_prop_value(20261301), None);
     }
 
-    /// 跟本机原值一样就不动（A 端已经全同步的情况），不一样才动。
+    /// 跟本机值一样就不动（A 端已全同步），不一样才动。
     #[test]
     fn decides_by_local_original_value() {
         assert!(value_matches(OS_PROP, "2026-08-01", "2026-08-01"));

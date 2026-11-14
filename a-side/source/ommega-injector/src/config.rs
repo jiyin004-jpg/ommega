@@ -14,29 +14,21 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
-/// Legacy A-side (client-a) per-app interception list.  Each non-comment line is
-/// a package name (optionally suffixed `!`/`?`, or a `[keybox]` scope
-/// header).  These packages are merged into the effective scoop so apps selected
-/// in the webroot UI are intercepted exactly as under the old A-side module.
-///
-/// This is the single data location: the webroot UI writes it through the
-/// `/data/adb/ommega/ommegadata` symlink (which points here), and the injected
-/// payload (keystore2, uid 1017) reads the same file.  There is no copy.
+/// Legacy A-side per-app interception list.  Each non-comment line is a package
+/// name (optional `!`/`?` suffix) or a `[keybox]` scope header; the listed
+/// packages become the effective scoop.  Single data location, no copy: the
+/// webroot UI writes via `/data/adb/ommega/ommegadata`, uid 1017 payload reads it.
 const CLIENTA_TARGET_PATH: &str = "/data/misc/ommega/target.txt";
-/// Legacy A-side flat config (same directory as `target.txt`, written by the
-/// webroot UI and read by the keymint daemon).  The injector only looks at one
-/// key here: `global_scope`.  Everything else in that file belongs to the
-/// daemon's own parser (`crate::config` on the keymint side).
+/// Legacy A-side flat config (same directory as `target.txt`), written by the
+/// webroot UI and read by the keymint daemon.  The injector reads only its
+/// `global_scope` key; the rest belongs to the daemon's own parser.
 const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
-/// 日志开关的副本，由 daemon-injector 按真配置写好：`log_flag: 1` / `log_flag: 0`。
-///
-/// 位置挑在 `/data/misc` 下面是有讲究的：SOTER 宿主是 uid 1000 的 system_app，
-/// 它连 `/data/adb`（0700 root）的门都进不去，读不到就回落到「日志关」。
-/// `/data/misc/ommega` 的 context 是 `system_data_file`，system_app 读得动。
+/// 日志开关副本，由 daemon-injector 按真配置写入：`log_flag: 1` / `log_flag: 0`。
+/// 必须落在 `/data/misc` 下：SOTER 宿主是 uid 1000 的 system_app，进不去
+/// `/data/adb`（0700 root）；`/data/misc/ommega` 是 system_data_file，读得动。
 const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/ommega/log_flag";
-/// 同一份开关的另一个副本（root / `su` 域看这个）。曾经 daemon-injector 只写这一份、
-/// payload 只读上面那一份，两边对不上：SOTER 宿主读到的是一份没人更新的旧值，
-/// 于是日志在 03:21 之后一个字都不再写。现在两份都写、两份都读，先读能读到的那个。
+/// 同一份开关的另一个副本，给 root / `su` 域用。
+/// 两份都写、两份都读，取先读到的那份。
 const CLIENTA_LOG_FLAG_FALLBACK_PATH: &str = "/data/adb/ommega/conf/log_flag";
 const CURRENT_CONFIG_VERSION: u32 = 1;
 const REPLACE_SAVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -69,25 +61,20 @@ pub struct FilterConfig {
     pub deny_packages: Vec<String>,
     pub block_android_package: bool,
     pub allow_unknown_package: bool,
-    /// Intercept every app, ignoring `scoop`/`deny_packages` and the package
-    /// resolution gates ("全局作用域").  Set from the A-side WebUI; see
-    /// `clienta_global_scope()`.  Local-vs-remote handling is NOT affected:
-    /// this only widens which callers get handled by ommega.
+    /// Intercept every app, ignoring `scoop` and the package-resolution gates
+    /// ("全局作用域").  Set from the A-side WebUI.  Local-vs-remote handling is
+    /// NOT affected: this only widens which callers ommega handles.
     pub global_scope: bool,
     /// 系统 uid（< AID_APP_START）里额外放行接管的 SELinux 域前缀。
     ///
-    /// 默认 `engineermode`：一加/OPPO 的工程模式跑在 system uid +
-    /// `engineermode_app` 域上，它的 Key 状态页要用 AndroidKeyStore 做
-    /// attestation 自检；不接管就只能看到原厂 TEE 的 ATTK 状态（未预制 → -74）。
-    /// 放行要求域以 `_app` 结尾，system_server / init / keystore 这类平台进程
-    /// 不受影响。
+    /// 默认 `engineermode`：一加/OPPO 工程模式跑在 system uid 的 `engineermode_app`
+    /// 域上，需要被接管。只认以 `_app` 结尾的域，system_server / init /
+    /// keystore 这类平台进程不受影响。
     pub allow_system_sids: Vec<String>,
     /// 系统 uid 的 app 域对应哪个包：`域前缀 -> 包名列表`。
     ///
-    /// `getKeyAttestationApplicationId(1000)` 对系统 uid 返回空，调用方的包名
-    /// 根本解析不出来（决策日志里一直是 `packages=[]`），按包判定的 scope 自然
-    /// 命不中。这里把域映射回包名，之后跟普通 app 一样照 `scoop` / `deny_packages`
-    /// / `global_scope` 判定——配了才接管，没配就不接管。
+    /// uid 1000 的 `getKeyAttestationApplicationId` 返回空，包名解析不出来，按包判定
+    /// 的 scope 命不中；映射回包名后照常走 `scoop` / `deny_packages` / `global_scope`。
     pub system_sid_packages: BTreeMap<String, Vec<String>>,
 }
 
@@ -121,11 +108,9 @@ impl Default for InjectorConfig {
 }
 
 fn default_scoop() -> Vec<String> {
-    // 出厂作用域是**空**的：作用域只从面板写的 `target.txt` 来。
-    //
-    // 以前这里列了六个包当默认套餐，结果跟 `target.txt` 表达同一件事、靠“文件在不在”
-    // 判优先级。现在一律以面板为准：全局开就接管普通应用（外加 `system_sid_packages`
-    // 里那几个系统 app 域）；全局关就只接管 `target.txt` 里勾选的那些。
+    // 出厂作用域是空的：作用域只从面板写的 `target.txt` 来。
+    // 全局开就接管普通应用（外加 `system_sid_packages` 里的系统 app 域）；
+    // 全局关就只接管 `target.txt` 里勾选的那些。
     Vec::new()
 }
 
@@ -145,8 +130,8 @@ impl Default for FilterConfig {
             deny_packages: Vec::new(),
             block_android_package: true,
             allow_unknown_package: false,
-            // 默认开：全局作用域（只接管 app uid 和显式绑定的系统 app 域，系统进程
-            // 始终留系统后端）。要恢复“只看 scoop / target.txt”就在面板里关掉。
+            // 默认开：接管 app uid 和显式绑定的系统 app 域，系统进程始终留系统后端。
+            // 要恢复“只看 scoop / target.txt”就在面板里关掉。
             global_scope: true,
             allow_system_sids: vec!["engineermode".to_string()],
             system_sid_packages: BTreeMap::from([(
@@ -277,30 +262,15 @@ pub fn get() -> Arc<InjectorConfig> {
     apply_clienta_overrides(base)
 }
 
-/// Applies the legacy A-side files to the effective config:
-///
-/// * `/data/misc/keystore/ommega/target.txt` — the packages ticked in the webroot
-///   UI replace `scoop` outright (an empty file means "nothing ticked"); the file
-///   being absent leaves `scoop` alone.
-/// * `/data/misc/keystore/ommega/config` — its `global_scope` key switches on
-///   "intercept every app" mode.
-///
-/// Both files are re-read on every `get()`, so toggling either one in the
-/// WebUI takes effect without restarting the injector.  An absent or unreadable
-/// file leaves the base config unchanged.
-/// 这两个 legacy 文件（`target.txt` 和扁平 `config`）以前每笔 `get()` 都要重新
-/// 读一遍、解析一遍，而 `get()` 就在每笔 binder 调用的路上。它们的改动频率和
-/// 调用频率差着好几个数量级，所以最多每 200ms 重看一次，中间直接复用上次结果
-/// （热路径上只剩一次锁 + 一次 `Instant::elapsed`）。
+/// legacy 文件（`target.txt` / 扁平 `config`）的复查间隔：`get()` 在每笔 binder
+/// 调用路上，文件改动远慢于调用频率，最多每 200ms 重看一次。
 const CLIENTA_OVERRIDE_TTL: Duration = Duration::from_millis(200);
 
 struct ClientaOverrides {
     /// `target.txt` 里的包名（已去重、已脱掉 `!`/`?` 后缀）。
     ///
-    /// `None` = 文件不存在或读不出来 —— 面板没碰过作用域页，沿用 `injector.toml`
-    /// 的 `scoop` 默认值；`Some(vec![])` = 面板明确一个都没勾，这时候就该一个都
-    /// 不接管（之前空的也当“没配过”处理，结果默认那六个照样生效，2026-10-17 报
-    /// 上来「作用域全没勾、密钥认证还是被接管」）。
+    /// `None` = 文件不存在或读不出来，沿用 `injector.toml` 的 `scoop`；`Some(vec![])`
+    /// = 面板明确一个都没勾，这时候就不接管任何包。
     target: Option<Vec<String>>,
     scope_override: Option<bool>,
 }
@@ -330,17 +300,18 @@ fn clienta_overrides() -> Arc<ClientaOverrides> {
     fresh
 }
 
+/// 把 legacy A-side 文件叠加到有效配置上：`target.txt` 的包名直接替换 `scoop`
+/// （文件在但为空 = 一个都不勾；文件不存在 = 保持原列表），扁平 `config` 的
+/// `global_scope` 键切换「接管所有应用」。读不到文件就保持基础配置不变。
 fn apply_clienta_overrides(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
     let overrides = clienta_overrides();
-    // Tri-state: a `global_scope` key present in the flat config wins; when the
-    // key is absent the `injector.toml` value is kept.  The WebUI always writes
-    // the key, so unchecking the box there really turns the mode off.
+    // Tri-state: a `global_scope` key present in the flat config wins; when it is
+    // absent the `injector.toml` value is kept.  The WebUI always writes the key.
     let scope_changed = overrides
         .scope_override
         .is_some_and(|value| value != base.filter.global_scope);
-    // 作用域的唯一事实源是面板写的 `target.txt`：文件在（哪怕内容是空的）就以它为准，
-    // 不再把 `injector.toml` 里的 `scoop` 默认套餐进来。只有文件根本不存在时才回退
-    // 到默认值 —— 那样刚装完、还没开过面板的设备仍然有可用的默认作用域。
+    // 作用域的唯一事实源是面板写的 `target.txt`：文件在（哪怕空的）就以它为准，
+    // 只有文件根本不存在时才回退到 `injector.toml` 的默认值。
     if overrides.target.is_none() && !scope_changed {
         return base;
     }
@@ -349,12 +320,10 @@ fn apply_clienta_overrides(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
         merged.filter.global_scope = value;
     }
     if let Some(list) = overrides.target.as_ref() {
-        // 非全局模式：作用域只看面板勾的那份（`target.txt`），不再自动塞内置包。
-        //
-        // 全局模式：把 `system_sid_packages`（工程模式那类系统 app 域）补回来。
-        // 它们的包名命中 ROM 前缀，只有显式列入才过得了 `RejectedSystemPackage`；
-        // GMS / 商店不需要补——`GLOBAL_SCOPE_ALWAYS` 已经让它们不算系统包，
-        // 全局模式下自然接管。
+        // 非全局模式：作用域只看面板勾的那份（`target.txt`），不自动塞内置包。
+        // 全局模式：把 `system_sid_packages`（工程模式那类系统 app 域）补回来——它们
+        // 的包名命中 ROM 前缀，只有显式列入才过得了 `RejectedSystemPackage`；
+        // `GLOBAL_SCOPE_ALWAYS` 已让 GMS / 商店不算系统包，无需补。
         let mut effective = list.clone();
         if merged.filter.global_scope {
             for packages in base.filter.system_sid_packages.values() {
@@ -402,14 +371,10 @@ fn clienta_global_scope_override() -> Option<bool> {
     clienta_config_bool(Path::new(CLIENTA_CONFIG_PATH), &["global_scope"])
 }
 
-/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`),
-/// or `None` when the file or key is absent.
-///
-/// Read straight from the file, not through the injector config: logging is
-/// initialised before (and independently of) the config, and inside a target
-/// that cannot open the flat file — the SOTER host runs as uid 1000, the file
-/// lives in a 0770 keystore-owned directory — the read fails and logging falls
-/// back to off.
+/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`), or
+/// `None` when the file or key is absent.  Read from the file directly: logging is
+/// initialised before the config, and a target that cannot open the flat file
+/// (SOTER host, uid 1000) keeps logging off.
 pub fn clienta_debug_logging() -> Option<bool> {
     // 先看启动器（daemon-injector，root）读完之后写下的两份副本：`/data/misc` 那份
     // system_app 读得到（SOTER 宿主走它），`/data/adb` 那份 root/su 域读得到。
@@ -425,13 +390,10 @@ pub fn clienta_debug_logging() -> Option<bool> {
     )
 }
 
-/// Reads one boolean key out of a flat `key: value` config file.  `None` when
-/// the file is unreadable or the key is missing; a present key always wins, so
-/// `false` has to be spelled out to turn something off.
-///
-/// 跟 keymint 侧 `src/config.rs` 的 `parse_flat_config` 是同一套格式，但这里是独立
-/// crate（payload），而且要多照顾一条「uid 1000 读不到真配置、用启动器写下的副本」
-/// 的路，所以没共享实现。**改 `key: value` 的格式时两边都要动。**
+/// Reads one boolean key out of a flat `key: value` config file.  `None` when the
+/// file is unreadable or the key is missing; a present key always wins, so `false`
+/// has to be spelled out to turn something off.  Same format as `parse_flat_config`
+/// on the keymint side, so change both.
 fn clienta_config_bool(path: &Path, keys: &[&str]) -> Option<bool> {
     let contents = fs::read_to_string(path).ok()?;
     for line in contents.lines() {
@@ -470,8 +432,7 @@ fn config_path() -> PathBuf {
         return PathBuf::from(path);
     }
     // 只有一份：keystore 域和 SOTER 宿主域读同一个路径（/data/misc/ommega 是
-    // system_data_file，两边的 sepolicy 都放行了）。以前那份「抄到 app 域」
-    // 的副本已经不存在，不要再读一遍同一个路径假装有 fallback。
+    // system_data_file，两边的 sepolicy 都放行了）。
     PathBuf::from(DEFAULT_CONFIG_PATH)
 }
 
@@ -569,10 +530,8 @@ fn load_or_seed(path: &Path, context: LoadContext) -> Option<InjectorConfig> {
                 error
             );
             if matches!(context, LoadContext::Startup) {
-                // 启动时读不到（典型：payload 落进读不到 keystore 目录的域，
-                // 比如 SOTER 宿主 uid 1000）就把注入关了——这是故意的，宁可什么都不做
-                // 也别拿默认配置去拦。说清楚是“关了”，别写成“保持现有配置”让人以为
-                // 还在干活。
+                // 启动时读不到（典型：payload 落进读不到 keystore 目录的域，比如
+                // SOTER 宿主 uid 1000）就关掉注入——宁可什么都不做，也别拿默认配置去拦。
                 let mut config = current_config_snapshot();
                 config.main.enabled = false;
                 log::warn!(

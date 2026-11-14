@@ -322,12 +322,7 @@ mod test {
             .context(err!("legacy expand failed"))
     }
 
-    /// 原来是拿一份"旧版固定输出"当向量，可那份向量用现在的实现怎么都复现不出来：
-    /// 换 `LegacyTruncated` 的 ECDH 不行，把 pbkdf2 的 password/salt 调个个儿也不行。
-    /// 密钥派生这条路是严格对称的（拿着 recipient 私钥和 sender 公钥就能把
-    /// `agree_key` 那一串原样重算），所以只要向量出自当前代码就一定解得开，
-    /// 解不开只能是它出自另一套参数。那份向量到此为止，改成现场走一遍 legacy
-    /// 加密再解回来 —— 至少钉住这条兼容路径本身是通的。
+    /// 钉住 legacy 消息的兼容路径：现场走一遍 legacy 加密再解回来。
     #[test]
     fn test_ommega_legacy_message_can_be_decrypted() -> Result<()> {
         let recipient = ECDHPrivateKey::generate()?;

@@ -24,13 +24,11 @@
 //! `tls_insecure` (default true) accepts any server certificate — matching the
 //! B-side client behaviour.
 //!
-//! One long-lived reqwest client is kept in a cache and picked per request from
-//! the current `tls_insecure` config value and the outgoing interface the
-//! traffic should use (see `desired_iface`).  The client carries its own internal
-//! connection pool, so concurrent requests are not serialised through a single
-//! Mutex — fixing the previous single-connection pool bottleneck.  reqwest also
-//! natively supports chunked transfer encoding and HTTP keep-alive, both of which
-//! the hand-written client did not.
+//! One long-lived client per (`tls_insecure`, bound interface) is kept in
+//! `CLIENT_CACHE`, picked per request from the current config value and the
+//! outgoing interface traffic should use (see `desired_iface`).  Each client
+//! carries its own connection pool, so concurrent requests are not serialised
+//! through a single Mutex.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -53,19 +51,18 @@ pub struct RemoteRelay;
 
 /// A cached client together with the inputs it was built from.
 ///
-/// The interface is part of the identity because it follows VPN state: pinning
-/// it in a `OnceLock` the way `tls_insecure` used to be pinned would freeze
-/// whatever was decided the first time a request went out.
+/// The interface is part of the identity: it follows VPN state, so it must not
+/// be pinned once for the process lifetime.
 struct CachedClient {
     insecure: bool,
     iface: Option<String>,
     client: Client,
 }
 
-/// The connection pool.  Keyed by (`tls_insecure`, bound interface) and kept for
-/// a few combinations at once: 「不绑接口」的那份和探测出来的绑定接口那份要同时
-/// 活着，否则一笔请求先走默认路由、下一笔走绑定，两份会互相把对方的连接池
-/// 踢掉，每次都重开 TCP。
+/// The connection pool.  Keyed by (`tls_insecure`, bound interface), a few
+/// combinations kept at once: the unbound client and the probe-picked bound one
+/// must coexist, otherwise consecutive requests evict each other's pool and
+/// reopen TCP every time.
 static CLIENT_CACHE: Mutex<Vec<CachedClient>> = Mutex::new(Vec::new());
 
 fn cached_client(insecure: bool, iface: Option<String>) -> Result<Client> {
@@ -91,10 +88,7 @@ fn cached_client(insecure: bool, iface: Option<String>) -> Result<Client> {
 }
 
 /// 不探测、不绑接口的 client：直接交给 OS 默认路由。
-///
-/// 正常网络下这就是最快的一条路，一个往返就完事；探测只在真的有 VPN 吞流量时
-/// 才有意义，不能拿它给每一笔请求都加一道前置开销（实测一次探测就是 0.3~0.5s，
-/// 打开一次 KeyAttestation 就白等半秒）。
+/// 探测只在真有 VPN 吞流量时才有意义，每笔请求都探一次是 0.3~0.5s 的纯开销。
 fn unbound_client() -> Result<Client> {
     let insecure = config::config()
         .read()
@@ -132,9 +126,8 @@ fn build_client(insecure: bool, iface: Option<&str>) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .timeout(Duration::from_millis(READ_TIMEOUT_MS))
-        // 空闲连接留久一点：原来用 reqwest 默认的 90s，而 attest 这类请求隔几分钟
-        // 才来一笔，次次都落到「池里没可用连接」上，每一笔白付一个 TCP 握手的往返。
-        // 300s 覆盖得掉正常使用节奏，又不会把死连接留太久（下面还有 keepalive 探活）。
+        // 空闲连接留 300s：attest 这类请求隔几分钟才来一笔，用默认 90s 会次次都
+        // 落到「池里没可用连接」上，每笔白付一个 TCP 握手；死连接由 keepalive 兜。
         .pool_idle_timeout(Duration::from_secs(300))
         .pool_max_idle_per_host(8)
         .tcp_keepalive(Duration::from_secs(30))
@@ -188,21 +181,15 @@ const SYS_CLASS_NET: &str = "/sys/class/net";
 
 /// Decides which interface (if any) this request should leave from.
 ///
-/// Why bind at all: with a VPN up, the OS steers ordinary traffic into the
-/// tunnel — netd points the connection's fwmark at the VPN network and the
-/// default route ends up on `tun`.  Traffic to our own relay server gets caught
-/// by the same rules, so it goes through the tunnel too: slower, jittery, and in
-/// the bad cases simply unreachable.  The only way to keep a socket out of that
-/// is to name its outgoing device (`SO_BINDTODEVICE`, which is what reqwest's
-/// `.interface()` sets).
+/// With a VPN up, netd steers ordinary traffic into the tunnel, and traffic to
+/// our own relay server is caught by the same rules — slower, jittery and in the
+/// bad cases simply unreachable.  The only way out is `SO_BINDTODEVICE` (what
+/// reqwest's `.interface()` sets).
 ///
-/// With no VPN up nothing is touched at all: an unbound socket interferes least
-/// and keeps the OS's own "WiFi dropped, fall back to cellular" switching, so a
-/// healthy machine is finished right there.  With a VPN the system default route
-/// is tried first — if the relay answers over it, nothing is bound either; only
-/// when that route cannot reach the relay (the VPN swallowed the traffic, or the
-/// default route points at a dead upstream) is an uplink picked.  Nothing usable
-/// leaves the socket unbound as well.
+/// Ladder: no VPN → bind nothing, keeping the OS's own "WiFi dropped, fall back
+/// to cellular" switching.  With a VPN, the OS default route is tried first and
+/// only a route that cannot reach the relay makes an uplink get picked; nothing
+/// usable also leaves the socket unbound.
 ///
 /// The file-reading step is not cached (it is cheap); the steps that send probes
 /// are, see `PICK_TTL`.
@@ -271,20 +258,14 @@ struct CachedPick {
     at: Instant,
 }
 
-/// How long a pick is trusted.  A link that dies is re-picked after at most this
-/// long; much shorter and the cache does nothing.
-///
-/// 选了具体接口之后要能「一段时间内优先走它」，不然每 5 秒一次探测（一次完整 HTTP
-/// 往返）把省下的延迟又吃回去。断网由两个机制兜：探测失败会重新选，请求失败会调
-/// `invalidate_pick()` 把这份缓存清掉。
+/// How long a pick is trusted: a dead link is re-picked after at most this long,
+/// much shorter and the cache does nothing.  Losing the network is covered by
+/// re-probing on failure and by `invalidate_pick()` on request failure.
 const PICK_TTL: Duration = Duration::from_secs(60);
 
-/// 「结论是不绑接口」的缓存时间，比选中某个接口长得多。
-///
+/// 「结论是不绑接口」的缓存时间，跟选中某个接口的一样长。
 /// unbound 就是把包交给 OS 默认路由：换网、Wi-Fi 掉到蜂窝、VPN 断开都能自己跟随，
-/// 没有任何需要重探的理由。而选中具体接口的那份才要短 TTL —— 那条路是真的会断。
-/// 每次探测是一个完整的 HTTP 往返（实测 0.3~0.5s，开着 VPN 时的冷启动必走），
-/// 5 秒就过期的话，打开一次 KeyAttestation 就白等半秒。
+/// 没有需要重探的理由；选中具体接口的那份才是真的会断。
 const PICK_TTL_UNBOUND: Duration = Duration::from_secs(60);
 
 fn cached_pick(bind_iface: &str, base_url: &str) -> Option<Option<String>> {
@@ -314,9 +295,7 @@ fn store_pick(bind_iface: &str, base_url: &str, iface: Option<String>) {
 }
 
 /// 把选路缓存清掉。
-///
-/// 只在「按这个选路出去结果没通」的时候调（Wi-Fi 刚断、切网、VPN 拉起）：
-/// 缓存的有效期是 PICK_TTL，但那条路是真的会死的，不能等到过期。
+/// 只在「按这个选路出去结果没通」的时候调：TTL 到点之前，那条路可能已经死了。
 fn invalidate_pick() {
     if let Ok(mut guard) = PICK_CACHE.lock() {
         *guard = None;
@@ -324,18 +303,14 @@ fn invalidate_pick() {
 }
 
 /// Whether a VPN is currently up.  `VpnService` always leaves a `tun` device in
-/// `/sys/class/net`, the older pptp/l2tp paths leave a `ppp` and bridged VPNs
-/// leave a `tap` — an Android-wide convention, not something that varies per
-/// device model.
+/// `/sys/class/net`, older pptp/l2tp paths a `ppp`, bridged VPNs a `tap`.
 ///
-/// The name alone is not enough, it has to actually be up: `tunl0` / `ip6tnl0`
-/// are kernel-default tunnel devices that sit in the same directory forever
-/// (measured `flags=0x80`, i.e. down, with no address); counting one of those as
-/// "a VPN is up" makes `auto` fire a useless probe every cycle.
+/// The name alone is not enough, it has to be up: `tunl0` / `ip6tnl0` are
+/// kernel-default tunnel devices that sit there forever and are down.
 ///
 /// It only decides whether picking starts: missing one means "behave like there
-/// is no VPN" (nothing is bound), never a wrong link, and a false positive costs
-/// at most one extra probe.
+/// is no VPN" (nothing is bound), never a wrong link; a false positive costs at
+/// most one extra probe.
 fn vpn_present() -> bool {
     // 每笔请求都会问到（auto 模式下）；readdir `/sys/class/net` + 每个接口
     // 读 flags，同样存 3 秒。
@@ -371,8 +346,7 @@ fn is_vpn_name(name: &str) -> bool {
 /// hex string whose lowest bit is IFF_UP.
 ///
 /// Unreadable (SELinux denies it in some domains) counts as up: one extra probe
-/// is cheaper than missing a real VPN, which would mean not picking at all and
-/// falling back to a default route the VPN may well have swallowed.
+/// is cheaper than missing a real VPN and not picking at all.
 fn iface_is_up(name: &str) -> bool {
     match std::fs::read_to_string(format!("{SYS_CLASS_NET}/{name}/flags")) {
         Ok(text) => u32::from_str_radix(text.trim().trim_start_matches("0x"), 16)
@@ -410,9 +384,8 @@ fn pick_uplink(base_url: &str) -> Option<String> {
 /// Whether this interface looks like a real network card rather than a tunnel,
 /// bridge or dummy device.
 ///
-/// Names are never consulted: they are whatever the vendor and the kernel felt
-/// like calling things, and nobody can pre-list a vendor tunnel such as
-/// `vgate0`.  What the kernel says about the device is what counts:
+/// Names are never consulted: a vendor tunnel such as `vgate0` cannot be
+/// pre-listed.  What the kernel says about the device is what counts:
 ///
 /// - `/sys/class/net/<n>/device` exists only for devices hanging off a bus
 ///   (PCIe / SDIO / USB); tun, dummy, bridges and vlan interfaces have none.
@@ -435,11 +408,9 @@ fn physical_like(name: &str) -> bool {
 
 /// The relay's liveness endpoint, and the body it answers with.
 ///
-/// `/api/ping/` returns a fixed `pong` without touching any state, which makes it
-/// the right probe target: cheap enough to hit while picking an interface, and
-/// its body identifies the relay.  Probing `/` instead would accept any HTTP
-/// answer, including one from a captive portal or a carrier interstitial that
-/// swallowed the request.
+/// `/api/ping/` returns a fixed `pong` without touching any state: cheap enough
+/// to hit while picking an interface, and its body identifies the relay.
+/// Probing `/` instead would accept any HTTP answer, including a captive portal.
 const PING_PATH: &str = "/api/ping/";
 const PING_BODY: &str = "pong";
 
@@ -455,19 +426,14 @@ fn probe_url(base_url: &str) -> String {
 
 /// Whether traffic sent through `iface` actually reaches the relay server.
 ///
-/// Holding an IPv4 address is not the same as having a working route.  A phone
-/// joined to a WiFi network whose upstream is down — or stuck behind a captive
-/// portal — still gets a DHCP lease, so `wlan0` looks perfectly healthy while
-/// everything sent through it disappears.  Ranking by name alone then picks
-/// WiFi forever and forwarding is dead until the user finds a working network.
-///
-/// A short request is the only honest test, and the endpoint answers a known
-/// body: a transport failure means the interface cannot carry the request, while
-/// an answer that is not `pong` means something in between swallowed it.
+/// Holding an IPv4 address is not the same as having a working route: a phone on
+/// a WiFi network with a dead upstream still gets a DHCP lease.  A short request
+/// is the only honest test — a transport failure means the interface cannot
+/// carry the request, an answer that is not `pong` means something in between
+/// swallowed it.
 ///
 /// `None` probes whichever route the OS picks on its own — the "does the default
-/// path reach the relay at all" question that decides whether anything has to be
-/// bound.
+/// path reach the relay at all" question.
 fn probe_iface(iface: Option<&str>, base_url: &str) -> bool {
     // Nothing to probe against (unconfigured or malformed URL) — do not turn a
     // configuration problem into "no interface works".
@@ -496,15 +462,10 @@ fn probe_iface(iface: Option<&str>, base_url: &str) -> bool {
 /// Races the candidate uplinks against each other and returns whichever one
 /// answers the probe first.
 ///
-/// Racing rather than ranking is what makes the choice self-correcting: a WiFi
-/// link whose upstream died simply never answers, so it loses on its own —
-/// nobody has to notice it is dead and nobody waits for a cached decision to
-/// expire.  The losers' probes only ever send a harmless GET and are dropped;
-/// a blocking request cannot be cancelled, and none is needed.
-///
-/// Only the probe races.  The real request still goes out exactly once, over the
-/// winner: attestation is not idempotent, and sending it down both links would
-/// make the B-side TEE do the work twice.
+/// Racing is self-correcting: a WiFi link whose upstream died never answers and
+/// loses on its own.  Only the probe races; the real request goes out exactly
+/// once, over the winner — attestation is not idempotent, and sending it down
+/// both links would make the B-side TEE do the work twice.
 fn race_uplink(candidates: &[String], base_url: &str) -> Option<String> {
     if candidates.is_empty() {
         return None;
@@ -551,11 +512,9 @@ fn race_with(
             Some(winner)
         }
         // Nothing answered.  Leave the socket unbound rather than pinning a link
-        // that just failed to reach the relay: binding one anyway would put us
-        // back where this started — stuck on a WiFi link that carries nothing —
-        // and an unbound socket at least lets the OS follow the network.  This
-        // also covers a `url` that resolves through the tunnel (Clash fake-IP),
-        // where no physical link can ever answer.
+        // that just failed: an unbound socket at least lets the OS follow the
+        // network.  This also covers a `url` that resolves through the tunnel
+        // (Clash fake-IP), where no physical link can ever answer.
         Err(_) => {
             log::warn!(
                 "no uplink answered a probe; leaving the socket unbound (candidates: {})",
@@ -587,16 +546,14 @@ fn ifaces_with_ipv4() -> Vec<String> {
 /// The interfaces that hold an IPv4 route right now, split into (looks like a
 /// real NIC, everything else), each group best first.
 ///
-/// An interface has to appear in `/proc/net/route` to count at all: that is what
-/// proves it currently carries an IPv4 route, and binding to a device without
-/// one means binding to an empty shell.  No name is filtered here — a name list
-/// goes stale the moment another vendor shows up, and a missed real uplink is a
-/// worse failure than an extra probe.  Reachability is decided by `probe_iface`.
+/// An interface has to appear in `/proc/net/route` to count at all.  No name is
+/// filtered here — a name list goes stale as soon as another vendor shows up, and
+/// a missed real uplink is worse than an extra probe.  Reachability is decided
+/// by `probe_iface`.
 ///
 /// `operstate` that says `down` is skipped, but an *unreadable* one is not
 /// (SELinux denies it in some domains): `/proc/net/route` already proved the
-/// route exists.  Cellular interfaces report `unknown`, so that value has to
-/// pass too.
+/// route exists.  Cellular reports `unknown`, so that value has to pass too.
 fn candidates() -> (Vec<String>, Vec<String>) {
     let with_ip = ifaces_with_ipv4();
     if with_ip.is_empty() {
@@ -616,11 +573,8 @@ fn candidates() -> (Vec<String>, Vec<String>) {
 
 /// 本机有没有任何非环回的 IPv4 地址（跟选哪张路由表无关）。
 ///
-/// `/proc/net/route` 只反映主表（main）。Android 从某个版本起把默认路由放进按接口
-/// 分的表里（`rmnet_data3` 这种，靠 fwmark 规则选表），主表空着 —— 只认
-/// `/proc/net/route` 就会把「蜂窝正常在用」判成离线，远程那一路整段被跳过，SOTER /
-/// attest 全落本地兜底（OnePlus PKG110 / Android 16 上实测过）。
-/// `/proc/net/fib_trie` 是内核 FIB 的全量视图，不分表，拿它补这一刀。
+/// `/proc/net/route` 只反映主表（main），而 Android 把蜂窝默认路由放进按接口分的表
+/// （靠 fwmark 规则选表），主表空着；`/proc/net/fib_trie` 是内核 FIB 全量视图，用它补。
 fn has_ipv4_address() -> bool {
     let Ok(text) = std::fs::read_to_string("/proc/net/fib_trie") else {
         // 读不到就当有：宁可多发一次请求，也别把能用的网络判成离线。

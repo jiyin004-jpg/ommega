@@ -1,9 +1,8 @@
 //! A 端 SOTER 接替转发的线协议：payload 问「这笔 HAL 调用该由谁答」，daemon 回结论。
 //!
-//! 为什么要有这个协议：拦下调用的是注入在 SOTER 宿主里的 payload，而宿主是 uid 1000，
-//! 读不到 A 端配置（`/data/misc/keystore/ommega` 是 0770 的 keystore 目录，`debug_logging`
-//! 就是为此另做了一份 `log_flag` 副本）；所以「走远程还是本地」不能由 payload 自己判断，
-//! 得问跑在别处的 daemon（见 `top.jiyin004.ommega.IMaintenanceService.forwardSoter`）。
+//! 拦下调用的是注入在 SOTER 宿主里的 payload，宿主是 uid 1000、读不到 A 端配置（0770 的
+//! keystore 目录），所以「走远程还是本地」不能由 payload 自己判断，得问跑在别处的 daemon
+//! （`top.jiyin004.ommega.IMaintenanceService.forwardSoter`）。
 //!
 //! blob 布局（小端，两个 crate 共用这一份实现，谁也别另写一套）：
 //!
@@ -37,10 +36,9 @@ pub const NO_DATA: u32 = u32::MAX;
 
 /// HAL 号码 ↔ op 名。
 ///
-/// **14 槽排布（2 / 6 / 14 是空号）**：这是 NX721J 上 soterserver 实际发的形状 ——
-/// 实测它发 code 5 / 9 时只带 uid，正好对应 `generateAskKeyPair(int)` 和
-/// `hasAskAlready(int)`。APK 里那份 `ISoter.java`（1–11 连号）是没被用到的类，
-/// 按它读会把该带的 alias/challenge 读丢（日志里 alias=None）。
+/// **14 槽排布（2 / 6 / 14 是空号）**：soterserver 发 code 5 / 9 时只带 uid，正好对应
+/// `generateAskKeyPair(int)` 和 `hasAskAlready(int)`。APK 里那份 `ISoter.java`（1–11 连号）
+/// 是没被用到的类，按它读会把该带的 alias/challenge 读丢。
 pub const HAL_OPS: [(u32, &str); 11] = [
     (1, "export_ask_public_key"),
     (3, "export_auth_key_public_key"),
@@ -84,20 +82,16 @@ pub fn answers_with_session(op: &str) -> bool {
 // ── 真机 cpu_id 的副本文件 ──────────────────────────────────────────────
 //
 // SOTER 的身份是 `(cpu_id, uid)` 绑在一起的，而这个号只有真机（B 端 TEE）有。A 端
-// daemon 跟服务端要一次 `get_device_id`（服务端只会让真机答这个 op）学到真值，写到
-// 下面这两份；payload 读它，本地自签那套就报跟真机一模一样的号。不这么做的话，
-// 本地答一个号、服务端造一个号、真机又是另一个，检测器两次一对比就报「不一致」。
+// daemon 跟服务端要一次 `get_device_id`（服务端只会让真机答这个 op）学到真值并写到
+// 下面这份，payload 读它，本地自签那套就报跟真机一模一样的号 —— 两边各答一个号的话
+// 检测器两次一对比就报「不一致」。
 //
-// 两个位置对应两个域：
-// - `/data/misc/ommega/`：启动器（root）从 keystore 域镜像过来的那份，SOTER 宿主是
-//   uid 1000、进不去 0770 的 keystore 目录，本地兜底那套只能读这一份；
-// - `/data/misc/keystore/ommega/`：daemon 自己写的那份（它跑在 keystore uid 里，
-//   只有这个目录写得动），keystore 域里的 payload 读得到。
+// 位置定在 `/data/misc/ommega/`：SOTER 宿主是 uid 1000，进不去 0770 的 keystore 目录。
 
 /// 副本文件按顺序找，先读到的算（现在只有一个位置）。
 pub const CPU_ID_PATHS: [&str; 1] = ["/data/misc/ommega/soter_cpu_id"];
 
-/// daemon 写的那一份。数据根已统一到 /data/misc/ommega，不再往 keystore 目录写副本。
+/// daemon 写的那一份（数据根统一在 `/data/misc/ommega`）。
 pub const CPU_ID_WRITE_PATH: &str = "/data/misc/ommega/soter_cpu_id";
 
 /// 环境变量覆盖（测试、临时探针用）。
@@ -105,17 +99,15 @@ pub const CPU_ID_ENV: &str = "OMMEGA_SOTER_CPU_ID";
 
 /// 真机 cpu_id 的形状：32 个十六进制字符。
 ///
-/// 不卡 `09000000` 前缀：换个代次或者换个 TEE 实现的号头不一样，那时这个判断会
-/// 把真值当成废值丢掉，比放宽它坑。
+/// 不卡 `09000000` 前缀：换代次或换 TEE 实现后号头不一样，卡死会把真值当废值丢掉。
 pub fn is_cpu_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// 从副本文件的内容里抠出 cpu_id。
 ///
-/// 认 `soter_cpu_id: <值>` 这种扁平写法（跟 `log_flag` 一个格式），也认整个文件
-/// 就一行光秃秃的值；别的键、注释、空行都跳过。抠不出合法值就返回 `None`，调用方
-/// 自己决定用什么兜底 —— 这里绝不猜。
+/// 认 `soter_cpu_id: <值>` 这种扁平写法（跟 `log_flag` 一个格式），也认整个文件就一行
+/// 光秃秃的值；别的键、注释、空行都跳过。抠不出合法值返回 `None`，这里绝不猜。
 pub fn parse_cpu_id(text: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
@@ -137,8 +129,8 @@ pub fn parse_cpu_id(text: &str) -> Option<String> {
 
 /// 一笔调用的去处，以及远程给的答案本体。
 ///
-/// 形状跟 payload 本地那套 `Answer` 是一一对应的，转换放在 payload 里做 —— 这个模块
-/// 不认识 `Answer`，它只负责把字节摆平。
+/// 形状跟 payload 本地那套 `Answer` 一一对应，转换放在 payload 里做：这个模块不认识
+/// `Answer`，只负责把字节摆平。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// 只有状态码。

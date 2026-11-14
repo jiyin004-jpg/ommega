@@ -1,13 +1,11 @@
-//! 第二种让本机真 TEE 按 A 端日期出链的做法：**运行中直接改 KeyMint TA 的
+//! 让本机真 TEE 按 A 端日期出链的第二种做法：**运行中直接改 KeyMint TA 的
 //! attestation 配置**，不碰系统属性、不弹 keymint HAL、也不重启 keystore2。
 //!
-//! 第一种（[`super::patchlevel`]）是 resetprop + 弹 HAL 重读，秒级、全局生效；
-//! 这一种是往 TA 发两条命令（`keymint_set_version` + `configure`），单次 0.5ms，
-//! 签完立刻发回基线。代价是它只认高通那套 `KeymasterUtils` 通道，而且要在
-//! `uid 1000` 的进程里跑 —— 所以设备侧是独立的 `spl_daemon`（`native/spl/`），
-//! 我们这边只是它的一个 socket 客户端。
+//! 边界：只认高通那套 `KeymasterUtils` 通道，且必须在 `uid 1000` 的进程里跑 ——
+//! 设备侧是独立的 `spl_daemon`（`native/spl/`），我们这边只是 socket 客户端。
+//! 第一种做法是 [`super::patchlevel`]（resetprop + 弹 HAL 重读，秒级、全局生效）。
 //!
-//! 协议（abstract unix socket `@spl-daemon`，见 `native/spl/README.md`）：
+//! 协议（abstract unix socket `@spl-daemon`）：
 //!
 //! ```text
 //! APPLY <os> <sys> <vendor> [flag] [hold_ms]   ->  OK applied us=.. rc=..
@@ -15,10 +13,8 @@
 //! STATUS                                       ->  OK base=os/sys/vendor/flag cur=.. applied=.. hold_ms_left=..
 //! ```
 //!
-//! 窗口期就是「APPLY 到 RESTORE」这一段（实测 0.5ms 下发 + 签发那几十毫秒），
-//! 期间别的 App 发起认证也会看到目标值 —— 跟第一种一样，只是窗口短得多。
-//! daemon 自己还有看门狗：hold_ms 到点没等到 RESTORE 就回基线，relay 中途挂掉
-//! 也不会把假日期留在设备上。
+//! 窗口期是 APPLY 到 RESTORE 这一段（正常 0.5ms 下发 + 签发几十毫秒），期间别的
+//! App 认证也会看到目标值。daemon 自带看门狗：hold_ms 到点没等到 RESTORE 就回基线。
 
 use std::io::{Read, Write};
 #[cfg(target_os = "android")]
@@ -38,7 +34,7 @@ pub const METHOD_KEY: &str = "OMMEGA_RELAY_PATCHLEVEL_METHOD";
 const SOCK_NAME: &str = "spl-daemon";
 /// APPLY/RESTORE 正常都是亚毫秒到几毫秒；这个值只是防止卡死在 socket 上。
 const IO_TIMEOUT: Duration = Duration::from_millis(800);
-/// 连着失败就别每笔都白等一次超时，先退回第一种跑一会儿。
+/// 连着失败就先冷一会儿，别每笔都白等一次超时。
 const FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,7 +86,7 @@ fn request(line: &str) -> Result<String> {
         .with_context(|| format!("connect @{SOCK_NAME}（daemon 没起来？）"))?;
     sock.set_read_timeout(Some(IO_TIMEOUT)).ok();
     sock.set_write_timeout(Some(IO_TIMEOUT)).ok();
-    // 一次写完：daemon 读完就 reply 然后 close，分两次写的话第二段会 EPIPE
+    // 一次写完：daemon 读完就 reply 然后 close，分两次写的第二段会 EPIPE
     // （命令本身已经到了，但这个错误会被当成「RESTORE 失败」报出来）。
     sock.write_all(format!("{line}\n").as_bytes())
         .context("write to spl daemon")?;
@@ -246,7 +242,7 @@ impl Drop for LiveGuard {
             return;
         }
         if let Err(e) = self.restore() {
-            // daemon 的看门狗会兜底（APPLY 时带了 hold），这里只记一下。
+            // daemon 的看门狗会兜底（APPLY 时带了 hold_ms），这里只记一下。
             log::warn!("spl live: 回基线失败（交给 daemon 看门狗）：{e:#}");
         }
     }
@@ -259,13 +255,13 @@ pub fn apply_from_payload(payload: &Value, hold_ms: u32) -> Result<LiveGuard> {
         return Err(anyhow!("上次失败还没过冷却期"));
     }
     let st = status().inspect_err(|_| note_failure())?;
-    // 目标值 = 请求里要的那组；请求没带就用本机基线。注意不能因为
-    // 「请求值 == 基线」就直接跳过 —— daemon 最后下发的 `cur` 也可能是
-    // 上一次留下的（上一笔 RESTORE 没走到），不补一次 APPLY 就纠不回来。
+    // 目标值 = 请求里要的那组；请求没带就用本机基线。不能因为「请求值 == 基线」
+    // 就直接跳过 —— daemon 最后下发的 `cur` 也可能是上一笔留下的（RESTORE 没走到），
+    // 不补一次 APPLY 就纠不回来。
     let want = values_from_payload(payload, &st.base).unwrap_or(st.base);
     if want == st.cur {
-        // daemon 最后下发的就是它：可能上一笔的 RESTORE 没走到，但值已经是
-        // 我们要的，直接沿用，不再开一次窗口。
+        // daemon 最后下发的就是它：上一笔 RESTORE 可能没走到，但值已经是我们
+        // 要的，直接沿用，不再开一次窗口。
         return Ok(LiveGuard {
             restored: true,
             sent: want,

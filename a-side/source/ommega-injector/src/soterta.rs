@@ -1,13 +1,9 @@
-//! 软件 SOTER TA。
+//! 软件 SOTER TA：接管 `vendor.qti.hardware.soter.ISoter/default`，用本地软件实现应答。
+//! 原厂这个服务只是 TEE 里 applet 的薄代理，applet 起不来时整族调用一律 -20。
 //!
-//! 原厂 `vendor.qti.hardware.soter.ISoter/default` 只是 TEE 里那个 applet 的薄代理，
-//! applet 起不来时整族调用一律 -20（PKG110 / 安卓 15 实测），宿主和应用一起哑，产线
-//! 工具（工程模式那页）也跟着报红。这里把服务名原样接过来，用我们自己的软件实现应答，
-//! 调用方（soterserver、oplus 的 cryptoeng）一行都不用改。
-//!
-//! 号码表跟宿主 dex 里 `ISoter$Stub$Proxy` 对过：1/3/4/5/7/8/9/10/11/12/13 是运行时
-//! 那 11 个方法；2/6/14 原厂 HAL 是空号，只有产线 provisioning（cryptoeng）会调，
-//! 我们用同一套 ASK 顶上，工程模式的 SOTER key 就看 14 号那一笔是不是 0。
+//! 号码表：1/3/4/5/7/8/9/10/11/12/13 是运行时那 11 个方法；2/6/14 原厂 HAL 是空号，
+//! 只有产线 provisioning（cryptoeng）会调，用同一套 ASK 顶上。工程模式的 SOTER key
+//! 看 14 号那一笔是不是 0。
 
 use rsbinder::{
     hub, Binder, Interface, Parcel, Remotable, Result as BinderResult, Stability, TransactionCode,
@@ -19,10 +15,9 @@ use crate::hook::soter_relay;
 
 pub const DEFAULT_SERVICE_NAME: &str = "vendor.qti.hardware.soter.ISoter/default";
 const DEFAULT_DESCRIPTOR: &str = "vendor.qti.hardware.soter.ISoter";
-/// 运行时服务名从哪儿来：soterta.sh 把 VINTF 里读到的 `<name>.<fqname>` 拼好，走这个
-/// 环境变量传进来。各家 SOTER HAL 的接口名不一样（高通 `ISoter`、联发科 / Trustonic
-/// `ITrustonicSoter`、小米另一套），猜错就是「注册了一个没人认的名字」——NX809J /
-/// 安卓 16 上实测：我们的名字没人问、原厂名字又被我们停掉，SOTER 整族哑掉。
+/// 运行时服务名由 soterta.sh 写进 `run/soterta.service`，这里只是环境变量的兜底。
+/// 各家 SOTER HAL 的接口名不一样（高通 `ISoter`、联发科 / Trustonic
+/// `ITrustonicSoter`、小米另一套），猜错就是注册了一个没人认的名字，SOTER 整族哑掉。
 const SERVICE_ENV: &str = "OMMEGA_SOTER_SERVICE";
 
 /// 运行时定下来的接口描述符。`Remotable::descriptor()` 要 `&'static str`，所以只在
@@ -47,7 +42,7 @@ fn descriptor_of(service: &str) -> &'static str {
 }
 
 fn service_name() -> String {
-    // 服务名由 soterta.sh 写到文件里（不再走环境变量：environ 是 root 一句 tr 就能看的）。
+    // 文件优先，环境变量兜底：environ 是 root 一句 tr 就能看的。
     if let Ok(text) = std::fs::read_to_string("/data/adb/ommega/run/soterta.service") {
         let value = text.trim();
         if !value.is_empty() {
@@ -63,19 +58,10 @@ fn service_name() -> String {
 
 /// 只读探针：连上指定服务、发一次 `code`，把回复的前几个字段打出来。
 ///
-/// 用 rsbinder 而不是 libbinder_ndk：rsbinder 是我们自己实现对 /dev/binder 的 ioctl，
-/// 回复的字节完全可控，没有 libbinder 自己的异常包装夹在中间。拿来对「真机 HAL 回的
-/// 长什么样」和「我们回的有没有对上」最直接。
+/// 直接借系统自带的 `service call`：interface 头、稳定性标记、域权限它都按 AOSP 处理好。
+/// 不要改用 rsbinder 的 `as_transactable()`（远程 proxy 恒 None）或 `as_remote()`
+/// （回 UNKNOWN_TRANSACTION），那两条路对活着的服务也拿不到回复。
 pub fn probe(service: &str, code: u32) -> anyhow::Result<String> {
-    // 直接借系统自带的 `service call` 发这一笔。
-    //
-    // 为什么不在进程里自己搭 transact：两个坑都踩过 —— 原先用 `as_transactable()`，
-    // 那个在 rsbinder 里只对**本进程的 Native** 返回 Some，远程 proxy 恒 None，于是
-    // 对着活的好服务也永远报 “is not transactable”（SOTER 明明可用的机器上一样）；
-    // 改用 `as_remote()` 确实发出去了，但拿回来的是 UNKNOWN_TRANSACTION，而同一个
-    // 服务名用 `service call … 8` 就能拿到正常的 device_id。interface 头、稳定性标记、
-    // 域权限这些 `service call` 已经按 AOSP 的做法处理好了，探针只是诊断用的一次性
-    // 命令，没必要再自己复现一遍。
     let out = std::process::Command::new("/system/bin/service")
         .arg("call")
         .arg(service)
@@ -94,10 +80,7 @@ pub fn probe(service: &str, code: u32) -> anyhow::Result<String> {
     Ok(text.lines().map(str::trim).collect::<Vec<_>>().join(" "))
 }
 
-/// 原厂 HAL 声明的 14 个号码。
-/// 号码表：**4 槽排布（2 / 6 / 14 空号）**，这是 NX721J 上 soterserver 实际发的形状。
-/// 依据：实测它发 code 5 / 9 时只带 uid（= generateAskKeyPair / hasAskAlready）；
-/// APK 里那份 1–11 连号的 `ISoter.java` 是没被用到的类，按它读会丢 alias。
+/// 原厂 HAL 声明的 14 个号码（**4 槽排布：2 / 6 / 14 空号**）。
 const EXPORT_ASK_PUBLIC_KEY: u32 = 1;
 const EXPORT_ATTK_PUBLIC_KEY: u32 = 2;
 const EXPORT_AUTH_KEY_PUBLIC_KEY: u32 = 3;
@@ -117,22 +100,21 @@ const VERIFY_ATTK_KEY_PAIR: u32 = 14;
 /// 记成空列表，之后 vendor 客户端按（名字 + 接口名）取服务一律 null。
 const INTERFACE_TRANSACTION: u32 = 0x5f4e_5446;
 
-/// 不同设备 / 不同 SoterService 版本的 HAL 号码排布不一样：
-/// - **4 槽排布（2/6/14 空号）**：NX721J 这类，实测 soterserver 发 9/5 时只带 uid；
-/// - **1–11 连号**：APK 里另一种 `ISoter`，9 是 initSign、7 是 hasAskAlready。
+/// HAL 号码排布有两套：
+/// - **4 槽排布（2/6/14 空号）**：soterserver 发 9 / 5 时只带 uid；
+/// - **1–11 连号**：9 是 initSign、7 是 hasAskAlready。
 ///
-/// 两者对同一个号的含义相反，光看 code 分不出来。但**参数长度能分**：首笔
-/// `hasAskAlready` 在 4 槽里是 9、连号里是 7，而且都只带一个 int（4 字节）。
-/// 于是第一次见到它就定下布局并缓存，之后把连号的号换算成 4 槽的规范号，
-/// 后续所有逻辑只用一套写法。
+/// 两者对同一个号的含义相反，光看 code 分不出来，但**参数长度能分**：首笔
+/// hasAskAlready 在 4 槽里是 9、连号里是 7，都只带一个 int（4 字节）。第一次见到
+/// 就定下布局并缓存，之后把连号的号换算成 4 槽规范号，后续逻辑只用一套写法。
 static LAYOUTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u8>>> =
     std::sync::OnceLock::new();
 const LAYOUT_UNKNOWN: u8 = 0;
 const LAYOUT_14: u8 = 1;
 const LAYOUT_11: u8 = 2;
 
-/// 调用方是谁（`/proc/<pid>/cmdline` 的第一段）。拿不到就给空串，那些调用共用
-/// 一个匿名槽位，行为跟以前的全局判定一样。
+/// 调用方是谁（`/proc/<pid>/cmdline` 的第一段）。拿不到就给空串，那些调用共用一个
+/// 匿名槽位。
 fn caller_key() -> String {
     let pid = rsbinder::get_calling_pid();
     if pid <= 0 {
@@ -153,9 +135,7 @@ fn layout_slot(caller: &str) -> u8 {
 
 /// 布局按**调用方**分开记，不能全局一个值：同一台机器上 soterserver 和第三方检测器
 /// 可能用不同版本的 ISoter 号表（4 槽 vs 1–11 连号），定成一个值会让后到的那个
-/// 客户端全程调到错的方法上。MEIZU 20 Pro（391QYGDJ2244E）实测：SoterChecker 走连号
-/// （7 = hasAskAlready），被按 4 槽解释成 generateAuthKeyPair，于是它读到
-/// hasAsk=false、generate 记 -20、export 记 -5，五项全红。
+/// 客户端全程调到错的方法上。
 fn note_layout(caller: &str, code: u32, avail: usize) {
     if layout_slot(caller) != LAYOUT_UNKNOWN {
         return;
@@ -213,18 +193,13 @@ fn op_name(code: u32) -> &'static str {
 }
 
 /// `int xxx(out byte[] data)` 那一类：返回值 + AIDL 原生 byte[]。
-/// 不是 `SoterBufferReturn` parcelable —— cryptoeng（C++ ndk 客户端）的反汇编里就是
-/// 一个 vector<uint8_t> out 加一个 int 返回，按 parcelable 拼它会在解析时越界崩。
+/// 不是 `SoterBufferReturn` parcelable —— cryptoeng（C++ ndk 客户端）收的就是
+/// vector<uint8_t> out 加一个 int 返回，按 parcelable 拼它会在解析时越界崩。
 ///
-/// 除这一类，其余全按 parcelable 给：soterserver、SoterChecker、工程模式那页都是
-/// Java 客户端，读的就是 `SoterBufferReturn`（[非空标记][总长][byte[]][dataLength]）。
-///
-/// 以前只认 soterserver 一个进程名，其余一律给原生形状 —— 结果所有第三方/自带的 Java
-/// 检测器都把数据解成垃圾（2026-10-20 SoterChecker 报告：`len=825 data=0`、
-/// `short blob len=0`）。反过来判断之后，「给原生」变成一个要手动点名的例外。
-///
-/// 名单：环境变量 `OMMEGA_SOTER_NATIVE_CALLERS`（逗号分隔，按 cmdline 包含匹配）。
-/// 空字符串 = 全部走 parcelable。
+/// 除这一类，其余全按 parcelable 给：Java 客户端读的是 `SoterBufferReturn`
+/// （[非空标记][总长][byte[]][dataLength]）。名单走环境变量
+/// `OMMEGA_SOTER_NATIVE_CALLERS`（逗号分隔，按 cmdline 包含匹配），空字符串 = 全部
+/// 走 parcelable。
 fn caller_wants_parcelable() -> bool {
     let pid = rsbinder::get_calling_pid();
     // 拿不到调用者就别赌：Java 客户端占绝大多数，给原生形状只会把人家数据弄坏。
@@ -238,8 +213,8 @@ fn caller_wants_parcelable() -> bool {
     !is_native_caller(name)
 }
 
-/// 缺省走原生形状的那几个（进程名包含匹配）。oplus 的 cryptoeng 是产线/CDK 那种工具，
-/// 平时不出现；出现时给它原生形状，否则它按 parcelable 解析会越界崩。
+/// 缺省走原生形状的进程（进程名包含匹配）：oplus 的 cryptoeng 是产线 / CDK 工具，
+/// 给它 parcelable 形状会在解析时越界崩。
 const DEFAULT_NATIVE_CALLERS: &str = "cryptoeng";
 
 fn is_native_caller(name: &[u8]) -> bool {
@@ -267,7 +242,7 @@ fn write_bytes_reply(reply: &mut Parcel, data: &[u8], code: i32) -> BinderResult
         data.len()
     );
     if !parcelable {
-        // 原生形状（产线工具那类）：返回值 + 原始字节，跟以前一样。
+        // 原生形状：返回值 + 原始字节。
         reply.write_i32(code)?;
         reply.write(&data.to_vec())?;
         return Ok(());
@@ -318,13 +293,11 @@ impl Remotable for SoterTa {
             reply.write(&descriptor_text().to_string())?;
             return Ok(());
         }
-        // AIDL 的回复第一个 int 是 status（0 = OK）。Java 的 Stub$Proxy 每条回复都先
-        // readException() 读它；rsbinder 做服务端不写这一格，后面所有字段就会整体
-        // 错位 4 字节（soterserver 把方法返回值当 status、把非空标记当返回值，
-        // exportAsk 的 exportData 就解不出来，Duck/微信卡在 askModel）。
+        // AIDL 的回复第一个 int 是 status（0 = OK）：Java 的 Stub$Proxy 每条回复都先
+        // readException() 读它。服务端不写这一格，后面所有字段就整体错位 4 字节。
         reply.write_i32(0)?;
-        // 号码先归一到「4 槽规范号」：不同设备的排布不一样，同一台上不同客户端
-        // 也可能不一样（见 note_layout），所以按调用方各自记。
+        // 号码先归一到「4 槽规范号」：同一台上不同客户端的排布也可能不一样，
+        // 按调用方各自记。
         let caller = caller_key();
         let code = canonical_code(&caller, code, reader.data_avail());
         // 先按 AIDL 定义把入参读干净：读错位的话后面拿到的 uid/alias 全是垃圾。
@@ -401,11 +374,10 @@ impl Remotable for SoterTa {
             caller_uid: None,
             data_size: 0,
         };
-        // 先问 daemon（它按配置决定是转 B 端真 TEE、走服务端还是本地兜底）；
-        // 问不到才有本地自签那条退路。直接调 soter_local 的话永远只能自签，
-        // 微信拿这把 ASK 去腾讯验证一定被拒（就是“系统错误”）。
-        // finishSign：会话要是本进程开的（init 那笔服务端让我们本地答），这一笔也必须本地答。
-        // 去问远程就是 B 端不认识这个句柄，直接 -204 —— 检测器的 T12 就是这么红的。
+        // 先问 daemon（它按配置决定是转 B 端真 TEE、走服务端还是本地兜底），问不到才走
+        // 本地自签。直接调 soter_local 永远只能自签，微信拿这把 ASK 去腾讯验证必被拒。
+        // finishSign：会话要是本进程开的，这一笔也必须本地答 —— 去问远程 B 端不认识这个
+        // 句柄，直接回 -204。
         let local_session = code == FINISH_SIGN && session.is_some_and(soter_local::has_session);
         if local_session {
             log::info!("event=soterta finishSign session is local; answering without the relay");
@@ -456,12 +428,12 @@ impl Remotable for SoterTa {
 
 /// 起服务并常驻。返回即表示服务名已经抢到手。
 ///
-/// `driver` 决定注册到哪个 servicemanager：vendor 的 AIDL HAL 习惯落在
-/// `/dev/vndbinder`（vndservicemanager），应用侧的 Java 客户端只看 `/dev/binder`。
-/// App 面向接口的自测端点：只在开关（环境变量或 `/data/misc/ommega/soter_app_selftest`）
-/// 打开时注册。它的**接口描述符就是** `com.tencent.soter.soterserver.ISoterService`，
-/// 所以 `service call ommega.soter.app/default <code> i32 <uid>` 发出来的字节跟宿主
-/// 收到的那笔一模一样：解析、答复两段能单独验，不用起任何 app。
+/// `driver` 决定注册到哪个 servicemanager：vendor 的 AIDL HAL 落在 `/dev/vndbinder`
+/// （vndservicemanager），应用侧的 Java 客户端只看 `/dev/binder`。
+///
+/// App 自测端点只在开关（环境变量或 `/data/misc/ommega/soter_app_selftest`）打开时注册；
+/// 它的描述符就是 `com.tencent.soter.soterserver.ISoterService`，所以
+/// `service call ommega.soter.app/default <code> i32 <uid>` 发出的字节跟宿主收到的一样。
 const APP_SELFTEST_ENV: &str = "OMMEGA_SOTER_APP_SELFTEST";
 const APP_SELFTEST_SWITCH: &str = "/data/misc/ommega/soter_app_selftest";
 const APP_SELFTEST_SERVICE: &str = "ommega.soter.app/default";
@@ -560,25 +532,17 @@ fn app_selftest_enabled() -> bool {
 }
 
 pub fn serve(driver: &str) -> anyhow::Result<()> {
-    // 第二个参数是 binder 线程池上限。传 0 会让驱动把上限设成 0：framework 那边会报
-    // 「Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be
-    // implemented」，而且 looper 会在十几秒后被驱动拒掉、进程静默退出（保活又拉起来，
-    // 就是现场那个每 20 秒换一个 pid 的抖动）。这里给默认 15。
+    // 第二个参数是 binder 线程池上限，必须非 0：设成 0 时 framework 报
+    // “Cannot cache binder as linkToDeath cannot be implemented”，looper 随后被驱动
+    // 拒掉、进程静默退出。这里给 15。
     rsbinder::ProcessState::init(driver, 15)
         .map_err(|error| anyhow::anyhow!("binder init on {driver} failed: {error}"))?;
-    // 用 `System` 而不是 `Vintf`：`Vintf` 要求服务名在 VINTF 清单里有 AIDL 声明，
-    // 但很多老平台只声明了 HIDL 的 `vendor.qti.hardware.soter@1.0::ISoter`（PGP110 /
-    // Android 15 实测）。那种机器上 `Vintf` 会在 servicemanager 侧直接被拒（
-    // `VINTF declaration error`），soterta.sh 就每 5 秒停一次原厂 HAL、再拉回来。
-    //
-    // 也不能用 `Vendor`：那档注册得上（不校验 VINTF），但只有 vendor 域的客户端
-    // 能访问，**工程模式（system_app 域）调过来会被 servicemanager 直接拒掉**
-    // —— 现场表现就是 `service check` 能查到名字、`service call` 却是
-    // `Parcel(NULL)`（日志里只有一笔 INTERFACE_TRANSACTION，真调用的 code 根本
-    // 没进来），工模因此判 SOTER key 失败。
-    //
-    // `System` 不校验 VINTF 且 system 域能访问；走 HIDL 的微信不经过这条 AIDL 服务，
-    // 不受影响。
+    // stability 必须用 `System`：
+    // - `Vintf` 要求服务名在 VINTF 清单里有 AIDL 声明，老平台只声明了 HIDL 的
+    //   `vendor.qti.hardware.soter@1.0::ISoter`，会被 servicemanager 拒；
+    // - `Vendor` 注册得上，但只有 vendor 域客户端能访问，工程模式（system_app 域）拿到
+    //   `Parcel(NULL)`：`service check` 查得到名字、`service call` 进不来；
+    // - `System` 不校验 VINTF 且 system 域可访问，走 HIDL 的微信不受影响。
     let binder = Binder::new_with_stability(SoterTa, Stability::System);
     let service = service_name();
     let descriptor = descriptor_of(&service);
@@ -601,15 +565,14 @@ pub fn serve(driver: &str) -> anyhow::Result<()> {
         "event=soterta registered {service} on {driver} (descriptor={descriptor} return_code={})",
         has_return_code()
     );
-    // 本地兜底那条路的 cpu_id 得给 app 域那份 payload 备好：宿主是 platform_app，
-    // exec `getprop` 被 SELinux 拒、直接读属性区也拿不到序列号。这里跑在 root 里，
-    // 算一次落盘，宿主那边直接读文件。
+    // 本地兜底要用的 cpu_id 在这里算一次落盘：宿主是 platform_app，exec `getprop` 被
+    // SELinux 拒、读属性区也拿不到序列号，只能读我们写好的文件。
     let local_cpu_id = crate::hook::soter_local::device_id();
     if !local_cpu_id.is_empty() {
         crate::hook::soter_local::publish_local_cpu_id(&local_cpu_id);
     }
-    // 连 daemon 的 RPC 放后台：它要等 socket 就绪（最长几十秒），不能挡着注册
-    // —— soterta.sh 在启动后一秒就看服务名在不在，迟一步就被当成失败回滚掉。
+    // 连 daemon 的 RPC 放后台：要等 socket 就绪（最长几十秒），不能挡着注册 —— 启动脚本
+    // 一秒内就看服务名在不在，迟了就当成失败回滚。
     std::thread::spawn(|| match crate::ipc::install_direct_rpc_session() {
         Ok(()) => log::info!("event=soterta daemon RPC ready"),
         Err(error) => {
@@ -626,9 +589,6 @@ mod layout_tests {
     use super::*;
 
     /// 布局按调用方分开记：同一台机器上两个客户端用不同号表时互不干扰。
-    ///
-    /// 以前是全局一个 AtomicU8，先到的 soterserver 把布局定成 4 槽，后到的
-    /// SoterChecker 走连号就全程调到错的方法上（MEIZU 20 Pro 实测五项全红）。
     #[test]
     fn layouts_are_tracked_per_caller() {
         // 4 槽那套：hasAskAlready 是 9，号表原样不动。

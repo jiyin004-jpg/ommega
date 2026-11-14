@@ -25,12 +25,10 @@ const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
 const PM_SERVICE: &str = "sec_key_att_app_id_provider";
 
-// 进程内那份起不来（这台机器上很常见：开机 key 是独立 HAL 铸的，进程内那套开库就卡住），
-// 头一笔等满 15 秒是值得的 —— 两套服务同时写一个钥匙库是错的。但等过一次就说明它这条
-// 路上暂时没戏，之后每一笔再干等 15 秒就是纯浪费：实测 keystore2 到 HAL 的每笔
-// generateKey 都被拖成 15000ms，检测器一轮下来就是十几分钟。
-// 所以只等第一笔。之后只做非阻塞的 `ready()` 判断：它自己的启动线程该完就会完，
-// 完了一瞬间就能看见，不用我们在这里陪等。
+// 进程内那份起不来时，头一笔等满 15 秒是值得的 —— 两套服务同时写一个钥匙库是错的。
+// 等过一次就说明这条路上暂时没戏，之后每笔再干等 15 秒就是纯浪费（keystore2 到 HAL 的
+// generateKey 每笔都被拖成 15000ms，检测器一轮十几分钟）。
+// 所以只等第一笔。之后只做非阻塞的 `ready()` 判断：它自己的启动线程该完就会完。
 static INPROC_WAIT_GAVE_UP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const INPROC_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -450,7 +448,7 @@ where
     F: FnMut(&Strong<B>) -> Result<T>,
 {
     let client = get()?;
-    // 影子可能刚换了一代（重启 / 被替换），它内存里的解锁材料跟着没了；先把我们手上
+    // 影子可能刚换了一代（重启 / 被替换），它内存里的解锁材料跟着没了；先把手上
     // 存着的那份补喂回去，免得这笔请求撞在「设备已锁定」上。没有材料时这行不做事。
     crate::hook::rewrite::sync_ommega_state_after_reconnect();
     match f(&client) {

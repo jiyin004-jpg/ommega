@@ -170,9 +170,9 @@ impl KeystoreService {
             return Ok(());
         }
 
-        // 慢路径：只让一个线程重建。以前是多个线程同时进来、各自把这一档先
-        // 摘掉再重新挂，中间那个空档就是并发出证报 `No such security level`、
-        // JCA 报 “No installed provider supports this key: (null)” 的根。
+        // 慢路径：只让一个线程重建。多个线程各自把这一档先摘掉再重挂，中间那个空档
+        // 就是并发出证报 `No such security level`、JCA 报 “No installed provider
+        // supports this key: (null)” 的根。
         let _guard = self
             .refresh_lock
             .lock()

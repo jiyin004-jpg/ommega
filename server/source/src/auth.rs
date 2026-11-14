@@ -1,12 +1,13 @@
 //! Token authentication and simple in-memory rate limiting.
 //!
-//! Mirrors Django's `_check_token` + `_db_token_valid`:
+//! Auth chain:
 //!   1. static env token (RELAY_TOKEN) matches exactly -> allowed
-//!   2. otherwise, a DB-issued "card" token (ApiToken) is checked:
+//!   2. otherwise a DB-issued "card" token (ApiToken) is checked:
 //!        - role must match the endpoint's expected role (a/b), if any
 //!        - activated on first use (activation-based expiry)
 //!        - `expires_at = activated_at + duration_seconds`
-//!   3. if neither env token nor any DB token is configured, allow (back-compat)
+//!   3. anonymous access only when `auth_required` is off AND no static token
+//!      AND no DB token is configured (back-compat)
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,21 +24,17 @@ pub struct TokenMeta {
     pub kind: String,
 }
 
-/// 请求方带过来的设备指纹：`ro.serialno` 与 `ro.boot.serialno`。
+/// 请求方带过来的设备指纹：`ro.serialno` / `ro.boot.serialno` / IMEI1。
 ///
-/// A 端私卡首次成功鉴权时把这两个值写进 `api_token`，之后每次请求
-/// 必须跟已绑定的一致，换设备就过不去（要换机器得先在 /card 页面解绑）。
-///
-/// 两者稳定性不同，鉴权时以 `sn` 为准：
-/// - `ro.boot.serialno`（`sn`）是 bootloader 传下来的只读属性，重启、模块重装、
-///   伪装身份重刷都不会变；
-/// - `ro.serialno`（`serial`）是可写属性，A 端开机后会被 `remote_identity` /
-///   `props.conf` 改写，同一台机器前后能报出两个值。
+/// 私卡首次成功鉴权时把这几项写进 `api_token`，之后每次请求必须跟已绑定的一致，
+/// 换设备就过不去（要换机器先在 /card 页面解绑）。稳定性：`sn`
+/// （`ro.boot.serialno`，bootloader 只读）与 IMEI 改不动；`serial`（`ro.serialno`）
+/// 是可写属性，会被 `remote_identity` / `props.conf` 改写，只作兜底。
 #[derive(Debug, Clone, Default)]
 pub struct DeviceFp {
     pub serial: String,
     pub sn: String,
-    /// IMEI1（`persist.radio.imei1` 一类）。硬件写死、改不动，比序列号更适合作绑定材料。
+    /// IMEI1（`persist.radio.imei1` 一类）。硬件写死，比序列号更适合作绑定材料。
     pub imei: String,
 }
 
@@ -51,16 +48,13 @@ impl DeviceFp {
 }
 
 impl TokenMeta {
-    /// 能不能跟另一端的 token 配对互通。
-    ///
-    /// 卡密只有两种，判断就两条：
+    /// 能不能跟另一端的 token 配对互通。卡密只有两种：
     ///
     /// - **普通卡**（`kind = "public"`）：两边都是普通卡才通，公开卡不能指挥别人的私机；
-    /// - **私卡**（`kind = "pair"`，含历史上 `kind` 为空的早期记录）：`pair_id` 任一方
-    ///   为空 = 没约束 → 通，都有值就必须同组。
+    /// - **私卡**（`kind = "pair"`，含 `kind` 为空的早期记录）：`pair_id` 任一方为空 =
+    ///   没约束 → 通；都有值就必须同组。
     ///
-    /// 没有第三种。早期那条「kind 为空就直接放行」的兼容分支会把白卡和私卡混在一起，
-    /// 已经删了。
+    /// `kind` 为空走私卡分支，不存在「空 kind 直接放行」的第三个分支。
     pub fn allows(&self, other: &TokenMeta) -> bool {
         let public = |m: &TokenMeta| m.kind.eq_ignore_ascii_case("public");
 
@@ -81,8 +75,8 @@ impl TokenMeta {
 /// Token 使用登记的节流：同一 token 60 秒内只写一次库。
 ///
 /// B 端几百台设备共用一把 token、70ms 一轮 poll，每笔都 `UPDATE api_token SET last_ip…`
-/// 会撞在同一行上，把 MySQL 的行锁打满（实测 mysqld 200%+、8 个 session 同时等更新）。
-/// 节流只降低「最后使用 IP / 时间」的精度（最多晚 60 秒），鉴权与过期判断不受影响。
+/// 会撞在同一行上，把 MySQL 的行锁打满。节流只降低「最后使用 IP / 时间」的精度
+/// （最多晚 60 秒），鉴权与过期判断不受影响。
 fn should_record_token_use(token: &str) -> bool {
     use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, Instant};
@@ -130,10 +124,9 @@ pub struct AuthState {
     pub auth_required: bool,
     /// 鉴权结果的短缓存：token -> (整行, 时间)。
     ///
-    /// `get_api_token` 是同步 MySQL 查询，而 A 端每笔 attest/sign/decrypt、
-    /// B 端每 5 秒一次 poll 都要走一次鉴权 —— 全部落在关键路径上。卡密的
-    /// role/kind/enabled/绑定这些字段几秒内不会变，存 10 秒最划算；运营改卡或
-    /// 用户解绑最多晚 10 秒生效。
+    /// `get_api_token` 是同步 MySQL 查询，而 A 端每笔 attest/sign/decrypt、B 端每 5 秒
+    /// 一次 poll 都要鉴权，全在关键路径上；卡密的 role/kind/enabled/绑定几秒内不会变，
+    /// 所以值得缓存，代价是运营改卡 / 用户解绑最多晚 `TOKEN_CACHE_TTL` 生效。
     token_cache: Arc<Mutex<HashMap<String, (crate::db::ApiTokenRow, Instant)>>>,
 }
 
@@ -178,9 +171,7 @@ impl AuthState {
         self
     }
 
-    /// 卡密鉴权结果的缓存时长。
-    ///
-    /// 10 秒：A 端连着发几十笔时只查一次库，运营改卡 / 用户解绑最多晚 10 秒生效。
+    /// 卡密鉴权结果的缓存时长：10 秒。
     const TOKEN_CACHE_TTL: Duration = Duration::from_secs(10);
 
     fn cached_token(&self, token: &str) -> Option<crate::db::ApiTokenRow> {
@@ -204,9 +195,6 @@ impl AuthState {
     }
 
     /// 拿 token 行：先看缓存，没命中再查库（查到就存进去）。
-    ///
-    /// 鉴权、配对、绑定都在关键路径上，`get_api_token` 是同步 MySQL 查询，
-    /// 每笔请求一次很浪费；这几个字段几秒内不会变。
     fn lookup_token(&self, token: &str) -> Option<crate::db::ApiTokenRow> {
         if let Some(row) = self.cached_token(token) {
             return Some(row);
@@ -380,15 +368,9 @@ impl AuthState {
     }
 
     /// Token 身份：配对组 + 类型，供「A/B 必须配对才能走通」的判断用。
+    /// 配对规则见 [`Self::allows`]；`enabled = false` 的卡返回 `None`（等于认不出）。
     ///
-    /// - `kind = "pair"`：专用配对卡密，只有同一 `pair_id` 的 A 与 B 才能互通；
-    ///   `pair_id` 任一方为空视为无约束。
-    /// - `kind = "public"`：公开/测试卡密，只能与同为 `public` 的另一端互通，
-    ///   不能指挥私机。
-    /// - `kind` 为空（老卡密）：走私卡分支，按 `pair_id` 规则判断。
-    ///
-    /// 静态 env token / 未配置 token 时 [`Self::token_meta`] 返回 `None`，调用方
-    /// 按历史行为放行，不进入这里的配对判断。
+    /// 静态 env token / 没配 token 时返回 `None`，调用方按历史行为放行，不进入配对判断。
     pub fn token_meta(&self, header: Option<&str>) -> Option<TokenMeta> {
         let token = header.unwrap_or("");
         if token.is_empty() || self.check_static_token(Some(token)) {
@@ -410,14 +392,12 @@ impl AuthState {
 
     /// Full auth check for an endpoint with an optional required role.
     ///
-    /// `role`: `Some("a")` for A-side endpoints, `Some("b")` for B-side,
-    /// `None` for role-agnostic endpoints (ping/health). Returns true when the
-    /// request is authorized. Also activates the token on first use and records
-    /// the client IP.
+    /// `role`: `Some("a")` for A-side, `Some("b")` for B-side, `None` for
+    /// role-agnostic endpoints (ping/health). On success the token is activated on
+    /// first use and the client IP is recorded.
     ///
-    /// `fp`: 设备指纹（`ro.serialno` / `ro.boot.serialno`）。显式私卡
-    /// （`pair` / `private`）用它做首次绑定与后续一致性校验，A、B 两端都绑；
-    /// 公开卡和 `kind` 为空的老卡不参与绑定。
+    /// `fp`: 设备指纹。显式私卡（`pair` / `private`）用它做首次绑定与后续一致性
+    /// 校验，A、B 两端都绑；公开卡和 `kind` 为空的老卡不参与绑定。
     pub fn check_token(
         &self,
         header: Option<&str>,
@@ -447,10 +427,7 @@ impl AuthState {
                         return false;
                     }
                     // 私卡绑定设备：首次带指纹就绑，之后每次都要对得上。
-                    //
-                    // A 端和 B 端都绑 —— 以前只给 A 端绑，B 端的私卡/配对卡
-                    // 永远停在「未绑定」（它的请求也带指纹，就是没人理），
-                    // 卡店卖出去的那些 B 卡换台机器照样能用。公开卡照旧不绑。
+                    // A、B 两端都绑（只给 A 端绑的话 B 卡换机器照样能用）；公开卡不绑。
                     if role.is_some()
                         && Self::is_private_card(&row)
                         && !self.device_binding_ok(db, &row, fp)
@@ -473,11 +450,7 @@ impl AuthState {
                     }
                     // record usage (IP + last-used)
                     //
-                    // 节流：同一个 token 60 秒内只落一次库。B 端几百台设备共用一把
-                    // token、70ms 一轮 poll，每笔都 `UPDATE api_token SET last_ip…`
-                    // 会全打在同一行上（实测 MySQL 看着 8 个 session 在等价的行锁，
-                    // mysqld 吃到 200%+，整机 load 10 以上，买卡页跟着变慢）。
-                    // 节流只影响「最后使用 IP / 时间」的精度，鉴权与过期判断不变。
+                    // 节流：同一 token 60 秒内只落一次库（见 should_record_token_use）。
                     if should_record_token_use(token) {
                         if let Err(e) = db.record_token_use(token, ip) {
                             tracing::warn!(
@@ -511,9 +484,9 @@ impl AuthState {
 
     /// 这张卡要不要绑定设备：**只有显式私卡/配对卡才绑**。
     ///
-    /// - `kind` 为空（老卡密、控制台默认生成的那种）：公开卡，谁都能用，不绑；
+    /// - `kind` 为空（老卡密、控制台默认生成的）：公开卡，谁都能用，不绑；
     /// - `public`：公开/测试卡，不绑；
-    /// - `pair`（卡店卖的配对卡）、`private`：一卡一机，第一次用哪台就锁哪台。
+    /// - `pair`（配对卡）、`private`：一卡一机，第一次用哪台就锁哪台。
     fn is_private_card(row: &crate::db::ApiTokenRow) -> bool {
         let k = row.kind.trim();
         !(k.is_empty() || k.eq_ignore_ascii_case("public"))
@@ -521,14 +494,12 @@ impl AuthState {
 
     /// 设备指纹一致性检查：没绑就绑上，绑了就要求每次都对上。
     ///
-    /// 两个细节：
-    /// - 两者都空时只绑定不检查（不传指纹的老 A 端仍能用，但永远绑不上）；
-    /// - 旧库里可能只记了其中一项，那就只比非空的那项。
+    /// - 库里全空：只绑定不检查；不传指纹的老 A 端仍能用，但永远绑不上；
+    /// - 旧库只记了其中一项：只比非空的那项。
     ///
-    /// 绑定用 `bind_token_device` 的乐观锁做仲裁：返回 `Ok(false)` 说明另一台
-    /// 设备已经先绑上了。以前这里无视返回值直接放行，第二台设备还能借着 10 秒
-    /// 鉴权缓存继续用；现在必须回库确认库里记的确实是自己的指纹才放行。写绑定
-    /// 失败也按不通过处理，别让一次数据库异常把私卡退化成不绑定。
+    /// 绑定仲裁走 `bind_token_device` 的乐观锁：`Ok(false)` 说明另一台设备先绑上了，
+    /// 必须回库确认库里记的确实是自己的指纹才放行；写绑定失败也按不通过处理，
+    /// 别让一次数据库异常把私卡退化成不绑定。
     fn device_binding_ok(
         &self,
         db: &Arc<Db>,
@@ -546,8 +517,7 @@ impl AuthState {
             }
             match db.bind_token_device(&row.token, &fp.serial, &fp.sn, &fp.imei) {
                 Ok(true) => {
-                    // 把缓存更新成已绑定：本机在这 10 秒里再请求时不会拿旧行
-                    // 去撞自己的绑定，也就不会被误判成“抢输了”。
+                    // 更新缓存：本机接下来的请求不该拿旧行去撞自己的绑定。
                     let mut bound = row.clone();
                     bound.bound_serial = fp.serial.clone();
                     bound.bound_sn = fp.sn.clone();
@@ -556,8 +526,7 @@ impl AuthState {
                     true
                 }
                 Ok(false) => {
-                    // 缓存的还是绑定前的行，而库里已经有主了：以库里的最新
-                    // 绑定为准（直接查库，绕过可能仍然陈旧的缓存）。
+                    // 缓存是绑定前的行、库里已经有主：以库里最新绑定为准（绕过缓存直查）。
                     match db.get_api_token(&row.token) {
                         Ok(Some(fresh)) => {
                             let ok = Self::bounds_match(
@@ -593,10 +562,9 @@ impl AuthState {
             else {
                 return false;
             };
-            // 指纹对上了，但上报值跟库里不完全一样：把**库里缺的那几项补上**。
-            // `serial`（`ro.serialno`）是可写的伪装串号，跟到当前值；`sn` / `imei`
-            // 是硬件项，只补空、不拿新值盖旧值（同 sn 装过不同设备的 sim 模块不常见，
-            // 但真碰上时宁可保留首次绑定的那个）。
+            // 指纹对上了但上报值跟库里不完全一样：把**库里缺的那几项补上**。
+            // `serial`（可写伪装串号）跟到当前值；`sn` / `imei` 是硬件项，只补空、
+            // 不拿新值盖旧值（宁可保留首次绑定的那个）。
             let new_serial = if fp.serial.trim().is_empty() {
                 bound_serial.to_string()
             } else {
@@ -645,14 +613,12 @@ impl AuthState {
 
     /// 已绑定行与本次上报的指纹是否一致。
     ///
-    /// **任一稳定项对得上就算同一台**：`sn`（`ro.boot.serialno`，只读）和
-    /// `imei`（IMEI1，硬件写死）任意一项相等就放行 —— IMEI 基本改不动，是私卡
-    /// 最适合的绑定材料；序列号在部分机器上会被伪装层改写，两者互为兵备。
-    /// 可写的 `serial`（`ro.serialno`）只在前两项都拿不到时倒背。
+    /// **任一稳定项对得上就算同一台**：`sn`（`ro.boot.serialno`，只读）和 `imei`
+    /// （IMEI1，硬件写死）任意一项相等就放行 —— 序列号在部分机器上会被伪装层改写，
+    /// 两者互为兵备。可写的 `serial`（`ro.serialno`）只作第三顺位兜底。
     ///
-    /// 旧行只记了其中一项、或者这台机器只报得出一项时，就按“两边都非空的那些项”
-    /// 比：有一项相等就过。两边没有任何可比项（包括全空、或只有占位值
-    /// `unknown`）绝不命中 —— 没有指纹不能当匹配。
+    /// 只按「两边都非空的项」比，有一项相等就过。两边没有任何可比项（含全空、
+    /// 或只有占位值 `unknown` / `0`）绝不命中 —— 没有指纹不能当匹配。
     fn bounds_match(bound_serial: &str, bound_sn: &str, bound_imei: &str, fp: &DeviceFp) -> bool {
         let pairs = [
             (
@@ -684,9 +650,7 @@ impl AuthState {
             value
         }
     }
-    /// Returns true if the request is allowed.
-    /// Sliding-window rate limit. `key` 就是客户端 IP（见 check_auth）。
-    /// Returns true if the request is allowed.
+    /// Sliding-window rate limit，`key` 就是客户端 IP（见 check_auth）。返回是否放行。
     pub fn allow(&self, key: &str) -> bool {
         self.allow_with_limit(&self.rate, key, self.rate_limit_requests)
     }
@@ -723,8 +687,7 @@ impl AuthState {
         let mut map = crate::util::mu(rate);
         // 在锁内取时间，保证桶内时间递增，才能只弹出过期前缀。
         let now = Instant::now();
-        // key 以前是 token（就那几把），现在是 IP，来源杂得多，扫一遍全表的 IP 都
-        // 会各留一个桶。桶空了不删，表只涨不消；攒到一定规模就把过期的清一遭。
+        // 桶空了不删，表只涨不消；攒到一定规模就把过期的清一遭。
         if map.len() > RATE_MAP_MAX && !map.contains_key(key) {
             map.retain(|_, v| {
                 prune_rate_bucket(v, now, self.rate_limit_window);
@@ -755,9 +718,7 @@ fn prune_rate_bucket(bucket: &mut VecDeque<Instant>, now: Instant, window: Durat
 
 /// Check expiry of an already-activated token. Returns true if not expired.
 /// A token with no `activated_at` is treated as not-yet-activated (valid).
-///
-/// 直接吃调用方手里那行，不再自己查一次库 —— 以前 `check_token` 刚查完
-/// 又把 token 传进来重查，同一笔请求两次 MySQL。
+/// Callers pass the already-fetched row; this must not query the DB again.
 fn token_is_valid(row: &crate::db::ApiTokenRow, duration_seconds: i64) -> bool {
     if row.activated_at.is_empty() {
         return true; // not activated yet

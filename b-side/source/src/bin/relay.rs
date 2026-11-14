@@ -1,7 +1,4 @@
-//! relay daemon for ommegaclient-b.
-//!
-//! This binary is the "new B-side" agent that talks to the existing
-//! relay_server (ommega-old) using its B-side protocol:
+//! relay daemon for ommegaclient-b: talks to relay_server over its B-side protocol.
 //!
 //!   * `GET  /api/b/poll/?device_id=..&machine_id=..&timeout=N` (X-Relay-Token)
 //!     -> 200: {task_id, task_type, payload, target_device_id}
@@ -9,24 +6,19 @@
 //!   * `POST /api/b/result/` body {task_id, result, device_id}
 //!     -> {status: ok}
 //!
-//! When an `attest` task arrives, the A-side supplies (inside `payload`):
-//!   * `challenge`                    : base64, the real-time attestation nonce
-//!   * `attestation_application_id`  : base64, DER-encoded `AttestationApplicationId`
-//!     (this is the "appid / tag 709" the A-side wants)
+//! An `attest` task carries, inside `payload`, base64 `challenge` and base64 DER
+//! `attestation_application_id` (the "appid / tag 709"). The relay mints a chain
+//! via the real hardware TEE (`ommegaclient_b::keymaster::attest_proxy`) with that
+//! appid embedded and returns `{cert_chain: [base64, ...]}`.
 //!
-//! The relay daemon mints a certificate chain via the *real* on-device
-//! hardware TEE (see `ommegaclient_b::keymaster::attest_proxy`) with that appid
-//! embedded, then uploads `{cert_chain: [base64, ...]}` back to the server,
-//! which forwards it to the A-side.
-//!
-//! Configuration is read from the config file `/data/adb/ommega-b/conf/relay.conf`
-//! (KEY=VALUE lines), falling back to environment variables:
+//! Config comes from `/data/adb/ommega-b/conf/relay.conf` (KEY=VALUE lines),
+//! falling back to environment variables:
 //!   OMMEGA_RELAY_SERVER      base URL, e.g. https://example.com:8443
 //!   OMMEGA_RELAY_DEVICE_ID   device id (required)
 //!   OMMEGA_RELAY_MACHINE_ID  machine id (optional)
 //!   OMMEGA_RELAY_TOKEN       relay B-side token (X-Relay-Token)
 //!   OMMEGA_RELAY_LOG_ENABLED   file log on/off (default true)
-//!   OMMEGA_RELAY_LOG_LEVEL     file log level: off|error|warn|info|debug|trace (default debug)
+//!   OMMEGA_RELAY_LOG_LEVEL     file log level: off|error|warn|info|debug|trace (default info)
 //!   OMMEGA_RELAY_LOGCAT_ENABLED logcat on/off (default true)
 //!   OMMEGA_RELAY_LOGCAT_LEVEL   logcat level: off|error|warn|info|debug|trace (default info)
 //!   OMMEGA_RELAY_BIND_IFACE    outgoing interface: none|auto|always|<ifname> (default auto)
@@ -36,16 +28,14 @@
 //! Logging is read *before* the rest of the config is validated, so a broken
 //! `relay.conf` still honours its log settings while reporting the error.
 //!
-//! The config is hot-reloaded at runtime: a background thread watches
-//! `relay.conf` for modification and the `restart.all` marker, and updates the
-//! live config in place (no process restart needed). The service
-//! (`template/service.sh`) starts the relay directly (killing stale instances
-//! first); there is no daemon wrapper.
+//! The config is hot-reloaded: a background thread watches `relay.conf` and the
+//! `restart.all` marker and updates the live config in place (no restart needed).
+//! `template/service.sh` starts the relay directly, killing stale instances first.
 //!
-//! Both `http://` and `https://` are supported. The relay_server runs over
-//! HTTPS with a self-signed certificate, so any server certificate is accepted.
+//! `http://` and `https://` are both supported; TLS certificate verification is
+//! disabled because relay_server uses a self-signed certificate.
 
-// relay 同时挂着长轮询、任务队列和 SOTER 转发，换 mimalloc：每线程一个堆、无全局锁。
+// mimalloc：每线程一个堆、无全局锁，长轮询 + SOTER 转发并发下不抢锁。
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -67,37 +57,25 @@ use ommegaclient_b::keymaster::attest_proxy::{check_app_id_der, SYSTEM_KEYMINT_S
 use ommegaclient_b::keymaster::tee_ops::{self, KeyAlgorithm, KeySpec};
 use ommegaclient_b::wakelock;
 
-/// 长轮询一次挂多久（秒）。
-///
-/// 0 = 不等（短轮询）：服务端立即回 204/任务，节奏完全由下面的 `MIN_POLL_INTERVAL`
-/// 控制。之前用长轮询（15s→5s→1s）时，任务落在两轮之间就要等满一个周期，实测
-/// 端到端多出 1 秒以上的固定延迟；改成 120ms 短轮询后，最坏等 120ms。
-/// 短轮询的空响应只有几字节，服务端压力可以忽略。
-/// 长轮询秒数：0 = 短轮询（问一次就回，任务到达最多等一个轮询间隔 ~70ms）。
-/// 设成 5 之后 B 挂在服务端等，有任务立刻推回来，attested 路径能少 20~40ms ——
-/// T04 那个「远程/本地配对差」就卡在 120ms 线上，这点延迟很关键。
+/// 长轮询一次挂多久（秒）；0 = 短轮询，服务端立即回 204 或任务。
 ///
 /// **不能超过 POLL_WALL_LIMIT（8s）**：超了 watchdog 会判「循环不往前转」直接退进程，
-/// service.sh 再拉起来，就变成 15s 一次的崩溃重起了。
+/// service.sh 再拉起来，就成了崩溃重起循环。
 const POLL_TIMEOUT_SEC: u32 = 5;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
-/// 一轮 poll 最多允许的墙钟时间。刻意比上面的 READ_TIMEOUT_MS 早一步收网：那个
-/// 30s 是 reqwest 自己的总超时，用单调钟算，设备 suspend 之后就不作数了。
-/// 短轮询下正常一个往返就回来（实测 20~40ms），给 8s 是留「Wi-Fi 抖一下、TCP 重传
-/// 一两次」的余地：原来只给 3s，实测多了 800ms 就被判超时，watchdog 直接退进程，
-/// `service.sh` 重拉要 2s，那 2s 里派给这台设备的任务全在队列里干等（实测 wait=2049ms）。
+/// 一轮 poll 最多允许的墙钟时间。比 READ_TIMEOUT_MS 早一步收网：那个 30s 是 reqwest
+/// 的总超时，用单调钟算，设备 suspend 之后就不作数了。8s 留「Wi-Fi 抖一下、TCP 重传
+/// 一两次」的余地。
 const POLL_WALL_LIMIT: Duration = Duration::from_secs(8);
 /// 处理一个任务的上限。任务里有真 TEE 调用、还有带重试的结果回传（最坏 4×33s
 /// 再加退避），所以给得宽一点，这一条只用来兜「整个循环不再往前转」。
 const TASK_WALL_LIMIT: Duration = Duration::from_secs(180);
-/// 探针结果缓存多久。B 端一秒能打几百个请求，每条都探一下等于把流量翻倍，
-/// 所以选出来的结果留一小会儿；失败的那一份只存一秒，路不通的时候就是要急着
-/// 重试 —— 设备醒着的窗口很短，得挤进去。
+/// 探针成功结果的缓存时长：B 端一秒几百个请求，每条都探等于把流量翻倍。失败的一条
+/// 只缓存 `PATH_FAIL_TTL`（1s），路不通要急着重试。
 const PATH_TTL: Duration = Duration::from_secs(10);
 const PATH_FAIL_TTL: Duration = Duration::from_secs(1);
-/// 多久看一眼 wakelock 还在不在。它不是自己掉，而是可能被人解掉（卸载脚本、
-/// 手滑、别的工具），补回去要快，但也不用每秒看。
+/// 多久查一次 wakelock：它可能被外部解掉，要尽快补回去，但不必每秒查。
 const WAKELOCK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const CONF_PATH: &str = "/data/adb/ommega-b/conf/relay.conf";
 const RESTART_MARKER: &str = "/data/adb/ommega-b/run/restart.all";
@@ -121,14 +99,12 @@ fn module_root_from_exe() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Keep the KernelSU/Magisk module status (module.prop description) in sync
-/// with the relay's real state. Best effort: failures are silently ignored
-/// (e.g. module dir absent when running from a manual copy).
+/// Keep the KernelSU/Magisk module status (module.prop description) in sync with
+/// the relay's real state. Best effort: failures are silently ignored.
 ///
-/// The write goes through [`write_atomic`] on purpose: `service.sh` kills stale
-/// relay processes with `kill -9` before every start, and a plain `fs::write`
-/// (truncate, then write) landing in that window leaves an empty `module.prop` —
-/// the manager card would then show neither name nor version.
+/// The write must go through [`write_atomic`]: `service.sh` kills stale relay
+/// processes with `kill -9`, and a plain `fs::write` landing in that window
+/// leaves an empty `module.prop`.
 fn update_module_status(status: &str) {
     let prop_file = module_root_from_exe()
         .map(|root| root.join("module.prop"))
@@ -180,13 +156,10 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// SOTER 默认并行几笔。
+/// SOTER 默认并行几笔：不同 uid 可以同时跑，同一个 uid 仍然串行。
 ///
-/// 2026-10-03 之前是一把全局串行锁（同一时刻只许 1 笔），线上量到排队 `wait`
-/// p50 0 / p90 198 / p99 857 ms。现在放到 2：不同 uid 可以同时跑，同一个 uid 仍然
-/// 串行；全局上限压得低是因为 TA 里的 RPMB 会话是独占资源 —— 留的那点空位是给
-/// 机器自己（系统 / 微信在真机上直接调 TA）用的。改 relay.conf 里的
-/// `OMMEGA_RELAY_SOTER_CONCURRENCY` 就能调，不用重刷模块。
+/// 上限压得低是因为 TA 里的 RPMB 会话是独占资源 —— 留的空位给机器自己（系统 /
+/// 微信直接调 TA）用。改 relay.conf 的 `OMMEGA_RELAY_SOTER_CONCURRENCY` 即可。
 const DEFAULT_SOTER_CONCURRENCY: u32 = 2;
 
 /// live 方法下发给 spl daemon 看门狗的兜底时长：正常签发几十毫秒就回来了，
@@ -202,9 +175,8 @@ struct RelayConfig {
     /// Allow SOTER ops that create or remove keys on the device.  Off by
     /// default: those ops change the real payment-key state.
     soter_allow_mutation: bool,
-    /// SOTER 同时能压进 TA 几笔（`OMMEGA_RELAY_SOTER_CONCURRENCY`，默认 2）。
-    /// 上限留小：RPMB 会话是独占资源，我们自己少占一点，机器自己那条路才有空位。
-    /// 同一个 uid 无论如何都是串行的（见 `soter::handle`）。
+    /// SOTER 同时能压进 TA 几笔（`OMMEGA_RELAY_SOTER_CONCURRENCY`，默认 2）。RPMB 会话
+    /// 是独占资源，所以上限留小；同一个 uid 无论如何都是串行的（见 `soter::handle`）。
     soter_concurrency: u32,
     /// Slot to try a real signature on when reporting the `soter_sign`
     /// capability.  Optional: without it the relay reports only `soter` until it
@@ -217,15 +189,12 @@ struct RelayConfig {
     /// 发长轮询之前先探一下路通不通。路死的时候挂 15s 长轮询没有意义，早点回来
     /// 重试反而能挤进设备醒着的那几个窗口。
     path_probe: bool,
-    /// 拿一把 wakelock 按住系统，别让它 suspend。开着的时候这个进程（以及整台机器）
-    /// 不会睡。**默认开** —— 灭屏掉线就是这么来的，默认把它按住才对；想要省电、
-    /// 允许它睡（靠看门狗在醒过来之后救）就设成 false。
-    /// 内核没这个接口时安静跳过，不算错。见 `ommegaclient_b::wakelock`。
+    /// 拿 wakelock 按住系统，别让它 suspend；开着时整台机器不会睡。**默认开** —— 关掉
+    /// 就只能靠看门狗在醒过来之后救。内核没这个接口时安静跳过，不算错。
     wakelock: bool,
-    /// A 端在 `device_attest_context` 里声明的补丁日期，要不要落到本机 TEE 上
-    /// （改属性 + 让 keymint HAL 重读，见 `ommegaclient_b::plat::patchlevel`）。
-    /// **默认关** —— 开了以后一笔认证可能要多等两三秒，而且本机的补丁日期会跟着
-    /// 请求方变。
+    /// A 端在 `device_attest_context` 里声明的补丁日期要不要落到本机 TEE 上（改属性 +
+    /// 让 keymint HAL 重读，见 `ommegaclient_b::plat::patchlevel`）。**默认关**：一笔认证
+    /// 可能多等两三秒，本机补丁日期也会跟着请求方变。
     patchlevel_follow_a: bool,
     /// 用哪种办法把日期落下去：`prop` = 改属性 + 弹 HAL（默认，任何机器都能用）；
     /// `live` = 直接改 TA 的 configure（只在高通 KeymasterUtils 通道上可用，
@@ -396,9 +365,7 @@ fn parse_log_level(v: &str) -> Option<log::LevelFilter> {
 }
 
 /// Extract the `OMMEGA_RELAY_LOG_*` and `OMMEGA_RELAY_LOGCAT_*` keys from raw
-/// relay.conf content. Absent keys fall back to the defaults (file log on
-/// debug, logcat on info) so an existing relay.conf without them keeps its
-/// previous behaviour.
+/// relay.conf content. Absent keys fall back to file log on info, logcat on info.
 fn parse_log_config(raw: &str) -> (bool, log::LevelFilter, bool, log::LevelFilter) {
     let mut file_enabled = true;
     // 默认 info：debug 是排查时手动开的。文件 sink 每条记录要 flock + stat +
@@ -432,10 +399,8 @@ fn parse_log_config(raw: &str) -> (bool, log::LevelFilter, bool, log::LevelFilte
     (file_enabled, file_level, logcat_enabled, logcat_level)
 }
 
-/// Read the logging switches *before* the full RelayConfig is loaded/validated,
-/// so a broken relay.conf still honours its log settings while reporting the
-/// error. Order: relay.conf -> environment -> defaults (file log on info,
-/// logcat on info).
+/// Read the logging switches *before* the full RelayConfig is loaded/validated, so
+/// a broken relay.conf still honours its log settings while reporting the error.
 fn preload_log_config() -> (bool, log::LevelFilter, bool, log::LevelFilter) {
     if let Ok(raw) = std::fs::read_to_string(CONF_PATH) {
         return parse_log_config(&raw);
@@ -518,15 +483,11 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP client (reqwest-based with rustls).
+// HTTP client (reqwest blocking + rustls).
 //
-// Uses reqwest's blocking client with rustls TLS backend.  The relay_server
-// uses a self-signed certificate, so certificate verification is disabled.
-// reqwest provides built-in connection pooling, keep-alive, and chunked
-// transfer encoding support — all things the old hand-rolled client lacked.
-//
-// The client is rebuilt on config hot-reload so that a server URL change
-// does not leave stale pooled connections pointing at the old address.
+// Certificate verification is disabled: relay_server uses a self-signed cert.
+// The client is rebuilt on config hot-reload so a server URL change does not
+// leave stale pooled connections pointing at the old address.
 // ---------------------------------------------------------------------------
 
 /// 缓存里的客户端，连同它是照哪块出口网卡建的。网卡是这个身份的一部分：
@@ -546,9 +507,8 @@ fn build_http_client(iface: Option<&str>) -> Result<Client> {
         .danger_accept_invalid_certs(true)
         .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .timeout(Duration::from_millis(READ_TIMEOUT_MS))
-        // 轮询每 70ms 一笔、回报紧跟其后，连接必须复用：默认 90s 的空闲回收对
-        // 这种节奏够用，但一旦碰上配置重读或探针失败就会重建客户端，所以把空闲
-        // 保留时间和 keepalive 都写死，别让「重建 + 重新握手」退化成每次 70ms。
+        // 连接必须复用：碰上配置重读或探针失败会重建客户端，空闲回收和 keepalive
+        // 都写死，别让「重建 + 重新握手」退化成每笔请求一次。
         .pool_idle_timeout(Duration::from_secs(300))
         .pool_max_idle_per_host(8)
         .tcp_keepalive(Duration::from_secs(30));
@@ -599,14 +559,12 @@ fn get_http_client(cfg: &RelayConfig) -> Result<Arc<Client>> {
     Ok(client)
 }
 
-/// Drops the shared HTTP client so the next request rebuilds it.
-/// Called from the config watcher when the server URL changes, and from the
-/// worker when a probe says the current uplink stopped carrying traffic.
+/// Drops the shared HTTP client so the next request rebuilds it. Called from the
+/// config watcher and when a probe says the uplink stopped carrying traffic.
 fn reset_http_client() {
     if let Ok(mut guard) = HTTP_CLIENT.write() {
         *guard = None;
-        // 出口选择也跟着作废：下轮重建会重新探、重新挑，别抱着一个刚证明
-        // 打不通的结论不放。
+        // 出口选择也跟着作废：下轮重建会重新探、重新挑，不沿用刚证明走不通的结论。
         ommegaclient_b::uplink::invalidate_pick();
         log::info!("HTTP client reset (connection pool cleared)");
     }
@@ -615,14 +573,10 @@ fn reset_http_client() {
 /// 上一次探路的结果：哪块网卡、什么时候探的、通不通。
 static PATH_CHECK: Mutex<Option<(Option<String>, Instant, bool)>> = Mutex::new(None);
 
-/// 发长轮询之前先确认路还通着。
+/// 发长轮询之前先确认路还通着：链路死的时候长轮询只会耗掉设备醒着的窗口，探针
+/// 几百毫秒就能给答复。探不通就把客户端丢掉，下一轮重建会重新竞速、自己换一条。
 ///
-/// 链路已经死的时候，一个 15s 长轮询不会带回任何东西，只会把设备醒着的那点
-/// 窗口全耗在里面；探针几百毫秒就能给个答复，不通就早点回去重试。当前这条路
-/// 刚刚证明打不通的时候，顺手把客户端丢掉 —— 下一轮重建会重新竞速，自己换一条。
-///
-/// 代价是每 10 秒多一个几字节的 `/api/ping/`（相对 B 端一分钟几百个请求可以
-/// 忽略）；不想付这个代价就把 `OMMEGA_RELAY_PATH_PROBE` 关掉。
+/// 代价是每 10 秒多一个几字节的 `/api/ping/`；`OMMEGA_RELAY_PATH_PROBE` 可关掉。
 fn path_ready(cfg: &RelayConfig) -> bool {
     if !cfg.path_probe {
         return true;
@@ -673,8 +627,7 @@ fn http_request(
         req = req.header(k, v);
     }
     // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验（换机要解绑）。
-    // 以前只给 A 端加了这两个头，B 端一直没带 —— 所以 B 那边的私卡永远
-    // 停在「未绑定」。值只读一次（属性区是 mmap，但没必要每笔都读）。
+    // 值只读一次（属性区是 mmap，但没必要每笔都读）。
     let (dev_serial, dev_sn) = device_fingerprint();
     if !dev_serial.is_empty() {
         req = req.header("X-Device-Serial", dev_serial);
@@ -711,9 +664,8 @@ fn http_request(
 // ---------------------------------------------------------------------------
 
 fn poll_tasks(cfg: &RelayConfig) -> Result<Option<(String, String, Value)>> {
-    // 带上本机能力声明：服务端靠它把 SOTER 任务路由到真能做的设备上，状态页也
-    // 显示这几个。SOTER 那一支会真去签一次（命中缓存时不再碰 HAL），其余只查
-    // 服务实例在不在，没有副作用。
+    // 带上本机能力声明：服务端靠它把 SOTER 任务路由到真能做的设备上。SOTER 那一支
+    // 会真去签一次（命中缓存时不再碰 HAL），其余只查服务实例在不在，没有副作用。
     let caps = ommegaclient_b::caps::report(cfg.soter_probe.as_ref());
     // 把这台的「不跟随补丁日期」名单一起报上去：服务端拿到之后，命中名单的认证请求
     // 就不再往这台派，直接让 keybox 层构造返回（少一跳）。
@@ -911,16 +863,11 @@ fn parse_key_spec(payload: &Value) -> Result<KeySpec> {
             .transpose()?,
         // Device properties / ID attestation (710..=717, plus 723 for the second
         // IMEI; 718 is VENDOR_PATCHLEVEL, never an ID) forwarded by the A-side as
-        // `[tag, base64(value)]` pairs. These are the values the *A-side*
-        // device wants attested, so a TEE that does not own them answers
-        // `CannotAttestIds` (-66) — expected when the balancer serves this request
-        // with a different B端. The task then fails, the A-side gets no chain from
-        // this layer, and the server keybox layer (which writes the IDs into the
-        // minted leaf itself) takes over with values that actually match the
-        // requesting device. Minting a chain while silently dropping the IDs would
-        // be worse: the chain would claim to come from a real TEE and carry no
-        // device properties at all. Malformed entries are dropped so a request
-        // carrying junk still mints a key.
+        // `[tag, base64(value)]` pairs. The TEE validates every value and answers
+        // `CannotAttestIds` (-66) when they are not this device's own, so a foreign
+        // A-side request fails here instead of getting a chain that carries no
+        // device properties. Malformed entries are dropped so a request carrying
+        // junk still mints a key.
         attestation_ids: get("attestation_ids")
             .and_then(Value::as_array)
             .map(|pairs| {
@@ -930,24 +877,18 @@ fn parse_key_spec(payload: &Value) -> Result<KeySpec> {
                         let pair = pair.as_array()?;
                         let tag = u32::try_from(pair.first()?.as_i64()?).ok()?;
                         let value = b64_decode(pair.get(1)?).ok()?;
-                        // 718 is VENDOR_PATCHLEVEL, so it is not an ID tag; the
-                        // second IMEI is 723 (`TagType.BYTES | 723`).
                         ((710..=717).contains(&tag) || tag == 723).then_some((tag, value))
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
-        // User-authentication / authorization-list entries forwarded by the
-        // A-side as `[tag, value]` pairs (502 USER_SECURE_ID, 503
-        // NO_AUTH_REQUIRED, 504 USER_AUTH_TYPE, 505 AUTH_TIMEOUT, 506
-        // ALLOW_WHILE_ON_BODY, 507 TRUSTED_USER_PRESENCE_REQUIRED, 508
-        // TRUSTED_CONFIRMATION_REQUIRED, 509 UNLOCKED_DEVICE_REQUIRED). These go
-        // straight into the real TEE request: the TEE keeps USER_SECURE_ID inside
-        // the key blob, enforces USER_AUTH_TYPE/AUTH_TIMEOUT, and stamps them (but
-        // not NO_AUTH_REQUIRED) into the leaf. Duplicated tags are dropped, and
-        // NO_AUTH_REQUIRED is dropped whenever a real auth requirement came along
-        // — KeyMint rejects that contradictory combination, and the A-side
-        // fallback (the server keybox layer) drops it the same way.
+        // User-auth / authorization-list entries forwarded by the A-side as
+        // `[tag, value]` pairs: 502 USER_SECURE_ID, 503 NO_AUTH_REQUIRED,
+        // 504 USER_AUTH_TYPE, 505 AUTH_TIMEOUT, 506 ALLOW_WHILE_ON_BODY,
+        // 507 TRUSTED_USER_PRESENCE_REQUIRED, 508 TRUSTED_CONFIRMATION_REQUIRED,
+        // 509 UNLOCKED_DEVICE_REQUIRED. The TEE keeps 502 inside the key blob,
+        // enforces 504/505 and stamps them (not 503) into the leaf. Duplicated tags
+        // and 503 next to a real auth requirement are dropped — KeyMint rejects it.
         user_auth: {
             let mut tags = Vec::new();
             for pair in get("user_auth")
@@ -1152,24 +1093,19 @@ fn handle_generate_attest(cfg: &RelayConfig, _task_type: &str, payload: &Value) 
         .and_then(|c| c.get("attestation_security_level"))
         .and_then(Value::as_i64)
         .unwrap_or(1);
-    // A 端在 ctx 里声明的补丁日期要不要落到本机 TEE 上（开关是 relay.conf 的
-    // OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A）。真改了属性就得等 keymint HAL 重读，
-    // 这一笔会慢两三秒；值没变时什么都不做。
-    // 开了跟随开关、且这个请求的包不在黑名单里、且 A 端版本不低于 1.7.0，才把
-    // 「改属性 + 弹 HAL 重读」和「铸这把钥匙」锁在一起 —— 中间不能被别的请求插进来
-    // （见 plat::patchlevel::lock）。不跟的请求、老版本客户端的请求不碰属性，不用排队。
+    // 开了跟随开关、包不在黑名单、且 A 端版本不低于 1.7.0，才把「改属性 + 弹 HAL 重读」
+    // 和「铸这把钥匙」锁在一起（见 plat::patchlevel::lock）—— 中间不能被别的请求插进来。
+    // 不跟的请求、老版本客户端的请求不碰属性，不用排队。
     let follow_this = cfg.patchlevel_follow_a
         && ommegaclient_b::plat::patchlevel::client_version_ok(payload)
         && !ommegaclient_b::plat::patchlevel::package_blocked(payload, &cfg.patchlevel_skip_pkgs);
     let _align_guard = follow_this.then(ommegaclient_b::plat::patchlevel::lock);
     // 第二种办法（`OMMEGA_RELAY_PATCHLEVEL_METHOD=live`）：直接改 TA 的 configure，
-    // 不碰系统属性、也不弹 keymint HAL，签完立刻回基线。只在高通 KeymasterUtils
-    // 那条通道上可用；APPLY 失败（daemon 没起来 / 不是这类机器）就当场退回第一种，
-    // 保证这一笔的链还是对的，只是慢两三秒。
+    // 不碰属性、也不弹 keymint HAL，签完立刻回基线。只在高通 KeymasterUtils 通道上可用；
+    // APPLY 失败（daemon 没起来 / 不是这类机器）就当场退回第一种，只是慢两三秒。
     //
-    // StrongBox 请求不走这条路：那条通道只改 TEE 那个 HAL 的配置，strongbox HAL
-    // 是另一个进程（/strongbox），只能靠第一种「全弹一遍」才改得到。所以这类请求
-    // 直接交给第一种，宁可慢一点也不能给一条日期不对的 StrongBox 链。
+    // StrongBox 请求不走这条路：那条通道只改 TEE 那个 HAL，strongbox 是另一个进程
+    // （/strongbox），只能靠第一种「全弹一遍」改到。
     let mut live_guard = None;
     if follow_this
         && security_level != 2
@@ -1193,21 +1129,17 @@ fn handle_generate_attest(cfg: &RelayConfig, _task_type: &str, payload: &Value) 
             Err(e) => log::warn!("attest: live 不可用，这一笔退回改属性：{e:#}"),
         }
     }
-    // StrongBox 请求连属性都不动：NXP 的 strongbox HAL 会把 OS_VERSION /
-    // OS_PATCH / VENDOR_PATCH 写进 SE 里的 TA（`javacard.keymint.device.strongbox-impl`），
-    // 而 TA 只认首次绑定的那组值 —— 后面再写会回 APDU 状态 6985
-    //（"Error in sending system properties"），紧接着 generateKey 就报 -74
-    //（attestation keys not provisioned）。实测：A 端要的补丁日期一伪造，
-    // strongbox 必挂；不动属性就正常出链。
+    // StrongBox 请求连属性都不动：NXP 的 strongbox HAL 会把 OS_VERSION / OS_PATCH /
+    // VENDOR_PATCH 写进 SE 里的 TA（`javacard.keymint.device.strongbox-impl`），而 TA 只认
+    // 首次绑定的那组值 —— 再写会回 APDU 6985，紧接着 generateKey 报 -74（attestation
+    // keys not provisioned）。
     if live_guard.is_none() && security_level != 2 {
         if let Some(note) = ommegaclient_b::plat::patchlevel::follow_a_side(payload, follow_this) {
             log::info!("attest: {note}");
         }
     }
-    // 请求的用途（含 ATTEST_KEY）原样下发给真 TEE：真机实测独占 ATTEST_KEY
-    // 可以铸（purposes=[ATTEST_KEY]，Key Usage=Certificate Sign）。把它换成 SIGN
-    // 就等于把「证明密钥」换成普通签名密钥，链上看不到硬件授权。
-    // 调用方自带证明密钥时，`spec.attestation_key` 会让本端走原生委派。
+    // 请求的用途（含 ATTEST_KEY）原样下发给真 TEE：换成 SIGN 就等于把「证明密钥」换成
+    // 普通签名密钥，链上看不到硬件授权。带 `spec.attestation_key` 时本端走原生委派。
 
     let session = if security_level == 2 {
         match tee_ops::generate_attest_key_on(
@@ -1220,15 +1152,10 @@ fn handle_generate_attest(cfg: &RelayConfig, _task_type: &str, payload: &Value) 
             Ok(session) => session,
             Err(e) => {
                 let err_str = format!("{e:#}");
-                // Distinguish the root cause so operators can tell apart:
-                //   - HAL not present (binder connect failed)
-                //   - HAL present but attestation keys not provisioned (-74)
-                //   - HAL present but hardware unavailable (-68)
-                //   - Parameter/version incompatibility (other KeyMint errors)
-                // AOSP keystore2 does not retry on -74 (it is a hard
-                // failure that propagates to the caller); the three-tier
-                // server fallback then handles recovery without ever
-                // mislabelling a TEE chain as StrongBox.
+                // Classify the root cause: StrongBox HAL not present (binder connect
+                // failed), not provisioned (-74), hardware unavailable (-68), or
+                // parameter/version mismatch (other KeyMint errors). keystore2 does not
+                // retry on -74; the server fallback handles recovery.
                 let reason = if err_str.contains("[km_error=-74]") {
                     "HAL exists but attestation keys not provisioned (factory provisioning issue)"
                 } else if err_str.contains("[km_error=-68]") {
@@ -1305,10 +1232,9 @@ fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
 }
 
 fn handle_agree(_task_type: &str, payload: &Value) -> Result<Value> {
-    // 不在 B 上跑 ECDH。实测这台真机的 TEE 被 `begin(AGREE_KEY)` 进去一次就会落到
-    // `-49: ServiceSpecific` 的坏状态，之后连普通签名都回 `-1000`，整条链跟着废，
-    // 而且 binder 调用不返回 —— 任务永远不 post_result，服务端只能反复重投。
-    // 直接回一个明确的不支持，让 A 端自己回落本地 keybox 算 ECDH。
+    // 不在 B 上跑 ECDH：`begin(AGREE_KEY)` 会让 TEE 落到 `-49: ServiceSpecific` 的坏状态，
+    // 之后连普通签名都回 -1000，而且 binder 调用不返回。直接回不支持，让 A 端自己回落
+    // 本地 keybox 算 ECDH。
     let _ = payload;
     log::warn!("agree: not supported on this B device, asking the A-side to fall back");
     Err(anyhow!("unsupported task type: agree"))
@@ -1366,9 +1292,8 @@ fn handle_task(cfg: &RelayConfig, task_id: &str, task_type: &str, payload: &Valu
 }
 
 /// Background thread: hot-reload the config when `relay.conf` changes or the
-/// `restart.all` marker appears. The live config is updated in place via the
-/// shared `RwLock`, so the poll loop keeps running and never conflicts with the
-/// wrapper (the wrapper does not kill the relay on config changes).
+/// `restart.all` marker appears. The live config is updated in place via the shared
+/// `RwLock`, so the poll loop keeps running across a reload.
 fn spawn_config_watcher(shared: Arc<RwLock<RelayConfig>>, last_mtime: u64) {
     thread::spawn(move || {
         let mut last = last_mtime;
@@ -1411,13 +1336,9 @@ fn spawn_config_watcher(shared: Arc<RwLock<RelayConfig>>, last_mtime: u64) {
     });
 }
 
-/// 一台 B 端能同时做几条活。
-///
-/// 2026-09-30 实测：这台机器上 attest 的排队平均 886ms，而它自己只跑 98ms ——
-/// 一条重活把整条队堵在后面，跟谁先谁后无关。所以默认开两路：取一条、做一条的
-/// 循环变成两路各自长轮询，下一单不用等上一单跑完。HAL 本身（KeyMint / soter）
-/// 就是多线程 binder 服务，两路并发不会打架。想回到单线程设
-/// `OMMEGA_RELAY_WORKERS=1`。
+/// 一台 B 端能同时做几条活。默认两路：一条重活会把单线程的队列堵在后面；HAL 本身
+/// （KeyMint / soter）是多线程 binder 服务，并发不互相阻塞。`OMMEGA_RELAY_WORKERS` 可调
+/// （1..=8）。
 fn worker_count() -> usize {
     std::env::var("OMMEGA_RELAY_WORKERS")
         .ok()
@@ -1447,17 +1368,13 @@ fn run_loop(shared: Arc<RwLock<RelayConfig>>) {
 }
 
 fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
-    // 正常情况下服务端会挂着 15s 长轮询，一轮一个请求。但它要是立刻回 204
-    // （老版本服务端、代理提前收掉连接等），这里不设下限就变成“能跑多快跑多快”，
-    // 直接把服务器打满。失败路径同理，用指数退避兜住。
-    // 短轮询：服务端立即返回，两轮之间的间隔就是最坏延迟。定时下的结论：
-    // 70ms（每秒约 14 次）比 80ms 更贴近任务实际到达节奏，空转请求只多两成。
+    // 服务端立刻回 204（老版本服务端、代理提前收掉连接等）时，不设下限就会把服务器
+    // 打满；短轮询下两轮之间的间隔就是最坏延迟，70ms 是折中值。失败路径走指数退避。
     const MIN_POLL_INTERVAL: Duration = Duration::from_millis(70);
     const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(30);
-    // 长轮询卡死之后没人管，是线上那几次几小时静默 gap 的成因：请求停在 reqwest
-    // 的 read 上，那一路超时都用单调钟算，设备 suspend 之后永远不到 —— 进程活着，
-    // 却再也不发轮询，service.sh 的 wait 也一直陪着等。这里按开机时长盯住，超了
-    // 就退出去让 service.sh 重启。细节见 watchdog 模块。
+    // 请求停在 reqwest 的 read 上、超时用单调钟算，设备 suspend 之后永远不到 —— 进程
+    // 活着却再也不发轮询。这里按开机时长盯住，超了就退出去让 service.sh 重启（见
+    // watchdog 模块）。
     let watchdog = ommegaclient_b::watchdog::SuspendWatchdog::spawn(
         ommegaclient_b::watchdog::DEFAULT_TICK,
         |over_ms| {
@@ -1483,9 +1400,8 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
         ommegaclient_b::soter::set_max_concurrency(cfg.soter_concurrency);
         let started = Instant::now();
         watchdog.arm(POLL_WALL_LIMIT);
-        // 先探路再发长轮询：链路死的时候挂 15s 长轮询只会把设备醒着的那点窗口
-        // 全耗完，快点回来重试才有机会。探针也放在看门狗底下：它一样会被
-        // suspend 冻住，超了还是得退出去重拉。
+        // 先探路再发长轮询，探针也放在看门狗底下：它一样会被 suspend 冻住，超了还是
+        // 得退出去重拉。
         if !path_ready(&cfg) {
             watchdog.disarm();
             std::thread::sleep(Duration::from_secs(1));
@@ -1523,9 +1439,8 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
 
 /// 拿住 wakelock，让系统别 suspend。
 ///
-/// 默认开。拿不到就安静跳过：没开 `CONFIG_PM_WAKELOCKS` 的内核根本没这个文件，
-/// 那种机型上 relay 就只能继续靠看门狗等醒过来 —— 少个能力，不是个错误，
-/// 不该每次都哀一声。
+/// 拿不到就安静跳过：没开 `CONFIG_PM_WAKELOCKS` 的内核根本没这个文件，那种机型上
+/// relay 只能靠看门狗等醒过来 —— 少个能力，不是个错误。
 fn hold_wakelock() -> Option<wakelock::WakeLock> {
     let name = wakelock::DEFAULT_NAME;
     let wl = match wakelock::WakeLock::acquire(name) {

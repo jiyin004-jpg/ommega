@@ -1,4 +1,4 @@
-//! In-memory task queue mirroring `relay_server/apps/relay_core/store.py`.
+//! In-memory task queue.
 //!
 //! A-side endpoints create tasks, wait for a B-side device to claim them
 //! (`pop_for_b`), process them and report the result back (`complete_task`).
@@ -22,22 +22,18 @@ pub enum TaskStatus {
     Failed,
 }
 
-/// 一个任务最多被重新派发多少次。没这个上限的话，B 端反复领取又超时
-/// （拿了一直不 complete，或者领完就挂）会让任务在 Pending 里无限打转：
-/// reclaim_locked 每次回收都把 created_at_ms 重置成 now，expire_locked
-/// 就永远等不到 pending TTL。
+/// 一个任务最多被重新派发多少次，到顶判死。没有上限时 B 端反复领取又超时
+/// （领了不 complete、领完就挂）会让任务在 Pending 里无限打转：回收会把
+/// `created_at_ms` 重置成 now，`expire_locked` 就永远等不到 pending TTL。
 const MAX_ASSIGN_ATTEMPTS: u32 = 5;
 
-/// 没有启动信息（从来没出过链）的设备隔多久再排一次自检（毫秒）。这只是兜底：
-/// 出过链的设备不再自检 —— 它的启动信息靠真实请求的链来刷，B 端按 A 端声明的属性
-/// 出链，补丁日期这类值本来就随请求变，拿自检去盖反而会把真实请求下的值盖掉。
+/// 没有启动信息（从来没出过链）的设备隔多久再排一次自检（毫秒）。
+/// 出过链的设备不再自检：启动信息靠真实请求的链来刷，自检会盖掉真实值。
 const SELFCHECK_RETRY_MS: u64 = 30 * 60 * 1000;
 
-/// 两次「清理」之间至少隔多久（毫秒）。`reclaim_locked` / `expire_locked` 都是
-/// 对 `tasks` 的全表扫描，而 `pop_for_b` 的长轮询里每 250 ms 就回退醒一次
-/// —— 一次 30 秒的 poll 光清理就扫上百遍，且全程占着同一把全局锁。这些
-/// TTL 都是秒到分钟级的，按这个间隔节流既不妨碍判定超时，又能把扫描次数
-/// 压到几十次以内。
+/// 两次清理之间至少隔多久（毫秒）。`reclaim_locked` / `expire_locked` 都是
+/// `tasks` 全表扫描且全程持同一把全局锁，长轮询的兜底唤醒又很密，必须节流。
+/// TTL 是秒到分钟级，最坏晚一个间隔不影响判定。
 const SWEEP_INTERVAL_MS: u64 = 1_000;
 
 /// 自检失败原因写进状态页前的截断长度（B 端错误文本可能很长）。
@@ -53,11 +49,9 @@ const ACTIVITY_WINDOW_MS: u64 = 60_000;
 /// Sticky offline-device routing lifetime, shared by KeyMint and SOTER.
 const SUBSTITUTE_TTL_MS: u64 = 10 * 60 * 1000;
 
-/// 设备「最近一次心跳」在这个窗口内，就不许把它的配对组换成别的组。
-///
-/// 窗口跟在线判定一样（`resolve_online_target` 的 120 秒）：一台还在心跳的 B，
-/// 只有它自己那把 token 能改它的配对组。别人拿着另一张 B 卡来改，说明想把它
-/// 认领进自己的组，从而让配对检查放行别人的 A —— 这种一律不认。
+/// 设备最近一次心跳在这个窗口内，就不许换它的配对组（窗口同在线判定的 120 秒）。
+/// 还在心跳的 B 只有自己那把 token 能改；否则任意一张 B 卡心跳一笔就能把它
+/// 认领进自己组，配对检查形同虚设。
 const TOKEN_META_REBIND_AFTER_MS: u64 = 120_000;
 
 #[derive(Debug, Clone)]
@@ -97,12 +91,10 @@ pub struct DeviceEntry {
     /// Boot state parsed from the last attestation this device produced (see
     /// `cert::device_boot_info_from_chain`).  Carried across poll upserts.
     pub boot: Option<crate::cert::DeviceBootInfo>,
-    /// `ATTESTATION_APPLICATION_ID` from the last chain this device produced —
-    /// the package identity the key was minted for, parsed by
-    /// `cert::attestation_application_id_from_chain`.  This is the one field
-    /// that tells a chain minted by the device's *app* (`org.ommega.deviceb`)
-    /// apart from one the module minted while relaying someone else's request
-    /// (the requesting package).  Carried across poll upserts like `boot`.
+    /// `ATTESTATION_APPLICATION_ID` of the last chain this device produced, parsed
+    /// by `cert::attestation_application_id_from_chain`. Tells a chain minted by the
+    /// device's own app (`org.ommega.deviceb`) from one it minted while relaying a
+    /// requester's package. Carried across poll upserts like `boot`.
     pub last_aaid: Option<String>,
     /// 自检（连上后替它排的那次认证）失败的原因。成功或还没自检时是 None，
     /// 状态页用它解释"这台为什么没有启动信息"。
@@ -121,12 +113,9 @@ pub struct DeviceEntry {
     /// （`soter_nosign`），签名类 op 不再派给它；`None` 是没上报（老版本 relay），
     /// 还能试。
     pub soter_nosign: Option<bool>,
-    /// 心跳里上报“TA 卡在 TEE 里了”（`soter_stuck`）：RPMB 会话被 TA 自己占死，
-    /// 它读不到自己的持久存储，导出/建料全回 `-5`，还会报 `258`。这是暂态，
-    /// 重启整机就能恢复（设备侧自己会先试）。跟 `soter_nosign` 那种「结构性做不到」
-    /// 分开记：它**不是**「这台不会做 SOTER」，只是「现在做不了」。
-    ///
-    /// 路由上只用来降优先级，不用来踢人（见 `resolve_soter_target`）。
+    /// 心跳里上报“TA 卡在 TEE 里了”（`soter_stuck`）：RPMB 会话被 TA 占死，导出/
+    /// 建料全回 `-5`。这是暂态，重启整机可恢复，跟 `soter_nosign`（结构性做不到）
+    /// 分开记。路由上只降优先级，不踢人（见 `resolve_soter_target`）。
     pub soter_stuck: Option<bool>,
     /// 心跳里上报的 StrongBox 能力（有没有那个 HAL 实例）。只看展示，
     /// StrongBox 出证走的是 strongbox 模式那套逻辑。
@@ -187,16 +176,12 @@ impl DeviceIdentityReport {
 }
 
 impl DeviceEntry {
-    /// 设备质量分级（越高越优先占名额）。
-    ///
-    /// 判断依据是它自己出过的证（`boot`，由 `cert` 从叶子解析）和自检结果：
+    /// 设备质量分级（越高越优先占名额），依据 `boot`（`cert` 从叶子解析）与自检结果：
     /// - 3 = 锁定 + 可信启动（`device_locked=true` 且 verified / self-signed）
-    /// - 2 = 锁定但启动状态不明，或还没出过证（质量未知，按中性算）
-    /// - 1 = 解锁的（能出链，只是链不好看）
-    /// - 0 = **自检失败**（`tee_error` 有值）：根本出不了链，占着名额也没用，
-    ///   排在解锁的后面，让能用的设备优先
+    /// - 2 = 锁定但启动状态不明，或还没出过证
+    /// - 1 = 解锁的
+    /// - 0 = 自检失败（`tee_error` 有值），出不了链，排在解锁的后面
     pub fn seat_quality(&self) -> u8 {
-        // 出不了链的排最低：自检失败往往是 TA 卡住 / 未预制，占名额纯浪费。
         if self.tee_error.is_some() {
             return 0;
         }
@@ -213,27 +198,23 @@ impl DeviceEntry {
                 }
             }
             Some(false) => 1,
-            // 证里没带 locked 标记：当锁定但无法确认，别让它比真解锁的还差
+            // 证里没带 locked 标记：当锁定但无法确认
             None => 2,
         }
     }
-    /// 这台是模块 relay（`Some(true)`）、手机 App（`Some(false)`）还是分不出来（`None`）。
+    /// 模块 relay（`Some(true)`）、手机 App（`Some(false)`）、分不出来（`None`）。
     ///
-    /// 心跳带了模块专属参数的一定是模块 relay；没带的看它出过的链 —— App 铸的链
-    /// AAID 固定是它自己的包名（`org.ommega.deviceb`），而模块中继别人请求时这个
-    /// 字段是请求方的包名，自检那条是 `org.ommega.selfcheck`，所以只要出过链、又
-    /// 不是 App 那个包名，就是模块（老版本 relay 也能这么认出来）。
-    /// 只有根本没出过链的（比如自检就失败的）才给 `None`，调用方按“能用”处理。
+    /// 心跳带了模块专属参数的一定是模块 relay；没带的看它出过的链：App 铸的链 AAID
+    /// 固定是自己包名（`org.ommega.deviceb`），其余出过链的都是模块。
+    /// 根本没出过链的才给 `None`，调用方按“能用”处理。
     pub fn module_kind(&self) -> Option<bool> {
         if self.from_module {
             return Some(true);
         }
         match self.last_aaid.as_deref() {
-            // App 铸的链固定带它自己的包名；其余出过链的都能说明是模块：自检那条是
-            // `org.ommega.selfcheck`，中继别人请求时是请求方的包名。
             Some(a) if a.starts_with("org.ommega.deviceb") => Some(false),
             Some(_) => Some(true),
-            // 连一条链都没有（比如自检就失败的）才真的分不出来。
+            // 连一条链都没有才真的分不出来。
             None => None,
         }
     }
@@ -256,28 +237,23 @@ pub struct DeviceCaps {
     pub soter: Option<bool>,
     /// 设备真签出来过一次（`soter_sign`）：签名那两个 op 派过去能做完。
     pub soter_sign: Option<bool>,
-    /// 设备明说“签名这步做不了”（`soter_nosign`）：老版本 relay 会这么报，现在这版
-    /// 不再产生（失败码推不出设备能力，见 B 端 `soter::SignState`）。名字仍然解析，
-    /// 只是给旧设备留兼容：跟 `soter = Some(false)`（压根没 HAL）分开记，因为它
-    /// 还能做身份/导出那些 op。
-    ///
-    /// 老版本 relay 不会报这个名字 —— 那是“没说”，不是“做不到”，签名还能试。
+    /// 设备明说“签名这步做不了”（`soter_nosign`）。当前 relay 不再上报，只为旧设备
+    /// 兼容；跟 `soter = Some(false)`（压根没 HAL）分开记，它还能做身份/导出那些 op。
+    /// 没报这个名字是“没说”，签名还能试。
     pub soter_nosign: Option<bool>,
-    /// 设备明说“TA 现在卡在 TEE 里”（`soter_stuck`）：RPMB 会话被 TA 自己占着，
-    /// 导出/建料一概回 `-5`。
+    /// 设备明说“TA 现在卡在 TEE 里”（`soter_stuck`）：RPMB 会话被 TA 占着，导出/
+    /// 建料一概回 `-5`。
     ///
-    /// 跟 `soter = Some(false)`（压根没 HAL）、`soter_nosign`（结构上不签）都不同：
-    /// 这是**暂态**。所以它不进 `soter_relay_marks_unavailable` —— 那个名单的语义是
-    /// 「这层做不了」，会把槽位挪到服务端自签那两层，把 App 手里的真料换成假料。
-    /// 卡住只降优先级、并上报给操作员。
+    /// 跟 `soter = Some(false)`、`soter_nosign` 不同：这是暂态。所以它不进
+    /// `soter_relay_marks_unavailable` —— 那会把槽位挪到服务端自签那两层，
+    /// 把 App 手里的真料换成假料。卡住只降优先级。
     pub soter_stuck: Option<bool>,
     pub strongbox: Option<bool>,
 }
 
-/// 这一步由 TEE 现场签：`init_sign` 开会话、`finish_sign` 出签名。无人值守的 B 端
-/// 也做得了（2026-10-06 在 PLC110 上实测：不按指纹也出真签名），只是这两步必须
-/// 落在同一台设备上，别处不能顶替。
-/// 其余的 op（身份、公钥导出、建/删）设备自己就能答。
+/// 这一步由 TEE 现场签：`init_sign` 开会话、`finish_sign` 出签名，无人值守的 B 端
+/// 也做得了；这两步必须落在同一台设备上，别处不能顶替。
+/// 其余 op（身份、公钥导出、建/删）设备自己就能答。
 pub(crate) fn soter_op_needs_sign(op: &str) -> bool {
     matches!(op, "init_sign" | "finish_sign")
 }
@@ -304,11 +280,9 @@ fn task_needs_soter_sign(task: &Task) -> bool {
         .unwrap_or(false)
 }
 
-/// 排队优先级：数字越小越先被 B 端领走。
-///
-/// attest 最靠前（RKP / 出链那条路，Duck Detector 拿它比延迟），sign / decrypt
-/// 次之，SOTER 垫底（那些 op 本来就有短 TTL 合并，晚几毫秒无所谓）。未知类型
-/// 排中间，免得以后加的新类型凭空插到 attest 前面。
+/// 排队优先级：数字越小越先被 B 端领走。attest 最靠前（RKP 出链那条路对延迟敏感），
+/// sign / decrypt 次之，SOTER 垫底（有短 TTL 合并）。未知类型排中间，
+/// 免得新加的类型凭空插到 attest 前面。
 fn task_priority(task_type: &str) -> u8 {
     match task_type {
         "attest" => 0,
@@ -330,8 +304,6 @@ impl DeviceCaps {
                 let has = |name: &str| raw.split(',').any(|t| t.trim().eq_ignore_ascii_case(name));
                 DeviceCaps {
                     soter: Some(has("soter")),
-                    // 只有真签出来过的设备才会报这个名字；没报 = 没量过（或者量不
-                    // 出来），那是“还能试”，不是“不行”。
                     soter_sign: Some(has("soter_sign")),
                     soter_nosign: Some(has("soter_nosign")),
                     soter_stuck: Some(has("soter_stuck")),
@@ -381,11 +353,9 @@ struct Inner {
     /// doesn't always pick the same (first) device when several are idle.
     load_balance_index: usize,
     /// Sticky substitute per requested-but-offline device_id: `(target, chosen_at_ms)`.
-    ///
-    /// EC and RSA attestation are separate requests; letting the balancer round-robin
-    /// them onto different B devices hands the app two chains with different issuers
-    /// for the same device (reported as an RSA/EC profile mismatch). Pinning the
-    /// substitute for [`SUBSTITUTE_TTL_MS`] keeps consecutive requests consistent.
+    /// EC and RSA attestation are separate requests; round-robining them onto two B
+    /// devices hands the app two chains with different issuers for the same device.
+    /// Pinned for [`SUBSTITUTE_TTL_MS`] so consecutive requests stay consistent.
     substitutes: HashMap<String, (String, u64)>,
     /// SOTER identities must stay on one TEE across generate/export/sign steps.
     /// Kept separate from KeyMint substitutes, with the same bounded TTL.
@@ -396,8 +366,7 @@ struct Inner {
 
 pub struct TaskStore {
     inner: Mutex<Inner>,
-    /// Woken whenever a new pending task appears (long-poll support).
-    /// 有新任务、或有结果落地时递增的版本号，仅 B 端订阅。
+    /// 有新任务或有结果落地时递增的版本号，B 端长轮询据此唤醒。
     tick: watch::Sender<u64>,
     /// Sync snapshot of recently-polling device ids (seen within the online
     /// window) so blocking threads (e.g. the auto-keybox loop) can read "who is
@@ -490,8 +459,7 @@ impl TaskStore {
             "device_id": device_id,
             "alias": SELFCHECK_ALIAS,
             "challenge": challenge,
-            // 跟 A 端真实请求同形。b 端除了 `challenge` 和 AAID 之外都有默认值，
-            // 这里还是把常用参数显式写出来，让它跟一次真实认证走同一条路径。
+            // 跟 A 端真实请求同形：显式写出默认参数，走同一条认证路径。
             "device_attest_context": {
                 "attestation_application_id": app_id,
                 "attestation_security_level": 1,
@@ -571,11 +539,9 @@ impl TaskStore {
 
     /// 叫醒 B 端等活的请求；A 端用独立的任务结果 watch。
     ///
-    /// 用 `watch` 的版本号，而不是 `Notify::notify_waiters()`：后者只唤醒「此刻已经
-    /// 注册上」的等待者，入队与注册之间那一瞬的通知会丢，等的人只能靠兜底轮询醒过来
-    /// —— 2026-09-30 实测，那就是远端一跳 ~180ms 的主要来源（Duck Detector 量到的
-    /// `medianRkpPath` 就是它）。`watch` 记的是版本号，迟到的等待者一 `changed()`
-    /// 立刻看见，不会丢。没有订阅者时 `send` 返回 Err，无所谓。
+    /// 用 `watch` 的版本号而不是 `Notify::notify_waiters()`：后者只唤醒此刻已注册的
+    /// 等待者，入队与注册之间那一瞬的通知会丢。`watch` 记版本号，迟到的等待者
+    /// 一 `changed()` 立刻看见。没有订阅者时 `send` 返回 Err，无所谓。
     fn bump_tick(&self) {
         let next = self.tick.borrow().wrapping_add(1);
         let _ = self.tick.send(next);
@@ -600,10 +566,8 @@ impl TaskStore {
 
     /// 窗口内的活动量 —— 调度和状态页共用的那个“负载”。
     ///
-    /// 队列只在 `record_event_locked` 里修剪，而那只有在该设备又冒出新事件时
-    /// 才会跑：设备一安静，队列就停在那里，里面的旧事件永远不会过期。所以求和
-    /// 时得自己按窗口筛一遍，不能信队列里的残留 —— 否则“曾经忙、现在闲着”的
-    /// 机器负载一直挂在高位，被排在负载 0 的新机器后面，越闲越派不到活。
+    /// 队列只在 `record_event_locked` 里修剪，设备一安静就停在那里，旧事件不会
+    /// 过期，所以求和时必须自己按窗口筛，不能信队列里的残留。
     fn window_activity_locked(inner: &Inner, device_id: &str) -> u64 {
         Self::window_activity_at(inner, device_id, Self::now_ms())
     }
@@ -621,15 +585,11 @@ impl TaskStore {
             .unwrap_or(0)
     }
 
-    /// Pop the next pending task matching this device, with long-poll semantics.
-    /// Returns None after `timeout` elapsed with no match.
     /// B 端连上来时问一句：按当前在线情况，这台排得上名额吗？
     ///
-    /// **无状态实现**：不维护占位标记，每次 poll 现场把在线设备排一遍，看本设备在不在
-    /// 前 `max` 名。排序：固定的默认设备优先，其次按质量（锁定+可信启动），同质量按
-    /// 最近活跃。掉线超过 120 秒的不参与排名。
-    ///
-    /// 拒绝时不更新任何状态，被拒的设备 120 秒后自然掉出在线列表。
+    /// 无状态：不维护占位标记，每次现场把在线设备排一遍，看本设备是否在前 `max` 名。
+    /// 排序为固定的默认设备优先，其次按质量（锁定 + 可信启动），同质量按最近活跃。
+    /// 掉线超过 120 秒的不参与排名；拒绝时不更新任何状态。
     pub async fn allow_poll(&self, device_id: &str, max: usize) -> Result<(), String> {
         if max == 0 {
             // 只在第一次提醒（无限制是默认值，也可能说明配置文件没读上）
@@ -659,9 +619,8 @@ impl TaskStore {
             })
             .collect();
 
-        // 本设备可能还不在这张表里（首次 poll 要等 pop_for_b 才 insert）。
-        // 给它**最旧**的时间戳参与排名：之前这里用的是 `now`，排序按最近活跃降序，
-        // 结果新设备天然排第一、名次永远 < max，544 台全放行 ✓
+        // 本设备可能还不在这张表里（首次 poll 要等 pop_for_b 才 insert），
+        // 给它最旧的时间戳参与排名，否则新设备天然排第一、名次永远 < max。
         if !rank.iter().any(|(id, _, _, _)| id == device_id) {
             rank.push((device_id.to_string(), 1, 0, false));
         }
@@ -690,6 +649,7 @@ impl TaskStore {
         ))
     }
 
+    /// 长轮询领取一条任务；`timeout` 内没有匹配的返回 `None`。
     pub async fn pop_for_b(
         &self,
         device_id: &str,
@@ -703,13 +663,12 @@ impl TaskStore {
         loop {
             {
                 let mut inner = self.inner.lock().await;
-                // 心跳节流：B 端现在是 70ms 一轮，每轮都重建一次 `DeviceEntry` 等于
-                // 每秒对全局队列锁写十几次，还带两次 String 分配。在线窗口是 120s，
-                // 500ms 刷一次完全够用，省下的锁时间留给 complete_task 那头。
+                // 心跳节流：每轮都重建 `DeviceEntry` 等于反复写全局队列锁，
+                // 在线窗口 120s，500ms 刷一次足够。
                 let heartbeat_due = {
                     let now = Self::now_ms();
-                    // 能力改口的那一轮不节流：B 端刚说“不支持了 / 签不了了”要立刻生效，
-                    // 否则接下来 500ms 还会按旧结论派活（单测里连续两次 online 也会卡在这）。
+                    // 能力改口的那一轮不节流：B 端刚改口要立刻生效，
+                    // 否则接下来 500ms 还会按旧结论派活。
                     let caps_changed = inner.devices.get(device_id).is_some_and(|d| {
                         let diff = |incoming: Option<bool>, known: Option<bool>| {
                             incoming.is_some_and(|v| Some(v) != known)
@@ -814,10 +773,8 @@ impl TaskStore {
                             .active_machine
                             .insert(device_id.to_string(), (machine_id.to_string(), hb_now));
                     }
-                    // 自检只是兜底：给从来没有出过链的设备（刚装的、或者之前铸证一直
-                    // 失败的那台）排一次，好让状态页有东西可看，也让它有机会报上真实
-                    // 能力。链一旦出过就不再排 —— 那之后的启动信息、补丁日期靠真实请求
-                    // 的链自己刷（B 端按 A 端声明的属性出链，本来就随请求变），不去盖掉。
+                    // 自检只是兜底：只给从没出过链的设备排一次，让状态页有东西可看。
+                    // 出过链就不再排，启动信息与补丁日期靠真实请求的链自己刷。
                     if self.b_selfcheck
                         && no_boot_yet
                         && hb_now.saturating_sub(known_probe_at) > SELFCHECK_RETRY_MS
@@ -869,11 +826,8 @@ impl TaskStore {
             if remaining.is_zero() {
                 return None;
             }
-            // 版本号变了就是有新任务或新结果；兜底轮询只防「消息真丢了」。
-            // 500ms 而不是 100ms：每个挂着长轮询的 B 都在这个 select 里循环，
-            // 300 台在线时 100ms 就是 3000 次/秒的定时器唤醒（watch 正常工作时
-            // 这些唤醒全是在确认「没变化」）。真的入队会通过 rx.changed() 即时唤醒，
-            // 兜底放宽到 500ms 不会影响派发时效。
+            // 版本号变了就是有新任务或新结果；兜底轮询只防消息真丢了。
+            // 真入队由 rx.changed() 即时唤醒，兜底 500ms 不影响派发时效。
             let poll_interval = remaining.min(Duration::from_millis(500));
             tokio::select! {
                 _ = rx.changed() => {},
@@ -885,11 +839,10 @@ impl TaskStore {
     /// Try to dequeue a task matching this device from the FIFO.
     /// Checks per-device priority queue first, then the wildcard FIFO.
     fn dequeue_locked(&self, inner: &mut Inner, device_id: &str) -> Option<Task> {
-        // 说过不支持的设备不该拿到 SOTER 任务：正常路径上 `resolve_soter_target`
-        // 已经把它排除了，这里是兜底（比如设备在上报之后能力又变了）。
-        // 两道门槛：`soter_ok` 是“这层能不能接 SOTER”（没 HAL 就整类不接），
-        // `soter_sign_ok` 是“签名那两步行不行”（HAL 能答话但签不了的话，只有
-        // 签名 op 不该派过来）。
+        // 兜底：说过不支持 SOTER 的设备不派 SOTER 任务（正常路径上
+        // `resolve_soter_target` 已排除，这里挡设备上报后能力又变的情况）。
+        // 两道门槛：`soter_ok` = 这层能否接 SOTER（没 HAL 整类不接），
+        // `soter_sign_ok` = 签名那两步行不行（HAL 能答话但签不了的只挡签名 op）。
         let (soter_ok, soter_sign_ok) = inner
             .devices
             .get(device_id)
@@ -901,16 +854,13 @@ impl TaskStore {
             })
             .unwrap_or((true, true));
         // 1) Try device-specific queue first.
-        //
         let mut picked: Option<Task> = None;
         let mut deferred: Vec<String> = Vec::new();
         let mut cancelled: Vec<String> = Vec::new();
         if let Some(q) = inner.pending_by_device.get_mut(device_id) {
-            // 按优先级挑，同优先级里先后到。不能直接 pop_front：远端一跳要跟本地
-            // attest 比延迟，排在几十条别的活后面必红；soter 那些 op 有短 TTL 合并，
-            // 晚几毫秒无所谓。
-            // 原地清掉失效引用，能力变化后做不了的定向任务收集起来终结，
-            // 不迁移身份。无需克隆整条队列再按 id 查找/删除一次。
+            // 按优先级挑，同优先级里先来后到：不能直接 pop_front，attest 跑到
+            // 几十条别的活后面会拖垮远端延迟。
+            // 原地清掉失效引用；能力变化后做不了的定向任务收集起来待终结，不迁移身份。
             q.retain(|id| {
                 let Some(t) = inner.tasks.get(id) else {
                     return false;
@@ -1027,10 +977,7 @@ impl TaskStore {
     }
 
     /// 一次清理：先回收超时没回的派发，再剪掉过期/超量的任务。
-    ///
-    /// 两步都是 `tasks` 全表扫描，调用点（长轮询回退、每笔结果结算）又都很密，
-    /// 所以这里按 `SWEEP_INTERVAL_MS` 节流。TTL 判定最坏晚一个间隔，实际影响
-    /// 可以忽略 —— 而省下的是全程持锁的全表扫描。
+    /// 两步都是全表扫描，按 `SWEEP_INTERVAL_MS` 节流（见常量注释）。
     fn sweep_locked(&self, inner: &mut Inner) {
         let now = Self::now_ms();
         if now.saturating_sub(inner.last_sweep_ms) < SWEEP_INTERVAL_MS {
@@ -1159,7 +1106,6 @@ impl TaskStore {
                 t.assigned_device_id = None;
                 t.attempts = t.attempts.saturating_add(1);
                 if t.attempts >= MAX_ASSIGN_ATTEMPTS {
-                    // 派发次数用完了，判死，不再重派。
                     t.status = TaskStatus::Failed;
                     t.result = Some(serde_json::json!({
                         "error": "task expired: too many delivery attempts"
@@ -1170,9 +1116,8 @@ impl TaskStore {
                     continue;
                 }
                 t.status = TaskStatus::Pending;
-                // 重置创建时间：expire_locked 按创建时长判 pending TTL，
-                // 不重置的话刚被回收重试的任务会立刻被判定超时失败，
-                // 重试机制形同虚设。次数上界由 attempts 兜住。
+                // 重置创建时间：expire_locked 按创建时长判 pending TTL，不重置的话
+                // 刚回收重试的任务会立刻被判超时失败。次数上界由 attempts 兜住。
                 t.created_at_ms = now;
                 // Put back into the appropriate bucket.
                 if t.target_device_id.is_empty() {
@@ -1191,9 +1136,8 @@ impl TaskStore {
     /// Complete a task with a result reported by the B-side.
     /// Returns Ok(()) if the task existed and was still open, Err(msg) otherwise.
     ///
-    /// 守卫（2026-09-21 加固）：只有 Assigned / Pending 状态可以被回传终结，
-    /// 已 Completed / Failed 的任务直接拒绝；认领过的任务只接受
-    /// assigned_device_id 那台设备的结果。
+    /// 守卫：只有 Assigned / Pending 可以被回传终结，认领过的任务只接受
+    /// `assigned_device_id` 那台设备的结果。
     pub async fn complete_task(
         &self,
         task_id: &str,
@@ -1217,11 +1161,9 @@ impl TaskStore {
             .and_then(|t| t.payload.get("selfcheck"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // 同一条叶子证书上再取一次 AAID：启动信息说的是「设备处于什么状态」，AAID 说的
-        // 是「这条链是谁的身份」，两个都要上状态页。
-        //
-        // 这里只抄 leaf、不当场解析：解析是两次 DER/CBOR 遍历，而这段还在 `inner` 锁里，
-        // 会把等结果的 A 端请求一起拖住。先把结果发出去，再解析、再落表。
+        // 同一条叶子证书上再取一次 AAID：启动信息说的是设备处于什么状态，AAID 说的是
+        // 这条链是谁的身份。这里只抄 leaf、不当场解析 —— 解析是两次 DER/CBOR 遍历，
+        // 还在 `inner` 锁里会把等结果的 A 端请求一起拖住，发完结果再解析落表。
         let leaf =
             if task_type == "attest" && result.get("error").is_none() && !device_id.is_empty() {
                 result
@@ -1233,15 +1175,13 @@ impl TaskStore {
             } else {
                 None
             };
-        // 只允许"在飞"的任务被回传终结：已经完结的任务再来一次（b 端最多
-        // 重试 4 次、最坏 139s，同一个结果可能重复到达）不能覆盖已有结果，
-        // 也不能把同一条任务二次塞进 completed_queue —— 那会让队列长度
-        // 虚高，并让结果被取两次。Pending 仍然放行：分配超时（默认 60s）
-        // 把任务回收成 Pending 后，原设备的晚到结果依旧是有效结果，此时
-        // assigned_device_id 已被清空，下面的归属校验自然跳过。
+        // 只允许"在飞"的任务被回传终结：已完结的任务重复回传不能覆盖已有结果，
+        // 也不能二次塞进 completed_queue（队列长度虚高、结果被取两次）。
+        // Pending 仍然放行：分配超时把任务回收成 Pending 后，原设备的晚到结果
+        // 依旧有效，此时 assigned_device_id 已清空，归属校验自然跳过。
         {
-            // 上面刚查过，但这里不能用 expect：panic 会毒化整个状态锁，
-            // 等于服务停摆。真跑到这只能是锁内逻辑被改过，当重复回传幂等处理。
+            // 这里不能用 expect：panic 会毒化整个状态锁，等于服务停摆。
+            // 真跑到这只能是锁内逻辑被改过，按重复回传幂等处理。
             let Some(task) = inner.tasks.get(task_id) else {
                 tracing::warn!(
                     "complete_task: task {task_id} vanished under the lock; ignoring report from {device_id}"
@@ -1250,9 +1190,8 @@ impl TaskStore {
             };
             match task.status {
                 TaskStatus::Assigned | TaskStatus::Pending => {}
-                // 重复回传当幂等处理：结果已经在里面了，不动它，也不报错 ——
-                // b 端 post_result 只在收到 2xx 时停止重试，回 4xx 只会让它的
-                // 日志多一条"被拒绝"。真正的重复在这里被吃掉。
+                // 重复回传当幂等处理：结果已在里面，不动它也不报错 ——
+                // b 端 post_result 只在收到 2xx 时停止重试。
                 TaskStatus::Completed | TaskStatus::Failed => {
                     tracing::debug!(
                         "complete_task: duplicate report for {task_id} from {device_id} ignored"
@@ -1260,11 +1199,9 @@ impl TaskStore {
                     return Ok(());
                 }
             }
-            // 归属校验：认领过设备 id 的任务，只认那个设备报上来的结果，
-            // 免得共享 B token 下另一台设备把结果顶掉。空 device_id 同样
-            // 不认——以前放行空 id，等于谁都能用空 id 顶掉在飞任务。
-            // 尚未认领（Pending 且 assigned 为空）的任务不拦，分配超时回收后
-            // 原设备的晚到结果依旧有效。
+            // 归属校验：认领过设备的任务只认那台报上来的结果，免得共享 B token
+            // 下另一台把结果顶掉；空 device_id 同样不认，否则谁都能顶掉在飞任务。
+            // 尚未认领的任务不拦，分配超时回收后原设备的晚到结果依旧有效。
             if let Some(assigned) = task.assigned_device_id.as_deref() {
                 if !assigned.is_empty() && assigned != device_id {
                     return Err("device mismatch".to_string());
@@ -1292,9 +1229,8 @@ impl TaskStore {
         } else {
             TaskStatus::Completed
         };
-        // 一段远端跳到底慢在哪里：入队→被领走（等轮询/排队）与
-        // 被领走→结果回来（B 自己干活 + 回传）分开打。A 端看到的
-        // 「RKP 路径延迟」就是这两段加上两端各自的网络往返。
+        // 入队→被领走 与 被领走→结果回来 分开打日志：
+        // A 端看到的「RKP 路径延迟」就是这两段加上两端各自的网络往返。
         {
             let queued_ms = task.assigned_at_ms.saturating_sub(task.created_at_ms);
             let served_ms = now.saturating_sub(task.assigned_at_ms);
@@ -1320,9 +1256,8 @@ impl TaskStore {
             inner.completed_queue.push_back((now, task_id.to_string()));
         }
         Self::publish_result_locked(&mut inner, task_id);
-        // 任务本身（结果 + 状态 + 归属 + 队列）到这里已经全部落定，先把锁放掉：
-        // A 端已由独立 watch 收到结果，不必再次争抢 inner 锁。
-        // 下面那串"状态页的活儿"不该再挡在它前面。
+        // 结果 + 状态 + 归属 + 队列已全部落定，放掉锁：A 端已由独立 watch 收到结果，
+        // 下面状态页的活不该挡在它前面。
         drop(inner);
         self.bump_tick();
 
@@ -1335,8 +1270,8 @@ impl TaskStore {
             None => (None, None),
         };
 
-        // 再拿一次锁补设备记录。这一步纯粹是状态页展示用的，晚几十微秒没有任何
-        // 代价；万一这段时间设备下线、条目被清掉了，就当这次没解析过，不重建条目。
+        // 再拿一次锁补设备记录，只供状态页展示；这段时间设备下线、条目被清掉的话
+        // 就当这次没解析过，不重建条目。
         let mut inner = self.inner.lock().await;
         if boot.is_some() || chain_aaid.is_some() {
             if let Some(entry) = inner.devices.get_mut(device_id) {
@@ -1410,7 +1345,7 @@ impl TaskStore {
                 return Some(result);
             }
         }
-        // Missing/cancelled tasks used to poll until the deadline, not return early.
+        // 缺失/已取消的任务同样要等满截止时间，不提前返回。
         tokio::time::sleep(deadline.saturating_duration_since(Instant::now())).await;
         // 尚未派发的请求已无人等待，不能在调用者回退后再去建/删钥匙。
         // Assigned mutations cannot be withdrawn or replayed; late replies must
@@ -1800,13 +1735,13 @@ impl TaskStore {
 
     /// Resolve the target for a SOTER task.
     ///
-    /// SOTER 的答案是在目标设备的 TEE 里签的，换台设备就换了身份，所以它跟认证
-    /// 不一样，没有 keybox / self_signed 兜底，只能挑一台真能做的设备：
+    /// SOTER 的答案在目标设备的 TEE 里签，换台设备就换了身份，所以没有 keybox /
+    /// self_signed 兜底，只能挑一台真能做的设备，且顺序不能变：
     ///
-    /// 1. 指定的设备在线 → 能力允许就用它，否则 None，不换设备身份；
+    /// 1. 指定设备在线 → 能力允许就用它，否则 None，不换设备身份；
     /// 2. 指定设备离线 → TTL 内沿用在线的 SOTER 替身，能力不足返回 None；
-    /// 3. 未指定或替身离线/过期 → 在"上报了支持"的在线设备里按负载挑一台；
-    /// 4. 再否则（没有设备上报过能力，比如老版本 relay）在"没上报"的设备里按负载挑；
+    /// 3. 未指定或替身离线/过期 → 在"上报了支持"的在线设备里按负载挑；
+    /// 4. 再否则在"没上报"的设备里按负载挑（老版本 relay）；
     /// 5. 都没有 → `None`，调用方自己降级。
     ///
     /// 明确上报"不支持"的设备不会被选中。
@@ -1850,10 +1785,9 @@ impl TaskStore {
             .filter(|d| now.saturating_sub(d.last_seen_ms) < 120_000)
             // 签名 op 不能落到“明说签不了”的设备上：它接下去只会白跑一趟 -26。
             .filter(|d| !(needs_sign && d.soter_nosign == Some(true)))
-            // 要签名的活只派给「真签出来过一次」的设备。`soter_sign` 是 B 端自己
-            // 跑过一遍 init_sign + finish_sign 实测出来的结论（见 b-side `caps.rs`），
-            // 不是配置推断 —— 默认设备离线时临时改派到另一台，不确认这一条就会
-            // 把活交给“HAL 能答但不肯签”的机器，白跑一趟。
+            // 要签名的活只派给「真签出来过一次」的设备：`soter_sign` 是 B 端跑过
+            // init_sign + finish_sign 得出的结论（见 b-side `caps.rs`），不是配置推断。
+            // 不卡这一条就会把活交给“HAL 能答但不肯签”的机器，白跑一趟。
             .filter(|d| !needs_sign || d.soter_sign == Some(true))
             .map(|d| {
                 (
@@ -1886,11 +1820,9 @@ impl TaskStore {
             if candidates.is_empty() {
                 continue;
             }
-            // 卡住的那台排到最后：只要这一档里还有一台是好的，就别把活交给它。
-            // 整档都卡住时它仍是候选 —— 宁可让真机自己回 `-5`，也不要因为「避卡」
-            // 就回退到服务端自签那两层（那会把 App 手里的真料换成假料，见
-            // `run_soter_task` 的层回退注释）。这一档的意义不是「不给活」，
-            // 只是「挑一台更合适的」。
+            // 卡住的那台排到最后：只要这一档里还有一台好的就别把活交给它；整档都
+            // 卡住时它仍是候选 —— 宁可让真机自己回 `-5`，也不因避卡回退到服务端
+            // 自签那两层（会把 App 手里的真料换成假料，见 `run_soter_task`）。
             candidates.sort_by(|a, b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
             let min = (candidates[0].1, candidates[0].2);
             // 打平时只在同一个「卡没卡」档里打平，不能让一台卡住的挤进并列池。
@@ -1974,11 +1906,8 @@ mod soter_substitute_tests {
         }
     }
 
-    /// 卡住的设备（TA 卡在 TEE 里，导出/建料全回 -5）：在「没点名」的负载均衡里
-    /// 排到最后，还有好设备就别把活给它。
-    ///
-    /// 但点名要它的时候照旧给它 —— 点名不换身份，让真机自己回 -5，别把请求支到
-    /// 别的 TEE（也就别支到自签那两层）。
+    /// 卡住的设备（TA 卡在 TEE 里）在「没点名」的负载均衡里排到最后，有点好设备就不给它活；
+    /// 但点名要它时照旧给它 —— 点名不换身份，让真机自己回 -5。
     #[tokio::test]
     async fn a_stuck_device_is_a_last_resort_but_still_honours_a_direct_request() {
         let store = TaskStore::new(30, 60, 100, 60, false);
@@ -2004,9 +1933,8 @@ mod soter_substitute_tests {
         );
     }
 
-    /// 只剩卡住的那台时还是得给它：返回 `None` 会让上层回退到服务端自签那两层，
-    /// 把 App 手里的真料换成假料 —— 那比「让真机自己回 -5」坏得多。
-    /// 清掉卡住标记（重启后 B 端心跳不再带这个名字）它当然也回到正常候选里。
+    /// 只剩卡住的那台时还是得给它：返回 `None` 会让上层回退到服务端自签那两层。
+    /// 清掉卡住标记（重启后心跳不再带这个名字）它回到正常候选里。
     #[tokio::test]
     async fn a_stuck_device_still_serves_when_it_is_the_only_candidate() {
         let store = TaskStore::new(30, 60, 100, 60, false);
@@ -2314,7 +2242,7 @@ mod selfcheck_tests {
             .expect("challenge 必须是 base64");
         assert_eq!(nonce.len(), 32, "challenge 应该是 32 字节随机数");
 
-        // 模拟 b 端回传失败（比如三星那种"成功但空链"最终被拦下的情况）。
+        // 模拟 b 端回传失败。
         store
             .complete_task(
                 &task.task_id,
@@ -2450,8 +2378,7 @@ mod selfcheck_tests {
     }
 
     /// 上报 `soter_nosign` 的设备（老版本 relay 的结论）：身份/导出还能领，
-    /// `init_sign`/`finish_sign` 不派过来。现在的 relay 不会再这么报（失败码推不出
-    /// 设备能力），这条只当兼容旧设备的路由规则。
+    /// `init_sign`/`finish_sign` 不派过来。当前 relay 不再这么报，只当旧设备兼容规则。
     #[tokio::test]
     async fn sign_ops_skip_a_device_that_reported_soter_nosign() {
         let store = TaskStore::new(30, 60, 100, 60, false);
@@ -2731,8 +2658,7 @@ mod device_load_window_tests {
         assert_eq!(TaskStore::window_activity_at(&inner, "dev", now), 4);
     }
 
-    /// 派活的口径得跟 `get_device_load` 一样：很久没动静的机器不能因为历史
-    /// 负载高就永远排在后面 —— 那正是“越闲越派不到活”的那个坑。
+    /// 派活的口径得跟 `get_device_load` 一样：出了窗口的旧事件不再压低排名。
     #[tokio::test]
     async fn balancing_uses_the_same_fresh_window() {
         let now = TaskStore::now_ms();

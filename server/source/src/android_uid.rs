@@ -1,19 +1,15 @@
 //! Android 的 uid 拆分（照 AOSP 的 `UserHandle` / `KernelUid` 那套）。
 //!
-//! 一个完整 uid = `userId * PER_USER_RANGE + appId`，`PER_USER_RANGE` 是 100000。
-//! 机主是 user 0，工作资料是 10/11/12，分身（MIUI / ColorOS 的应用双开、平行空间）
-//! 在 user 999。也就是说**同一个包在不同用户下 uid 完全不同**：微信在机主上是
-//! 10490，在 user 999 上是 99910490。SOTER 的槽位、钉层、会话本来就按完整 uid
-//! 分开存，这里只是把两个数字拆出来，给日志、策略匹配和身份选路用。
+//! 完整 uid = `userId * PER_USER_RANGE + appId`，`PER_USER_RANGE` 是 100000。
+//! 机主是 user 0，工作资料是 10/11/12，分身（应用双开、平行空间）在 user 999。
+//! 同一个包在不同用户下 uid 完全不同（微信在机主是 10490，在 user 999 是 99910490），
+//! 所以「多用户下的同一个应用」只能靠 `(userId, appId)` 或完整 uid 判，不是 appId。
 //!
 //! 几档 uid（AOSP `android_filesystem_config.h`）：
-//!   - 10000..=19999  普通应用（appId 落在这一段；加不加 userId 前缀都算）
-//!   - 90000..=99999  隔离进程（isolated）。这类进程没有自己的身份，keystore / SOTER
-//!     在 AOSP 里本来就不给它开，槽位上不该出现；真出现了按「不是应用」记一笔。
+//!   - 10000..=19999  普通应用（appId 落在这段）
+//!   - 90000..=99999  隔离进程（isolated）。AOSP 不给它们开 keystore / SOTER，
+//!     槽位上不该出现；真出现了按「不是应用」记一笔。
 //!   - 1000 以内       系统 / root / shell 之类，不是应用。
-//!
-//! 注意 `appId` 不看 `userId`，所以「多用户下同一个应用」的唯一判据是
-//! `(userId, appId)` 或完整 uid，而不是 appId 一个数。
 
 use serde::Serialize;
 
@@ -52,7 +48,7 @@ impl Uid {
         })
     }
 
-    /// 是不是普通应用（appId 在 10000..=19999）。分身/多用户只是 user 不同，
+    /// 是不是普通应用（appId 在 10000..=19999）。多用户/分身只是 user 不同，
     /// appId 这一段不变，所以 user 999 的微信一样算应用。
     pub fn is_app(&self) -> bool {
         (AID_APP_START..=AID_APP_END).contains(&self.app)

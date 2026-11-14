@@ -61,8 +61,8 @@ fn generated_deserializers_reject_invalid_lengths_and_presence_flags() {
 }
 
 /// nullable 参数的存在标记：AOSP 只判「非 0」（Java `readInt() != 0`、C++
-/// `readInt32() != 0`），所以 2 / -1 / INT_MAX 都得当成「存在」。以前我们这边只认
-/// 1，检测器把标记改成别的值就能让同一条 generateKey 落到系统后端去（KEY_NOT_FOUND）。
+/// `readInt32() != 0`），所以 2 / -1 / INT_MAX 都得当成「存在」。只认 1 的话，
+/// 把标记改成别的值就能让同一条 generateKey 落到系统后端（KEY_NOT_FOUND）。
 #[test]
 fn non_unit_presence_marker_means_present() {
     for marker in [2i32, -1, i32::MAX] {

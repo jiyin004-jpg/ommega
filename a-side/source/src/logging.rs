@@ -49,9 +49,8 @@ pub fn init_logger() {
 }
 
 /// 跟着面板的开关走：关掉之后 appender 还在，必须把 `max_level` 压到 Off 才真的不写。
-///
-/// 以前只在 `init_logger` 里读一次，于是面板关了开关也只停得住 `daemon::log()` 那条现读的路，
-/// tracing / log4rs 这条一直写到进程重启。返回是否发生了变化。
+/// 只在 `init_logger` 里读一次不够：那样 panel 关开关也停不住 tracing / log4rs 这条。
+/// 返回是否发生了变化。
 pub fn refresh_switch() -> bool {
     let now = crate::config::flat_debug_logging();
     if now == ENABLED.load(Ordering::Relaxed) {

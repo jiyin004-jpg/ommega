@@ -1,29 +1,17 @@
 //! 按住系统，别让它进 suspend。
 //!
-//! Android 的规则是「没人持有 wakelock 就 suspend」，而 suspend 会把 relay 整个
-//! 冻住：
+//! suspend 会把 relay 冻住：reqwest 的超时都挂在单调钟上，睡的时候单调钟不走，
+//! 恢复后第一次 poll 就一直挂着不返回；看门狗的 `sleep` 同样是单调钟，也要等设备
+//! 醒了才收网。服务端 120 秒收不到 poll 就把这台 B 端标成离线，A 端请求转给别人。
 //!
-//! - reqwest 的超时（连接、读、总超时）都挂在单调钟上，睡的时候单调钟不走，
-//!   所以恢复后第一次 poll 会一直挂在那里不返回；
-//! - 看门狗判得对（它读的 `/proc/uptime` 是启动钟，睡的时候照走），但它自己那个
-//!   `sleep` 也是单调钟，睡着的时候同样不跑 —— 只能在设备醒过来之后才收网。
+//! 做法：`CONFIG_PM_WAKELOCKS=y` 的内核上，往 `/sys/power/wake_lock` 写一个名字就
+//! 拿到一把全局锁，拿着锁系统不会 suspend。
 //!
-//! 结果就是：灭屏一会儿，服务端就收不到 poll 了（服务端 120 秒没有 poll 就把这
-//! 台 B 端标成离线），A 端的请求被转给别的 B 端。醒过来之后看门狗能救，但那是
-//! 「醒了之后」的事。
-//!
-//! 治本只有两条路：要么别让它睡，要么外面定时把它叫醒。这里做第一种 ——
-//! `CONFIG_PM_WAKELOCKS=y` 的内核上，往 `/sys/power/wake_lock` 写一个名字就拿到
-//! 一把全局锁，拿着锁系统不会 suspend（这台机器上实测这文件是 777，不用 root 也
-//! 写得进去）。
-//!
-//! 一个必须记住的坑：**这把锁不跟进程绑定**。实测写完之后进程退出，锁还挂着。
-//! 所以三件事都得做：
+//! **这把锁不跟进程绑定**：进程退出了锁还挂着。所以三件事都得做，漏一条手机就会
+//! 一直醒着耗电：
 //! 1. 上线前先把同名残留解掉（上次被 `pkill -9` 打死留下的）；
 //! 2. 退出时自己解（`Drop`）；
 //! 3. 模块卸载脚本里再解一把。
-//!
-//! 漏掉哪一条，手机都会一直醒着耗电。
 
 use std::io::{Error, ErrorKind, Write};
 
@@ -162,7 +150,7 @@ mod tests {
     #[test]
     fn acquiring_clears_a_stale_lock_of_the_same_name_first() {
         let (lock, unlock, dir) = fixtures();
-        // 上一次被 -9 打死留下的，解锁文件里没人写它，锁还挂着
+        // 上一次被 -9 打死留下的：解锁文件里没人写过它，锁还挂着。
         std::fs::write(&lock, "ommega_test\n").unwrap();
         let _wl = WakeLock::acquire_at(&lock, &unlock, "ommega_test").unwrap();
         assert_eq!(std::fs::read_to_string(&unlock).unwrap(), "ommega_test");
@@ -214,8 +202,8 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    // 「本来有一条、解掉了」那一半只能在真内核上验（测试里没有会把名字从 lock
-    // 文件里抹掉的内核）。这里只管住没锁的时候不去乱写。
+    // 「本来有一条、解掉了」那一半得在真内核上验（测试里没有会把名字从 lock 文件
+    // 里抹掉的内核）。这里只管住没锁的时候不去乱写。
     #[test]
     fn clearing_a_lock_that_is_not_held_writes_nothing() {
         let (lock, unlock, dir) = fixtures();

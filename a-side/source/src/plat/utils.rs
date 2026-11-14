@@ -68,9 +68,8 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
         match get_application_id_from_provider(uid) {
             Ok(id) => id,
             Err(error) => {
-                // SKRoot 下 keymint 必须保持 root（降权后绑不了 socket、binder 初始化也会 abort），
-                // 而 AAID provider 只认 Keystore/Credstore 的 uid，以 root 去问必被拒。
-                // 退一步自己从 /data/system/packages.list 造一份（包名一样，versionCode 给 1）。
+                // SKRoot 下 keymint 必须保持 root：降权会连不上 socket、binder 也起不来；
+                // AAID provider 只认 Keystore/Credstore 的 uid，root 去问必被拒。
                 debug!("AAID provider failed ({error:#}), falling back to packages.list");
                 aaid_from_packages_list(uid)?
             }
@@ -82,17 +81,13 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
     encode_application_id(application_id)
 }
 
-/// AAID 的本地兜底：系统 AAID provider 用不了的时候（我们被注入进 keystore2、
-/// 或者 SKRoot 下以 root 跑）自己拼一份。
+/// AAID 的本地兜底：AAID provider 用不了时（被注入进 keystore2、或 SKRoot 下以 root 跑）
+/// 自己拼一份。
 ///
-/// 两个来源，按可靠程度排：
-///
-/// 1. `/data/system/packages.list`：只有我们以 root 跑时读得到。真机上这个文件是
-///    `0640 system:package_info` + `packages_list_file`，被注入之后我们在 keystore
-///    （uid 1017）里跑，DAC 和 SELinux 两头都拦，一读就是 EACCES。
-/// 2. `/data/misc/ommega/aaid_table`：keymint 守护（一直是 root）从 packages.list
-///    和 `pm list packages --show-versioncode` 抄出来的，放在数据根里、0644、
-///    system_data_file，keystore 域读得到，也不用动系统文件半个字节。
+/// 1. `/data/system/packages.list`：`0640 system:package_info` + `packages_list_file`，
+///    只有以 root 跑时读得到，在 keystore 域（uid 1017）读会 EACCES。
+/// 2. `/data/misc/ommega/aaid_table`：keymint 守护（root）抄出来的副本，0644，
+///    system_data_file，keystore 域读得到，且不改系统文件。
 fn aaid_from_packages_list(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
     let mut direct_error: Option<String> = None;
     match std::fs::read_to_string(PACKAGES_LIST) {
@@ -196,11 +191,9 @@ fn decode_signature_digest(value: &str) -> Option<Signature> {
 
 /// 这个 uid 挂着哪些包（AAID 里那几个 `packageInfos` 的包名）。
 ///
-/// SOTER 分流要按「真调用者是谁」判：调用方自己填的 uid / 别名都不可信（实测探测机
-/// 填过 Gmail 的 uid），只有内核填的 `sender_euid` 可信；而 uid→包名这个映射得问系统。
-/// 那个服务只认 Keystore/Credstore 的 uid，所以只能在这儿翻（daemon 跑在 keystore uid），
-/// payload 那边（SOTER 宿主，uid 1000）一问就被拒：
-/// `This service can only be used by Keystore or Credstore`。
+/// SOTER 分流只认内核填的 `sender_euid`，调用方自填的 uid / 别名不可信。uid→包名
+/// 必须问 AAID provider，而它只认 Keystore/Credstore 的 uid，所以只能在这里翻
+/// （daemon 跑在 keystore uid），payload 侧（uid 1000）一问就被拒。
 pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
     // 系统自己那两份没有对应的安装包，`get_aaid` 里也是这么特判的。
     if uid == 0 || uid == 1000 {
@@ -218,15 +211,10 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
         Err(failed) => error = Some(failed),
     }
 
-    // 不是 user 0 的 uid（多用户 / 分身 / 空间）：`uid = userId * 100000 + appId`。系统那套
-    // 正常查表认不出这些用户号 —— 实测生产里的槽位表上见过 `999`(288) / `998`(84) / `997`(33) /
-    // `996`(16) / `995`(10) / `994`(4) / `19000`(30)，还有真实的 `10` / `11` / `12`——
-    // AAID 要么回空、要么直接报错，于是这些 uid 永远翻不出包名，服务端只能退回按别名/槽位猜
-    // （生产日志里 `99910365` / `99910617` 那些就是这么被拦下的）。
-    // 同一个 App 的 appId 跟它在 user 0 上那份一致，所以拿 appId 再问一次就能拿到同一个包。
-    // 先问 root 侧那张表（它就是系统自己的 `packages.list`，分身的行也在里面，最准）；
-    // 表里没这一条（root 侧还没写出来、或者那个 ROM 的表里真没有）再拿 appId 猜一次 ——
-    // 同一个 App 的 appId 跟它在 user 0 上那份一致，所以猜也能猜对大多数。
+    // 非 user 0 的 uid（多用户 / 分身 / 空间）满足 `uid = userId * 100000 + appId`，
+    // AAID provider 对这些用户号要么回空、要么报错。先查 root 侧那张 uid→包名表
+    // （系统 `packages.list` 的副本，分身的行也在里面，最准）；表里没有就用 appId
+    // 再问一次：同一个 App 的 appId 与它在 user 0 上的一致。
     if let Some(package) = package_from_uid_table(uid) {
         log::info!("event=soter caller uid {uid} 从 root 侧 uid→包名表里翻出 {package}");
         return Ok(vec![package]);
@@ -243,8 +231,7 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
         }
     }
 
-    // 没翻到就是没翻到（空名单）；但系统真的拒绝了（不是「查无此 uid」）时把错报上去，
-    // 调用方那条 warn 日志才有东西可写。
+    // 一条都没翻到就回空名单；系统真的拒绝（不是「查无此 uid」）时才把错报上去。
     match error {
         Some(failed) => Err(failed),
         None => Ok(Vec::new()),
@@ -253,9 +240,8 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
 
 /// root 侧（`daemon-injector`）周期写出来的「uid → 包名」表。
 ///
-/// 为什么要多这条：AAID 服务在分身/空间/多用户那些 uid 上会回空或直接报错，那些机器就永远
-/// 翻不出包名、只能退回按别名/槽位猜。这张表是 root 直接从系统自己的 `packages.list` 抄的，
-/// 不依赖那个服务、也不靠 appId 猜（分身那些 999xxxxx 在 `packages.list` 里本来就有行）。
+/// AAID 服务在分身/空间/多用户 uid 上会回空或报错；这张表由 root 直接抄系统
+/// `packages.list`（分身那些 999xxxxx 本来就有行），不依赖那个服务。
 const UID_PACKAGES_PATH: &str = "/data/misc/ommega/uid_packages";
 
 /// 表的内容 + 什么时候读的。文件不大（几百行），一分钟重读一次就够。
@@ -301,13 +287,12 @@ fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
 
 /// root 侧（`daemon-injector`）周期性写出来的「当前前台应用」：一行 `<epoch 秒> <包名>`。
 ///
-/// 它是最后一道兜底：前面三层（内核 uid、root 侧表、appId 回退）都拿不到包名时才用它。
-/// 它比前三层弱 —— 前台是谁不等于谁在调 SOTER（支付流程可能在子进程/后台）—— 所以还带
-/// 新鲜度阀（文件超过这个秒数就不用）和配置开关（root 侧得不写，它就不存在）。
+/// 最后一道兜底，比前面三层弱：前台是谁不等于谁在调 SOTER（可能在子进程/后台），
+/// 所以还要过新鲜度阀（见 `FOREGROUND_TTL_SECS`），文件不存在就等于没数据。
 const FOREGROUND_PATH: &str = "/data/misc/ommega/foreground";
 
-/// 前台信息算多新鲜才能用。要比写侧的间隔大（写侧每拍都采：开机阶段 3 秒、
-/// 之后 5 秒），留一倍余量；再旧就不能代表「现在是谁在调」了。
+/// 前台信息算多新鲜才能用。写侧开机阶段每 3 秒、之后每 5 秒采一次，
+/// 留一倍余量；再旧就不能代表「现在是谁在调」。
 const FOREGROUND_TTL_SECS: u64 = 10;
 
 /// 前台应用兜底：把那个文件读出来，太旧/格式不对就回 `None`。
@@ -343,7 +328,7 @@ fn package_names_of(application_id: &KeyAttestationApplicationId) -> Vec<String>
         .collect()
 }
 
-/// 不是 user 0 的 uid（多用户 / 分身 / 空间）回它的 appId；user 0 的就没什么可回退的（appId 就是 uid）。
+/// 非 user 0 的 uid（多用户 / 分身 / 空间）回它的 appId；user 0 的 appId 就是 uid。
 fn other_user_app_id(uid: u32) -> Option<u32> {
     (multiuser_get_user_id(uid) != 0).then(|| multiuser_get_app_id(uid))
 }
@@ -636,8 +621,7 @@ mod tests {
         );
     }
 
-    /// 不是 user 0 的 uid（分身/空间/多用户）都得能认出、并把 appId 取对。生产槽位表里见过
-    /// `999` / `998` / `997` / `996` / `995` / `994` / `19000` 和真实的 `10` / `11` / `12`。
+    /// 非 user 0 的 uid（分身/空间/多用户）都得能认出、并把 appId 取对。
     #[test]
     fn a_non_user_zero_uid_falls_back_to_its_app_id() {
         assert_eq!(other_user_app_id(99910365), Some(10365));

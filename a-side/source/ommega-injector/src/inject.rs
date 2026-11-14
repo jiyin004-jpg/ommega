@@ -134,10 +134,10 @@ fn write_daemon_peer_state(body: &str) {
     let path = Path::new(DAEMON_PEER_STATE_PATH);
     match std::fs::write(path, body) {
         Ok(()) => {
-            // 读这张表的是 keystore2 里的 payload（keystore uid），而这个文件是我们（root）
-            // 写出来的，默认 0600 root —— 它读不了，于是 app 域的 RPC 连接全被当成“没注过”
-            // 拒掉。实测后果：SOTER 宿主每笔调用重试到超时（30 秒）、检测器一轮十几分钟。
-            // 跟 keystore 目录对齐：属主换成这个目录的属主，只给它自己读。
+            // 读这张表的是 keystore2 里的 payload（keystore uid），而这个文件是 root
+            // 写的，默认 0600 root —— 它读不了，app 域的 RPC 连接就全被当成“没注过”拒掉，
+            // SOTER 宿主每笔调用重试到超时。跟 keystore 目录对齐：属主换成目录的属主，
+            // 只给它自己读。
             if let Ok(dir) = std::fs::metadata("/data/misc/keystore") {
                 use std::os::unix::fs::MetadataExt;
                 let _ = std::os::unix::fs::chown(path, Some(dir.uid()), Some(dir.gid()));
@@ -157,7 +157,7 @@ fn write_daemon_peer_state(body: &str) {
 
 fn wait_for_rpc_socket(pid: Pid) -> Result<()> {
     // 进程内模式下服务是 payload 自己在 keystore2 里起的：还没注进去的时候当然没
-    // socket，等下去就是死锁（实测卡 30 秒后报 "RPC endpoint did not become reachable"）。
+    // socket，等下去就是死锁（卡满超时后报 "RPC endpoint did not become reachable"）。
     // 其他目标（SOTER 宿主这类）仍旧等，它们本来就靠别人提供的 socket。
     if inproc_mode() && is_keystore2(pid) {
         debug!(
@@ -445,9 +445,8 @@ fn do_inject(pid: Pid, self_path: &std::path::Path) -> Result<()> {
     };
 
     // payload 镜像统一走 memfd：在目标进程里现开一块内存文件、分块写完再 dlopen 它。
-    // 这条对 keystore2 和 SOTER 宿主一样有效，也不碰文件系统。以前是先跨进程递 fd
-    // （只有 keystore2 那条验过）、memfd 只当兜底，两个目标各走一条路；现在从 memfd
-    // 起手，递 fd 和直接开文件只留作老内核 / 权限受限时的回落，行为一致。
+    // 这条对 keystore2 和 SOTER 宿主一样有效，也不碰文件系统。递 fd 和直接开文件
+    // 只留作老内核 / 权限受限时的回落。
     let remote_lib_fd = 'handoff: {
         let memfd_note = match memfd_addrs {
             Some(addrs) => match write_payload_into_remote_memfd(

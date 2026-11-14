@@ -1,29 +1,14 @@
 //! SOTER 请求的短 TTL 合并（削峰用）。
 //!
-//! 背景：2026-09-30 实测，A 端 App 的 SOTER 初始化循环在失败后会「自删自重试」——
-//! 同一份只读查询（`has_auth_key` / `has_ask_already` / `export_ask_public_key`）
-//! 一秒内能问好几遍，重建类 op（`generate_*` / `remove_*`）也被反复重放，量级
-//! 200~400 次/分钟，把 B 端那条单线程 relay 的队列占满，真正的 `init_sign` 反倒
-//! 排队排到超时，服务端只好落 keybox 顶替 —— App 又拿到假签名，继续重试。
+//! 同一台设备上、同一份请求，在很短的时间窗里直接复用上一次由设备自己答出来的结果。
+//! 只有 `layer=b`（真设备答的）才进缓存：keybox / self_signed 顶替出来的答案不进，
+//! 免得把「这台设备现在不行」也一起缓存住。`init_sign` / `finish_sign` 一律不缓存：
+//! 那里面有会话句柄和「这一笔的验证过没过」的状态，复用会把语义搞坏。
 //!
-//! 这一层只做一件事：同一台设备上、同一份请求，在很短的时间窗里直接复用上一次
-//! **设备自己答出来**的结果。
-//!
-//! 两条不越界的规矩：
-//! - 只有 `layer=b`（真设备答的）才进缓存。keybox / self_signed 顶替出来的答案
-//!   不进，免得把「这台设备现在不行」也一起缓存住，下一笔连试都不试了。
-//! - `init_sign` / `finish_sign` 一律不缓存：那里面有会话句柄和「这一笔的验证
-//!   过没过」的状态，复用会把语义搞坏。
-//!
-//! 重建类 op 走的是「去重窗」：同一个 (设备, uid, 别名, op) 在窗口内重复打进来，
-//! 直接把上一次的结果还回去；同时把该 uid 名下所有只读缓存清掉 —— 设备状态变了，
-//! 之前量出来的「有没有料」就不能再用了。
-//!
-//! 2026-10-01 补的一条：**同一个写 op 记进来时，要把同 uid 上别的写记录丢掉**。
-//! 去重窗只认 (设备, op, uid, 别名)，认不出中间夹了一次 `remove`；实测 App 的循环
-//! 是 `remove` → `generate` → `has_auth_key`，那次 generate 落在前一笔 generate 的
-//! 窗里被原样回放（同一个 task_id、33ms、根本没到设备），App 收到「建成功」，紧接着
-//! 查还是删后那份 -8，去签名又 -65528，于是自删自重试 —— 请求量就是这么堆起来的。
+//! 写 op 走「去重窗」：同一个 (设备, uid, 别名, op) 在窗口内重复打进来，直接还上一次
+//! 的结果，同时清掉该 uid 名下的只读缓存（设备状态变了）。记下某个写 op 时，同 uid
+//! 上别的写记录一律丢掉 —— 那些答案是上一种状态下的，回放出去就是骗人；同 op 的
+//! 记录留着；`remove_all_uid_key` 是 uid 级的，把这个 uid 的写记录全清。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// 只读、同一台设备上答案稳定的 op：短 TTL 合并的主力（实测占请求量的七成）。
+/// 只读、同一台设备上答案稳定的 op：短 TTL 合并的主力。
 const READ_OPS: &[&str] = &[
     "has_auth_key",
     "has_ask_already",
@@ -45,8 +30,8 @@ const READ_OPS: &[&str] = &[
 
 /// 会改设备状态的 op：只做窗口内去重，并把只读缓存清掉。
 ///
-/// `remove_all_uid_key` 是 uid 级的，`remove_auth_key` 是 (uid, 别名) 级的 ——
-/// 清理的时候一律按 uid 清，宁可多清一点。
+/// `remove_all_uid_key` 是 uid 级的，`remove_auth_key` 是 (uid, 别名) 级的；
+/// 清理一律按 uid，宁可多清。
 const WRITE_OPS: &[&str] = &[
     "generate_ask_key_pair",
     "generate_auth_key_pair",
@@ -55,18 +40,16 @@ const WRITE_OPS: &[&str] = &[
     "remove_all_uid_key",
 ];
 
-/// 默认 5 秒：够短，设备一恢复下一笔就问得着；也够长，能把一轮初始化里的重复问
-/// 全部吃掉。
+/// 默认 5 秒：够短，设备一恢复下一笔就问得着；够长，能吃掉一轮初始化里的重复问。
 const DEFAULT_READ_TTL_MS: u64 = 5_000;
 /// 默认 2 秒：App 的重放间隔就在几百毫秒量级。
 const DEFAULT_WRITE_WINDOW_MS: u64 = 2_000;
 
 /// 「自删自建」的统计窗口与上报节拍。
 ///
-/// 窗口故意压得很短（实测死循环里两次删是**秒级**的：19:59:20 / 19:59:22），而健康的
-/// 开通流程即使重试也是分钟级。所以「短窗口里 2 次」就够把卡死的循环跟正常重试分开：
-/// 比旧的「60 秒 3 次」早一个量级看见，又不会因为用户取消一次就误判。
-/// 想调就改 `OMMEGA_SOTER_CHURN_WINDOW_MS` / `OMMEGA_SOTER_CHURN_REPORT_AT`。
+/// 窗口压到 30 秒：死循环里两次删是**秒级**的，健康开通流程即使重试也是分钟级，
+/// 短窗口里 2 次就够把两者分开。可用 `OMMEGA_SOTER_CHURN_WINDOW_MS` /
+/// `OMMEGA_SOTER_CHURN_REPORT_AT` 调。
 const CHURN_WINDOW: Duration = Duration::from_secs(30);
 /// 窗口里第几次删开始报（健康的开通流程最多删一两次，但两次之间不会只隔几秒）。
 const CHURN_REPORT_AT: u32 = 2;
@@ -75,18 +58,14 @@ const CHURN_REPEAT_EVERY: u32 = 5;
 /// 判出「槽位 ASK 被毒化」后，这段时间里把 `has_ask_already` 一律答成「没有 ASK」，
 /// 逼 App 重跑「生成 ASK → 上报腾讯」这一步。
 ///
-/// 为什么这么修（2026-10-11 实测 nubia NX721J / 微信 uid 10489）：App 的注册流程是
-/// 「ASK 不存在才上报腾讯」，槽位上一旦有别的时候铸下的 ASK，它就永远跳过上报 → 建
-/// AuthKey → 腾讯不认 → 自删自建，死循环；而它自己的救命手段是 `remove_all_uid_key`
-/// （uid 级、会连坐同槽位别的账号），服务端又专门挡了这一手，于是**没有任何自动出路**。
-/// 现在改成只在回答层面说真话：App 以为没有 ASK，就会重新生成并上报，循环就解开了，
-/// 不需要我们动别的账号的任何钥匙。
-///
-/// 10 分钟：App 的重试间隔在分钟级，够它跑一轮上报；没跑通就再延一轮（只要它还在自删
-/// 自建，`note_slot_churn` 每看见一次就把窗口续上）。
+/// App 只在 ASK 不存在时才上报腾讯：槽位上一旦有别的时候铸下的 ASK，它就永远跳过
+/// 上报，建 AuthKey 之后腾讯不认，只能自删自建。它自己的救命手段 `remove_all_uid_key`
+/// 是 uid 级的（会连坐同槽位别的账号），服务端不允许自动清，所以只能在回答层面说
+/// 「没有 ASK」：App 以为没有就会重新生成并上报，循环就解开了。
+/// 10 分钟：App 重试是分钟级，够跑一轮上报；还在自删自建就由 `note_slot_churn` 续窗。
 const ASK_POISON_TTL: Duration = Duration::from_secs(600);
-/// B 那台对「这把 ASK 不在」的答复码（实测 Trustonic AIDL：清掉 ASK 后 hasAskAlready 回
-/// `fffffffb`）。App 看到它就会去生成 + 上报。
+/// B 对「这把 ASK 不在」的答复码：-5，Trustonic AIDL 里是 `fffffffb`。
+/// App 看到它就会去生成 ASK 并上报腾讯。
 const ASK_MISSING_CODE: i64 = -5;
 
 enum Kind {
@@ -106,9 +85,8 @@ fn kind_of(op: &str) -> Kind {
     }
 }
 
-/// 缓存键：`设备|uid|op|别名`。只读缓存和写去重窗共用这一套布局 ——
-/// 两边都按 `设备|uid|` 前缀清理，布局不一样就筛不干净。
-/// uid 和别名都可能没有（uid 级 op 就没有别名）。
+/// 缓存键：`设备|uid|op|别名`。只读缓存和写去重窗共用这套布局 —— 两边都按
+/// `设备|uid|` 前缀清理，布局不一样就筛不干净。uid 和别名都可能没有。
 fn slot(device: &str, op: &str, uid: Option<i32>, alias: Option<&str>) -> String {
     let uid = uid
         .map(|v| v.to_string())
@@ -272,22 +250,13 @@ impl SoterGate {
         self.note_slot_churn(device, op, uid, alias)
     }
 
-    /// 同一槽位在窗口里被反复「删 AuthKey」，就给一句给操作员看的说明（不改设备状态）。
+    /// 同一槽位在窗口里被反复「删 AuthKey」时，给操作员一句说明（不改设备状态）。
     ///
-    /// 为什么要看这个（2026-10-06 实测）：真应用的 SOTER 开通流程是
-    /// `has_ask_already` → `export_ask_public_key`（上报腾讯）→ `generate_auth_key_pair`
-    /// → `export_auth_key_public_key` → `remove_auth_key` → `init_sign` → `finish_sign`。
-    /// 腾讯那边一旦没认这批材料，App 就在「建 AuthKey → 导出 → 删掉」这一段循环，
-    /// 永远走不到签名那两步。两种最常见的成因：
-    ///
-    /// 1. 那台 B 的建料闸门没开（`OMMEGA_RELAY_SOTER_MUTATION`）：`generate_*` 全被它
-    ///    自己拒了，外层只看到 -5「这把钥匙不在这台」（B 端会带 `soter_mutation_disabled`
-    ///    标记，服务端另有一条 WARN 专门喊这个）；
-    /// 2. 槽位上的 ASK 是**别的时候/别处**铸的：微信这类 App 只在 ASK 不存在时才走
-    ///    「生成 ASK → 上报腾讯」，有一把现成的 ASK 就跳过上报 —— 腾讯那边没有这条设备
-    ///    的记录，之后怎么建 AuthKey 都白搭。这条只能清一次槽位让 App 从零走一遍，而
-    ///    `remove_all_uid_key` 是 uid 级的（会连坐同一个 uid 上别的账号，见
-    ///    `handlers.rs` 里那条「uid 级全清会连坐」的处置），所以这里只报不改设备状态。
+    /// 腾讯没认这批材料时，App 就卡在「建 AuthKey → 导出 → 删掉」这一段，永远走不到
+    /// 签名。两种成因：那台 B 的建料闸门没开（`OMMEGA_RELAY_SOTER_MUTATION`，
+    /// `generate_*` 全被它自己拒成 -5，B 端会带 `soter_mutation_disabled` 标记）；或者
+    /// 槽位上的 ASK 是别的时候 / 别处铸的。清 ASK 只能靠 `remove_all_uid_key`（uid 级，
+    /// 会连坐同一个 uid 上别的账号），所以这里只报不改设备状态。
     fn note_slot_churn(
         &self,
         device: &str,
@@ -304,8 +273,7 @@ impl SoterGate {
         let alias_text = alias.unwrap_or("-").to_string();
         let key = format!("{device}|{uid_text}|{alias_text}");
         let now = Instant::now();
-        // 只要还在自删自建，就把「ASK 毒化」的窗口续上（不只在报的时候）：窗口跟着
-        // 现象走，循环一停它自然过期。
+        // 只要还在自删自建就续上毒化窗口：窗口跟着现象走，循环一停自然过期。
         self.mark_ask_poisoned(device, uid);
         let mut guard = self
             .churn
@@ -396,10 +364,8 @@ impl SoterGate {
             return false;
         }
         // **只允许改写我们自己兜底层（builtin / self_signed）的答复。**
-        // 设备（B）的答复是真话，一个字都不能动 —— 一旦改写成「没有 ASK」，
-        // App 就会现铸一个新的，跟腾讯那边记的对不上，于是自删自建死循环。
-        // （2026-10-13 实证：B 的 TEE 里 hasAskAlready = 0（有），我们却告诉 App 没有，
-        //   结果 generate/export/remove 反复循环，永远走不到 init_sign。）
+        // 设备（B）的答复是真话，一个字都不能动：改成「没有 ASK」会让 App 现铸一把，
+        // 跟腾讯那边记的对不上，于是自删自建死循环，永远走不到 init_sign。
         let layer = value.get("layer").and_then(Value::as_str).unwrap_or("");
         if layer != "builtin" && layer != "self_signed" {
             return false;
@@ -413,11 +379,9 @@ impl SoterGate {
         }
     }
 
-    /// 记下一笔写操作时，把同一 uid 上**别的**写去重记录丢掉：那些答案是「上一种
-    /// 状态」下的，中间已经夹了这次改动，回放出去就是骗人。
-    ///
-    /// 同 op 的记录留着（App 重复重放同一笔还是该走窗，这是这层的本意）；
-    /// `remove_all_uid_key` 是 uid 级的，把这个 uid 的写记录全清。
+    /// 记下一笔写操作时，把同一 uid 上**别的**写去重记录丢掉：那些答案是「上一种状态」
+    /// 下的，中间已经夹了这次改动，回放出去就是骗人。同 op 的记录留着（App 重复重放同一
+    /// 笔还是该走窗）；`remove_all_uid_key` 是 uid 级的，把这个 uid 的写记录全清。
     fn invalidate_sibling_writes(&self, device: &str, uid: Option<i32>, op: &str) {
         let prefix = uid_prefix(device, uid);
         let mut guard = self
@@ -584,9 +548,8 @@ mod tests {
 
     #[test]
     fn a_remove_kills_the_earlier_generate_replay() {
-        // 2026-10-01 实测的循环：remove → generate → has_auth_key。
-        // 那次 generate 曾经被前一笔 generate 的结果回放（同一个 task_id、33ms、
-        // 根本没到设备），App 收到「建成功」再查却还是没有，只能自删自重试。
+        // remove 之后，前一笔 generate 的回放必须作废：App 收到「建成功」再查却还是
+        // 没有，只能自删自重试。
         let gate = gate();
         gate.record(
             "dev",

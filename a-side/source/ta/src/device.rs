@@ -171,13 +171,8 @@ pub struct SigningInfoSnapshot {
     pub identity_digest: [u8; 32],
 }
 
-/// Remote TEE backend (A-side remote relay).
-///
-/// When present, attestation for A-side keys is minted by a B-side real TEE
-/// through the relay_server, and sign/decrypt for remote keys are forwarded
-/// Key-generation parameters forwarded from the A-side app to the B-side real
-/// TEE, mirroring the `device_attest_context` fields client-a sends.  Absent
-/// fields let the B-side fall back to its defaults (EC P-256, SHA-256, etc.).
+/// 从 A 端 App 转发给 B 端真 TEE 的建钥参数，对应 client-a 的 `device_attest_context`。
+/// 缺项由 B 端按默认值处理（EC P-256、SHA-256 等）。
 #[derive(Debug, Clone, Default)]
 pub struct RemoteAttestParams {
     /// Raw KeyMint algorithm enum value (1 = RSA, 3 = EC).
@@ -263,18 +258,18 @@ pub struct RemoteAttestationKey {
     pub device_id: Option<String>,
     /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
     ///
-    /// 真机的 `generateKey(.., attestationKey)` 直接把这个 blob 交给 HAL 用，
-    /// 不靠任何会话表。B 端以前只能拿 alias 去查自己的 session，一旦那把 AK
-    /// 不是在它那里铸的（智能模式在服务端、或换了另一台 B）就报
+    /// 真机的 `generateKey(.., attestationKey)` 直接把这个 blob 交给 HAL，不靠会话表。
+    /// 只看 alias 的实现在这把 AK 不是本机铸的时候会报
     /// `issuer key ... is not available on this device`。
     pub key_blob: Vec<u8>,
 }
 
-/// there.  Each method returns `Ok(None)` when the remote is unavailable or not
-/// configured, letting the TA fall back to the local software keybox.
-/// 远程铸造回来的证链，以及铸它的那台 B（服务端 keybox 层为空）。
+/// 远程铸回来的证链（DER，叶子在前），以及铸它的那台 B（服务端 keybox 层为空）。
 pub type RemoteAttestChain = (Vec<Vec<u8>>, Option<String>);
 
+/// 远程 TEE 后端（A 端 relay）。开启时 A 端钥匙的证明由 B 端真 TEE 铸造，
+/// 远程钥匙的 sign/decrypt 也转发过去。各方法在远端不可用时返回 `Ok(None)`，
+/// TA 据此回落本地软件 keybox。
 pub trait RemoteBackend: Send {
     /// Forward an attestation request.  Returns the B-side certificate chain
     /// (DER, leaf first) plus the B device that minted it (empty for the

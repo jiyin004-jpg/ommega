@@ -4097,9 +4097,8 @@ mod tests {
             utils::AesGcm,
         };
 
-        // 这条分支读的是切到 HKDF 之前、拿 PBKDF2 派生 super key 写下的密文。
-        // 原先那份固定向量解不开（换过 ECDH 版本、也把 pbkdf2 的 password/salt
-        // 调过个儿，都对不上），改成现场用 PBKDF2 派生的 key 封一份再读回来。
+        // 这条分支读的是切到 HKDF 之前、拿 PBKDF2 派生 super key 写下的密文；
+        // 现场用 PBKDF2 派生的 key 封一份再读回来。
         let password = Password::from(&b"fixed synthetic password"[..]);
         let salt: Vec<u8> = (0..16).collect();
 

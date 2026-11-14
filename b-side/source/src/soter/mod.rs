@@ -11,8 +11,11 @@
 //! `op` 缺省是 `probe`，只报这台设备能不能做 SOTER；HAL 不在时其它 op 都返回描述性错误。
 //! 会改设备状态的 op（建 / 删钥匙）需要 `OMMEGA_RELAY_SOTER_MUTATION=1` 才放行。
 //!
-//! See [`hal`] for the wire format (it is hand-marshalled and verified against
-//! captured replies, see [`fixtures`]).
+//! The wire format lives in [`hal`]: hand-marshalled, checked against captured
+//! replies (see [`fixtures`]).
+//!
+//! 后端按 [`hal::Backend::ALL`] 的顺序逐个尝试，AIDL / HIDL 两套并存；`probe` 回包里的
+//! `backend` / `service` / `interface` 就是实际选中的那一个。
 
 pub mod fixtures;
 pub mod flow;
@@ -62,15 +65,14 @@ const KNOWN_OPS: &[&str] = &[
     "remove_auth_key",
 ];
 
-/// 这些 op 把槽位的材料换掉了，之后「这批材料能不能签」得重新量（服务端那边
-/// ASK 重建也会把槽位的层钉清掉，这里对齐）。
+/// 这些 op 换掉了槽位的材料：之后「这批材料能不能签」必须重新量一次。
 const SLOT_REBUILD_OPS: &[&str] = &[
     "generate_ask_key_pair",
     "remove_all_uid_key",
     "remove_auth_key",
 ];
 
-/// SOTER_ERROR_VERIFICATION_FAILED。TA 说这份材料验不过 —— 不是「还没建好」。
+/// SOTER_ERROR_VERIFICATION_FAILED（-26）：这一笔的验证没过去，不是「还没建好」。
 const SOTER_VERIFICATION_FAILED: i64 = -26;
 
 /// SOTER_ASK_NOT_READY / SOTER_AUTH_KEY_NOT_READY：这个槽位上还没有对应材料。
@@ -86,22 +88,17 @@ const SOTER_TA_UNAVAILABLE: i64 = -20;
 
 /// 能力探针量出来的结论。
 ///
-/// 只有 [`SignVerdict::Unavailable`] 算「这台现在签不了」的硬证据（SOTER 没开、
-/// ATTK 没配、安全通道不通这类结构性毛病）。
+/// 只有 [`SignVerdict::Unavailable`] 是「这台现在签不了」的硬证据（SOTER 没开 / ATTK
+/// 没配 / 安全通道不通这类结构性毛病）。
 ///
-/// `-26`（`SOTER_ERROR_VERIFICATION_FAILED`）**谁都不该拿它下结论**：它说的是
-/// 「这一笔的验证没过去」——真应用那条路上就是 App 自己那步生物认证没成，是这一笔
-/// 的状态，不是这台机器的能力。2026-10-06 在 PLC110（Trustonic AIDL，HAL
-/// `vendor.trustonic.hardware.soter.ITrustonicSoter`）上实测：没人按指纹、没人
-/// 值守，走中继 `init_sign` 回 0、`finish_sign` 回真签名，拿 AuthKey 公钥验签
-/// `Verified OK`、拿 ASK 验则失败（反例对照）⇒ 无人值守的 B 端**签得出来**。
-/// 以前这里把 -26 当「TA 要新鲜指纹」，服务端据此报过 `soter_nosign`，会把一台
-/// 能签的机器从签名链路上踢掉（假阴性）。
+/// `-26`（`SOTER_ERROR_VERIFICATION_FAILED`）不能拿来下结论：它说的是这一笔的验证没
+/// 过去（真应用那条路上就是 App 自己那步生物认证没成），换一笔就可能成。把它当
+/// 「TA 要新鲜指纹」上报 `soter_nosign`，服务端会把能签的机器从签名链路上踢掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignVerdict {
     /// 真签出来了一次。
     Signed,
-    /// 槽位有料，TA 说必须刚匹配过指纹（-26）：这次没签成，但这台能不能签还得再看。
+    /// TA 回 -26：这一笔的验证没过去（真应用就是 App 那步生物认证没成）。
     BiometricRequired,
     /// 这个槽位上没材料（-5 / -6），探不出签名能力。
     NoMaterial,
@@ -153,10 +150,9 @@ impl std::fmt::Display for SignVerdict {
     }
 }
 
-/// 最近一次「真拿这个槽位发起了签名」的 (uid, alias)，给能力探针当目标用。
+/// 最近一次真发起签名的 (uid, alias)，给能力探针当目标用。
 ///
-/// 只放内存：要落盘得先问用户，而重启后重新学一次就够了 —— 没上报能力的设备
-/// 服务端照样会派活。
+/// 只放内存：重启后重新学一次就够了，没上报能力的设备服务端照样会派活。
 static LEARNED_PROBE_TARGET: Mutex<Option<(i32, String)>> = Mutex::new(None);
 
 /// Serializes real signing HAL calls with the entire probe. The same mutex
@@ -166,15 +162,13 @@ static SIGN_GUARD: Mutex<sign_guard::SignGuard> = Mutex::new(sign_guard::SignGua
 
 /// SOTER 进 HAL 的排队：全局有上限 + 同一个 uid 串行。
 ///
-/// RPMB 会话是独占资源：TA 一旦漏释放，后续 `export_*` / `generate_*` 全部 -5，只有重启
-/// 能松开。所以这里是有上限的并行：
-///
+/// RPMB 会话是独占资源：TA 漏释放后 `export_*` / `generate_*` 全部回 -5，只有重启能松开。
+/// 所以是有上限的并行：
 ///   1. 全局同时在飞不超过 `max`（`relay.conf` 的 `soter_concurrency`，默认 2），留出
 ///      空位给系统自己那条路；
 ///   2. 同一个 uid 严格串行，不同 uid 之间并行。
 ///
-/// 真撞上卡死的 TA 由 `hal_restart` 的「连续 258 → 自动重启」兜底。KeyMint / attest
-/// 不经过这里。
+/// 卡死的 TA 由 `hal_restart` 的「连续 258 → 自动重启」兜底；KeyMint / attest 不走这里。
 const SOTER_CONCURRENCY_MIN: u32 = 1;
 const SOTER_CONCURRENCY_MAX: u32 = 4;
 /// 默认上限（`DEFAULT_SOTER_CONCURRENCY` 的库内镜像，见 `bin/relay.rs`）。
@@ -192,7 +186,7 @@ fn max_concurrency() -> u32 {
         .load(AtomicOrdering::Relaxed)
         .clamp(SOTER_CONCURRENCY_MIN, SOTER_CONCURRENCY_MAX)
 }
-/// 排队超过这么久就记一笔（线上 `wait` 的 p99 就是这么数出来的）。
+/// 排队超过这么久就记一条 WARN。
 const SOTER_WAIT_LOG_MS: u128 = 1000;
 
 struct HalQueue {
@@ -285,17 +279,14 @@ thread_local! {
 /// 一次 SOTER HAL 准入；出作用域自动还。
 struct SoterHalGate {
     /// 占了名额的是哪张队列；重入那次是 `None`（名额记在最外层那笔上）。
-    ///
-    /// 早先这里用「uid 是不是 None」来判断该不该还名额，于是没指名 uid 的进门
-    /// （`probe()`）就把名额吞了：两笔之后 `total` 一直是满的，谁也别想再进 HAL。
-    /// 现在进门时就记下「我占没占」，Drop 只看这个。
+    /// Drop 只看这个字段决定还不还名额。
     queue: Option<&'static HalQueue>,
     uid: Option<i32>,
 }
 
 impl SoterHalGate {
-    /// `uid` 为 `None` 表示这笔请求没指名 uid（探针那种），只吃全局名额。
-    /// `max` 为 `None` 就读全局那个（探针那条路），传值的是手里有实时配置的那条路。
+    /// `uid` 为 `None` 表示这笔请求没指名 uid（探针那种），只吃全局名额；
+    /// `max` 为 `None` 就读全局配置值。
     fn enter(uid: Option<i32>, max: Option<u32>) -> Self {
         hal_queue().enter(uid, max)
     }
@@ -337,11 +328,10 @@ pub fn learned_probe_target() -> Option<(i32, String)> {
 
 /// 这台机器签名到底行不行。只有两档：真签出来过，或者还没量出来。
 ///
-/// **没有「签不了」这一档。** 失败码全是「这一笔没成」：`-26` 是这一笔的验证没
-/// 过去（真应用那条路上＝App 那步生物认证）、`-204` 是这张会话被别人顶掉了、
-/// 超时是没等到 —— 换一笔就可能成，推不出「设备能力」这个结论。报 `soter_nosign`
-/// 的代价是服务端把签名 op 从这台机器上挪走、甚至把槽位钉到服务端自签那两层
-/// （App 手里的真料换成假料），比不报糟得多。
+/// **没有「签不了」这一档。** 失败码全是「这一笔没成」：`-26` 是这一笔的验证没过去
+/// （真应用那条路上就是 App 那步生物认证）、`-204` 是会话被别人顶掉、超时是没等到
+/// —— 换一笔就可能成，推不出「设备能力」。报 `soter_nosign` 会让服务端把签名 op 从
+/// 这台机器上挪走，甚至把槽位钉到服务端自签那两层（App 手里的真料换成假料）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignState {
     /// 真签出来过（真实 op 或探针）：报 `soter_sign`。
@@ -370,9 +360,8 @@ fn mark_sign_proven() {
 
 /// 一个真签名 op 的结果：只有「真签出来」算证据。
 ///
-/// 失败码一律不参与结论（`-26` 这一笔没验过、`-204` 会话被顶掉、超时没等到）：
-/// 那都是「这笔没成」，换一笔就可能成。2026-10-06 实测 PLC110 无人值守也签得出来，
-/// 所以更不能拿失败码去推断「这台签不了」—— 那会把能签的机器踢出签名链路。
+/// 失败码一律不参与结论（`-26` 这一笔没验过、`-204` 会话被顶掉、超时没等到）：那都是
+/// 「这笔没成」，换一笔就可能成，推不出「这台签不了」。
 fn note_sign_result(error_code: i64) {
     if error_code == 0 {
         mark_sign_proven();
@@ -389,7 +378,7 @@ pub fn clear_sign_state() {
 }
 
 /// `init_sign` 回了 0 说明这个槽位真有材料，记下来给探针用（探针只用现成材料，
-/// 不建不删）。没这一步，没配探针目标的机器只能一直“量不出来”。
+/// 不建不删）。没配探针目标的机器只能靠这里学到目标。
 fn remember_probe_target(uid: i32, alias: &str) {
     if alias.is_empty() {
         return;
@@ -405,33 +394,29 @@ fn remember_probe_target(uid: i32, alias: &str) {
     }
 }
 
-/// -26 落在签名步骤上，是「这一笔没签成」（这一笔的验证没过去，真应用那条路上就是
-/// App 自己那步生物认证没成），不是「这份材料签不了」。
+/// 恒 `false`：本机不替服务端判「这份材料签不了」。
 ///
-/// 以前这里把它当「这份材料签不了」，记下 uid、24 小时内不再服务这个槽位。那是个
-/// 误判：材料本身没毛病，而“拒绝服务”只能把 App 推给服务端那两层自签的假料
-/// （PLC110 上就这么让一轮支付流程拿了一整套假材料）。现在一律把 TA 的答复原样递
-/// 上去，要不要换层由服务端按错误码的性质决定，本机不再替它下结论。
+/// `-26` 只是这一笔没签成（这一笔的验证没过去，真应用就是 App 那步生物认证没成），
+/// 材料本身没毛病。拒服务这个槽位只会把 App 推向服务端那两层自签的假料；TA 的答复
+/// 原样递上去，要不要换层由服务端按错误码性质决定。
 fn is_hard_slot_failure(op: &str, result: &Value) -> bool {
     let _ = (op, result);
     false
 }
 
 /// `-5` / `-6`：TA 说这个槽位上的 ASK / AuthKey 没就绪 —— 这两码才值得原地重建。
-/// 别的非零码（-18 安全通道、-8、-26 没指纹）都是另一回事，动设备状态只会更糟。
+/// 别的非零码（-18 安全通道、-8、-26 验证没过）动设备状态只会更糟。
 ///
-/// `-65528`（`TEE_ERROR_ITEM_NOT_FOUND`）2026-10-02 补进来：在 PLC110 上拿一个
-/// 全新 alias 打 `init_sign` 就是这个码，意思是「这台机器上没有这号材料」，
-/// 和 -5/-6 同一种缺料，一样该就地补齐再试。
+/// `-65528`（`TEE_ERROR_ITEM_NOT_FOUND`）：这台机器上没有这号材料，和 -5/-6 同属缺料，
+/// 一样该就地补齐再试。
 const SOTER_ASK_NOT_READY_CODE: i32 = -5;
 const SOTER_AUTH_KEY_NOT_READY_CODE: i32 = -6;
 const SOTER_ITEM_NOT_FOUND_CODE: i32 = -65528;
 
 /// 「B 端手上没这批材料」就地补齐再重试签名。
 ///
-/// 只在 mutation 开关打开时调用。先问 HAL 到底缺哪一样（ASK / AuthKey），缺什么铸
-/// 什么，然后重新建一次签名会话；补齐失败就把原始错误原样递上去 —— 宁可让上层
-/// 看到「这台真没有」，也绝不假装签成功。
+/// 只在 mutation 开关打开时调用。先问 HAL 缺哪一样（ASK / AuthKey），缺什么铸什么，
+/// 然后重新建一次签名会话；补齐失败就把原始错误原样递上去，绝不假装签成功。
 fn rebuild_material_then_sign(
     soter: &Soter,
     uid: i32,
@@ -439,13 +424,10 @@ fn rebuild_material_then_sign(
     challenge: &str,
     original: SoterSession,
 ) -> SoterSession {
-    // 探 HAL 的返回码。只有「这个槽位确实没有」的码才算缺：-5 ASK 没好、
-    // -6 AuthKey 没好、-65528 item not found。
-    //
-    // 别把「非 0」都当缺：-26（这一笔的验证没过，真应用就是指纹那步）、-204（会话
-    // 句柄被顶掉）、-18/-20（TA 坏了）都是「有料，但这次没成」。当它们缺会去
-    // generate_* 把 App 已经和腾讯/支付宝注册过的那把真材料覆盖掉，服务端存档从此
-    // 对不上，而且没有恢复路径。探不动（HAL 报错）同样当「不缺」。
+    // 只有「这个槽位确实没有」的码才算缺：-5 ASK 没好、-6 AuthKey 没好、-65528。
+    // 别把「非 0」都当缺：-26（这一笔验证没过）、-204（会话被顶掉）、-18/-20（TA 坏了）
+    // 都是「有料，但这次没成」。当它们缺会去 generate_* 覆盖掉 App 已经和腾讯/支付宝
+    // 注册过的真材料，服务端存档从此对不上且无法恢复。探不动（HAL 报错）同样当「不缺」。
     let ask_missing = matches!(
         soter.has_ask_already(uid),
         Ok(SOTER_ASK_NOT_READY_CODE) | Ok(SOTER_ITEM_NOT_FOUND_CODE)
@@ -532,11 +514,9 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
         bail!("unknown soter op: {op}");
     }
     if MUTATING_OPS.contains(&op) && !allow_mutation {
-        // 别 `bail`：任务失败在链路上会被当成「这台设备没这把钥匙」（外层只看到
-        // -5），线上真踩过 —— 一整天所有 generate_* 都被拒，App 一直在原地重建，
-        // 排查时还以为是 TEE 坏了。这里按正常答复递一个 -5（跟真缺料同一个码，A 端
-        // 行为不变），另加一个只有服务端看得懂的标记，让服务端把它和真缺料区分开、
-        // 写进日志；本机也留一条 WARN。
+        // 别 `bail`：任务失败在链路上会被当成「这台设备没这把钥匙」（外层只看到 -5）。
+        // 按正常答复递一个 -5（跟真缺料同码，A 端行为不变），另加一个只有服务端看得懂的
+        // 标记，让它能和真缺料区分开；本机也留一条 WARN。
         log::warn!(
             "soter: op '{op}' 被建料闸门拦下（relay.conf 里没开 \
              OMMEGA_RELAY_SOTER_MUTATION）：这台接不了建料/删料，A 端会一直拿到\
@@ -552,9 +532,8 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
         // 自检不碰 HAL，不占名额。
         return Ok(fixtures::selftest());
     }
-    // 有上限地并行：全局不超过 max，同一个 uid 串行。uid 没给（探针那种）就只吃
-    // 全局名额。注：这个 `uid` 只是拿来排队的，真正要用的那两处 arm 里各自还会
-    // 再解析一次（坏 payload 该报错就报错，不在这里默默当没给）。
+    // 有上限地并行：全局不超过 max，同一个 uid 串行；uid 没给就只吃全局名额。
+    // 这里的 uid 只用于排队，各 arm 里还会再解析一次（坏 payload 该报错就报错）。
     let _gate = SoterHalGate::enter(uid_of(payload).ok(), Some(max_concurrent));
     if op == "probe" {
         return Ok(probe());
@@ -610,17 +589,15 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
             );
             let mut guard = SIGN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            // 抢不到租约不拒：拒了（回 -9）会让 App 连指纹圈都弹不出来，还会把探针的
-            // 旧会话一直挂到租约过期。让它去顶掉旧会话，被顶掉的那笔在 finish 上吃
-            // -204，由服务端补签收尾；租约只用来挡探针（`probe_allowed`）。
+            // 抢不到租约不拒：回 -9 会让 App 连指纹圈都弹不出来。让它去顶掉旧会话，
+            // 被顶掉的那笔在 finish 上吃 -204，由服务端补签收尾；租约只用来挡探针
+            // （`probe_allowed`）。
             guard.activity(now);
             let soter = open_soter(op)?;
             let mut session = soter.init_sign(uid, &alias, &challenge)?;
-            // 这台机器上没有这批材料：原地补齐再签一次。
-            //
-            // 只对「没料」的三个码重建：-5（ASK 未就绪）/ -6（AuthKey 未就绪）/
-            // -65528。-18（安全通道不通）、-8 这类是 TA 的结构性问题，重建没用，还会把
-            // 真钥匙重铸掉。
+            // 这台机器上没有这批材料：原地补齐再签一次。只对「没料」的三个码重建：
+            // -5（ASK 未就绪）/ -6（AuthKey 未就绪）/ -65528。-18（安全通道不通）、
+            // -8 这类是 TA 的结构性问题，重建没用，还会把真钥匙重铸掉。
             if matches!(
                 session.error_code,
                 SOTER_ASK_NOT_READY_CODE
@@ -636,8 +613,7 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
                 // 探针以后可以拿它去试签。
                 remember_probe_target(uid, &alias);
             } else {
-                // TA 连会话都不给建（-26 = 这一笔的验证没过去）：记一笔，但不参与
-                // 「这台能不能签」的结论。
+                // TA 连会话都不给建（-26 = 这一笔的验证没过去）：记一笔，但不参与结论。
                 note_sign_result(session.error_code as i64);
             }
             Ok(json!({
@@ -653,8 +629,7 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
         "has_auth_key" => {
             let (uid, alias) = (uid_of(payload)?, alias_of(payload)?);
             let result = code_result(op, open_soter(op)?.has_auth_key(uid, &alias)?);
-            // 0 = 这个槽位有材料。除了 init_sign，从这里也能学到一个能拿去试签的
-            // 槽位 —— 学到的机会多一点，能力上报就能早点变准。
+            // 0 = 这个槽位有材料：除了 init_sign，这里也能学到一个能拿去试签的槽位。
             if result.get("error_code").and_then(Value::as_i64) == Some(0) {
                 remember_probe_target(uid, &alias);
             }
@@ -694,16 +669,14 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
     };
     let result = result?;
 
-    // 设备层不再替服务端下结论：`-26` 是 TA 对「这一笔」的答复，原样递上去。
-    // 换不换层、要不要把某个槽位钉到服务端自签那两层，由服务端看错误码的性质定 ——
-    // 在设备这边把它改成「这层做不了」就等于替 App 做了决定，还会把一台好机器从
-    // 签名链路上踢掉（见 `is_hard_slot_failure`）。
+    // 设备层不替服务端下结论：`-26` 是 TA 对「这一笔」的答复，原样递上去。换不换层、
+    // 要不要把某个槽位钉到服务端自签那两层，由服务端看错误码性质定（见
+    // `is_hard_slot_failure`）。
     let _ = is_hard_slot_failure(op, &result);
 
     // 顺手把这笔的结果喂给 HAL 自愈：连着两笔真失败（-5/-6/-26 这几个正常答复除外）
-    // 就重启一次那个服务。这台机器会卡成「建料类 op 全正常、只有签名恒 -18」的半死状态，
-    // 不收拾的话服务端会把它当「结构性做不了」，把槽位换到自签那两层 —— App 拿到假料
-    // 和一个误导性的 -5（2026-09-30 Duck Detector 那轮就是这么来的）。见 `hal_restart`。
+    // 就重启一次那个服务，否则卡成「建料类 op 全正常、只有签名恒 -18」时，服务端会把
+    // 它当「结构性做不了」把槽位换到自签那两层。见 `hal_restart`。
     hal_restart::note(
         op,
         result
@@ -729,19 +702,14 @@ fn open_soter(op: &str) -> Result<Soter> {
 /// 探针签名用的挑战值（十六进制字符串，跟 A 端传下来的形状一样）。
 const PROBE_CHALLENGE: &str = "00112233445566778899aabbccddeeff";
 
-/// 真去签一次：拿一个现成的槽位走 `init_sign` + `finish_sign`。
+/// 真去签一次：拿一个现成的槽位走 `init_sign` + `finish_sign`，能力上报用。
 ///
-/// 这是能力上报用的。`getDeviceId` 只能证明 HAL 活着，证明不了它肯签，而失败码
-/// 也证明不了「不肯签」（-26 是这一笔没验过）。所以「能不能签」只能靠真签一次
-/// 量出来，而且**只有签出来这一种结论**：没人按指纹也签得出来（2026-10-06 在
-/// PLC110 上实测过），量不出来就是量不出来，不许推断成「签不了」。
-///
-/// 只用槽位上现成的材料，不建不删（改设备密钥状态得先问操作者）：槽位上没材料
-/// （-5 / -6）时结论是「没量出来」。这点很要紧 —— 把量不出来当成签不了上报，
-/// 服务端会把一台其实能签的机器从签名链路上踢掉。
+/// `getDeviceId` 只能证明 HAL 活着，失败码也证明不了「不肯签」（-26 是这一笔没验过），
+/// 所以「能不能签」只能真签一次量出来，而且只有签出来这一种结论。只用槽位上现成的
+/// 材料，不建不删：槽位没材料（-5 / -6）时结论是「没量出来」，不能当「签不了」上报。
 ///
 /// 结论写在 `verdict` 里（见 [`SignVerdict`]），`signed` 只为看日志方便。
-/// 不走 Err：这是探针，HAL 不给面子也得把原因带回去写进日志。
+/// 不走 Err：探针失败也得把原因带回去写进日志。
 pub fn sign_probe(uid: i32, alias: &str) -> Value {
     // 探针也是真的去 init/finish，跟派下来的活一样得排队（上限走全局那个值）。
     let _gate = SoterHalGate::enter(Some(uid), None);
@@ -1031,8 +999,7 @@ mod tests {
 
     #[test]
     fn a_verification_failure_is_never_a_hard_sign_failure() {
-        // -26 只是「这笔没签成」，材料没毛病；本机不再替服务端判「这层做不了」——
-        // 以前这么判过，结果是 App 被推去拿服务端自签的假料。
+        // -26 只是「这笔没签成」，材料没毛病：本机不替服务端判「这层做不了」。
         for op in ["finish_sign", "init_sign", "has_auth_key", "get_device_id"] {
             for code in [-26, 0, -5, -6, -7, -9, -1000] {
                 assert!(
@@ -1045,8 +1012,6 @@ mod tests {
 
     /// 只有「真签出来」算证据：失败码再多也不许变成「这台签不了」。
     ///
-    /// 2026-10-06 实测（PLC110 / Trustonic AIDL）：没人按指纹、没人值守，走中继
-    /// `init_sign` + `finish_sign` 照样出真签名（AuthKey 公钥验签 OK）。所以
     /// `-26`（这一笔没验过）、`-204`（会话被顶掉）、超时都只是「这笔没成」。
     #[test]
     fn only_a_real_signature_is_capability_evidence() {
@@ -1118,9 +1083,8 @@ mod tests {
 
     #[test]
     fn a_gate_without_a_uid_still_gives_the_slot_back() {
-        // 探针那条路不指名 uid。早先 Drop 里拿「uid 是不是 None」当「该不该还名额」
-        // 使，于是这种门把名额吞了：漏够 max 个之后所有 SOTER 操作全都卡在等名额上，
-        // 真机上的表现就是「卡死」而不是报错。
+        // 探针那条路不指名 uid。这种门也必须还名额：漏够 max 个之后所有 SOTER
+        // 操作全都卡在等名额上，真机上的表现就是「卡死」而不是报错。
         let q = fresh_queue();
         {
             let _g = q.enter(None, Some(1));
@@ -1195,7 +1159,7 @@ mod tests {
         let held = q.enter(Some(40031), Some(2));
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::thread::spawn(move || {
-            // 上限 2：另一个 uid 该直接进（这就是从「全局串行」换来的那点并行）
+            // 上限 2：另一个 uid 该直接进。
             let _g = q.enter(Some(40032), Some(2));
             let _ = tx.send(());
         });

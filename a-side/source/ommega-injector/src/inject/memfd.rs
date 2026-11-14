@@ -1,8 +1,8 @@
 //! 把 payload 镜像塞进目标进程自己名下的一个 memfd 里。
 //!
 //! 为什么不走跨进程递 fd：那条路要在目标进程里建一个 unix socket 收 fd，SELinux 得放行
-//! 「我们的 socket → 目标域」这条跨域规则；换一台机器、换一个域就得多加一条策略，而且
-//! A 端这台机器上往 system_app 递的时候内核只送来 SCM_CREDENTIALS、把 SCM_RIGHTS 丢掉了。
+//! 「我们的 socket → 目标域」这条跨域规则，换机器或换域就得多加一条，而且部分域里内核
+//! 只送 SCM_CREDENTIALS、把 SCM_RIGHTS 丢掉。
 //! memfd 这条不经过任何 IPC：在目标进程里 memfd_create 出一个匿名文件，字节分块写进
 //! 目标栈上一块固定的暂存区、再用目标自己的 write() 落进 memfd，最后把手里的 fd 交给
 //! android_dlopen_ext。目标读的是自己的内存，不需要任何读文件的权限。

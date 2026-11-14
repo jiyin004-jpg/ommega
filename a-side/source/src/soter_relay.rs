@@ -1,9 +1,7 @@
 //! A 端 SOTER 接替转发的决策端：宿主拦到一笔 HAL 调用后，由这里决定问远程、走本地还是透传。
 //!
-//! 决策为什么在这儿而不是 payload 里：宿主是 uid 1000，读不到 A 端配置（`/data/misc/keystore/
-//! ommega` 是 0770 的 keystore 目录），而 daemon 盯着那个文件（`config.rs` 里的
-//! `ommega-clienta-config-watch`），所以 WebUI 改完开关，下一次调用就按新值走，不用重启。
-//!
+//! 决策必须在这儿：宿主是 uid 1000，读不到 A 端配置（`/data/misc/keystore/ommega` 是
+//! 0770 的 keystore 目录）；daemon 盯着那个文件，WebUI 改完开关下一次调用就生效，不用重启。
 //! 回给 payload 的 blob 布局在 `kmr_common::soter_relay`，两边共用那一份实现。
 
 use std::collections::HashMap;
@@ -17,19 +15,16 @@ use crate::remote::{fallback_local, soter_remote_enabled, RemoteRelay};
 
 /// 「这些调用只在本地兜底回答、一次都不往 B 端转」的缺省别名前缀。
 ///
-/// 两个名字都是探针自己起的（别名尾部带毫秒时间戳，每跑一轮新铸一个），所以认前缀
-/// 比认 uid 稳。**uid 完全不能信**：SOTER 的接口把 uid 当参数传，宿主不拿
-/// `Binder.getCallingUid()` 覆盖它，所以探测机可以随便填 —— 实测鸭子的 AuthKey 那几笔
-/// 用的是 Gmail 的 uid，ASK 用的是 `com.android.pacprocessor` 这类系统包。按 uid 或按
-/// 包名认探测机都是南辕北辙。配置里写 `none` 就是关掉。
+/// 探测机自己起的名字，尾部带毫秒时间戳，所以认前缀比认 uid 稳。**uid 完全不能信**：
+/// SOTER 的接口把 uid 当参数传，宿主不拿 `Binder.getCallingUid()` 覆盖它，所以探测机
+/// 可以随便填（按 uid 或按包名认探测机都是南辕北辙）。配置里写 `none` 就是关掉。
 pub const DEFAULT_LOCAL_ONLY_PREFIXES: &str = "chunqiu_soter_probe_,duckdetector_soter_probe_";
 
 /// 刚看见探测别名之后多久内，这台设备上不带别名的那几笔（ASK 那套）也按探测机处理。
 ///
-/// 为什么要这个窗：探测机的 ASK 接口本身没有别名，uid 又是假的，本来无从辨认；但它
-/// 那一轮总是先带别名铸 AuthKey / 签名，紧接着（实测同一个秒到两秒的窗口）才发那几笔
-/// 不带别名的 ASK。取 4 秒：窗口只是给「同一轮」盖个戳，太长反而会把真应用的 ASK 也
-/// 带进本地兜底（那样它的身份会跟真机那份对不上）。
+/// 探测机的 ASK 没有别名、uid 又是假的，只能靠这个窗：它那一轮总是先带别名铸 AuthKey /
+/// 签名，紧接着才发不带别名的 ASK。取 4 秒：只盖「同一轮」，太长会把真应用的 ASK 也带进
+/// 本地兜底（那样它的身份会跟真机那份对不上）。
 const PROBE_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// 这台设备最后一次看到探测别名是什么时候。
@@ -50,8 +45,8 @@ static LAST_PROBE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mut
 
 /// 一笔 SOTER 调用的去处，`request` 是 payload 拼好的 JSON（`{"op":..,"uid":..}`）。
 ///
-/// 认不出来的请求、远程没开、远程没答案，都会回退到「本地兜底」——那是接线之前的行为，
-/// 也是唯一不会把宿主坑住的退路。
+/// 认不出来的请求、远程没开、远程没答案，一律回退到「本地兜底」——这是唯一不会把宿主
+/// 坑住的退路。
 pub fn forward(request: &str) -> Vec<u8> {
     let started = std::time::Instant::now();
     let out = forward_inner(request);
@@ -91,19 +86,17 @@ fn forward_inner(request: &str) -> Vec<u8> {
     // App 拿着脏缓存自删自建（见 `note_churn_and_maybe_heal`）：第 2 次删 AuthKey 就判。
     note_churn_and_maybe_heal(&value, &op);
 
-    // 探测机（春秋 / 鸭子这类检测器）的这笔直接本地兜底，一次都不往 B 端转。
-    //
-    // 它们每跑一轮都新铸一把别名、签完也不收尾，在 B 端吃的是真 TEE 的空会话
-    // （实测一天 900+ 次 init_sign，顶掉全部 init 的一半以上），而它们只看「这条路
-    // 通不通」——本地兜底那份自洽的答复就够，真机会话留给真应用。
+    // 探测机（春秋 / 鸭子这类检测器）的这笔直接本地兜底，一次都不往 B 端转：它们每轮
+    // 新铸一把别名、签完也不收尾，只问「这条路通不通」，本地兜底那份自洽的答复就够，
+    // 真机会话留给真应用。
     if let Some(why) = local_only(&value) {
         log::info!("event=soter relay op={op} {why}；本地兜底作答，不往 B 端转");
         return Outcome::Local.encode();
     }
 
-    // WebUI 的「SOTER 走远程」关着：跟接线之前一样，本地自签兜底。这一行走 info：开关拨到
-    // 关之后，日志里看不到 "answered remotely" 了，得能看见为什么没看见。
-    // 这个开关与 KeyMint 的远程开关完全分开（`remote` 只管出证）。
+    // WebUI 的「SOTER 走远程」关着：本地自签兜底。这一行走 info，因为关掉之后日志里就
+    // 没有 "answered remotely" 了。这个开关与 KeyMint 的远程开关完全分开（`remote`
+    // 只管出证）。
     if !soter_remote_enabled() {
         log::info!("event=soter relay op={op} soter remote disabled; using the local backend");
         return Outcome::Local.encode();
@@ -112,15 +105,14 @@ fn forward_inner(request: &str) -> Vec<u8> {
     match RemoteRelay::soter(&request_value(&value, op.as_str())) {
         Ok(Some(reply)) => {
             // 服务端说「这笔你自己本地答」（白名单外/检测器一类）：它不造料、不占真机，
-            // 把工作交给本机自己的 SOTER 能力。直接在本地这条路上答即可。
+            // 把工作交给本机自己的 SOTER 能力。
             if reply.get("local_only").and_then(Value::as_bool) == Some(true) {
                 log::info!("event=soter relay op={op} server asked for a local answer");
                 return Outcome::Local.encode();
             }
-            // Trustonic 在 ASK 已存在时会把重复的 generate 回 -5（ASK_NOT_READY），而 App
-            // 把 generate 的失败当成「ASK 没准备好」，于是一路自删自建、永远走不到签名
-            // （微信看到的就是「系统错误」）。这里补查一次 has_ask_already：ASK 在就把
-            // 这一笔改答成功，对 App 来说就是幂等的建料。
+            // Trustonic 在 ASK 已存在时会把重复的 generate 回 -5（ASK_NOT_READY），App 把
+            // 它当成「ASK 没准备好」而一路自删自建。这里补查一次 has_ask_already：ASK 在
+            // 就把这一笔改答成功，对 App 来说就是幂等的建料。
             let mut reply = reply;
             let mut code = reply.get("error_code").and_then(Value::as_i64).unwrap_or(0);
             if op == "generate_ask_key_pair" && code == -5 {
@@ -200,17 +192,15 @@ fn relay_ask_present(value: &Value) -> Option<Value> {
     }
 }
 
-/// 只看这一笔是不是「自删自建」，是且到了第 2 次就起一个线程把应用和槽位重置掉。
+/// 这一笔是不是「自删自建」；是且到了第 2 次就起线程把应用和槽位重置掉。
 ///
-/// 为什么必须重置**应用侧的缓存**：微信把「ASK / AuthKey 已存在」记在自己的
-/// `shared_prefs/soter_status.xml` 里，一旦写上就永远跳过「生成 ASK → 上报腾讯」，
-/// 我们把 B 上的料清了、重铸了它也不理，于是永远对不上腾讯那边的记录，只会自删
-/// 自建。分身是另一份 app 数据、没有这份缓存，所以「分身能修、主微信修不了」。
+/// 必须重置**应用侧的缓存**：微信把「ASK / AuthKey 已存在」记在
+/// `shared_prefs/soter_status.xml` 里，一旦写上就永远跳过「生成 ASK → 上报腾讯」，只清
+/// B 上的料它也不理（分身是另一份 app 数据，没有这份缓存）。
 ///
-/// 重置三件事（跟人手工做的一样）：
-///   1. `am force-stop <pkg>`（先停，免得它退出时把缓存写回去）
-///   2. 备份并删掉 `shared_prefs/soter_status.xml`（主用户 + 分身目录）
-///   3. 让 B 把该 uid 的料清空（带 `force_scope_wipe`，绕过服务端「多账号不清」的保护）
+/// 重置三件事：`am force-stop <pkg>`（先停，免得退出时把缓存写回去）→ 备份并删掉
+/// `shared_prefs/soter_status.xml`（主用户 + 分身目录）→ 让 B 清空该 uid 的料
+/// （带 `force_scope_wipe`，绕过服务端「多账号不清」的保护）。
 fn note_churn_and_maybe_heal(value: &Value, op: &str) {
     if !matches!(op, "remove_auth_key" | "remove_all_uid_key") {
         return;
@@ -301,12 +291,9 @@ fn heal_soter_slot(pkg: &str, uid: i64) -> anyhow::Result<()> {
             }
         }
     }
-    // 本地脏缓存没清掉就别去动 B 的料。
-    //
-    // payload 跑在 keystore uid 下，删 /data/data/<pkg> 是跨应用操作，基本都会被挡；
-    // 以前这两步失败被忽略、第三步（清 B 槽位）照做，结果是 App 侧缓存一点没动、
-    // B 上还可用的钥匙反而被清掉了，然后进 10 分钟冷却 —— 比不修更糟，用户看到的就是
-    // 「一直系统错误，而且现在连料都没了」。
+    // 本地脏缓存没清掉就别去动 B 的料：payload 跑在 keystore uid 下，删
+    // /data/data/<pkg> 是跨应用操作、基本都会被挡；只清 B 会把 App 上还可用的钥匙
+    // 清掉再进 10 分钟冷却，比不修更糟。
     if removed == 0 && failed > 0 {
         log::warn!(
             "event=soter selfheal cannot clear local cache for {pkg}; leaving the B slot alone"
@@ -333,9 +320,8 @@ fn heal_soter_slot(pkg: &str, uid: i64) -> anyhow::Result<()> {
 }
 
 /// 一笔调用该不该只在本地兜底回答（连远程都不问）。命中时回一句「凭什么」给日志。
-/// 名单从配置里现读（`/data/misc/keystore/ommega/config` 的 `soter_local_only_prefixes` /
-/// `soter_local_only_uids`）：宿主是 uid 1000、读不到那个 0770 的 keystore 目录，
-/// 所以这个判断只能留在 daemon 这边，跟这个文件里其它开关同理。
+/// 名单从配置里现读（`soter_local_only_prefixes` / `soter_local_only_uids`）：宿主是
+/// uid 1000、读不到那个 0770 的目录，所以这个判断只能留在 daemon 这边。
 fn local_only(value: &Value) -> Option<String> {
     let (prefixes, uids) = match crate::config::config().read() {
         Ok(cfg) => (
@@ -350,9 +336,8 @@ fn local_only(value: &Value) -> Option<String> {
         note_probe_sighting();
         return Some(why);
     }
-    // 带了真调用者包名（新 payload）的那几笔不吃这个时间窗：这笔到底是不是探测机由
-    // 服务端按包名判（名单之外一律内置）。靠窗猜会把真应用紧跟着探测机跑的那笔不带
-    // 别名的 ASK 也拽到本地来 —— 它跟同一轮真机那把钥匙就对不上了（微信栽过）。
+    // 带了真调用者包名的几笔不吃这个时间窗：是不是探测机由服务端按包名判。靠窗猜会把
+    // 真应用紧跟着探测机跑的那笔不带别名的 ASK 也拽到本地，跟同一轮真机那把钥匙对不上。
     if !has_caller_pkg(value) && probe_recently_seen() && alias_is_blank(value) {
         return Some("这台设备刚跑过探测机的流程（名字前几秒刚出现过）".to_string());
     }
@@ -376,13 +361,12 @@ pub const CALLER_PKG_FIELD: &str = "caller_pkg";
 type CallerNames = std::sync::Mutex<Vec<(u32, std::time::Instant, Option<String>)>>;
 static CALLER_NAMES: CallerNames = std::sync::Mutex::new(Vec::new());
 
-/// uid → 包名（逗号连起来），带一层短缓存。
-///
-/// 为什么要缓存：它每笔 SOTER 调用都要问一次系统，而那个映射只有装/卸应用才会变。
+/// uid → 包名（逗号连起来），带一层短缓存：它每笔 SOTER 调用都要问一次系统，而那个映射
+/// 只有装/卸应用才会变。
 fn caller_package_for_uid(uid: i64) -> Option<String> {
-    // 翻成功记一分钟就够（只有装/卸应用才会变）；翻不出来只记几秒 —— 那多半是系统那一刻
-    // 没答上来（AAID 服务刚起来、那一瞬间查不到这个 uid），拿一分钟的负面缓存把「按包名判」
-    // 这条路挡住不值得。
+    // 翻成功记一分钟（只有装/卸应用才会变）；翻不出来只记几秒 —— 那多半是系统那一刻
+    // 没答上来（AAID 服务刚起来、查不到这个 uid），不值得用一分钟的负面缓存挡住
+    // 「按包名判」这条路。
     const OK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
     const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -425,9 +409,7 @@ fn caller_package_for_uid(uid: i64) -> Option<String> {
 /// 请求里已经有 `caller_pkg`（或压根没带 `caller_uid`）就原样不动 —— 后者是旧 payload
 /// 或者没有 App 侧事务的调用，服务端会自动退回别名/槽位那套。
 fn with_caller_pkg(mut value: Value) -> Value {
-    // 一行诊断：daemon 到底收到了什么。三件事一眼能分开：
-    //   payload 是不是还自己塞了 caller_pkg；请求里有没有 uid；内核 uid 那格有没有。
-    // 以前没这行，只能在「包名翻了、翻错了、根本没翻」之间猜。
+    // 一行诊断：payload 是否自带 caller_pkg、请求里有没有 uid、内核 uid 那格有没有。
     log::info!(
         "event=soter caller in op={} uid={:?} caller_uid={:?} caller_pkg={:?} src={:?}",
         value.get("op").and_then(Value::as_str).unwrap_or("-"),
@@ -445,21 +427,15 @@ fn with_caller_pkg(mut value: Value) -> Value {
         .and_then(Value::as_i64)
         .and_then(caller_package_for_uid)
         .or_else(|| {
-            // `caller_uid` 是内核给的，只有「注在宿主进程里」那条路才有意义。
-            // `soterta-ta` 是独立 HAL，调它的是 soterserver（uid 1000），内核那格拿到
-            // 的不是 App —— 它甚至会把一堆共享 uid 的系统包一起翻出来（实测 SoterChecker
-            // 被判成 com.android.dynsystem,com.zte.*，整轮退回本地）。
-            //
-            // SOTER 接口本来就把 App uid 当参数传（原厂 TA 也只认这个），而且宿主就是
-            // 拿它转发进来的，所以退一级用它翻。
+            // `caller_uid` 只有「注在宿主进程里」那条路才有意义：`soterta-ta` 是独立 HAL，
+            // 调它的是 soterserver（uid 1000），内核那格拿到的不是 App（还会把一堆共享 uid
+            // 的系统包一起翻出来）。SOTER 接口本来就把 App uid 当参数传（原厂 TA 也只认这个），
+            // 宿主就是拿它转发进来的，所以退一级用它翻。
             app_uid.and_then(caller_package_for_uid)
         })
         .or_else(|| {
-            // 两个都没有：用 root 侧写的“当前前台应用”兜底。
-            //
-            // 这一步为什么必须放在这里：以前它接在 `caller_package_for_uid` 的失败分支里，
-            // 而“没有 caller_uid”是**更早**的 `return`（实测小米那台就是这样）—— 文件压根
-            // 没人看，于是整条包名路全空、只能退回别名/槽位猜，他那台的指纹一直起不来。
+            // 两个都没有：用 root 侧写的「当前前台应用」兜底。这一步必须放在这里 ——
+            // 没有 `caller_uid` 是更早的 return，接在别处就永远走不到。
             crate::plat::utils::foreground_package().inspect(|pkg| {
                 log::info!("event=soter caller 用前台应用兜底 -> {pkg}");
             })
@@ -537,9 +513,9 @@ fn parse_number_list(raw: &str) -> Vec<i64> {
 
 /// 远程没给出答案时的分岔：配置允许退回本地就退回，否则把这笔调用放给真 HAL。
 ///
-/// 注意这里用的是「是否远程」之外的第二个开关 `local_hw`（`RemoteConfig::fallback_local`，
-/// 缺省为真）：B 端不在线时，默认还是拿 A 端自签把流程走完，而不是让 app 拿到真 HAL 那个
-/// 整族 ATTK 都是 -20 的答复。
+/// 用的是「是否远程」之外的第二个开关 `local_hw`
+/// （`RemoteConfig::fallback_local`，缺省为真）：B 端不在线时默认拿 A 端自签把流程走完，
+/// 而不是让 app 拿到真 HAL 那整族 -20 的答复。
 fn no_remote_answer(op: &str, reason: &str) -> Vec<u8> {
     if fallback_local() {
         log::warn!("event=soter relay op={op} {reason}; falling back to the local backend");
@@ -562,14 +538,12 @@ fn out_bytes(outcome: &Outcome) -> usize {
     }
 }
 
-/// SOTER 的身份是 `(cpu_id, uid)` 一起绑的：B 的密钥库里只有它自己那套应用的密钥
-/// （本机实测：B 上只有 10373 那把 = B 自己的微信，其余 uid 全 `-5`，而 ASK 的 JSON 里
-/// 钉着 `"uid":"10373"` 和 B 自己的 cpu_id）。所以设备替身这条线上，拿 A 端那个 uid
-/// 去问 B 必然问不到 —— 得按 B 自己的身份问。
+/// SOTER 的身份是 `(cpu_id, uid)` 一起绑的：B 的密钥库里只有它自己那套应用的密钥，
+/// 其余 uid 全 `-5`，所以设备替身这条线上拿 A 端那个 uid 去问 B 必然问不到 —— 得按 B 自己
+/// 的身份问。
 ///
-/// 这就是那张表存在的理由（`soter_uid_map: 10490=10373`，逗号/分号/空格分隔多条，
-/// 每条的 `A=B` 里 `=` 也可以写成 `:` 或 `->`）。没配就不动：uid 猜错了答出来的东西
-/// 比「没有」更坑。
+/// 这就是那张表存在的理由（`soter_uid_map: 10490=10373`，逗号/分号/空格分隔多条，每条的
+/// `A=B` 里 `=` 也可以写成 `:` 或 `->`）。没配就不动：uid 猜错了答出来的东西比「没有」更坑。
 fn apply_uid_map(value: &Value, raw: &str) -> Option<Value> {
     let from = value.get("uid").and_then(Value::as_i64)?;
     let to = parse_uid_map(raw).into_iter().find(|(a, _)| *a == from)?.1;
@@ -607,10 +581,8 @@ pub(crate) fn parse_uid_map(raw: &str) -> Vec<(i64, i64)> {
 }
 
 /// 转发前的最后一步：按配置里的映射表把请求的 uid 换成 B 端对应的那个，再把学到的
-/// 真机 cpu_id 带上。
-///
-/// 换成功了记一行 info —— 拿 A 的 uid 去问 B 得到的是「没有」，换完才拿得到真材料，
-/// 这条日志是区分这两种情况的唯一依据。
+/// 真机 cpu_id 带上。换成功了记一行 info —— 拿 A 的 uid 去问 B 得到的是「没有」，
+/// 换完才拿得到真材料，这条日志是区分这两种情况的唯一依据。
 fn request_value(value: &Value, op: &str) -> Value {
     let raw = match crate::config::config().read() {
         Ok(cfg) => cfg.remote.soter_uid_map.clone(),
@@ -649,19 +621,17 @@ fn with_cpu_id(mut value: Value, cpu_id: Option<String>) -> Value {
 
 /// 把服务端那份 JSON 答案翻成 payload 认的形状。形状对不上返回 `None`（上层转透传）。
 ///
-/// 服务端/B 端的字段见 `server/source/src/handlers.rs` 的 `run_soter_task`：`error_code`
-/// 是必定有的状态码，`data` 是 base64 的 out 参数（只在成功、且在 `answers_with_data` 的
-/// 那几个 op 上有），`init_sign` 另有 `session`。
+/// `error_code` 是必定有的状态码；`data` 是 base64 的 out 参数（只在成功、且属于
+/// `answers_with_data` 的那几个 op 上有）；`init_sign` 另有 `session`。
 fn encode_reply(op: &str, reply: &Value) -> Option<Outcome> {
     let code = reply.get("error_code").and_then(Value::as_i64)? as i32;
 
     if soter_relay::answers_with_session(op) {
         let session = match reply.get("session").and_then(Value::as_i64) {
             Some(session) => session,
-            // 答了成功却没有会话号：这张会话在 TA 里根本没建起来。服务端那边对同
-            // 一形状就是这个判据（还额外要求 session != 0）。照撒成 status=0/session=0
-            // 等于递一个假成功给 App，App 拿着 session=0 去 finish_sign 才报错，
-            // 本该在这一步走「透传给真 HAL / 本地兜底」的分支就吃不到了。
+            // 答了成功却没有会话号：这张会话在 TA 里根本没建起来（服务端对同一形状也是
+            // 这个判据，还额外要求 session != 0）。撒成 status=0/session=0 等于递一个假
+            // 成功给 App，走到 finish_sign 才报错，本该在这里走透传/本地兜底的分支就吃不到了。
             None if code == 0 => return None,
             // 失败码本来就没有会话号，保留原状态码。
             None => 0,
@@ -683,9 +653,7 @@ fn encode_reply(op: &str, reply: &Value) -> Option<Outcome> {
         _ => None,
     };
     // `get_device_id`：真机 / SDK 给的是 **32 字符 hex 文本**（有的还跟一个 NUL），而检测器
-    // 要的是 16 字节原始值（转 hex 后跟 `cpu_id` 比）。本地兜底那条路已经转了
-    // （`soter_local::hex_bytes`），转发这条路以前没转，检测器就看到 `30393030…` ——
-    // ASCII 的 "0900"，C5b 直接对不上。已经是 16 字节的原样放过，幂等。
+    // 要的是 16 字节原始值（转 hex 后跟 `cpu_id` 比）。已经是 16 字节的原样放过，幂等。
     let data = if op == "get_device_id" {
         match data.as_deref().and_then(hex_text_32) {
             Some(raw) => Some(raw),
@@ -717,12 +685,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 真机实测拿回来的应答（见 `D:\ace5u-forensics` 那份状态文档），字段名和形状都是
-    /// 服务端真实输出，不是照着代码猜的。
+    /// 真机拿回来的应答，字段名和形状都是服务端真实输出。
     #[test]
     fn a_device_id_answer_is_16_raw_bytes() {
-        // 服务端 2026-10-21 起回 16 字节 raw（原来回的是 32 字符 hex 的 ASCII 再加 NUL）。
-        // 检测器的 getDeviceId 期望 16 字节，转 hex 后再跟 cpu_id 比。
+        // 服务端回 16 字节 raw；检测器的 getDeviceId 期望 16 字节，转 hex 后再跟 cpu_id 比。
         let reply = json!({
             "data": "CQAAAFFxc0xChmvqFIsh9Q==",
             "error_code": 0,
@@ -908,8 +874,7 @@ mod tests {
 
     #[test]
     fn a_real_app_is_not_diverted() {
-        // 微信自己那套别名一个字都不能碰（这台机器上是 uid 10490 的
-        // `SoterAuthKeyV2_<salt>_scene1`）。
+        // 微信自己那套别名一个字都不能碰（uid 10490 的 `SoterAuthKeyV2_<salt>_scene1`）。
         let value = json!({
             "op": "init_sign",
             "uid": 10490,
@@ -945,8 +910,8 @@ mod tests {
         assert!(!alias_is_blank(
             &json!({"op": "init_sign", "alias": "SoterAuthKeyV2_salt1_scene1"})
         ));
-        // 窗口本身是设备级的静态变量，测试之间共享，所以只断言「记一笔之后就是热的」
-        // 这个方向，不去断言「没记过就是冷的」（别的测试可能刚记过）。
+        // 窗口本身是设备级的静态变量，测试之间共享，所以只断言「记一笔之后就是热的」这个
+        // 方向，不去断言「没记过就是冷的」（别的测试可能刚记过）。
         note_probe_sighting();
         assert!(probe_recently_seen());
         assert!(!PROBE_WINDOW.is_zero());
@@ -1025,9 +990,9 @@ mod tests {
         );
     }
 
-    /// 真机上手工跑的验证：把设备上那份真配置装进运行时配置，再拿真的探测别名走
-    /// `local_only`（`forward()` 里就是这一步），确认它判成「本地兜底」、而微信那类真
-    /// 应用的别名一个都判不出来。只读设备文件，不发请求、不改任何东西。
+    /// 真机上手工跑的验证：把设备上那份真配置装进运行时配置，再拿真的探测别名走 `local_only`
+    /// （`forward()` 里就是这一步），确认它判成「本地兜底」、而微信那类真应用的别名一个都判
+    /// 不出来。只读设备文件，不发请求、不改任何东西。
     ///
     /// ```text
     /// adb push <test-bin> /data/local/tmp/a-keymint-tests
@@ -1064,7 +1029,7 @@ mod tests {
         assert!(!url.is_empty() && !device_id.is_empty(), "扁平配置没被读到");
         assert!(!list_disabled(&prefixes), "真配置把本地兜底名单关掉了");
 
-        // 两台探测机的别名（名字是从生产服务端日志里抄回来的真的）。
+        // 两台探测机的别名。
         for alias in [
             "chunqiu_soter_probe_1791022575713",
             "duckdetector_soter_probe_1791022480012",

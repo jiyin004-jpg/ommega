@@ -1,49 +1,39 @@
-//! 「默认设备 id」：A 端留空时服务端拿它挑 B。
+//! 「默认设备 id」：A 端留空时，服务端拿它挑 B。
 //!
-//! A 端远程模式默认不带 `device_id`（模块装好就是这样，面板也不用占位一台设备）。
-//! 请求照样发上来，由服务端决定落到哪台 B。
+//! A 端远程模式默认不带 `device_id`（模块装好就是这样，面板也不占位一台设备），请求照发，
+//! 由服务端决定落到哪台 B。
 //!
-//! **两条链路各有一个默认 id，互不影响**：
+//! 两条链路各有一个默认 id，互不影响：
+//! - `keymint`：attest / sign / decrypt 这类走 KeyMint 的请求，落到 B 层时优先用这一台；
+//!   物理模式下它是第一顺位。
+//! - `soter`：SOTER 转发的请求（init/finish、建料、探针）。SOTER 层序永远 B 设备层打头
+//!   （`handlers::run_soter_task_inner`），留空时直接落到这一台。
 //!
-//! - `keymint`：attest / sign / decrypt 这类走 KeyMint 的请求。落到 B 端层时优先
-//!   用这一台；物理模式下它更是第一顺位。
-//! - `soter`：SOTER 转发的请求（init/finish、建料、探针）。SOTER 的层序永远是
-//!   B 设备层打头（`handlers::run_soter_task_inner`），所以留空时就直接落到这台。
+//! 不能合并成一个值：KeyMint 那条要「补丁日期 / 链好看」的机器，SOTER 那条要「槽位上有
+//! 真料、能签」的机器，共用一个默认值会互相拖累。同一个 SOTER 流程的 ASK / AuthKey /
+//! 签名还必须出自同一台（见 `soter_gate`），所以默认值必须是固定一台，不能每次按负载挑。
 //!
-//! 为什么拆开：这两个链路要的机器往往不是同一台。KeyMint 那条要的是「补丁日期 /
-//! 链好看」的那台，SOTER 那条要的是「槽位上有真料、能签」的那台；共用一个默认值
-//! 就会互相拖累（改了一个把另一个也带走了）。
+//! 请求自带非空 `device_id` 时一律按请求来。没配（空字符串）= 各层自己按负载挑在线 B。
 //!
-//! 请求自带非空 `device_id` 时一律按请求来，这里什么都不做。
-//!
-//! 没配（空字符串）= 保持原来的行为：由各层自己按负载挑一台在线的。
-//!
-//! 为什么要落盘：A 端一装好就是留空，几乎所有设备都吃这个默认值。进程重启后如果
-//! 退回「按负载挑」，同一轮 SOTER 流程的前后两笔就可能落到不同 B 上 —— 而同一个
-//! 槽位的 ASK / AuthKey / 签名必须出自同一台（见 `soter_gate`）。所以运营在控制台
-//! 填的那一台必须活过重启。
-//!
-//! 优先级：环境变量（文件里没有值时当初始值）→ `data/default_device.json`。
-//! 文件里还留着老格式 `{"device_id":"..."}` 时，两条链路都用它，升级不改行为。
+//! 唯一来源是环境变量：`RELAY_DEFAULT_KEYMINT_DEVICE_ID` / `RELAY_DEFAULT_SOTER_DEVICE_ID`
+//! 各自的优先，缺了回落通用 `RELAY_DEFAULT_DEVICE_ID`。`data/default_device.json` 已废弃，
+//! 只在单测里解析。
 
 use std::sync::RwLock;
 
 use serde_json::Value;
 
-/// 落盘位置。跟其它状态文件一样按进程工作目录算（systemd 的 WorkingDirectory=/opt/relay）。
-/// `OMMEGA_DEFAULT_DEVICE_FILE` 可覆盖。
-/// 只给单测留的路径（运行时不读文件）。
+/// 单测用的落盘路径（运行时不读文件）。
 #[cfg(test)]
 pub const DEFAULT_PATH: &str = "data/default_device.json";
 
 /// 老的通用环境变量：两条链路都拿它当初始值（兼容既有部署）。
 pub const ENV_KEY: &str = "RELAY_DEFAULT_DEVICE_ID";
 
-/// 设备 id 的长度上限。`device-b-xxxxxxxx` 是 17 个字符，留足余量。
+/// 设备 id 长度上限。`device-b-xxxxxxxx` 是 17 个字节，留足余量。
 const MAX_LEN: usize = 128;
 
-/// 两条链路。别把两者当成可互换的：SOTER 要的是能签的那台，KeyMint 要的是链好看
-/// 的那台，共用一台只会在某一边卡住。
+/// 两条链路，不能互换：SOTER 要能签的那台，KeyMint 要链好看的那台。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Chain {
     Keymint,
@@ -107,10 +97,9 @@ pub fn get_all() -> (String, String) {
     (get(Chain::Keymint), get(Chain::Soter))
 }
 
-/// 规范化一个设备 id：去空白；空字符串表示「不指定」。
-///
-/// 只做宽松校验（不允许空白字符、长度上限），因为设备 id 是运营自己给 B 端起的，
-/// 有自己的命名习惯；这里拦住的只是明显写错的东西（粘贴进来带空格/换行、超长串）。
+/// 规范化一个设备 id：去两端空白；空字符串表示「不指定」。
+/// 只做宽松校验（不允许内部空白、限长）：设备 id 是运营自己起的，拦的只是明显写错的
+/// （粘贴带空格 / 换行、超长串）。
 fn normalize(raw: &str) -> Result<String, String> {
     let id = raw.trim();
     if id.len() > MAX_LEN {
@@ -122,10 +111,8 @@ fn normalize(raw: &str) -> Result<String, String> {
     Ok(id.to_string())
 }
 
-/// 改某条链路的默认值。**只作用于当前进程**：持久化请改 `.env`
-/// （`RELAY_DEFAULT_KEYMINT_DEVICE_ID` / `RELAY_DEFAULT_SOTER_DEVICE_ID`）然后重启。
-///
-/// 不落盘是故意的：默认设备只该有一个写入口，否则又会回到「重启之后到底算哪个」的老问题。
+/// 改某条链路的默认值，**只作用于当前进程**：持久化改 `.env` 后重启。
+/// 不落盘是故意的 —— 默认设备只该有一个写入口（环境变量）。
 pub fn set(chain: Chain, raw: &str) -> Result<String, String> {
     let id = normalize(raw)?;
     let current = get_all();
@@ -144,14 +131,8 @@ pub fn set(chain: Chain, raw: &str) -> Result<String, String> {
     Ok(id)
 }
 
-/// 启动时装载一次。环境变量只在文件里没有值时当初始值（环境变量写错了不该
-/// 每次重启都把控制台保存的值盖掉）。
-/// 装载：**唯一来源是环境变量**。
-///
-/// 以前这里还会读 `data/default_device.json`，而且「文件里有值就压过环境变量」，
-/// 同一份设置两个写入口，排查时分不清到底用的是哪个。8443 那个实例就是因为
-/// 没有那份文件，归一回落到代码默认，把 SOTER 请求派到了一台没有 SOTER 能力的 B。
-/// 现在文件那套（含 `OMMEGA_DEFAULT_DEVICE_FILE`）完全不用了。
+/// 启动时装载一次，唯一来源是环境变量：两条链路各取自己的变量，都缺时回落
+/// `RELAY_DEFAULT_DEVICE_ID`。写错的（含空白 / 超长）按未指定处理。
 pub fn init() {
     let mut ids = Ids::default();
     for chain in [Chain::Keymint, Chain::Soter] {
@@ -184,15 +165,14 @@ pub fn init() {
     }
 }
 
-/// 只给单测用：验证旧文件的解析不回归（运行时不读文件了）。
+/// 只给单测用：验证老文件格式的解析（运行时不读文件）。
 #[cfg(test)]
 fn read_file(file_path: &str) -> Ids {
     let Ok(text) = std::fs::read_to_string(file_path) else {
         return Ids::default();
     };
-    // 文件格式就是 `{"keymint_device_id":"...","soter_device_id":"..."}`；
-    // 老版本只有 `device_id`，那就两条都用它（升级不改行为）。
-    // 解析失败就当没配，不要因此起不来。
+    // 格式 `{"keymint_device_id":"...","soter_device_id":"..."}`；老格式只有
+    // `device_id`，那就两条都用它。解析失败当没配，不能因此起不来。
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
@@ -225,17 +205,11 @@ fn read_file(file_path: &str) -> Ids {
 }
 
 /// 把一个 A 端请求的 `device_id` 按链路补齐成「实际要用的那台」。
-///
-/// 语义就是用户定下的那条：A 端留空 + 服务端配了这条链路的默认设备 = **完全等同于
-/// A 端自带了那个 id**。所以这里在入口处就把 body 归一，而不是在某一层里临时拿默认值
-/// —— 归一之后，physical / serverbox 两种模式的层序、StrongBox 分流、身份查找、
-/// 队列派发、SOTER 的槽位钉/会话路由看见的都是同一台具体设备，行为与「A 端真填了
-/// 这个 id」一字不差。
-///
-/// 请求已经带了非空 id 就原样返回（哪怕那台离线）：那是调用方点名的机器，回退逻辑
-/// 自己会处理；这里不能拿默认值把点名的请求截走。
-///
-/// 没配默认值时原样返回，空 id 继续走各层的按负载挑选。
+/// 语义：A 端留空 + 服务端配了这条链路的默认设备 = 完全等同于 A 端自带了那个 id。
+/// 所以在入口处归一，后面 physical / serverbox 层序、StrongBox 分流、身份查找、
+/// 队列派发、SOTER 槽位钉与会话路由看到的都是同一台具体设备。
+/// 请求已带非空 id 则原样返回（哪怕那台离线）：那是调用方点名的机器，不能拿默认值截走。
+/// 没配默认值时也原样返回，空 id 继续走各层按负载挑选。
 pub fn fill_in_body(chain: Chain, body: &Value) -> Value {
     let raw = body
         .get("device_id")

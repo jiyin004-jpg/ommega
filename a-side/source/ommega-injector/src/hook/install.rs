@@ -22,8 +22,8 @@ pub(super) fn init_hook() -> Result<()> {
 
 /// soterserver（system_ext 的 platform_app）里 libbinder 的 GOT/RELRO 那一段是 `---p`，
 /// lsplt 的 ScanHookInfo 只收 private 且可读的映射，commit 时找不到承载 GOT 的那块就
-/// 整片失败，主流程再 expect 一下宿主就直接 SIGABRT（安 15 / PKG110 实测）。
-/// 这里在 commit 之前把 libbinder* / libhidlbase 的 `---p` 段放开成只读，让它能被 lsplt 认领。
+/// 整片失败，宿主直接 SIGABRT。这里在 commit 之前把 libbinder* / libhidlbase 的 `---p`
+/// 段放开成只读，让它能被 lsplt 认领。
 fn unlock_binder_relro() {
     let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
         return;
@@ -106,8 +106,8 @@ fn install_hooks() -> Result<()> {
         if let Some(path) = &map.pathname {
             let name = path.rsplit('/').next().unwrap_or(path);
             // HIDL 那套的 ipc 实现不在 libbinder 里：Android 13+ 的 `libhwbinder.so`
-            // 只是个 10KB 的空壳，真正调 ioctl 的是 `libhidlbase.so`（一加 PGP110
-            // 实测：只 hook libbinder 时，cryptoeng 发往 HIDL soter 的事务一条都看不到）。
+            // 只是个 10KB 的空壳，真正调 ioctl 的是 `libhidlbase.so`（只 hook libbinder 时，
+            // cryptoeng 发往 HIDL soter 的事务一条都看不到）。
             if (name.starts_with("libbinder")
                 || name == "libhwbinder.so"
                 || name == "libhidlbase.so")

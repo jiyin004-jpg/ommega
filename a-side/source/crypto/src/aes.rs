@@ -183,10 +183,8 @@ impl crypto::EmittingOperation for OmmegaAesOperation {
                 }
             },
             crypto::aes::CipherMode::Ctr { nonce } => {
-                // AOSP 把 CTM nonce 的**整 16 字节**当计数器初值（末 4 字节是
-                // 计数器本身，调用方给的 DEADBEEF 要原样参与运算）。以前这里只取
-                // 前 12 字节、把后 4 字节清零，密文跟原生复算对不上 —— KmProbe 的
-                // 「AES-256-CTR · 16 字节固定 IV」就是拿这个判的。
+                // AOSP 把 CTM nonce 的**整 16 字节**当计数器初值（末 4 字节是计数器本身，
+                // 调用方给的值要原样参与运算）；只取前 12 字节会跟原生复算对不上。
                 out = ctr_transform_keyed_bytes(&self.key, &nonce, &self.data)?;
             }
         }
@@ -464,7 +462,7 @@ mod kmprobe_regression_tests {
         n
     }
 
-    /// AOSP 同时支持 128/192/256 位 AES-GCM，192 位以前被直接拒了。
+    /// AOSP 同时支持 128/192/256 位 AES-GCM。
     #[test]
     fn aes192_gcm_round_trips() {
         let key = [0x11u8; 24];
@@ -490,7 +488,7 @@ mod kmprobe_regression_tests {
     }
 
     /// AES-CTR 的 16 字节 IV 要**整段**当计数器初值（末 4 字节非零也要参与），
-    /// 不能像以前那样把后 4 字节清零。
+    /// 不能把后 4 字节清零。
     #[test]
     fn ctr_uses_the_whole_sixteen_byte_iv() {
         use ctr::cipher::{KeyIvInit as _, StreamCipher as _};

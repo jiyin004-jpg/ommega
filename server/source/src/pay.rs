@@ -1,33 +1,29 @@
-//! 聚合支付（易支付/码支付协议）支持。
+//! 聚合支付（易支付/码支付协议）。
 //!
-//! 支持的平台：彩虹易支付、PayJS、码支付等基于同一协议的聚合支付平台。
-//! 只需在 `.env` 中配置：
-//!   PAY_GATEWAY     = 平台下单接口地址，如 https://pay.example.com/submit.php
-//!   PAY_PID         = 商户号
-//!   PAY_KEY         = 商户密钥
-//!   PAY_NOTIFY_URL  = 异步通知地址（本服务 /api/card/pay_callback/）
-//!   PAY_RETURN_URL  = 支付完成后同步跳转地址
+//! `.env` 配置：`PAY_GATEWAY` 下单地址、`PAY_PID` 商户号、`PAY_KEY` 商户密钥、
+//! `PAY_NOTIFY_URL` 异步通知地址（本服务 `/api/card/pay_callback/`）、
+//! `PAY_RETURN_URL` 支付完成后同步跳转地址。
 //!
-//! 协议说明（易支付标准）：
-//!   - 下单：向网关 POST 表单参数 pid/type/out_trade_no/notify_url/return_url/name/money，
+//! 协议（易支付标准）：
+//!   - 下单：向网关 POST 表单 pid/type/out_trade_no/notify_url/return_url/name/money
 //!     连同 MD5 签名，平台返回 JSON：{ code, msg, trade_no, qrcode, cashier_url, url }。
-//!   - 签名：按参数名升序拼接 `k1=v1&k2=v2&...&key=商户密钥`，取 MD5 小写。
-//!   - 通知：平台回调 notify_url（GET/POST 表单），携带 sign，验签通过且
-//!     trade_status == "TRADE_SUCCESS" 即表示支付成功，需应答纯文本 `success`。
+//!   - 签名：参数名升序拼接 `k1=v1&k2=v2&...&key=商户密钥`，取 MD5 小写。
+//!   - 通知：平台回调 notify_url（GET/POST 表单）带 sign，验签通过且
+//!     trade_status == "TRADE_SUCCESS" 即支付成功，需应答纯文本 `success`。
 
 use std::collections::BTreeMap;
 
 use md5::{Digest, Md5};
 use serde_json::Value;
 
-/// Compute the MD5 hex digest (lowercase) of a string.
+/// Lowercase MD5 hex digest of a string.
 pub fn md5_hex(s: &str) -> String {
     let digest = Md5::digest(s.as_bytes());
     format!("{digest:x}")
 }
 
-/// Render a QR code as an inline SVG `data:` URI so the front-end can show it
-/// with a plain `<img>` tag, with no external JS/CDN dependency.
+/// Render a QR code as an inline SVG `data:` URI, so the front-end can use a
+/// plain `<img>` tag with no external JS/CDN dependency.
 pub fn qrcode_svg_data_uri(content: &str) -> Option<String> {
     use qrcode::render::svg;
     let code = qrcode::QrCode::new(content.as_bytes()).ok()?;
@@ -117,7 +113,7 @@ pub async fn submit_order(gw: Gateway<'_>, order: OrderReq<'_>) -> Result<OrderR
     params.insert("sign".to_string(), sign);
     params.insert("sign_type".to_string(), "MD5".to_string());
 
-    // 总超时兑底：网关挂起时不能让下单接口无限阻塞（tokio 任务泄漏式挂起）
+    // 总超时兜底：网关挂起时不能阻塞下单接口（会泄漏 tokio 任务）
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()

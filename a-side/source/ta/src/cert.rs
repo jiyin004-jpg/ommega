@@ -60,7 +60,7 @@ pub const ATTESTATION_EXTENSION_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
 const X509_ATTESTATION_EXTENSION_OID: X509ObjectIdentifier =
     X509ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
-/// KeyMint 4.0 起的一个东西，同一份 KeyDescription，只是从 DER 换成了 CBOR。
+/// KeyMint 4.0 起的 EAT（CBOR）形式 attestation extension，内容同 DER 版 KeyDescription。
 const X509_EAT_ATTESTATION_EXTENSION_OID: X509ObjectIdentifier =
     X509ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.25");
 
@@ -115,9 +115,8 @@ pub(crate) fn certificate(tbs_cert: TbsCertificate, sig_val: &[u8]) -> Result<Ce
 }
 
 /// Determine whether a remote key's SubjectPublicKeyInfo (SPKI DER) is RSA
-/// (as opposed to EC). Relay attestation keys are minted on the B-side / relay
-/// and only their public key is visible to the A-side; the cert's signature OID
-/// (and the JCA algorithm forwarded for TBS signing) must match the key type.
+/// (as opposed to EC). Only the public key of a relay attestation key is visible
+/// here, and the cert's signature OID must match the key type.
 pub(crate) fn remote_key_is_rsa(public_key_spki: &[u8]) -> bool {
     use x509_cert::der::Decode;
     match X509SubjectPublicKeyInfoOwned::from_der(public_key_spki) {
@@ -141,11 +140,8 @@ pub(crate) fn tbs_certificate<'a>(
     let not_before = get_tag_value!(params, CertificateNotBefore, ErrorCode::MissingNotBefore)?;
     let not_after = get_tag_value!(params, CertificateNotAfter, ErrorCode::MissingNotAfter)?;
 
-    // Determine the contents of the `AlgorithmIdentifier`, as an OID and parameters:
-    // - RSA: RFC 4055 section 5 requires `NULL` parameters.
-    // - ECDSA: RFC 5758 section 3.2 requires parameters be omitted.
-    // - EdDSA: RFC 8410 section 3 requires parameters be omitted.
-    // - ML-DSA: RFC 9881 section 2 requires parameters be omitted.
+    // `AlgorithmIdentifier` parameters: RSA requires `NULL` (RFC 4055 §5);
+    // ECDSA, EdDSA and ML-DSA omit them (RFC 5758 §3.2, RFC 8410 §3, RFC 9881 §2).
     let (sig_alg_oid, parameters) = match info {
         Some(info) => match info.signing_key {
             KeyMaterial::Rsa(_) => (
@@ -174,7 +170,7 @@ pub(crate) fn tbs_certificate<'a>(
             }
         },
         None => {
-            // No signing key, so signature will be empty, but we still need a value here.
+            // No signing key: the signature stays empty but the field needs a value.
             match tag::get_algorithm(params)? {
                 keymint::Algorithm::Rsa => (
                     crypto::rsa::SHA256_PKCS1_SIGNATURE_OID,
@@ -272,19 +268,10 @@ pub(crate) fn extract_subject(cert: &keymint::Certificate) -> Result<Vec<u8>, Er
     Ok(subject_data)
 }
 
-/// Parse the root-of-trust from a certificate's Android attestation extension.
-/// Returns `Ok(None)` when the certificate carries no attestation extension
-/// (a non-attested key) or no root-of-trust record.
+/// 远端链声明的设备身份：brand/device/product/serial/manufacturer/model、
+/// verified boot hash、bootPatchlevel 与设备锁状态。
 ///
-/// When a remote (B-side TEE) key is later used as an attestation key, its
-/// root-of-trust must be reused verbatim for the child leaf — otherwise the
-/// child's ROOT_OF_TRUST disagrees with the attestation key's and detectors
-/// flag the attestation key as tampered.
-/// 远端链里声明的设备身份：B 真机自己那套 brand/device/product/serial/
-/// manufacturer/model，加上它的 verified boot hash。
-///
-/// 拿它去对齐本机属性：一条真机链只能证明那台机器，本机如果说自己叫
-/// 另一个型号，检测器就会报 `device_properties` / VBMeta 摘要不一致。
+/// 子叶子的 ROOT_OF_TRUST 必须逐字沿用远端链，否则与证明密钥对不上，会被判为篡改。
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RemoteDeviceIdentity {
     pub brand: Option<Vec<u8>>,
@@ -294,17 +281,16 @@ pub(crate) struct RemoteDeviceIdentity {
     pub manufacturer: Option<Vec<u8>>,
     pub model: Option<Vec<u8>>,
     pub verified_boot_hash: Option<Vec<u8>>,
-    /// RootOfTrust 里 `deviceLocked` 的值。走远程时证书是 B 端真机出的，
-    /// 本机属性必须说同一套，否则检测器一比就报 locked 不一致。
+    /// RootOfTrust 的 `deviceLocked`。远程证书由 B 端真机签发，本机属性必须与之一致。
     pub device_locked: Option<bool>,
     /// RootOfTrust 里 `verifiedBootState` 的枚举值（0=green 1=yellow 2=orange 3=red）。
     pub verified_boot_state: Option<i64>,
-    /// AuthorizationList 里的 `bootPatchlevel`（719，YYYYMMDD）。
-    /// A 端算本地证书的 719 用的是本机 boot 镜像日期，跟 B 的不一样就会像 A14/S06 那样对上。
+    /// AuthorizationList 的 `bootPatchlevel`（tag 719，YYYYMMDD）。本地证书取本机
+    /// boot 镜像日期，与 B 端不一致会被检测器比出来。
     pub boot_patchlevel: Option<i64>,
 }
 
-/// 从远端叶子证书里抽出上面那套身份。解不开就返回 `None`（不阻断生成）。
+/// 从远端叶子证书抽出设备身份；解析失败返回 `None`，不阻断生成。
 pub(crate) fn parse_remote_device_identity(cert_der: &[u8]) -> Option<RemoteDeviceIdentity> {
     let cert = <x509_cert::Certificate as Decode>::from_der(cert_der).ok()?;
     let extensions = cert.tbs_certificate().extensions()?;
@@ -347,7 +333,6 @@ pub(crate) fn parse_remote_device_identity(cert_der: &[u8]) -> Option<RemoteDevi
             identity.verified_boot_state = Some(rot.verified_boot_state as i64);
         }
     }
-    // bootPatchlevel（719）：硬件强制优先，其次软件层。
     let boot_patch = |auths: &[KeyParam]| -> Option<i64> {
         auths.iter().find_map(|param| match param {
             KeyParam::BootPatchlevel(value) => Some(i64::from(*value)),
@@ -375,14 +360,10 @@ pub(crate) fn parse_remote_root_of_trust(
     };
     let ext_value = att_ext.extn_value.as_bytes();
 
-    // Fail-open: if the remote attestation extension can't be parsed (e.g. an
-    // unusual keymint version or vendor layout), we must NOT fail attest_key
-    // generation — that would break remote mode entirely. Return `Ok(None)`
-    // and let the child sign_key fall back to the local ROT/version.
-    //
-    // 远端链可能是 CBOR（EAT）形式的，那个按 DER 解不开，先按载荷首字节
-    // 分派。少了这一支的话，远端链的 ROT/版本会被默默丢掉，子证书退回本地
-    // 值，和 attestation key 对不上，会被当成篡改。
+    // Fail-open：远端 extension 解不开（keymint 版本或厂商布局不同）时不能
+    // 让 attest_key 失败，回 `Ok(None)`，由子证书退回本地 ROT/版本。
+    // 远端链可能是 CBOR（EAT）形式，按 DER 解不开，需先按载荷首字节分派；
+    // 少了这一支 ROT/版本会被默默丢掉，子证书与 attestation key 对不上，被当成篡改。
     if kmr_common::eat::is_cbor_attestation_extension(ext_value) {
         return match kmr_common::eat::root_of_trust(ext_value) {
             Ok(rot) => Ok(rot),
@@ -425,18 +406,16 @@ fn x509_oid(oid: ObjectIdentifier) -> Result<X509ObjectIdentifier, Error> {
         .map_err(|_| Error::from(CommonErrorKind::Der(ErrorKind::OidMalformed)))
 }
 
-/// 核对一张「证明密钥」证书是不是真机硬件的 ATTEST_KEY。
+/// 校验一张「证明密钥」证书是否为硬件 ATTEST_KEY。
 ///
-/// 原生 KeyMint 的签发权限来自 keyblob 的用途，**不是** PKIX 的 CA 属性：真机
-/// （2026-10-23 实测，高通 / MTK Trustonic / Kirin）铸出来的 ATTEST_KEY 叶子
-/// `Key Usage` 只有 `Certificate Sign`（或再加 digitalSignature），**且没有任何
-/// BasicConstraints**。所以这里只认证书里硬件授权的用途：
+/// 原生 KeyMint 的签发权限来自 keyblob 的用途而不是 PKIX 的 CA 属性：真机铸出的
+/// ATTEST_KEY 叶子 `Key Usage` 只有 Certificate Sign（可能再加 digitalSignature），
+/// 且没有 BasicConstraints。所以只认证书里硬件授权的用途：
 ///
 /// * `hw_enforced.purpose` 恰好是 `[ATTEST_KEY]`（混了别的用途就不是证明密钥），
-/// * `keymint_security_level` 是 TEE / StrongBox，且与 `attestation_security_level` 一致。
+/// * `keymint_security_level` 是 TEE / StrongBox 且与 `attestation_security_level` 一致。
 ///
-/// 这样既能拒掉旧实现「把 ATTEST_KEY 换成 SIGN」留下的普通签名密钥证书，也不会
-/// 因为缺少 BasicConstraints 而误杀真机链。
+/// 缺少 BasicConstraints 不影响判定。
 pub(crate) fn validate_native_attestation_issuer(cert_der: &[u8]) -> Result<(), Error> {
     let cert = <x509_cert::Certificate as Decode>::from_der(cert_der)
         .map_err(|e| km_err!(VerificationFailed, "parse attestation issuer: {e:?}"))?;
@@ -473,11 +452,10 @@ pub(crate) fn validate_native_attestation_issuer(cert_der: &[u8]) -> Result<(), 
     Ok(())
 }
 
-/// 校验 B 端确实用了调用方指定的那把证明密钥来签发子证书。
+/// 校验 B 端用调用方指定的那把证明密钥签发了子证书。
 ///
-/// 凡是结构上对不上就报 `VerificationFailed`（**不能**回退到其它签发密钥：
-/// 旧版 B 会忽略委派参数、改用本机批量 key 签一张无关的证书，那种链必须被拒），
-/// 然后再用父证书公钥真的验一遍子证书签名。
+/// 结构对不上就报 `VerificationFailed`，不能回退到其它签发密钥；最后用父证书
+/// 公钥实际验一遍子证书签名。
 pub(crate) fn validate_remote_delegation(
     chain: &[Vec<u8>],
     issuer: &crate::device::RemoteAttestationKey,
@@ -584,7 +562,6 @@ fn validity_time_from_datetime(when: DateTime) -> Result<Time, Error> {
             ))
         }
     } else {
-        // TODO: cope with negative offsets from Unix Epoch.
         Ok(Time::GeneralTime(
             X509GeneralizedTime::from_unix_duration(Duration::from_secs(0)).map_err(|e| {
                 x509_der_error(
@@ -608,9 +585,8 @@ pub(crate) fn x509_der_encode<T: x509_der::Encode>(obj: &T) -> Result<Vec<u8>, x
     Ok(encoded_data)
 }
 
-/// Build key usage extension bits.
+/// Build key usage extension bits from the key's allowed purposes.
 pub(crate) fn key_usage_extension_bits(params: &[KeyParam]) -> KeyUsage {
-    // Build `KeyUsage` bitmask based on allowed purposes for the key.
     let mut key_usage_bits = FlagSet::<KeyUsages>::default();
     for param in params {
         if let KeyParam::Purpose(purpose) = param {

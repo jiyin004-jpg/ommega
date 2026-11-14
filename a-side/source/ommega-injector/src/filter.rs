@@ -185,8 +185,7 @@ pub fn evaluate_with_sid(
 
     if !config.enabled {
         // 主开关关着 ≠“谁都能接”：系统进程（init / system_server / keystore /
-        // vold / root）一律留在系统后端。以前这里直接放行，一旦有人把
-        // `[filter] enabled` 改成 false，开机期的 keystore 流量会全拐到我们这里，
+        // vold / root）一律留在系统后端，否则开机期的 keystore 流量会全拐到我们这里，
         // 系统拿到它用不了的回复就是开机即重启。普通应用（每用户 10000–19999）
         // 和显式绑定的系统 app 域照旧放行。
         let app_uid = uid % AID_USER_OFFSET >= AID_APP_START;
@@ -244,9 +243,9 @@ pub fn evaluate_with_sid(
             .iter()
             .any(|pkg| config.deny_packages.contains(pkg));
         let system_like = packages.iter().any(|pkg| is_system_package_name(pkg));
-        // deny_packages 是安全阀（防 com.zte.* 开机循环那类事故），必须压过
-        // scoop 显式收录——与非全局路径（denylist 先于 scope）口径一致，否则
-        // target.txt 并入 scoop 后 overlap 的 deny 条目会静默失效。
+        // deny_packages 是安全阀（防开机循环那类事故），必须压过 scoop 显式收录
+        // ——与非全局路径（denylist 先于 scope）口径一致，否则 target.txt 并入
+        // scoop 后 overlap 的 deny 条目会静默失效。
         let allowed = !denied && (explicitly_in_scope || !system_like);
         return FilterDecision {
             allowed,

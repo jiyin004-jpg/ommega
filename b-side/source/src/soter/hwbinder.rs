@@ -1,22 +1,16 @@
 //! 最小可用的 hwbinder 客户端传输层。
 //!
-//! HIDL 的 HAL 走 `/dev/hwbinder`，它跟 `/dev/binder` 是同一个内核驱动、同一套
-//! ioctl 协议（`BINDER_WRITE_READ` + `BC_TRANSACTION` + `binder_transaction_data`），
-//! 所以这里不重造协议，只把四处真不一样的地方补上：
+//! HIDL 的 HAL 走 `/dev/hwbinder`，与 `/dev/binder` 是同一内核驱动、同一套 ioctl
+//! 协议（`BINDER_WRITE_READ` + `BC_TRANSACTION` + `binder_transaction_data`），
+//! 只有四处不同：
 //!
-//! 1. 设备节点换成 `/dev/hwbinder`；
-//! 2. interface token 是裸的 C 字符串（`Parcel::writeInterfaceToken` 在 libhwbinder
-//!    里就是 `writeCString`），不是普通 binder 那种「先 i32 字符数、再 UTF-16」；
-//! 3. 字符串和 vector 走 `binder_buffer_object`（`BINDER_TYPE_PTR`）：parcel 里只躺
-//!    对象，真正的数据结构在 parcel 外面，靠对象里写的地址去读，内核负责翻译。
-//! 4. 从应答里读出来的句柄得自己 `BC_ACQUIRE`：内核随应答给的那个 ref 只撑到该
-//!    应答 buffer 被 `BC_FREE_BUFFER` 交回为止，见 [`HwBinder::acquire_handle`]。
+//! 1. 设备节点是 `/dev/hwbinder`；
+//! 2. interface token 是裸 C 字符串（带结尾 NUL），不是「先 i32 字符数、再 UTF-16」；
+//! 3. 字符串和 vector 走 `binder_buffer_object`（`BINDER_TYPE_PTR`）：parcel 里只有
+//!    对象，数据体在 parcel 之外，靠对象里的地址去读，由内核翻译；
+//! 4. 应答里读出的句柄必须自己 `BC_ACQUIRE`，见 [`HwBinder::acquire_handle`]。
 //!
-//! 为什么不用 rsbinder：它能换驱动路径，但 `Parcel` 只实现了 `flat_binder_object`，
-//! 没有 `BINDER_TYPE_PTR` 的写入口，而 HIDL 传字符串和 vec 绕不开它。
-//!
-//! 这个模块只做「一个进程里的一次同步调用」，不建线程池、不收异步事务：relay 是
-//! 一问一答的客户端，够用就行。
+//! 只做进程内一问一答的同步调用，不建线程池、不收异步事务。
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -36,8 +30,8 @@ const BINDER_CURRENT_PROTOCOL_VERSION: i32 = 8;
 const BINDER_WRITE_READ: u64 = 0xC030_6201; // _IOWR('b', 1, struct binder_write_read) —— 48 字节
 const BINDER_VERSION: u64 = 0xC004_6209; // _IOWR('b', 9, struct binder_version) —— 4 字节
 
-/// 命令号本身只占低 8 位能表示的范围，但内核的 `_IO` 宏会给它套上方向位和类型位，
-/// 所以这里换算回来时得先砍掉高位再比。`_IOC_NRMASK` / `_IOC_TYPEMASK` 都是 0xff。
+/// 命令号只占低 8 位，内核 `_IO` 宏还会套上方向位和类型位，比较前须先屏蔽高位。
+/// `_IOC_NRMASK` / `_IOC_TYPEMASK` 都是 0xff。
 const IOC_NRBITS: u32 = 8;
 const IOC_TYPEBITS: u32 = 8;
 const IOC_NRSHIFT: u32 = 0;
@@ -54,13 +48,9 @@ const fn cmd_type(cmd: u32) -> u32 {
     (cmd >> IOC_TYPESHIFT) & IOC_TYPEMASK
 }
 
-// 命令号按内核 uapi 的 `_IOC(dir, type, nr, size)` 展开。方向位要跟宏里写的一致：
-// 大多数 BR_ 用的是 `_IO`（dir=0），但 `BR_INCREFS` 那一族是 `_IOW`、`BR_TRANSACTION`
-// 那一族是 `_IOR` —— 弄反了数值就不同，匹配会落空。
-//
-// 顺带说一句：真正必需的是低 8 位的命令号，方向位和 size 位只在内核那边校验，我们
-// 拿来匹配时其实只看 nr。但既然要对齐 uapi 就对齐得完整些，将来别人对着头文件核对
-// 也一目了然。
+// 命令号按内核 uapi 的 `_IOC(dir, type, nr, size)` 展开，方向位必须与宏一致：
+// 多数 BR_ 是 `_IO`（dir=0），但 `BR_INCREFS` 一族是 `_IOW`、`BR_TRANSACTION` 一族是
+// `_IOR`；弄反了数值就不同，匹配会落空。
 const fn io_noarg(dir: u32, ty: u8, nr: u32) -> u32 {
     (dir << 30) | ((ty as u32) << IOC_TYPESHIFT) | nr
 }
@@ -74,20 +64,17 @@ const _IOC_READ: u32 = 2;
 
 pub const BC_TRANSACTION: u32 = io_arg(_IOC_WRITE, b'c', 0, 64);
 
-/// `BC_TRANSACTION_SG`：跟 [`BC_TRANSACTION`] 同一件事，但在 `binder_transaction_data`
-/// 后面多带一个 `buffers_size`，告诉内核给 buffer 对象的数据体留多少地方。
-///
-/// 带 buffer 对象（HIDL 的 string 和 vector）的事务必须走这个，走 `BC_TRANSACTION`
-/// 的话内核拿 `extra_buffers_size = 0`，直接判成 "too large buffer"。
-/// 结构是 `_IOW('c', 1, struct binder_transaction_data_sg)`，64 + 8 = 72 字节。
+/// `BC_TRANSACTION_SG`：同 [`BC_TRANSACTION`]，尾随一个 `buffers_size`，内核据此给
+/// buffer 对象的数据体留空间。带 buffer 对象（string / vector）的事务必须走这个，
+/// 否则内核按 `extra_buffers_size = 0` 处理，直接判 "too large buffer"。
+/// 结构是 `_IOW('c', 17, struct binder_transaction_data_sg)`，64 + 8 = 72 字节。
 pub const BC_TRANSACTION_SG: u32 = io_arg(_IOC_WRITE, b'c', 17, 72);
 
 pub const BC_FREE_BUFFER: u32 = io_arg(_IOC_WRITE, b'c', 3, __SIZEOF_BINDER_UINTPTR);
 
-/// `BC_ACQUIRE` / `BC_RELEASE`：把本进程里的一个 `__u32` 句柄加减一次**强**引用。
-///
-/// 注意参数就是 `__u32`（4 字节），不是像 `BC_FREE_BUFFER` 那样的 `binder_uintptr_t`；
-/// 命令字里的 size 位因此是 4，跟内核 `_IOW('c', 5, __u32)` 对得上。
+/// `BC_ACQUIRE` / `BC_RELEASE`：把本进程一个 `__u32` 句柄加减一次强引用。
+/// 参数是 `__u32`（4 字节），不是 `BC_FREE_BUFFER` 那样的 `binder_uintptr_t`，
+/// 命令字的 size 位因此是 4，对应内核 `_IOW('c', 5, __u32)`。
 pub const BC_ACQUIRE: u32 = io_arg(_IOC_WRITE, b'c', 5, 4);
 pub const BC_RELEASE: u32 = io_arg(_IOC_WRITE, b'c', 6, 4);
 
@@ -134,14 +121,12 @@ pub const BINDER_TYPE_FD: u32 = pack_chars(b'f', b'd', b'*', 0x85);
 pub const BINDER_TYPE_PTR: u32 = pack_chars(b'p', b't', b'*', 0x85);
 pub const BINDER_BUFFER_FLAG_HAS_PARENT: u32 = 0x01;
 
-/// 事务标志：只走本进程，且让内核读完把 buffer 清掉。
+/// 事务标志：`TF_ONE_WAY` 单向；`TF_ACCEPT_FDS` 允许携带 fd。
 pub const TF_ONE_WAY: u32 = 0x01;
 pub const TF_ACCEPT_FDS: u32 = 0x10;
 
-/// HIDL 那副骨架（`hidl_pointer` + `uint32_t mSize` + `bool mOwnsBuffer` + 补位）
-/// 固定 16 字节。指针槽两个 ABI 都是 8 字节（`hidl_pointer` 内部是
-/// `union { T*; uint64_t; }`，AOSP 有 `static_assert(sizeof(*this) == 8)`），
-/// 32 位进程只填低 4 字节、高位留 0，所以这个布局在两边一样。
+/// HIDL 骨架（`hidl_pointer` + `uint32_t mSize` + `bool mOwnsBuffer` + 补位）固定
+/// 16 字节。指针槽两个 ABI 都是 8 字节，32 位进程只填低 4 字节、高位留 0，布局一致。
 pub const HIDL_STRUCT_SIZE: usize = 16;
 
 #[repr(C)]
@@ -161,13 +146,13 @@ struct BinderVersion {
     protocol_version: i32,
 }
 
-/// `struct binder_transaction_data`。`target` 和 `data` 在内核里是 union，这里摊成
-/// 结构体：union 里成员都是 8 字节对齐的，摊开后偏移不变（`target` 用 `ptr` 那格的
-/// 宽度，发送时把 handle 填在低 4 字节）。
+/// `struct binder_transaction_data`。内核里 `target` / `data` 是 union，这里摊成结构体：
+/// 成员都按 8 字节对齐，偏移不变（`target` 用 `ptr` 那格的宽度，发送时只在低 4 字节
+/// 填 handle）。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct BinderTransactionData {
-    /// union { __u32 handle; binder_uintptr_t ptr; } —— 发送时只填低 4 字节。
+    /// union { __u32 handle; binder_uintptr_t ptr; }
     target: u64,
     cookie: u64,
     code: u32,
@@ -192,14 +177,11 @@ pub struct Reply {
 // Parcel 写入。
 // ---------------------------------------------------------------------------
 
-/// 一个只负责「攒字节 + 记偏移表」的 parcel。
-///
-/// 偏移表里记的是每个 `binder_object_*` 在 data 里的字节下标 —— 内核按这张表去认哪些
-/// 位置是「对象」，好做地址翻译。写一个 buffer 对象就记一次。
-///
-/// `keep` 是保命用的：HIDL 的字符串和 vector 在 parcel 里只留地址，真正的字节得在
-/// 别处活着，而且地址在 ioctl 返回前不能变。堆上分配的 `Box<[u8]>` 满足这两条，
-/// 存在这里等 Parcel 自己 drop 的时候一起放。
+/// 攒字节 + 记偏移表的 parcel。
+/// 偏移表记录每个 `binder_object_*` 在 data 里的字节下标，内核按它识别哪些位置是对象
+/// 以便做地址翻译；写一个 buffer 对象就记一次。
+/// `keep` 里的堆块承载真正的字节：HIDL 字符串 / vector 在 parcel 里只留地址，且地址
+/// 在 ioctl 返回前不能变，`Box<[u8]>` 满足这两条，随 Parcel drop 一起释放。
 #[derive(Default)]
 pub struct Parcel {
     data: Vec<u8>,
@@ -226,10 +208,8 @@ impl Parcel {
     }
 
     /// 写一段字节，然后补到 4 字节边界。
-    ///
-    /// 补位不是可选项：内核 `binder_get_object` 里有一句 `!IS_ALIGNED(offset, sizeof(u32))`，
-    /// 偏移表里的对象偏移只要不是 4 的倍数，整个事务就被当成非法。AOSP 的
-    /// `Parcel::writeInplace` 每次写完都会 `pad_size(len)` 补零，就是为这个。
+    /// 补位不可省：内核 `binder_get_object` 用 `!IS_ALIGNED(offset, sizeof(u32))` 校验，
+    /// 偏移表里的对象偏移不是 4 的倍数就整笔事务非法。
     fn write(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
         while !self.data.len().is_multiple_of(4) {
@@ -249,10 +229,8 @@ impl Parcel {
         self.write(&value.to_le_bytes());
     }
 
-    /// `Parcel::writeInterfaceToken` 在 libhwbinder 里的实现就是 `writeCString` ——
-    /// 名字当字符串写，带结尾的 NUL。别写成普通 binder 的 UTF-16 那套。
-    ///
-    /// NUL 跟字符一起写、一起补位，别分两次 —— 分两次会在中间先补一轮，长度就错了。
+    /// interface token 按 C 字符串写，带结尾 NUL；不要用普通 binder 的 UTF-16 那套。
+    /// NUL 必须与字符一起写、一起补位，分两次会在中间先补一轮而弄错长度。
     pub fn write_interface_token(&mut self, interface: &str) {
         let mut buf = Vec::with_capacity(interface.len() + 1);
         buf.extend_from_slice(interface.as_bytes());
@@ -265,16 +243,14 @@ impl Parcel {
         self.write(bytes);
     }
 
-    /// 所有 buffer 对象的长度按 8 对齐求和。
-    ///
-    /// 这个数要跟命令一起交给内核（`BC_TRANSACTION_SG` 的 `buffers_size`），内核拿它
-    /// 给 buffer 对象的数据体留地方；报少了就直接 "too large buffer"。
-    /// AOSP 里对应 `Parcel::ipcBufferSize`。
+    /// 所有 buffer 对象长度按 8 对齐求和。
+    /// 作为 `BC_TRANSACTION_SG` 的 `buffers_size` 交给内核，用来给数据体留空间；
+    /// 报少了会被判 "too large buffer"。
     pub fn buffers_size(&self) -> usize {
         let mut total = 0usize;
         for &at in &self.offsets {
             let at = at as usize;
-            // 偏移表里每条都指着 data 里的一个对象；只算 buffer 对象那几种。
+            // 偏移表每项指向 data 里的一个对象；只累加 buffer 对象（BINDER_TYPE_PTR）。
             if at + 4 > self.data.len() {
                 continue;
             }
@@ -303,11 +279,8 @@ impl Parcel {
         addr
     }
 
-    /// 挂一段调用方自己拼好的字节，返回稳定地址。
-    ///
-    /// 给 HIDL keymaster 那条路用：它的 `KeyParameter` 数组、`hidl_vec` 头要先拿到
-    /// 内层地址再拼外层，而那个模块不在本文件里，`lash` 是私有的。只加这一个公开
-    /// 转发，SOTER 那几处调用一点没动。
+    /// 挂一段调用方拼好的字节，返回稳定地址。
+    /// 外模块需先拿内层地址再拼外层，而 `lash` 私有，故开这个转发。
     pub fn lash_bytes(&mut self, bytes: &[u8]) -> usize {
         self.lash(bytes.to_vec())
     }
@@ -317,10 +290,8 @@ impl Parcel {
         self.lash(vec![0u8; n])
     }
 
-    /// 查上一块挂上去的字节的可写地址。
-    ///
-    /// 返回 `*mut u8` 是故意的：`hidl_string` 的结构体里要回填一个指向字符区的指针，
-    /// 而那个字段得在 `Box` 落位之后才能算。
+    /// 上一块挂上去的字节的可写地址。
+    /// 返回 `*mut u8` 是留待 `Box` 落位后回填内部指针（`hidl_string` 要写字符区地址）。
     fn last_block_mut(&mut self) -> *mut u8 {
         match self.keep.last_mut() {
             Some(block) => block.as_mut_ptr(),
@@ -328,20 +299,17 @@ impl Parcel {
         }
     }
 
-    /// 一个 HIDL 的 `hidl_string`：parcel 里躺两个对象，一个指向 16 字节的
-    /// `hidl_string` 结构体，一个指向字符本身。
-    ///
-    /// 结构体是 `{ hidl_pointer<char> mBuffer; uint32_t mSize; bool mOwnsBuffer; }`
-    /// 加上补位，一共 16 字节；`mBuffer` 必须跟第二个对象里的 `buffer` 指向同一块内存，
-    /// 接收方会去比这一对（AOSP 的 `readEmbeddedBuffer` 就是这么校的）。
+    /// 写一个 HIDL `hidl_string`：parcel 里两个对象，一个指向 16 字节的
+    /// `{ hidl_pointer<char> mBuffer; uint32_t mSize; bool mOwnsBuffer; }` 头，
+    /// 一个指向字符本身。`mBuffer` 必须与第二个对象的 `buffer` 指向同一块内存，
+    /// 接收方会校验这一对。
     pub fn write_hidl_string(&mut self, value: &str) {
-        // 字符区带上结尾的 NUL —— HIDL 的 `setToExternal` 里有一个 `CHECK(data[size] == '\0')`，
-        // 接收方拿到的是直接指向这块内存的指针，少一个字节就炸。
+        // 字符区带结尾 NUL：接收方 `setToExternal` 会 `CHECK(data[size] == '\0')`。
         let mut chars = value.as_bytes().to_vec();
         chars.push(0);
         let char_addr = self.lash(chars);
 
-        // 结构体里先把指针那格留空，等块挂上去拿到地址再回填。
+        // 先挂空头拿到地址，再回填指针槽。
         let head_addr = self.lash_zeroed(HIDL_STRUCT_SIZE);
         // SAFETY: 刚挂上去的块地址有效、可写，长度就是 HIDL_STRUCT_SIZE。
         unsafe {
@@ -354,11 +322,11 @@ impl Parcel {
             );
         }
 
-        // 第一个对象：指向那个结构体。没有 HAS_PARENT，它是链条的根。
+        // 第一个对象：指向结构体，无 HAS_PARENT，是链条的根。
         let parent_handle = self.offsets.len() as BinderSize;
         self.write_buffer_object(head_addr, HIDL_STRUCT_SIZE, 0, 0, 0, true);
-        // 第二个对象：指向字符。带 HAS_PARENT，`parent` 是结构体对象在偏移表里的下标，
-        // `parent_offset` 是结构体里指针那一格的偏移（`offsetof(hidl_string, mBuffer)` = 0）。
+        // 第二个对象：指向字符，带 HAS_PARENT；`parent` 是头对象在偏移表里的下标，
+        // `parent_offset` 是头内指针槽的偏移（`offsetof(hidl_string, mBuffer)` = 0）。
         self.write_buffer_object(
             char_addr,
             value.len() + 1,
@@ -369,12 +337,9 @@ impl Parcel {
         );
     }
 
-    /// 一个 HIDL 的 `vec<uint8_t>`。
-    ///
-    /// 布局跟 `hidl_string` 一模一样（指向 16 字节的 `hidl_vec` 头 + 指向元素），
-    /// 区别只在长度是元素个数、且不带 NUL。空 vector 走 `readNullableEmbeddedBuffer`
-    /// 那一套：元素指针和长度都给 0，而且内核不登记 buffer 为 0 的对象，所以两个对象
-    /// 只登记前一个。
+    /// 写一个 HIDL `vec<uint8_t>`：布局同 `hidl_string`（16 字节 `hidl_vec` 头 + 元素），
+    /// 区别是长度按元素个数、不带 NUL。空 vector 的元素指针和长度都给 0，内核不登记
+    /// `buffer == 0` 的对象，所以两个对象只登记前一个。
     pub fn write_hidl_vec_u8(&mut self, value: &[u8]) {
         let (elem_addr, elem_len) = if value.is_empty() {
             (0usize, 0usize)
@@ -411,11 +376,9 @@ impl Parcel {
         }
     }
 
-    /// 往 data 里写一个 `binder_buffer_object` 并把它的下标记进偏移表。
-    ///
-    /// 内核 uapi 的顺序是 `{hdr{type}, flags, buffer, length, parent, parent_offset}`，
-    /// 后四个字段宽度跟 ABI 走。`buffer = 0` 的对象内核不登记（AOSP 的 `writeObject`
-    /// 就是这么做的），所以空 vector 不会在偏移表里留下痕迹。
+    /// 往 data 里写一个 `binder_buffer_object`，`register` 为真时把偏移记进偏移表。
+    /// uapi 字段顺序 `{hdr{type}, flags, buffer, length, parent, parent_offset}`，
+    /// 后四个字段宽度随 ABI。`buffer == 0` 的对象内核不登记。
     pub fn write_buffer_object(
         &mut self,
         buffer: usize,
@@ -442,10 +405,7 @@ impl Parcel {
 // 连接。
 // ---------------------------------------------------------------------------
 
-/// `/dev/hwbinder` 上的一条连接。
-///
-/// 同步调用要独占「发命令 → 收应答」这一轮，所以整条连接挂一把锁；relay 的 SOTER 任务
-/// 本来就串行，锁不会成为瓶颈。
+/// `/dev/hwbinder` 上的一条连接，串行收发同步事务。
 pub struct HwBinder {
     fd: OwnedFd,
     /// mmap 出来的接收区。内核把应答 parcel 放进这里，所以地址得一直有效。
@@ -454,15 +414,12 @@ pub struct HwBinder {
     /// 整条连接上只能有一轮「发命令 → 收应答」在跑，不然会串包。
     gate: Mutex<()>,
     /// 上一轮收下、还没交回内核的应答 buffer。
-    ///
-    /// 不在 `collect_reply` 里当场 `BC_FREE_BUFFER`：应答里 buffer 对象指向的数据
-    /// 体就躺在这块 buffer 里，调用方还要拿它拼 `hidl_string` / `hidl_vec`。AOSP 的
-    /// libbinder 也是把释放挂在 `Parcel` 的析构上，而不是收到就交回。
+    /// 不在 `collect_reply` 里当场 `BC_FREE_BUFFER`：应答中 buffer 对象指向的数据体
+    /// 就在这块 buffer 里，调用方还要用它拼 `hidl_string` / `hidl_vec`。
     pending_free: Mutex<Vec<BinderSize>>,
-    /// 从应答里读出来、已经在我们这边 `BC_ACQUIRE` 过的句柄。
-    ///
-    /// 这些号在装着它们的那条应答 buffer 被 `BC_FREE_BUFFER` 交回后仍然有效（强
-    /// 引用是我们自己拿着的），连接析构时再一并 `BC_RELEASE`。
+    /// 已在本地 `BC_ACQUIRE` 过的应答句柄。
+    /// 这些号在装着它们的 buffer 被 `BC_FREE_BUFFER` 交回后仍然有效（强引用是我们
+    /// 自己拿着的），连接析构时统一 `BC_RELEASE`。
     acquired: Mutex<Vec<u32>>,
 }
 
@@ -504,8 +461,7 @@ impl HwBinder {
             );
         }
 
-        // mmap 是给接收用的：内核把应答 parcel 映射进来，`binder_transaction_data`
-        // 里给的地址就落在这块里。
+        // mmap 供接收：内核把应答 parcel 映射进来，事务里给的地址落在这里。
         // SAFETY: fd 有效，map_len 非零，属性跟 AOSP 的 ProcessState::open_driver 一致。
         let map = unsafe {
             libc_mmap(
@@ -531,10 +487,8 @@ impl HwBinder {
         })
     }
 
-    /// 一块地址是不是落在我们 mmap 出来的接收区里。
-    ///
-    /// 应答里的 `binder_buffer_object` 指向的数据是内核映射过来的，理应都在这块里；
-    /// 读之前验一下，免得一个错位的地址把进程读崩。
+    /// 地址是否落在本连接 mmap 的接收区内。
+    /// 应答里 `binder_buffer_object` 指向的数据都应在此范围，读前必须校验。
     pub fn is_mapped(&self, addr: usize, len: usize) -> bool {
         let start = self.map as usize;
         let end = start + self.map_len;
@@ -553,17 +507,12 @@ impl HwBinder {
         Some(unsafe { std::slice::from_raw_parts(addr as *const u8, len) }.to_vec())
     }
 
-    /// 把一条从应答里读出来的句柄在本进程里补一次强引用（`BC_ACQUIRE`）。
-    ///
-    /// `IServiceManager::get` 回来的 `flat_binder_object` 里那个号，是内核在翻译
-    /// 那笔应答时刚给本进程建的 ref。那条应答的 buffer 一旦用 `BC_FREE_BUFFER` 交
-    /// 回，`binder_transaction_buffer_release` 就会把这次翻译加的引用减回去；我们
-    /// 这边没有别的强引用，ref 的 `strong` 掉到 0 就被删掉，再拿这个号发事务内核
-    /// 会回 `BR_FAILED_REPLY`（“bad handle”）。libhwbinder 的做法是读到句柄就
-    /// `BC_ACQUIRE`（`BpBinder::onFirstStrongRef`），这里照做。
-    ///
-    /// 必须在装着这条对象的 buffer 被交回之前调用 —— 也就是 [`Self::transact`]
-    /// 返回之后、下一次事务（它开头会 `flush_pending_free`）之前。
+    /// 给从应答里读出的句柄补一次强引用（`BC_ACQUIRE`）。
+    /// 内核随应答给的 ref 只撑到该应答 buffer 被 `BC_FREE_BUFFER` 交回：交回时
+    /// `binder_transaction_buffer_release` 会减掉这次翻译加的引用，`strong` 掉到 0
+    /// 就被删掉，再用这个号发事务会收到 `BR_FAILED_REPLY`（bad handle）。
+    /// 必须在装着该对象的 buffer 被交回之前调用，即 [`Self::transact`] 返回之后、
+    /// 下一次事务（其开头会 `flush_pending_free`）之前。
     pub fn acquire_handle(&self, handle: u32) -> Result<()> {
         let _gate = self
             .gate
@@ -585,7 +534,6 @@ impl HwBinder {
     }
 
     /// 发一笔同步事务，等应答。
-    ///
     /// `handle` 是目标服务的句柄（0 是 hwservicemanager），`code` 是事务号。
     pub fn transact(&self, handle: u32, code: u32, parcel: &Parcel) -> Result<Reply> {
         let _gate = self
@@ -598,7 +546,7 @@ impl HwBinder {
             target: handle as u64,
             cookie: 0,
             code,
-            // TF_ACCEPT_FDS 跟 AOSP 的 transact 一致：HIDL 时不时会带 fd 过来。
+            // HIDL 可能带 fd，需 TF_ACCEPT_FDS。
             flags: TF_ACCEPT_FDS,
             sender_pid: 0,
             sender_euid: 0,
@@ -613,7 +561,7 @@ impl HwBinder {
             },
         };
         if tr.data_buffer == 0 {
-            // 零长度 parcel 也过得去，但给个非空地址更省心（内核会当成 0 长度）。
+            // 给非空地址更省心（内核按 0 长度处理）。
             tr.data_buffer = parcel.data().as_ptr() as u64;
         }
 
@@ -628,13 +576,10 @@ impl HwBinder {
             )
         };
         out.extend_from_slice(raw);
-        // 尾巴上的 `buffers_size`：内核拿它给 buffer 对象的数据体留地方。
+        // 尾随的 `buffers_size`。
         out.extend_from_slice(&(parcel.buffers_size() as u64).to_le_bytes());
-        // SAFETY: 上面刚填好命令流。
-        //
-        // 接收侧用一块普通堆内存，不用那张 mmap —— AOSP 的 `talkWithDriver` 也是把
-        // `bwr.read_buffer` 指到 `Parcel` 的堆内存上，内核拿 `put_user` 往里写命令流。
-        // mmap 区只用来放应答里 buffer 对象指向的数据体。
+        // SAFETY: 上面刚填好命令流。接收侧用普通堆内存而不是 mmap：内核用 `put_user`
+        // 把命令流写进 `bwr.read_buffer`；mmap 区只放应答里 buffer 对象指向的数据体。
         wait_for_reply(
             &out,
             code,
@@ -677,8 +622,8 @@ fn wait_for_reply(
             }
         }
         if wwr.write_consumed != wwr.write_size {
-            // 内核没把命令流吃完，说明这笔事务没能完整交出去。此时读侧通常只有一条
-            // `BR_FAILED_REPLY`，跟「对端收到但答不出来」是两回事，别混在一起。
+            // 命令流没被吃完说明事务没能完整交出；读侧通常只有一条 `BR_FAILED_REPLY`，
+            // 与「对端收到但答不出来」是两回事，别混在一起。
             bail!(
                 "binder consumed only {} of {} command bytes for code {code}",
                 wwr.write_consumed,
@@ -770,7 +715,7 @@ fn parse_commands(
                 at += size;
             }
             other => {
-                // 不认识的命令不能瞎猜它带多少参数，再往下走必然错位，直接停。
+                // 不认识的命令无法推断参数长度，继续解析必然错位，直接停。
                 bail!("unknown BR_ command {other:#x} (nr={nr}) in the reply stream");
             }
         }
@@ -826,8 +771,7 @@ impl HwBinder {
             .to_vec();
         }
 
-        // 记下这块 buffer，等着下一轮事务（或连接析构）再交回内核 —— 现在还不能
-        // 放：应答里 buffer 对象指向的数据体就在这块里，调用方还没读。
+        // 现在不能交回：应答中 buffer 对象指向的数据体就在这块里，调用方还没读。
         if data_ptr != 0 {
             if let Ok(mut pending) = self.pending_free.lock() {
                 pending.push(data_ptr as BinderSize);
@@ -848,7 +792,7 @@ impl Drop for HwBinder {
         for handle in handles {
             let _ = send_u32_command(self.fd.as_raw_fd(), BC_RELEASE, handle);
         }
-        // 尽力把还没交回的应答 buffer 还掉。fd 一关内核也会回收它们，所以失败不管。
+        // 还没交回的应答 buffer 尽力还掉；fd 关闭后内核也会回收，失败不管。
         let ptrs: Vec<BinderSize> = match self.pending_free.get_mut() {
             Ok(pending) => std::mem::take(pending),
             Err(_) => Vec::new(),
@@ -863,7 +807,7 @@ impl Drop for HwBinder {
     }
 }
 
-/// AOSP 的 `ProcessState` 默认 1MB；relay 的事务都很小，够用。
+/// 接收区默认 1MB，relay 的事务都很小，够用。
 const DEFAULT_MAP_LEN: usize = 1024 * 1024;
 
 /// 若干块 `BC_FREE_BUFFER` 命令串成一条写流。空表就是空流（什么也不发）。
@@ -916,8 +860,7 @@ fn free_reply_buffers(fd: i32, ptrs: &[BinderSize]) {
 }
 
 // ---------------------------------------------------------------------------
-// libc 摘要 —— B 端只在这里需要几个符号，不值得为它引一个 libc 依赖。
-// 这些都是稳定 ABI，声明形状照着 libc crate 抄。
+// libc 摘要：只用到几个符号，不值得引 libc 依赖；声明形状按稳定 ABI 对齐。
 // ---------------------------------------------------------------------------
 
 #[allow(non_camel_case_types)]
@@ -950,7 +893,6 @@ const MAP_NORESERVE: i32 = 0x4000;
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 
 /// `ioctl` 是变参函数，Rust 里没法直接包一层；这里按每个请求的形状分别包。
-///
 /// SAFETY: 调用方保证 `arg` 指向的内存对这次请求来说大小和可写性都对。
 unsafe fn libc_ioctl(fd: i32, request: u64, arg: *mut BinderVersion) -> i32 {
     ffi::ioctl(fd, request, arg)
@@ -978,8 +920,7 @@ unsafe fn libc_munmap(addr: *mut c_void, length: usize) {
     let _ = ffi::munmap(addr, length);
 }
 
-/// 不给编译器留「这个模块什么都没用」的抱怨口子：BC_ENTER_LOOPER 之类的常量这里
-/// 用不上，但留着是为了以后要收异步事务时不用再翻一遍 uapi。
+/// 保留暂未使用的 uapi 常量（`BC_ENTER_LOOPER` 等），避免 dead_code 告警。
 #[allow(dead_code)]
 fn _keep_alive() {
     let _ = (
@@ -1134,7 +1075,7 @@ mod tests {
     fn ioctl_command_numbers_match_the_kernel_macros() {
         // _IOW('c', 0, struct binder_transaction_data) = 0x40406300
         assert_eq!(BC_TRANSACTION, 0x4040_6300, "BC_TRANSACTION");
-        // _IOW('c', 1, struct binder_transaction_data_sg) = 64 + 8 = 72 = 0x48
+        // _IOW('c', 17, struct binder_transaction_data_sg) = 64 + 8 = 72 = 0x48
         assert_eq!(BC_TRANSACTION_SG, 0x4048_6311, "BC_TRANSACTION_SG");
         // _IOW('c', 3, binder_uintptr_t) = 0x40086303
         assert_eq!(BC_FREE_BUFFER, 0x4008_6303, "BC_FREE_BUFFER");
@@ -1155,7 +1096,7 @@ mod tests {
 
     #[test]
     fn binder_type_ptr_is_pack_chars_p_t_star_large() {
-        // 跟 rsbinder 的 sys::binder 里那个 bindgen 出来的常量对齐。
+        // `B_PACK_CHARS('p', 't', '*', 0x85)` = 1886661253。
         assert_eq!(BINDER_TYPE_PTR, 1886661253);
     }
 
@@ -1170,7 +1111,7 @@ mod tests {
     fn interface_token_is_a_plain_c_string() {
         let mut p = Parcel::new();
         p.write_interface_token("vendor.qti.hardware.soter@1.0::ISoter");
-        // 裸 ASCII + NUL（38），再按 AOSP 的 `pad_size` 补到 4 字节边界。
+        // 裸 ASCII + NUL，再补到 4 字节边界。
         let padded_len = ("vendor.qti.hardware.soter@1.0::ISoter".len() + 1 + 3) & !3;
         assert_eq!(p.data().len(), padded_len);
         assert_eq!(*p.data().last().unwrap(), 0, "must be NUL terminated");

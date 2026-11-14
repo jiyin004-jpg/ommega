@@ -662,10 +662,9 @@ fn check_android_permission_with_manager(
     permission_denied: KsError,
 ) -> anyhow::Result<()> {
     // 拿不到 permissionmgr 一律按「没有这个权限」拒绝，不能报内部错误：
-    // SYSTEM_ERROR 映射到调用方就是 ResponseCode(4)，检测器（UnifiedAudit 的
-    // UNIQUE_ID_CONSISTENCY）会当成意外异常；PERMISSION_DENIED 才是普通 app
-    // 不持 REQUEST_UNIQUE_ID_ATTESTATION 时应得的那一个。
-    // 顺手把真实原因写进日志：以前 `.ok()` 一吞，现场只剩「unavailable」。
+    // SYSTEM_ERROR 映射到调用方就是 ResponseCode(4)，会被当成意外异常；
+    // PERMISSION_DENIED 才是普通 app 不持 REQUEST_UNIQUE_ID_ATTESTATION 时应得的那一个。
+    // 真实原因写进日志，别静默吞成「unavailable」。
     let binder = match hub::try_get_service(PERMISSION_MANAGER_SERVICE) {
         Ok(Some(binder)) => binder,
         Ok(None) => {
@@ -734,8 +733,8 @@ pub fn check_device_attestation_permissions(caller: Option<&CallerInfo>) -> anyh
 pub fn check_unique_id_attestation_permissions(caller: Option<&CallerInfo>) -> anyhow::Result<()> {
     let caller = resolve_caller_info(caller);
     // AOSP 这里就是 `KsError::perm()`（keystore2 的 PERMISSION_DENIED = 6）。
-    // 之前用的是 KeyMint 的 CANNOT_ATTEST_IDS(-66)，检测器只把 6 / -32 当成
-    // 「普通 app 没这个权限，跳过」，拿到 -66 会当成意外异常判 INCONCLUSIVE。
+    // 不能回 KeyMint 的 CANNOT_ATTEST_IDS(-66)：检测器只把 6 / -32 当成
+    // 「普通 app 没这个权限，跳过」，-66 会被当成意外异常判 INCONCLUSIVE。
     check_android_permission(&caller, REQUEST_UNIQUE_ID_ATTESTATION, KsError::perm())
 }
 

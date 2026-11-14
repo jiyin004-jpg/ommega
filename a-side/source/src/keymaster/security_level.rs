@@ -594,10 +594,9 @@ impl KeystoreSecurityLevel {
         }
 
         if params.iter().any(|kp| kp.tag == Tag::INCLUDE_UNIQUE_ID) {
-            // 没权限就整笔拒（跟 AOSP 一致）。以前这里是「把 tag 摸掉、让请求成功」，
-            // TrustAttestor 那个 bit34 unique_id_permission 检测项就是看这一点：它发两笔
-            // 带 INCLUDE_UNIQUE_ID(202) 的 generateKey，拿到成功就判「权限被绕过」；
-            // 真机上同样是不持权限的调用方（GMS / Play 商店也不持）一样回错。
+            // 没权限就整笔拒（跟 AOSP 一致）。不能「把 tag 摸掉、让请求成功」：
+            // 检测项 unique_id_permission 会发两笔带 INCLUDE_UNIQUE_ID(202) 的
+            // generateKey，拿到成功就判「权限被绕过」；真机上不持权限的调用方同样回错。
             if check_key_permission(KeyPerm::GenUniqueId, key, None, ctx).is_err() {
                 check_unique_id_attestation_permissions(ctx).context(ks_err!(
                     "Caller does not have the permission to include a unique ID."
@@ -634,13 +633,11 @@ impl KeystoreSecurityLevel {
         // 敏感 ID。
         //
         // 公开的 brand/device/product/manufacturer/model 必须留着：它们不需要任何权限，
-        // 真机本来就带，摘掉反而露馅。工程模式「StrongBox Attestation Key ID Modify」
-        // 就是拿叶子里的 brand 跟 ro.product.brand 比，摘掉这一项直接判 Fail（logcat:
-        // `StrongBox attested brand mismatch, expected: OnePlus, actual: null`）。
+        // 真机本来就带，摘掉反而露馅（工程模式会拿叶子里的 brand 跟 `ro.product.brand` 比，
+        // 摘掉直接判 Fail）。
         //
-        // 只在远程出证（`remote_enabled()`：开关开着且 url 不空）时摘：本地模式我们自己的 TA
-        // 能同时给出「本机 ID + 自洽的链」，没必要动调用方要的参数，按 AOSP（它没这一步）
-        // 原样往下传。
+        // 只在远程出证（`remote_enabled()`：开关开着且 url 不空）时摘：本地模式自己的 TA
+        // 能同时给出「本机 ID + 自洽的链」，没必要动调用方要的参数，按 AOSP 原样往下传。
         if crate::remote::remote_enabled()
             && params.iter().any(|kp| is_attestation_id_tag(kp.tag))
             && check_device_attestation_permissions(ctx).is_ok()

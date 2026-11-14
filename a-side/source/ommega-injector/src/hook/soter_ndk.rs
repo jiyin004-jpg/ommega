@@ -1,9 +1,9 @@
 //! 从 Java/Treble 那条 binder 路去调 SOTER HAL，给 write 侧的拦截做一次真触发。
 //!
-//! 为什么不直接用 payload 里现成的 rsbinder：rsbinder 是纯 Rust 自己实现对
+//! 为什么不用 payload 里现成的 rsbinder：rsbinder 是纯 Rust 自己实现对
 //! /dev/binder 的 ioctl，压根不引用 libbinder.so，而我们 hook 是打在
 //! libbinder*.so 的 ioctl GOT 上的。自检报回来的 code=0 是真实 HAL 回的，
-//! 证明不了拦截生效 —— 这一点之前踩过一次，别再用 rsbinder 当验证手段。
+//! 证明不了拦截生效，所以不能用 rsbinder 当验证手段。
 //!
 //! libbinder_ndk.so 的 NEEDED 里有 libbinder.so，从它发事务必然穿过那个被改过的
 //! 入口。宿主本来就是 Java 服务，libbinder 早在进程起来时就加载好了，GOT 也早已
@@ -116,7 +116,7 @@ pub fn transact(service: &str, interface: &str, code: u32) -> Result<i32, String
         }
 
         // 不用 AIBinder_prepareTransaction：它靠 getInterfaceDescriptor() 拼 token，
-        // 而远端代理那个 descriptor 是空的，实测直接返 -38（ENOSYS）。远端 binder
+        // 而远端代理那个 descriptor 是空的，会返 -38（ENOSYS）。远端 binder
         // 只能自己把 AIDL 的 interface token 写进 parcel 开头。
         let mut input: *mut AParcel = (ndk.parcel_create)();
         if input.is_null() {

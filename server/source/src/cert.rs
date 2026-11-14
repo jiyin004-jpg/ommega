@@ -35,10 +35,9 @@ const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 const OID_COUNTRY_NAME: &[u64] = &[2, 5, 4, 6];
 const OID_ORG_NAME: &[u64] = &[2, 5, 4, 10];
 const OID_COMMON_NAME: &[u64] = &[2, 5, 4, 3];
-/// Google keybox 那两张「TEE」中间证书用的两个属性。真机链是
-/// (title, serialNumber)，2019 年流出的公开 keybox 是反的 —— 见 `RdnShape`。
-/// `title` 现在两边都用：解析时认级别（`chain_security_levels`），自签链铸链时
-/// 也靠它把级别写进中间证书。
+/// 2.5.4.12 (title)：中间证书标 KeyMint 级别用的属性。真机链的 RDN 顺序是
+/// (title, serialNumber)，老公开 keybox 是反的 —— 见 `RdnShape`。
+/// 解析时认级别（`chain_security_levels`），自签链铸链时也靠它把级别写进中间证书。
 const OID_TITLE: &[u64] = &[2, 5, 4, 12];
 #[cfg(test)]
 const OID_SERIAL_NUMBER: &[u64] = &[2, 5, 4, 5];
@@ -87,12 +86,11 @@ pub struct AttestationParams {
     /// "CN=Android Keystore Key" when absent.
     pub subject_name: Option<Vec<u8>>,
     /// Device-property / ID-attestation values the app asked to be attested, as
-    /// `(KeyMint tag, value)` pairs (710..=717 plus 723 for the second IMEI). A real device's leaf
-    /// carries these whenever the caller requested them - Android 15's
-    /// `setDevicePropertiesAttestationIncluded(true)` makes the framework add
-    /// brand/device/product/manufacturer/model to every key-generation request -
-    /// so minting a leaf without them is trivially detectable from an app
-    /// (TrustAttestor reports it as `hardware.attestation.device_properties`).
+    /// `(KeyMint tag, value)` pairs: 710..=717 plus 723 for the second IMEI.
+    /// Android 15's `setDevicePropertiesAttestationIncluded(true)` adds
+    /// brand/device/product/manufacturer/model to every key-generation request,
+    /// so a leaf minted without them is reported as
+    /// `hardware.attestation.device_properties`.
     pub attestation_ids: Vec<(u64, Vec<u8>)>,
     /// User-authentication / authorization-list entries the app asked to be
     /// attested, as `(KeyMint tag, value)` pairs:
@@ -107,10 +105,8 @@ pub struct AttestationParams {
     /// it) but deliberately **not** written into the leaf: AOSP's KeyMint emits
     /// the SID only for `importWrappedKey()`, so every normal attested key shows
     /// `USER_AUTH_TYPE` + `AUTH_TIMEOUT` instead. A leaf that says
-    /// `NO_AUTH_REQUIRED` for a key the app created with
-    /// `setUserAuthenticationRequired(true)` is self-contradictory and is what
-    /// TrustAttestor reports as `hardware.attestation.user_auth_metadata` /
-    /// `hardware.attestation.user_auth_policy`.
+    /// `NO_AUTH_REQUIRED` for an auth-bound key is self-contradictory and is
+    /// reported as `hardware.attestation.user_auth_metadata`.
     pub user_auth: Vec<(u64, i64)>,
     /// Leaf validity window requested by the caller (epoch ms); 0/None falls
     /// back to creation time / the fixed 2048 notAfter.
@@ -125,14 +121,12 @@ pub struct AttestationParams {
     /// Serial number for the leaf certificate. AOSP convention is 1.
     pub serial: i64,
     /// `MODULE_HASH` (KeyMint tag 724) forwarded by the A-side: SHA-256 of the
-    /// device's APEX module-info bundle, taken from the same
-    /// `SetAdditionalAttestationInfo` the local software keybox path uses.
+    /// device's APEX module-info bundle.
     ///
     /// AOSP's KeyMint (4.0+) writes it as `[724] EXPLICIT OCTET STRING` inside
-    /// the attestation extension.  Without it the relay-minted leaf omits the
-    /// tag while `getSupplementaryAttestationInfo(MODULE_HASH)` on the device
-    /// still returns the local bundle, which attestation verifiers report as
-    /// "MODULE_HASH omitted from attestation".
+    /// the attestation extension.  A leaf that omits the tag while
+    /// `getSupplementaryAttestationInfo(MODULE_HASH)` returns the local bundle
+    /// is reported as "MODULE_HASH omitted from attestation".
     pub module_hash: Option<Vec<u8>>,
 }
 
@@ -187,9 +181,8 @@ fn key_description_der(p: &AttestationParams) -> Vec<u8> {
             w.next().write_bytes(&p.challenge);
             // uniqueId: always empty bytes (matches Django's `_octet(b"")`)
             w.next().write_bytes(b"");
-            // softwareEnforced — holds CREATION_DATETIME (tag 701) and
-            // ATTESTATION_APPLICATION_ID (tag 709, only if challenge is present)
-            // sorted by tag to match Django's `sw_pairs.sort(key=lambda x: x[0])`
+            // softwareEnforced — CREATION_DATETIME (tag 701) and
+            // ATTESTATION_APPLICATION_ID (tag 709), sorted by tag.
             w.next().write_sequence(|w| {
                 let mut sw_tags: Vec<u64> = Vec::new();
                 sw_tags.push(701); // CREATION_DATETIME — always present
@@ -248,14 +241,9 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
     if !p.mgf_digest.is_empty() {
         tags.push(203);
     } // RSA_OAEP_MGF_DIGEST (RSA only)
-      // User-auth / authorization list. Real KeyMint marks an auth-bound key with
-      // USER_AUTH_TYPE (504) + AUTH_TIMEOUT (505) and *omits* NO_AUTH_REQUIRED, so
-      // a leaf saying "no auth required" for a key the app created with
-      // `setUserAuthenticationRequired(true)` is self-contradictory; conversely a
-      // key that needs no authentication carries NO_AUTH_REQUIRED only. 502
-      // (USER_SECURE_ID) is dropped here on purpose — AOSP only emits the SID for
-      // `importWrappedKey()`. Non-auth requests keep the previous behaviour
-      // (NO_AUTH_REQUIRED present).
+      // Auth-bound key: 504 USER_AUTH_TYPE + 505 AUTH_TIMEOUT, no 503. Plain
+      // key: 503 NO_AUTH_REQUIRED only. 502 USER_SECURE_ID is dropped here —
+      // AOSP emits the SID only for `importWrappedKey()`.
     let mut user_auth: Vec<u64> = p
         .user_auth
         .iter()
@@ -264,11 +252,9 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
         .collect();
     user_auth.sort_unstable();
     user_auth.dedup();
-    // 如实反映 App 的请求：auth-bound key 带 504/505、不带 503，普通 key 只带 503。
-    // server_keybox 模式下签名用的是 keybox 私钥（软件签），不需要 auth token，
-    // 所以这里不能像“给真 TEE 转发”那样把 504/505 抹成 503——抹了就是“证书说
-    // 不要认证”，而 App 明明是 setUserAuthenticationRequired(true) 建的 key，
-    // TrustAttestor 的 user_auth_metadata（bit 35）会直接判异常。
+    // 不能把 504/505 抹成 503：证书会变成“不要认证”，与 App 的
+    // setUserAuthenticationRequired(true) 相反，TrustAttestor 的
+    // user_auth_metadata（bit 35）会判异常。
     if user_auth.iter().any(|tag| *tag != 503) {
         user_auth.retain(|tag| *tag != 503);
     }
@@ -288,8 +274,8 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
     if p.os_patch_level.is_some() {
         tags.push(706);
     }
-    // KeyAttestation 1.7's tag table: VENDOR_PATCHLEVEL=718, BOOT_PATCHLEVEL=719
-    // (707/708 are UNIQUE_ID/ATTESTATION_CHALLENGE in the old keymaster numbering).
+    // VENDOR_PATCHLEVEL = 718, BOOT_PATCHLEVEL = 719 (KeyAttestation 1.7's tag
+    // table); 707/708 are UNIQUE_ID/ATTESTATION_CHALLENGE, not patch levels.
     if p.vendor_patch_level.is_some() {
         tags.push(718);
     }
@@ -396,8 +382,8 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                     });
                 }
                 704 => {
-                    // Always present。没有 rootOfTrust 时也不能发全零：全零是「未签名 /
-                    // 异常」的明确特征，改用稳定派生值（同一序列号每次一样）。
+                    // 恒存在。没有 rootOfTrust 时不能发全零：全零是「未签名 / 异常」
+                    // 的明确特征，改用稳定派生值（同一序列号每次一样）。
                     let rot = p
                         .root_of_trust
                         .as_ref()
@@ -410,8 +396,8 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                             )
                         })
                         .unwrap_or_else(|| {
-                            // 这条路径拿不到 device_id，只锚时间：同一小时内稳定。
-                            // 真正常走的路径是 fulfill 的 parse_ctx，那里锚的是 device_id + 小时。
+                            // 这条路径拿不到 device_id，只按 serial + 小时锚定：
+                            // 同一小时内稳定。
                             let stamp = current_hour_stamp();
                             let seed = format!("serial-{}", p.serial);
                             (
@@ -540,10 +526,8 @@ impl Der {
     fn utctime(&mut self, s: &str) {
         self.raw(0x17, s.as_bytes());
     }
-    /// GeneralizedTime (tag 0x18, 4-digit year). Required for notAfter dates
-    /// at/after 2050: UTCTime's two-digit year maps `50`-`99` to 1950-1999,
-    /// so "500101000000Z" encodes as the year 1950 — a certificate that is
-    /// already expired, which attestation verifiers flag as a tampered key.
+    /// GeneralizedTime (tag 0x18, 4-digit year). Required for dates at/after
+    /// 2050: UTCTime's two-digit year maps `50`-`99` to 1950-1999.
     fn generalized_time(&mut self, s: &str) {
         self.raw(0x18, s.as_bytes());
     }
@@ -609,10 +593,8 @@ pub enum EcKey {
     P521(P521SecretKey),
 }
 
-/// RSA 私钥比 EC 那几种大出一个数量级（`RsaPrivateKey` 约 300 字节，
-/// P-256 才 32 字节），不装箱的话整个 enum 都得按 RSA 的大小走，EC 分支也白背
-/// 这份体积。装箱后 EC 分支只剩一个指针的代价，RSA 分支多一次分配，而密钥本来
-/// 就是低频生成/低频解析的东西。
+/// RSA 私钥比 EC 那几种大一个数量级（`RsaPrivateKey` 约 300 字节，P-256 才
+/// 32 字节），装箱后 EC 分支只付一个指针，RSA 分支多一次分配。
 pub enum KeyMaterial {
     Ec(EcKey),
     Rsa(Box<rsa::RsaPrivateKey>),
@@ -623,11 +605,10 @@ const PEM_BODY_WIDTH: usize = 64;
 
 /// 把 PEM 文本里每个 BEGIN/END 块重新按 64 列折行。
 ///
-/// keybox.xml 里的私钥常被写成**一整行超长 base64**（Yurikey 源发的就是这形状），
-/// 而 rustcrypto 的 `from_sec1_pem` / `from_pkcs8_pem` 走的是 pem-rfc7468 的严格
-/// 解码：行宽超标直接拒，报出来还只是看不出原因的 `unable to parse identity
-/// private key`。这里统一重新折行后再交给各解码器；`EC PARAMETERS` 这种非私钥
-/// 段也原样保留（它解不出来，但不妨碍后面的真私钥段）。
+/// keybox.xml 里的私钥常写成**一整行超长 base64**，而 rustcrypto 的
+/// `from_sec1_pem` / `from_pkcs8_pem` 走 pem-rfc7468 的严格解码：行宽超标直接拒。
+/// 这里统一重新折行后再交给各解码器；`EC PARAMETERS` 这种非私钥段也原样保留
+/// （它解不出来，但不妨碍后面的真私钥段）。
 fn refolded_pem_blocks(pem: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current: Option<(String, String)> = None;
@@ -770,9 +751,8 @@ pub fn validate_identity_pem(private_key_pem: &str, chain_pem: &str) -> Option<S
 /// 一条身份能不能进池子的综合判定：私钥跟链配不配对 + 链本身像不像造出来的。
 /// `None` 表示没问题，`Some(原因)` 表示这条该扔。
 ///
-/// 单独拎出来是因为只查配对不够：用脚本现场生成的假 keybox（私钥、证书、链全是
-/// 自己造自己签的）本身完全自洽，配对和链结构都能过，得把「像不像造出来的」
-/// 也一起看。管理员手动上传不走这里 —— 那是人自己挑的，好坏自负。
+/// 只查配对不够：自造的假 keybox 本身自洽，配对和链结构都能过，得把「像不像
+/// 造出来的」一起看。管理员手动上传不走这里。
 pub fn identity_problem(private_key_pem: &str, chain_pem: &str) -> Option<String> {
     if let Some(why) = validate_identity_pem(private_key_pem, chain_pem) {
         return Some(why);
@@ -818,16 +798,16 @@ fn chain_problem(chain_pem: &str) -> Option<String> {
     if looks_generated(&name) {
         return Some(format!("chain root looks generated: {name}"));
     }
-    // 没见过的根也顺手记一笔，日志里能看出池子里的材料都挂在谁下面。
+    // 通过的根记一笔，便于核对池子里的材料都挂在谁下面。
     tracing::debug!("cert chain ok root={name} certs={}", certs.len());
     None
 }
 
-/// 明摆着是造出来的根 —— mock keybox 生成器爱在 DN 里写这些词。
-/// 认不出来的新根不拦（免得误杀将来出现的真根），这里只挡最直白的一类。
+/// 明摆着是造出来的根 —— mock keybox 生成器爱在 DN 里写这些词。只挡最直白的
+/// 一类，认不出来的新根不拦（免得误杀真根）。
 ///
-/// 按词边界找：只要关键词前后不是字母数字就算命中。不这么卡的话，
-/// "Software At-[tes-t]-ation Root" 里的 "test" 也算上了。
+/// 按词边界找：关键词前后不是字母数字才算命中，否则 "Attestation" 里的
+/// "test" 也会算上。
 fn looks_generated(name: &str) -> bool {
     const WORDS: [&str; 8] = [
         "mock",
@@ -860,17 +840,13 @@ fn looks_generated(name: &str) -> bool {
 /// 链里那几张「TEE」证书的 subject RDN 顺序 —— 真机出链和公开 keybox 之间
 /// 唯一一处形状差异。
 ///
-/// 实测（2026-09-30，服务端同一套参数）：Pixel 6a（Google 自家）、22041211AC、
-/// PLC110 三台真机出的链都是 `title=TEE` 在前、`serialNumber` 在后；而池子里那份
-/// 公开 keybox（2019 年的中间证书）是 `serialNumber` 在前。属性 OID 一样、字符串
-/// 类型一样（title=UTF8String，serialNumber=PrintableString）、签名一样能验到
-/// Google 根，唯独顺序不同 —— 这正是 TrustAttestor 那条
-/// `cloud.attestation.subject_rdn_order`（“证书编码序列异常”）能一眼认出回退链的原因。
+/// 真机链是 `title=TEE` 在前、`serialNumber` 在后，老公开 keybox 是反的；
+/// TrustAttestor 的 `cloud.attestation.subject_rdn_order` 据此认定回退链。
 ///
-/// 顺序写在已经签好名的证书 DER 里：改动一个字节，子证书的 issuer 就对不上上级的
-/// subject（逐字节比较），整条链立刻失效；而这两张中间证书是 Google 签的，我们手上
-/// 没有签发者的私钥，重签不出来。所以这份材料只能**识别**、不能就地修 —— 服务端能做
-/// 的事是别再把它当成“和真机一样”的链发出去（见 `fulfill::attest_and_cache` 的告警）。
+/// 顺序写在已经签好名的证书 DER 里：改一个字节，子证书的 issuer 就对不上上级的
+/// subject（逐字节比较），整条链失效；而这两张中间证书是 Google 签的，没有签发者
+/// 私钥，重签不出来。所以这份材料只能**识别**、不能就地修 —— 服务端据此不再把它
+/// 当成“和真机一样”的链发出去（见 `fulfill::attest_and_cache` 的告警）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RdnShape {
     /// `title=TEE` 在 `serialNumber` 之前：真机出链的形状。
@@ -896,8 +872,8 @@ impl RdnShape {
     }
 }
 
-/// 2.5.4.12 (title) 与 2.5.4.5 (serialNumber) 的 AttributeType OID 编码。
-/// 直接找字节比走 ASN.1 解析省事，也不会被名字里别的属性干扰。
+/// 2.5.4.12 (title) 与 2.5.4.5 (serialNumber) 的 AttributeType OID 编码（含 0x06
+/// 标签）：直接按字节找，不走 ASN.1 解析，也不会被名字里别的属性干扰。
 const DER_ATTR_TITLE: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x0c];
 const DER_ATTR_SERIAL_NUMBER: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x05];
 
@@ -942,9 +918,6 @@ pub fn chain_rdn_shape(chain_pem: &str) -> RdnShape {
 ///   - **Google RKP 签的写在 `O`（2.5.4.10）里**，DN 长这样：
 ///     `CN=<16 hex>,O=TEE` / `CN=<16 hex>,O=StrongBox`。
 ///
-/// 以前只认 `title`，RKP 那批链就全是“没标级别”，连带的后果是：级别不匹配
-/// 的 session 会被当成同一个级别复用（要 StrongBox 的请求拿回 TEE 链），兜底挑
-/// 身份时也拦不住 StrongBox 那份被 TEE 请求用上。
 /// `O` / `OU` 里只收本来就是级别名的值，避免把 `O=Google LLC` 当成级别。
 pub fn chain_security_levels(chain_pem: &str) -> Vec<String> {
     let Ok(ders) = parse_chain_pem(chain_pem) else {
@@ -1077,10 +1050,9 @@ fn make_name(attrs: &[(&[u64], &[u8])]) -> Vec<u8> {
     name.into_vec()
 }
 
-/// 兜底值的锚点：只到小时（UTC 的 `YYYYMMDDHH`）。
+/// 兜底值的锚点：只到小时（UTC 的 `YYYYMMDDHH`），同一小时内稳定。
 ///
-/// 同一小时内稳定，跨小时才换。不要用 app_id：那个在部分调用路径上没有，而且
-/// 也没必要——兜底值本来就不是真值，锚在时间上简单、不会缺。
+/// 不要用 app_id：部分调用路径上没有它。
 pub fn current_hour_stamp() -> String {
     chrono::Utc::now().format("%Y%m%d%H").to_string()
 }
@@ -1191,24 +1163,18 @@ fn build_chain_signed_by(
         .unwrap_or(p.creation_datetime_ms);
     let not_before_ts = chrono::DateTime::from_timestamp_millis(not_before_ms as i64)
         .unwrap_or_else(chrono::Utc::now);
-    // Dates at/after 2050 must use GeneralizedTime: as UTCTime the two-digit
-    // year maps `50`-`99` to 1950-1999, so "500101000000Z" would encode as an
-    // already-expired 1950 certificate (see `Der::generalized_time`).
+    // 2050 及以后的日期用 GeneralizedTime：两位年 UTCTime 会回旋到 1950-1999。
     const GT_THRESHOLD_MS: i64 = 2_524_608_000_000; // 2050-01-01T00:00:00Z
 
-    // notBefore 与 notAfter 同规则：2050 及以后若仍用两位年 UTCTime 会回旋成 1951。
     let (not_before, not_before_is_generalized) =
         if not_before_ts.timestamp_millis() >= GT_THRESHOLD_MS {
             (not_before_ts.format("%Y%m%d%H%M%SZ").to_string(), true)
         } else {
             (not_before_ts.format("%y%m%d%H%M%SZ").to_string(), false)
         };
-    // notAfter: honour the caller-requested expiry, else fixed 2048-01-01
-    // (matches Django's _build_attested_chain).
-    //
-    // caller 的 notBefore 要是已经晚于这个默认值（2050 以后那种），再顶着
-    // 2048 就会做出一张 notBefore > notAfter 的"尚未生效"证书，链校验可能被
-    // 整条拒掉。这种情况把 notAfter 顺延一天，至少保证区间是正的。
+    // notAfter: caller-requested expiry, else the fixed 2048-01-01 (matches
+    // Django's _build_attested_chain). 若 notBefore 已晚于该默认值（2050 以后），
+    // notAfter 顺延一天，否则 notBefore > notAfter 会被链校验整条拒掉。
     const DEFAULT_NOT_AFTER_MS: u64 = 2_461_449_600_000; // 2048-01-01T00:00:00Z
     let not_after_ms = match p.not_after_ms.filter(|&v| v > 0) {
         Some(ms) => ms,
@@ -1250,8 +1216,7 @@ fn build_chain_signed_by(
     // extensions [3] EXPLICIT
     // NOTE: no BasicConstraints on the leaf — AOSP adds it only when the key
     // has KeyCertSign purpose (a CA key). Normal attestation keys (SIGN +
-    // ATTEST_KEY) get KeyUsage + the attestation extension only; adding
-    // CA=false here diverged from real leaves and broke STRONG integrity.
+    // ATTEST_KEY) get KeyUsage + the attestation extension only.
     let ext_value = build_attestation_extension_der(p);
     // KeyUsage：请求了 ATTEST_KEY（用途枚举值 7）的叶子必须带 keyCertSign ——
     // AIDL 里写得很死：「keyCertSignBit: iff the attested key has
@@ -1280,10 +1245,8 @@ fn build_chain_signed_by(
 
     let tbs_content = t.into_vec();
 
-    // Build the full TBSCertificate TLV (SEQUENCE wrapping the content).
-    // X.509 requires the signature to cover the complete DER-encoded
-    // TBSCertificate (including the SEQUENCE tag + length prefix), not just
-    // the inner content. Otherwise the verifier computes a different hash.
+    // Sign the complete DER-encoded TBSCertificate (SEQUENCE tag + length prefix
+    // included), not just the inner content, or verifiers hash differently.
     let mut tbs_tlv = Der::new();
     tbs_tlv.raw(0x30, &tbs_content);
     let tbs_full = tbs_tlv.into_vec();
@@ -1322,10 +1285,8 @@ pub fn generate_leaf_key(p: &AttestationParams) -> anyhow::Result<(KeyMaterial, 
 
     if p.algorithm == KM_ALG_RSA {
         let mut rng = rand::rngs::OsRng;
-        // 下限放到 512：一加/OPPO 工程模式的 `KeyAttestationTest` 就拿 512 位 RSA 自检，
-        // 而以前这里把 <1024 的请求**静默改成 2048**：签出来的叶证书是 2048 位，
-        // attestation extension 里声明的却是 512，工程模式一比就报
-        // `Failed on key size 512`，连带 `Attestation key` 判失败。
+        // 范围 512..=8192，超出的回落到 2048。512 必须接受：一加/OPPO 工程模式的
+        // `KeyAttestationTest` 拿 512 位 RSA 自检，声明值必须和叶证书密钥长度一致。
         let size = if (512..=8192).contains(&p.key_size) {
             p.key_size as usize
         } else {
@@ -1336,8 +1297,8 @@ pub fn generate_leaf_key(p: &AttestationParams) -> anyhow::Result<(KeyMaterial, 
         Ok((KeyMaterial::Rsa(Box::new(private)), pem.to_string()))
     } else {
         match p.ec_curve {
-            // secp224r1：一加/OPPO 工程模式的 Key 状态页会拿 P-224 建一把
-            // attestation 钥匙来验链，缺了它那边直接判「失败」。
+            // secp224r1：一加/OPPO 工程模式的 Key 状态页拿 P-224 attestation
+            // 钥匙验链，缺了就判失败。
             Some(KM_EC_CURVE_P_224) => {
                 use p224::elliptic_curve::rand_core::OsRng;
                 let secret = P224SecretKey::random(&mut OsRng);
@@ -1356,9 +1317,8 @@ pub fn generate_leaf_key(p: &AttestationParams) -> anyhow::Result<(KeyMaterial, 
                 let pem = secret.to_sec1_pem(pkcs8::LineEnding::LF)?;
                 Ok((KeyMaterial::Ec(EcKey::P521(secret)), pem.to_string()))
             }
-            // P-256 (curve 1) is the default and must be handled explicitly;
-            // previously `Some(1)` fell through to the bail below and every
-            // server_keybox EC attestation failed with "unsupported EC curve 1".
+            // P-256 (curve 1) is the default: `Some(1)` and `None` both land
+            // here; anything else falls through to the bail below.
             Some(KM_EC_CURVE_P_256) | None => {
                 use p256::elliptic_curve::rand_core::OsRng;
                 let secret = P256SecretKey::random(&mut OsRng);
@@ -1386,9 +1346,8 @@ pub struct SelfSignedIdentity {
 /// - `rsa` -> 2048-bit RSA PKCS#8 key, self-signed sha256WithRSAEncryption cert.
 ///
 /// `level` 是这次请求的 `attestationSecurityLevel`（0 软件 / 1 TEE / 2
-/// StrongBox），会写进中间证书的 `title`。真机的链没有一条是「叶子说
-/// StrongBox、中间证书什么都不说」的；不写就等于把级别藏在叶子里，看链
-/// 的那一侧只能猜。
+/// StrongBox），会写进中间证书的 `title`：真机的链没有「叶子说 StrongBox、
+/// 中间证书什么都不说」这种形状。
 pub fn generate_self_signed(algorithm: &str, level: i64) -> anyhow::Result<SelfSignedIdentity> {
     match algorithm.to_ascii_lowercase().as_str() {
         "rsa" => generate_self_signed_rsa(level),
@@ -1466,8 +1425,7 @@ fn build_self_signed_chain(
     let now = chrono::Utc::now();
     let not_before = now.format("%y%m%d%H%M%SZ").to_string(); // precise now, matches Django's _generate_self_signed_cert_chain
     let not_after_2049 = "490101000000Z".to_string(); // 2049-01-01 (UTCTime, matches Django)
-                                                      // 2050-01-01 as GeneralizedTime (4-digit year). As UTCTime, "50" decodes
-                                                      // to 1950 (expired) — see `Der::generalized_time`.
+                                                      // 2050-01-01 as GeneralizedTime (4-digit year): as UTCTime, "50" decodes to 1950.
     let not_after_2050 = "20500101000000Z".to_string();
 
     // ---- Names matching Django ----
@@ -1656,18 +1614,15 @@ pub struct DeviceBootInfo {
     /// 0 = verified, 1 = self-signed, 2 = unverified, 3 = failed.
     pub verified_boot_state: Option<i64>,
     /// KeyMint attestation security level of the leaf: 0 = software, 1 = TEE,
-    /// 2 = StrongBox.  Deliberately NOT part of [`DeviceBootInfo::is_empty`]:
-    /// it says nothing about the device's boot state, so letting it turn an
-    /// otherwise empty record non-empty would make the status page show a boot
-    /// block for a chain that carries no boot information.  Smart mode reads it
-    /// through [`attestation_security_level_from_chain`] instead.
+    /// 2 = StrongBox.  Deliberately NOT part of [`DeviceBootInfo::is_empty`],
+    /// so it cannot make an otherwise empty record non-empty; Smart mode reads
+    /// it through [`attestation_security_level_from_chain`].
     pub security_level: Option<i64>,
     /// `ATTESTATION_APPLICATION_ID` (tag 709) as the chain itself reports it:
     /// the package name(s) the key was minted for, `com.example` or
     /// `com.example@12`.  Like `security_level` it is deliberately NOT part of
-    /// [`DeviceBootInfo::is_empty`] — it says nothing about the boot state, and
-    /// the status page reads it through
-    /// [`attestation_application_id_from_chain`] instead.
+    /// [`DeviceBootInfo::is_empty`]; the status page reads it through
+    /// [`attestation_application_id_from_chain`].
     pub aaid: Option<String>,
     /// KeyMint os_version in its packed form (e.g. 160000 = Android 16).
     pub os_version: Option<i64>,
@@ -1907,12 +1862,9 @@ fn read_auth_list(list: &[u8], out: &mut DeviceBootInfo) {
             705 => out.os_version = explicit_int(entry.value),
             706 => out.patch_system = explicit_int(entry.value).and_then(as_patch_level),
             // 718/719 是本服务 record builder 用的 vendor/boot patch 编号。
-            // 注意 AOSP 的 707/708 是 UNIQUE_ID/ATTESTATION_CHALLENGE（OCTET
-            // STRING），不能当 patch 级别的别名收进来——否则 challenge 之类
-            // 的随机字节会被 explicit_int 累积成整数，落在日期区间内就编造
-            // 出一条假的 patch 值。
-            // ATTESTATION_APPLICATION_ID。链是“谁的身份”出的就看它，所以
-            // 不能像别的 tag 那样一丢了事。
+            // AOSP 的 707/708 是 UNIQUE_ID/ATTESTATION_CHALLENGE（OCTET STRING），
+            // 不能当 patch 别名收进来：随机字节会被 explicit_int 拼成假的日期。
+            // 709 ATTESTATION_APPLICATION_ID 必须收，链的身份由它判断。
             709 => out.aaid = parse_attestation_application_id(entry.value),
             718 => out.patch_vendor = explicit_int(entry.value).and_then(as_patch_level),
             719 => out.patch_boot = explicit_int(entry.value).and_then(as_patch_level),
@@ -1922,11 +1874,10 @@ fn read_auth_list(list: &[u8], out: &mut DeviceBootInfo) {
 }
 
 /// KeyMint's CBOR attestation extension (OID 1.3.6.1.4.1.11129.2.1.25): the
-/// same authorization lists as the ASN.1 form, but encoded as a CBOR map with
-/// the claim numbers AOSP's `EatClaim` defines — KeyMint tags are renumbered
-/// `-80000 - tag`, and the non-KeyMint claims start below `-82000`.  This
-/// reader keeps only what the status page shows, which is why it is not a
-/// general CBOR decoder.
+/// same authorization lists as the ASN.1 form, encoded as a CBOR map with the
+/// claim numbers AOSP's `EatClaim` defines — KeyMint tags are renumbered
+/// `-80000 - tag`, and the non-KeyMint claims start below `-82000`.  Only the
+/// claims the status page shows are decoded.
 mod eat {
     use super::{as_patch_level, parse_attestation_application_id, to_hex, DeviceBootInfo};
     use anyhow::{anyhow, bail, Result};
@@ -2389,9 +2340,8 @@ mod bench {
     use std::time::{Duration, Instant};
 
     const WARMUP: usize = 2;
-    // 10 samples is enough for a rough latency figure; with 100 samples the
-    // RSA-2048 keygen bench alone stalls a normal `cargo test` for minutes in
-    // the unoptimized debug build. Run with `-- --ignored` for real numbers.
+    // 10 samples is enough for a rough latency figure; 100 samples would keep
+    // the RSA-2048 keygen bench in a normal `cargo test` for minutes.
     const ITERATIONS: usize = 10;
 
     fn run_bench<F>(name: &str, mut f: F)
@@ -2548,12 +2498,9 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
-    /// keybox.xml 里那种「一整行超长 base64」的 SEC1 私钥必须能解出来。
-    ///
-    /// Yurikey 源发的 EC 私钥就是这个形状：`-----BEGIN EC PRIVATE KEY-----` 后面
-    /// 跟着一行一千多字符的 base64。rustcrypto 的严格 PEM 解码（pem-rfc7468）对
-    /// 行宽有硬要求，以前这种材料走管理接口上传一律报
-    /// `unable to parse identity private key`，只能手工转成 PKCS#8 才传得进去。
+    /// keybox.xml 里那种「一整行超长 base64」的 SEC1 私钥必须能解出来：严格 PEM
+    /// 解码（pem-rfc7468）对行宽有硬要求，行宽超标只会得到
+    /// `unable to parse identity private key`。
     #[test]
     fn single_line_sec1_private_key_parses() {
         use pkcs8::LineEnding;
@@ -2588,10 +2535,9 @@ mod tests {
         }
     }
 
-    /// 真机链（Pixel 6a / qti / 小米实测）的中间证书是
-    /// `(title=TEE, serialNumber=…)`，2019 年流出的公开 keybox 是反的。这个形状是
-    /// keybox 材料自带的指纹：顺序写在已签名的 DER 里，改一个字节就断链，所以只能
-    /// 识别、不能就地修 —— 服务端据此判断“这条链发出去会不会被一眼认成假链”。
+    /// 真机链的中间证书是 `(title=TEE, serialNumber=…)`，老公开 keybox 是反的。
+    /// 顺序写在已签名的 DER 里，改一个字节就断链：只能识别、不能就地修，服务端
+    /// 据此判断这条链发出去会不会被一眼认成假链。
     #[test]
     fn rdn_shape_tells_device_chains_from_legacy_keyboxes() {
         let device_like = make_name(&[
@@ -2613,9 +2559,8 @@ mod tests {
         assert!(!RdnShape::Unknown.is_legacy());
     }
 
-    /// 自签链的中间证书要带上请求的级别。叶子写着 StrongBox、中间证书什么都不
-    /// 说，看链的那一侧就只能当它没标（真机的链从来没有这个形状）；库里的身份
-    /// 也因为这条而按错级别被挑来用。
+    /// 自签链的中间证书要带上请求的级别：叶子写 StrongBox、中间证书什么都不说
+    /// 不是真机的形状，库里的身份也会因此被按错级别挑走。
     #[test]
     fn self_signed_chain_stamps_the_requested_level() {
         let tee = generate_self_signed("ec", 1).unwrap();
@@ -2672,9 +2617,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 质量门（identity_problem / chain_problem）的测试素材：几张现造的证书，
-    // 全部活到 2026-10-27。前两张是一对由 mock 根签出来的链，模拟那些用生成器
-    // 造的假 keybox；后两张是一对正常名字的链，用来盯住别误杀。
+    // 质量门的测试素材：前两张是一对由 mock 根签出来的链（模拟生成器造的假
+    // keybox）；后两张是一对正常名字的链，用来盯住别误杀。
     // -----------------------------------------------------------------
     const MOCK_LEAF: &str = "\
 -----BEGIN CERTIFICATE-----
@@ -2744,7 +2688,7 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         assert!(!looks_generated("CN=Google RKP Root CA, O=Google"));
     }
 
-    /// mock 生成器的链结构是自洽的（差在名字上），这条门就是为它加的。
+    /// mock 生成器的链结构自洽，只能靠名字识别。
     #[test]
     fn generated_chain_is_rejected() {
         let why = chain_problem(&format!("{MOCK_LEAF}{MOCK_ROOT}")).unwrap();
@@ -3327,13 +3271,10 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         assert!(info.knox.is_none());
     }
 
-    /// AAID 是「这条链是谁的身份出的」唯一硬证据（服务端判读法就是靠它），
-    /// 所以两种编码都要能读出来，而且不能把没有 AAID 的链读成有。
     /// Device properties / ID attestation: the minted leaf must carry the
-    /// `KM_TAG_ATTESTATION_ID_*` entries the caller asked for. Without them a
-    /// chain that claims to come from a real TEE looks like one that never saw
-    /// device properties at all (TrustAttestor:
-    /// `hardware.attestation.device_properties`).
+    /// `KM_TAG_ATTESTATION_ID_*` entries the caller asked for, or a chain that
+    /// claims to come from a real TEE is reported as one that never saw device
+    /// properties (`hardware.attestation.device_properties`).
     #[test]
     fn key_description_carries_requested_device_properties() {
         let with_ids = AttestationParams {
@@ -3370,10 +3311,9 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         assert!(!der.windows(5).any(|w| w == b"nubia"));
     }
 
-    /// MODULE_HASH (724) 必须由 A 端转发、B 端原样写进叶子：
-    /// `getSupplementaryAttestationInfo(MODULE_HASH)` 在设备上返回的是本机 APEX
-    /// module-info bundle 的摘要，叶子缺 724 时校验方会报
-    /// `MISSING_ATTESTATION_MODULE_HASH`。
+    /// MODULE_HASH (724) 必须由 A 端转发、B 端原样写进叶子，否则校验方会报
+    /// `MISSING_ATTESTATION_MODULE_HASH`（设备上的
+    /// `getSupplementaryAttestationInfo(MODULE_HASH)` 会返回本机 APEX 摘要）。
     #[test]
     fn key_description_carries_forwarded_module_hash() {
         /// DER 里是否出现 context-specific tag `n`（high-tag-number 形式）。
@@ -3412,10 +3352,9 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
 
     /// auth-bound key（`setUserAuthenticationRequired(true)`，framework 展开成 502 + 504 +
     /// 505）必须带 `USER_AUTH_TYPE` (504) + `AUTH_TIMEOUT` (505) 且**不带**
-    /// `NO_AUTH_REQUIRED` (503)：证书说“不要认证”跟 App 的请求直接矛盾，
+    /// `NO_AUTH_REQUIRED` (503)：证书说“不要认证”与 App 的请求矛盾，
     /// TrustAttestor 会报 `hardware.attestation.user_auth_metadata`。
     /// SID (502) 不进叶证书，只用于 A 端本地校验指纹。
-    /// （server_keybox 模式签名用 keybox 私钥，不需要 auth token，所以带 504/505 不受影响。）
     #[test]
     fn key_description_carries_requested_user_auth_policy() {
         /// Whether the DER contains a context-specific tag `n` (high-tag-number
@@ -3448,8 +3387,8 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
             "USER_SECURE_ID (502) must not be attested"
         );
 
-        // No auth tags in the request (and no user_auth at all): keep the previous
-        // behaviour — NO_AUTH_REQUIRED only, no spurious auth tags.
+        // No auth tags in the request: NO_AUTH_REQUIRED only, no spurious auth
+        // tags.
         for plain in [
             AttestationParams::default(),
             AttestationParams {
@@ -3547,10 +3486,9 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         );
     }
 
-    /// 拿真机证书对拍。android/keyattestation 的 testdata 里每张 `.pem` 边上放着一份
-    /// `.json`，是 AOSP 自己解析出来的结果（Pixel 2 一路到 10、Sony Xperia 10 III 都
-    /// 有）。证书不进仓库，用 `OMMEGA_REAL_CERTS` 指着那个 testdata 目录跑；没设环境
-    /// 变量就跳过，免得别人 clone 下来到处找证书。
+    /// 拿真机证书对拍：android/keyattestation 的 testdata 里每张 `.pem` 边上放着一份
+    /// `.json`（AOSP 自己解析出来的结果）。证书不进仓库，用 `OMMEGA_REAL_CERTS`
+    /// 指向那个目录跑；没设该环境变量就跳过。
     #[test]
     fn real_device_certs_match_the_reference_values() {
         let Ok(root) = std::env::var("OMMEGA_REAL_CERTS") else {
@@ -3599,8 +3537,7 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
             let Some(info) = device_boot_info_from_chain(
                 &base64::engine::general_purpose::STANDARD.encode(leaf),
             ) else {
-                // 期望值里也没有启动状态，那就没错：这张证书本来就没带 RootOfTrust
-                // （marlin 那两张是纯软件认证，teeEnforced 里根本没这一项）。
+                // 期望值里也没有启动状态，那就没错：这张证书本来就没带 RootOfTrust。
                 if rot.is_none() {
                     continue;
                 }

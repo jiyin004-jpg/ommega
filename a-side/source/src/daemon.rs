@@ -1,13 +1,9 @@
 //! keymint 守护进程（`keymint --daemon`）。
 //!
-//! 替代原来的 `template/daemon` shell 脚本。那版每 10 秒要跑十几次 fork
-//! （`grep` 读配置、若干次 `sed` 读身份文件、`getprop` 读属性、必要时 `resetprop`
-//! 写），实测光这一个 shell 就吃 4.9% CPU。这里全部改成直接读文件 + 直接比较，
-//! 只有真的要写属性时才 exec 一次。
+//! 配置与属性值全部直接读文件比较，只有真要写属性时才 exec 一次。
 //!
-//! 职责和 shell 版一一对应：
-//!   - 单实例（`run/keymint-daemon.lock`，带 pid 归属校验，防 PID 复用误判）；
-//!   - 定位 keymint 二进制（`bin/` → 模块根 → `libs/<abi>/`）；
+//!   - 单实例（flock + `run/keymint-daemon.lock` 的 pid/starttime 校验，防 PID 复用）；
+//!   - 定位 keymint 二进制（模块内 `libs/<abi>/keymint`）；
 //!   - 干掉残留实例、导出出证要用的几个属性、拉起 keymint、盯着它；
 //!   - 每 10 秒把 `remote_identity` 里的身份/哈希/boot 补丁同步到本机属性（幂等）；
 //!   - `run/restart.keymint` 出现就重启 keymint（面板操作 / watchdog 触发）。
@@ -29,8 +25,8 @@ const CONF_PATH: &str = "/data/misc/ommega/config";
 const LOG_FILE: &str = "/data/misc/ommega/logs/daemon.log";
 /// 系统自己的 uid→包名 表，只有 root（本守护）读得到。
 const PACKAGES_LIST: &str = "/data/system/packages.list";
-/// 抄给 keystore 域看的 AAID 表：我们被注入进 keystore2 之后在那儿跑，
-/// `packages.list` 是 `0640 system:package_info` + `packages_list_file`，两头都拦。
+/// 抄给 keystore 域看的 AAID 表：`packages.list` 是 `0640 system:package_info` +
+/// `packages_list_file`，DAC 与 SELinux 两头都拦，只有本守护（root）读得到。
 const AAID_TABLE: &str = "/data/misc/ommega/aaid_table";
 const REMOTE_IDENTITY: &str = "/data/misc/ommega/remote_identity";
 const CONFIG_TOML: &str = "/data/misc/ommega/config.toml";
@@ -43,8 +39,7 @@ const PEER_RESTART_FILE: &str = "/data/adb/ommega/run/restart.injector";
 const RESTART_ALL_FILE: &str = "/data/adb/ommega/run/restart.all";
 const LOCK_DIR: &str = "/data/adb/ommega/run/keymint-daemon.lock";
 
-/// 身份同步周期。同步的是「链里声明的身份」，只在远程出证时才变一次，
-/// 10 秒足够快，也不至于把 CPU 耗在这上面。
+/// 身份同步周期：同步的是「链里声明的身份」，只在远程出证时才变一次。
 const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 /// 子进程存活检查周期（比同步密，重启请求能尽快生效）。
 const TICK: Duration = Duration::from_secs(1);
@@ -57,47 +52,38 @@ const KEYMINT_ENV: [&str; 6] = [
     "ro.build.version.security_patch",
     "ro.vendor.build.security_patch",
     "ro.boot.build.security_patch",
-    // AProbe 的 A13 拿这个名字当期望值；后面设置会覆盖前面的同名环境变量，
-    // 所以它在最前面被读到、最后写进 OMMEGA_PATCH_BOOT，优先生效。
+    // 顺序有意义：它被最后写进 OMMEGA_PATCH_BOOT，覆盖前面同名键的值。
     "ro.boot.image.build.security_patch",
 ];
 
 /// 守护进程入口。`extra` 是原始参数里除 `--daemon` 以外的部分，原样交给 keymint。
 pub fn run(extra: Vec<String>) -> ! {
-    // 同上：守护自己也不能把 cwd 留在模块目录里。
+    // cwd 不能留在模块目录：`/proc/<pid>/cwd` 一读就露出模块文件。
     let _ = std::env::set_current_dir("/");
-    // 单实例靠内核锁（flock）：锁在我手上就到死不放，进程一死内核自动释放。
-    // 以前那套「mkdir 锁目录 + pid/starttime 校验」有两个实例同时认领陈锁的竞态，
-    // 实测会真的起两份守护 —— 两边每轮都把对方的 HAL 当残留杀掉，现象是 HAL 每两秒
-    // 被 SIGKILL 一次，证书全失败。
+    // 单实例靠内核锁（flock）：锁不主动放，进程一死内核自动释放。
     let singleton = acquire_flock();
     if singleton.is_none() || !acquire_singleton() {
         log("another instance is running; exiting");
         std::process::exit(0);
     }
-    // 锁也会失效（锁目录被清、两轮自己的 pid 对不上时双方都以为自己抢到了）。
-    // 同名守护就是两份内存态：两边每轮都会把对方的 HAL 当残留杀掉，实际现象是
-    // HAL 每两秒被 SIGKILL 一次、证书请求全失败。这里按「名字 + memfd + pid 更小」
-    // 再兜一道：只要看到比自己早起的同名实例就退。
+    // 锁目录被清、pid 归属对不上时两个实例都会认为自己抢到锁，所以再按
+    // 「伪装名 + memfd + pid 更小」兜一道：看到比自己早起的同名实例就退。
     if let Some(name) = crate::stealth::cached_name("daemon") {
         if let Some(old) = older_same_name(&name) {
             log(&format!("older daemon pid {old} is alive; exiting"));
             std::process::exit(0);
         }
     }
-    // pidfile 由守护自己写：自举（memfd 重生）会把 cmdline 换掉，shell 那边
-    // 拿 `$!` 记的 pid 也可能是 setsid 的中间进程，靠它判断死活不再可靠。
-    // 格式是 `pid starttime`，判活就比 starttime —— pid 被复用了也对不上。
+    // pidfile 格式是 `pid starttime`，判活比 starttime：自举会换掉 cmdline，
+    // pid 被复用后只有启动时刻能对上。
     write_pidfile();
     log("keymint daemon started");
     // 伪装参数只在开机（或本守护重启）时算一次：面板保存只写 props.conf，
     // 不会即时改运行时；这样属性和证书永远是同一份，不会一边新一边旧。
     normalize_all();
-    // AAID 兜底表：悄悄跑着，不让它拖住主循环（里面会 fork 一次 `pm`）。
+    // AAID 兜底表跑在单独线程里：里面要 fork 一次 `pm`，不能拖住主循环。
     std::thread::spawn(aaid_sync_loop);
-    // 看护线程：注入器和 adbr 以前是 service.sh 里那个 `while true; sleep 5`
-    // （一个常驻的 busybox sh，进程列表里一眼就是「模块自带的脚本」）。
-    // 搬到守护里之后，那一层就彻底没有了。
+    // 看护线程：每 5 秒确认注入器与 adbr 在位，不在就重拉。
     std::thread::spawn(supervisor_loop);
 
     let mut last_sync = std::time::Instant::now();
@@ -211,7 +197,7 @@ const INPROC_GRACE: Duration = Duration::from_secs(90);
 const HEARTBEAT_TTL: u64 = 90;
 
 /// KeyMint 主体是不是跑在 keystore2 里（`/data/misc/ommega/inproc`，默认开）。
-/// 写 `0` 就回到老路子：单独拉一个 HAL 进程。
+/// 写 `0` 就改用独立的 HAL 进程。
 fn inproc_keymint_enabled() -> bool {
     match fs::read_to_string("/data/misc/ommega/inproc") {
         Ok(text) => text.trim() != "0",
@@ -220,9 +206,7 @@ fn inproc_keymint_enabled() -> bool {
 }
 
 /// 进程内那套还在、而且 RPC 已经挂上了吗。
-///
-/// 用 payload 自己刷的心跳，而不是去看 `/proc/net/unix`：socket 上有人在听并不能说明
-/// 是我们的进程内服务（回退后的独立 HAL 也在听同一个名字）。
+/// 看 payload 自己刷的心跳，不看 `/proc/net/unix`：独立 HAL 也在听同一个 socket 名。
 fn inproc_healthy() -> bool {
     let Ok(text) = fs::read_to_string(HEARTBEAT_PATH) else {
         return false;
@@ -266,7 +250,7 @@ fn idle_tick(last_sync: &mut std::time::Instant) {
     sleep(TICK);
 }
 
-/// 只在面板开了「调试日志」时才落文件 —— 开关每轮现读，跟 shell 版一致。
+/// 只有面板开了「调试日志」时才落文件；开关每轮现读。
 fn log(message: &str) {
     if !debug_logging() {
         return;
@@ -301,7 +285,7 @@ fn utc_stamp(epoch: u64) -> String {
     )
 }
 
-/// Howard Hinnant 的 `civil_from_days`（`days_from_civil` 的反向）。
+/// 天数 → (年, 月, 日)，是 `days_from_civil` 的反向换算。
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -338,17 +322,13 @@ fn config_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 // ---------------------------------------------------------------------------
 // AAID 兜底表
 // ---------------------------------------------------------------------------
+// 出证要往证书里塞 `attestationApplicationId`（tag 709），系统只给 Keystore /
+// Credstore 的 uid 提供；TA 注入 keystore2 后拿不到，`packages.list` 又是
+// `0640 system:package_info` + `packages_list_file` 两头都拦。本守护是 root，
+// 抄一份到数据根给 TA 读。
 //
-// 为什么要有这张表：出证要往证书里塞 `attestationApplicationId`（tag 709），
-// 系统只给 Keystore/Credstore 的 uid 提供，而我们的 TA 被注入进 keystore2 之后
-// 拿不到那个服务；自己读 `/data/system/packages.list` 也不行（`0640 system:package_info`
-// + `packages_list_file`，DAC 和 SELinux 两头都拦）。本守护一直是 root，读得到，
-// 那就抄一份到数据根，TA 从那里拿。
-//
-// 表里行格式：`uid 包名 版本号 签名摘要`（`#` 开头是注释；摘要拿不到写 `-`）。
-// 版本号和 APK 路径从 `pm list packages -f --show-versioncode` 拿，
-// 签名摘要是 APK 签名证书的 SHA-256 —— 就是 AAID（709）里那个 signatureDigests。
-// 只 stat `packages.list`，装/卸载才会变，变了才重抄 —— 常驻零开销。
+// 行格式：`uid 包名 版本号 签名摘要`（`#` 注释；摘要拿不到写 `-`）。版本号与 APK
+// 路径来自 `pm list packages -f --show-versioncode`，摘要就是 709 的 signatureDigests。
 fn aaid_sync_loop() {
     let mut last_stamp: Option<(u64, u64)> = None;
     loop {
@@ -714,7 +694,7 @@ fn holder_is_daemon(pid: u32, start: u64) -> bool {
     let Some(now) = start_time(pid) else {
         return false;
     };
-    // 老格式的锁没记 starttime，那时候只能看进程还在不在了。
+    // starttime 为 0 的老格式锁只能看进程是否还在。
     if start == 0 {
         return true;
     }
@@ -725,13 +705,9 @@ fn holder_is_daemon(pid: u32, start: u64) -> bool {
 // keymint 生命周期
 // ---------------------------------------------------------------------------
 
-/// keymint 的位置：`bin/`（热更新过）→ 模块根 → `libs/<abi>/`。
-///
-/// 刚安装完时 `customize.sh` 会清掉 `bin/` 里的旧二进制，运行用的是模块内那份；
-/// 热更新过就优先用 `bin/`。两种都是正常布局，不是兼容旧版。
+/// keymint 的唯一位置：模块内 `libs/<abi>/keymint`。
 fn find_keymint() -> Option<PathBuf> {
-    // 唯一位置：模块内的 `libs/<abi>/keymint`。ELF 只要能 execute（ksu 域有），
-    // 不需要 read；`bin/` 那套热更新布局已废弃。ABI 用编译期常量，不读属性。
+    // ELF 只要能 execute（ksu 域有），不需要 read。ABI 用编译期常量，不读属性。
     let abi_dir = if cfg!(target_arch = "aarch64") {
         "arm64-v8a"
     } else if cfg!(target_arch = "arm") {
@@ -745,12 +721,10 @@ fn find_keymint() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// 杀掉跑着 HAL 名字的残留实例。
+/// 杀掉跑着 HAL 伪装名的残留实例。
 ///
-/// 按 **comm** 认人，不读 cmdline：读一个卡在 D 状态的进程的 `/proc/pid/cmdline`
-/// 会把调用方一起卡住（实测设备 load 被三个这样的 tr 拉到 12，每个吃 100% CPU
-/// 跑了几十分钟）。comm 存在 task_struct 里，读它不会阻塞；而我们的伪装名本来就
-/// 是按 comm 前缀去重挑的，拿它认人够用。
+/// 按 **comm** 认人，不读 cmdline：读卡在 D 状态进程的 `/proc/<pid>/cmdline`
+/// 会把调用方一起卡住，comm 在 task_struct 里、读取不会阻塞。
 fn stop_stale_instances(target: &Path) {
     let me = std::process::id();
     let mut wanted: Vec<String> = Vec::new();
@@ -809,7 +783,7 @@ fn comm_prefix(path: &str) -> String {
 }
 
 fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
-    // 没有（table 没挑出来）就老样子直接从模块目录 exec —— 难看但能跑。
+    // 没有伪装名（table 没挑出来）就直接从模块目录 exec。
     let fake = crate::stealth::cached_name("hal").unwrap_or_default();
     let mut memfd = None;
     let mut command = if fake.starts_with('/') {
@@ -844,7 +818,7 @@ fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
 }
 
 // ---------------------------------------------------------------------------
-// 看护（以前在 service.sh 的 keep-alive 循环里）
+// 看护
 // ---------------------------------------------------------------------------
 
 /// 每 5 秒看一眼：注入器和 adbr 的监管脚本还在不在？不在就用「memfd + 伪装名」
@@ -853,9 +827,8 @@ fn supervisor_loop() {
     let mut last_soterta = std::time::Instant::now();
     loop {
         sleep(Duration::from_secs(5));
-        // 先把 pidfile 刷一遍：它可能被清理脚本删了（旧版本只在启动时写一次），
-        // 而看护/注入器/面板都拿它判断死活。文件不在就会被当成「守护挂了」，
-        // 每 5 秒重拉一个（每个都要把 8MB 二进制读进 memfd），白白烧 CPU。
+        // 先刷 pidfile：清理脚本会删它，而看护/注入器/面板都靠它判断死活；
+        // 文件不在就会被当成「守护挂了」，每 5 秒重拉一个 8MB 进程。
         write_pidfile();
         ensure_script("injector", &format!("{MODDIR}/daemon-injector"), &[]);
         let adbr = format!("{MODDIR}/adbr-daemon.sh");
@@ -942,8 +915,7 @@ fn comm_running(want: &str) -> bool {
 
 /// pidfile 里是 `pid starttime`；两列都对得上才算活着。
 ///
-/// 没有 starttime 就不认：光看 pid 是会被复用骗过去的（一个复活成内核线程的 pid
-/// 能让这里永远返回「活着」，监管就再也不重拉了）。陈格式的 pidfile 宁肯重拉一次，
+/// 没有 starttime 就不认（pid 复用会让这里永远「活着」）；宁肯重拉一次 ——
 /// 脚本自己会抢锁，多拉一份也不会真起两份。
 fn pidfile_stamp_alive(path: &str) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
@@ -992,7 +964,7 @@ fn spawn_script(role: &str, script: &str, args: &[&str]) -> std::io::Result<Chil
         // KernelSU 给模块脚本塞的，直接把模块名写在环境里。
         .env_remove("KSU_MODULE")
         .env("PWD", "/")
-        // 同上：脚本守护的 cwd 也必须在根目录。
+        // 脚本守护的 cwd 也必须在根目录。
         .current_dir("/")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
@@ -1001,9 +973,8 @@ fn spawn_script(role: &str, script: &str, args: &[&str]) -> std::io::Result<Chil
 }
 
 /// 把出证要用的几个属性写进 `run/keymint.env`，HAL 启动时自己读。
-///
-/// 不用环境变量：`/proc/<pid>/environ` 是 root 一句 `tr` 就能看的东西，
-/// 里面出现 `OMMEGA_BOOT_HASH` 这种名字等于把菜单贴在门上。
+/// 不走环境变量：`/proc/<pid>/environ` root 一句 `tr` 就能看，里面的
+/// `OMMEGA_BOOT_HASH` 这类名字等于把菜单贴在门上。
 fn write_env_file(_target: &Path) {
     let mut text = String::new();
     for name in KEYMINT_ENV {
@@ -1068,24 +1039,14 @@ fn set_prop(name: &str, value: &str) -> bool {
     }
 }
 
-/// 把链里声明的身份对齐到本机属性。
-///
-/// 来源是 `remote_identity`（TA 每次收到链都写）：服务端 keybox 出链时里面的哈希
-/// 就是本机属性，值相同不会写；真机 B 出链时是 B 的说法，同步一次之后每次都比得上；
-/// 本地模式下这个文件不更新，走不到这里。
-/// boot 补丁的三个属性变体，第一个是权威名（AProbe 的 A13 与 bootloader 都用它）。
+/// boot 补丁的三个属性变体，第一个是权威名（bootloader 与检测器读的都是它）。
 const BOOT_PATCH_PROPS: [&str; 3] = [
     "ro.boot.image.build.security_patch",
     "ro.boot.build.security_patch",
     "ro.vendor.boot_security_patch",
 ];
 
-/// 开机把三个 boot 补丁属性统一到 boot 分区的真值上。
-///
-/// 为什么要有这一步：属性是 bootloader 的快照，厂商不跟着 OTA 刷 bootloader 就会停在
-/// 旧日期（实测属性 2025-03-01，而 boot 分区里写的是 2026-08-01）。以前出链是属性优先，
-/// 属性又会被 `remote_identity` 反写回来，旧日期就永远出不去。现在开机对齐一次，之后
-/// 出链、面板、检测器读的都是同一个值，也省得每次去解析分区。
+/// 开机对齐一次所有归一化项，之后出链、面板、检测器读的都是同一个值。
 fn normalize_all() {
     normalize_boot_patch();
     normalize_vbmeta_digest();
@@ -1126,9 +1087,8 @@ fn normalize_identity_props() {
 }
 
 /// os / vendor 补丁清掉伪装后回 build.prop 的真值。
-///
-/// 这两个没有分区级别的“真值”概念，伪装写的就是属性；用户把伪装清掉时，props.conf
-/// 里那行没了，但属性还停在旧值上，没人拉得回去。这里每次归一都跟 build.prop 对一遍。
+/// 这两个没有分区级的“真值”：props.conf 那行没了，属性却停在旧值，没人拉得回去，
+/// 所以每次归一都跟 build.prop 对一遍。
 fn normalize_patch_props() {
     for prop in [
         "ro.build.version.security_patch",
@@ -1151,10 +1111,12 @@ fn normalize_patch_props() {
     }
 }
 
+/// 开机把三个 boot 补丁属性变体统一到 boot 分区的真值上。
+/// 属性是 bootloader 的快照，厂商不跟 OTA 刷 bootloader 就会停在旧日期，
+/// 且会被 `remote_identity` 反写回来，所以开机对齐一次。
 fn normalize_boot_patch() {
     // 优先级：props.conf 里的伪装 > config.toml 的显式值 > boot 分区真值。
-    // 伪装不只需要跳过归一，还得把三个变体都刷成伪装值 —— 面板保存时那次 resetprop
-    // 不一定每条都写成（实测 ro.vendor.boot_security_patch 会漏）。
+    // 有伪装时要把三个变体都刷成伪装值，面板保存时那次 resetprop 不一定每条都写成。
     let (value, source) = match props_conf_explicit_boot_patch() {
         Some(value) => (value, "props.conf"),
         None => match declared_boot_patchlevel() {
@@ -1259,9 +1221,7 @@ fn normalize_vbmeta_public_key() {
 }
 
 /// vbmeta 摘要（链上的 `verifiedBootHash`）对齐到 bootloader 的真值。
-///
-/// 本机实测过：属性里能是 `8a7aa2b9…`，而 `/proc/bootconfig` 里 bootloader 写的是
-/// `a2a08ff43…`——属性被改过后就再也回不去。bootconfig 只读，拿它当准。
+/// 属性被改过后回不去，`/proc/bootconfig` 只读，拿它当准。
 fn normalize_vbmeta_digest() {
     // 伪装优先：写了就用写的（并保证属性也真是它），没写才用 bootloader 的真值。
     let truth = props_conf_value("ro.boot.vbmeta.digest")
@@ -1286,6 +1246,8 @@ fn props_conf_value(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// 把链里声明的身份（`remote_identity`，TA 每次收到链都写）同步到本机属性。
+/// 值相同不写，因此必须幂等；本地模式下这个文件不更新。
 fn sync_remote_identity() {
     let configured = fs::read_to_string(CONF_PATH).unwrap_or_default();
     let remote_mode = config_value(&configured, "remote").is_some_and(|value| {
@@ -1302,9 +1264,8 @@ fn sync_remote_identity() {
         return;
     }
 
-    // 只有真连得上远端 B 才拿 identity 刷属性。以前只看 remote 开关：面板勾了远端
-    // 而 device_id/token 没填时，链其实是本地出的，属性却被 B（或上一次）的旧值
-    // 刷回去 —— boot 补丁就此锁死，本机就是这么锁在 2025-03-01 的。
+    // 只有 device_id 与 token 都配好才拿 identity 刷属性：否则链其实本地出的，
+    // 属性会被 B（或上一次）的旧值刷回去，boot 补丁就此锁死。
     let remote_ready = ["device_id", "token"]
         .iter()
         .all(|key| config_value(&configured, key).is_some_and(|v| !v.trim().is_empty()));
@@ -1351,9 +1312,8 @@ fn sync_remote_identity() {
             continue;
         }
         if let Some(prop) = identity_prop(key) {
-            // 写失败也照样记账：`ro.product.*` 这种属性本来就未必写得进去，
-            // 不记账就会每 10 秒重试一轮。身份值真的变了（B 换机器）时这里的
-            // 比对不命中，自然还会再写一次。
+            // 写失败也照样记账：`ro.product.*` 未必写得进去，不记账就会每 10 秒
+            // 重试一轮。身份值真变了（B 换机器）时比对不命中，自然还会再写一次。
             set_prop(prop, value);
         }
         applied.retain(|(k, _)| k != key);
@@ -1441,7 +1401,7 @@ fn epoch_from_ymd(year: &str, month: &str, day: &str) -> Option<i64> {
     Some(days_from_civil(year, month, day) * 86_400)
 }
 
-/// Howard Hinnant 的 `days_from_civil`。
+/// 公历日期 → day 计数。
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;

@@ -1,22 +1,12 @@
-//! 把「A 端本地兜底该报的 cpu_id」摆到 payload 读得到的地方，并让转发请求带上它。
+//! 把 A 端本地兜底要报的 cpu_id 摆到 payload 读得到的地方，并让转发请求带上它。
 //!
-//! 为什么不用真机（B）报的那个号：兜底这条路连密钥都是我们自己的（本地自签那把
-//! ASK/AuthKey），身份再去借真机的号就成了杂交货 —— 判证器按值一对比就看出来
-//! 「文档里的号是那台中继设备的默认值」。所以兜底就用本机自己的号。
+//! 兜底那条路的密钥是我们自己的（本地自签的 ASK/AuthKey），身份也必须用本机自己的号；
+//! 借真机（B）的号会让判证器按值对比出不一致。号只从真实属性派生
+//! （`ro.boot.serialno` / `ro.serialno`），读不到序列号就不报号、也不编一个 —— 转发
+//! 干脆不带 `cpu_id`，由服务端按当时的年月日时分现造。
 //!
-//! 号只从**真实属性**来：`ro.boot.serialno` / `ro.serialno` 派生（每台机器一个、同一台
-//! 机器每次都一样）。读不到序列号就**不报号**，也不编一个 —— 转发时干脆不带 `cpu_id`，
-//! 由服务端按当时的年月日时分现造一个（`soter_mint::time_device_id`）。走真机那条路由
-//! 真机的 TA 自己定，我们一个字都不改；真要递到 B 的请求，服务端那边也会把 `cpu_id` 摘掉。
-//!
-//! 为什么要落盘：SOTER 宿主是 uid 1000，读不到 daemon 这边的域，所以写一份到
-//! `/data/misc/keystore/ommega/soter_cpu_id`（daemon 跑在 keystore uid 里，只有这个目录
-//! 写得动），启动器 `daemon-injector` 再镜像到 app 域（见
-//! [`kmr_common::soter_relay::CPU_ID_PATHS`]）。每次转发的 SOTER 请求也带上它，这样
-//! 服务端那两层（真机答不了时的兜底）跟本地自签报的是同一个号。
-//!
-//! 算法必须和 payload 里那份一致（`soter_local::cpu_id_from`），否则同一条兜底路会
-//! 因为「文件在不在」而报两个号。
+//! 落盘是因为 SOTER 宿主是 uid 1000，读不到 daemon 的域。算法必须和 payload 里的
+//! `soter_local::cpu_id_from` 一致，否则同一条兜底路会因为文件在不在而报两个号。
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -32,18 +22,16 @@ const SEED: &str = "ommega-a-side-soter:";
 static DERIVED: Mutex<Option<String>> = Mutex::new(None);
 static STARTED: OnceLock<()> = OnceLock::new();
 
-/// 起派生线程（幂等：main 里调一次，`forward()` 里兜底再调也没事）。
-///
-/// 这只是读属性 + 写一个小文件，不发请求、不用等网络，所以开销可以忽略；放后台是因为
-/// 它要定期看一眼序列号，而热路径（`forward()`）只读缓存。
+/// 起派生线程（幂等）。
+/// 只读属性 + 写一个小文件，不发请求；放后台是因为它定期看一眼序列号，热路径只读缓存。
 pub fn start() {
     if STARTED.set(()).is_err() {
         return;
     }
     std::thread::spawn(|| loop {
-        // 手上已经有号（服务端学过 / 人工写的）就不要拿本地序列号算的那个覆盖它：
-        // SOTER 身份必须是真机（B 端 TEE）那个号，本地派生的是另一串，两边不一致
-        // 腾讯就会判「设备换了」→ 微信直接报系统错误。只有什么都没有时才现算一个兜底。
+        // 已有号（服务端学过或人工写的）不能被本地序列号算出的值覆盖：SOTER 身份必须
+        // 是 B 端 TEE 那个号，两边不一致判证方就会判「设备换了」。只有什么都没有时才
+        // 现算一个兜底。
         if let Some((value, source)) = read_mirror() {
             store(value, &source);
         } else {
@@ -65,8 +53,7 @@ pub fn start() {
     });
 }
 
-/// 没有真实属性可报时：清掉缓存，并把之前写下那份副本也删了 —— 留着它等于继续报一个
-/// 已经不成立的身份。
+/// 没有真实属性可报时：清掉缓存并删掉写下的副本，留着它等于继续报一个不成立的身份。
 fn forget() {
     let had_value = DERIVED
         .lock()
@@ -81,11 +68,8 @@ fn forget() {
     }
 }
 
-/// 当前该报给服务端的 cpu_id。没有真实来源返回 `None`，转发时就干脆不带这个字段，
-/// 由服务端按当时的年月日时分现造一个。
-///
-/// 这条路不发请求：内存里有就用内存，没有才顺手看一眼副本文件（daemon 刚起来的时候），
-/// 再没有就现派生一个；连序列号都没有就 `None`。
+/// 当前该报给服务端的 cpu_id；没有真实来源返回 `None`，转发时不带这个字段。
+/// 不发请求：内存有就用内存，否则看副本文件，再否则现派生；没有序列号就 `None`。
 pub fn current() -> Option<String> {
     if let Some(value) = cached() {
         return Some(value);
@@ -131,12 +115,12 @@ fn read_mirror_from(paths: &[&str]) -> Option<(String, String)> {
     None
 }
 
-/// 现算一个：序列号从系统属性读（root 读得到）。读不到序列号就没有号 —— 不编。
+/// 现算一个：序列号从系统属性读（root 读得到）。读不到就没有号，不编。
 fn derive() -> Option<String> {
     id_for_serial(serial().as_deref())
 }
 
-/// `serial()` 的结果到该报的号：没有序列号就没有号（这段是纯逻辑，好单测）。
+/// `serial()` 的结果到该报的号：没有序列号就没有号。
 fn id_for_serial(serial: Option<&str>) -> Option<String> {
     serial.map(local_id_from_serial)
 }
@@ -163,8 +147,8 @@ fn local_id_from_serial(serial: &str) -> String {
     out
 }
 
-/// 写副本：先写临时文件再 rename，读的一方（payload 每 30 秒看一眼，启动器每 5 秒镜像
-/// 一次）永远读不到半截。内容没变就不动文件。
+/// 写副本：先写临时文件再 rename，读的一方永远读不到半截。内容没变就不动文件。
+/// 读者是 payload（每 30 秒看一次）和启动器（每 5 秒镜像一次）。
 fn write_mirror(value: &str) -> Result<()> {
     write_mirror_to(
         kmr_common::soter_relay::CPU_ID_WRITE_PATH,
@@ -196,8 +180,8 @@ fn write_mirror_to(path: &str, key: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 算法钉死：nubia 那台的序列号必须派生出它一直在报的那个号，payload 那边算出来
-    /// 得是同一个（两边算法一字不差，这条就是那份合同）。
+    /// 算法钉死：这个序列号必须派生出这个号，payload 那边算出来得是同一个
+    /// （两边算法一字不差）。
     #[test]
     fn the_derived_id_matches_the_payload_one() {
         assert_eq!(
@@ -207,8 +191,8 @@ mod tests {
         assert_eq!(local_id_from_serial("320143945328").len(), 32);
     }
 
-    /// 读不到序列号就没有号：不再拿一个写死的种子编一个出来（那样每台读不到序列号的
-    /// 机器报同一个号，业务侧一眼假）。转发时就不带 cpu_id，交给服务端按时间造。
+    /// 读不到序列号就没有号：不拿写死的种子编一个（否则每台机器报同一个号）。
+    /// 转发时不带 cpu_id，交给服务端按时间造。
     #[test]
     fn a_missing_serial_yields_no_id_at_all() {
         assert_eq!(id_for_serial(None), None);
@@ -245,7 +229,7 @@ mod tests {
             .contains("5171734c42866bea148b21f5"));
     }
 
-    /// 副本文件怎么读：临时目录，不碰设备上那两份真位置。
+    /// 副本文件怎么读：用临时目录，不碰设备上那两份真位置。
     #[test]
     fn the_mirror_round_trips_through_a_file() {
         let dir = std::env::temp_dir().join(format!("ommega-cpuid-r-{}", std::process::id()));

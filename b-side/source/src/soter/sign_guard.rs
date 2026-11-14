@@ -1,10 +1,9 @@
 //! In-memory signing lease and probe exclusion. Hold the mutex only across HAL
 //! calls, never across the init -> finish wait. A lost finish (or HAL restart) expires.
 //!
-//! 租约**不再拒掉 App 派下来的 init**：一台设备上多路客户端抢同一张 TA 会话是常态
-//! （2026-10-03 在 PLC110 上实测，光探针就每分钟吃掉一次），拒掉等于让真活儿一直
-//! 抢不到。这里只剩两件事：挡住我们自己的能力探针（`probe_allowed`），以及记住
-//! 「哪个会话还没收尾」好让 finish 认人。
+//! 租约不拒 App 派下来的 init：一台设备上多路客户端抢同一张 TA 会话是常态（光探针就
+//! 每分钟吃掉一次），拒掉等于让真活儿一直抢不到。这里只剩两件事：挡住能力探针
+//! （`probe_allowed`），以及记住哪个会话还没收尾好让 finish 认人。
 
 use std::time::{Duration, Instant};
 
@@ -71,8 +70,8 @@ mod tests {
 
     #[test]
     fn a_hanging_lease_no_longer_refuses_the_next_init() {
-        // 2026-10-03 PLC110：这条「还占着就不许再 init」曾经把 A 端的微信开通挡死
-        // （回 -9，App 连指纹圈都弹不出来），现在它只用来挡住我们自己的探针。
+        // 「还占着就不许再 init」会把 A 端的微信开通挡死（回 -9，指纹圈都弹不出来），
+        // 现在它只用来挡住能力探针。
         let now = Instant::now();
         let mut guard = SignGuard::new();
         guard.init_succeeded(1, now);

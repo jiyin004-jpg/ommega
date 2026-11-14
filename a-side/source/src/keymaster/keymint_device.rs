@@ -422,9 +422,8 @@ impl KeyMintDevice {
                     });
 
                 // 内部钥匙（boot level key 这种）解不开，基本都是 root_kek 换了：blob 是
-                // 升级前用旧种子铸的。这种情况不重建的话，进程内那条路会永久起不来
-                // （错误码 INVALID_KEY_BLOB = -33，真机实测）。丢掉重建，跟 km_uuid
-                // 对不上时那条路一样处理。
+                // 升级前用旧种子铸的。不重建的话进程内那条路会永久起不来
+                // （INVALID_KEY_BLOB = -33）。丢掉重建，跟 km_uuid 对不上时一样处理。
                 let unreadable_internal = key_desc.nspace == AID_KEYSTORE as i64
                     && upgraded.as_ref().err().is_some_and(|error| {
                         matches!(

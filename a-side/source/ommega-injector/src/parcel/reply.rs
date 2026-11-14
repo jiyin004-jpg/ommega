@@ -24,12 +24,10 @@ pub struct OwnedReply {
     parcel: Parcel,
     pub offsets: Box<[usize]>,
     pub(crate) native_operation: Option<NativeBinderRetirement>,
-    /// HIDL 的答复里，对象（`binder_buffer_object`）的 `buffer` 写的是堆块的地址，
-    /// 那些块得跟 parcel 一样活到宿主把 `BC_FREE_BUFFER` 交回来为止：内核不认识这些
-    /// 指针，我们拿来就用、宿主直接按地址读，谁挪一下（或者提前释放）宿主就崩。
-    /// AIDL 那条路没有这种东西，留空就行。
+    /// HIDL 答复里 `binder_buffer_object` 的 `buffer` 指向这些堆块：内核不认识这些指针，
+    /// 宿主直接按地址读，块必须活到 `BC_FREE_BUFFER` 交回为止。AIDL 那条路留空。
     ///
-    /// 这些块没人读，纯靠它活着，所以标记成别管 lint。
+    /// 没人读这些块，纯靠它活着，所以标记成别管 lint。
     #[allow(dead_code)]
     storage: Vec<Box<[u8]>>,
 }
@@ -317,21 +315,16 @@ pub fn build_plain_reply<T: Serialize>(value: &T) -> Result<OwnedReply> {
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
-/// HAL 那边 `void/int xxx(..., out SoterBufferReturn)` 的回复。
-///
-/// 两家 HAL 的形状差一格，规格就是宿主 dex 里各自的代理类（联发科 `d/a`、高通 `b/a`）：
+/// HAL 那边 `void/int xxx(..., out SoterBufferReturn)` 的回复。两家形状差一格：
 ///
 /// ```text
 /// 联发科 [Status][非空标记][总长][错误码][byte[]][dataLength]   总长 = 16 + pad4
 /// 高通   [Status][返回值][非空标记][总长][byte[]][dataLength]   总长 = 12 + pad4
 /// ```
 ///
-/// 高通的错误码就在方法返回值里、parcelable 里没有那一格；联发科反过来，方法不带返回值。
-/// 两家的字节数还常常一模一样（4+4+4+…），写错了宿主不会报错，只是把垃圾当数据收下 ——
-/// 所以千万别按长度对齐来猜是哪家。
-///
-/// `data = None` 是「这次没数据但有错误码」：真 HAL 这时给的是**非空**的 parcelable
-/// （`[标记=1][总长][错误码][长度=0][长度=0]`），不是 null，别写成 0 标记那一支。
+/// 高通的错误码在方法返回值里，联发科的在 parcelable 里。两家字节数常常一模一样，写错了
+/// 宿主不报错、只把垃圾当数据收下，所以不能按长度猜是哪家。`data = None` 时真 HAL 给的
+/// 是**非空** parcelable（`[标记=1][总长][错误码][长度=0][长度=0]`），别写成 0 标记。
 pub fn build_soter_buffer_reply(
     code: i32,
     data: Option<&[u8]>,
@@ -347,32 +340,15 @@ pub fn build_soter_buffer_reply(
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
-/// `SoterInitReturn initSign(...)` 的回复。**两家 AIDL 一模一样**，不按家分：
+/// `SoterInitReturn initSign(...)` 的回复，两家 AIDL 完全一样，不按家分：
 ///
 /// ```text
 /// [Status][非空标记=1][总长=16][错误码][session]
 /// ```
 ///
-/// 这形状是宿主 dex 里的生成代码定的，不是照着别的方法推的：
-///
-/// - 高通 AIDL（`vendor.qti.hardware.soter.ISoter`，A 端 soterserver 的
-///   `vendor/qti/hardware/soter/ISoter$Stub$Proxy`）：`initSign` 的返回值就是那个
-///   parcelable 本身，代理里只有一句 `readTypedObject(SoterInitReturn.CREATOR)`，
-///   **没有**「方法返回值」那一格；`SoterInitReturn.writeToParcel` 是 `[总长][status][session]`。
-/// - 联发科 AIDL（`vendor.trustonic.hardware.soter.ITrustonicSoter`）：`void initSign(..., out c)`，
-///   代理是 `readInt() != 0` 之后再读那个 parcelable，里面同样 `[总长][int status][long session]`。
-///
-/// 两家都是 4+4+8 = 24 字节。别再加「方法返回值」那一格、也别把两个字段对调：
-/// 多一格的话宿主 `readTypedObject` 读到的第一个 i32 正好是我们写的错误码，成功时它是 0，
-/// 于是 parcelable 被判成 **null**，soterserver 那边 `initSigh` 的 `if (initSign != null)`
-/// 不成立、把 `SoterSessionResult` 留在默认值（`resultCode = 0`、`session = 0`）交回，
-/// 微信拿 0 去 `finishSign`，又被它自己那句 `if (j == 0) resultCode = -204;` 挡下 ——
-/// 现象就是按完指纹「开通失败」。
-///
-/// 现场日志对号的时候别被旁边那条 `<<< BC_REPLY ... data_size: 20` 带跑：那是**下一跳**
-/// ——soterserver 自己回给微信的 `SoterSessionResult`（`[Status][标记=1][session i64]`
-/// `[resultCode i32]` = 4+4+12=20 字节，偏移 8 起就是 session）。这份回复走 synthetic
-/// 伪造 BR_REPLY 那条路，不经过 `log_write_transaction`，所以日志里看不到它的 24 字节原文。
+/// 别多写「方法返回值」那一格、也别把两个字段对调：多一格时宿主 `readTypedObject` 读到的
+/// 第一个 i32 正好是错误码，成功时它是 0，整个 parcelable 被判成 null，`initSign` 于是回
+/// 默认值（`resultCode = 0`、`session = 0`），现象就是按完指纹「开通失败」。
 pub fn build_soter_init_reply(code: i32, session: i64) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
@@ -391,20 +367,10 @@ pub fn build_app_int_reply(value: i32) -> Result<OwnedReply> {
 
 /// App 面向的 `SoterExportResult`：`[Status][非空标记=1][resultCode][byte[]][dataLength]`。
 ///
-/// 那个非空标记**不能省**。客户端拿到的是 AIDL 生成代码，`getAppSecureKey` / `getAuthKey`
-/// 的代理里第一步是 `obtain2.readInt() != 0 ? CREATOR.createFromParcel(obtain2) : null`
-/// （老版生成器写的是同一句 `if (_reply.readInt() != 0)`，只是不叫 `_Parcel`）。少写这
-/// 4 字节，客户端读到的「标记」正好是 resultCode，成功时它是 0，于是整个 parcelable 被
-/// 判成 **null** —— `getAppGlobalSecureKeyModel()` 里 `.exportData` 直接 NPE，被 catch
-/// 掉就成了 `askModel=false` / Duck 的 1003，跟「料在不在」完全无关。
-///
-/// 这里踩过一次来回：`2d85e557` 按「客户端只读三格」的口径把这个标记删了，结果两头
-/// 都空。反过来的实证在 Duck 自带的那份 soter-core 里也看得到（`ISoterService$Proxy`
-/// 里 `readInt() != 0 ? SoterExportResult.CREATOR.createFromParcel`），别再删。
-///
-/// `data = None` 照宿主自己的写法（`writeByteArray(null)` 是 `-1` + 长度 0），别写成空数组：
-/// 客户端 `createByteArray()` 看到 -1 才回 null，看到 0 是「长度为 0 的数组」，两者在
-/// 检测器眼里不一样（`exportData == null` 的那几条判据）。
+/// 非空标记不能省：客户端代理第一步是 `readInt() != 0 ? CREATOR.createFromParcel() : null`，
+/// 少写这 4 字节时读到的「标记」正好是 resultCode，成功时它是 0，整块 parcelable 被判成
+/// null，`.exportData` 直接 NPE。`data = None` 写 `-1` + 长度 0（即 `writeByteArray(null)`），
+/// 别写成空数组：客户端 `createByteArray()` 只有看到 -1 才回 null，看到 0 是长度为 0 的数组。
 pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
@@ -424,12 +390,10 @@ pub fn build_app_export_reply(code: i32, data: Option<&[u8]>) -> Result<OwnedRep
 }
 
 /// App 面向的 `SoterSessionResult`：`[Status][非空标记=1][session i64][resultCode i32]`。
-/// 注意字段顺序跟 HAL 那份 `SoterInitReturn` 相反（那边是 status 在前）。
+/// 字段顺序跟 HAL 的 `SoterInitReturn` 相反（那边 status 在前）。
 ///
-/// 非空标记跟 `SoterExportResult` 那条同源：`initSigh` 的代理也是先 `readInt() != 0`。
-/// 少写的话客户端拿 session 的高 32 位当标记 —— 我们自己发的会话号从 1 往上加，高位恒 0，
-/// 于是必然判成 null；`initSigh` 回 null 之后微信那套直接当失败，或者拿一个凑不上的号去
-/// `finishSign`，回来就是服务端的 `-204`。
+/// 非空标记不能省：少了它客户端拿 session 的高 32 位当标记，而我们的会话号从 1 往上加、
+/// 高位恒 0，于是必然判成 null。
 pub fn build_app_session_reply(session: i64, code: i32) -> Result<OwnedReply> {
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok))?;
@@ -453,9 +417,9 @@ pub fn build_app_extra_param_reply(value: i32) -> Result<OwnedReply> {
 /// `Parcel.writeValue` 里整数那个类型标（frameworks/base 的 `Parcel::VAL_INTEGER`）。
 const VAL_INTEGER: i32 = 1;
 
-/// `SoterBufferReturn` 自己那段：`[总长][(错误码)][byte[]][dataLength]`。
-/// 总长从它自己那 4 字节算起，一路盖到最后的 dataLength：联发科把错误码也圈进来
-/// （16 = 4+4+4+4，再加补到 4 的数据），高通没有错误码那一格（12 = 4+4+4）。
+/// `SoterBufferReturn` 自己那段：`[总长][(错误码)][byte[]][dataLength]`。总长从它自己那
+/// 4 字节算起、盖到最后的 dataLength：联发科把错误码也圈进来（16 = 4+4+4+4，再加补到 4 的
+/// 数据），高通没有错误码那一格（12 = 4+4+4）。
 fn write_soter_buffer_return(
     parcel: &mut Parcel,
     data: &[u8],
@@ -473,12 +437,11 @@ fn write_soter_buffer_return(
     Ok(())
 }
 
-/// HIDL 的 `hidl_pointer<T>` / `hidl_vec<T>` / `hidl_string` 那一副骨架一共 16 字节：
+/// HIDL 的 `hidl_pointer<T>` / `hidl_vec<T>` / `hidl_string` 共用这副 16 字节骨架：
 /// `hidl_pointer`(8) + `uint32_t mSize` + `bool mOwnsBuffer` + 3 字节补位。
 ///
-/// 指针那个槽两个 ABI 都是 8 字节 —— `hidl_pointer` 内部是 `union { T*; uint64_t; }`，
-/// AOSP 里有 `static_assert(sizeof(*this) == 8)`；32 位进程只填低 4 字节、高位留 0，
-/// 所以这个结构体的字节布局在两边一模一样，不用按 ABI 分开写。
+/// 指针槽两个 ABI 都是 8 字节（`union { T*; uint64_t; }`），32 位进程只填低 4 字节、高位
+/// 留 0，所以这份布局不用按 ABI 分开写。
 pub(crate) const HIDL_STRUCT_SIZE: usize = 16;
 
 fn hidl_struct(pointer: usize, size: u32) -> Box<[u8]> {
@@ -490,10 +453,9 @@ fn hidl_struct(pointer: usize, size: u32) -> Box<[u8]> {
 
 /// 往 parcel 里写一个 `binder_buffer_object`。
 ///
-/// 内核 uapi 里它是 `{hdr{type}, flags, buffer, length, parent, parent_offset}`，
-/// 后面四个字段的宽度跟着 ABI 走（`binder_uintptr_t` / `binder_size_t` 就是 32 位 4 字节、
-/// 64 位 8 字节的 typedef）。同一份结构体在没有 libhwbinder 源码的年代被猜成过别的字段
-/// 顺序，别照那个来 —— 以内核头文件为准。
+/// 内核 uapi 的字段顺序是 `{hdr{type}, flags, buffer, length, parent, parent_offset}`，
+/// 后四个字段的宽度跟 ABI 走（`binder_uintptr_t` / `binder_size_t`：32 位 4 字节、64 位
+/// 8 字节）。字段顺序以内核头文件为准。
 fn write_hidl_buffer_object(
     parcel: &mut Parcel,
     buffer: usize,
@@ -520,22 +482,14 @@ fn write_abi_usize(parcel: &mut Parcel, value: usize) -> Result<()> {
     Ok(())
 }
 
-/// HIDL 那边 `generates (int32 error, vec<uint8_t> data, soter_size_t length)` 的回复。
+/// HIDL 那边 `generates (int32 error, vec<uint8_t> data, soter_size_t length)` 的回复：
+/// `[Status i32 = 0][错误码 i32][对象 A][对象 B][长度 u32]`。
 ///
-/// ```text
-/// [Status i32 = 0][错误码 i32][对象 A][对象 B][长度 u32]
-/// ```
-///
-/// 两个对象都是 `binder_buffer_object`（64 位下 40 字节）：A 指向那个 16 字节的
-/// `hidl_vec` 结构体（`length` 必须正好等于 `sizeof(hidl_vec<uint8_t>)`，宿主读完会
-/// 逐字节比），B 指向元素本身，`parent` 是 A 在偏移表里的下标（这里是 0）、
-/// `parent_offset` 是结构体里指针那一格的偏移（`offsetof(hidl_vec, mBuffer)` = 0）。
-/// 宿主校验 B 的时候会去读 A 指向的那个结构体、看第一个指针是不是就指着 B 的 `buffer`
-/// —— 两者必须一致，所以结构体得我们自己拼好、地址写进去。
-///
-/// `data = None` 就是空 vector：元素指针和长度都给 0。这不是「不写」—— 读的那侧走的是
-/// `readNullableEmbeddedBuffer`，空 vector 天生就长这样（AOSP 的 `writeObject` 对
-/// buffer 为 null 的对象也不登记偏移表，所以这里只登记 A）。
+/// 两个对象都是 `binder_buffer_object`（64 位下 40 字节）：A 指向 16 字节的 `hidl_vec`
+/// 结构体，`length` 必须正好是 `sizeof(hidl_vec<uint8_t>)`；B 指向元素本身，`parent` 是 A
+/// 在偏移表里的下标（0），`parent_offset` 是结构体里指针那格 `mBuffer` 的偏移（0）。宿主会
+/// 读 A 指向的结构体、核对第一个指针是不是 B 的 `buffer`，所以结构体得自己拼好。
+/// `data = None` 是空 vector：元素指针和长度都给 0，偏移表只登记 A。
 pub fn build_hidl_soter_buffer_reply(error: i32, data: Option<&[u8]>) -> Result<OwnedReply> {
     let payload = data.unwrap_or(&[]);
     let mut storage: Vec<Box<[u8]>> = Vec::new();
@@ -552,8 +506,7 @@ pub fn build_hidl_soter_buffer_reply(error: i32, data: Option<&[u8]>) -> Result<
     storage.push(structure);
 
     let mut parcel = Parcel::new();
-    // 回包开头是 `hardware::Status`：一个 i32，0 即成功。非 0 时后面还得跟一条
-    // String16 的 message，我们从来不往那条路上走。
+    // 回包开头是 `hardware::Status`：一个 i32，0 即成功；非 0 时后面还要跟 String16 message。
     parcel.write_i32(0)?;
     parcel.write_i32(error)?;
     let parent = parcel.data_position();

@@ -63,9 +63,8 @@ type BinderGetCallingUid = unsafe extern "C" fn() -> libc::uid_t;
 type BinderGetCallingPid = unsafe extern "C" fn() -> libc::pid_t;
 type BinderSetRequestingSid = unsafe extern "C" fn(*mut c_void, bool);
 /// `AIBinder_setInheritRt(binder, true)`：让强引用跟着 parcel 传下去。
-/// 不设的话，我们这边一放强引用，App 拿到的那个 binder 就失效了（logcat 里那句
-/// `Binder ... destroyed after setInheritRt before being parceled`），
-/// 表现为「链已经出来了但 App 拿不到」。
+/// 不设的话，这边一放强引用，App 拿到的那个 binder 就失效了，表现为
+/// 「链已经出来了但 App 拿不到」。
 type BinderSetInheritRt = unsafe extern "C" fn(*mut c_void, bool);
 type ParcelCreate = unsafe extern "C" fn() -> *mut c_void;
 type ParcelDelete = unsafe extern "C" fn(*mut c_void);
@@ -678,7 +677,7 @@ fn create_native_binder_with_api(
     unsafe {
         (api.binder_set_requesting_sid)(binder.binder as *mut c_void, true);
         (api.binder_mark_vintf_stability)(binder.binder as *mut c_void);
-        // 必须在被 writs 进 parcel 之前设：之后设会 panic/无效。
+        // 必须在被写进 parcel 之前设：之后设会 panic / 无效。
         if let Some(set_inherit_rt) = api.binder_set_inherit_rt {
             set_inherit_rt(binder.binder as *mut c_void, true);
         }

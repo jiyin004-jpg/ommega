@@ -24,64 +24,61 @@ use crate::cert::{self, AttestationParams, RootOfTrust};
 use crate::db::{Db, DeviceIdentity};
 
 /// AOSP keymint::kMaxChallengeSize = 128 bytes.
-/// Attestation challenges larger than this are rejected to avoid
-/// triggering Duck-Detector's OversizedChallengeProbe.
+/// Larger attestation challenges are rejected; oversized challenges are
+/// flagged by verifiers.
 const MAX_CHALLENGE_SIZE: usize = 128;
 
 const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// 自动源（public 采集）专用的槽位 device id。某台设备一份身份都没存过的时候
-/// 用它的材料顶上，别掉到 self_signed 那条一眼假的自签链。
+/// 自动源（public 采集）专用的槽位 device id。设备一份身份都没存过时用它代替，
+/// 避免落到 self_signed 自签链。
 const AUTO_PUBLIC_SLOT: &str = "device-b-2";
 
-/// 距上次顶过「最后使用」多久才值得再顶一次。TTL/LRU 判的是小时级窗口，差几分钟
-/// 无所谓；这条节流把「每签一次就写一次库」压成每个 alias 五分钟最多一次。
+/// 「最后使用」写库的节流窗：每个 alias 最多每 5 分钟写一次。TTL/LRU 按小时级
+/// 窗口判定，分钟级误差不影响语义。
 const SESSION_TOUCH_MIN_MS: u64 = 5 * 60 * 1000;
 
-/// 会话表过期清理的节流间隔。清理是 O(会话数) 的，几千条的表在每个 sign /
-/// decrypt 请求上都扫一遍纯属浪费；隔一分钟清一次就够，反正过期会话在查表
-/// 时本来也拿不到东西。
+/// 过期会话清理的节流间隔（1 分钟）。清理是 O(会话数)，不必每个 sign/decrypt
+/// 请求都扫一遍；过期会话在查表时本来也取不到。
 const PURGE_INTERVAL_MS: u64 = 60 * 1000;
-/// 一轮清理最多打几批。每批上限见 `statedb::DELETE_BATCH`，积压很多时靠多轮慢慢推。
+/// 一次清理最多执行几批删除。每批上限见 `statedb::DELETE_BATCH`；积压多时分多轮推进。
 const PURGE_BATCH_ROUNDS: usize = 5;
 
 static LAST_PURGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 「超上限但没东西可删」这条告警上次打的时间，用来自助限频。
+/// 「超上限但没有可淘汰会话」这条告警上次打印的时间，用于限频。
 static SESSION_CAP_REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Where server_keybox sessions (leaf private key + chain) are persisted so a
 /// relay restart does not orphan the A-side's `KeyMaterial::Remote` keys.
 /// The A-side allocates the session alias as an independent 128-bit random
-/// `ommega-remote-*` identity per remote key, but the private key lives here —
-/// if it is lost (e.g. a restart), the app's "use attestation key" flow cannot
-/// sign child certs and hangs.
+/// `ommega-remote-*` identity per remote key, but the private key lives here:
+/// if it is lost, the app's "use attestation key" flow cannot sign child
+/// certs and hangs.
 ///
 /// Sessions are keyed by the A-side's `ommega-remote-*` alias ALONE (not by
 /// device_id): the alias is independent of device_id. Keying by
-/// (device_id, alias) meant that any
-/// device_id change (or a B-side identity re-upload under a new id) orphaned
-/// every previously stored attestation key and forced a manual app reset. With
+/// (device_id, alias) would orphan stored attestation keys whenever the
+/// device_id changes or a B-side identity is re-uploaded under a new id. With
 /// alias-keying, a sign request for a known alias always resolves to the same
-/// leaf key — across server restarts, device_id changes and identity rotation.
+/// leaf key, across server restarts, device_id changes and identity rotation.
 ///
-/// 落盘在 `sessions` 表（见 `crate::statedb`）。旧的 `data/sessions.json` 只在库
-/// 里是空的时候导一次，导完原样留着当回滚源，之后不再往里写。
+/// 落盘在 `sessions` 表（见 `crate::statedb`）。`data/sessions.json` 只在库为空时
+/// 由 `statedb` 导入一次，之后不再写入，原样保留作回滚源。
 #[derive(Debug, Clone)]
 struct Session {
     chain_pem: String,
     leaf_key_pem: String,
-    /// 解析好的叶子私钥，惰性缓存。以前每次 sign/decrypt 都现 `parse_leaf_key`
-    /// （PEM 框架 + EC/RSA 大整数解码），高频时纯属白烧 CPU，而这整段时间都在
-    /// A 端那柄全局锁的占用窗口里。Arc 让 Session 被 clone 出去后仍共享同一份。
+    /// 解析好的叶子私钥，惰性缓存。`parse_leaf_key`（PEM 解码 + EC/RSA 大整数）
+    /// 开销大，且发生在 A 端全局锁的占用窗口内，因此只解析一次。Arc 让 Session
+    /// 被 clone 后仍共享同一份。
     cached_key: Arc<OnceLock<Arc<LeafKey>>>,
-    /// 落盘用的 Fernet 密文。构造时算一次、之后每轮写盘直接复用 —— 以前是
-    /// 每写一次盘就把表里所有会话重新加密一遍，几千条就是几百毫秒，还全程
-    /// 持着全局锁。
+    /// 落盘用的 Fernet 密文。`put_session` 构造时算一次，之后每次写盘直接复用，
+    /// 不重新加密。
     leaf_key_cipher: String,
     created_epoch_ms: u64,
-    /// 最后一次被取用的时间。TTL 和 LRU 都按它算：创建早不等于该丢，一直有人用
-    /// 的会话就得一直留着（B 端那把 `no key for alias` 就是这么坏的）。
+    /// 最后一次被取用的时间。TTL 和 LRU 都按它算，不按 `created_epoch_ms`：
+    /// 创建早但一直有人在用的会话必须保留。
     used_epoch_ms: u64,
 }
 
@@ -94,7 +91,7 @@ struct SessionFile {
     chain_pem: String,
     leaf_key_pem: String,
     created_epoch_ms: u64,
-    /// 老落盘格式没有这一列，读回来时缺省 0，由调用方拿创建时间顶上。
+    /// 缺省为 0；读回时由调用方用 `created_epoch_ms` 顶上（兼容缺这一列的旧行）。
     #[serde(default)]
     used_epoch_ms: u64,
 }
@@ -103,7 +100,7 @@ impl From<&Session> for SessionFile {
     fn from(s: &Session) -> Self {
         SessionFile {
             chain_pem: s.chain_pem.clone(),
-            // 非空由 put_session / From<SessionFile> 保证；万一走了别的路子才现加。
+            // 非空由 put_session / From<SessionFile> 保证；为空时在这里现加密兜底。
             leaf_key_pem: if s.leaf_key_cipher.is_empty() {
                 crate::crypto::encrypt_private_pem(&s.leaf_key_pem)
             } else {
@@ -141,7 +138,7 @@ impl Session {
             return Ok(k.clone());
         }
         let parsed = Arc::new(parse_leaf_key(&self.leaf_key_pem)?);
-        // 并发下可能别人先塞了，谁先谁算，反正同一份 PEM 解析结果一样。
+        // 并发下可能已被别人先写入；同一份 PEM 解析结果相同，谁先写入都行。
         let _ = self.cached_key.set(parsed.clone());
         Ok(self.cached_key.get().cloned().unwrap_or(parsed))
     }
@@ -161,11 +158,12 @@ pub struct Fulfill {
     attest_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// Cache of generated self-signed identities per (device_id, algorithm, level)
     /// so a device without a stored identity doesn't regenerate a fresh key (RSA
-    /// keygen is slow) on every attestation. 级别进键是因为链上标的级别不同。
+    /// keygen is slow) on every attestation. Level is part of the key because the
+    /// chain's declared security level differs.
     self_signed_cache: Mutex<HashMap<(String, String, i64), DeviceIdentity>>,
     pub db: Option<Arc<Db>>,
-    /// 要长期保留的状态全在这一个 SQLite 文件里（会话语义今天还是内存 map 权威，
-    /// 这里只做写穿 + 启动装载）。
+    /// 长期保留的状态都在这个 SQLite 文件里。内存 map 是会话的读写入口，这里负责
+    /// 写穿与启动装载。
     state: Arc<crate::statedb::StateDb>,
 }
 
@@ -175,7 +173,7 @@ impl Fulfill {
 
     pub fn new(enabled: bool, db: Option<Arc<Db>>) -> Arc<Self> {
         let state = crate::statedb::shared();
-        // 界面切过的值优先于启动配置：不然一次重启就又退回 .env 里的启动值（2026-10-17 踩过）。
+        // 持久化的值优先于启动配置：否则重启会退回 .env 里的启动值，而非界面设置。
         let enabled = match state.get_meta(Self::MODE_KEY) {
             Ok(Some(v)) => v == "1",
             Ok(None) => enabled,
@@ -221,8 +219,8 @@ impl Fulfill {
         now_ms.saturating_sub(s.used_epoch_ms) > SESSION_TTL.as_millis() as u64
     }
 
-    /// 内存只留「热」的一批（按最后使用从新到旧）。超出的从 map 里删掉就行 ——
-    /// 库里那条还在，下次真用到再按 alias 单查回来（见 `get_session`）。
+    /// 内存只保留最近使用的 `SESSION_MEMORY_HOT` 条。超出的从 map 移除，库里那条
+    /// 仍在，下次用到时按 alias 单查回来（见 `get_session`）。
     fn enforce_memory_cap(map: &mut HashMap<String, Session>) {
         while map.len() > crate::statedb::SESSION_MEMORY_HOT {
             let oldest = map
@@ -238,8 +236,7 @@ impl Fulfill {
         }
     }
 
-    /// 过期会话在库里也按条件删掉（原来得把 74 MB 整份重写一遍才删得掉）；
-    /// 顺手把库里的条数也按 LRU 压到上限。
+    /// 过期会话按条件从库里删掉，并把库里条数按 LRU 压到上限；不整表重写。
     fn purge_if_due(&self, map: &mut HashMap<String, Session>) {
         let now_ms = Utc::now().timestamp_millis() as u64;
         let last = LAST_PURGE.load(Ordering::Relaxed);
@@ -249,8 +246,8 @@ impl Fulfill {
         LAST_PURGE.store(now_ms, Ordering::Relaxed);
         map.retain(|_, s| !Self::session_expired_at(s, now_ms));
         let cutoff_ms = now_ms.saturating_sub(SESSION_TTL.as_millis() as u64) as i64;
-        // 单条 `DELETE` 已经限量（见 `statedb` 里的 `DELETE_BATCH`），所以这里多打几轮：
-        // 积压多的时候能往前推，但每轮都把活控制在小块里，不拿写锁一堵到底。
+        // 单条 `DELETE` 已按 `statedb::DELETE_BATCH` 限量，所以这里多打几轮推进积压；
+        // 每轮控制在小块内，避免长时间持有写锁。
         for _ in 0..PURGE_BATCH_ROUNDS {
             match self.state.delete_sessions_expired_before(cutoff_ms) {
                 Ok(0) => break,
@@ -277,8 +274,7 @@ impl Fulfill {
                 }
             }
         }
-        // 超上限但全是活跃会话时，上一行是 0 —— 得能看出来现在到底多少条。
-        // 隔一小时才报一次，不刷屏。
+        // 超上限但全是活跃会话时淘汰数为 0；这条告警打出当前条数，每小时最多一次。
         if let Ok(count) = self.state.session_count() {
             if count > cap
                 && now_ms.saturating_sub(SESSION_CAP_REPORTED.swap(now_ms, Ordering::Relaxed))
@@ -297,11 +293,11 @@ impl Fulfill {
         }
     }
 
-    /// 启动时从库里把「最近用过的」一批会话装进内存（过期的不装）。
+    /// 启动时从库里把最近用过的会话装进内存（过期的不装）。
     ///
-    /// 内存是热缓存、库是权威：只装 `SESSION_MEMORY_HOT` 条，冷的那批留在库里，
-    /// 取用时按 alias 单查（见 `get_session`）。旧的 `data/sessions.json` 由
-    /// `statedb` 导一次，这里只认库。
+    /// 内存是热缓存、库是权威：只装 `SESSION_MEMORY_HOT` 条，其余留在库里，取用时
+    /// 按 alias 单查（见 `get_session`）。`data/sessions.json` 只由 `statedb` 导入
+    /// 一次，这里只读库。
     fn load_sessions(&self) {
         let rows = match self
             .state
@@ -332,30 +328,26 @@ impl Fulfill {
         Self::enforce_memory_cap(&mut inner.sessions);
     }
 
-    /// 落一条会话：一条 INSERT。
-    ///
-    /// 原来是「把所有会话收集一遍、序列化、整份重写」—— 实测 11714 条 / 73.9 MB，
-    /// 而出证约 400 次/天，也就是 25~30 GB/天的写放大，就为了每条多出来的一行。
+    /// 落一条会话：单条 INSERT，不收集全表、不整份重写。
     fn persist_session(&self, alias: &str, session: &Session) {
         let row = crate::statedb::SessionRow {
             chain_pem: session.chain_pem.clone(),
-            // 密文在 put_session 算过一次，这里直接复用；万一没算过就现加。
+            // 密文在 put_session 算过一次，这里直接复用；未算过则现加密。
             leaf_key_pem: SessionFile::from(session).leaf_key_pem,
             created_epoch_ms: session.created_epoch_ms,
             used_epoch_ms: session.used_epoch_ms,
         };
         if let Err(e) = self.state.upsert_session(alias, &row) {
-            // 写不进去就等于重启后 A 端那些 `KeyMaterial::Remote` 的钥匙全废，
-            // 跟原来“静默丢文件”一样严重，所以是 error 不是 warn。
+            // 写失败会导致重启后 A 端 `KeyMaterial::Remote` 的密钥全部失效，所以用 error。
             tracing::error!("sessions: {alias} 没写进 state db：{e:#}");
         }
     }
 
-    /// 取一条会话：先内存热缓存，没命中再回库单查一条。
+    /// 取一条会话：先查内存热缓存，未命中再回库单查一条。
     ///
-    /// 库里热的那批在启动时装进内存；别的那批（长期没人用的）不占内存，用到
-    /// 了再查回来 —— 内存就永远顶不爆。取一次就把「最后使用」顶一下（内存每次
-    /// 都顶，库里节流到 `SESSION_TOUCH_MIN_MS`），TTL 与 LRU 都吃这个时间。
+    /// 热的那批在启动时装进内存，冷的那批不占内存、用到时再查回来。每次取用都会
+    /// 更新「最后使用」（内存每次都更新，库里按 `SESSION_TOUCH_MIN_MS` 节流），
+    /// TTL 与 LRU 都按这个时间算。
     fn get_session(&self, alias: &str) -> Option<Session> {
         let now_ms = Utc::now().timestamp_millis() as u64;
         let cached = {
@@ -410,8 +402,8 @@ impl Fulfill {
         Some(session)
     }
 
-    /// 忘掉一个 alias 的会话：B 端真机重新铸过同一个 alias（它那边才有对应的
-    /// 私钥），我们手里这条跟 App 拿到的叶证书就不是一对儿了，留着只会签错。
+    /// 忘掉一个 alias 的会话：B 端真机可能用同一 alias 重新铸过密钥（私钥在它那边），
+    /// 本地这条与 App 持有的叶证书不再配对，留着会签错。
     pub fn forget_session(&self, alias: &str) {
         let mut inner = crate::util::mu(&self.inner);
         inner.sessions.remove(alias);
@@ -422,7 +414,7 @@ impl Fulfill {
     }
 
     fn put_session(&self, alias: &str, mut s: Session) -> Session {
-        // 密文在这里算一次，之后每轮落盘都直接复用（见 persist_session）。
+        // 密文在这里算一次，之后每次落盘直接复用（见 persist_session）。
         s.leaf_key_cipher = crate::crypto::encrypt_private_pem(&s.leaf_key_pem);
         let now_ms = Utc::now().timestamp_millis() as u64;
         if s.created_epoch_ms == 0 {
@@ -450,11 +442,9 @@ impl Fulfill {
     /// A cancelled HTTP waiter cannot cancel its spawn_blocking worker: retries
     /// must wait for that worker and reuse its key instead of replacing it.
     ///
-    /// 但缓存**只在本级别内复用**。`want_level` 是这次请求的
-    /// `attestation_security_level`（1 = TEE、2 = StrongBox）：缓存的链级别和它
-    /// 对不上就丢掉重建。以前完全不看级别，同一个 alias 先出 TEE 再请求 StrongBox
-    /// 会直接复用那条 TEE 链 —— App 要 StrongBox 却拿到 TEE，级别就串了（实测
-    /// level=2 请求回来 `O=TEE`）。
+    /// 缓存只在同一安全级别内复用。`want_level` 是请求的
+    /// `attestation_security_level`（1 = TEE、2 = StrongBox）：缓存的链级别与它不符
+    /// 就丢掉重建，否则链的级别会与请求不符。
     fn session_or_generate(
         &self,
         alias: &str,
@@ -480,17 +470,17 @@ impl Fulfill {
             tracing::info!(
                 "session_or_generate: alias={alias} 缓存的链级别与请求级别 {want_level} 不符，重建"
             );
-            // 先丢掉旧的：put_session 的规则是「先发布的赢」，不删就写不进去。
+            // 先丢掉旧的：`put_session` 只保留先发布的那条，不删无法写入新链。
             self.forget_session(alias);
         }
         let session = self.put_session(alias, generate()?);
         Ok((session, true))
     }
 
-    /// 缓存的链和这次请求的级别对得上吗。
+    /// 缓存的链与请求的安全级别是否匹配。
     ///
-    /// 没标级别（软件链 / 自签链 / 老 keybox）按 TEE 算：这也是 AOSP 的语义，
-    /// 软件级证书不可能被当成 StrongBox。
+    /// 未标级别（软件链 / 自签链 / 老 keybox）按 TEE 处理：软件级证书不能被当成
+    /// StrongBox。
     fn session_level_matches(chain_pem: &str, want_level: i64) -> bool {
         let cached_strongbox = cert::chain_security_level(chain_pem) == Some(2);
         cached_strongbox == (want_level >= 2)
@@ -521,15 +511,15 @@ impl Fulfill {
 
     /// Lookup a stored identity for `(device_id, algorithm)`.
     ///
-    /// 顺序：`prefer_slot`（这次请求是被黑名单打下来的）时先槽位 `device-b-2`，
-    /// 再按请求的 device id；都不是就挑一条能用的（见 `identity_for_id` /
-    /// `get_any_usable_identity`）。serverbox 模式的正常流程和普通失败后的
-    /// 兜底回落都不传 `prefer_slot`，就是「先按请求的 id」。
+    /// 顺序：`prefer_slot` 为真（请求被黑名单打下来）时先取槽位 `device-b-2`，
+    /// 再按请求的 device id；都没有就挑一条能用的（见 `identity_for_id` /
+    /// `get_any_usable_identity`）。serverbox 正常流程和普通失败后的兜底都不传
+    /// `prefer_slot`，即「先按请求的 id」。
     ///
-    /// 身份按**设备**选、不按算法选。一台真设备的 EC / RSA 两条认证用的是同一份
-    /// keybox 链，两次各取一行不同身份会让中间证书 / 签发者不一样 —— 检测方报的
-    /// `hardware.attestation.algorithm_differential` 就是这么来的。叶子用哪种算法
-    /// 与签发者的密钥类型无关，一份身份可以同时铸 EC 和 RSA 叶子。
+    /// 身份按**设备**选、不按算法选：一台真设备的 EC / RSA 两条认证共用同一份
+    /// keybox 链，取到不同身份会让中间证书 / 签发者不一致（检测方会报
+    /// `hardware.attestation.algorithm_differential`）。叶子算法与签发者密钥类型
+    /// 无关，一份身份可以同时铸 EC 和 RSA 叶子。
     ///
     /// `algorithm` 只用在退一步的那条查询上（整台设备的行都不 active 时）。
     fn identity_for(
@@ -539,8 +529,8 @@ impl Fulfill {
         prefer_slot: bool,
     ) -> Option<DeviceIdentity> {
         if prefer_slot {
-            // 「这次请求是被黑名单打下来的」：先看自动源（public 采集）的专用槽位
-            // `device-b-2`，它没有才按请求里的设备 id 找。
+            // 被黑名单打下来的请求：先看自动源（public 采集）的槽位 `device-b-2`，
+            // 没有才按请求里的设备 id 找。
             if let Some(id) = self.identity_for_id(AUTO_PUBLIC_SLOT, algorithm) {
                 tracing::info!(
                     "server_keybox: device={device_id} 命中黑名单，先取槽位 {AUTO_PUBLIC_SLOT}（machine_id={}）",
@@ -552,8 +542,8 @@ impl Fulfill {
         if let Some(id) = self.identity_for_id(device_id, algorithm) {
             return Some(id);
         }
-        // 都没有就挑一条能用的顶上。自动采集的那些优先 —— 它们本来就是给所有设备
-        // 共用的；手动上传 / 真机自己传上来的那份是人家的真身份，只当最后手段。
+        // 都没有就挑一条能用的身份：自动采集的优先（它们本就供所有设备共用），
+        // 手动上传 / 真机上传的真身份只当最后手段。
         match self.db.as_ref()?.get_any_usable_identity() {
             Ok(Some(id)) => {
                 tracing::info!(
@@ -567,10 +557,10 @@ impl Fulfill {
         }
     }
 
-    /// 兜底：不看请求的 device id，按级别挑一条能用的身份。
+    /// 兜底：不看请求的 device id，按安全级别挑一条能用的身份。
     ///
-    /// 跟 `identity_for` 最后那一步的区别就是多了一道级别过滤 —— TEE 请求不能
-    /// 拿 StrongBox 的链，不然链上标的级别和请求对不上。
+    /// 比 `identity_for` 最后一步多一道级别过滤：TEE 请求不能拿 StrongBox 的链，
+    /// 否则链上标的级别与请求不符。
     fn identity_any_for_level(&self, want_strongbox: bool) -> Option<DeviceIdentity> {
         self.db
             .as_ref()?
@@ -579,8 +569,8 @@ impl Fulfill {
             .flatten()
     }
 
-    /// 按设备 id 找一份存下的身份：先不挑算法（一台设备的 EC / RSA 两条算法本来就
-    /// 共用同一份身份），再退到指定算法那条（处理整台设备的行都不 active 的情况）。
+    /// 按设备 id 找一份存下的身份：先不挑算法（一台设备的 EC / RSA 共用一份身份），
+    /// 再退到指定算法那条（处理整台设备的行都不 active 的情况）。
     fn identity_for_id(&self, device_id: &str, algorithm: &str) -> Option<DeviceIdentity> {
         let db = self.db.as_ref()?;
         if let Some(id) = db.get_any_device_identity(device_id).ok().flatten() {
@@ -818,12 +808,11 @@ impl Fulfill {
             .unwrap_or(1);
         p.security_level = att_sl;
         // Use device-provided versions if available; otherwise infer from the
-        // A-side's `os_version` (Android major * 10000). A chain whose
-        // attest_key (minted here) and sign_key (minted by the A-side software
-        // KeyMint) disagree on attestationVersion is flagged as a tampered
-        // attestation key, so the minted attest_key must carry the SAME KeyMint
-        // version the A-side reports for its local HAL. The old Django heuristic
-        // (200 for att_sl < 2) triggers VINTF mismatch on KeyMint 3.0+ devices.
+        // A-side's `os_version` (Android major * 10000). The minted attest_key
+        // must carry the SAME KeyMint version the A-side reports for its local
+        // HAL: a disagreement between attest_key and sign_key versions is
+        // flagged as a tampered attestation key. Do not fall back to 200 for
+        // att_sl < 2; that triggers a VINTF mismatch on KeyMint 3.0+ devices.
         let inferred_version =
             ctx.get("os_version")
                 .and_then(Value::as_i64)
@@ -845,19 +834,14 @@ impl Fulfill {
             .and_then(Value::as_i64)
             .unwrap_or(p.attestation_version);
 
-        // verified_boot_key / verified_boot_hash 应当是 32 字节。A 端没带、或者带过来的
-        // 解不出 32 字节时，用「设备 + 固定串」派生一个：**不能带时间戳**。
-        //
-        // 以前是按「设备 + 当前小时」派生，结果同一台设备换个小时出的链哈希就变了，
-        // 跟设备上任何固定属性都对不上（Duck 的 Boot consistency 直接拿证书里的
-        // verifiedBootHash 比 ro.boot.vbmeta.digest，必 mismatch）。现在同一设备永远
-        // 得到同一个值；正常路径是 A 端带上伪装参数解出来的哈希，直接用它。
-        // 兜底锚点：设备 ID + 当前小时。同一小时内算出来的值不变，
-        // 不会出现“每笔请求都不一样”那种一看就假的链。
+        // verified_boot_key / verified_boot_hash 必须是 32 字节。A 端没带、解不出
+        // 32 字节、或全零时，用「设备 + 用途 + 当前小时」派生一个 32 字节值：同一
+        // 小时内稳定，换小时 / 换设备 / 换用途就变。正常路径是 A 端伪装参数解出来的
+        // 哈希，直接用它。
         let stamp = crate::cert::current_hour_stamp();
         let stamp = stamp.as_str();
-        // 全零也当没传：A 端属性读不到时会发 32 字节全零，照收等于把「未签名 /
-        // 异常」的特征写进证书，Play Integrity 一看就拒。
+        // 全零也当没传：A 端属性读不到时会发 32 字节全零，照收会把「未签名 / 异常」
+        // 的特征写进证书，Play Integrity 会拒。
         let vb_key = match b64("verified_boot_key") {
             Some(k) if k.len() == 32 && k.iter().any(|b| *b != 0) => k,
             _ => boot_value_seed(device_id, "bootkey", stamp).to_vec(),
@@ -866,9 +850,8 @@ impl Fulfill {
             Some(h) if h.len() == 32 && h.iter().any(|b| *b != 0) => h,
             _ => boot_value_seed(device_id, "boothash", stamp).to_vec(),
         };
-        // 排障：A 端到底报了什么。Boot consistency 那类问题全看这一行。
-        // 只打哈希前 12 字节 + 锁定/状态，不拼字段名列表（那只是这次排障临时加的，
-        // 每笔 attest 都 collect 一遍 vec 不划算）。
+        // 排障：记录 A 端上报的 hash 前缀与锁定 / 启动状态。只打前 12 字节，不拼
+        // 字段名列表，避免每笔 attest 都 collect 一遍。
         tracing::info!(
             "parse_ctx: device={device_id} A 上报 hash={} locked={:?} state={:?}",
             hex_prefix(&vb_hash, 12),
@@ -909,8 +892,8 @@ impl Fulfill {
 
     /// 找出请求指定的那把「服务端自持」的证明密钥。
     ///
-    /// 返回 `Ok(None)` 表示这把 key 不在本端（在 B 端真机）—— 那时本层不该硬逞，
-    /// 交给下一层用真 TEE 签。
+    /// 返回 `Ok(None)` 表示这把 key 不在本端（在 B 端真机）：本层不处理，交给
+    /// 下一层用真 TEE 签。
     fn server_issuer(&self, ctx: &Value) -> anyhow::Result<Option<(String, String)>> {
         let Some(reference) = ctx.get("attestation_key") else {
             return Ok(None);
@@ -956,9 +939,9 @@ impl Fulfill {
         challenge: &[u8],
     ) -> anyhow::Result<(String, String)> {
         let params = self.parse_ctx(ctx, challenge, &identity.device_id);
-        // 一条链只能有一个级别标签。链里的 CA 是 TEE 就全 TEE，是 StrongBox 就全
-        // StrongBox；同时出现两种说明这份材料是拼的（比如 TEE 的中间 CA 配了
-        // StrongBox 的根），发出去就是一条自己矛盾的链。只留痕，不拦请求。
+        // 一条链只能有一个安全级别标签：CA 是 TEE 则全链 TEE，是 StrongBox 则全链
+        // StrongBox。同时出现两种（如 TEE 中间 CA 配 StrongBox 根）说明材料不一致，
+        // 发出去是自相矛盾的链；这里只记日志，不拦请求。
         let tagged = cert::chain_security_levels(&identity.certificate_chain_pem);
         if tagged.len() > 1 {
             tracing::warn!(
@@ -966,9 +949,9 @@ impl Fulfill {
                 identity.device_id
             );
         }
-        // 调用方带了证明密钥（App AttestKey 委派）：若那把 key 就在本服务端
-        // （serverbox 模式下的 session），就用它自己签发子证书；不在本端则交给
-        // 下一层（真机 B），**不**改用身份自带的签发密钥冒充。
+        // 调用方带了证明密钥（App AttestKey 委派）：那把 key 在本服务端
+        // （serverbox 模式的 session）时用它签发子证书；不在本端则交给下一层
+        // （真机 B），**不**改用身份自带的签发密钥冒充。
         let issuer = self.server_issuer(ctx)?;
         let want_level = params.security_level;
         let (session, generated) = self.session_or_generate(alias, want_level, || {
@@ -1016,10 +999,9 @@ impl Fulfill {
         let chain_pem = session.chain_pem;
         let new_leaf_key_pem = session.leaf_key_pem;
 
-        // 这份材料的形状是发出去就会被认出来的那种（老公开 keybox：中间证书
-        // subject 是 serialNumber 在前）——真机出链不会长这样。修不了（见
-        // `cert::RdnShape`），但日志里必须留下痕迹：客户端报
-        // `cloud.attestation.subject_rdn_order` 时，对着这行就能知道是哪条链。
+        // 旧公开 keybox 的链形状：中间证书 subject 里 serialNumber 在 title 之前
+        // （真机是 device-like）。`cert::RdnShape` 无法修正，但必须留日志：客户端报
+        // `cloud.attestation.subject_rdn_order` 时能定位到具体链。
         let shape = cert::chain_rdn_shape(&chain_pem);
         if shape.is_legacy() {
             tracing::warn!(
@@ -1155,10 +1137,10 @@ impl Fulfill {
             .get("device_attest_context")
             .cloned()
             .unwrap_or(Value::Null);
-        // 调用方指定了证明密钥，但本层没有那把密钥的 session（被淘汰、服务端重启
-        // 过、或那把钥匙根本在真机那层）：本层**不能**用别的签发密钥偷偷铸一张
-        // 普通链，那会让调用方的证明密钥和链脱钩。回一个带标记的错误，句柄层
-        // 直接把它交给 A，A 再映射成 InvalidKeyBlob 让应用作废重建。
+        // 调用方指定了证明密钥，但本层没有对应的 session（被淘汰、重启丢失，或钥匙
+        // 在真机那层）：本层**不能**改用别的签发密钥铸普通链，否则证明密钥与链脱钩。
+        // 返回带 `relay_error_kind` 标记的错误，句柄层交给 A，映射成 InvalidKeyBlob
+        // 让应用作废重建。
         if self.attest_issuer_missing(&ctx) {
             let alias = ctx
                 .get("attestation_key")
@@ -1176,17 +1158,17 @@ impl Fulfill {
             }));
         }
         let algorithm = Self::ctx_algorithm_str(&ctx);
-        // 控制台可以按安全级别钉死用哪份身份（StrongBox 一份、TEE 一份）。钉了就按钉的
-        // 来，不再看这次请求的是哪台 B（也不走「黑名单先看槽位」那条）。
+        // 控制台可按安全级别钉死身份（StrongBox 一份、TEE 一份）。钉死后按钉的来，
+        // 不看请求的 device_id，也不走「黑名单先看槽位」。
         let level = ctx
             .get("attestation_security_level")
             .and_then(Value::as_i64)
             .unwrap_or(1);
         let pinned = crate::identity_policy::device_for_level(level);
         let identity = if level >= 2 {
-            // StrongBox 只认控制台钉死的那份。没钉、或钉的那份不在库里，就报错——
-            // 不能退到 `identity_for` 的「随便一份能用身份」：那个池子里放的是源采集和
-            // 真机 TEE 的材料，链上标的是 TEE / 软件，拿到 level=2 的请求上就是级别串了。
+            // StrongBox 只认控制台钉死的那份；没钉或钉的不在库里就报错。不能退到
+            // `identity_for` 的「任一可用身份」：那个池子是源采集和真机 TEE 材料，链上
+            // 标的是 TEE / 软件，配 level=2 请求会造成级别不符。
             let Some(id) = pinned.as_deref() else {
                 tracing::warn!(
                     "server_keybox: level=2 请求没有钉死 StrongBox 身份，拒绝出链（请求 device={device_id}）"
@@ -1221,10 +1203,9 @@ impl Fulfill {
                 None => device_id,
             };
             let found = self.identity_for(lookup_id, &algorithm, prefer_slot && pinned.is_none());
-            // 兜底那一步（`get_any_usable_identity`）以前不看级别：库里同时有 TEE 和
-            // StrongBox 两份时，TEE 请求会拿到 StrongBox 的链，级别就串了。这里拦一道：
-            // 拿到的是 StrongBox 就不用它，换一份同级别（无标 / TEE）的；换不到就报错。
-            // 反方向也要拦：没标级别的链（软件链 / 自签链）绝不能配一把写着 StrongBox 的叶子。
+            // 兜底那一步（`get_any_usable_identity`）也要按级别过滤：拿到 StrongBox 而
+            // 请求是 TEE 时，换一份同级别（无标 / TEE）的；换不到就报错。
+            // 反方向同样要拦：没标级别的链（软件链 / 自签链）绝不能配写着 StrongBox 的叶子。
             let want_strongbox = level >= 2;
             let got_level = found
                 .as_ref()
@@ -1300,8 +1281,7 @@ impl Fulfill {
             .unwrap_or("")
             .to_string();
         let Some(s) = self.get_session(&alias) else {
-            // 别把整个 session 表打出来：线上几百条会话，每一条被 warn 一次就是几十 KB，
-            // 日志全被它撑满了（读日志时根本翻不动）。这里只要「内存里现在还热着几条」够定位。
+            // 不打印整个 session 表（几百条会话会撑满日志）；只记录内存中热会话的条数。
             let hot = self.inner.lock().map(|g| g.sessions.len()).unwrap_or(0);
             tracing::warn!(
                 "try_handle_sign: no session for device={device_id} alias={alias} hot_sessions={hot}"
@@ -1346,8 +1326,8 @@ impl Fulfill {
                 }))
             }
         };
-        // session 在（上面已命中），这里失败就不能再当「本层不适用」：一降级到设备层
-        // 只会拿到 `no key for alias`，把真正的原因（算法不支持 / 填充对不上）盖掉。
+        // session 已命中，签名失败不能当「本层不适用」降级：设备层只会返回
+        // `no key for alias`，掩盖真正原因（算法不支持 / 填充不匹配）。
         let sig = match sign_data(&key, &data, algorithm) {
             Ok(sig) => sig,
             Err(e) => {
@@ -1599,10 +1579,8 @@ fn parse_leaf_key(pem_data: &str) -> anyhow::Result<LeafKey> {
 
 /// A 端转发过来的 `algorithm` 串里带的摘要。
 ///
-/// 服务端这几条密钥是给 remote 模式兜底的，必须按**请求的真实算法**签/解：
-/// `NONEwithECDSA` 的输入本身就是摘要（再哈希一层验签必挂），`SHA384withRSA`
-/// 的 DigestInfo 前缀也跟 SHA-256 不一样。以前这里一律按曲线默认摘要算，
-/// 于是 `NONEwithECDSA` 与任何非 SHA-256 的请求都静默算错。
+/// 必须按**请求的真实算法**签 / 解：`NONEwithECDSA` 的输入本身就是摘要（再哈希
+/// 一层验签必挂），`SHA384withRSA` 的 DigestInfo 前缀也与 SHA-256 不同。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeafDigest {
     None,
@@ -1696,16 +1674,14 @@ fn sign_rsa_pkcs1(
 ) -> anyhow::Result<Vec<u8>> {
     use rsa::Pkcs1v15Sign;
     let sig = match digest {
-        // Sha1 的 `AssociatedOid` 要 sha1 crate 的 oid feature（Cargo.toml 已开）。
+        // Sha1 的 `AssociatedOid` 需要 sha1 crate 的 oid feature（Cargo.toml 已开）。
         LeafDigest::Sha1 => rk.sign(Pkcs1v15Sign::new::<Sha1>(), hashed),
         LeafDigest::Sha224 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha224>(), hashed),
         LeafDigest::Sha256 => rk.sign(Pkcs1v15Sign::new::<Sha256>(), hashed),
         LeafDigest::Sha384 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha384>(), hashed),
         LeafDigest::Sha512 => rk.sign(Pkcs1v15Sign::new::<sha2::Sha512>(), hashed),
-        // PKCS#1 v1.5 的 DigestInfo 必须标一个摘要；真机也不会用 NONE 走这条。
-        // DIGEST=NONE 的 PKCS#1 签名是「type-1 填充 + 裸模幂」，不能套任何 DigestInfo。
-        // 之前这里用 `new::<Sha256>()`，签出来的是「SHA-256 DigestInfo || data」，
-        // Java 的 NONEwithRSA 验签自然过不了（aprobe C03）。
+        // DIGEST=NONE 的 PKCS#1 签名是「type-1 填充 + 裸模幂」，不能套任何 DigestInfo，
+        // 否则 Java 的 NONEwithRSA 验签失败。
         LeafDigest::None => rk.sign(Pkcs1v15Sign::new_unprefixed(), hashed),
     }?;
     Ok(sig)
@@ -1726,9 +1702,8 @@ fn sign_rsa_pss(rk: &RsaPrivateKey, digest: LeafDigest, hashed: &[u8]) -> anyhow
     Ok(sig)
 }
 
-/// 按请求的算法解密。`PKCS1` / `NoPadding` / `OAEP` 三种都要认：
-/// 以前只实现了 OAEP，于是 `RSA/ECB/PKCS1Padding` 这条在服务端 keybox 层
-/// 直接失败、被当成"本层不适用"，最后落到设备层报 `no key for alias`。
+/// 按请求的算法解密，必须支持 `PKCS1` / `NoPadding` / `OAEP` 三种：
+/// `RSA/ECB/PKCS1Padding` 若落到设备层只会报 `no key for alias`。
 fn decrypt_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<Vec<u8>> {
     let up = algorithm.to_ascii_uppercase();
     let LeafKey::Rsa(rk) = key else {
@@ -1739,8 +1714,8 @@ fn decrypt_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<V
         return Ok(rk.decrypt(rsa::Pkcs1v15Encrypt, data)?);
     }
     if up.contains("NOPADDING") {
-        // 原始 RSA：m = c^d mod n，按模长补零输出。
-        // c 必须严格小于 n，否则是非法代表（A 端已经预拦，这里再兵一道）。
+        // 原始 RSA：m = c^d mod n，按模长左侧补零输出。
+        // c 必须严格小于 n，否则是非法代表（A 端已预拦，这里再校验一次）。
         use rsa::traits::{PrivateKeyParts, PublicKeyParts};
         let n = rk.n();
         let d = rk.d();
@@ -1766,8 +1741,8 @@ fn decrypt_data(key: &LeafKey, data: &[u8], algorithm: &str) -> anyhow::Result<V
     decrypt_oaep(rk, digest, mgf, data)
 }
 
-// 每档失败只盖写同一个 `last`、真正读在 match 之后，编译器会报 unused_assignments，
-// 这里就在函数上下方方便一下。
+// 每个分支只覆写同一个 `last`，真正读取在 match 之后；编译器会报
+// unused_assignments，因此用 `#[allow]` 放行。
 #[allow(unused_assignments)]
 fn decrypt_oaep(
     rk: &RsaPrivateKey,
@@ -1808,7 +1783,7 @@ fn decrypt_oaep(
         (LeafDigest::Sha512, _) => try_scheme!(last, sha2::Sha512, Sha256),
         (LeafDigest::None, _) => try_scheme!(last, Sha256, Sha1),
     }
-    // 老调用方没带算法串时按历史上能用的两种组合再兜一遍。
+    // 兜底再试两种常用组合，覆盖没带算法串的调用方。
     try_scheme!(last, Sha256, Sha256);
     try_scheme!(last, Sha256, Sha1);
     match last {
@@ -1826,11 +1801,10 @@ fn hex_prefix(bytes: &[u8], n: usize) -> String {
         .collect::<String>()
 }
 
-/// 按 (用途, 设备, 固定串) 派生一个 32 字节值。
+/// 按 (设备, 用途, 时间戳) 派生一个 32 字节值。
 ///
-/// 同一台设备永远得到同一个值（以前带小时时间戳，导致隔小时出的链哈希就变了，
-/// 跟设备上任何固定属性都对不上）。`kind` 把 boot key 和 boot hash 分开，
-/// 避免两者变成同一串。
+/// 同一设备、同一小时、同一用途得到同一个值；换小时 / 换设备 / 换用途就变。
+/// `kind` 把 boot key 与 boot hash 分开，避免两者相同。
 fn boot_value_seed(device_id: &str, kind: &str, stamp: &str) -> [u8; 32] {
     crate::cert::boot_value_seed(device_id, kind, stamp)
 }
@@ -2052,8 +2026,8 @@ mod tests {
         assert_eq!(fresh.leaf_key_pem, "fresh");
     }
 
-    /// 同一个 alias 换了安全级别就不能再复用：以前不看级别，App 要 StrongBox
-    /// 却拿到缓存的 TEE 链（实测 level=2 请求回来 `O=TEE`），级别就串了。
+    /// 同一个 alias 换了安全级别就不能复用：缓存级别与请求级别不符时必须重建，
+    /// 否则 App 要 StrongBox 却拿到缓存的 TEE 链。
     #[test]
     fn cached_session_is_rebuilt_when_the_level_changes() {
         let f = fulfill();
@@ -2170,8 +2144,8 @@ mod layer_crypto_tests {
         (sk.clone(), LeafKey::Ec(cert::EcKey::P256(sk.clone())))
     }
 
-    /// PKCS#1 v1.5 解密：以前这条完全没实现，`RSA/ECB/PKCS1Padding` 的请求在
-    /// 服务端 keybox 层直接失败、被当成"本层不适用"，最后落到设备层报 key_not_found。
+    /// PKCS#1 v1.5 解密：`RSA/ECB/PKCS1Padding` 请求必须在服务端 keybox 层成功，
+    /// 不能落到设备层报 key_not_found。
     #[test]
     fn pkcs1_decrypt_round_trips() {
         let (priv_key, leaf) = rsa_leaf();
@@ -2186,7 +2160,7 @@ mod layer_crypto_tests {
         assert_eq!(out, msg);
     }
 
-    /// OAEP 仍然可用（摘要 SHA-256 + MGF1 SHA-1，Java 的老组合）。
+    /// OAEP（摘要 SHA-256 + MGF1 SHA-1，Java 常用组合）必须可解密。
     #[test]
     fn oaep_decrypt_still_works() {
         let (priv_key, leaf) = rsa_leaf();

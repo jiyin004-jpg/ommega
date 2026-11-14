@@ -67,8 +67,8 @@ pub const QTI_INTERFACE: &str = "vendor.qti.hardware.soter.ISoter";
 /// 和新的 AIDL（跑 `/dev/binder`）。Android 13 以后厂商陆续搬到 AIDL，但过渡期
 /// 两种都可能有，所以这几个后端都要认。两个名字对不上别当成一家。
 ///
-/// 小米只在 HIDL 上出现过（`vendor.xiaomi.hardware.soterservice@1.0::ISoter`，天玑机
-/// 实测能签），没有对应的 AIDL 形态。
+/// 小米只有 HIDL 形态（`vendor.xiaomi.hardware.soterservice@1.0::ISoter`）天玑机
+/// 没有对应的 AIDL 实现。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Trustonic,

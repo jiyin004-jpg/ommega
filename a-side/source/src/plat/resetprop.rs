@@ -237,8 +237,8 @@ pub fn read_string_property(name: &str) -> Option<String> {
     // 链接的进程里拿不到（返回 Err，被 `.ok()` 吞掉后静默走进兼容回退，于是证书就
     // 用了开机快照而不是当前属性）。
     //
-    // 退回模块自带的 resetprop：它在同一台设备上实测能读到实时值（`resetprop <name>`
-    // 打印当前值），而且就住在 `/data/adb` 下，keymint 一定 exec 得动。
+    // 退回模块自带的 resetprop：它能读到实时值（`resetprop <name>` 打印当前值），
+    // 而且就住在 `/data/adb` 下，keymint 一定 exec 得动。
     read_property_via_resetprop(name)
 }
 

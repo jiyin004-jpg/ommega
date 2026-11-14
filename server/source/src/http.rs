@@ -1,8 +1,7 @@
 //! 走系统 curl 取 HTTP 文本。
 //!
-//! 为什么不用 reqwest：这个机房里的 reqwest（rustls）过不了 Cloudflare 的 bot 检查，
-//! 会一直挂到超时；curl 每次都是秒回。另外这台机器有些域名只解析出 IPv6，而它的
-//! IPv6 是不通的 —— curl 会自己退回 IPv4，reqwest 不会。
+//! 不用 reqwest：这里 rustls 过不了 Cloudflare 的 bot 检查、会一直挂到超时，
+//! 而且它不像 curl 那样在域名只解析出 IPv6（又走不通）时退回 IPv4。
 //!
 //! `-f` 是让 404/403 直接算失败：不然拿回来的是一张错误页，照样被当成正文往下解析。
 

@@ -220,11 +220,10 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
     }
 }
 
-/// app 域那份日志是好几个 uid 共用的：SOTER HAL 是 system(1000)、SOTER 宿主在某些
-/// 机型上是 system、在一加 PLC110 上是 u0_a292(10292)。谁先起来谁建文件，权限按各自
-/// 的 umask 来（HAL 的 umask 是 0077，建出来就是 0600），后面那个连开都开不了。
-/// 建完就把它放开成 0666，目录也跟着放开 —— 只动这第二个位置，keystore 那个
-/// 0660 keystore:keystore 的目录保持原样。
+/// app 域那份日志是好几个 uid 共用的：SOTER HAL 是 system(1000)、SOTER 宿主可能是
+/// system 也可能是普通应用 uid。谁先起来谁建文件，权限按各自 umask 来（HAL 是 0077，
+/// 建出来就是 0600），后面那个连开都开不了。建完就放开成 0666，目录也跟着放开
+/// —— 只动这第二个位置，keystore 那个 0660 keystore:keystore 的目录保持原样。
 fn loosen_app_domain_path(path: &str) {
     if path != APP_DOMAIN_LOG_PATH {
         return;

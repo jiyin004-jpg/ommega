@@ -54,7 +54,7 @@ impl LockedRotatingFileAppender {
         let _ = fs::remove_file(suffixed_path(&path, ".lock"));
         // 这里就把文件开掉，不等到第一条日志：调用方拿这个 Result 判断“这个位置
         // 到底写不写得动”（SOTER 宿主是 uid 1000，进不去 keystore 那个 0770 目录），
-        // 如果拖到 append 才发现，那就没机会换别的路径了。
+        // 拖到 append 才发现就没机会换路径了。
         let file = Self::open_log_file(&path)?;
         Ok(Self {
             path,
@@ -65,11 +65,9 @@ impl LockedRotatingFileAppender {
     }
 
     fn open_log_file(path: &Path) -> io::Result<File> {
-        // 先直接开，开不动再说建目录的事。以前是先 `create_dir_all` 再开，看着更
-        // 保险，其实反过来：目录一般都在，而 `create_dir_all` 在“目录已存在但自己
-        // 对它没有 getattr”的域里（SOTER 宿主、SOTER HAL 就是，日志目录是 system
-        // 的、标签还是 system_app_data_file）会返回 EEXIST —— 那个 `?` 一挂，整个
-        // appender 就建不起来，本地日志整条哑掉，还只 eprintln 一句没人看的话。
+        // 先直接开，开不动再建目录：目录一般都在，而 `create_dir_all` 在“目录已存在
+        // 但对它没有 getattr”的域里（SOTER 宿主 / SOTER HAL，日志目录是 system 的、
+        // 标签 system_app_data_file）会返回 EEXIST，一挂 appender 就建不起来。
         let open = || OpenOptions::new().create(true).append(true).open(path);
         let file = match open() {
             Ok(file) => file,
@@ -222,9 +220,8 @@ impl Drop for FileLockGuard {
     }
 }
 
-/// Builds a file-only log4rs config.  A 端不再有第二个落点：以前这里还会往
-/// stdout 挂一个 console appender，但那条线要么进了管理器的 service 日志（一样
-/// 算系统日志），要么在 app 域里根本没人看，索性全部去掉，日志只落文件。
+/// Builds a file-only log4rs config.  A 端日志只落文件，不挂 console appender：
+/// 那条线要么进了管理器的 service 日志，要么在 app 域里没人看。
 ///
 /// 第二个返回值是“文件 appender 到底装上没有”：目标进程没权限打开日志目录时
 /// （SOTER 宿主是 uid 1000，日志目录是 0770 keystore），这里不报错，而是把

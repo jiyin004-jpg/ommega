@@ -1,7 +1,6 @@
 //! 拿设备上现成的 HIDL 服务验一下 HIDL 传输层这半边。
 //!
-//! 这台机器上没有 HIDL 版 SOTER（全 AIDL），所以用一个无论如何都在的服务
-//! `android.hidl.allocator@1.0::IAllocator/ashmem` 来验两件事：
+//! 用一个无论如何都在的服务 `android.hidl.allocator@1.0::IAllocator/ashmem` 验两件事：
 //!
 //! 1. `IServiceManager::get(fqName, instance)` 那笔事务编对了 —— 能换回一个句柄；
 //! 2. 换回来的句柄真能用 —— 拿它发一笔 `IBase::ping()`。

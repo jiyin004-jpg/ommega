@@ -1,12 +1,10 @@
-//! A 端 SOTER 接替转发的客户端半边：把 HAL 调用交给 daemon，把它的结论翻成本地那套
-//! `Answer`。
+//! A 端 SOTER 接替转发的客户端半边：把 HAL 调用交给 daemon，把它的结论翻成本地 `Answer`。
 //!
-//! 开关（WebUI 的「是否远程」/ `local_hw`）由 daemon 读 —— 宿主是 uid 1000，那份配置在
-//! 0770 的 keystore 目录里，我们打不开（`debug_logging` 就是为此另做了一份 `log_flag`
-//! 副本）。所以这里只认 daemon 回的三种结论，blob 布局见 `kmr_common::soter_relay`。
+//! 开关（WebUI 的「是否远程」/ `local_hw`）由 daemon 读：宿主是 uid 1000，打不开 0770 的
+//! keystore 目录。这里只认 daemon 回的三种结论，blob 布局见 `kmr_common::soter_relay`。
 //!
-//! 拿不到结论（老版本 daemon、daemon 挂了、答复形状不认识）一律退回本地自签：那是接线
-//! 之前的行为，也是唯一不会把宿主坑在「等一笔永远不来的答复」上的退路。
+//! 拿不到结论（老版本 daemon、daemon 挂了、形状不认识）一律退回本地自签，绝不能让宿主
+//! 等一笔永远不来的答复。
 
 use kmr_common::soter_relay::{self, Outcome};
 use log::debug;
@@ -33,10 +31,9 @@ pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
 
 /// 问 daemon 这笔该怎么答。
 ///
-/// 只能由 daemon 决定走真机、服务端还是本地兜底 —— 它才是看「远程 keymint」开关和
-/// 真应用名单的那一方（宿主读不到上那份 0770 的配置）。所以**问不到的时候不能默认
-/// 本地**：白名单内的真应用本该由 B 签，一旦这里偷偷拿 A 端自己的料签，同一轮里
-/// `cpu_id` 和密钥就会一半来自 A、一半来自 B（检测器的 C5b / T10 就是这么红的）。
+/// 走真机、服务端还是本地兜底只能由 daemon 决定：只有它看得到「远程 keymint」开关和真
+/// 应用名单。所以**问不到的时候不能默认本地** —— 白名单内的真应用本该由 B 签，一旦这里
+/// 用 A 端自己的料签，同一轮里 `cpu_id` 和密钥就会一半来自 A、一半来自 B。
 fn resolve(call: &SoterCall) -> Outcome {
     let Some(request) = request(call) else {
         // 号码不在转发表里（空号、app 侧那套号码）：老规矩，本地能答就本地答。
@@ -70,10 +67,8 @@ fn resolve(call: &SoterCall) -> Outcome {
 
 /// 只读 op 的缓存槽名；写 op / 签名类返回 `None`（同时意味着要清缓存）。
 fn cache_slot(call: &SoterCall) -> Option<String> {
-    // 1.7.4 加的只读 op 本地缓存先关掉：微信开通一轮里会反复问 has_ask_already /
-    // export_ask_public_key，而它自己又在清场重建。缓存把「清场前那把 ASK」多续三秒，
-    // 微信拿到的一直是旧钥匙，比不过就再清一轮 —— 表现就是建了立刻删。
-    // 1.7.3 没有这个缓存，先回到那个行为。
+    // 缓存整体关掉：微信开通一轮会反复问 has_ask_already / export_ask_public_key，而它自己
+    // 又在清场重建，缓存会把清场前那把 ASK 多续三秒，于是建了立刻删。
     let _ = call;
     return None;
     #[allow(unreachable_code)]
@@ -140,15 +135,15 @@ fn cache_clear() {
 
 /// 拼 daemon 要的 JSON。号码不在转发表里返回 `None`（不转发）。
 ///
-/// `uid` / `session` 是数字，`alias` / `challenge` 是字符串；`challenge` 原样传宿主给的
-/// 那个十六进制串，服务端/B 端会直接写进 HAL 的 String16，**不要**在这边解码（只有本地
-/// 兜底那条路才需要 hex 解码）。哪些号码带哪些参数由 `soter::parse` 定，这里照抄。
+/// `uid` / `session` 是数字，`alias` / `challenge` 是字符串；`challenge` 按宿主给的十六进制
+/// 串原样透传，服务端/B 端直接写进 HAL 的 String16，**不要**在这边解码。哪些号码带哪些
+/// 参数由 `soter::parse` 定，这里照抄。
 fn request(call: &SoterCall) -> Option<String> {
     request_with_table(call, None)
 }
 
-/// 拼 JSON 的本体。`table` 是给测试的假 uid→包名 表；`None` 表示读真表，并允许退回前台
-/// 应用兜底（测试那条路不碰真文件，也不拿前台应用顶替）。
+/// 拼 JSON 的本体。`table` 是给测试的假 uid→包名 表；`None` 表示读真表（测试走假表，
+/// 不碰真文件）。
 fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
     let op = soter_relay::op_for_code(call.code)?;
     let mut out = String::from("{\"op\":");
@@ -169,17 +164,10 @@ fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
         out.push_str(",\"session\":");
         out.push_str(&session.to_string());
     }
-    // 真调用者是谁（App 侧事务头里内核填的 sender_euid）。取不到就不带：daemon 翻不出
-    // 包名、服务端就退回别名/槽位那套老判据，跟旧 payload 一个样。
-    //
-    // 包名也在这边自己翻一份带上。为什么在这边翻：实测有的机器（小米那台）SOTER 根本不走
-    // daemon 那段转发（daemon 侧的翻名代码一次都没跑到），服务端就一直收到 `caller_pkg=-`、
-    // 认不出这是真应用。表是 root 侧 daemon-injector 写的世界可读副本，宿主域读得到。
-    //
-    // 查表只认 `caller_uid`（内核填的 sender_euid，伪造不了），**不认请求里的 `uid`** ——
-    // 那个是应用自己填的参数，探测机（春秋/鸭子）故意填假 uid 试我们，拿它翻名就会把假 uid
-    // 撞上的那个包当成真调用者，服务端可能因此把探测机当真应用派给真机。取不到 caller_uid
-    // 就不带包名，跟旧 payload 一个样。
+    // `caller_uid` 是 App 侧事务头里内核填的 sender_euid，伪造不了；查表只认它，**不认请求
+    // 里的 `uid`** —— 那是应用自己填的参数，探测机会故意填假 uid，拿它翻名就会把假 uid 撞
+    // 上的那个包当成真调用者。包名在这边翻一份带上：表是 root 侧 daemon-injector 写的世界
+    // 可读副本，宿主域读得到。取不到 caller_uid 就不带，服务端退回别名/槽位那套老判据。
     if let Some(uid) = call.caller_uid {
         out.push_str(",\"caller_uid\":");
         out.push_str(&uid.to_string());
@@ -196,11 +184,9 @@ fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
             push_json_string(&mut out, &pkg);
         }
     } else if let Some(uid) = call.uid.filter(|uid| *uid > 0) {
-        // 没有内核给的 sender_euid：我们接管的是 HAL 层，到这里调用方已经是
-        // soterserver（系统进程），App 的身份早就不在 binder 头里了。只能拿 SOTER 参数
-        // 里那个 uid（App 自己填的）翻一把。它**不可信** —— 探测机（春秋/鸭子）故意填
-        // 假 uid —— 所以必须带 `caller_pkg_src=arg`：服务端只拿它做负向判断（包名不在
-        // 真应用白名单就服务端作答、不落 B），绝不用它放行真机。
+        // 没有内核给的 sender_euid：接管的是 HAL 层，到这里调用方已经是 soterserver，App
+        // 身份早不在 binder 头里。只能拿 SOTER 参数里那个 uid（App 自己填的，探测机会伪造），
+        // 所以必须带 `caller_pkg_src=arg`：服务端只拿它做负向判断，绝不用它放行真机。
         let pkg = match table {
             Some(table) => lookup_in_table(table, uid as u32),
             None => caller_package_for_uid(uid as u32),
@@ -219,21 +205,17 @@ fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
     Some(out)
 }
 
-/// root 侧（`daemon-injector`）写的世界可读副本：一行 `<uid> <包名>`。
-///
-/// 为什么不用那个 0770 的 keystore 目录：宿主域（指纹进程/应用）打不开它。
+/// root 侧（`daemon-injector`）写的世界可读副本：一行 `<uid> <包名>`。不用 0770 的
+/// keystore 目录，因为宿主域（指纹进程/应用）打不开它。
 const UID_TABLE_FALLBACK: &str = "/data/misc/ommega/uid_packages";
 /// 表只在装/卸应用时变，缓存一分钟；前台那份短一点，别拿刚才那个应用去顶现在这笔。
 const UID_TABLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `uid` → 包名（共享 uid 会好几个，逗号连起来）。表里没有就返回 `None`。
 ///
-/// 不在这一层套前台应用：以前翻不到就套一个当前前台应用的名字带上去，而 daemon 那边
-/// 看到「已经有 caller_pkg」就不自己翻了——于是前台恰好是别的 App 时，真应用被判成
-/// 探测机（实测 SoterChecker 被当成 bin.mt.plus / com.tencent.mobileqq）。
-///
-/// 前台应用作为兜底保留，但只放在 daemon 那条链的最后一级（它那边能看到更多：AAID
-/// 服务、packages.list、多用户/分身号），本层拿不到就不带，让 daemon 继续试。
+/// 这一层不套前台应用兜底：daemon 看到已经有 `caller_pkg` 就不再自己翻，前台恰好是别的
+/// App 时真应用会被安上别人的包名。前台兜底只放在 daemon 那条链的最后一级（它能看到
+/// AAID 服务、packages.list、多用户/分身号），本层拿不到就不带，让 daemon 继续试。
 fn caller_package_for_uid(uid: u32) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<Option<(std::time::Instant, String)>>> = OnceLock::new();
@@ -268,12 +250,7 @@ fn lookup_in_table(table: &str, uid: u32) -> Option<String> {
     }
 }
 
-/// 前台应用兜底只在 daemon 那边做（`src/soter_relay.rs` 的第三级）。这一层不再走：
-/// 以前它翻不到 uid 就拿前台应用的名字当 caller_pkg 发出去，而 daemon 看到已经有值就
-/// 不自己翻了——前台恰好是别的 App 时，真应用被安上别人的包名（实测 SoterChecker 被
-/// 当成 bin.mt.plus / com.tencent.mobileqq），整轮退回本地。
-///
-/// `/data/misc/ommega/foreground` 那份副本也不再读，留给 daemon 用。
+/// 把字符串写成 JSON 字面量：转义引号、反斜杠和所有控制字符。
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
     for c in value.chars() {

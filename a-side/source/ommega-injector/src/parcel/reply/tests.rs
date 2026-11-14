@@ -228,7 +228,7 @@ fn a_return_value_slot_in_the_init_reply_makes_the_host_read_a_null_session() {
     // 第一个 i32 就是那个错误码 —— 成功的时候它恰好吃到 0，于是整个 parcelable 被判成
     // null；soterserver 里 `if (initSign != null)` 不成立，`SoterSessionResult` 留在默认值
     // （resultCode = 0、session = 0）交回微信，微信拿 0 去 finishSign，又被它自己那句
-    // `if (j == 0) resultCode = -204;` 挡下。当初「能按指纹、开通失败」就是这么来的。
+    // `if (j == 0) resultCode = -204;` 挡下，开通就失败。
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok)).unwrap();
     parcel.write(&0i32).unwrap();
@@ -259,9 +259,9 @@ fn a_qti_soter_buffer_reply_reads_back_the_way_the_host_reads_it() {
     assert_eq!(return_code, 0);
     let non_null: i32 = parcel.read().unwrap();
     assert_eq!(non_null, 1);
-    // 剩下那块得交给 Java 的 createByteArray：rsbinder 的 Vec<u8> 读法跟它不一样
-    // （试过，报 NotEnoughData），所以只断言游标确实落在 SoterBufferReturn 开头、
-    // 剩余长度也对：4(总长) + 4(array 长) + 200 + 4(dataLength)。
+    // 剩下那块得交给 Java 的 createByteArray：rsbinder 的 Vec<u8> 读法跟它不一样，
+    // 所以只断言游标确实落在 SoterBufferReturn 开头、剩余长度也对：
+    // 4(总长) + 4(array 长) + 200 + 4(dataLength)。
     assert_eq!(
         parcel.data_avail(),
         4 + 4 + ((payload.len() + 3) & !3) + 4,

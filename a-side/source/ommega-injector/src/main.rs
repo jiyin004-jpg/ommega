@@ -24,33 +24,27 @@ pub use ommega::{android, top, vendor};
 
 /// 主目标：KeyMint 的客户端进程，这个注不进去就算启动失败。
 const KEYSTORE_PROCESS: &str = "keystore2";
-/// SOTER 的宿主进程：App 的 SOTER 调用都是它转成对 HAL 的调用发出去的，
-/// hook 得在它进程里才认得到那条 transaction。它是附加目标，没在跑也不影响主路。
+/// SOTER 的宿主进程：App 的 SOTER 调用由它转成对 HAL 的调用，hook 必须装在它进程里
+/// 才能看到那条 transaction。附加目标，没在跑不影响主路。
 const SOTER_HOST_PROCESS: &str = "com.tencent.soter.soterserver";
-/// SOTER HAL 的进程名。宿主把 app 的 SOTER 调用转成对它的调用，所以注上它就能
-/// 看见直接打到 HAL 的那条路（`service call` 绕开宿主，只有注进 HAL 才有反应）。同样是
-/// 附加目标，没在跑只记一条日志。
-///
-/// 各家 HAL 的进程名不一样，摆一起挨个试：高通是 `vendor.qti.hardware.soter-service`，
-/// 联发科走 Trustonic 那套的叫 `vendor.trustonic.soter@1.0-service`（一加 PLC110 实测，
-/// 它上面根本没有高通那个进程），小米是个单独的 HIDL 服务，按 HIDL 的老规矩叫
-/// `vendor.xiaomi.hardware.soterservice@1.0-service`。一个都没匹配上也不当事 ——
-/// 宿主那条路（app → 宿主 → HAL）本来就在宿主进程里，这条只为了 `service call` 那种
-/// 绕开宿主直接打 HAL 的流量。
+/// SOTER HAL 的进程名，逐个尝试：注上它才能看见绕过宿主直接打 HAL 的流量
+/// （`service call` 不经过宿主）。附加目标，没在跑只记一条日志。
+/// 各家名字不同：高通 `vendor.qti.hardware.soter-service`，联发科（Trustonic）
+/// `vendor.trustonic.soter@1.0-service`，小米
+/// `vendor.xiaomi.hardware.soterservice@1.0-service`。
+/// 一个都没匹配上不影响宿主那条路（app → 宿主 → HAL）。
 const SOTER_HAL_PROCESSES: [&str; 5] = [
     "vendor.qti.hardware.soter-service",
-    // 高通的 HIDL 版：进程名带 `@1.0`，跟上面那个不带版本的 AIDL 服务并存于不同
-    // 平台。PGP110 / Android 15 就是这种（vendor_hal_soter_qti 域）。
+    // 高通的 HIDL 版：进程名带 `@1.0`，与上面不带版本的 AIDL 服务按平台二选一。
     "vendor.qti.hardware.soter@1.0-service",
     "vendor.trustonic.soter@1.0-service",
     "vendor.xiaomi.hardware.soterservice@1.0-service",
     "vendor.microtrust.hardware.soter@1.0-service",
 ];
 
-/// 已经注过的目标不要再注第二遍：payload 是同一个可执行文件，dlopen 第二次就是第二份
-/// 代码、各自一套全局状态，两边的初始化会互相扯（实测往已经注过的 SOTER 宿主再注一次，
-/// 目标进程直接 SIGABRT）。判据是目标里有没有我们自己的线程名 —— 这名字是 payload 起来
-/// 之后自己起的，跟注入走的是文件还是 memfd、标识符叫什么都不相干。
+/// 已注过的目标不能再注第二遍：重复 dlopen 会得到第二份代码与全局状态，初始化互相
+/// 干扰并可能导致 SIGABRT。判据是目标进程里有没有下面这些 payload 自己起的线程名，
+/// 与注入方式（文件或 memfd）无关。
 const PAYLOAD_THREAD_NAMES: [&str; 3] = ["injector-config", "ommega-mirror-r", "ommega-binder-p"];
 
 fn payload_thread_names_match(name: &str) -> bool {
@@ -67,11 +61,9 @@ fn payload_thread_present(pid: i32) -> bool {
     })
 }
 
-/// 自检要打的目标。宿主取 HAL 用的就是这些名字，一个接口一个实例。
-///
-/// 高通是 `vendor.qti.hardware.soter-service` 那个进程、服务名不带版本；联发科走
-/// Trustonic 那套（一加 PLC110 实测），服务名里嵌着版本、接口描述符也不同。摆一起
-/// 挨个试：在 ServiceManager 里查不到的会直接报错退出，不碍事。
+/// 自检要打的目标，一个接口一个实例，与宿主取 HAL 用的名字一致。
+/// 高通的服务名不带版本；联发科（Trustonic）服务名内嵌版本、接口描述符也不同。
+/// 在 ServiceManager 里查不到的会直接报错，不影响其它目标。
 const SOTER_HAL_CANDIDATES: [(&str, &str); 2] = [
     (
         "vendor.qti.hardware.soter.ISoter/default",
@@ -105,8 +97,8 @@ fn in_keystore2_host() -> bool {
         .unwrap_or(false)
 }
 
-/// 进程内 KeyMint 的开关：默认开，`/data/misc/ommega/inproc` 写 `0` 才关（回到走 RPC
-/// 的那套：单独一个 HAL 进程）。留这个开关是为了出事能一条命令退回去。
+/// 进程内 KeyMint 的开关：默认开，`/data/misc/ommega/inproc` 写 `0` 才关，回退到
+/// 独立 HAL 进程走 RPC 的旧路径。
 fn inproc_keymint_enabled() -> bool {
     match std::fs::read_to_string("/data/misc/ommega/inproc") {
         Ok(text) => text.trim() != "0",
@@ -114,13 +106,10 @@ fn inproc_keymint_enabled() -> bool {
     }
 }
 
-///
-/// 为什么非得自己造：宿主平时根本没人喊 —— 淘宝和 QQ音乐只 bind 上、从不调用，
-/// 宿主自己的 Java 日志一条都没有。没有流量，`parse_write_buffer` 里那个
-/// `observe` 就等于没被跑过，后面拦截那块改起来没法验。
-///
-/// 起独立线程、还先睡一会儿：这条调用的 ioctl 本身就是被 hook 的，跑在 `entry`
-/// 的栈上等于 hook 还没装完就自己撞自己。
+/// 自检流量必须自己造：宿主平时没有真实调用（app 只 bind 不调用），没有流量
+/// `parse_write_buffer` 的 `observe` 分支就跑不到。
+/// 用独立线程并先 sleep 2s：这条调用的 ioctl 本身被 hook，在 `entry` 栈上执行
+/// 会在 hook 装完之前撞到自己。
 fn spawn_soter_selfcheck() {
     let thread = std::thread::Builder::new()
         .name("soter-selfcheck".to_string())
@@ -140,23 +129,17 @@ fn spawn_soter_selfcheck() {
     }
 }
 
-/// 给 write 侧那套拦截造一次真流量。
-///
-/// 这里**必须**走 libbinder_ndk，不能图省事用 rsbinder：rsbinder 是纯 Rust 自己
-/// 实现对 /dev/binder 的 ioctl，不引用 libbinder.so，而我们 hook 打在 libbinder*
-/// .so 的 ioctl GOT 上，所以 rsbinder 发出去的调用绕过了 hook。之前用 rsbinder
-/// 跑出来的 code=0 是真实 HAL 回的，当成"拦截生效"是错的。
+/// 给 write 侧拦截造一次真实流量。
+/// 必须走 libbinder_ndk：rsbinder 直接对 /dev/binder 做 ioctl、不引用 libbinder.so，
+/// 会绕过打在 libbinder*.so ioctl GOT 上的 hook（code=0 是真实 HAL 回的响应）。
 fn soter_selfcheck_transact(service: &str, interface: &str) -> anyhow::Result<i32> {
     crate::hook::soter_ndk::transact(service, interface, SOTER_HAL_GET_DEVICE_ID)
         .map_err(|error| anyhow::anyhow!(error))
 }
 
-/// 扫 `/proc` 找 SOTER HAL 进程：cmdline 里含 `soter`、但不是腾讯的宿主进程。
-///
-/// HAL 进程名各家不一样（`vendor.qti.hardware.soter-service`、
-/// `vendor.qti.hardware.soter@1.0-service`、`vendor.trustonic.soter@1.0-service`……），
-/// 靠硬编码列表总有遗漏。这里直接按实际在跑的进程认，认出来的名字拿去走
-/// `inject_named_process`，跟硬编码列表里那些名字是同一套比对逻辑。
+/// 扫 `/proc` 找 SOTER HAL 进程：cmdline 含 `soter` 且不是腾讯宿主。
+/// HAL 进程名各家不同（`vendor.qti.hardware.soter-service`、
+/// `vendor.trustonic.soter@1.0-service` 等），硬编码列表不全，故按运行中进程动态发现。
 fn discover_soter_hal_processes() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -178,10 +161,9 @@ fn discover_soter_hal_processes() -> Vec<String> {
         };
         let text = String::from_utf8_lossy(&raw).replace('\0', " ");
         let lower = text.to_ascii_lowercase();
-        // 含 soter，但排除三类自己人：
-        //   soterserver —— 腾讯那个宿主（`SOTER_HOST_PROCESS`，上面已经单独注了）
-        //   soterta-serve / soterta-ta —— 我们自己的守护（cmdline 也带 soter，
-        //     不排掉就会把自己当成 HAL 目标去注，实测会拦下）
+        // 含 soter，但排除自己人：soterserver（腾讯宿主，已单独注入）、
+        // soterta-serve / soterta-ta（自家守护）、ommega-inject（自身），
+        // 否则会把自己当成 HAL 目标注进去。
         if !lower.contains("soter")
             || lower.contains("soterserver")
             || lower.contains("soterta-serve")
@@ -190,9 +172,8 @@ fn discover_soter_hal_processes() -> Vec<String> {
         {
             continue;
         }
-        // 我们自己的进程现在是 memfd + 伪装成厂商 HAL 的名字（daemon / HAL / 软件 TA），
-        // cmdline 和 comm 看着就是 `/vendor/...` 的服务，不排掉会把自己当目标注进去。
-        // 真 HAL 的 exe 是 /vendor 下的真文件，不会指向 memfd。
+        // 自家进程由 memfd 承载并伪装成 `/vendor/...` 服务，按 exe 指向 /memfd: 排除；
+        // 真 HAL 的 exe 是 /vendor 下的真实文件。
         let self_memfd = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map(|path| path.to_string_lossy().starts_with("/memfd:"))
             .unwrap_or(false);
@@ -202,9 +183,8 @@ fn discover_soter_hal_processes() -> Vec<String> {
         let Some(name) = utils::process_name(pid) else {
             continue;
         };
-        // 光看名字带 soter 不够：检测器自己的包名就带（`com.andrealyz.soterchecker`
-        // 实测被当成 HAL 注了）。HAL 必须真是 vendor 侧的：进程名以 `vendor.` 开头，
-        // 或者可执行文件落在 /vendor /odm /system_ext 下面。
+        // 名字带 soter 不够（检测器包名也带）；HAL 必须是 vendor 侧：进程名以
+        // `vendor.` 开头，或 exe 位于 /vendor、/odm、/system_ext 之下。
         let is_vendor_side = name.starts_with("vendor.") || {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(|path| {
@@ -226,19 +206,14 @@ fn discover_soter_hal_processes() -> Vec<String> {
     names
 }
 
-/// 会直接调 `vendor.qti.hardware.soter@1.0::ISoter` 的厂商侧进程。
-///
-/// 一加的 `vendor.oplus.hardware.cryptoeng@1.0-service` 就是这种：工程模式那页的
-/// SOTER key 走 cryptoeng → HIDL soter，进程名里根本没有 "soter"，
-/// `SOTER_HAL_PROCESSES` 和那套动态发现都碰不到它。静态名单兜一档，再按「加载了
-/// soter 的 HIDL 客户端库」扫一遍 hw 目录下的进程，别的机型换了名字也能认。
+/// 会直接调 `vendor.qti.hardware.soter@1.0::ISoter` 但进程名不含 "soter" 的厂商侧进程，
+/// 例如 `vendor.oplus.hardware.cryptoeng@1.0-service`（工程模式页的 SOTER key 走
+/// cryptoeng → HIDL soter）。静态名单兜底，另有按 HIDL 客户端库的动态发现。
 const SOTER_HIDL_CLIENT_PROCESSES: [&str; 1] = ["vendor.oplus.hardware.cryptoeng@1.0-service"];
 
-/// 扫 /proc 找「加载了 soter HIDL 客户端库」的厂商进程。
-///
-/// 只认 `/bin/hw/` 下的可执行文件：cryptoeng 这类 HAL/产线工具都在那儿，量小，
-/// 不用把满机器 app 的 maps 都读一遍。名字带 soter 的（原厂 HAL 自己）跳过 ——
-/// 那是服务端，上面 HAL 那一路已经注过了。
+/// 扫 /proc 找加载了 soter HIDL 客户端库的厂商进程。
+/// 只看 `/bin/hw/` 下的可执行文件（cryptoeng 这类工具都在此，量小）。名字带 soter
+/// 的跳过：那是服务端，已由 HAL 那一路覆盖。
 fn discover_soter_hidl_clients() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -300,11 +275,9 @@ fn inject_soter_hidl_clients() {
     }
 }
 
-/// 按进程名找目标、把 payload 注进去，顺带把它的身份打进日志。
-///
-/// 同名进程不止一个时每一个都注：多用户 / 分身会让 soterserver 起两份实例
-/// （2026-10-22 魅族 20 Pro 上 u999 与 system 各一个），客户端只认自己那个 uid
-/// 的实例，少注一个就是白干。
+/// 按进程名找目标并注入 payload，同时把可执行文件身份写进日志。
+/// 同名进程有多个时每个都要注：多用户/分身会让 soterserver 起多份实例，客户端只认
+/// 自己 uid 那份，漏注等于没注。
 fn inject_named_process(name: &str) -> anyhow::Result<()> {
     let targets = utils::find_processes_by_name(name)?;
     let mut injected = 0usize;
@@ -397,8 +370,8 @@ fn main() {
     // 成功的话这里不会返回。
     hide::hide_self("injector");
 
-    /* 自检模式：给面板一个「加载就有的结论」—— 用当前生效的 ASK 签一段固定文本
-    再验一遍。纯本地密码学（微秒级，不碰网络也不碰 TEE），所以不会挡任何签名路径。 */
+    /* 自检模式：用当前生效的 ASK 签一段固定文本再验一遍，给面板一个结论。
+    纯本地密码学（微秒级，不碰网络也不碰 TEE），不会挡任何签名路径。 */
     if let Some(arg) = std::env::args().find(|arg| arg.starts_with("--soterta-serve")) {
         logging::init_logger_fallback(LevelFilter::Debug);
         let driver = if arg.ends_with("=vnd") {
@@ -426,8 +399,8 @@ fn main() {
             }
         }
     }
-    // 只读探针：对着真实 SOTER HAL 打一次 getDeviceId，把回复的前几个字段打出来。
-    // 没有工程模式页的机器（NX809J 那种）就靠它看 HAL 到底能不能用、我们回的字节对不对。
+    // 只读探针：对真实 SOTER HAL 打一次 getDeviceId 并打印回复字段，用于确认 HAL
+    // 可用性与我们返回的字节。
     if std::env::args().any(|arg| arg == "--soter-probe") {
         logging::init_logger_fallback(LevelFilter::Debug);
         let mut services: Vec<String> = SOTER_HAL_CANDIDATES
@@ -501,9 +474,8 @@ fn main() {
             Ok(()) => info!("soter host injection completed"),
             Err(e) => warn!("soter host injection skipped: {:#}", e),
         }
-        // HAL 的进程名一家一个样，逐个试。谁都不在就都不注（宿主那条路照常）。
-        // 先动态扫一遍：cmdline 里带 soter 但不是腾讯宿主（那个上面已经单独注了）。
-        // 新厂商的 HAL 自己会认出来，不用改代码。
+        // HAL 进程名各家不同，逐个尝试；都不在就不注（宿主那条路照常）。先动态扫一遍
+        // 补齐静态名单，新厂商的 HAL 也能认出来。
         let mut hal_targets = discover_soter_hal_processes();
         for hal in SOTER_HAL_PROCESSES {
             if !hal_targets.iter().any(|name| name == hal) {
@@ -523,9 +495,8 @@ fn main() {
         info!("soter host target skipped by OMMEGA_INJECT_TARGETS");
     }
 
-    // 走 HIDL 调 SOTER 的厂商进程：它们既不是 HAL 也不叫 soter（一加的 cryptoeng 就是），
-    // 上面那套发现不到。它们发出去的正是 14 号 verifyAttkKeyPair 这类只有我们能答的号 ——
-    // 不注进去，工程模式那页的 SOTER 项就一直吃原厂 TA 的 -20。
+    // 走 HIDL 调 SOTER、但既不叫 soter 也不是 HAL 的厂商进程（如 cryptoeng）：其发出的
+    // 14 号 verifyAttkKeyPair 等只有我们能答，不注进去工程模式页会一直拿原厂 TA 的 -20。
     if inject_soter || inject_soter_hidl {
         inject_soter_hidl_clients();
     } else {
@@ -542,8 +513,8 @@ fn main() {
     }
 }
 
-/// 诊断用：payload 里 panic 一律 abort，消息默认去 stderr（app 进程那是 /dev/null），
-/// 事后只剩一条 SIGABRT。这里把 panic 原文写进日志和两个兜底文件。
+/// 诊断用：payload 里 panic 一律 abort，消息默认写 stderr（app 进程下是 /dev/null），
+/// 事后只剩 SIGABRT。这里把 panic 原文写进日志和 panic.log。
 fn install_payload_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -560,9 +531,8 @@ fn install_payload_panic_hook() {
                 "<non-string panic>".to_string()
             };
             log::error!("payload panic at {location}: {msg}");
-            // 只落数据根的 logs（1777 + sticky，app 域的 payload 也写得进去）。
-            // 以前另写一份 /data/local/tmp/ommega-panic.log 兜底，那是 shell 的
-            // 公共目录，不再拿它当我们的落盘位置。
+            // 只落数据根的 logs（1777 + sticky，app 域 payload 也写得进去）；
+            // 不写 /data/local/tmp 这类 shell 公共目录。
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -582,9 +552,8 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
     // for that process. On Android this enables both logcat and stdout logging.
     logging::init_logger_fallback(LevelFilter::Debug);
     install_payload_panic_hook();
-    // 这一条必须放在最前面：下面 `config::get()` 一起手就会起一个叫
-    // `injector-config` 的线程，而那正好也是我们用来认「已经注过了」的记号。
-    // 放到后面查就等于自己把自己当成前一份，把 hook 跳过。
+    // 必须放在最前面：下面的 `config::get()` 会起 `injector-config` 线程，而那正是
+    // 「已经注过了」的判据，放在后面查会把自己当成前一份而跳过 hook。
     if payload_thread_present(std::process::id() as i32) {
         warn!("payload is already loaded in this process; skipping repeated initialization");
         return true;
@@ -614,15 +583,13 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
         ipc::enable_inproc_keymint();
         ommega::inproc::request_start();
     }
-    // RPC 会话不通不代表 hook 没用：SOTER 那条观察路径完全不碰网络，而 KeyMint
-    // 那条路每次请求本来就会在 ommega 不可用时回退到系统服务（rewrite 里有那套
-    // 判断）。所以这里只记日志，照样把 hook 装上。
+    // RPC 会话不通不代表 hook 没用：SOTER 观察路径不碰网络，KeyMint 路径在 ommega
+    // 不可用时本就会回退到系统服务。所以只记日志，照样装 hook。
     if let Err(error) = ipc::install_direct_rpc_session() {
         error!("failed to initialize ommega RPC session: {error:#}; installing the hook anyway");
     }
-    // 日志到底装上没有、装在哪：app 域的进程（SOTER 宿主、SOTER HAL）各自的 uid 不一样，
-    // 有的机型上那个目录它们进不去，本地日志就整条哑掉。这一条顺 RPC 递给 daemon，
-    // 至少能看见原因，不用再靠猜。
+    // 上报日志是否装上、装在哪：app 域进程（SOTER 宿主、SOTER HAL）uid 各不相同，
+    // 有的机型进不去日志目录，顺 RPC 递给 daemon 便于查因。
     crate::ipc::report_event(format!(
         "event=logging role=Payload path={} enabled={} probes=[{}] error={}",
         crate::logging::active_path(),
@@ -636,10 +603,9 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
         log::error!("binder hook not installed in this process: {error:#}");
     }
     if in_soter_host() {
-        // 宿主是「只会回 -200 的壳」时不造这种流量：它压根不发 HAL 请求，自检没有意义；
-        // 而它每秒一次 `getService(vendor…soter)` 会把原厂那个懒加载 HAL 叫起来 ——
-        // 那个一注册就按 VINTF 把名字从我们手里拿走，soterta.sh 再抢回来，来回打架
-        // （实测：TA 起 → 名字被抢 → 重抢 → 踢宿主，5 秒一轮）。
+        // 宿主是「只回 -200 的壳」时不造自检流量：它不发 HAL 请求，自检无意义；且它每秒
+        // 一次 `getService(vendor…soter)` 会唤醒原厂懒加载 HAL，其注册时按 VINTF 抢走名字，
+        // 与我们反复争抢（约 5 秒一轮）。
         if hook::soter::app_serving_enabled() {
             log::info!("event=soter host is a stub; skipping the HAL selfcheck");
         } else {

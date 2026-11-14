@@ -388,9 +388,8 @@ fn ec_digest_bytes(digest: Digest, data: &[u8]) -> Result<Vec<u8>, Error> {
 /// 不足的左边补 0。
 ///
 /// P-256/P-384 的域宽正好等于阶位数（32/48 字节），这条看不出来；**P-521 的域是 528 位、
-/// 阶只有 521 位**，多出的 7 位必须右移掉。以前这里把这 66 字节原样交给 RustCrypto，
-/// 它按域宽截断而不是按阶位数截断，签出来的签名只对「未做 521 位截断的那个整数」成立，
-/// 用 FIPS/NONEwithECDSA 的标准验签一验就不过（真机缺口探针 E02 命中的就是这条）。
+/// 阶只有 521 位**，多出的 7 位必须右移掉。按域宽截断会让签名只对未截断的那个整数成立，
+/// 标准验签验不过。
 fn bits2int(msg: &[u8], curve: ec::NistCurve) -> Vec<u8> {
     let nbits = match curve {
         ec::NistCurve::P224 => 224,
@@ -461,7 +460,7 @@ fn sign_ecdsa_prehashed(key: &Key, curve: ec::NistCurve, msg: &[u8]) -> Result<V
     let mut rng = rand_core::OsRng;
     let sig = match curve {
         // P-224 只有工程模式那类自检会要（`KeyAttestationTest.testEcAttestation` 用的就是
-        // secp224r1）。以前这里直接回 UnsupportedEcCurve，于是工程模式的
+        // secp224r1）。缺了它，工程模式的
         // `isGoogleKeyImport()` 抛异常 → 「Attestation key 失败」。
         ec::NistCurve::P224 => {
             let sk = EcdsaSigningKey::<p224::NistP224>::from_slice(&priv_bytes)
@@ -689,8 +688,8 @@ mod signing_tests {
         assert_eq!(&z[22..], &short);
     }
 
-    /// 同一把钥匙、同一个摘要签两次，字节必须不同（AOSP 的 BoringSSL 取随机 k）。
-    /// 以前走 RFC 6979 是确定性的，两次一模一样，检测器拿这个判「不是 TEE 的 ECDSA」。
+    /// 同一把钥匙、同一个摘要签两次，字节必须不同（AOSP 的 BoringSSL 取随机 k）；
+    /// 确定性签名会被判成「不是 TEE 的 ECDSA」。
     #[test]
     fn repeated_ecdsa_signatures_differ() {
         let digest = [0x42u8; 32];

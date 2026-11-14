@@ -763,15 +763,12 @@ impl crate::KeyMintTa {
         result
     }
 
-    /// Return the associated [`Operation`], removing it.
     /// 如果这单是远程 key 的 finish，把要转发的数据取出来并结束 operation；不是远程就
     /// 原样放回去返回 None，调用方照旧走 `finish()`。
     ///
-    /// 为什么要多这一道：远端签名是百毫秒级的网络请求，而 `KeyMintTa` 被
-    /// `KeyMintDevice` 的全局 Mutex 包着。在锁内做网络会把别人的 begin 一起堵住，
-    /// 检测器（TrustAttestor keystore_timing）量的就是“忙时 begin 慢不慢”。
-    ///
-    /// 返回 `(is_sign, alias, algorithm, data, 这把钥匙的出生设备)`，由调用方在锁外完成请求。
+    /// 远端签名要走网络（百毫秒级），而 `KeyMintTa` 被 `KeyMintDevice` 的全局 Mutex
+    /// 包着；在锁内做网络会把别人的 begin 一起堵住。返回 `(is_sign, alias, algorithm,
+    /// data, 这把钥匙的出生设备)`，由调用方在锁外完成请求。
     #[allow(clippy::type_complexity)]
     pub fn take_remote_finish(
         &mut self,

@@ -22,13 +22,10 @@ static CONFIG_WATCHER_STARTED: OnceLock<()> = OnceLock::new();
 static CONFIG_FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 const CONFIG_PATH: &str = "/data/misc/ommega/config.toml";
-/// Legacy A-side (client-a) flat `key: value` config. When present, the remote
-/// relay settings in this file override the `[remote]` table in `config.toml`,
-/// matching how the old A-side module was configured on-device.
-///
-/// This is the single data location: the webroot UI writes it through the
-/// `/data/adb/ommega/ommegadata` symlink (which points here), so both the UI
-/// and the keystore process (uid 1017) see the same file.  There is no copy.
+/// Legacy A-side (client-a) flat `key: value` config, and the only source of the remote
+/// relay settings: the webroot UI writes it through the `/data/adb/ommega/ommegadata`
+/// symlink that points here, so the UI and the keystore process (uid 1017) see one file.
+/// There is no copy.
 const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
 const CONFIG_VERSION_V1: u32 = 1;
 const CURRENT_CONFIG_VERSION: u32 = 2;
@@ -66,12 +63,10 @@ pub fn config_path() -> &'static str {
     CONFIG_PATH
 }
 
-/// True when the WebUI option "Declare StrongBox unsupported" is enabled
-/// (`hide_strongbox` in the flat A-side config, surfaced as
-/// `RemoteConfig::hide_strongbox`). Callers must treat StrongBox exactly like
-/// a device without StrongBox support while this is set. The config watcher
-/// keeps the runtime config in sync with the flat file, so toggling the
-/// option applies without a daemon restart.
+/// True when the WebUI option "Declare StrongBox unsupported" is on (`hide_strongbox` in the
+/// flat A-side config, surfaced as `RemoteConfig::hide_strongbox`). Callers must treat
+/// StrongBox exactly like a device without it. The config watcher keeps this in sync with
+/// the flat file, so toggling the option applies without a daemon restart.
 pub fn strongbox_hidden() -> bool {
     config()
         .read()
@@ -129,7 +124,7 @@ fn bootstrap_config_file_to_path(path: &Path) -> Result<ConfigFile> {
         Ok(contents) => match parse_config_file(&contents, true) {
             Ok(parsed) => (Some(contents), parsed),
             Err(error) => {
-                // 配置被写坏时不能每 5 秒崩一次装死，先试 .bak。
+                // 配置写坏时先试 .bak，不能每 5 秒崩一次。
                 let restored = recover_from_broken_config(path, &error)?;
                 let parsed = parse_config_file(&restored, true)?;
                 (Some(restored), parsed)
@@ -179,11 +174,8 @@ fn bootstrap_config_file_to_path(path: &Path) -> Result<ConfigFile> {
 }
 
 /// 配置被写坏时的兜底：把坏文件改名留档，拿 `config.toml.bak` 顶上。
-///
-/// 旧版面板曾经把平铺格式（`url: xxx` 而不是 `url = "xxx"`）写进 `config.toml`，
-/// keymint 启动时 TOML 解析失败就退出，守护每 5 秒重拉一次、永远起不来，而模块
-/// 在管理器里还显示「运行中」—— 现场表现为工程模式的 Key 状态列到一半就空了。
-/// 这里恢复不了就直接把错往上抛，不静默兜底成一份空配置。
+/// 恢复不了就直接把错往上抛，不静默兜底成一份空配置（否则守护每 5 秒重拉一次、
+/// 永远起不来）。
 fn recover_from_broken_config(path: &Path, error: &anyhow::Error) -> Result<String> {
     let file_name = path
         .file_name()
@@ -458,12 +450,10 @@ fn start_config_watcher() -> Result<()> {
         PathBuf::from(CONFIG_PATH),
         reload_runtime_config,
     )?;
-    // The legacy A-side flat config (`/data/misc/keystore/ommega/config`,
-    // written by the WebUI) also carries `remote`/`token`/`device_id`. Watch
-    // it too so toggling "remote mode" in the WebUI applies without a restart:
-    // reload_runtime_config re-reads it via load_clienta_remote_override()
-    // inside Config::from_file(). Watch the parent dir, so a missing file is
-    // picked up when it first appears.
+    // The flat A-side config also carries `remote`/`token`/`device_id`; watching it makes a
+    // WebUI "remote mode" toggle apply without a restart, because reload_runtime_config
+    // re-reads it through Config::from_file(). The watcher covers the parent dir, so a
+    // missing file is picked up when it first appears.
     file_watch::spawn_path_watcher(
         "clienta-config-watch",
         PathBuf::from(CLIENTA_CONFIG_PATH),
@@ -644,9 +634,8 @@ pub struct Config {
 
 impl Config {
     fn from_file(config_file: &ConfigFile, resolved_trust: ResolvedTrust) -> Self {
-        // 远程配置只有一个来源：面板写的平铺 config。平铺不存在/读不出来就是
-        // 默认值（不启用远程），不再回落到 `config.toml` 的 `[remote]` ——
-        // 同一组设置两个载体只会让“到底哪份生效”变成玄学。
+        // 远程配置只有一个来源：面板写的平铺 config。它不存在或读不出来就用默认值
+        // （不启用远程），不回落到 `config.toml` 的 `[remote]`。
         let remote = load_clienta_remote_override().unwrap_or_default();
         Self {
             main: config_file.main.clone(),
@@ -659,18 +648,8 @@ impl Config {
     }
 }
 
-/// Reads the legacy A-side flat config (`/data/adb/ommega/config`) and maps it
-/// onto a [`RemoteConfig`], matching the old client-a semantics exactly.
-///
-/// The file is a simple `key: value` map (one pair per line, `#` comments and
-/// blank lines ignored, keys lowercased). `remote` / `local_hw` /
-/// `tls_insecure` accept `0|1|false|true|no|yes|off|on`; an empty or
-/// `none`/`off` URL disables the relay. Returns `None` when the file is absent
-/// (or unreadable), in which case the `[remote]` table in `config.toml` is used.
-/// 平铺 config 的解析：`key: value` 一行一条，`#` 开头是注释，键名按小写归一。
-///
-/// 同一个文件原来散在三处各扫一遍（remote 覆盖、debug 开关、SOTER 开关），
-/// 改一处忘一处就会「面板上行、实际不行」。现在只留这一份。
+/// 平铺 config 的解析：`key: value` 一行一条，`#` 开头是注释，空行忽略，键名按小写归一。
+/// 布尔项接受 `0|1|false|true|no|yes|off|on`；URL 为空或 `none`/`off` 表示不启用远程。
 fn parse_flat_config(contents: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     for line in contents.lines() {
@@ -727,8 +706,7 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         _ => !is_url_disabled,
     };
 
-    // WebUI「SOTER 走远程」：与 `remote` 完全独立的开关，缺省关。
-    // 两个开关各管各的，不互相跟随。
+    // WebUI「SOTER 走远程」：与 `remote` 独立的开关，缺省关，两者互不跟随。
     let soter_remote = matches!(
         get(&["soter_remote", "remote_soter"])
             .map(|v| v.to_lowercase())
@@ -759,10 +737,9 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
-    // WebUI "mask SOTER" switch, off by default (an absent key means off).
-    // `kmod-loader.sh` is the only consumer and reads the flat key itself;
-    // `hide_soter` is accepted as an alias so a hand-written config cannot
-    // silently differ from the loader's reading.
+    // WebUI "mask SOTER" switch, off by default (an absent key means off). `kmod-loader.sh`
+    // is the only consumer and reads the flat key itself; `hide_soter` is accepted as an
+    // alias so a hand-written config cannot silently differ from the loader's reading.
     let soter_hide = matches!(
         get(&["soter_hide", "hide_soter"])
             .map(|v| v.to_lowercase())
@@ -770,10 +747,9 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
-    // WebUI "inject the local SOTER service" switch, off by default (an absent
-    // key means off, which is what a fresh install and the WebUI both leave
-    // behind).  `daemon-injector` is the consumer: it reads the flat key itself
-    // and only starts the local SOTER host and injects into it when this is on.
+    // WebUI "inject the local SOTER service" switch, off by default (an absent key means
+    // off). `daemon-injector` is the consumer: it reads the flat key itself and only starts
+    // the local SOTER host and injects into it when this is on.
     let soter_inject = matches!(
         get(&["soter_inject", "inject_soter"])
             .map(|v| v.to_lowercase())
@@ -781,9 +757,8 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         Some("1" | "true" | "yes" | "on")
     );
 
-    // WebUI 的「远程不通就退回本地」开关，落盘写的是 `local_hw`（老配置写
-    // `local_depend_hardware`）。legacy client-a 一直都退，所以缺省就是 true —— 但这个键
-    // 以前没人读（写下去的 `local_hw` 白写），现在归位：它就是 `remote.fallback_local`。
+    // WebUI 的「远程不通就退回本地」开关，落盘写 `local_hw`（老配置写
+    // `local_depend_hardware`），缺省 true，对应 `remote.fallback_local`。
     let fallback_local = !matches!(
         get(&["local_hw", "local_depend_hardware"])
             .map(|v| v.to_lowercase())
@@ -792,18 +767,18 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
     );
 
     // SOTER uid 替身映射（`soter_uid_map: 10490=10373`）。不解析成结构：这里只负责把
-    // 原串交给 `soter_relay`，解析 + 单测都在那边，免得两处对格式的理解跑偏。
+    // 原串交给 `soter_relay`，解析和单测都在那边，免得两处对格式的理解跑偏。
     let soter_uid_map = get(&["soter_uid_map", "soter_uid_replace"])
         .unwrap_or_default()
         .to_string();
 
-    // 转发流量要不要绑网卡（绕开 VPN）。缺省是 auto，语义见 remote::desired_iface。
+    // 转发流量要不要绑网卡（绕开 VPN）。缺省 auto，语义见 remote::desired_iface。
     let bind_iface = get(&["bind_iface", "iface", "bind_interface", "uplink_iface"])
         .unwrap_or_default()
         .to_string();
 
-    // 「这些调用只在本地兜底回答」的名单：别名前缀 + uid。缺省前缀就是两台探测机
-    // （春秋/鸭子），不写这个键也拦；写 `none` 关掉。uid 缺省空（每台设备一套，手写）。
+    // 「只在本地兜底回答」的名单：别名前缀 + uid。前缀缺省是两台探测机
+    // （春秋/鸭子），写 `none` 关掉；uid 缺省空（每台设备一套）。
     let soter_local_only_prefixes = get(&[
         "soter_local_only_prefixes",
         "soter_local_only_alias_prefixes",
@@ -841,12 +816,9 @@ pub struct ConfigFile {
     pub crypto: CryptoConfig,
     pub trust: RawTrustConfig,
     pub device: DeviceProperty,
-    /// Remote TEE relay settings.
-    ///
-    /// **不从 `config.toml` 读写**：远程配置的唯一载体是面板写的平铺
-    /// `/data/misc/keystore/ommega/config`（`load_clienta_remote_override`）。
-    /// 以前两处都能写 `[remote]`，平铺有内容就覆盖 TOML、没内容就用 TOML，
-    /// 同一组设置两个载体。`skip_serializing` 保证保存 TOML 时不会再写回去。
+    /// 远程中继配置。
+    /// 不从 `config.toml` 读写：唯一载体是面板写的平铺 config
+    /// （`load_clienta_remote_override`）。`skip_serializing` 保证不会写回 TOML。
     #[serde(default, skip_serializing)]
     pub remote: RemoteConfig,
 }
@@ -864,12 +836,10 @@ impl Default for ConfigFile {
     }
 }
 
-/// Remote TEE relay configuration (A-side).
-///
-/// When `enabled` is true, attestation (tag 709) is minted by the B-side real
-/// TEE through the relay_server, and sign/decrypt operations for remote keys
-/// are forwarded to it. If the remote is unreachable, `fallback_local` controls
-/// whether ommega falls back to its local software keybox attestation.
+/// Remote TEE relay configuration (A-side). When `enabled` is true, attestation (tag 709)
+/// is minted by the B-side real TEE through the relay_server, and sign/decrypt for remote
+/// keys is forwarded to it. When the remote is unreachable, `fallback_local` decides whether
+/// to fall back to the local keybox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
@@ -884,8 +854,7 @@ pub struct RemoteConfig {
     pub token: String,
     /// B-side device id (must match the device registered on the relay_server).
     pub device_id: String,
-    /// Accept self-signed TLS certificates (client-a default is `false`; the
-    /// `/data/adb/ommega/config` `tls_insecure` flag controls this on-device).
+    /// Accept self-signed TLS certificates, controlled by the flat `tls_insecure` flag.
     pub tls_insecure: bool,
     /// Fall back to local software keybox attestation when the remote is unreachable.
     pub fallback_local: bool,
@@ -893,56 +862,42 @@ pub struct RemoteConfig {
     /// `verbose` in `/data/adb/ommega/config`, client-a semantics).
     #[serde(default)]
     pub debug_logging: bool,
-    /// WebUI option "Declare StrongBox unsupported". When true the keystore
-    /// daemon refuses the STRONGBOX KeyMint security level exactly like a
-    /// device without StrongBox, and `post-fs-data.sh` shadows the device's
-    /// `android.hardware.security.strongbox_keystore` feature XMLs so
-    /// PackageManager reports the feature as absent.
+    /// WebUI option "Declare StrongBox unsupported". When true the keystore daemon refuses
+    /// the STRONGBOX KeyMint security level exactly like a device without StrongBox, and
+    /// `post-fs-data.sh` shadows the device's `android.hardware.security.strongbox_keystore`
+    /// feature XMLs so PackageManager reports the feature as absent.
     #[serde(default)]
     pub hide_strongbox: bool,
-    /// WebUI option "Mask SOTER". `kmod-loader.sh` reads the flat config key
-    /// directly and hides `/system/priv-app/SoterService` with the bundled
-    /// PathMask kernel module when the local SOTER binder service cannot be
-    /// reached; when this is false no kernel module is loaded at all and an
-    /// existing mask of ours is removed. Defaults to false: masking has to be
-    /// switched on explicitly in the WebUI.
+    /// WebUI option "Mask SOTER". `kmod-loader.sh` reads the flat key directly and hides
+    /// `/system/priv-app/SoterService` with the bundled PathMask kernel module when the
+    /// local SOTER binder service cannot be reached; false loads no module and removes an
+    /// existing mask of ours. Defaults to false.
     #[serde(default)]
     pub soter_hide: bool,
-    /// WebUI option "Inject the local SOTER service". When true
-    /// `daemon-injector` starts `com.tencent.soter.soterserver` at boot and
-    /// injects the payload into it (plus the Qualcomm SOTER HAL) so App SOTER
-    /// traffic can be observed; when false the SOTER host is neither started
-    /// nor injected. Defaults to false: injection has to be switched on
-    /// explicitly in the WebUI.
+    /// WebUI option "Inject the local SOTER service". When true `daemon-injector` starts
+    /// `com.tencent.soter.soterserver` at boot and injects the payload into it (plus the
+    /// Qualcomm SOTER HAL); when false the host is neither started nor injected.
+    /// Defaults to false.
     #[serde(default)]
     pub soter_inject: bool,
-    /// SOTER uid 的替身映射，写 `A 端 uid=B 端 uid`（逗号分隔多条），也会写进
-    /// RemoteConfig 的一份副本里。为什么需要它：SOTER 的身份是 `(cpu_id, uid)` 一起绑的，
-    /// B 的 store 里只有它自己那套应用的密钥（本机实测：B 上只有 10373 那把 = B 自己的
-    /// 微信，其余 uid 全 `-5`）。拿 A 端微信的 10490 去问 B，问到的必然是「没有」。
-    ///
-    /// 没配就原样转发（不做任何推断：uid 猜错了答出来的东西更坑）。
+    /// SOTER uid 的替身映射，写 `A 端 uid=B 端 uid`（逗号分隔多条）。
+    /// SOTER 身份是 `(cpu_id, uid)` 一起绑的，B 的 store 里只有它自己那套应用的密钥，
+    /// 拿 A 端某个 uid 去问 B 必然答「没有」。没配就原样转发，不做任何推断。
     #[serde(default)]
     pub soter_uid_map: String,
     /// 「这些调用只在本地兜底回答、一次都不往 B 端转」的别名前缀（逗号/分号/空格分隔）。
     /// 缺省就是两台探测机（`chunqiu_soter_probe_` / `duckdetector_soter_probe_`），
-    /// 写成 `none` / `off` 就是关掉这条（那两家的探针就又去打真机 TEE 了）。
-    ///
-    /// 为什么要有它：探针每跑一轮都新铸一把别名、签完也不收尾，在 B 端吃的是真 TEE
-    /// 的会话（实测一天 900+ 次 init_sign，占全部 init 的一半以上），而它们的结论
-    /// 只看「这条路通不通」，本地兜底那份自洽的答复就够。判定在 `soter_relay`。
+    /// 写成 `none` / `off` 关闭这条。探针每轮新铸别名、签完不收尾，占的是 B 端真 TEE
+    /// 的会话，而它们的结论只看这条路通不通。判定在 `soter_relay`。
     #[serde(default = "default_soter_local_only_prefixes")]
     pub soter_local_only_prefixes: String,
     /// 同上，按 uid 点名（逗号/分号/空格分隔，缺省空 = 不按 uid 拦）。
-    ///
-    /// `has_ask_already` 这类调用根本没有别名，只能按 uid 认；而 uid 每台设备一套，
-    /// 所以这个键是设备本地手写的。
+    /// `has_ask_already` 这类调用没有别名，只能按 uid 认；uid 每台设备一套，本地手写。
     #[serde(default)]
     pub soter_local_only_uids: String,
-    /// 连 relay server 时把 socket 绑到哪块网卡（`/data/adb/ommega/config` 的
-    /// `bind_iface`）。空（或缺省）＝ `auto`：先看系统默认那条路通不通，通了就不绑；
-    /// 不通才去挑一块真能打到服务端的网卡（优先物理链路）。`none` / `off` 表示
-    /// 永不绑；`always` / `on` 表示无条件挑；其余值当作网卡名直接用。
+    /// 连 relay server 时把 socket 绑到哪块网卡（`/data/adb/ommega/config` 的 `bind_iface`）。
+    /// 空或缺省 = `auto`：系统默认那条路通就不绑，不通才挑一块真能打到服务端的网卡
+    /// （优先物理链路）。`none` / `off` 永不绑，`always` / `on` 无条件挑，其余当网卡名。
     /// 见 `remote::desired_iface`。
     #[serde(default)]
     pub bind_iface: String,
@@ -956,15 +911,15 @@ impl Default for RemoteConfig {
             url: String::new(),
             token: String::new(),
             device_id: String::new(),
-            // The production relay serves a self-signed cert on :8443, so the
-            // WebUI default and this fallback both accept any server cert;
-            // operators who pin a proper CA set `tls_insecure = false`.
+            // The production relay serves a self-signed cert on :8443, so both the WebUI
+            // default and this fallback accept any server cert; pinning a CA means setting
+            // `tls_insecure = false`.
             tls_insecure: true,
             fallback_local: true,
             debug_logging: false,
             hide_strongbox: false,
             soter_hide: false,
-            // 默认接管 SOTER：接管后才能自己答 ASK/签名，不接管就只能透传原厂 HAL。
+            // 默认接管 SOTER：接管后才能自己答 ASK/签名，不接管只能透传原厂 HAL。
             soter_inject: true,
             soter_uid_map: String::new(),
             soter_local_only_prefixes: default_soter_local_only_prefixes(),
@@ -974,30 +929,22 @@ impl Default for RemoteConfig {
     }
 }
 
-/// 「只在本地兜底回答」名单的缺省值：还是拿 `soter_relay` 那份常量，免得两处跑偏。
+/// 「只在本地兜底回答」名单的缺省值，取 `soter_relay` 那份常量，免得两处跑偏。
 fn default_soter_local_only_prefixes() -> String {
     crate::soter_relay::DEFAULT_LOCAL_ONLY_PREFIXES.to_string()
 }
 
-/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`),
-/// read straight from the file instead of through the runtime [`config`].
-///
-/// `logging::init_logger()` is the first statement of `main()`, long before the
-/// runtime config exists, so the gate cannot go through the config bootstrap.
-/// An unreadable file, a missing key or a non-truthy value all mean "off" —
-/// which is exactly what the WebUI checkbox shows for those cases.  Off means
-/// every sink is silent (file log, logcat, all levels), not merely less
-/// verbose.
+/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`), read
+/// straight from the file instead of through the runtime [`config`], because
+/// `logging::init_logger()` runs before the runtime config exists. Unreadable file, missing
+/// key or non-truthy value all mean off, which silences every sink (file and logcat).
 pub fn flat_debug_logging() -> bool {
     flat_config_truthy(&["debug_logging", "debug", "verbose"])
 }
 
 /// 日志级别：平铺 config 的 `log_level` 键（`trace`/`debug`/`info`/`warn`/`error`/`off`），
-/// 没写就是 `Info`。
-///
-/// 以前这里是硬编码 `Debug`，一次开机就写四百多 KB（`rsproperties` 每开一个属性域
-/// 打一行，跟真正要看的东西没关系），既费 IO 也把日志文件刷得快。要现场就把
-/// `log_level: debug` 写进配置，默认只留 `info`。
+/// 没写就是 `Info`。缺省只留 info：debug 下 `rsproperties` 每开一个属性域就写一行，
+/// 开机就能写几百 KB。
 pub fn flat_log_level() -> log::LevelFilter {
     let Ok(contents) = std::fs::read_to_string(CLIENTA_CONFIG_PATH) else {
         return log::LevelFilter::Info;
@@ -1017,10 +964,9 @@ pub fn flat_log_level() -> log::LevelFilter {
     }
 }
 
-/// Reads one boolean key out of the flat A-side config.  Truthy spellings are
-/// `1` / `true` / `yes` / `on` (case-insensitive): the WebUI writes
-/// `true`/`false` for the relay flags and `0`/`1` for the mask/inject ones, and
-/// both have to keep working.
+/// Reads one boolean key out of the flat A-side config. Truthy spellings are
+/// `1` / `true` / `yes` / `on` (case-insensitive): the WebUI writes `true`/`false` for the
+/// relay flags and `0`/`1` for the mask/inject ones, and both have to keep working.
 fn flat_config_truthy(keys: &[&str]) -> bool {
     let Ok(contents) = std::fs::read_to_string(CLIENTA_CONFIG_PATH) else {
         return false;
@@ -1080,8 +1026,8 @@ pub struct MainConfig {
     /// Only the injector backend is currently enabled.
     pub backend: Backend,
     pub log_level: String,
-    /// Insecure fallback for devices whose system TEE cannot verify HATs.
-    /// When enabled, ommega accepts shape-valid HATs without system KeyMint MAC verification.
+    /// Insecure fallback for devices whose system TEE cannot verify HATs: when enabled,
+    /// shape-valid HATs are accepted without system KeyMint MAC verification.
     #[serde(default)]
     pub force_skip_system_biometric_hat_verification: bool,
 }
@@ -1195,12 +1141,9 @@ pub struct ResolvedTrust {
 }
 
 /// `[trust]` 段的原始配置。
-///
-/// 这里只管「补丁/版本」这类要推导的值；verified-boot 的 key / hash / 锁定状态
-/// **不放在这里** —— 它们是设备的运行时属性（`ro.boot.vbmeta.*`、
-/// `ro.boot.flash.locked`），证书应该直接读当刻的值。以前它们在配置里存一份
-/// 开机快照（还支持显式 hex / 随机），结果是快照和属性一旦错开，证书就和设备
-/// 自相矛盾（Duck 的 Boot consistency 就是这么抓到的）。
+/// 只管「补丁/版本」这类要推导的值。verified-boot 的 key / hash / 锁定状态不放这里：
+/// 它们是运行时属性（`ro.boot.vbmeta.*`、`ro.boot.flash.locked`），必须读当刻的值，
+/// 存快照会和设备自相矛盾。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawTrustConfig {
     pub os_version: OsVersionSpec,

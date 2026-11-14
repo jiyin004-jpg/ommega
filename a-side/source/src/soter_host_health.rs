@@ -1,29 +1,11 @@
-//! SOTER 宿主「起来了，但是哑的」的体检。
+//! SOTER 宿主「起来了但是哑的」的体检。
 //!
-//! 现象（实测 nubia NX721J，2026-10-09）：开机起来的那份 `com.tencent.soter.soterserver`
-//! 收得到 App 侧的 SOTER 调用，却**一笔都不往 SOTER HAL 发** —— 它自己的 HAL 客户端是死的。
-//! A 端的接管挂在「宿主发往 HAL 的那笔出站事务」上（payload 的
-//! `hook/intercept/ioctl/write.rs`），它不发，就等于整条链断在宿主里：App 那边一直报
-//! 「系统错误，可删除系统指纹，重新录入后再试」，而 daemon 这边看起来一切正常 —— 进程在、
-//! 载荷也注进去了、每次载荷起来那个开机自检还能转发成功。只有把宿主换成新实例才会好。
+//! 判据全部来自宿主自己的观测（[`observe`]）：一个窗口（[`WINDOW`]）内 App 侧调用 ≥
+//! [`MIN_APP_OPS`]、其中至少 [`MIN_MUTATIONS`] 笔 `mutation=1`，而 HAL 侧一笔都没有，
+//! 就判它哑了。`getVersion` / `getExtraParam` 这类不碰 HAL 的调用不计入。
 //!
-//! 判据只能靠宿主自己报上来的观测（[`observe`]）：payload 的 `log_call` 每观察一笔 SOTER
-//! 调用，就顺 RPC 递给 `IMaintenanceService::reportHookEvent`，**跟 WebUI 的「启用调试日志」
-//! 开关无关**（那个开关关着时 daemon 一个 sink 都不写，所以这条路不能读日志）。一个窗口里
-//! 同时满足：
-//!
-//! * App 侧（`side=app`）调用 ≥ [`MIN_APP_OPS`]，其中至少 [`MIN_MUTATIONS`] 笔带 `mutation=1`
-//!   —— 建 ASK/AuthKey、删钥匙这类**必然**要动 HAL 的东西，宿主缓存不掉；
-//! * HAL 侧（`side=hal` / `side=hal-hidl`）一笔都没有。
-//!
-//! 那就是哑了。daemon 不去动进程：它跑在 keystore uid，杀不动 system 域的宿主。它把结论写进
-//! [`STUCK_PATH`]，由 root 的启动器 `daemon-injector` 读走、重启宿主（那份脚本里
-//! `SOTER_STUCK_FILE` 一段）。顺手写一份 [`STATUS_PATH`] 供排查：日志关着的时候，
-//! 这两个文件是唯一看得见计数的地方。
-//!
-//! 反过来也要小心别误伤：健康的宿主每笔 App 侧调用都会带出至少一笔 HAL 侧事务，所以正常
-//! 窗口里 `hal` 一定不为 0；而 `getVersion` / `getExtraParam` 这种根本不碰 HAL 的调用单独
-//! 剔掉 —— App 能把它们轮询一天，拿它们当证据就是把好宿主踢掉。
+//! daemon 跑在 keystore uid，杀不动 system 域的宿主，所以只写 [`STUCK_PATH`] 让 root
+//! 启动器去重启宿主；[`STATUS_PATH`] 是每窗口一份的计数，日志关掉时靠它排查。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -31,17 +13,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-/// 一个统计窗口的长度。判断节拍按下限来算：App 一次开通流程（微信那种）两三秒里就能打出
-/// 十几笔调用，30 秒足够攒够证据，也不至于让用户干等太久。
+/// 统计窗口的长度。一次开通流程两三秒就能打出十几笔调用，30 秒足够攒够证据。
 const WINDOW: Duration = Duration::from_secs(30);
 /// 窗口里至少要看到的 App 侧调用笔数（`getVersion` / `getExtraParam` 不算）。
 const MIN_APP_OPS: u64 = 2;
 /// 其中至少要有这么多笔 `mutation=1` 的：这是「必然到 HAL」的那一类，误判风险最低。
 const MIN_MUTATIONS: u64 = 1;
-/// 两次报「哑了」之间的最短间隔。已经踢过一次还是哑的，说明不是这个原因，
-/// 那就每 10 分钟试一次，别把宿主当开关按。
+/// 两次报「哑了」的最短间隔：已换过实例仍哑说明另有原因，不必频繁重启。
 const REPEAT_COOLDOWN: Duration = Duration::from_secs(600);
-/// 体检线程的节拍。窗口（[`WINDOW`]）靠它来关，所以它得比窗口密得多。
+/// 体检线程的节拍，比窗口（[`WINDOW`]）密得多，窗口靠它来关。
 const TICK: Duration = Duration::from_secs(5);
 
 /// 判出「哑了」时写的标记文件。启动器读一行、删掉、然后把宿主重启。
@@ -49,7 +29,7 @@ const STUCK_PATH: &str = crate::root_path!("soter_host_stuck");
 /// 每个窗口写一份的计数，纯排查用（日志关着时也能看）。
 const STATUS_PATH: &str = crate::root_path!("soter_host_health");
 
-/// 一条观测归哪一类。字段跟 payload 里 `log_call` 拼出来的那行严格对应：
+/// 一条观测的归类。字段与 payload 里 `log_call` 拼出的那行严格对应：
 /// `event=soter side=<app|hal|hal-hidl> code=N op=NAME uid=… bytes=N[ mutation=1]…`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sample {
@@ -62,16 +42,15 @@ fn classify(message: &str) -> Option<Sample> {
     if !message.contains("event=soter ") {
         return None;
     }
-    // `side=hal` 这一条同时盖住 `side=hal-hidl`：HIDL 那几家（trustonic / 小米）走的
-    // 是同一个判断。
+    // 前缀 `side=hal` 同时盖住 `side=hal-hidl`，两种 HAL 实现走同一条判断。
     if message.contains("side=hal") {
         return Some(Sample::Hal);
     }
     if !message.contains("side=app") {
         return None;
     }
-    // App 面向那两个不走 HAL 的：问版本、问额外参数都是宿主自己就能答的，
-    // 而且 App 会反复轮询，拿它们当「哑了」的证据是纯误伤。
+    // App 面向那两条不碰 HAL：问版本、问额外参数宿主自己就能答，而 App 会反复轮询，
+    // 算进去就是纯误伤。
     if message.contains(" op=getVersion ") || message.contains(" op=getExtraParam ") {
         return None;
     }
@@ -108,7 +87,7 @@ struct State {
     last_report: Option<Instant>,
 }
 
-/// 一个窗口的结论。计数原样带出来（写状态文件用），`mute` 才是「去把宿主踢了」。
+/// 一个窗口的结论。计数原样带出来（写状态文件用），`mute` 才表示要去重启宿主。
 #[derive(Debug, PartialEq, Eq)]
 struct Verdict {
     app: u64,
@@ -117,9 +96,8 @@ struct Verdict {
     mute: bool,
 }
 
-/// 窗口够长了就算一次，返回结论；还没到点返回 `None`。
-///
-/// `mute` 只在「够格 + 不在冷却里」才为真 —— 冷却本身就是「已经踢过一次了」的意思。
+/// 窗口够长了就算一次并返回结论，还没到点返回 `None`。
+/// `mute` 只在「够格且不在冷却里」时为真。
 fn judge(state: &mut State, now: Instant) -> Option<Verdict> {
     if now.saturating_duration_since(state.start) < WINDOW {
         return None;
@@ -157,11 +135,8 @@ fn state() -> &'static Mutex<State> {
 }
 
 /// 起体检线程（幂等）。
-///
-/// **结算必须自己按时间跑，不能挂在观测上**：一开始把 `judge` 摆在 [`observe`] 里，实测两个
-/// 问题 —— 空闲时窗口永远不关，健康度文件根本不出现；更要命的是哑窗口会等到**下一笔**观测才
-/// 结算，而下一笔已经是恢复后的健康流量（带着 hal 侧）时，那个哑窗口就被判成不哑，真出事反而
-/// 漏判。现在 `observe` 只记数，结算全交给这个线程。
+/// 结算必须按时间自己跑，不能挂在观测上：空闲时窗口永远不关，而哑窗口等到下一笔观测
+/// （可能已是恢复后的健康流量）才结算就会漏判。`observe` 只记数，结算全在这里。
 pub fn start() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -199,9 +174,7 @@ pub fn observe(message: &str) {
 }
 
 /// 结算一个窗口：先把计数写进健康度文件，判出哑了再写标记。
-///
-/// 文件操作全在拿锁之外做：这里是体检线程，不是热路径。写不动只记日志 —— 顶多自愈不生效，
-/// 不该影响别的。
+/// 文件操作全在拿锁之外做；写不动只记日志，顶多自愈不生效，不影响别的。
 fn report(verdict: Verdict) {
     if let Err(error) = write_mirror(
         STATUS_PATH,
@@ -237,9 +210,7 @@ fn report(verdict: Verdict) {
 }
 
 /// 先写临时文件再 rename，读的一方永远读不到半截；内容没变不动文件。
-///
-/// 跟 `soter_cpu_id` 那份一个写法（同一个约定：keystore 域写的镜像放 `/data/misc/keystore/ommega/`，
-/// 0644 让 root 的启动器读得到）。
+/// 0644 让 root 的启动器读得到，写法与 `soter_cpu_id` 那份镜像一致。
 fn write_mirror(path: &str, body: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -261,7 +232,7 @@ fn write_mirror(path: &str, body: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 线上真实形状的几行（nubia NX721J 上微信开通那一次抓的），分类得跟它们走。
+    /// 真实观测行的形状，分类必须跟着它走。
     fn app_line(op: &str) -> String {
         format!(
             "event=soter side=app code=8 op={op} uid=10490 alias=\"SoterAuthKeyV2_salt11d8ba34_scene1\" session=None challenge_len=0 key=\"\" bytes=184"
@@ -299,7 +270,7 @@ mod tests {
         );
     }
 
-    /// 不走 HAL 的两条不准算：App 轮询起来一天不停，算进去就是把好宿主踢掉。
+    /// 不走 HAL 的两条不准算：App 轮询不停，算进去会误判健康宿主。
     #[test]
     fn the_two_local_only_app_ops_are_ignored() {
         assert_eq!(classify(&app_line("getVersion")), None);
@@ -342,7 +313,7 @@ mod tests {
         assert!(state.last_report.is_some(), "报过就要进冷却");
     }
 
-    /// 健康的窗口：HAL 侧有东西。这是常态（实测那一次是 app=14 / hal=32）。
+    /// 健康的窗口：HAL 侧有东西，这是常态。
     #[test]
     fn a_healthy_window_is_never_mute() {
         for (app, hal, mutations) in [(14u64, 32u64, 3u64), (2, 1, 1), (30, 60, 5)] {
@@ -379,7 +350,7 @@ mod tests {
         assert_eq!(state.window.app, 9, "没到点不能清窗口");
     }
 
-    /// 踢过一次还没好：冷却里不再报（不然就把宿主当开关按了），到期才再报一次。
+    /// 换过一次仍哑：冷却期内不再报，到期才再报一次。
     #[test]
     fn the_second_report_waits_for_the_cooldown() {
         let now = Instant::now();

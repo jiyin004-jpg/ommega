@@ -1,11 +1,10 @@
 //! 微信「指纹支付开通」那套流程的等价重写。
 //!
-//! 为什么要自己写一遍：开通这一步的行为全在微信 dex 里（8.0.79 的 classes13/14.dex，
-//! 包名被混淆成 `f46` / `s36` / `w36` / `x36` / `y36` 这些），我们只能从外面看日志猜它
-//! 在哪一步放弃。这里按反出来的顺序把同一串 HAL 调用重放一遍，每一步都照着**它自己的
-//! 判据**检查答复，于是「哪一步因为答了什么被判成失败」能直接摆出来，不用再猜。
+//! 按微信内部的顺序把同一串 HAL 调用重放一遍，每一步都照它自己的判据检查答复，于是
+//! 「哪一步因为答了什么被判成失败」能直接摆出来。类名以微信 8.0.79 为准（dex 被混淆成
+//! `f46` / `s36` / `w36` / `x36` / `y36`）。
 //!
-//! # 微信那边到底在干什么（8.0.79）
+//! # 微信那边的任务链（8.0.79）
 //!
 //! 入口是 `ym4.b`（SOTER 初始化 func）：它造一个 `f46.m`（`extends f46.n0`，即 TaskInit），
 //! 场景号 `{1, 2, 920, 3}`、ASK 名固定 `WechatASK`，然后把它塞进 `f46.n`（任务队列）。
@@ -29,16 +28,16 @@
 //! 4 generateAuthKey / 5 removeAuthKey / 6 getAuthKey / 7 removeAllUidKey / 8 hasAuthKey /
 //! 9 initSigh / 10 finishSign / 13 getExtraParam。
 //!
-//! # 三个判据，决定了「为什么明明有料它还要重走」
+//! # 三个判据
 //!
-//! 1. **ASK 能用** = `hasAskAlready(uid) == 0` **且** `getAppSecureKey(uid)` 能解析出模型。
-//!    （`w36.j.k()` = `g() && d() != null`，`s36.a.j()` 就是它。）
+//! 1. **ASK 能用** = `hasAskAlready(uid) == 0` **且** `getAppSecureKey(uid)` 能解析出模型
+//!    （`w36.j.k()` = `g() && d() != null`，`s36.a.j()` 就是它）。
 //! 2. **AuthKey 能用** = `hasAuthKey(uid, alias) == 0` **且** `getAuthKey(...)` 能解析。
-//! 3. **能解析**的定义很挑（`w36.b.q` / `s36.a.a`）：`[i32 小端 JSON 长度][JSON][签名]`，
-//!    长度 <4 丢、>1 MiB 丢、`4+长度` 必须**严格小于**总长（尾巴上必须真有签名），
-//!    JSON 还得能解析。少一截签名它就当「没导出」，于是「有 ASK」也会被判成「ASK 不可用」。
+//! 3. **能解析**（`w36.b.q` / `s36.a.a`）：`[i32 小端 JSON 长度][JSON][签名]`，长度 <4 丢、
+//!    超过 1 MiB 丢、`4+长度` 必须**严格小于**总长（尾巴上必须真有签名），JSON 还得能解析。
+//!    少一截签名就当「没导出」，于是「有 ASK」也会被判成「ASK 不可用」。
 //!
-//! # 失败之后它自己怎么收拾（这几条是我们最容易被带进死循环的地方）
+//! # 失败之后它自己怎么收拾
 //!
 //! - 建 ASK 失败 → 先 `s36.a.r()` 把 ASK 删掉再说。
 //! - ASK 上报腾讯失败 → 码 1003，同样 `s36.a.r()`。
@@ -47,7 +46,7 @@
 //! - AuthKey 上报失败 → 码 1004，业务层再 `y36.b.f(scene)` 删一遍。
 //!
 //! 也就是说：任何一环答错，它都会把料删掉重铸；而腾讯那边只认「第一次上报的那份 ASK」，
-//! 于是我们答错一次就可能永久对不上（槽位毒化）。
+//! 所以答错一次就可能永久对不上（槽位毒化）。
 //!
 //! # 跑法
 //!
@@ -57,7 +56,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-/// 微信 TaskPrepareAuthKey 里「强制重建」那个开关（`f46.u0` 构造的 `z` 参数）。
+/// 微信写死的 ASK 名。
 pub const WECHAT_ASK_NAME: &str = "WechatASK";
 
 /// 微信 8.0.79 里注册的场景号（`ym4.b` 里的 `{1, 2, 920, 3}`）。只用来打印。
@@ -82,8 +81,8 @@ pub struct Options {
     pub allow_mutation: bool,
     /// 只看到手的料，不开签名会话（`--no-sign`）。
     pub skip_sign: bool,
-    /// 真调用者的包名。走 relay 时**必须**带：服务端没包名就把这笔当探测机、
-    /// 就地拿内置料答（回 `-1001`），压根不会落到 B 端。A 端 daemon 转发时也是这么带的。
+    /// 真调用者的包名。走 relay 时**必须**带：服务端没包名就把这笔当探测机、就地拿内置
+    /// 料答（回 `-1001`），压根不会落到 B 端。
     pub caller_pkg: Option<String>,
 }
 
@@ -104,7 +103,7 @@ impl Default for Options {
 }
 
 impl Options {
-    /// 场景号 → AuthKey 别名。跟 `xm4.g0.d(int)` 一个字一个字对。
+    /// 场景号 → AuthKey 别名，跟 `xm4.g0.d(int)` 一致。
     pub fn auth_key_name(&self) -> String {
         format!("SoterAuthKeyV2_salt{}_scene{}", self.salt, self.scene)
     }
@@ -259,7 +258,7 @@ pub fn parse_envelope(data: &[u8]) -> std::result::Result<Envelope, String> {
     if len > 1024 * 1024 {
         return Err(format!("JSON 长度 {len} 超过 1 MiB，微信当垃圾丢掉"));
     }
-    // 这一条最坑：微信要求 `4 + len` 严格小于总长，也就是签名必须真实存在。
+    // 这一条最要紧：微信要求 `4 + len` 严格小于总长，也就是签名必须真实存在。
     if data.len() <= len + 4 {
         return Err(format!(
             "长度头说 JSON {len} 字节、整块 {} 字节 —— 尾巴上没有签名，微信会当成「没导出」",
@@ -276,8 +275,8 @@ pub fn parse_envelope(data: &[u8]) -> std::result::Result<Envelope, String> {
 
 /// 一份 SOTER 文档（ASK / AuthKey / 签名现场）的键位检查。
 ///
-/// 只查「微信和检测器会看」的那几个：公钥 PEM 在不在、cpu_id 是不是 32 位十六进制、
-/// uid 是不是字符串且跟请求一致、盐长是不是给了。
+/// 只查「微信和检测器会看」的那几个：公钥 PEM / raw 在不在、cpu_id 是不是 32 位十六进制、
+/// uid 是不是字符串且跟请求一致。
 fn check_doc(doc: &Value, uid: i32, where_: &str) -> Result<String, String> {
     let pub_key = doc
         .get("pub_key")
@@ -394,7 +393,7 @@ where
         ),
     ));
 
-    // 2. 有 ASK 的话它到底能不能用（微信 `s36.a.j()` 的第二半：模型解析得出来）。
+    // 2. 有 ASK 能不能用（微信 `s36.a.j()` 的第二半：模型解析得出来）。
     let mut ask_doc = None;
     let mut ask_ok = false;
     if ask_present {
@@ -730,8 +729,8 @@ fn record_cpu(acc: &mut Collected, where_: &'static str, doc: &Value) {
     }
 }
 
-/// 发一笔导出类 op，并按微信的判据解析它的答复。解析得出来就顺手把 cpu_id 跟原始字节
-///记进 `acc`（后者就是 `--dump` 拿去 openssl 验链的东西）。
+/// 发一笔导出类 op，按微信的判据解析答复。解析得出来就顺手把 cpu_id 和原始字节记进
+/// `acc`（后者是 `--dump` 拿去 openssl 验链的东西）。
 fn export_check<F>(
     send: &mut F,
     acc: &mut Collected,
@@ -1002,7 +1001,7 @@ mod tests {
     }
 
     /// 有 ASK、但导出不带签名尾巴 —— 微信那条解析器会判「模型为空」，
-    /// 于是明明「有 ASK」也要重走一遍。这一条正是最难从日志上看出来的坑。
+    /// 于是明明「有 ASK」也要重走一遍。
     #[test]
     fn export_without_signature_tail_counts_as_unusable() {
         let ask = serde_json::to_vec(&ask_doc()).unwrap();

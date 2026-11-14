@@ -254,9 +254,8 @@ impl crypto::AccumulatingOperation for OmmegaRsaDigestSignOperation {
             _ => return Err(km_err!(UnsupportedPaddingMode, "not a digest sign mode")),
         };
         let hashed = hash_digest(digest, &self.pending_input)?;
-        // PKCS#1 和 PSS 的摘要类型会影响 DigestInfo 前缀 / 盐长度，所以得跟着请求的
-        // 摘要走。以前一律写死 Sha256，SHA-1/224/384/512 的请求要么直接出错、要么
-        // 出来的签名用对应算法验不过。
+        // PKCS#1 和 PSS 的摘要类型影响 DigestInfo 前缀 / 盐长度，必须跟着请求的摘要走，
+        // 写死 Sha256 会让其它摘要的请求出错或签出验不过的签名。
         macro_rules! sign_pkcs1 {
             ($d:ty) => {{
                 priv_key
@@ -309,8 +308,8 @@ impl OmmegaRsaUndigestSignOperation {
             // 裸模幂（NoPadding）：输入最多一个模长，短的左边补 0。
             SignMode::NoPadding => (true, key_len),
             // PKCS#1 v1.5 签名（DIGEST=NONE）：AOSP 先做 type-1 填充
-            // `00 01 FF…FF 00 || M` 再模幂。以前这里漏了填充、直接拿明文模幂，
-            // 出来的 256 字节签名用公钥验不过（KmProbe 的「NONEwithRSA」项）。
+            // `00 01 FF…FF 00 || M` 再模幂。漏了填充、直接拿明文模幂，出来的签名
+            // 用公钥验不过。
             SignMode::Pkcs1_1_5Padding(Digest::None) => {
                 (false, key_len - PKCS1_UNDIGESTED_SIGNATURE_PADDING_OVERHEAD)
             }

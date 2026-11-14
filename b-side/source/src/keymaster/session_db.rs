@@ -1,19 +1,9 @@
-//! 会话（TEE key blob + 证书链）的落盘层：一个 SQLite 文件，取代原来「一个别名
-//! 一个 JSON 文件」的目录。
+//! 会话（TEE key blob + 证书链）的落盘层：一个 SQLite 文件，按 alias 主键存。
 //!
-//! 为什么换掉目录：
-//!   1. 取用一次是「拼路径 + 读整个 JSON」，别名还得先哈希成文件名（带截断，理论上
-//!      会撞）；库表按 alias 主键查一行。
-//!   2. 清一轮是 read_dir + 对两万个文件挨个 stat，再排序，再逐个 unlink；库里是
-//!      `DELETE ... WHERE used_ms < ?` 加一条按 used_ms 排序的搬运，索引直接扫。
-//!   3. 上限和 TTL 跟服务端的 sessions 表一个口径（20000 条 / 7 天，都按最后一次
-//!      使用算），两边讲的是同一件事。
-//!
-//! 旧目录**原样不动**：刷回旧版本时那边照样读得到，等于现成的回滚源；确认没问题后
-//! 手工 `rm -rf /data/adb/ommega-b/sessions` 就把那一百多 MB 收回来了。
-//!
-//! 库打不开不致命：退回纯内存会话（重启即丢，但设备还在干活），同时响亮地报一条
-//! error —— 静默降级会让人回头去别处找原因。
+//! 约束：
+//! - 上限与 TTL 跟服务端 sessions 表同一口径：20000 条 / 7 天，都按最后一次使用算。
+//! - 旧版「一个别名一个 JSON」目录原样不动，刷回旧版本时它就是回滚源。
+//! - 库打不开不致命：退回纯内存会话（重启即丢），同时报一条 error，不许静默降级。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -48,8 +38,7 @@ pub const MAX_ROWS: usize = 20_000;
 /// 两次清理之间至少隔这么久。
 const PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
-/// 一条会话。这里故意不认识 `tee_ops` 的类型：库里存的就是这几个字段，怎么解释
-/// （枚举、HAL 名字）由上层决定。
+/// 一条会话。故意不认识 `tee_ops` 类型：库里只存这几个字段，怎么解释由上层决定。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stored {
     pub key_blob: Vec<u8>,
@@ -172,8 +161,8 @@ fn open_conn(path: &Path) -> Result<Connection> {
     }
     let conn =
         Connection::open(path).with_context(|| format!("open session db {}", path.display()))?;
-    // WAL：写一条不用重写整表，被 pkill -9 打断也能在下次打开时自恢复（relay 每次
-    // 重启都是 SIGKILL，这条是常态而不是意外）。
+    // WAL：单条写入不用重写整表，被 SIGKILL 打断也能在下次打开时自恢复 —— relay
+    // 重启都是 SIGKILL，这是常态。
     let _mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .unwrap_or_else(|_| "unknown".to_string());
@@ -194,8 +183,7 @@ fn open_conn(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 证书链拼成一坨存：每条前面 4 字节大端长度。省一张子表，也不用 base64 撑大
-/// 三分之一（旧格式是 JSON + base64，实测 8 KB/条）。
+/// 证书链拼成一坨存：每条前面 4 字节大端长度，省掉子表和 base64 的三分之一膨胀。
 fn pack_chain(chain: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(chain.iter().map(|cert| cert.len() + 4).sum());
     for cert in chain {
@@ -273,9 +261,7 @@ fn touch_row(conn: &Connection, alias: &str, now: i64) -> Result<usize> {
 /// 清两个口子：超 TTL 的、以及超条数上限后按最后使用时间从旧到新淘汰的。
 /// 返回 (过期清掉几条, 超上限清掉几条)。
 ///
-/// `used_ms > 0` 是跟服务端学的教训：时间戳未知（0）是「不知道」，不是「早就过期」。
-/// 不过这里的行都是我们自己写的真实时间戳，0 只可能出现在旧目录里连 mtime 都读不出来
-/// 的那几条。
+/// `used_ms > 0` 必须有：时间戳未知（0）是「不知道」，不是「早就过期」，不能清。
 fn prune_rows(conn: &Connection, now: i64, ttl_secs: u64, cap: usize) -> Result<(usize, usize)> {
     let cutoff = now.saturating_sub((ttl_secs as i64).saturating_mul(1000));
     let expired = conn
@@ -296,9 +282,9 @@ fn prune_rows(conn: &Connection, now: i64, ttl_secs: u64, cap: usize) -> Result<
     Ok((expired, over_cap))
 }
 
-/// 旧目录导一次。别名反推不出来（文件名是哈希），所以只能逐个读 JSON；导入用的
-/// 「最后使用时间」取文件的 mtime —— 老版本的 LRU 依据正是 mtime，换算过来一致。
-/// 库里已经有东西就不导，免得把清过的旧记录又拽回来。
+/// 旧目录导一次。别名反推不出来（文件名是哈希），只能逐个读 JSON；「最后使用时间」
+/// 取文件 mtime —— 老版本 LRU 依据正是 mtime，换算一致。库里已有数据就不导，
+/// 免得把清过的旧记录拽回来。
 fn import_legacy_dir(conn: &Connection, dir: &Path, now: i64) -> Result<usize> {
     let existing: i64 = conn
         .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
@@ -469,7 +455,7 @@ mod tests {
         assert_eq!(live, vec!["k0", "k8", "k9"], "留的是最近用过的三个");
     }
 
-    /// 时间戳未知（0）算「不知道」，不算「早就过期」—— 服务端为这条规矩栽过一次。
+    /// 时间戳未知（0）算「不知道」，不算「早就过期」。
     #[test]
     fn unknown_timestamp_is_not_expired() {
         let dir = tempfile::tempdir().unwrap();
@@ -536,8 +522,8 @@ mod tests {
         assert_eq!(get_row(&conn, "alias").unwrap().unwrap(), session(3));
     }
 
-    /// 真机演练（默认跳过）：拿设备上真目录导一遍，看条数对不对、超 TTL 的占多少。
-    /// 要用 OMMEGA_SESSIONS_DB / OMMEGA_SESSIONS_DIR 两个环境变量指路：
+    /// 真机演练（默认跳过）：导一遍设备上的真目录，核对条数与超 TTL 的占比。
+    /// 用 OMMEGA_SESSIONS_DB / OMMEGA_SESSIONS_DIR 两个环境变量指路：
     ///
     /// ```text
     /// cp -r /data/adb/ommega-b/sessions /data/local/tmp/sessions-drill
@@ -561,9 +547,8 @@ mod tests {
         let started = std::time::Instant::now();
         let imported = import_legacy_dir(&conn, &dir, now).unwrap();
         let elapsed = started.elapsed();
-        // 逐条比对：旧 JSON 里那几条字段（key blob、证书链、算法、HAL）搬过来得一模一样，
-        // 少一条或错一个字节，刷上去就是一片 `no key for alias`。比对放在清理之前，
-        // 免得把「过期清掉了」误读成「没导进来」。
+        // 逐条比对：key blob、证书链、算法、HAL 必须一模一样，错一个字节就是一片
+        // `no key for alias`。比对放在清理之前，免得把「过期清掉」误读成「没导进来」。
         let mut checked = 0usize;
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
             let path = entry.path();

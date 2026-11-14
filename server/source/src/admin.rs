@@ -230,26 +230,19 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
                 "last_seen_ms": d.last_seen_ms,
                 "connected": d.connected,
                 "load": load,
-                // 心跳里上报的能力（None = 没上报过）。管理页用它判断
-                // 这台能不能接 SOTER 任务。
+                // 心跳上报的 SOTER 能力：null = 没上报过。
                 "soter": d.supports_soter,
-                // 设备真签出来过一次才报这个（`soter_sign`）：状态页的“签名支持”
-                // 认这一条，而不是“没说不支持”。
+                // 真签成功过一次才置位，比“没说不支持”可信。
                 "soter_sign": d.soter_sign,
-                // 设备自己说“签名做不了”（老版本 relay 的 `soter_nosign`；现在的
-                // relay 不再产生这个结论）：身份/导出还能用，签名类 op 不再派给它。
+                // 老版本 relay 报的“签名做不了”；有值时不再派签名类 op 给它。
                 "soter_nosign": d.soter_nosign,
-                // TA 卡在 TEE 里（RPMB 会话被它自己占死）：导出/建料会一直回 -5。
-                // 这是暂态，设备侧会自己试着重启整机；这个名字亮着就是「重启也没
-                // 搞定，得人工看一眼」。
+                // TA 卡在 TEE 里，导出/建料恒回 -5；暂态，重启整机可恢复。
                 "soter_stuck": d.soter_stuck,
-                // relay 上报的版本号（模块版本），以及这台是模块 relay 还是手机 App
-                // （分不出来时为 null，调用方按能用算）。
+                // relay 模块版本；module = null 表示分不清模块还是手机 App。
                 "version": d.version,
                 "module": d.module_kind(),
                 "strongbox": d.supports_strongbox,
-                // 本机设备身份（relay 心跳上报）：A 端「伪装参数 → 从服务器同步」
-                // 直接拿它去 resetprop，把本机属性对齐到这台 B。
+                // 本机设备身份：A 端拿它 resetprop 对齐这台 B。
                 "identity": json!({
                     "brand": d.identity.brand,
                     "device": d.identity.device,
@@ -542,12 +535,11 @@ pub struct TokenGenBody {
     pub role: String, // "a" | "b"
     pub duration_seconds: i64,
     pub note: Option<String>,
-    /// 卡类型：`pair`（私卡，要和另一端的同 pair_id 配对，并绑定设备）/
-    /// `public`（公开测试卡，只能与同为 public 的另一端互通，不绑设备）/
-    /// 空（老卡密，不绑设备，配对时按私卡的 pair_id 规则处理）。
+    /// 卡类型：`pair` 私卡（同 pair_id 配对 + 绑设备）/ `public` 公开测试卡
+    /// （只与 public 互通、不绑设备）/ 空 = 老卡密（不绑设备，按私卡规则配对）。
     #[serde(default)]
     pub kind: Option<String>,
-    /// 私卡的配对组；**可以留空**，之后再在列表里编辑补上。
+    /// 私卡的配对组，可留空后再在列表里补上。
     #[serde(default)]
     pub pair_id: Option<String>,
 }
@@ -603,10 +595,9 @@ pub struct TokenUnbindBody {
     pub token: String,
 }
 
-/// POST /api/admin/token_unbind/ — 控制台里给私卡解绑设备。
-///
-/// 只清设备指纹，不动激活时间与有效期；公开卡和 `kind` 为空的老卡不绑定，
-/// 调了只会返回“本来就没绑”；配对卡清除后下次使用会重新绑定。
+/// POST /api/admin/token_unbind/ — 给私卡解绑设备。
+/// 只清设备指纹，不动激活时间与有效期；未绑定的卡调用只回“本来就没绑”，
+/// 配对卡清除后下次使用会重新绑定。
 pub async fn admin_token_unbind(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -680,7 +671,6 @@ pub async fn admin_generate_token(
         return json_err(StatusCode::BAD_REQUEST, "pair_id too long (<= 64)");
     }
 
-    // 单条：role 必填。
     if body.role != "a" && body.role != "b" {
         return json_err(StatusCode::BAD_REQUEST, "role must be 'a' or 'b'");
     }
@@ -813,8 +803,7 @@ pub async fn admin_soter_attk_list(State(state): State<AppState>, headers: Heade
 #[derive(serde::Deserialize)]
 pub struct SoterAttkUploadBody {
     pub name: String,
-    /// 这把 ATTK 属于哪台 B。服务端密钥模式按请求（或者控制台默认）的设备 id 匹配它。
-    /// 留空 = 不绑设备，只能当兜底。
+    /// 归属哪台 B：按请求或控制台默认的设备 id 匹配；留空 = 只能兜底。
     #[serde(default)]
     pub device_id: String,
     pub cpu_id: String,
@@ -939,8 +928,7 @@ pub async fn admin_soter_attk_delete(
     };
     match tokio::task::spawn_blocking(move || db.delete_soter_attk(id)).await {
         Ok(Ok(())) => {
-            // 物料缓存跟着丢：这把 ATTK 签出来的 ASK/AuthKey 一起作废，
-            // 下次再传同一把就是新行新 id。
+            // 同时丢物料缓存：它签出的 ASK/AuthKey 作废；重传同一把是新行新 id。
             crate::soter_mint::forget_attk(id);
             Json(json!({ "status": "ok", "id": id })).into_response()
         }
@@ -1005,8 +993,7 @@ pub async fn admin_soter_policy_status(
 }
 
 /// POST /api/admin/soter_policy/ — 改策略（立即生效 + 落盘）。
-///
-/// 可改：模式、默认 ATTK、四份白名单、身份绑定规则（整份替换）；`reset: true` 恢复缺省。
+/// 可改模式、默认 ATTK、四份白名单、身份绑定规则（整份替换）；`reset: true` 恢复缺省。
 pub async fn admin_soter_policy_set(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1015,8 +1002,7 @@ pub async fn admin_soter_policy_set(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    // 引用了库里不存在的 ATTK 就直接拒：存进去也只会让这一层永远没物料，
-    // 请求默默落到自签上，控制台还以为自己配好了。
+    // 引用不存在的 ATTK 直接拒：否则这一层永远没物料，请求静默落到自签。
     let referenced: Vec<i64> = if body.reset {
         Vec::new()
     } else {
@@ -1058,10 +1044,9 @@ pub async fn admin_soter_policy_set(
     }
 }
 
-/// GET /api/admin/soter_slots/ — 服务端记着的那些槽位（按设备 + uid）。
-///
-/// uid 照 AOSP 拆成 `user = uid / 100000`、`app = uid % 100000`：工作资料（10/11）
-/// 和分身（999）里的同一个应用在这张表里是分开的几条，钉在哪一层也各算各的。
+/// GET /api/admin/soter_slots/ — 服务端记着的槽位（按设备 + uid）。
+/// uid 按 AOSP 拆成 `user = uid / 100000`、`app = uid % 100000`：工作资料（10/11）
+/// 与分身（999）里的同一应用是不同的行，钉在哪一层也各算各的。
 pub async fn admin_soter_slots(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
@@ -1100,7 +1085,7 @@ pub async fn admin_soter_slots(State(state): State<AppState>, headers: HeaderMap
             })
         })
         .collect();
-    // 按最近钉的时间倒序，最多给 300 条（控制台只是看个大概，不是全量表）。
+    // 按最近钉的时间倒序，最多 300 条（控制台只看大概，不是全量表）。
     let total = items.len();
     items.sort_by_key(|v| {
         std::cmp::Reverse(v.get("pinned_at").and_then(Value::as_i64).unwrap_or(0))
@@ -1242,9 +1227,8 @@ pub async fn admin_autokeybox_toggle(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    // 后台线程只在 KEYBOX_REFRESH_ENABLED=true 时由 main 启动一次，运行时开不
-    // 出来。这种情况下把开关翻成 true，状态页会显示已启用而实际永不刷新，
-    // 所以直接拒掉，让配置层去解决。
+    // 后台线程只在 KEYBOX_REFRESH_ENABLED=true 时由 main 启动，运行期起不来：
+    // 翻成 true 却永不刷新会误导状态页，所以直接拒，让配置层去解决。
     if body.enabled && !crate::autokeybox::is_started() {
         return json_err(
             StatusCode::CONFLICT,
@@ -1285,7 +1269,6 @@ pub struct AutoKeyboxCoverBody {
 }
 
 /// POST /api/admin/autokeybox/cover/ — enable/disable the auto-cover mode.
-///
 /// Enabling sets the flag and triggers an immediate refresh+cover (fetch keys,
 /// then write them into every online B device id's server identity). Disabling
 /// clears the flag and deletes the rows auto-cover wrote (`machine_id
@@ -1550,10 +1533,8 @@ pub async fn admin_ipfilter_remove(
 // ---------------------------------------------------------------------------
 
 /// GET /api/admin/strongbox/ — current StrongBox handling-mode switch state.
-///
 /// `mode` is the four-state token (`"off" | "smart" | "robust" | "refuse"`);
-/// `enabled` is kept for backwards compatibility and reports only whether the
-/// Robust (original "强健/降级") mode is active.
+/// `enabled` is legacy and only reports whether robust mode is active.
 pub async fn admin_strongbox_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
@@ -1577,22 +1558,14 @@ pub struct StrongboxToggleBody {
 }
 
 /// POST /api/admin/strongbox/ — set the StrongBox handling mode.
-///
-/// Modes:
-///   - off (default): strict native semantics — StrongBox errors propagate to
-///     the next fulfilment layer exactly as before.
-///   - smart: StrongBox-fidelity orchestration — serve from the B device's real
-///     StrongBox when it works; surface a present-but-broken StrongBox
-///     (keys not provisioned / hardware type unavailable) verbatim to the A-side
-///     app; fall back to the stored per-device keybox identity when the B device
-///     has no StrongBox; otherwise hand back to the A-side local keybox.
-///   - robust: Android-standard silent fallback — a B-side StrongBox capability
-///     error is transparently retried as a TEE request on the same B device.
-///   - refuse: honest refusal — a StrongBox request is served only by the B
-///     device's real StrongBox; anything else (no HAL / keys not provisioned /
-///     hardware type unavailable / TEE demotion / timeout) comes back as a
-///     `relay_error_kind` marker that the A side maps to the matching KeyMint
-///     error. Nothing is minted on the server or on the A side.
+///   - off (default): strict native semantics, errors propagate unchanged.
+///   - smart: serve from B's real StrongBox; a broken one (keys not provisioned /
+///     type unavailable) is surfaced verbatim; else stored identity; else A-side.
+///   - robust: a B-side StrongBox capability error is retried as TEE on the same B.
+///   - refuse: only B's real StrongBox serves; anything else (no HAL / keys not
+///     provisioned / type unavailable / TEE demotion / timeout) yields a
+///     `relay_error_kind` marker mapped to the KeyMint error. Nothing is minted
+///     on the server or the A side.
 pub async fn admin_strongbox_toggle(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1627,15 +1600,11 @@ pub async fn admin_strongbox_toggle(
 
 // ---------------------------------------------------------------------------
 // Attest layer-order switches (keybox first / device-ID attest server side).
-//
-// These used to be env-only (RELAY_ATTEST_KEYBOX_FIRST /
-// RELAY_ID_ATTEST_SERVER_SIDE): invisible on the console and requiring a
-// restart. The values now live in `crate::attest_policy` (runtime + persisted
-// to data/attest_policy.json), so saving the panel takes effect immediately.
+// Values live in `crate::attest_policy` and persist to data/attest_policy.json;
+// saving the panel takes effect immediately.
 // ---------------------------------------------------------------------------
 
 /// GET /api/admin/attest_policy/ - current layer-order policy.
-///
 /// `auto` (the default) simply means "follow the mode" (local minting -> server
 /// keybox first, physical -> real device first). `b_first` / `keybox_first` are
 /// troubleshooting overrides only.
@@ -1662,10 +1631,8 @@ pub async fn admin_attest_policy_status(
 }
 
 /// GET /api/admin/b_limit/ - B 端接入名额上限。
-///
-/// `max_b_devices = 0` 表示不限制（默认）。大于 0 时，在线的 B 超过这个数就按
-/// 「锁定+可信启动」优先的顺序筛选：新设备质量更高会顶掉最差的，否则拒（403）。
-/// 面板上配的默认 keymint / soter 设备无条件放行。
+/// `max_b_devices = 0` 不限制（默认）；大于 0 时在线 B 超限按「锁定 + 可信启动」
+/// 优先排序，新设备更优则顶掉最差的，否则 403。默认 keymint/soter 设备无条件放行。
 pub async fn admin_b_limit_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
@@ -1675,7 +1642,7 @@ pub async fn admin_b_limit_status(State(state): State<AppState>, headers: Header
         "status": "ok",
         "max_b_devices": crate::b_limit::get(),
         "path": crate::b_limit::path().display().to_string(),
-        // 这两台不受名额限制，面板上一起显示出来比较好理解
+        // 不受名额限制的两台，一并回给面板。
         "unlimited": {
             "keymint": km,
             "soter": soter,
@@ -1696,7 +1663,7 @@ pub async fn admin_b_limit_set(
     let Some(raw) = body.get("max_b_devices").and_then(Value::as_u64) else {
         return json_err(StatusCode::BAD_REQUEST, "max_b_devices is required");
     };
-    // 只改数字：判定是无状态的（每次 poll 现场排名），不需要重新分配什么。
+    // 判定无状态（每次 poll 现场排名），只改数字，无需重新分配。
     match crate::b_limit::set(raw as usize) {
         Ok(v) => Json(json!({
             "status": "ok",
@@ -1791,7 +1758,7 @@ pub async fn admin_attest_policy_set(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    // 这几个解析函数回的是 axum Response，体积本来就大；换成 Box 得改一堆调用点。
+    // 这几个解析函数返回 axum Response（体积大），换 Box 要改一堆调用点，故沿用 allow。
     #[allow(clippy::result_large_err)]
     fn parse(
         name: &str,
@@ -1872,15 +1839,10 @@ pub async fn admin_attest_policy_set(
 // Default device id (A side leaves `device_id` empty).
 // ---------------------------------------------------------------------------
 
-/// GET /api/admin/default_device/ — 当前「默认设备 id」（两条链路各一个）+ 在线情况。
-///
-/// A 端在远程模式下把 `device_id` 留空（模块装好就是空的，面板不用占位一台设备），
-/// 请求照样上来，服务端按链路分别落 B：
-/// - KeyMint 链（attest / sign / decrypt）用 `keymint_device_id`；
-/// - SOTER 链用 `soter_device_id`。
-///
-/// 没配就按负载挑一台在线的。返回里 `*_online` 是「配的那台现在在不在线」
-/// （`null` = 没配）。
+/// GET /api/admin/default_device/ — 每链一个「默认设备 id」+ 在线情况。
+/// A 端远程模式把 `device_id` 留空，服务端按链分派：KeyMint（attest / sign /
+/// decrypt）用 `keymint_device_id`，SOTER 用 `soter_device_id`；没配就按负载挑
+/// 一台在线的。返回的 `*_online` 表示配的那台是否在线（`null` = 没配）。
 pub async fn admin_default_device_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1898,9 +1860,8 @@ pub async fn admin_default_device_status(
             Some(connected.iter().any(|d| d.device_id == id))
         }
     };
-    // 只回「配的那台在不在线」+ 在线总数。别把整张设备表倒出去：在线 B 是几百台级别，
-    // 这个接口每开一次面板就被拉一次，返回体会越长越大（2026-10-18 实测 200+ 台）。
-    // 需要具体 id 的地方自己走 `/api/admin/devices/` 或 `/api/status/`。
+    // 只回「配的那台在不在线」+ 在线总数：在线 B 是几百台级别，整表返回体会越拉越大。
+    // 需要具体 id 的走 `/api/admin/devices/` 或 `/api/status/`。
     Json(json!({
         "status": "ok",
         "keymint_device_id": keymint,
@@ -1926,13 +1887,9 @@ pub struct DefaultDeviceBody {
 }
 
 /// POST /api/admin/default_device/ — 保存「默认设备 id」。
-///
-/// **只改内存，不落盘**：这段设置唯一来源是环境变量（README 里那几项），
-/// 重启后回到 `.env` 里的值。以前还有一份 `data/default_device.json`，与
-/// 环境变量两个写入口互相覆盖，排查时分不清用的是哪个——8443 那个实例就因为
-/// 没有那份文件、归一回落到代码默认，把 SOTER 请求派到了一台没有 SOTER 能力的 B。
-/// 要长期生效就改环境变量再重启。
-/// 两条链路互不影响：只传 `keymint_device_id` 时 SOTER 那台一个字都不动。
+/// **只改内存，不落盘**：唯一持久来源是环境变量，重启回落到 `.env` 的值；
+/// 要长期生效请改环境变量再重启。两条链路互不影响：只传 `keymint_device_id`
+/// 时 SOTER 那台不动。
 pub async fn admin_default_device_set(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1941,7 +1898,7 @@ pub async fn admin_default_device_set(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    // 老字段 `device_id` 一次性盖两条（旧面板的行为）；新面板走两条各自的字段。
+    // 老字段 `device_id` 一次覆盖两条链；新面板走各自的字段。
     let targets: Vec<(crate::default_device::Chain, String)> = if let Some(legacy) = &body.device_id
     {
         vec![
@@ -2035,31 +1992,24 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 "load": load,
                 "last_seen_ms": d.last_seen_ms,
                 "boot": boot,
-                // 链里 ATTESTATION_APPLICATION_ID（tag 709）解析出来的包名。这是
-                // 唯一能区分「链是设备自己的 app 出的」和「模块替别人出的」的字段。
+                // 链里 ATTESTATION_APPLICATION_ID（tag 709）解析出的包名，是区分
+                // 链来自设备自身 app 还是模块代签的唯一字段。
                 "aaid": d.last_aaid,
-                // 自检失败的原因（连上后替它排的那次认证的结果）。有值时状态页
-                // 点开就能看到“为什么这台没有启动信息”，不再是一片空白。
+                // 连上后替它排的那次认证的失败原因；有值即“没有启动信息”的原因。
                 "tee_error": d.tee_error,
-                // 心跳里上报的能力：`true` 支持 / `false` 明确不支持 / `null`
-                // 没上报过（老版本 relay）。状态页点开设备时显示。
+                // SOTER 能力：true/false 明确，null = 老版本 relay 没上报。
                 "soter": d.supports_soter,
-                // 真签出来过才报这个（`soter_sign`），状态页拿它区分“量过，行”
-                // 和“没量过，还能试”。
+                // 真签成功过才置位，用来区分「量过且行」与「没量过」。
                 "soter_sign": d.soter_sign,
-                // 另一条：老版本 relay 报的“签名这步做不了”（`soter_nosign`）。
-                // 现在的 relay 不再产生这个结论（失败码推不出设备能力）。
+                // 老版本 relay 报的“签名做不了”；现版本不再产生该结论。
                 "soter_nosign": d.soter_nosign,
-                // 再一条：TA 卡在 TEE 里（`soter_stuck`），导出/建料会一直回 -5。
-                // 跟上面两条不同，它是暂态，重启整机就能恢复。
+                // TA 卡在 TEE 里，导出/建料恒回 -5；暂态，重启整机可恢复。
                 "soter_stuck": d.soter_stuck,
-                // relay 上报的版本号（模块版本），以及这台是模块 relay 还是手机 App
-                // （分不出来时为 null，调用方按能用算）。
+                // relay 模块版本；module = null 表示分不清模块还是手机 App。
                 "version": d.version,
                 "module": d.module_kind(),
                 "strongbox": d.supports_strongbox,
-                // 本机设备身份（relay 心跳上报）：A 端「伪装参数 → 从服务器同步」
-                // 直接拿它去 resetprop，把本机属性对齐到这台 B。
+                // 本机设备身份：A 端拿它 resetprop 对齐这台 B。
                 "identity": json!({
                     "brand": d.identity.brand,
                     "device": d.identity.device,
@@ -2113,13 +2063,12 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
 
     Json(json!({
         "status": "ok",
-        // 线上跑的到底是哪一版 —— 以后不用再靠 sha256 认。
         "version": crate::config::VERSION,
         "mode": if state.fulfill.is_enabled() { "serverbox" } else { "physical" },
         "online_b_devices": connected,
         "cert_devices": cert_devices,
-        // A 端面板「从服务器同步」优先跟这台 KeyMint 设备；它不可用/不在线
-        // 时再按原来的规则（锁、验证启动、负载）自动挑。
+        // A 端「从服务器同步」优先跟这台 KeyMint；不在线时
+        // 按锁、验证启动、负载自动挑。
         "default_keymint_device_id": crate::default_device::get(crate::default_device::Chain::Keymint),
         "server_time_ms": chrono::Utc::now().timestamp_millis(),
     }))

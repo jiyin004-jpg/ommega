@@ -5,28 +5,20 @@
 //! sent as a comma separated `caps=` field on every poll (the B-side heartbeat),
 //! so this has to stay cheap — the SOTER verdict is probed once and then cached.
 //!
-//! SOTER is split in two on purpose:
+//! Fields:
 //!
-//! - `soter` — the HAL answers `getDeviceId`: identity / export ops can be
-//!   served.  Cheap to prove, and it is what the old relays reported.
+//! - `soter` — the HAL answers `getDeviceId`: identity / export ops can be served.
 //! - `soter_sign` — a signature was really produced once (`init_sign` +
-//!   `finish_sign` both answered 0).  This is the only honest way to claim it.
-//!   A headless device does not fail this: 2026-10-06 measured on PLC110
-//!   (Trustonic AIDL) that the relay signs with nobody pressing a fingerprint
-//!   (the signature verifies against the AuthKey public key).  "Not measured"
-//!   must therefore stay "not measured" — it never means "cannot".
-//! - `soter_nosign` — the OPPOSITE, stated out loud.  The server still parses
-//!   the name (old relays send it), but this build **never emits it**: every
-//!   code a refused sign produces is a per-attempt one (`-26` this attempt did
-//!   not verify, `-204` the session was clobbered, a timeout), and inferring a
-//!   device capability from those used to route sign ops away from devices
-//!   that can sign perfectly well.
-//! - `soter_stuck` — the TA is wedged inside the TEE: it holds the RPMB session
-//!   open and never lets go, so it can no longer read its own persistent store.
-//!   Export/build then answer `-5`/`258` while `has_*` still says the material is
-//!   there.  Before reporting this the relay already tried to escalate (reboot
-//!   the phone, see `soter::hal_restart`); this name means that escalation
-//!   either could not run or did not help, so a human has to look.
+//!   `finish_sign` both answered 0).  Nothing weaker may claim it: "not measured"
+//!   stays "not measured" and never means "cannot".
+//! - `soter_nosign` — the opposite.  The server still parses the name (old relays
+//!   send it), but this build **never emits it**: every code a refused sign
+//!   produces is per-attempt (`-26` not verified, `-204` session clobbered,
+//!   timeout), and inferring a capability from those misroutes sign ops.
+//! - `soter_stuck` — the TA is wedged in the TEE, holding the RPMB session open so
+//!   it cannot read its persistent store; export/build answer `-5`/`258` while
+//!   `has_*` says the material is there.  Reported only after escalation failed
+//!   (see `soter::hal_restart`) — a human has to look.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -34,12 +26,12 @@ use std::time::{Duration, Instant};
 use crate::keymaster::attest_proxy::SYSTEM_KEYMINT_STRONGBOX;
 use crate::soter;
 
-/// Which key slot to try a real signature on: `relay.conf` carries
-/// `OMMEGA_RELAY_SOTER_PROBE_UID` / `OMMEGA_RELAY_SOTER_PROBE_ALIAS`.
+/// 用哪个 key 槽试真签名：`relay.conf` 里的 `OMMEGA_RELAY_SOTER_PROBE_UID` /
+/// `OMMEGA_RELAY_SOTER_PROBE_ALIAS`。
 ///
-/// 没配也不等于签不了：那只是「手上还没有能试的槽位」，这时候什么都不上报（只报
-/// `soter`），服务端照旧会试着派活；等这台机器真跑过一次 `init_sign`，槽位会被
-/// 记下来当探针目标，下一次心跳就能量出结论。探针只用现成材料，**不建不删**。
+/// 没配也不等于签不了：那只是「手上还没有能试的槽位」，这时什么都不上报（只报
+/// `soter`），服务端照旧会派活；等这台机器真跑过一次 `init_sign`，槽位会被记
+/// 下来当探针目标。探针只用现成材料，**不建不删**。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignProbeTarget {
     pub uid: i32,
@@ -53,27 +45,20 @@ pub struct SignProbeTarget {
 /// it treats as "not reported" and is still willing to try.
 pub fn report(sign_target: Option<&SignProbeTarget>) -> String {
     let mut caps: Vec<&str> = Vec::new();
-    // 只用 `soter_usable` 这一道：它内部是 `soter::probe`，会把 AIDL 两家
-    // 和 HIDL 两家都真探一遍，而且带 5 分钟缓存。以前这里还有一层
-    // `service_present()` 预筛，但那个只认 AIDL（HIDL 那边没有同样廉价的
-    // 探法），`&&` 一短路就把 HIDL-only 的机器漏掉了。
+    // 只用 `soter_usable` 这一道：内部是 `soter::probe`，AIDL 两家和 HIDL 两家都真
+    // 探一遍，带 5 分钟缓存。不能再加一层 `service_present()` 预筛 —— 那个只认
+    // AIDL，`&&` 一短路就把 HIDL-only 的机器漏掉了。
     if soter_usable() {
         caps.push("soter");
-        // HAL 肯答话只够说明身份/导出能用，证明不了它肯签。所以「能签」得真签
-        // 出来一次才算（反面则一律不说：失败码推不出设备能力，见模块头）。
-        //
-        // 探针目标优先听配置的；没配就退到这台机器真跑过一次 `init_sign` 的那个
-        // 槽位 —— 探针只为了挣正面结论，量不出来就什么都不说。
+        // HAL 肯答话只够说明身份/导出能用，证明不了它肯签；「能签」得真签出来一次
+        // 才算。探针目标优先听配置的，没配就退到真跑过 `init_sign` 的那个槽位。
         probe_sign_capability(sign_target.cloned().or_else(learned_target).as_ref());
-        // 「行」只认真签出来过一次；「不行」这个版本不报（失败码推不出设备
-        // 能力，误报还会把签名 op 从这台挪走）。没量出来就只报 `soter`。
+        // 「行」只认真签出来过一次；「不行」这个版本不报。没量出来就只报 `soter`。
         if soter::sign_state() == soter::SignState::Proven {
             caps.push("soter_sign");
         }
-        // TA 卡在 TEE 里：HAL 照样答话、身份/导出 op 也照样回，但回的是错的
-        // （「说存在、却导不出来」，`-5` + `258`）。这台现在不该再被派 SOTER 活；
-        // 自愈自己会先试重启整机，试不动（次数到顶/开机宽限期/重启失败）才会报
-        // 这个名字，意思就是「得人工看一眼了」。
+        // TA 卡在 TEE 里：HAL 照样答话，但身份/导出回了错（`-5` + `258`），这台
+        // 不该再被派 SOTER 活。自愈先试重启整机，试不动才会报这个名字。
         if soter::hal_restart::tee_wedged() {
             caps.push("soter_stuck");
         }
@@ -99,15 +84,11 @@ static SOTER_VERDICT: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 /// 20 秒一次扛不住）。
 static SIGN_PROBED_AT: Mutex<Option<(Instant, Option<SignProbeTarget>)>> = Mutex::new(None);
 
-/// 光看 HAL 注册没注册不够 —— 得让它真的答一次。
+/// 光看 HAL 注册没注册不够 —— 得让它真的答一次。HAL 注册着但 `getDeviceId` 回错
+/// （如 `-20`）时 TA 根本没起来，服务端会把别人的 SOTER 任务派过来。
 ///
-/// 实测踩过的坑：一台骁龙机器上 `vendor.qti.hardware.soter.ISoter/default` 好端端注册
-/// 着，`getDeviceId` 却回 -20，KeyMint 那边 `generateKey` 也是 -49，TEE 里那套 TA 根本
-/// 没起来。服务端会把别人的 SOTER 任务派过来 —— 而 SOTER 只有 B 层、没有兜底，
-/// 等于把请求直接做废。
-///
-/// 探一次要开 binder 发个事务，心跳每 20 秒一次扛不住，所以结果缓存；失败也缓存（坏掉的
-/// TEE 不会自己好），但给 TTL，免得 TA 修好了还一直报空。
+/// 探一次要开 binder 发个事务，心跳每 20 秒一次扛不住，所以结果缓存；失败也缓存
+/// （坏掉的 TEE 不会自己好），但给 TTL，免得 TA 修好了还一直报空。
 fn soter_usable() -> bool {
     let mut cache = SOTER_VERDICT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, usable)) = *cache {
@@ -129,9 +110,8 @@ fn soter_usable() -> bool {
 /// 探针只能挣到正面结论（真签出来过），永远不能拿它去下「签不了」的断言。
 ///
 /// 探针撞上的失败码全是「这次没量出来」：`-26` 是这一笔没验过、`-5`/`-6` 是槽位
-/// 上没材料、`-204` 是会话被顶掉。2026-10-06 实测 PLC110 无人值守也签得出来，
-/// 所以更没理由从失败码推「这台签不了」—— 服务端接了这个结论会把一台明明能签的
-/// 机器从签名链路上踢掉，比不报还糟。
+/// 上没材料、`-204` 是会话被顶掉。服务端接了这个结论会把一台明明能签的机器从
+/// 签名链路上踢掉，比不报还糟。
 fn probe_sign_capability(target: Option<&SignProbeTarget>) {
     // sign_probe atomically checks the session lease and reserves HAL access.
     let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());

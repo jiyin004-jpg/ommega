@@ -1,44 +1,27 @@
 //! 探测机（春秋 / 鸭子）的 SOTER 请求：用服务端内置物料就地作答，一个字节都不落 B 端。
 //!
-//! 为什么要拦：这两台探测器把整套 SOTER 流程（ASK、AuthKey、签名）反复地跑，每笔都要真机
-//! TEE 陪着走一遍 —— 而它们要的只是「SOTER 能不能用」，不是腾讯认得的那把钥匙。实测当前
-//! 每分钟能从 B 端拿走十几到二十几笔。attest 走的是另一条路，这里一个字都不动，判据只对
-//! `/api/soter/` 生效。
-//!
-//! 判据为什么不只看别名：探测机的 ASK 那几个 op（`has_ask_already`、`export_ask_public_key`、
-//! `generate_ask_key_pair`、`remove_all_uid_key`）本来就不带别名，只看别名连一小半都拦不到。
-//! 所以这里还记「槽位」—— `(点名设备, uid)` 上见过探测别名，这个槽位接下来也按探测机对待。
-//! 反过来，同一个槽位只要见过一次真应用的别名（微信那种），就把它当回真应用、不再拦：
-//! uid 号在不同设备上是复用的，宁可漏拦，也不能把别人的真钥匙拦成服务端造的假料。
-//!
-//! 判据为什么必须留在服务端：别人自己写的 A 端不会带本地兜底（A 端那份见
-//! `a-side/source/src/soter_relay.rs`），这些流量只有服务端看得见。
+//! 判据只对 `/api/soter/` 生效，attest 走另一条路、一个字都不动。只看别名不够：探测机的
+//! ASK 那几个 op（`has_ask_already` / `export_ask_public_key` / `generate_ask_key_pair` /
+//! `remove_all_uid_key`）本来就不带别名，所以还要记「槽位」`(点名设备, uid)`：见过探测别名
+//! 就按探测机对待，见过真应用别名就放回真机（uid 在不同设备上复用，宁可漏拦）。
+//! 判据必须留在服务端：自写的 A 端不一定带本地兜底，这些流量只有服务端看得见
+//! （A 端那份见 `a-side/source/src/soter_relay.rs`）。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::config::Config;
 
-/// 真应用（支持 SOTER SDK 的那批，微信 / 支付宝 / GMS 都走这套名字）的别名前缀。
+/// 真应用（微信 / 支付宝 / GMS 都走这套名字）的别名前缀。
 ///
-/// 规则是反向的：**命中这里的交给真机，其余一律用内置料就地作答**。
-/// 探测机自己起的名字（`*_soter_probe_*`）不在里面，所以连它那几笔不带别名的 ASK
-/// 也一并落到内置料上 —— 同一轮的 ASK / AuthKey 报同一个号，不再一个真机一个本地。
-///
-/// 别名命中还有一层作用：它会把 `(点名设备, uid)` 这个槽位记成「真应用用过」（见
-/// `REAL_SLOT_TTL_MS`），之后同槽位那些**不带别名**的调用（`has_ask_already` /
-/// `export_ask_public_key` 那套）才会跟着走真机。所以漏一个真应用命名，代价不是「那一笔
-/// 被拦」，而是「那台机器整个流程都留在内置料上」——它的 ASK 与 AuthKey 从此不同源。
-///
-/// `Wechatuid...` 是 2026-10-04 从生产日志里补进来的：两小时半里 99 笔、来自十来台设备
-/// （uid 10333 / 10366 / 10442 …），名字形如 `Wechatuid10248__scene0`，之前一条都没命中，
-/// 全都靠 `sticky` 蹭过去的（蹭过去的那几笔不会标槽位）。
+/// 规则是反向的：**命中这里的交给真机，其余一律用内置料就地作答**。探测机自己的
+/// `*_soter_probe_*` 不在里面，所以它那几笔不带别名的 ASK 也落到内置料上。
+/// 命中还会把 `(点名设备, uid)` 槽位记成真应用（见 `REAL_SLOT_TTL_MS`）：漏一个真应用命名，
+/// 代价不是那一笔被拦，而是那台机器整个流程都留在内置料上，ASK 与 AuthKey 从此不同源。
 pub const DEFAULT_REAL_APP_PREFIXES: &str = "SoterAuthKey,WechatAuthKeyPay&,Wechatuid";
 
 /// 槽位上见过真应用别名之后，多久内它「不带别名的调用」（ASK / getDeviceId 那套）也照样
-/// 交给真机。真应用的 uid 是诚实的（SDK 拿自己的 `Binder.getCallingUid()` 填），但窗口要
-/// 短：一轮流程里那几笔本来就隔着几秒，6 秒够挂得住；再长只会把探测机/别的应用的
-/// 不带别名调用误当成真应用的，反而把它们送到真机上去。
+/// 交给真机。真应用的 uid 是诚实的（SDK 拿自己的 `Binder.getCallingUid()` 填）。
 const REAL_SLOT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 「这个槽位上一笔是谁答的」记多久。
@@ -61,7 +44,7 @@ struct SlotNote {
     served_ms: i64,
 }
 
-/// 槽位备注表。纯逻辑，好单测：生产里就是 `NOTES` 里那张表。
+/// 槽位备注表。生产里由 `NOTES` 持有。
 #[derive(Debug, Default)]
 struct Notes {
     map: HashMap<String, SlotNote>,
@@ -131,8 +114,8 @@ static NOTES: Mutex<Option<Notes>> = Mutex::new(None);
 
 /// 会话号（`init_sign` 开的）→ 这一轮是在哪一侧开的（`true` = 真机）。
 ///
-/// `finish_sign` 那笔**不带别名也不带 uid**，只有会话号；不能拿它去重新判“这是谁”，
-/// 必须送回开会话的那一侧 —— 不然真机的会话拿到内置料上去问，只会回 -5（微信就是这么失败的）。
+/// `finish_sign` 那笔**不带别名也不带 uid**，只有会话号；不能拿它去重新判「这是谁」，
+/// 必须送回开会话的那一侧 —— 真机的会话拿到内置料上只会回 -5。
 const SESSION_SIDE_TTL_MS: i64 = 10 * 60 * 1000;
 static SESSION_SIDES: Mutex<Option<HashMap<String, (bool, i64)>>> = Mutex::new(None);
 
@@ -158,22 +141,17 @@ pub fn session_side(device: &str, session: i64) -> Option<bool> {
 
 /// 「这台设备上一笔 SOTER 落在哪一层」记多久。
 ///
-/// `get_device_id` 没有 uid 参数，App 那边也没法把调用者带出来（SOTER 宿主是系统进程，
-/// 到 HAL 这一层只剩 soterserver），A 端只能拿「当前前台应用」凑一个 `caller_pkg`——
-/// 跑检测的时候前台多半是桌面，于是同一个 uid 的 ASK 走了 B、getDeviceId 却退回本地，
-/// 两边的 `cpu_id` 一撞就是检测器那条 C5b。它跟 `finish_sign` 一样是会话类调用，
-/// 跟着这台设备上一笔 SOTER 落在的那一层走，别另判一次。
-///
-/// 窗口只要盖得住一轮流程里那几笔的间隔：实测同一轮是亚秒级，30 秒足够；再长会把
-/// 刚跑完检测器的设备接着跑的真应用也拽到本地去。
+/// `get_device_id` 没有 uid 参数，A 端的 `caller_pkg` 是拿「当前前台应用」凑的，不能拿它
+/// 定层；它跟 `finish_sign` 一样是会话类调用，只能跟着这台设备上一笔走，否则两边的
+/// `cpu_id` 一撞就是检测器那条 C5b。一轮流程是亚秒级，30 秒足够，再长会把紧跟着的
+/// 真应用也拽到本地。
 const DEVICE_SIDE_MS: i64 = 30 * 1000;
 
 /// 这台设备上一笔 SOTER 是谁答的。
 ///
 /// 三态而不是布尔：`keybox` / `self_signed` / `attk` 是**服务端自己造料**（用 A 端带上来的
-/// `cpu_id`），跟“A 端本地作答”是两回事。以前只记“是不是真机”，这两类都落到 `false`，
-/// 于是 ASK 走服务端造料、getDeviceId 却退回 A 端本地（报的是本机派生号），两个 `cpu_id`
-/// 一撞就是检测器的 C5b。
+/// `cpu_id`），跟「A 端本地作答」是两回事；混成一个 `false` 会让 ASK 走服务端造料、
+/// getDeviceId 退回本机派生号，两个 `cpu_id` 一撞就是检测器的 C5b。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Side {
     /// B 端真机。
@@ -187,9 +165,7 @@ pub enum Side {
 static DEVICE_SIDES: Mutex<Option<HashMap<String, (Side, i64)>>> = Mutex::new(None);
 
 /// 记一笔：这台设备的这一笔是谁答的。
-///
-/// 只有 `get_device_id` 读它（见 [`device_side`]）：那个 op 翻不出调用者，只能跟着
-/// 上一笔走。别的 op 都有自己的判据，不掺这一份。
+/// 只有 `get_device_id` 读它（见 [`device_side`]）：那个 op 翻不出调用者，只能跟着上一笔走。
 pub fn note_device_side(device: &str, side: Side) {
     let device = device.trim();
     if device.is_empty() {
@@ -228,15 +204,13 @@ pub fn server_layer(device: &str) -> Option<String> {
 
 /// `get_device_id` 这一笔归哪一层（`None` = 交给真机）。
 ///
-/// 这个 op 没有 uid 参数，A 端那傷 `caller_pkg` 是拿「当前前台应用」凑的，所以不能像
-/// 别的 op 那样直接拿它定生死；但也不能反过来只看「上一笔谁答的」——真应用的 getDeviceId
-/// 往往是一轮流程的第一笔（微信就是这样），上一笔刚好是探测机的本地答案时，它就会被
-/// 拉到本地去，跟紧跟着走 B 的 ASK 撞成两个 cpu_id。SO：
+/// 这个 op 没有 uid 参数，A 端的 `caller_pkg` 是拿「当前前台应用」凑的，不能像别的 op 那样
+/// 直接定生死；也不能只看「上一笔谁答的」—— 真应用的 getDeviceId 常是一轮流程的第一笔，
+/// 被上一笔的本地答案拉回本地就会跟紧跟着走 B 的 ASK 撞成两个 cpu_id。优先级：
 ///
-/// 1. 包名命中白名单 → 真机。“要身份的这个 App 就是真应用”这条信号比上一笔硬；
-/// 2. 包名不在名单里 / 拿不到 → 看这台设备上一笔落在哪一层（探测机与 SoterChecker
-///    都是走这条）；
-/// 3. 什么证据都没有 → 本地作答，跟没有这个参数之前一样。
+/// 1. 包名命中白名单 → 真机（这条信号比上一笔硬）；
+/// 2. 包名不在名单里 / 拿不到 → 看这台设备上一笔落在哪一层；
+/// 3. 什么证据都没有 → 本地作答。
 pub fn get_device_id_side(
     cfg: &Config,
     caller_pkg: Option<&str>,
@@ -302,20 +276,14 @@ pub const CALLER_PKG_SRC_FIELD: &str = "caller_pkg_src";
 
 /// 真应用的包名白名单：这些才交给真机，其余一律内置料。
 ///
-/// 为什么用包名：别名是调用方自己起的、请求里的 uid 也是自己填的，两者都不可信；
-/// 包名由 A 端按内核给的真调用者 uid 在设备本地翻出来，是唯一精确的判据。
-///
-/// 宁可写宽：名单漏一个真应用，它拿到内置料、自己服务端验不过就直接坏；名单里多一个
-/// （哪怕它根本不用 SOTER）什么也不会发生。但**探测器/测试类的包一个都不能放进来**
-/// （放进来就是把真机那个 cpu_id 递出去）。要加硬就改环境变量
-/// `RELAY_SOTER_REAL_APP_PACKAGES`（逗号分隔，写了就不看这份缺省）。
+/// 别名是调用方自己起的、请求里的 uid 也是自己填的，两者都不可信；包名由 A 端按内核给的
+/// 真调用者 uid 在设备本地翻出来，是唯一精确的判据。名单漏一个真应用，它拿到内置料就直接
+/// 坏；名单里多一个什么也不会发生。但**探测/测试类的包一个都不能放进来**（放进来就是把
+/// 真机那个 cpu_id 递出去）。要加硬就改环境变量 `RELAY_SOTER_REAL_APP_PACKAGES`（逗号分隔，
+/// 写了就不看这份缺省）。
 pub const DEFAULT_REAL_APP_PACKAGES: &str = concat!(
-    // 只认真的会走腾讯 SOTER 的应用：微信（含工具进程）与支付宝（含 push 进程）。
-    // 其余一律在服务端就地作答、不落真机 —— 真机那个 cpu_id 不给探测类或非支付类应用。
-    // 要改就用环境变量 `RELAY_SOTER_REAL_APP_PACKAGES`（逗号分隔，写了就不看这份缺省）。
-    // 只写主包名。`caller_pkg` 来自 packages.list / AAID，天生只是包名、不带冒号；
-    // 即使哪天带了 `:tools` / `:push`，`same_app` 也会剥掉后缀再比，一个 App 一条就
-    // 覆盖它所有进程。
+    // 只写主包名。`caller_pkg` 来自 packages.list / AAID，天生只是包名、不带冒号；即使哪天
+    // 带了 `:tools` / `:push`，`same_app` 也会剥掉后缀再比，一个 App 一条就覆盖它所有进程。
     "com.tencent.mm,",
     "com.eg.android.AlipayGphone,",
     // 电商 / 生活服务 / 出行：这几家的支付和实名环节都会走指纹。
@@ -343,32 +311,25 @@ pub const DEFAULT_REAL_APP_PACKAGES: &str = concat!(
 /// 这笔要不要就地作答（用内置料）；要的话给出理由（拿去打日志）。
 ///
 /// 反向白名单：
-///
-/// 1. 别名命中真应用那套名字（`SoterAuthKey…` / `WechatAuthKeyPay&…`）→ `None`（交给真机），
-///    同时把这个槽位标成真应用；
+/// 1. 别名命中真应用前缀 → `None`（交给真机），同时把这个槽位标成真应用；
 /// 2. 有别名但不在名单里（探测机自己起的名字、其它自定义名）→ 就地作答；
 /// 3. 没别名（ASK / getDeviceId 那套）：槽位刚用过真应用别名 → 交给真机；否则就地作答。
 ///
-/// `soter_local_only_prefixes` / `soter_local_only_uids` 两个旧名单还留着当人工口子：
-/// 前者点名「永远本地」，后者点名「永远当真应用」。
+/// `soter_local_only_prefixes` / `soter_local_only_uids` 两个旧名单是人工口子：前者点名
+/// 「永远本地」，后者点名「永远当真应用」。
 pub fn reason(cfg: &Config, device: &str, uid: Option<i32>, alias: Option<&str>) -> Option<String> {
     reason_with_caller(cfg, device, uid, alias, None, None)
 }
 
-/// 带「调用者包名」的版本：A 端传了 `caller_pkg` 就按包名白名单判（精确），
-/// 没传就走旧的别名/槽位逻辑。
-///
-/// `caller_pkg_src` 只用来记日志/统计：实测系统自带的 `SoterService` 调 HAL 时一律
-/// 用 `Binder.getCallingUid()`（内核填的真实 App uid），而不是 App 传进来的参数，
-/// 所以 A 端拿这个 uid 翻出来的包名是真的，探测机伪造不了。
 /// 这个调用方包名在不在真应用名单里。
 ///
-/// 给入口闸门用：闸门只在探测机上省 CPU，真应用一轮流程里 ASK / generate / export
-/// 的间隔经常不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」——两边的
-/// cpu_id 和钥匙对不上，检测器的 C5b / T10 就是这么红的。
+/// 给入口闸门用：闸门只在探测机上省 CPU，真应用一轮流程里 ASK / generate / export 的间隔
+/// 经常不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」——两边的 cpu_id 和钥匙对不上，
+/// 检测器的 C5b / T10 就是这么红的。
 ///
 /// 跟 [`reason_with_caller`] 用同一份名单，但**不写任何状态**（不带 observe/served），
-/// 因为它要在真正路由之前跑。
+/// 因为它要在真正路由之前跑。包名由 A 端按内核给的 `Binder.getCallingUid()` 在设备本地翻出，
+/// 探测机伪造不了。
 pub fn is_listed_real_app(cfg: &Config, caller_pkg: Option<&str>) -> bool {
     let Some(pkg) = caller_pkg.map(str::trim).filter(|p| !p.is_empty()) else {
         return false;
@@ -388,9 +349,8 @@ pub fn is_listed_real_app(cfg: &Config, caller_pkg: Option<&str>) -> bool {
 
 /// 两个包名算不算同一个 App 的进程。
 ///
-/// `com.tencent.mm:tools` 和 `com.tencent.mm` 是同一个应用的进程，名单里写一条主包
-/// 就该把它所有进程都算进来——不然得把每个 `:push` / `:tools` / `:remote` 都枚举一遍，
-/// 漏一个那条进程就拿不到真机。
+/// `com.tencent.mm:tools` 与 `com.tencent.mm` 是同一个应用：名单里写一条主包就覆盖它所有
+/// 进程，不然每个 `:push` / `:tools` / `:remote` 都得枚举一遍，漏一个那条进程就拿不到真机。
 fn same_app(listed: &str, caller: &str) -> bool {
     fn base(name: &str) -> &str {
         name.split(':').next().unwrap_or(name).trim()
@@ -399,6 +359,7 @@ fn same_app(listed: &str, caller: &str) -> bool {
     !a.is_empty() && a == b
 }
 
+/// 带「调用者包名」的 [`reason`]：带了包名就按白名单判（精确），没带就退回别名/槽位逻辑。
 pub fn reason_with_caller(
     cfg: &Config,
     device: &str,
@@ -461,11 +422,10 @@ fn reason_without_caller(
         .map(|uid| uid_listed(device, uid, local_only_uids.as_str()))
         .unwrap_or(false);
 
-    // 只认包名（2026-10-20 定）：带 uid 但没包名 = 老 A 端，没有可信判据，
-    // 一律服务端作答；想落到真机就自己更新 A 端。
-    // 没 uid 的那几笔（`finish_sign` / `getDeviceId`）不在这里拍板：它们是会话类
-    // 调用，必须回到开会话的那一侧，由 handler 的会话路由决定。
-    // `soter_local_only_uids` 点名的 uid 当人工逃生口，仍然走真机。
+    // 带 uid 但没包名 = 老 A 端，没有可信判据，一律服务端作答；想落到真机就自己更新 A 端。
+    // 没 uid 的那几笔（`finish_sign` / `getDeviceId`）是会话类调用，必须回到开会话的那一侧，
+    // 由 handler 的会话路由决定，这里不拍板。`soter_local_only_uids` 点名的 uid 是人工逃生口，
+    // 仍然走真机。
     if uid.is_some() && !force_real {
         return Some("调用方没携带可识别的包名（老 A 端），服务端就地作答".to_string());
     }
@@ -486,11 +446,10 @@ fn reason_without_caller(
     let has_alias = !alias.is_empty() && alias != "-";
     let (real, why) = if is_real_alias {
         if sticky == Some(false) {
-            // 这一笔仍跟着内置料答（不拆 ASK/AuthKey 的同源性），但**槽位必须记上**：
-            // 它见过真应用的别名了。不记就是死锁 —— 那些流程总是先来一笔不带别名的 ASK
-            // （判内置料）→ 90 秒 sticky → 紧跟着带真别名的 AuthKey 也被钉成内置料 → 槽位
-            // 永远标不上 → 下一轮又从头来（实测小米那台：652 笔请求 / 34 条内置料 / 0 条落真机，
-            // 指纹一直起不来）。记上之后，下一轮那笔不带别名的 ASK 就放行，整条流程回到真机。
+            // 这一笔仍跟着内置料答（不拆 ASK/AuthKey 的同源性），但**槽位必须记上**：不记
+            // 就是死锁 —— 每轮先来一笔不带别名的 ASK（判内置料）→ 90 秒 sticky → 紧跟着
+            // 带真别名的 AuthKey 也被钉成内置料 → 槽位永远标不上。记上之后，下一轮那笔不带
+            // 别名的 ASK 就放行，整条流程回到真机。
             if let Some(uid) = uid {
                 notes.observe(device, uid, now);
             }
@@ -523,10 +482,9 @@ fn reason_without_caller(
             )
         }
     } else {
-        // 没别名也没 uid（`finish_sign` / `getDeviceId` 这种）：默认交给真机。
-        // 这是会话类调用，它必须回到开会话的那一侧；而“那一侧是不是内置料”由
-        // `soter_probe::session_side` 在外面判（handler 里）。这里不能拍板内置 ——
-        // 真机的会话拿到内置料上问只会回 -5。
+        // 没别名也没 uid（`finish_sign` / `getDeviceId` 这种）：默认交给真机。它是会话类
+        // 调用，必须回到开会话的那一侧，而那一侧是不是内置料由 `session_side` 在外面判。
+        // 这里不能拍板内置 —— 真机的会话拿到内置料上问只会回 -5。
         (true, "没别名也没 uid 的调用，默认交给真机".to_string())
     };
 
@@ -553,7 +511,7 @@ mod tests {
             "SoterAuthKeyV2_salt11d8ba34_scene1",
             "SoterAuthKey_salt0d4a5c11_scene2",
             "WechatAuthKeyPay&dx20079023",
-            // 生产日志里实测到的另一种微信命名（2026-10-04 加进来）。
+            // 生产日志里出现过的另一种微信命名。
             "Wechatuid10248__scene0",
         ] {
             assert!(prefix_hit(real, DEFAULT_REAL_APP_PREFIXES), "{real}");
@@ -737,8 +695,6 @@ mod tests {
     }
 
     /// 一个 uid 挂着好几个包时，A 端逗号连起来一起报；命中任意一个就算真应用。
-    /// 包名来自 SOTER 参数里的 uid（`src=arg`）：实测 SoterService 用
-    /// `Binder.getCallingUid()` 填这个值，所以跟在白名单里就应当放行。
     #[test]
     fn an_arg_sourced_package_is_trusted() {
         let cfg = Config::default();
@@ -819,7 +775,7 @@ mod tests {
                 "{pkg} 不在缺省真应用名单里"
             );
         }
-        // 抖音（含极速版）2026-10-04 按要求移出，别再手滑加回来。
+        // 抖音（含极速版）已按要求移出，别再手滑加回来。
         for pulled in [
             "com.ss.android.ugc.aweme",
             "com.ss.android.ugc.aweme.lite",

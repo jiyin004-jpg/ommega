@@ -286,9 +286,8 @@ pub fn resolve_func_addr(
 
 /// 按进程名找**全部**匹配的进程。
 ///
-/// 同一个服务在多用户 / 分身下会起好几个实例（2026-10-22 实测魅族 20 Pro 上
-/// `soterserver` 在 system 与 u999 下各一个），只注第一个的话很可能注到没人用的那个
-/// 上 —— 客户端只绑自己那个 uid 的实例，注错了等于没注。
+/// 同一个服务在多用户 / 分身下会起好几个实例（`soterserver` 在 system 与 u999 下各一个），
+/// 只注第一个很可能注到没人用的那个上 —— 客户端只绑自己那个 uid 的实例。
 pub fn find_processes_by_name(target_name: &str) -> Result<Vec<(i32, PathBuf)>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc")?.flatten() {

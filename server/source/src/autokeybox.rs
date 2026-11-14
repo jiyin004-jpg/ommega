@@ -25,9 +25,8 @@ use crate::queue::TaskStore;
 /// Global enable flag for the auto-refresh background loop.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// 后台线程是否真的被拉起来了。`ENABLED` 只是"用户想不想让它跑"，而线程只在
-/// `KEYBOX_REFRESH_ENABLED=true` 时由 main 启动一次。两者分开记，才能让管理接口
-/// 分辨"开关开着但根本没线程"这种状态 —— 否则状态页会报 enabled 而实际不刷新。
+/// 后台线程是否真的被拉起来了：线程只在 `KEYBOX_REFRESH_ENABLED=true` 时由 main
+/// 启动一次，与 `ENABLED` 分开记，才能分辨"开关开着但没有线程"。
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Runtime-overridable device_id per source name (initialised from env, editable
@@ -90,7 +89,7 @@ pub fn set_enabled(v: bool) {
 /// Global enable flag for the auto-cover step: after an auto-keybox refresh
 /// successfully fetches keys, also write them (unconditionally) into the
 /// server-side identity of every currently-online B device id, so serverbox
-/// mode can out-证 for those devices. Disabling clears the rows it wrote.
+/// mode can attest for those devices. Disabling clears the rows it wrote.
 static COVER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn cover_enabled() -> bool {
@@ -141,19 +140,17 @@ pub fn set_device_id(name: &str, device_id: &str) {
     crate::util::mu(device_ids()).insert(name.to_string(), device_id.to_string());
 }
 
-/// 公开源默认的仓库搜索入口。匿名 search 接口是 10 次/分钟，这里两小时才打一
-/// 次，余量很大。
+/// 公开源默认的仓库搜索入口：匿名 search 限 10 次/分钟，两小时一次余量充足。
 const DEFAULT_PUBLIC_SEARCH_URL: &str =
     "https://api.github.com/search/repositories?q=keybox&sort=updated&per_page=30";
 /// 一轮最多看几个仓库、最多收几条身份 —— 别让一轮刷新跑太久。
 const PUBLIC_MAX_REPOS: usize = 20;
 pub const PUBLIC_MAX_IDENTITIES: usize = 6;
-/// 一个仓库最多下几个文件。公开仓库里动不动躺几十个 keybox，全撸太慢；EC 和 RSA
-/// 各中一份就够用了。
+/// 一个仓库最多下几个文件：公开仓库常躺几十个 keybox，EC 与 RSA 各一份就够。
 const PUBLIC_MAX_FILES_PER_REPO: usize = 8;
 /// 整轮公开源最多下几个文件（跨仓库一起算）。
 const PUBLIC_MAX_FILES_TOTAL: usize = 24;
-/// keybox 文件在仓库里就这几个常见位置（列不出目录时的兵底）。
+/// 列不出目录时退回的常见 keybox 路径。
 const PUBLIC_PATHS: &[&str] = &["keybox.xml", "keybox", "module/keybox.xml"];
 
 /// A single configured upstream keybox source.
@@ -199,8 +196,7 @@ pub fn configured_sources() -> Vec<KeyboxSource> {
             name: "public".to_string(),
             device_id: device_id_for("public"),
             url_primary: env("KEYBOX_PUBLIC_SEARCH_URL", DEFAULT_PUBLIC_SEARCH_URL),
-            // 仓库里的 keybox 文件是直接取 raw 的（不走 API 配额），所以这一项是
-            // 取文件失败时换哪个镜像，而不是 API 镜像。
+            // 文件走 raw 直取、不吃 API 配额，所以这一项是取文件失败时的镜像，不是 API 镜像。
             url_mirror: env("KEYBOX_PUBLIC_MIRROR", "https://gh-proxy.com/"),
             decode_hex: false,
             api_list: false,
@@ -209,15 +205,12 @@ pub fn configured_sources() -> Vec<KeyboxSource> {
     ]
 }
 
-// Fetch a URL over http/https, returning the body text.
-//
-// 取网页文本统一走 `crate::http::get_text`（那边记了为什么不用 reqwest）。
+// Fetch a URL over http/https via `crate::http::get_text`; see there for why
+// reqwest is not used.
 
 /// Fetch the source body.
-///
-/// 候选顺序按「实测能通的排前面」：raw.githubusercontent.com 直连在这台机器上要么
-/// 30s 超时、要么被 CF 挡，几家公共镜像反而秒回，所以主址是 raw 链接时把它压到最后
-/// 兜底；主址不是 raw 的（API 类源）还是主址优先。重复的地址去掉，少打几个空包。
+/// 候选顺序：主址是 raw 链接时压到最后兜底（直连常 30s 超时或被 Cloudflare 挡），
+/// 公共镜像优先；主址不是 raw 的（API 类源）仍主址优先。重复地址去掉。
 fn fetch_source(src: &KeyboxSource) -> anyhow::Result<String> {
     let candidates = fetch_candidates(src);
 
@@ -304,9 +297,8 @@ fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
 /// Normalise raw source text into a keybox-XML-compatible payload.
 fn build_keybox_xml(source_text: &str, source_name: &str) -> String {
     let raw = source_text.trim();
-    // 已经是 keybox XML 就直接过。别只认 `<?xml` 开头 —— 有些源（yurikey 那个就是
-    // base64 解出来的）省了声明，直接 `<AndroidAttestation>` 开头；漏判就会掉进下面
-    // 的 PEM 合成分支，拼出来的证书链是空的，白拿一份材料还过不了校验。
+    // 已是 keybox XML 就直接过。不能只认 `<?xml` 开头：有些源省了声明，直接以
+    // `<AndroidAttestation>` 开头，误判会掉进 PEM 合成分支并拼出空证书链。
     if raw.contains("<AndroidAttestation") || raw.contains("<Keybox") {
         return raw.to_string();
     }
@@ -321,8 +313,7 @@ fn build_keybox_xml(source_text: &str, source_name: &str) -> String {
         .filter(|b| !b.contains("BEGIN CERTIFICATE"))
         .collect();
     if !keys.is_empty() {
-        // 证书按顺序挂在每把钥匙下面（通常这种文件里就一对）。没有证书的话链就是
-        // 空的，入库校验会把它挡掉 —— 但至少形状是完整的，日志能看出是被校验拒的。
+        // 证书按顺序挂到每把钥匙下；无证书时链为空，入库校验会拒掉这份材料。
         let chain: String = certs
             .iter()
             .map(|c| format!("      <Certificate format=\"pem\">{c}      </Certificate>\n"))
@@ -411,11 +402,9 @@ pub fn refresh_one(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
     stored
 }
 
-/// 采到的第 `taken` 份材料（从 0 起）挂在哪个 device_id 下。
-///
-/// A 端取公开 keybox 的路由扫的是主 id 加 `-1…-(PUBLIC_MAX_IDENTITIES-1)`，所以
-/// 编号必须是「第几份材料」而不是仓库下标 —— 用下标的话第一份常常落在够不着的
-/// 号上，采了跟没采一样。
+/// 第 `taken` 份材料（从 0 起）挂在哪个 device_id 下。
+/// A 端只扫主 id 加 `-1…-(PUBLIC_MAX_IDENTITIES-1)`，所以编号必须按「第几份材料」
+/// 而不是仓库下标，否则第一份常落在够不着的号上。
 pub fn public_device_id(base: &str, taken: usize) -> String {
     if taken == 0 {
         base.to_string()
@@ -425,10 +414,8 @@ pub fn public_device_id(base: &str, taken: usize) -> String {
 }
 
 /// 采集公开仓库里的 keybox。
-///
-/// 只花一次 API 调用（搜仓库），之后按常见路径直连 raw / CDN 取文件 —— 那些请求不
-/// 算 GitHub API 配额，所以可以放心多试几个仓库和几个路径。拿到内容后走和其它源一
-/// 样的解析 + 校验 + 入库流程，坏数据进不了池子。
+/// 只花一次 API 调用（搜仓库），之后直连 raw / CDN 取文件不吃 GitHub 配额；
+/// 内容走与其它源相同的解析、校验、入库流程。
 fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
     let body = match public_http_get(&src.url_primary, 25) {
         Some(b) => b,
@@ -468,17 +455,13 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
 
     let mut stored: Vec<KeyboxData> = Vec::new();
     let mut tried = 0usize;
-    // 采到材料的第几个仓库 —— 编号要用这个，不是仓库下标。用下标的话第一份材料
-    // 往往落在 device-b-2-9 这种位置，而 A 端取公开 keybox 的接口只扫主 id 和
-    // -1/-2/-3，那份材料就等于白采了。
+    // 已采到的材料份数：编号用它，不是仓库下标（见 public_device_id）。
     let mut taken = 0usize;
-    // 整轮下了几个文件、本轮收到了哪几种算法。仓库里 EC、RSA 是分在不同文件里的，
-    // 两种都到手就可以不看了。
+    // 本轮已下文件数，以及已到手算法（EC、RSA 各一份即可收工）。
     let mut files_fetched = 0usize;
     let mut algos: std::collections::HashSet<String> = std::collections::HashSet::new();
     'outer: for (full, br) in repos.iter().take(PUBLIC_MAX_REPOS) {
-        // 先把仓库里的 .xml 列出来再挑着下。原先只试几个固定路径，人家叫
-        // `Yurikey58.xml` 的文件就永远轮不到，里面的 RSA 也就永远采不进池子。
+        // 先列出仓库里的 .xml 再挑着下：只试固定路径会漏掉 `Yurikey58.xml` 这类文件。
         let mut paths: Vec<String> = public_repo_xml_files(full, br)
             .into_iter()
             .take(PUBLIC_MAX_FILES_PER_REPO)
@@ -501,8 +484,7 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
                     continue;
                 }
                 let xml = build_keybox_xml(&maybe_decode_ns_payload(&txt, false), &src.name);
-                // 解析失败不记 warn：同一个文件会因镜像被重试好几遍，一条 warn 重复
-                // 好几次；debug 里能看到是哪个仓库的哪个 URL 挖到了东西但不成形。
+                // 解析失败只记 debug：同一文件会被多个镜像重试，warn 会重复刷屏。
                 let parsed = match crate::keybox::parse_keybox_xml_all(&xml) {
                     Ok(p) if !p.is_empty() => p,
                     Ok(_) => {
@@ -516,8 +498,8 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
                         continue;
                     }
                 };
-                // 第一份用源自己的 device_id，后面的往下排 -1、-2 …。只有真的入库了
-                // 才往后排，不然校验不过的那几份会白占编号，后面的就跳过了一个号。
+                // 第一份用源自己的 device_id，之后排 -1、-2…；只有真入库才递增，
+                // 否则被校验拒掉的会白占编号。
                 let device_id = public_device_id(&src.device_id, taken);
                 let before = stored.len();
                 for kb in parsed {
@@ -532,8 +514,7 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
                 if stored.len() > before {
                     taken += 1;
                 }
-                // 这个文件里的东西都看完了，接着看同一个仓库的下一个 —— EC 和 RSA
-                // 往往就分散在同一仓库的不同文件里，别拿到第一个就换仓库。
+                // EC 与 RSA 常分处同一仓库的不同文件，本文件处理完先看同仓库的下一个。
                 break;
             }
             if algos.contains("ec") && algos.contains("rsa") {
@@ -550,11 +531,9 @@ fn refresh_public_source(src: &KeyboxSource, db: &Db) -> Vec<KeyboxData> {
     stored
 }
 
-/// 公开源专用取文件 —— 走系统 curl，不走 reqwest。
-///
-/// gh-proxy 和 jsdelivr 都在 Cloudflare 后面，而这个机房里的 reqwest（rustls）
-/// 过不了它的 bot 检查，会一直挂到超时；curl 实测每个都是秒回。服务端本来就装
-/// 了 curl，这里不多一个依赖。
+/// 公开源专用取文件，走系统 curl。
+/// gh-proxy 和 jsdelivr 在 Cloudflare 后面，reqwest（rustls）过不了 bot 检查会挂到
+/// 超时，curl 则正常；服务端已装 curl，不额外引入依赖。
 fn public_http_get(url: &str, timeout_secs: u64) -> Option<String> {
     match crate::http::get_text(url, Duration::from_secs(timeout_secs)) {
         Ok(t) => Some(t),
@@ -565,9 +544,8 @@ fn public_http_get(url: &str, timeout_secs: u64) -> Option<String> {
     }
 }
 
-/// URL 路径里必须转义的那些字符。公开仓库的文件名什么都有（`don't buy! it's
-/// free for you_v68.xml`、`keybox (1).xml`），原样拼进 URL 会被 curl 直接拒收，
-/// 文件就白列了。保留 RFC3986 里路径合法的那些，其余一律 %XX。
+/// URL 路径转义：公开仓库的文件名含空格、引号、括号（如 `keybox (1).xml`），
+/// 原样拼进 URL 会被 curl 拒收。保留 RFC3986 允许的路径字符，其余编码为 %XX。
 fn url_encode_path(p: &str) -> String {
     let mut out = String::new();
     for b in p.bytes() {
@@ -602,11 +580,8 @@ fn url_encode_path(p: &str) -> String {
 }
 
 /// 列一个仓库里所有 .xml 文件的相对路径。
-///
-/// 公开仓库动辄塞几十个 keybox 文件，而这边原先只试几个固定名字 —— 一个叫
-/// `Yurikey58.xml`、里头装看 RSA 材料的文件就永远轮不到。jsdelivr 的 data
-/// 接口不要 token、也不吃 GitHub 的匿名限额，拿它列目录最省事。列不出来（仓库
-/// 没被分发过 / 接口抽风）就返回空，调用方会退回固定的几个常见路径。
+/// 用 jsdelivr 的 data 接口列目录（不要 token，不吃 GitHub 匿名限额）；列不出来
+/// （仓库未被分发 / 接口失败）返回空，调用方退回固定常见路径。
 fn public_repo_xml_files(full: &str, branch: &str) -> Vec<String> {
     let url = format!("https://data.jsdelivr.com/v1/packages/gh/{full}@{branch}?structure=flat");
     let Some(txt) = public_http_get(&url, 10) else {
@@ -625,8 +600,7 @@ fn public_repo_xml_files(full: &str, branch: &str) -> Vec<String> {
         .collect()
 }
 
-/// 一个 raw.githubusercontent.com 链接的备选镜像。顺序按机房实测的可用性和速度
-/// 排：gh-proxy 和 jsdelivr 都是秒回，raw 本身放最后兜底。
+/// raw.githubusercontent.com 链接的备选镜像：gh-proxy、jsdelivr，raw 本身兜底。
 fn raw_url_mirrors(url: &str) -> Vec<String> {
     let Some(rest) = url.strip_prefix("https://raw.githubusercontent.com/") else {
         return Vec::new();
@@ -648,8 +622,7 @@ fn raw_url_mirrors(url: &str) -> Vec<String> {
     ]
 }
 
-/// 一个文件的几条候选取法：源自己配的镜像排最前，然后是上面的公共镜像，
-/// raw 本身放最后兜底。
+/// 一个文件的候选取法：源自己配的镜像最前，然后是公共镜像，raw 兜底。
 fn public_file_urls(src: &KeyboxSource, full: &str, branch: &str, path: &str) -> Vec<String> {
     let raw = format!("https://raw.githubusercontent.com/{full}/{branch}/{path}");
     let mut out: Vec<String> = Vec::new();
@@ -811,11 +784,9 @@ fn base_url(src: &KeyboxSource) -> String {
     }
 }
 
-/// 入库前的质量门：私钥配不配链、链像不像造出来的、链上的证书有没有被吊销。
-/// 返回 `Some(原因)` 表示这份材料该扔。
-///
-/// 吊销名单要联网，万一没拉下来（`attstatus` 那边会记 warn），这道就放行 ——
-/// 不能因为网络问题把整条采集链路卡死。
+/// 入库前的质量门：私钥是否配链、链是否像伪造、证书是否被吊销。
+/// 返回 `Some(原因)` 表示该丢弃。吊销名单需联网，拉不到时放行，不因网络问题
+/// 卡死采集链路。
 fn reject_reason(private_key_pem: &str, chain_pem: &str) -> Option<String> {
     if let Some(why) = crate::cert::identity_problem(private_key_pem, chain_pem) {
         return Some(why);
@@ -828,10 +799,8 @@ fn reject_reason(private_key_pem: &str, chain_pem: &str) -> Option<String> {
     None
 }
 
-/// 这个 device id 是否被控制台钉成了 StrongBox 身份。
-///
-/// 源采集（含 cover）只能更新 TEE 那份；StrongBox 一律人工指定，
-/// 所以采集入口都先过这道。
+/// 该 device id 是否被控制台钉成 StrongBox 身份。
+/// 源采集（含 cover）只能写 TEE 那份，StrongBox 一律人工指定，采集入口都先过这道。
 fn is_strongbox_identity(device_id: &str) -> bool {
     crate::identity_policy::snapshot().1.as_deref() == Some(device_id)
 }
@@ -839,8 +808,7 @@ fn is_strongbox_identity(device_id: &str) -> bool {
 /// Store an identity under a source's target device id. Returns whether it was
 /// actually written (`false` when validation or the DB write failed).
 fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData) -> bool {
-    // 源采集只喂 TEE。控制台把某个 id 钉成 StrongBox 身份之后，这里不能写它 ——
-    // StrongBox 那份只能是人工指定的，混进源里的 TEE 链就又是级别串了。
+    // 源采集只喂 TEE：被钉成 StrongBox 的 id 不能写，否则级别串用。
     if is_strongbox_identity(device_id) {
         tracing::warn!(
             "autokeybox skip device_id={device_id} source={} reason=strongbox identity is manual-only",
@@ -848,7 +816,7 @@ fn store_identity(db: &Db, src: &KeyboxSource, device_id: &str, kb: &KeyboxData)
         );
         return false;
     }
-    // 采集是自动跑的，宁可少收一份也不能把坏材料塞进池子 —— 出证时会直接失败。
+    // 采集自动运行：坏材料入池会让出证直接失败，宁可少收一份。
     if let Some(why) = reject_reason(&kb.private_key_pem, &kb.certificate_chain_pem) {
         tracing::warn!(
             "autokeybox skip device_id={device_id} source={} reason={why}",
@@ -933,11 +901,8 @@ pub fn clear_auto_cover(db: &Db) -> anyhow::Result<u64> {
     Ok(n)
 }
 
-/// 拿吊销名单给池子做体检：`auto:*` / `auto-cover:*` 这些自动写进来的身份，链上
-/// 有证书被吊销的就删掉，返回清了几条。
-///
-/// 只动自动写的行 —— 手动上传的身份是人自己挑的，删不删由人决定。同一个 device_id
-/// 的 EC 和 RSA 是一份材料的两半，删的时候一起走。
+/// 用吊销名单清池子：自动写入的身份（`auto:*` / `auto-cover:*`）链上有证书被
+/// 吊销即删除，返回清除条数。只动自动写的行；同一 device_id 的 EC 与 RSA 一起删。
 fn sweep_revoked(db: &Db) -> usize {
     if crate::attstatus::cached().is_none() {
         return 0; // ensure() 里已经记过日志，这里不重复刷屏
@@ -978,8 +943,7 @@ fn sweep_revoked(db: &Db) -> usize {
 /// server-side identity of every online B device id (`store` provides the
 /// online snapshot; pass `None` when no store is available — cover is skipped).
 pub fn refresh_all(db: &Db, store: Option<&TaskStore>) {
-    // 每轮先看一眼吊销名单，顺手给池子做个体检。被吊销的材料留在池子里只会害事
-    // （出证时对面一查就拒），清掉之后这轮采集会把缺的槽位重新填上。
+    // 每轮先查吊销名单清理池子（吊销材料会让出证被拒），随后本轮采集会补上缺的槽位。
     crate::attstatus::ensure(false);
     let removed = sweep_revoked(db);
     if removed > 0 {
@@ -1040,8 +1004,8 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
             STARTED.store(true, Ordering::Relaxed);
             tracing::info!("autokeybox loop started interval={:?}", interval);
             loop {
-                // 禁用时挂起等待而不是退出线程：一旦退出就没人再拉起（toggle 只翻
-                // 标志位），admin 会一直报 enabled=true 而刷新早已停止。
+                // 禁用时挂起而非退出线程：退出后没人再拉起（toggle 只翻标志位），
+                // admin 会一直报 enabled=true 而刷新早已停止。
                 if !is_enabled() {
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
@@ -1065,8 +1029,7 @@ pub fn start_background(db: Arc<Db>, store: Arc<TaskStore>, interval: Duration) 
 mod tests {
     use super::*;
 
-    /// 公开仓库的文件名带空格、引号、括号，不编码就取不到 —— curl 会直接
-    /// 报 “URL rejected”。
+    /// 公开仓库文件名带空格、引号、括号，不编码 curl 会报 "URL rejected"。
     #[test]
     fn public_file_names_get_url_encoded() {
         assert_eq!(url_encode_path("keybox (1).xml"), "keybox%20(1).xml");
@@ -1091,9 +1054,8 @@ mod tests {
         }
     }
 
-    /// 没有 `<?xml` 声明、直接 `<AndroidAttestation>` 开头的 keybox（yurikey 那
-    /// 个 base64 解出来就是这形状，公开仓库里也有一半是）必须原样过 —— 一旦掉进
-    /// PEM 合成分支，证书链就变空，拿去入库必然被校验拒掉。
+    /// 无 `<?xml` 声明、直接 `<AndroidAttestation>` 开头的 keybox 必须原样过：
+    /// 一旦掉进 PEM 合成分支，证书链为空，入库必被校验拒掉。
     #[test]
     fn keybox_xml_without_a_declaration_passes_through() {
         let xml =
@@ -1101,8 +1063,7 @@ mod tests {
         assert_eq!(build_keybox_xml(xml, "public"), xml);
     }
 
-    /// 拆散的 PEM（私钥 + 证书各一段）合出来的 XML 得把证书真的挂到链接里，
-    /// 不能只留一个空的 `<CertificateChain>`。
+    /// 拆散的 PEM（私钥 + 证书）合成 XML 时证书必须真挂进链，不能是空 `<CertificateChain>`。
     #[test]
     fn synthesised_xml_pairs_the_certificate_with_the_key() {
         const KEY: &str = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----";
@@ -1117,8 +1078,7 @@ mod tests {
             .contains("BEGIN CERTIFICATE"));
     }
 
-    /// 取文件的候选 URL：源自己配的镜像排最前，raw 兜底，重复的去掉。重复的
-    /// 请求看着无害，但一轮 240 个 URL 里白白多打几十个。
+    /// 取文件的候选 URL：源自己配的镜像最前，raw 兜底，并去重。
     #[test]
     fn file_urls_put_the_configured_mirror_first_and_dedupe() {
         let src = src_for_test();
@@ -1144,8 +1104,7 @@ mod tests {
         );
     }
 
-    /// raw 主址先走镜像、直连兜底；普通 API 主址还是主址优先。顺序错了不会
-    /// 致命，但 raw 那条会先白等 30s 超时，而且真通了还要跟 CF 磨。
+    /// raw 主址先走镜像、直连兜底；API 主址仍主址优先（否则先白等 30s 超时）。
     #[test]
     fn fetch_order_puts_mirrors_before_a_raw_primary() {
         let raw = "https://raw.githubusercontent.com/Yurii0307/yurikey/main/key";

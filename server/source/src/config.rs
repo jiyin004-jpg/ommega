@@ -1,4 +1,4 @@
-//! Runtime configuration, mirrored from relay_server/config/settings.py + .env.
+//! Runtime configuration.
 //!
 //! Precedence: environment variables override `.env` file values.
 //! Values are read once at startup.
@@ -6,9 +6,8 @@
 use std::path::Path;
 
 /// 版本号唯一来源 = 仓库根的 `VERSION`（三端同号，b-app 跟 B 端一起走）。
-///
-/// `Cargo.toml` 的 version 在编译期被写进二进制，所以这里用 `env!` 读它，再由
-/// `version_tests` 里的单测强制它等于 `VERSION` 文件：只改一处会在 `cargo test` 直接红。
+/// 这里用 `env!` 读 `Cargo.toml` 的 version，由 `version_tests` 强制它等于 `VERSION` 文件，
+/// 只改一处会让 `cargo test` 直接红。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
@@ -34,55 +33,43 @@ pub struct Config {
     /// `physical` (default) routes A/B tasks through the queue; `server_keybox`
     /// fulfils tasks locally using the stored DeviceServerIdentity.
     pub attest_source: String,
-    /// SOTER 点名那台 B 离线时统一落到哪台（空 = 保持原来的按负载挑）。
-    /// 也只在非写操作上生效：写操作仍严格跟着点名那台，不换设备。
+    /// SOTER 点名那台 B 离线时统一落到哪台（空 = 按负载挑）。
+    /// 仅非写操作生效：写操作仍严格跟着点名那台，不换设备。
     /// `RELAY_SOTER_FALLBACK_DEVICE`
     pub soter_fallback_device: String,
-    /// Seconds a B-side assignment may stay pending before being reclaimed.
-    ///
-    /// “设备接到任务后多久必须交结果”的死线，超时就把任务放回队列，免得一台卡住
-    /// 的设备拖住整条请求。TEE 里做一次 keymint 调用是百毫秒量级，设备又是在长
-    /// 轮询上等着拿任务，留 3s 已经很宽松。可用 `RELAY_ASSIGNMENT_TIMEOUT` 调整。
+    /// B 端接到任务后必须交结果的死线（秒），超时任务回队列，免得一台卡住的设备
+    /// 拖住整条请求。TEE 里一次 keymint 调用是百毫秒量级，设备又在长轮询上等着，
+    /// 3s 已很宽松。`RELAY_ASSIGNMENT_TIMEOUT`
     pub assignment_timeout_secs: u64,
-    /// A-side wait-for-result timeout, seconds —— layer ① 等 B 设备结果的上限。
-    ///
-    /// 必须小于 a 端的 HTTP 读超时（`a-side/source/src/remote.rs` 的
-    /// `READ_TIMEOUT_MS = 30_000`）：超了就是“a 端已经放弃、服务端还在等”，用户
-    /// 什么都拿不到。同时也必须足够短：一次 TEE 认证正常情况下是百毫秒到一两秒
-    /// （实测小米 1.6s / 三星 0.5s），等几十秒说明设备已经不对劲了，此时快速失败、
-    /// 让回退阶梯（服务端密钥 → 自签 → a 端本地）接手反而更快也更可靠。3s 覆盖
-    /// “一次长轮询空档 + TEE 运算 + 回传”的常规耗时。可用
-    /// `RELAY_WAIT_RESULT_TIMEOUT` 调整。
-    ///
-    /// 代价：b 端若需要重试回传（最多 4×33s + 7s 退避），这次结果可能晚于 a 端
-    /// 超时，就作废了 —— 但那时 a 端已经从回退层拿到一条能用的链。
+    /// A 端等 B 设备结果的上限（秒）。必须小于 a 端的 HTTP 读超时
+    /// （`a-side/source/src/remote.rs` 的
+    /// `READ_TIMEOUT_MS = 30_000`），否则就是 a 端已放弃、服务端还在等，用户什么都
+    /// 拿不到。也必须足够短：TEE 认证正常是百毫秒到一两秒，等几十秒说明设备已异常，
+    /// 让回退阶梯（服务端密钥 → 自签 → a 端本地）接手更快也更可靠；
+    /// 3s 覆盖「一次长轮询空档 + TEE 运算 + 回传」。`RELAY_WAIT_RESULT_TIMEOUT`
+    /// 代价：b 端重试回传（最多 4×33s + 7s 退避）时这次结果可能晚于 a 端超时作废，
+    /// 但那时 a 端已从回退层拿到可用的链。
     pub wait_result_timeout_secs: u64,
     /// SOTER 单独用一份等待超时（`RELAY_SOTER_WAIT_RESULT_TIMEOUT`，默认 15）。
-    ///
-    /// 认证那条路等不到 B 就换层是好事（回退层给的链能用，还能快一点），SOTER
-    /// 不一样：同一个槽位的 ASK / AuthKey / 签名必须出自同一层，早一步换层就是
-    /// 给 App 递了另一把钥匙。所以 SOTER 多等一会儿，宁可慢也别换错身份。
+    /// 同一槽位的 ASK / AuthKey / 签名必须出自同一层，早一步换层就是给 App 递了
+    /// 另一把钥匙，所以 SOTER 多等一会儿，宁可慢也别换错身份。
     pub soter_wait_result_timeout_secs: u64,
     /// 「这些 SOTER 调用只在服务端内置物料上作答、不落 B 端」的别名前缀名单
-    /// （`RELAY_SOTER_LOCAL_ONLY_PREFIXES`，缺省就是两台探测机春秋/鸭子）。
-    ///
-    /// 写 `none`/`off`/`-` 关掉。见 `soter_probe`：attest 那条路不受影响。
+    /// （`RELAY_SOTER_LOCAL_ONLY_PREFIXES`，缺省是两台探测机春秋/鸭子）。
+    /// 写 `none`/`off`/`-` 关掉；见 `soter_probe`：attest 那条路不受影响。
     pub soter_local_only_prefixes: String,
-    /// 再给一份手写的 uid 名单（`RELAY_SOTER_LOCAL_ONLY_UIDS`，缺省空）。
-    ///
-    /// 写法两种：`10401`（哪台点名设备都算）和 `device-b-c3f204aa:10401`（只认这台）。
-    /// 探测机那几个不带别名的 op 靠它和「槽位学过」两条判据兜（uid 号跨设备复用，
-    /// 手写一条就等于拍板把那个槽位当探测机，所以要人自己决定）。
+    /// 手写的 uid 名单（`RELAY_SOTER_LOCAL_ONLY_UIDS`，缺省空）。写法两种：
+    /// `10401`（哪台点名设备都算）和 `device-b-c3f204aa:10401`（只认这台）。
+    /// uid 号跨设备复用，手写一条等于拍板把该槽位当探测机，所以交给人决定。
     pub soter_local_only_uids: String,
     /// 「这些 SOTER 调用交给真机（B）答」的别名前缀名单
-    /// （`RELAY_SOTER_REAL_APP_PREFIXES`，缺省就是 SOTER SDK 那套真应用名字）。
-    ///
-    /// 规则是反向白名单：命中这里的给真机，其余（探测机自起的名字、其它自定义名、
+    /// （`RELAY_SOTER_REAL_APP_PREFIXES`，缺省是 SOTER SDK 那套真应用名字）。
+    /// 反向白名单：命中这里给真机，其余（探测机自起的名字、其它自定义名、
     /// 不带别名的 ASK）一律用内置料就地作答。写空字符串就用缺省那套。
     pub soter_real_app_prefixes: String,
-    /// 「这些包名的应用算真应用、交给真机答」的白名单
+    /// 「这些包名算真应用、交给真机答」的白名单
     /// （`RELAY_SOTER_REAL_APP_PACKAGES`）。A 端转发时带的 `caller_pkg` 按它判；
-    /// 没带包名（老 A 端）就退回上面那套别名/槽位逻辑。写空字符串就用缺省那套。
+    /// 没带包名（老 A 端）就退回上面的别名/槽位逻辑。写空字符串就用缺省那套。
     pub soter_real_app_packages: String,
     /// Long-poll default timeout, seconds.
     pub poll_timeout_secs: u64,
@@ -144,9 +131,8 @@ impl Default for Config {
             soter_fallback_device: String::new(),
             assignment_timeout_secs: 3,
             wait_result_timeout_secs: 3,
-            // SOTER 这条要的是「快 + 准」：真机那条链路健康时实测 70~190 毫秒就回来了,
-            // 等不到就是真机这会儿接不了 —— 那就快速失败让 App 自己重试（重试那一笔靠槽位
-            // 标记会直接走真机），而不是把 App 拖在这里、更不是拿服务端自己造的料顶上去。
+            // SOTER 要「快 + 准」：等不到真机就快速失败，让 App 重试（重试靠槽位标记
+            // 直接走真机），不能把 App 拖在这里，更不能拿服务端自己造的料顶上。
             soter_wait_result_timeout_secs: 2,
             // 反向白名单：不需要人工名单，留空就行（见 `soter_probe::reason`）。
             soter_local_only_prefixes: String::new(),
@@ -313,9 +299,9 @@ impl Config {
         if let Some(v) = env_or_dotenv(&dotenv, "RELAY_GEO_DB_PATH") {
             cfg.geo_db_path = v;
         }
-        // 按 IP 限、额度给得很宽：正常客户端（尤其 B 的长轮询）根本碰不到，
-        // 只有死循环或者刷接口的才会被拦。老默认值是 800/小时、按 token 算，
-        // 一台 B 端自己轮询就能吃满自己的额度，然后 429 -> 退避 -> 任务干等。
+        // 按 IP 限、额度给得很宽：正常客户端（尤其 B 的长轮询）碰不到，只有死循环
+        // 或者刷接口的才会被拦。额度给窄了会让一台 B 端自己吃满自己的配额，
+        // 然后 429 -> 退避 -> 任务干等。
         cfg.rate_limit_requests = env_u64("RELAY_RATE_LIMIT_REQUESTS", 60000);
         cfg.invalid_rate_limit_requests = env_u64("RELAY_INVALID_RATE_LIMIT_REQUESTS", 40);
         cfg.rate_limit_window_secs = env_u64("RELAY_RATE_LIMIT_WINDOW", 60);
@@ -391,8 +377,8 @@ mod version_tests {
         );
     }
 
-    /// A/B 模块与 b-app 的 versionCode 是 major*1000000+minor*1000+patch 推出来的，
-    /// 版本号必须是这个三段格式，它们才算得出来。
+    /// A/B 模块与 b-app 的 versionCode 由 major*1000000+minor*1000+patch 推出，
+    /// 版本号必须是这个三段格式，否则它们算不出来。
     #[test]
     fn version_is_major_minor_patch() {
         let parts: Vec<&str> = VERSION.split('.').collect();

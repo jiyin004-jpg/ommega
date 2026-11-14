@@ -1,9 +1,9 @@
 //! keybox.xml parsing.
 //!
-//! A single `keybox.xml` file carries everything the `server_keybox` mode
-//! needs: one or more `<Key>` entries, each with a `PrivateKey` PEM and a
-//! `CertificateChain` (leaf first). We extract the first usable key pair and
-//! store it as a `DeviceIdentity` so the admin UI only needs one file upload.
+//! A single `keybox.xml` file carries everything the `server_keybox` mode needs:
+//! one or more `<Key>` entries, each with a `PrivateKey` PEM and a
+//! `CertificateChain` (leaf first). All usable keys are parsed and stored as
+//! `DeviceIdentity`, so the admin UI only needs one file upload.
 
 use anyhow::Context;
 use roxmltree::Document;
@@ -35,25 +35,21 @@ fn clean_pem(raw: &str) -> String {
         + "\n"
 }
 
-/// Parse the full keybox.xml document.
-///
-/// A keybox file may carry several `<Keybox>` blocks — 公开仓库里常见的「EC 一个、
-/// RSA 一个」就是这个形状 —— and each block holds its own `<Key>`. Every usable
-/// `<Key>` with a `<PrivateKey>` is returned, so the admin upload can persist all
-/// of them and the fulfil layer can serve whichever algorithm the A-side request
-/// asks for.
+/// 解析整份 keybox.xml。
+/// 一个文件可有多个 `<Keybox>` 段（公开仓库常见「EC 一个、RSA 一个」），每段各自带
+/// `<Key>`。所有带 `<PrivateKey>` 的可用 `<Key>` 都返回，上传可全部入库，出证层按
+/// A 端请求的算法取用。
 pub fn parse_keybox_xml_all(xml: &str) -> anyhow::Result<Vec<KeyboxData>> {
     let doc = Document::parse(xml).context("invalid XML")?;
     let root = doc.root_element();
 
-    // 收全所有 `<Keybox>`（`descendants` 含自身，根就是 Keybox 时也在内）。以前只抓
-    // 第一个，同一个文件里第二个算法的材料整段就丢了 —— 那些「EC + RSA 双段」的公开
-    // keybox 因此永远只进得来 EC。
+    // 收全所有 `<Keybox>`（`descendants` 含自身，根是 Keybox 时也在内）；
+    // 只取第一个会丢掉同文件里第二套算法的材料。
     let boxes: Vec<roxmltree::Node> = root
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "Keybox")
         .collect();
-    // 有的文件省了 `<Keybox>` 这层，直接 `<AndroidAttestation><Key>…`；那就把根当成
+    // 有的文件省了 `<Keybox>` 层，直接 `<AndroidAttestation><Key>…`，那就把根当成
     // 唯一一段，DeviceID 也从根上取（没有就留空）。
     let boxes = if boxes.is_empty() { vec![root] } else { boxes };
 
@@ -118,10 +114,8 @@ pub fn parse_keybox_xml_all(xml: &str) -> anyhow::Result<Vec<KeyboxData>> {
 }
 
 /// 一个元素里的全部文本子节点拼起来。
-///
-/// keybox 文件里常夹着 `<!--t.me/xxx-->` 这类注释，注释既可能落在内容前面、也可能
-/// 正好插进 base64 中间把文本切成几段；只取第一个文本节点的话，后面那段就没了，
-/// 拿去解 base64 会报个看不懂的 “Invalid symbol …”。这里统统拼上。
+/// keybox 常夹 `<!--t.me/xxx-->` 注释，可能正好插进 base64 中间把文本切成几段，
+/// 只取第一个文本节点会丢后半段，解 base64 时报无效字符。所以全拼上。
 fn node_text(node: &roxmltree::Node) -> String {
     node.children()
         .filter(|c| c.is_text())
@@ -190,13 +184,8 @@ fn cert_pem_blocks(chain: &str) -> Vec<String> {
     out
 }
 
-/// 把一条已存的身份重新拼成 keybox.xml 文本。
-///
-/// `parse_keybox_xml_all` 的逆操作：池子里的身份按 PEM 分开存，而 A 端要的是
-/// keybox.xml 这个形状，所以往设备送之前得拼回去。私钥和证书都原样保留。
-///
-/// 现在只有测试还在用它（公开池那条路要一次塞两种算法，直接走
-/// `build_keybox_xml_with_keys`），所以非 test 构建里编不进去，省得留个死函数。
+/// 把一条已存的身份拼回 keybox.xml 文本（`parse_keybox_xml_all` 的逆操作），
+/// 私钥和证书原样保留。仅测试使用，非 test 构建不编译。
 #[cfg(test)]
 pub fn build_keybox_xml(
     device_id: &str,
@@ -215,9 +204,8 @@ pub fn build_keybox_xml(
 }
 
 /// 同一个 `<Keybox>` 里塞多段 `<Key>`（EC 一份、RSA 一份）。
-///
-/// A 端要的是「两种算法都在」：上游只给一种材料的话，请求落到缺的那种上头就只能
-/// 报错。所以公开池那条路会把同一个槽位上凑得到的算法一起发过去。
+/// A 端要两种算法都在：只给一种时，请求落到缺的那种上就报错，所以公开池把同一
+/// 槽位上凑得到的算法一起发。
 pub fn build_keybox_xml_with_keys(device_id: &str, keys: &[(String, String, String)]) -> String {
     let blocks: String = keys
         .iter()
@@ -271,8 +259,6 @@ mod tests {
     use super::*;
 
     /// 一个文件里 EC、RSA 各一个 `<Keybox>`，两段都得出来。
-    ///
-    /// 公开仓库里那种「EC + RSA 双段」文件以前只进得来第一个，RSA 整段白丢。
     #[test]
     fn both_keyboxes_are_parsed() {
         let xml = r#"<AndroidAttestation>
@@ -300,8 +286,7 @@ mod tests {
         assert_eq!(got[1].device_id, "dev-a");
     }
 
-    /// 注释插在内容中间时，文本要拼回去，不能只留第一段（那正是 “Invalid symbol 61,
-    /// offset 1377” 的来源）。
+    /// 注释插在内容中间时文本要拼回去，不能只留第一段。
     #[test]
     fn comments_inside_content_do_not_truncate_it() {
         let xml = r#"<AndroidAttestation><Keybox DeviceID="x"><Key algorithm="rsa">
@@ -331,10 +316,7 @@ mod tests {
         assert_eq!(got[0].algorithm, "ec");
     }
 
-    /// 两种算法拼成一份 XML，再解析回来还是两份 —— 公开池现在就是这么发的。
-    ///
-    /// 以前一次只发一种算法，A 端拿到的 keybox 永远只有半套材料，请求落到缺的
-    /// 那一半上就只有报错。
+    /// 两种算法拼成一份 XML，解析回来仍是两份。
     #[test]
     fn multi_key_xml_round_trips_both_algorithms() {
         let keys = vec![
@@ -363,7 +345,7 @@ mod tests {
         assert_eq!(xml.matches("<Key algorithm=").count(), 2);
     }
 
-    /// 单份那版还是老形状（两个 `<Key>` 的容器版本兼容它）。
+    /// 单份那版仍是老形状，容器版本要兼容它。
     #[test]
     fn single_key_xml_still_has_the_old_shape() {
         let xml = build_keybox_xml(

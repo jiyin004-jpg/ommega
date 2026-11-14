@@ -1,25 +1,22 @@
 //! HIDL 版 SOTER 客户端（`vendor.qti.hardware.soter@1.0::ISoter`）。
 //!
-//! AIDL 那两家（`vendor.trustonic.hardware.soter.ITrustonicSoter` /
-//! `vendor.qti.hardware.soter.ISoter`）走的是 `/dev/binder`，见 [`super::hal`]。
-//! HIDL 这几家跑在 `/dev/hwbinder` 上，事务号和参数形状跟 AIDL 那两套都不一样：
+//! AIDL 那两家走 `/dev/binder`，见 [`super::hal`]；HIDL 这几家跑在 `/dev/hwbinder`
+//! 上，事务号和参数形状跟 AIDL 都不一样：
 //!
 //! ```text
 //! HIDL  = `.hal` 里的声明顺序 1..14
 //! AIDL  = 按方法名字母序排的 1..14
 //! ```
 //!
-//! 两边对不上的地方很多（HIDL 4 = AIDL 8 的 getDeviceId、HIDL 6 = AIDL 1 的
-//! exportAskPublicKey …），A 端那张 `HIDL_TO_INTERNAL_CODE` 表就是把这一对一关系
-//! 抠出来的结果，这里按 HIDL 的号发即可，不用再换算。
+//! 两套号对不上（HIDL 4 = AIDL 8 的 getDeviceId，HIDL 6 = AIDL 1 的
+//! exportAskPublicKey），这里一律按 HIDL 的号发，不做换算。
 //!
-//! 跟 AIDL 另一个大差别是参数和返回值里的字符串 / vector：AIDL 是内联的
-//! 「长度 + 字节」，HIDL 是 binder 的 buffer 对象，parcel 里只躺对象，数据体在
-//! parcel 外面。这部分由 [`super::hwbinder::Parcel`] 负责。
+//! 字符串 / vector 参数在 HIDL 里是 binder 的 buffer 对象，parcel 里只躺对象，数据
+//! 体在 parcel 外面（AIDL 是内联的「长度 + 字节」），由 [`super::hwbinder::Parcel`]
+//! 负责。
 //!
-//! 服务发现也要多一步：HIDL 不认 `servicemanager`，得先问 `hwservicemanager`
-//! （`/dev/hwbinder` 的 handle 0）要句柄。`IServiceManager::get(fqName, instance)`
-//! 就在 1.0 里，事务号 1。
+//! 服务发现要走 `hwservicemanager`：它占着 `/dev/hwbinder` 的 handle 0，
+//! `IServiceManager::get(fqName, instance)` 的事务号是 1，`instance` 是单独参数。
 
 use anyhow::{bail, Context, Result};
 
@@ -29,21 +26,17 @@ use super::hwbinder::{
     BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE, BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE,
 };
 
-/// HIDL 的服务全名。注意 instance 是单独一个参数，不在这个名字里。
+/// HIDL 服务全名。`instance` 是单独参数，不在名字里。
 pub const HIDL_QTI_FQNAME: &str = "vendor.qti.hardware.soter@1.0::ISoter";
 
-/// Trustonic 那套的 HIDL 名字。跟 AIDL 那边一样是两家vendor各来一份，
-/// 一台机器只注册其中一个（宿主 dex 里 `@1.0::ISoter@Proxy` 与
-/// `@1.0::ITrustonicSoter@Proxy` 两个代理类都在，哪条通得看系统装的是哪种）。
+/// Trustonic 那套的 HIDL 名字。两家 vendor 各来一份，一台机器只注册其中一个。
 pub const HIDL_TRUSTONIC_FQNAME: &str = "vendor.trustonic.hardware.soter@1.0::ITrustonicSoter";
 
-/// 小米那套的 HIDL 名字。小米把 SOTER 单独做成了 `vendor.xiaomi.hardware.soterservice`
-/// （天玑机型上常见），接口名还是 `ISoter`，方法声明顺序跟另外两家一致。
+/// 小米那套的 HIDL 名字，接口名仍为 `ISoter`，方法声明顺序与另外两家一致。
 pub const HIDL_XIAOMI_FQNAME: &str = "vendor.xiaomi.hardware.soterservice@1.0::ISoter";
 
-/// Registered by rubyx's manifest_microtrust_wechat.xml on hwbinder/default.
-/// The vendor stub has the same 14 HIDL signatures (initSign=13, finishSign=14).
-/// This is an artifact contract check, not on-device validation.
+/// Registered by rubyx's manifest on hwbinder/default. The vendor stub has the
+/// same 14 HIDL signatures (initSign=13, finishSign=14).
 pub const HIDL_MICROTRUST_FQNAME: &str = "vendor.microtrust.hardware.soter@1.0::ISoter";
 
 /// HIDL backends in the same order as [`super::hal::Backend::ALL`].
@@ -57,7 +50,7 @@ pub const BACKENDS: [&str; 4] = [
 /// 默认实例名。设备上只注册这一个。
 pub const HIDL_DEFAULT_INSTANCE: &str = "default";
 
-/// 问服务句柄用的接口。`get` 在 1.0 就是两参数版本，后来几个版本没改过签名。
+/// 问服务句柄用的接口。`get` 在 1.0 是两参数版本，后续版本没改过签名。
 pub const HW_SERVICE_MANAGER_DESCRIPTOR: &str = "android.hidl.manager@1.0::IServiceManager";
 
 /// `IServiceManager::get(fqName, instance)` 的事务号。
@@ -93,10 +86,9 @@ pub struct HidlSoter {
 }
 
 impl HidlSoter {
-    /// 顺着 `hwservicemanager` 把服务找出来，各家 vendor 依次试。
+    /// 顺着 `hwservicemanager` 找服务，各家 vendor 依次试。
     ///
-    /// `Ok(None)` 是「这台机器上都没注册」；「有 /dev/hwbinder 但没这家服务」
-    /// 也归到 `Ok(None)`（跟 AIDL 那边的语义对齐）。
+    /// 机器上一个都没注册时（包括有 /dev/hwbinder 但没这家服务）返回 `Ok(None)`。
     pub fn open() -> Result<Option<Self>> {
         for fq_name in BACKENDS {
             if let Some(soter) = Self::open_named(fq_name, HIDL_DEFAULT_INSTANCE, fq_name)? {
@@ -137,36 +129,31 @@ impl HidlSoter {
         self.descriptor
     }
 
-    /// SOTER 的 HIDL 版本。名字里写死了 `@1.0`，所以这里不用发事务去问 ——
-    /// 真去问的话那个 `getInterfaceVersion` 属于 `IBase`，还得换一次 interface
-    /// token，为个常量不值当。
+    /// SOTER 的 HIDL 版本。全名里写死了 `@1.0`，不必发事务去问 —— 那是 `IBase`
+    /// 的方法，还得再换一次 interface token。
     pub fn interface_version(&self) -> i32 {
         1
     }
 
     /// 拿到的服务句柄。
     ///
-    /// **只能在 `self` 自己的连接上使**（见 [`Self::call_on_own_connection`]）。
-    /// 句柄号是 per-`binder_proc` 的：每开一次 `/dev/hwbinder` 就是内核里一个新
-    /// proc，换条连接这个号就作废，内核会回 `BR_FAILED_REPLY`。
+    /// **只能在 `self` 自己的连接上使**（见 [`Self::call_on_own_connection`]）：句柄
+    /// 号是 per-`binder_proc` 的，换条连接这个号就作废，内核回 `BR_FAILED_REPLY`。
     pub fn handle(&self) -> u32 {
         self.handle
     }
 
     /// 用本代理自己的连接和句柄发一笔别的事务（探针拿它问 `IBase::ping`）。
     ///
-    /// 这个入口存在的意义就是不给「把句柄借到别的连接上发」留口子：内核按
-    /// 发送方 proc 的 refs 表翻句柄，句柄只有在收到它的那条连接上才算数。
+    /// 句柄只在收到它的那条连接上才算数，所以不提供「借到别的连接上发」的入口。
     pub fn call_on_own_connection(&self, descriptor: &str, code: u32) -> Result<Reply> {
         let mut parcel = Parcel::new();
         parcel.write_interface_token(descriptor);
         self.conn.transact(self.handle, code, &parcel)
     }
 
-    /// 发一笔先把 interface token 写好的事务。
-    ///
-    /// `pub` 是为了让探针能拿同一个连接去问别的接口（比如 `IBase::ping`）——
-    /// 服务端能不能认、句柄是不是真的活的，就看这一下了。
+    /// 发一笔先把 interface token 写好的事务。`pub` 是为了让探针能拿同一个连接去问
+    /// 别的接口（比如 `IBase::ping`）—— 服务端认不认、句柄活不活，就看这一下。
     pub fn call(&self, code: u32, fill: impl FnOnce(&mut Parcel)) -> Result<Reply> {
         let mut parcel = Parcel::new();
         parcel.write_interface_token(self.descriptor);
@@ -283,8 +270,8 @@ impl HidlSoter {
 
 /// 用 `IServiceManager::get(fqName, instance)` 把服务句柄要过来。
 ///
-/// 返回 `Ok(None)` 表示 hwservicemanager 认得这个名字但没登记（服务不在）；
-/// 名字里的包/接口根本不存在时它也是给个空 binder，两种都算「没有」。
+/// 服务未注册、或名字里的包/接口根本不存在（hwservicemanager 给个空 binder），两
+/// 种都返回 `Ok(None)`。
 fn fetch_service_handle(conn: &HwBinder, fq_name: &str, instance: &str) -> Result<Option<u32>> {
     let mut parcel = Parcel::new();
     parcel.write_interface_token(HW_SERVICE_MANAGER_DESCRIPTOR);
@@ -300,17 +287,16 @@ fn fetch_service_handle(conn: &HwBinder, fq_name: &str, instance: &str) -> Resul
     // 回包是一个 `interface service`，HIDL 那边就是个 hidl_binder。
     let handle = cur.binder_handle()?;
     if let Some(handle) = handle {
-        // 趁那条应答 buffer 还没交回，先把句柄在本进程里做成一次强引用。不这么做
-        // 的话，下一次事务开头会 `BC_FREE_BUFFER`，内核把翻译应答时给的那个 ref
-        // 减掉，句柄就作废了，再拿它发事务就是 `BR_FAILED_REPLY`。
-        // 见 `HwBinder::acquire_handle`。
+        // 应答 buffer 交回前先把句柄在本进程里做成一次强引用：下一笔事务开头的
+        // `BC_FREE_BUFFER` 会减掉内核翻译应答时给的 ref，句柄随之作废，再用就是
+        // `BR_FAILED_REPLY`。见 `HwBinder::acquire_handle`。
         conn.acquire_handle(handle)
             .with_context(|| format!("acquire the handle for {fq_name}/{instance}"))?;
     }
     Ok(handle)
 }
 
-/// 解析应答的游标。所有方法都是「先一个 Status，再方法自己的字段」。
+/// 解析应答的游标。每个方法都是「先一个 `Status`，再方法自己的字段」。
 struct Cursor<'a> {
     reply: &'a Reply,
     at: usize,
@@ -360,10 +346,10 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// HIDL 里 `hardware::Status` 是个 i32：0 就是没事。
+    /// HIDL 里 `hardware::Status` 是个 i32，0 即成功。
     ///
-    /// 非 0 时后面还跟一条 String16 的 message，但那条路我们从来不期待走到 —— 真走到了
-    /// 说明 HAL 自己崩了，报个带 code 的错就够，别再去解那条消息。
+    /// 非 0 时后面还跟一条 String16 message，但那条路不该走到（HAL 已崩），报 code
+    /// 就够，不去解那条消息。
     fn status(&mut self) -> Result<()> {
         let code = self.i32()?;
         if code != 0 {
@@ -384,9 +370,9 @@ impl<'a> Cursor<'a> {
     }
 
     /// 读 `hidl_vec<uint8_t>` 的 out 参数：两个对象，第一个指向 16 字节的头结构体
-    /// （里面第一格是元素地址、第二格是元素个数），第二个指向元素本身。
+    /// （第一格是元素地址、第二格是元素个数），第二个指向元素本身。
     ///
-    /// 返回元素字节。空 vector 在 parcel 里就是 A 指向头、B 的 buffer 为 0。
+    /// 空 vector 在 parcel 里就是 A 指向头、B 的 buffer 为 0。
     fn hidl_vec_u8(&mut self, conn: &HwBinder) -> Result<Vec<u8>> {
         let (_ty_a, head_addr, head_len) = self.buffer_object()?;
         if head_len != HIDL_STRUCT_SIZE {
@@ -398,8 +384,7 @@ impl<'a> Cursor<'a> {
         }
         let (_ty_b, elems_addr, elems_len) = self.buffer_object()?;
 
-        // 头结构体里第一格是指针、第二格是 size。元素地址要跟第二个对象对得上，
-        // 对不上就是我们把对象顺序读反了，宁可报错也不猜。
+        // 元素地址必须与第二个对象重合，对不上就是对象顺序读反了，宁可报错也不猜。
         let head = conn
             .read_mapped(head_addr, HIDL_STRUCT_SIZE)
             .context("hidl_vec header is outside our binder mapping")?;
@@ -427,15 +412,14 @@ impl<'a> Cursor<'a> {
             .context("hidl_vec elements are outside our binder mapping")
     }
 
-    /// `interface T` 在 parcel 里是一个 `hidl_binder`：非 null 就是 `flat_binder_object`，
-    /// null 就是单个 i32 的 0。返回句柄（`BINDER_TYPE_HANDLE` 那格，远程对象的情形）。
+    /// `interface T` 在 parcel 里是一个 `hidl_binder`：非 null 是 `flat_binder_object`，
+    /// null 是单个 i32 的 0。返回 `BINDER_TYPE_HANDLE` 那格（远程对象的情形）。
     fn binder_handle(&mut self) -> Result<Option<u32>> {
         let object_at = self.at;
 
-        // 内核把应答里每个对象的字节位置记在偏移表里。有表就得对得上：对不上说明
-        // 「Status 之后紧跟对象」这个假设在这条回包上不成立，硬读出来的只可能是别的
-        // 字段里的一串字节。拿它当句柄使，下一笔事务就是 `BR_FAILED_REPLY`（内核：
-        // 这个 proc 里没有这个 ref）。所以宁可报错，也不交出一个来路不明的句柄。
+        // 内核把应答里每个对象的字节位置记在偏移表里，有表就必须对得上：对不上说明
+        // 「Status 之后紧跟对象」不成立，硬读出来的只可能是别的字段。拿它当句柄使，
+        // 下一笔事务就是 `BR_FAILED_REPLY`（内核：这个 proc 里没有这个 ref）。
         if !self.reply.offsets.is_empty() && !self.reply.offsets.contains(&(object_at as u64)) {
             bail!(
                 "reply object at {object_at} is outside the kernel's offset table {:?}",
@@ -454,9 +438,8 @@ impl<'a> Cursor<'a> {
                 self.reply.data.len() - object_at
             );
         }
-        // 非 null：这一格其实是 `flat_binder_object` 的 type，接着是 flags，再往后
-        // 是 `binder` / `handle` 那格和 cookie。本地对象和远程句柄都接受 —— 服务
-        // 可能就在自己进程里（passthrough / 同进程 HAL）。
+        // 非 null：这一格其实是 `flat_binder_object` 的 type，接着是 flags，再往后是
+        // `binder` / `handle` 那格和 cookie。本地对象和远程句柄都接受（同进程 HAL）。
         if !matches!(
             mark,
             BINDER_TYPE_HANDLE
@@ -467,10 +450,9 @@ impl<'a> Cursor<'a> {
             bail!("unexpected binder object type {mark:#x} in an interface reply");
         }
         let _flags = self.u32()?;
-        // `union { binder_uintptr_t binder; __u32 handle; }` —— uapi 里 HANDLE 那格
-        // 就是 `__u32`，后面 4 个字节按 ABI 属于 union 的另一半（实际是 `cookie` 的
-        // 头半截）。读 8 字节再截断只在对方把 cookie 后半填成 0 时才碰巧对，读 4 字节
-        // 才是照着结构来。
+        // `union { binder_uintptr_t binder; __u32 handle; }`：uapi 里 HANDLE 那格是
+        // `__u32`，后面 4 字节按 ABI 属于 union 另一半（`cookie` 的头半截）。读 4 字节
+        // 才是照着结构来；读 8 字节再截断只在对方把 cookie 后半填 0 时才碰巧对。
         let handle = self.u32()?;
         let _union_upper = self.u32()?;
         let _cookie = self.u64()?;
@@ -538,7 +520,7 @@ mod tests {
 
     #[test]
     fn transaction_numbers_say_hello_before_signing() {
-        // `.hal` 里的声明顺序，跟 AIDL 那套完全不是一个排列。
+        // `.hal` 里的声明顺序，跟 AIDL 的排列完全不同。
         assert_eq!(TX_GENERATE_ATTK_KEY_PAIR, 1);
         assert_eq!(TX_GET_DEVICE_ID, 4);
         assert_eq!(TX_EXPORT_ASK_PUBLIC_KEY, 6);
@@ -678,8 +660,7 @@ mod tests {
 
     #[test]
     fn a_data_reply_parses_down_to_the_length_field() {
-        // 头结构体指向的地址不在映射里，所以只验到「对象和长度都读对了」为止 ——
-        // 再往后一步就是读 mmap，真机才有。
+        // 头结构体指向的地址不在映射里，因此只验到「对象和长度读对」；再往后要读 mmap。
         let reply = Reply {
             data: empty_vec_reply(0),
             offsets: Vec::new(),
@@ -712,8 +693,7 @@ mod tests {
 
     #[test]
     fn an_object_off_the_kernel_offset_table_is_refused() {
-        // 假如回包在 Status 和对象之间还有一格（内核的偏移表会说对象在 8），我们按
-        // `[Status][object]` 算出来的 4 就对不上表 —— 硬读出来的那串字节不是句柄。
+        // 偏移表说对象在 8，而我们按 `[Status][object]` 算出的 4 对不上，必须报错。
         let mut data = 0i32.to_le_bytes().to_vec();
         data.extend_from_slice(&7i32.to_le_bytes());
         push_binder_object(&mut data, 1, BINDER_TYPE_HANDLE);

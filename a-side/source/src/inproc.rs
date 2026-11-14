@@ -1,14 +1,11 @@
 //! 在宿主进程里直接跑 KeyMint 服务。
 //!
-//! 背景：payload 注入 keystore2 之后，它和我们的 HAL 是两个进程，中间还要过一趟
-//! RPC socket。按 uid 筛进程、按调用耗时测跳数，这两种查法都能把那一跳看出来。
-//! 这条路把服务主体搬进 keystore2 自己的进程，调用改成本地对象直调。
+//! 注入到 keystore2 的 payload 与独立 HAL 是两个进程、中间过一趟 RPC socket，按 uid
+//! 筛进程或按耗时测跳数都能看出来。这里把服务主体搬进宿主进程，调用改成本地直调。
 //!
-//! 边界（2026-11-09 在设备上探过）：keystore 域读得到 keymaster.db 和系统属性、
-//! 能在 /system/bin 里 exec，但读不了 /data/system/packages.list、写不了系统属性。
-//! 网络本来是没的（AOSP 原版不给 keystore 域 inet），远程出证又必须从本进程发出去，
-//! 所以我们在自己的 sepolicy 里给了 tcp + netd 那几条，见 template/sepolicy.rule。
-//! AAID 不靠 packages.list，读 daemon 落的那份表；改属性（resetprop）仍旧归 helper。
+//! 域边界：keystore 域读得到 keymaster.db 和系统属性、能在 /system/bin 里 exec，但
+//! 读不了 /data/system/packages.list、写不了系统属性；AOSP 原版不给它 inet，而远程
+//! 出证必须从本进程发，所以 sepolicy 里单独开了 tcp + netd。AAID 读 daemon 落的表。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +24,7 @@ use crate::keymaster::service::KeystoreService;
 use crate::top::jiyin004::ommega::IKeymintService::BnKeymintService;
 
 /// 心跳文件：告诉 daemon「进程内这套还活着、RPC 也挂上了」。
-/// 判定放在 daemon 侧（`src/daemon.rs:inproc_healthy`），这里只负责刷。
+/// 判定在 daemon 侧（`src/daemon.rs:inproc_healthy`），这里只负责刷。
 const HEARTBEAT_PATH: &str = "/data/misc/ommega/inproc.heartbeat";
 /// 起服务失败的原因。存在它就说明这条路在这台机器上跑不了，daemon 直接退到独立 HAL。
 const FAILED_PATH: &str = "/data/misc/ommega/inproc.failed";
@@ -78,9 +75,8 @@ pub fn request_start() {
                     Err(error) => {
                         let message = format!("{error:#}");
                         warn!("in-process KeyMint services failed to start: {message}");
-                        // 定死落盘：同一台机器上这条错基本是确定的（比如 boot key
-                        // 是旧版本独立 HAL 铸的，进程内那套找不到），不写出来 daemon
-                        // 就要每轮等心跳、白等一分多钟才退到独立 HAL。
+                        // 落盘缓存失败原因：这条错在同一台机器上基本是确定的（比如 boot
+                        // key 由独立 HAL 铸），不写出来 daemon 每轮要多等一分多钟。
                         let _ = std::fs::write(FAILED_PATH, format!("{message}\n"));
                         state.failed = Some(message);
                     }
@@ -89,9 +85,8 @@ pub fn request_start() {
             })
             .ok();
 
-        // 看门狗：过了宽限期还没结论（成或败都没有），就判它起不来。
-        // 不这么做的后果是所有调用方每笔都干等 15 秒（见 injector 的 ipc.rs），
-        // 实测能把检测器一整轮拖到十几分钟。
+        // 看门狗：过了宽限期还没有结论就判它起不来。否则每个调用方都要干等 15 秒，
+        // 一整轮检测能被拖到十几分钟。
         std::thread::Builder::new()
             .name("inproc-gate".to_string())
             .spawn(|| {
@@ -144,9 +139,8 @@ pub fn wait_ready(timeout: Duration) -> bool {
 /// 根侧落的「开机已完成」标记。
 const BOOT_DONE_PATH: &str = "/data/misc/ommega/boot_done";
 
-/// 进程内那套从开始到有结论的宽限期。开库那一步在“另一个进程占着库”的时候会
-/// 一直睡下去（上游就是这么写的，把重试改成有超时反而会把整个 keystore2 abort 掉，
-/// 实测），所以不能靠它自己回来，得有东西替它下结论。
+/// 从开始到必须有结论的宽限期。开库那一步在别的进程占着库时会一直睡下去（上游实现
+/// 如此，改成带超时的重试会让整个 keystore2 abort），所以得由外部下结论。
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn boot_done_present() -> bool {
@@ -164,12 +158,11 @@ fn replay_early_boot_ended() {
 fn start() -> Result<HashMap<&'static str, SIBinder>> {
     let config_file = crate::config::bootstrap_config_file().context("bootstrap config")?;
 
-    // 日志归宿主（payload 已经装了自己的 logger，`log` 的 max_level 也是全局的，
-    // 这里再调一次会把 payload 自己的日志一起关掉）。
+    // 日志归宿主：payload 已装自己的 logger，`log` 的 max_level 是全局的，
+    // 这里再调一次会把 payload 自己的日志一起关掉。
     info!("starting in-process ommega KeyMint");
     crate::keymaster::permission::initialize_runtime_service_context();
-    // 目录/权限这套在这里基本是「看一眼就过」：我们已经是 keystore uid，chown 自己
-    // 会成功，chown 到别人的会 EPERM —— 只打日志，不挡启动。
+    // 目录/权限只打日志不挡启动：这里已是 keystore uid，chown 别人的会 EPERM。
     crate::prepare_android_storage();
     let _ = rsbinder::ProcessState::init_default();
 
@@ -212,27 +205,22 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
     ] {
         services.insert(name, binder);
     }
-    // 同一个流程就手把抽象 socket 也冒充上：SOTER 宿主（uid 1000）在别的进程里，
-    // 只能靠这条路找过来。HAL 还在的时候名字被它占着，这里就一直重试，等它退了我们接手。
+    // 顺手把抽象 socket 也挂上：SOTER 宿主（uid 1000）在别的进程里，只能走这条路。
+    // 名字被独立 HAL 占着时一直重试，等它退了我们接手。
     let for_rpc: HashMap<&'static str, SIBinder> = services.clone();
     std::thread::Builder::new()
         .name("inproc-rpc".to_string())
         .spawn(move || serve_app_rpc(for_rpc))
         .ok();
 
-    // early boot 结束的重放放在最后一步：它要建一个 KeyMint wrapper（内部会走
-    // init_keymint_ta，用到 keybox 和 boot level cache），所以必须在
-    // boot_level_cache 和 keybox 都就绪之后 —— 放前面不但会因 boot level key
-    // 还没铸出来而让整条启动失败，也会因 keybox 未初始化而让重放自己失败。
-    //
-    // 根侧（daemon-injector）在 sys.boot_completed=1 后落 boot_done；这里只看它，
-    // 不去读属性（payload 是静态链接的，read_string_property 会退到 exec resetprop）。
+    // early boot 结束的重放必须在 boot level cache 和 keybox 都就绪之后：它要建
+    // KeyMint wrapper（内部走 init_keymint_ta），提前做会整条启动失败。
+    // 只看根侧的 boot_done 标记，不读属性（payload 静态链接，读属性会退到 exec resetprop）。
     if boot_done_present() {
         replay_early_boot_ended();
     } else {
-        // 开机时 keystore2 往往比注入器守护先起（实测 13:30:13 vs 13:31），这一刻
-        // boot_done 还没落。等它出现再重放，否则 early boot 状态会一直不更新，
-        // EARLY_BOOT_ONLY 的钥匙开机之后仍然能 import。
+        // 宿主常比注入器守护先起，这一刻 boot_done 还没落。等它出现再重放，
+        // 否则 EARLY_BOOT_ONLY 的钥匙开机之后仍然能 import。
         let spawned = std::thread::Builder::new()
             .name("inproc-boot-wait".to_string())
             .spawn(|| {
@@ -273,12 +261,9 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
 }
 
 /// 把本地服务挂到抽象 socket 上，给 app 域的调用方（SOTER 宿主）。
-///
-/// 绑定失败最常见的理由是名字被单独跑的 HAL 占着（切过来的那段过渡期），
-/// 所以这里是个带退避的循环，不把它当错误。
+/// 名字被独立 HAL 占着时绑定会失败，这是预期情况，所以是带退避的循环而非错误。
 fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
-    // HAL 还占着名字的时候绑不上，这是预期情况；只在原因变化时记一笔，
-    // 否则每轮一行会把真正有用的日志淡掉。
+    // 绑不上（名字被 HAL 占着）是预期情况，只在原因变化时记一笔，免得刷掉有用日志。
     let mut last_error = String::new();
     loop {
         match bind_app_rpc() {
@@ -301,9 +286,8 @@ fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
                         warn!("in-process RPC stopped: {error:#}");
                     }
                 }
-                // 心跳里的 rpc 字段跟着服务一起改口：这一轮要么没挂全、要么 run() 已经
-                // 返回，就说明 app 域那边没人应答了。不回 false 的话，daemon 会一直认为
-                // 进程内健康、不去拉独立 HAL，SOTER 宿主那条路就一直空着。
+                // 没挂全或 run() 已返回都说明 app 域没人应答，rpc 字段必须回 false，
+                // 否则 daemon 会一直认为进程内健康、不去拉独立 HAL。
                 RPC_READY.store(false, Ordering::Relaxed);
             }
             Err(error) => {
@@ -323,9 +307,8 @@ fn bind_app_rpc() -> Result<Arc<rsbinder::rpc::RpcServer>> {
     match crate::create_rpc_server(crate::RpcBind::Abstract) {
         Ok(server) => Ok(server),
         Err(error) => {
-            // keystore 域写不了 /proc/self/attr/sockcreate（那份权限是给 root 起的 HAL
-            // 用的）。不设也行：socket 会继承本进程的 u:r:keystore:s0，跟 HAL 当初设的
-            // 是同一个值，接入判断照样按 uid 走。
+            // keystore 域写不了 /proc/self/attr/sockcreate（那权限只给 root 起的 HAL）。
+            // 不设也行：socket 继承本进程的 u:r:keystore:s0，接入判断照样按 uid 走。
             log::debug!(
                 "sockcreate context unavailable in this domain ({error:#}); binding directly"
             );
@@ -340,8 +323,8 @@ fn bind_app_rpc() -> Result<Arc<rsbinder::rpc::RpcServer>> {
     }
 }
 
-/// 抽象 socket 的准入判断，跟 lib 里那份一样（file socket 那套在本域名里用不了，
-/// 所以这里是单独一份）：keystore 自己、root（软件 SOTER TA）、被注入过的进程。
+/// 抽象 socket 的准入判断（file socket 那套在本域名里用不了，所以单独一份）：
+/// keystore 自己、root（软件 SOTER TA）、被注入过的进程。
 fn app_authorizer() -> impl Fn(&rsbinder::rpc::PeerIdentity) -> bool + Send + Sync + 'static {
     move |peer| {
         let allowed = match peer {

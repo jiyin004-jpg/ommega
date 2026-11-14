@@ -120,8 +120,8 @@ fn disabled_filter_reports_disabled_and_allows() {
     assert_eq!(decision.reason, FilterReason::Disabled);
 }
 
-/// 主开关关着也不能把系统进程接过来：以前这里直接 allowed，把 `enabled = false`
-/// 一改就变成“开机期 keystore 流量全拐到我们”，系统拿到用不了的回复就是重启。
+/// 主开关关着也不能把系统进程接过来：否则 `enabled = false` 一改就变成“开机期
+/// keystore 流量全拐到我们”，系统拿到用不了的回复就是重启。
 #[test]
 fn disabled_filter_still_rejects_non_app_callers() {
     let mut config = base_config();

@@ -18,9 +18,9 @@ const SECURITY_PATCH_FALLBACK: &str = "2025-06-05";
 const VENDOR_PATCH_PROP: &str = "ro.vendor.build.security_patch";
 const BOOT_PATCH_PROP: &str = "ro.vendor.boot_security_patch";
 
-/// 面板「伪装参数」曾经写的那个名字（部分 ROM 用这个）。与上面等价。
+/// 部分 ROM 用的等价名字（面板「伪装参数」写的就是这个）。
 const BOOT_PATCH_ALT_PROP: &str = "ro.boot.build.security_patch";
-/// AProbe 的 A13 查的就是这个名字（`boot.image`，不是 `boot.build`）。
+/// 检测器 A13 查的是这个名字（`boot.image`，不是 `boot.build`），必须一起写。
 const BOOT_PATCH_APROBE_PROP: &str = "ro.boot.image.build.security_patch";
 
 const VBMETA_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
@@ -84,9 +84,8 @@ pub(crate) fn write_runtime_security_patch(desired: &str, previous: Option<&str>
     )
 }
 
-/// daemon 落的 `run/keymint.env` 里的值（出证要用的几个属性）。
-///
-/// 先读文件，再退回真环境变量 —— 手动启动、旧 daemon 时还能用。
+/// 出证要用的属性值：先读 daemon 落的 `/data/adb/ommega/run/keymint.env`，
+/// 读不到再退回进程环境变量（手动启动时用）。
 pub(crate) fn value_from_file_or_env(name: &str) -> Option<String> {
     if let Ok(text) = std::fs::read_to_string("/data/adb/ommega/run/keymint.env") {
         for line in text.lines() {
@@ -106,15 +105,14 @@ pub(crate) fn value_from_file_or_env(name: &str) -> Option<String> {
 
 /// daemon 传进来的 verified-boot hash（`OMMEGA_BOOT_HASH`）。
 ///
-/// 为什么需要它：keymint 进程里 `rsproperties` 读属性区不可靠（读不到时不报错，
-/// 静默退回「从原机 vbmeta 分区算出来的值」），而 daemon 是 shell 域，
-/// `getprop` 拿到的一定是检测器也能看到的那一份。开机解析 config 和出证上报都用它。
+/// keymint 进程里 `rsproperties` 读属性区不可靠（读不到也不报错），daemon 是 shell 域，
+/// `getprop` 拿到的才是检测器看到的那一份。
 pub(crate) fn boot_hash_from_env() -> Option<[u8; 32]> {
     let raw = value_from_file_or_env("OMMEGA_BOOT_HASH")?;
     parse_hex_32(raw.trim()).ok()
 }
 
-/// 同理，vbmeta 公钥摘要。
+/// 同上，vbmeta 公钥摘要（`OMMEGA_BOOT_KEY`）。
 pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
     let raw = value_from_file_or_env("OMMEGA_BOOT_KEY")?;
     parse_hex_32(raw.trim()).ok()
@@ -122,27 +120,18 @@ pub(crate) fn boot_key_from_env() -> Option<[u8; 32]> {
 
 /// daemon 通过环境变量传进来的 boot 补丁级别（`OMMEGA_PATCH_BOOT`）。
 ///
-/// 为什么需要：三个候选属性里，`ro.vendor.boot_security_patch` 落在
-/// `vendor_default_prop`，而 `ro.boot.build.security_patch` /
-/// `ro.boot.image.build.security_patch` 落在 `bootloader_prop`。不少 ROM 不给
-/// keystore 域读 vendor_default_prop（NX721J 实测：policy 里只放行了
-/// vendor_security_patch_level_prop），keymint 里又没法 fork resetprop 兜底
-/// （entrypoint 被拒），于是三个都读不到，退回 boot 镜像编译日期——检测器的 A13
-/// 拿 719 跟 `ro.boot.image.build.security_patch` 一对就报不一致。
-///
-/// daemon 是 shell 域，`getprop` 读得到真实值，开机时传进来。
+/// 三个候选属性分属 `vendor_default_prop` 与 `bootloader_prop`，不少 ROM 不给 keystore
+/// 域读权限，keymint 里又没法 fork resetprop 兜底；daemon 是 shell 域，读得到真实值。
 fn boot_patchlevel_from_env() -> Option<String> {
     let raw = value_from_file_or_env("OMMEGA_PATCH_BOOT")?;
     let value = raw.trim().to_string();
     (!value.is_empty()).then_some(value)
 }
 
-/// 出证路径上 key / hash 的短缓存：一次出证要读两个属性，各 fork 一个进程（实测
-/// 单次 22ms）。而 attest 往往是连着来几笔（generateKey 一笔、getKeyEntry 一笔、
-/// 再换算法一笔），3 秒内复用同一份读结果就够了。
+/// 出证路径上 key / hash 的短缓存：每读一个属性要 fork 一个进程（约 22ms），
+/// 而 attest 常常连着来几笔，3 秒内复用同一份读结果。
 ///
-/// 只缓存**成功**的结果：读失败不缓存，下一次直接重试（不会把一次性的权限问题
-/// 锁死两秒）。
+/// 只缓存**成功**的结果：读失败不缓存，下一笔直接重试。
 const ROT_CACHE_TTL: Duration = Duration::from_secs(3);
 
 fn cached_hex_property(name: &'static str) -> Option<[u8; 32]> {
@@ -171,11 +160,10 @@ fn cached_hex_property(name: &'static str) -> Option<[u8; 32]> {
     Some(value)
 }
 
-/// 解锁设备的 `ro.boot.vbmeta.public_key_digest` 本来就是空的（原生全零），
-/// 而 `verifiedBootKey` 全零本身就是个「未签名/解锁」特征，不能就这么发出去。
+/// 解锁设备的 `ro.boot.vbmeta.public_key_digest` 是全零，而 `verifiedBootKey` 全零
+/// 本身就是「未签名/解锁」特征，不能就这么发出去。
 ///
-/// 用 boot hash 派生一个稳定的非零值：同一台设备每次一样、不同设备不一样，
-/// 也仍然属同一台机器的根。
+/// 用 boot hash 派生稳定的非零值：同机每次一致、跨机不同，仍属同一台机器的根。
 fn derived_boot_key(hash: &[u8; 32]) -> [u8; 32] {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     ctx.update(hash);
@@ -185,7 +173,7 @@ fn derived_boot_key(hash: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// `#RRGGBB` 风格的 64 位十六进制串 → 32 字节。
+/// 64 位十六进制串 → 32 字节。
 fn decode_hex32(value: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(value.trim()).ok()?;
     bytes.try_into().ok()
@@ -193,8 +181,7 @@ fn decode_hex32(value: &str) -> Option<[u8; 32]> {
 
 /// 最后一道兜底：同一天内固定，跨天才换。
 ///
-/// 不用随机、不用进程号（那些每笔请求都会变，检测器一看就知道是编的）；
-/// 也不用真机属性（已经读不到了）。
+/// 不能用随机数或进程号（每笔请求都会变，检测器一看就知道是编的）。
 fn derived_boot_hash() -> [u8; 32] {
     let stamp = utc_day_stamp();
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
@@ -215,22 +202,17 @@ fn utc_day_stamp() -> String {
     format!("{year:04}{month:02}{day:02}")
 }
 
-/// 当前 RootOfTrust：key / hash 读**当刻属性**（2 秒内复用），锁定与验证状态固定
+/// 当前 RootOfTrust：key / hash 读**当刻属性**（3 秒内复用），锁定与验证状态固定
 /// 「已锁定 + 已验证」。
 ///
-/// 顺序：读属性（带短缓存）→ daemon 启动时读好的环境变量（兜底）。
-/// **不能反过来**：env 是开机快照，运行中 daemon 会把 B 的属性同步过来（physical
-/// 模式），快照就是旧的 —— 证书和 `getprop` 一对就是 mismatch。
+/// 顺序：读属性（带短缓存）→ 环境变量兜底。**不能反过来**：env 是开机快照，运行中
+/// daemon 会把 B 的属性同步过来，快照就是旧的，证书和 `getprop` 一对就是 mismatch。
 ///
-/// key 全零（设备没这个属性）时用 hash 派生，不发全零证书；hash 全零就真的没招，
-/// 但那种情况下证书本身也没法自洽，保留零值并交给上层报错。
-///
-/// 代价：缓存过期后的第一笔出证要 fork 两次（约 40ms）；连着来的几笔零开销。
-/// 属性真变了（daemon 同步了 B 的值）最多晚 2 秒被发现，可接受。
+/// key 全零时用 hash 派生；hash 全零则保留零值并交给上层报错。
+/// 缓存过期后的第一笔出证要 fork 两次（约 40ms），连着来的几笔零开销。
 pub(crate) fn runtime_root_of_trust() -> ([u8; 32], [u8; 32], bool, u32) {
-    // 全零不往外发：全零是「没有 rootOfTrust」的明确特征，本地链和服务端兜底
-    // 都不能带它。属性读不到时退到 bootloader 的 bootconfig，再不行就「同一天内
-    // 稳定」地派生一个（跟服务端兜底同一个思路：锚时间，不锚随机）。
+    // 全零不往外发：全零是「没有 rootOfTrust」的明确特征，本地链和服务端兜底都不能带。
+    // 读不到时退到 bootloader 的 bootconfig，再不行按「同一天内稳定」派生（锚时间，不锚随机）。
     let hash = cached_hex_property(VBMETA_HASH_PROP)
         .or_else(boot_hash_from_env)
         .filter(|h| h.iter().any(|b| *b != 0))
@@ -259,26 +241,23 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
     let property_boot_patch = boot_patchlevel_from_env()
         .or_else(|| resetprop::read_string_property(BOOT_PATCH_PROP))
         .or_else(|| read_build_prop_value(BOOT_PATCH_PROP))
-        // 面板「伪装参数」写的是 AOSP 常见名 `ro.boot.build.security_patch`，
-        // 而厂商习惯用 `ro.vendor.boot_security_patch`。两个都认，否则用户在面板上
-        // 写了值，证书里却还是 bootimage 编译日期。
+        // AOSP 名是 `ro.boot.build.security_patch`，厂商习惯 `ro.vendor.boot_security_patch`。
+        // 两个都认，否则面板写了值、证书里还是 boot 镜像编译日期。
         .or_else(|| resetprop::read_string_property(BOOT_PATCH_ALT_PROP))
         .or_else(|| read_build_prop_value(BOOT_PATCH_ALT_PROP))
-        // AProbe 的 A13 直接读这个名字，三个变体都认，免得检测器查的跟我们写的不是同一个。
+        // 检测器 A13 直接读这个名字，三个变体都认，保证写的和查的是同一个。
         .or_else(|| resetprop::read_string_property(BOOT_PATCH_APROBE_PROP))
         .or_else(|| read_build_prop_value(BOOT_PATCH_APROBE_PROP))
-        // 上面的开机属性在不少 ROM 上根本读不到（keystore 域没有 vendor_default_prop /
-        // bootloader_prop 的读权限），那就退到「设备自己报的安全补丁」这两个属性：
-        // 它们是 build.prop 里的静态值，读文件就能拿到，而且检测器一般都拿它们当基准。
-        // 比退回 boot 镜像编译日期（可能差好几个月）准得多。
+        // 上面的开机属性在不少 ROM 上读不到（keystore 域没有 vendor_default_prop /
+        // bootloader_prop 的读权限），退到 build.prop 里的静态安全补丁值：读文件就能拿到，
+        // 检测器一般也拿它当基准，比 boot 镜像编译日期（可能差好几个月）准。
         .or_else(|| resetprop::read_string_property(VENDOR_PATCH_PROP))
         .or_else(|| read_build_prop_value(VENDOR_PATCH_PROP))
         .or_else(|| resetprop::read_string_property(SECURITY_PATCH_PROP))
         .or_else(|| read_build_prop_value(SECURITY_PATCH_PROP));
     // boot 分区内嵌 vbmeta 里的补丁日期是**镜像事实**：跟 os/vendor 同一次 OTA，
-    // 不会像 bootloader 属性那样停在旧值（本机实测属性 2025-03-01、分区 2026-08-01，
-    // 因为厂商没跟着刷 bootloader）。所以 auto 模式下它排在属性前面，两者不一致时
-    // 以它为准并打一条 warn —— 以前是属性优先，旧日期就此锁进链里。
+    // 不会像 bootloader 属性那样停在旧值。auto 模式下它排在属性前面，
+    // 两者不一致时以它为准并打一条 warn。
     let avb_boot_patch = match read_abl_boot_patchlevel() {
         Ok(value) => Some(value.to_string()),
         Err(error) => {
@@ -294,14 +273,10 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
         }
     }
     // 顺序：daemon 算好的最终值（伪装优先）→ boot 分区真值 → vendor → boot 属性 → 编译日期。
+    // 优先级统一在 daemon 里定，结果落进 `patch.state`，这里只管用它。
     //
-    // 以前属性排第一，属性被污染后旧日期就锁进链里；反过来把 AVB 排第一又有另一个
-    // 毛病：用户明明伪装了日期，链上还是真值。所以优先级统一在 daemon 里定，结果落进
-    // `patch.state`，这里只管用它。
-    //
-    // AVB 读不到时用 **vendor 的值**，而不是 bootloader 那份 `ro.boot.image.build.security_patch`：
-    // 后者不随 OTA 更新（本机实测停在 2025-03-01，而系统镜像早就是 2026-08-01），跟
-    // os/vendor 一对比就露。TEESimulator 干脆一直这么干（boot 直接用 vendor）。
+    // AVB 读不到时用 vendor 的值，而不是 bootloader 那份
+    // `ro.boot.image.build.security_patch`：后者不随 OTA 更新，跟 os/vendor 一对比就露。
     let state_boot_patch = read_boot_patchlevel_state();
     let boot_patch = if trust.boot_patchlevel.trim() == "auto" {
         state_boot_patch
@@ -335,8 +310,8 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
 
 /// `ro.bootimage.build.date.utc` 的 epoch 秒转成 YYYYMMDD。
 ///
-/// AVB 里没给 boot 补丁级别时用它当近似值：检测器比的就是这个属性（boot 镜像
-/// 的编译日期）跟链上的 boot 补丁级别，差一个月以上就报警。
+/// AVB 里没给 boot 补丁级别时用它当近似值：检测器拿这个属性跟链上的 boot 补丁级别比，
+/// 差一个月以上就报警。
 fn bootimage_date_patchlevel() -> Option<String> {
     let raw = resetprop::read_string_property("ro.bootimage.build.date.utc")?;
     let secs: i64 = raw.trim().parse().ok()?;
@@ -347,7 +322,7 @@ fn bootimage_date_patchlevel() -> Option<String> {
     Some(format!("{y:04}{m:02}{d:02}"))
 }
 
-/// Howard Hinnant 的 `days_from_civil` 逆运算：epoch 天数 → (年, 月, 日)。
+/// epoch 天数 → (年, 月, 日)。
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -441,8 +416,8 @@ pub fn build_prop_value(key: &str) -> Option<String> {
 
 /// build.prop 的键值表，进程内只解析一次。
 ///
-/// 归一每次重跑要查十几个键，一个个去遍历那八个文件会变成几十次整文读取；
-/// 缓存之后只是一次哈希查表。同一进程生命周期内 build.prop 不会变，缓存安全。
+/// 归一每次要查十几个键，逐个遍历那八个文件就是几十次整文读取；同一进程生命周期内
+/// build.prop 不会变，缓存安全。
 fn build_props() -> &'static std::collections::HashMap<String, String> {
     static PROPS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
     PROPS.get_or_init(|| {
@@ -463,7 +438,7 @@ fn build_props() -> &'static std::collections::HashMap<String, String> {
                 if key.is_empty() || value.is_empty() {
                     continue;
                 }
-                // 跟以前一样：前面的文件优先。
+                // 前面的文件优先。
                 map.entry(key.to_string())
                     .or_insert_with(|| value.to_string());
             }
@@ -603,12 +578,7 @@ pub fn boot_image_patchlevel_date() -> Result<String> {
     ))
 }
 
-/// 顶层 vbmeta 的公钥摘要（SHA256(public key)），就是链上的 `verifiedBootKey`。
-///
-/// bootloader 只在 bootconfig 里给 `androidboot.vbmeta.digest`（对应 verifiedBootHash），
-/// 不给公钥摘要；原生 HAL 自己读分区算。以前我们拿 boot hash 派生一个、后来变成全零，
-/// 两个都不是真值，检测器一看就知道。这里按 AVB 规范算真的。
-/// 顶层 vbmeta 的字节，进程内只读一次（归一和公钥摘要都要它，以前各读一份）。
+/// 顶层 vbmeta 的字节，进程内只读一次（归一和公钥摘要都要它）。
 fn cached_top_level_vbmeta() -> Result<&'static [u8]> {
     static CACHE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
     match CACHE.get_or_init(|| {
@@ -622,6 +592,10 @@ fn cached_top_level_vbmeta() -> Result<&'static [u8]> {
     }
 }
 
+/// 顶层 vbmeta 的公钥摘要（SHA256(public key)），就是链上的 `verifiedBootKey`。
+///
+/// bootloader 只在 bootconfig 里给 `androidboot.vbmeta.digest`（对应 verifiedBootHash），
+/// 不给公钥摘要，必须按 AVB 规范读分区自己算。
 pub fn boot_image_public_key_digest() -> Result<String> {
     let top_level = cached_top_level_vbmeta()?;
     let key = avb_public_key(top_level)?;
@@ -632,13 +606,12 @@ pub fn boot_image_public_key_digest() -> Result<String> {
 
 /// 在 vbmeta 里找 AVB 公钥结构：`num_bits(u32=2048) + n0inv(u32) + modulus(256) + rr(256)`。
 ///
-/// 不定死偏移：这台 ROM 的 offset 字段跟 AOSP 的基准不一致（hash_offset 是 0、公钥偏移
-/// 相对 aux block），按规矩解析会指错地方；直接按结构扫反而稳，同一把 key 扫到的几处
-/// 摘要都一样。
+/// 不能定死偏移：部分 ROM 的 offset 基准与 AOSP 不一致（公钥偏移相对 aux block），
+/// 按 header 解析会指错地方，只能按结构扫。
 fn avb_public_key(vbmeta: &[u8]) -> Result<&[u8]> {
     const KEY_LEN: usize = 520;
-    // 先走 O(1)：按 header 里的偏移取候选，两种基准都试（AOSP 是相对文件头，
-    // 本机这 ROM 实测是相对 aux block）。取到先验证结构像公钥，不像才退化成扫描。
+    // 先按 header 里的偏移取候选，两种基准都试（相对文件头 / 相对 aux block）；
+    // 取到先验证结构像公钥，不像才退化成扫描。
     if vbmeta.len() >= AVB_HEADER_SIZE && &vbmeta[..4] == b"AVB0" {
         if let (Ok(pub_off), Ok(pub_sz), Ok(auth_sz)) = (
             be_u64(&vbmeta[64..72]),
@@ -656,8 +629,7 @@ fn avb_public_key(vbmeta: &[u8]) -> Result<&[u8]> {
             }
         }
     }
-    // 兜底：按结构扫。不定死偏移是因为各 ROM 的 offset 基准不一定一样，
-    // 扫一遍最多 64KB/4 = 16K 次比较，只在上面全部失败时才走。
+    // 兜底按结构扫：最多 64KB/4 = 16K 次比较，只在上面全部失败时才走。
     if vbmeta.len() < KEY_LEN {
         bail!("vbmeta is too small to hold a public key");
     }
@@ -680,9 +652,8 @@ fn looks_like_avb_public_key(candidate: &[u8]) -> bool {
 
 /// bootloader 实际算出来的 vbmeta 摘要（`androidboot.vbmeta.digest`）。
 ///
-/// `ro.boot.vbmeta.digest` 只是 init 从 bootconfig 拄过来的一份，抄完谁都能 resetprop；
-/// 一旦抄坏，链和属性就会互相喂着错下去。bootconfig 本身是 bootloader 写的、只读的，
-/// 拿它当最后的真值。
+/// `ro.boot.vbmeta.digest` 只是 init 从 bootconfig 抄过来的一份，谁都能 resetprop；
+/// bootconfig 由 bootloader 写、只读，只能以它当真值来源。
 pub fn bootloader_vbmeta_digest() -> Option<String> {
     for path in ["/proc/bootconfig", "/proc/cmdline"] {
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -714,9 +685,8 @@ fn find_bootloader_digest(text: &str) -> Option<String> {
 
 /// 归一后的 boot 补丁值落盘位置（daemon 写、keymint 读）。
 ///
-/// 为什么不直接让 keymint 读 props.conf：keystore 域读不了 `/data/adb`；而这个文件
-/// 就在 `/data/misc/ommega` 里，是 TA 自己的目录。伪装和真值的优先级只在 daemon 里
-/// 判一次，落进这个文件，出链就只认它 —— 不会出现「属性伪装了、链上却是真值」。
+/// 放在 `/data/misc/ommega`：keystore 域读不了 `/data/adb`，这里是 TA 自己的目录。
+/// 伪装与真值的优先级只在 daemon 里判一次并落进这个文件，出链只认它。
 const PATCH_STATE_PATH: &str = "/data/misc/ommega/patch.state";
 
 /// 读 daemon 算好的 boot 补丁值。
@@ -777,8 +747,8 @@ fn read_abl_boot_patchlevel_from_blob(top_level: Result<&[u8]>, boot_path: &Path
     read_boot_header_patchlevel(boot_path)
 }
 
-/// 跟 `read_abl_boot_patchlevel_from_blob` 同一套判断，只是顶层 vbmeta 现从路径读。
-/// 真机上顶层那份是缓存好的字节，这个入口留给测试用（测试要能摆一份自己的文件）。
+/// 同 `read_abl_boot_patchlevel_from_blob`，只是顶层 vbmeta 现从路径读；
+/// 真机走缓存的字节，这个入口留给测试。
 #[cfg(test)]
 fn read_abl_boot_patchlevel_from_paths(
     top_level: Result<std::path::PathBuf>,

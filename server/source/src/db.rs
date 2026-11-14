@@ -27,25 +27,22 @@ fn col_index(row: &mysql::Row, col: &str) -> Option<usize> {
         .position(|c: &Column| c.name_str() == col)
 }
 
-/// Safely read an optional string / datetime / numeric column from a MySQL
-/// row.  The official `row.get::<Option<String>>()` panics when the driver
-/// returns the value as `Value::Date(..)` (DATETIME / TIMESTAMP columns),
-/// or `Value::Int(..)`.  We decode based on the actual Value variant.
+/// Read an optional string / datetime / numeric column without panicking.
+/// `row.get::<Option<String>>()` panics on `Value::Date(..)` / `Value::Int(..)`,
+/// so decode by the actual `Value` variant instead.
 fn row_str_opt(row: &mysql::Row, col: &str) -> Option<String> {
-    // 1) Try the naive path first for plain VARCHAR.
+    // 先按普通 VARCHAR 解，解不出再落到原始 Value。
     match row.get_opt::<Option<String>, _>(col) {
         Some(Ok(Some(s))) => return Some(s),
         Some(Ok(None)) => return None,
-        _ => {} // fallthrough: try Value-based decoding
+        _ => {}
     }
-    // 2) Fallback: inspect the raw Value.
     let idx = col_index(row, col)?;
     value_to_string(row.as_ref(idx)?.clone())
 }
 
-/// Same as `row_str_opt` but looking up by column positional index.  Useful
-/// for aggregate queries (`MIN(..)`, `MAX(..)`) whose output columns are
-/// anonymous.
+/// Same as `row_str_opt` but by positional index — aggregate columns
+/// (`MIN(..)`, `MAX(..)`) come back anonymous.
 fn row_str_opt_pos(row: &mysql::Row, idx: usize) -> Option<String> {
     value_to_string(row.as_ref(idx)?.clone())
 }
@@ -128,8 +125,8 @@ pub struct ApiTokenRow {
     pub bound_serial: String,
     /// 首次激活时绑定的设备 SN（`ro.boot.serialno`）。空 = 还没绑定。
     pub bound_sn: String,
-    /// 首次激活时绑定的 IMEI1。硬件写死、基本改不动，跟 `bound_sn` 互为兵备；
-    /// 任意一项对得上就算同一台机器。空 = 当时没读到。
+    /// 首次激活时绑定的 IMEI1（硬件写死）。与 `bound_sn` 互为备份，任意一项对得上
+    /// 就算同一台机器。空 = 绑定时没读到。
     pub bound_imei: String,
     /// 绑定的时间（北京时间字符串）。
     pub bound_at: String,
@@ -152,8 +149,7 @@ pub struct CardOrderRow {
     pub trade_no: String, // 支付平台流水号
 }
 
-/// 新建一张卡订单要写的字段。字段多了点，打包成一个结构体传，省得在调用处
-/// 数到第几个参数是什么。
+/// 一张卡订单的写入字段。
 pub struct NewCardOrder<'a> {
     pub order_id: &'a str,
     pub card_type: &'a str, // "year" | "month"
@@ -177,9 +173,8 @@ pub struct ClientReportRow {
 }
 
 impl Db {
-    /// Connect to MySQL. `url` is a MySQL connection URL such as
-    /// `mysql://user:pass@host:port/dbname`. Sets the session time zone to
-    /// Beijing time (`+08:00`) so all `NOW()` values are local time.
+    /// Connect to MySQL (`mysql://user:pass@host:port/dbname`). Session time zone
+    /// is pinned to Beijing time (`+08:00`) so every `NOW()` is local time.
     pub fn open(url: &str) -> anyhow::Result<Self> {
         let base = mysql::Opts::from_url(url)?;
         let opts = OptsBuilder::from_opts(base).init(vec![
@@ -192,9 +187,8 @@ impl Db {
         Ok(Self { pool })
     }
 
-    /// Get a connection from the pool. The `OptsBuilder::init` above ensures
-    /// every new connection has the correct time_zone and charset — no need
-    /// to repeat SET queries on every checkout.
+    /// Check out a pooled connection. `OptsBuilder::init` already applied the
+    /// session time zone and charset to every new connection.
     fn conn(&self) -> anyhow::Result<mysql::PooledConn> {
         Ok(self.pool.get_conn()?)
     }
@@ -295,9 +289,8 @@ impl Db {
         }
     }
 
-    /// 随便挑一条能用的身份（`active = 1`）。自动采集的那些（`machine_id` 以 `auto`
-    /// 开头）优先 —— 它们本来就是给所有设备共用的材料；手动上传 / 真机自己传上来的
-    /// 那份是人家的真身份，只当最后手段。定序是固定的，同一个库里挑到的永远同一条。
+    /// 随便挑一条能用的身份（`active = 1`）：自动采集的（`machine_id` 以 `auto` 开头）
+    /// 优先，手动上传 / 真机自传的真身份只当最后手段。定序固定，同一库里结果稳定。
     pub fn get_any_usable_identity(&self) -> anyhow::Result<Option<DeviceIdentity>> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
@@ -319,17 +312,9 @@ impl Db {
     }
 
     /// 按链上标的级别挑一条能用的身份（`want_strongbox` = 要 StrongBox 那份）。
-    ///
-    /// 兜底专用。以前兜底走 `get_any_usable_identity`，不看级别：库里既存了 TEE
-    /// 的一份又存了 StrongBox 的一份时，TEE 请求可能拿到 StrongBox 的链，级别就
-    /// 串了（实测 level=1 请求返回 `O=StrongBox`）。
-    ///
-    /// 没标级别的链（软件链 / 自签链 / 老 keybox）现在**排在后面**：它是软件
-    /// 级的东西，配一把写着 TEE 的叶子自己就矛盾，所以只有库里真的没有标了
-    /// 同级别的身份时才拿它顶（老行为是直接当 TEE 用）。
-    ///
-    /// 排序跟 `get_any_usable_identity` 一样（自动采集的优先、新的优先），只是多
-    /// 了一道级别过滤；同一份库里挑到的结果稳定。
+    /// 级别对不上的一律不能顶：库里同时有 TEE 和 StrongBox 时，TEE 请求会拿到
+    /// `O=StrongBox` 的链。没标级别的链（软件链 / 自签链 / 老 keybox）排在最后，
+    /// 只在没有同级身份时才用。排序同 `get_any_usable_identity`，结果稳定。
     pub fn get_any_usable_identity_for_level(
         &self,
         want_strongbox: bool,
@@ -378,15 +363,11 @@ impl Db {
         Ok(None)
     }
 
-    /// Fetch any active identity for a device regardless of algorithm — a
-    /// targeted lookup replacing a full `list_device_identities()` scan when
-    /// the exact algorithm match is missing.
-    ///
+    /// 取一台设备任意一条 `active = 1` 的身份，不按算法过滤。
     /// `ORDER BY` 不能省：一台设备可能按算法存着好几行（EC 一行、RSA 一行），
-    /// 没有排序时 `LIMIT 1` 取哪一行由存储引擎决定。EC 和 RSA 两次认证各取到
-    /// 一行不同身份，链的中间证书/签发者就不一样 —— 检测方报的就是
-    /// `hardware.attestation.algorithm_differential`。按 algorithm 定序，两条
-    /// 算法永远落在同一行上（一行身份本来就能同时铸 EC 与 RSA 叶子）。
+    /// 没有排序时 `LIMIT 1` 取哪行由存储引擎决定，EC 和 RSA 两次认证会取到不同身份，
+    /// 链的签发者就不一样 —— 检测方报 `hardware.attestation.algorithm_differential`。
+    /// 按 algorithm 定序后两条算法永远落在同一行（一行身份能同时铸 EC 与 RSA 叶子）。
     pub fn get_any_device_identity(
         &self,
         device_id: &str,
@@ -410,10 +391,8 @@ impl Db {
         }
     }
 
-    /// Lists identity metadata without private-key decryption — only the
-    /// display fields (device_id, algorithm, cert_count, active, etc.) are
-    /// populated. Callers that only need the identity list for display should
-    /// prefer this to avoid the overhead of Fernet decryption.
+    /// List identity metadata without private-key decryption — only display
+    /// fields (device_id, algorithm, cert_count, active, ...) are populated.
     pub fn list_device_identities_meta(&self) -> anyhow::Result<Vec<DeviceIdentity>> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
@@ -473,8 +452,7 @@ impl Db {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             "#,
         )?;
-        // 先建表再补列：早一版已经建过这张表（没有 device_id），这里补一下。
-        // 列已经在了 MySQL 会报 1060，当没事。
+        // 老库里这张表没有 device_id，补列；列已存在时 MySQL 报 1060，忽略。
         if let Err(e) = conn.query_drop(
             "ALTER TABLE soter_attk ADD COLUMN device_id VARCHAR(96) NOT NULL DEFAULT '' AFTER name",
         ) {
@@ -527,17 +505,15 @@ impl Db {
         Ok(Some(crate::crypto::decrypt_private_pem(&cipher)))
     }
 
-    /// 这一笔该用哪把 ATTK。顺序就是身份归属的顺序，一步都不能跳：
-    ///
+    /// 这一笔该用哪把 ATTK。顺序即身份归属顺序，一步都不能跳：
     /// 1. `preferred_id`（身份绑定规则点名的那把）；
-    /// 2. 绑定在**请求那台设备**上的那把（`device_id`）—— 服务端密钥模式默认走这条；
+    /// 2. 绑定在请求那台设备上的那把（`device_id`）—— 服务端密钥模式默认走这条；
     ///    请求 device_id 为空时 handler 已用控制台配的 SOTER 默认设备填过，所以这支
     ///    就是「默认 id 对应的那把 ATTK」；
     /// 3. `fallback_id`（控制台显式指定的兜底那把）；
     /// 4. 库里标了默认 / 最早启用的那把。
     ///
-    /// 前一步失败（那一把被禁、被删了）才往下走一步 —— 指定的东西不该因为一次禁用就
-    /// 只剩自签。
+    /// 只有前一步那把被禁 / 被删才往下走，指定的东西不该因一次禁用只剩自签。
     pub fn pick_soter_attk(
         &self,
         device: Option<&str>,
@@ -667,10 +643,9 @@ impl Db {
         Ok(())
     }
 
-    /// Delete every identity row whose `machine_id` starts with `prefix`
-    /// (e.g. `"auto-cover"`), returning the number of deleted rows. Used to
-    /// clear the identities that the auto-cover mode wrote, without touching
-    /// manually-uploaded or ordinary auto-keybox (`auto:<source>`) rows.
+    /// Delete identity rows whose `machine_id` starts with `prefix`
+    /// (e.g. `"auto-cover"`), returning the deleted count. Only auto-cover rows
+    /// are targeted; manually-uploaded and `auto:<source>` rows must survive.
     pub fn delete_device_identities_by_machine_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
         let mut conn = self.conn()?;
         conn.exec_drop(
@@ -785,10 +760,9 @@ impl Db {
     }
 
     /// 首次给卡密绑设备（只写还没绑的那行）。返回 true = 本次真的写进去了。
-    ///
-    /// 用 `WHERE bound_serial IS NULL OR bound_serial = ''` 做乐观锁，两台设备
-    /// 同时首次请求时只有一台能绑上；另一台会拿到 `Ok(false)`，由调用方回库
-    /// 复核并按「不匹配」当场拒绝 —— 这正是想要的：卡密跟着第一台设备走。
+    /// `WHERE bound_serial IS NULL OR bound_serial = ''` 是乐观锁：两台设备同时首次
+    /// 请求时只有一台能绑上，另一台拿到 `Ok(false)` 由调用方复核并按「不匹配」拒绝 ——
+    /// 卡密跟着第一台设备走。
     pub fn bind_token_device(
         &self,
         token: &str,
@@ -824,11 +798,9 @@ impl Db {
     }
 
     /// 同一台设备换了伪装串号后，把绑定记录跟到当前指纹。
-    ///
-    /// `ro.serialno`（`serial`）是可写属性，A 端开机后会按 `remote_identity` /
-    /// `props.conf` 重写；`ro.boot.serialno`（`sn`）是只读的，鉴权以它为准。
-    /// `sn` 对得上、`serial` 变了时只更新指纹，不动 `activated_at`、有效期和
-    /// `bound_at`（第一次绑定的时间保持原样）。
+    /// `ro.serialno`（`serial`）可写，A 端开机后会按 `remote_identity` / `props.conf`
+    /// 重写；`ro.boot.serialno`（`sn`）只读，鉴权以它为准。`sn` 对得上、`serial` 变了时
+    /// 只更新指纹，不动 `activated_at`、有效期和 `bound_at`。
     pub fn refresh_token_device(
         &self,
         token: &str,
@@ -851,9 +823,8 @@ impl Db {
         Ok(())
     }
 
-    /// 旧库补列：线上 `api_token` 是手工建的，没有 DDL 文件，升级时要能自己补上。
-    /// 用 information_schema 先查再加（MySQL 8 的 `ADD COLUMN IF NOT EXISTS` 只在
-    /// MariaDB 有，不能直接用）。
+    /// 旧库补列（线上 `api_token` 是手工建的，没有 DDL 文件）。
+    /// 用 information_schema 先查再加 —— `ADD COLUMN IF NOT EXISTS` 只有 MariaDB 有。
     pub fn ensure_token_device_columns(&self) -> anyhow::Result<()> {
         let mut conn = self.conn()?;
         let existing: Vec<String> = conn.exec(
@@ -911,11 +882,10 @@ impl Db {
     /// the usage log (for historical IP listing).
     pub fn record_token_use(&self, token: &str, ip: &str) -> anyhow::Result<()> {
         let mut conn = self.conn()?;
-        // BEGIN/COMMIT must use the text protocol: the mysql crate sends
-        // `exec_drop` (even with empty params) through the prepared-statement
-        // protocol, which MySQL rejects for BEGIN/COMMIT with ERROR 1295.
-        // 中途失败必须 ROLLBACK 后还连接：否则带着未提交事务和 api_token 行锁
-        // 归还连接池，后续同名 token 的写操作全部被阻塞到 wait_timeout。
+        // BEGIN/COMMIT 必须走文本协议：mysql crate 的 `exec_drop` 即使没有参数也走
+        // 预编译协议，MySQL 对 BEGIN/COMMIT 会报 ERROR 1295。
+        // 中途失败必须 ROLLBACK 再还连接：否则带着未提交事务和 api_token 行锁回到
+        // 连接池，后续同名 token 的写操作全被阻塞到 wait_timeout。
         let txn = (|| -> anyhow::Result<()> {
             conn.query_drop("BEGIN")?;
             conn.exec_drop(
@@ -954,7 +924,6 @@ impl Db {
         let mut out = Vec::new();
         for r in rows {
             let ip = row_str(&r, "ip");
-            // Columns returned without names via aggregate MIN/MAX; use positional lookup.
             let first = row_str_opt_pos(&r, 1).unwrap_or_default();
             let last = row_str_opt_pos(&r, 2).unwrap_or_default();
             let count: i64 = r.get(3).unwrap_or(0);
@@ -1141,16 +1110,11 @@ impl Db {
     }
 
     /// Atomically mark an order delivered and create/link its API token.
-    ///
-    /// Runs in a single transaction with `SELECT ... FOR UPDATE` so concurrent
-    /// payment callbacks (or platform retries) serialize on the order row:
-    /// exactly one token is minted per order, and a claimed-but-undelivered
-    /// order (left by an interrupted attempt) is recovered instead of being
-    /// stuck in `paid`.
-    ///
-    /// Returns `Ok(Some(token))` when the order is (or was already) delivered,
-    /// `Ok(None)` if it was already delivered but no token is resolvable,
-    /// `Err` for a missing order or a DB failure.
+    /// Single transaction + `SELECT ... FOR UPDATE` serializes concurrent payment
+    /// callbacks (or platform retries) on the order row: exactly one token per
+    /// order, and a `paid` row left by an interrupted attempt is recovered.
+    /// Returns `Ok(Some(token))` when delivered, `Ok(None)` when delivered but no
+    /// token is resolvable, `Err` for a missing order or a DB failure.
     pub fn deliver_order_with_token(
         &self,
         order_id: &str,
@@ -1159,7 +1123,6 @@ impl Db {
     ) -> anyhow::Result<Option<String>> {
         let mut conn = self.conn()?;
         conn.query_drop("BEGIN")?;
-        // Serialize on the order row so two concurrent callbacks cannot both mint.
         let rows: Vec<mysql::Row> = conn
             .exec(
                 "SELECT id, status, token_id FROM card_order WHERE order_id = :oid FOR UPDATE",
@@ -1182,8 +1145,6 @@ impl Db {
                 .unwrap_or_default();
             return Ok(if token.is_empty() { None } else { Some(token) });
         }
-        // pending — or a `paid` row left by an interrupted attempt: mint the
-        // token and deliver in the same transaction.
         let token = crate::util::generate_token_string();
         let duration = match card_type {
             "year" => YEAR_SECS,

@@ -1,8 +1,6 @@
-//! Real hardware TEE operation proxy (the "everything a normal TEE does" layer).
-//!
-//! Building on top of [`super::attest_proxy`], this module exposes the full set
-//! of TEE operations that the relay daemon needs in order to act as a drop-in
-//! replacement for the old `client-b` agent:
+//! Real hardware TEE operation proxy: every operation goes through the real
+//! on-device keymint HAL (`get_system_keymint` + `begin`/`update`/`finish`), so
+//! the signatures and certificate chains are genuine TEE outputs.
 //!
 //!   * generate an attestation/signing key (with an A-side supplied appid / 709)
 //!   * derive a signing key attested by an attestation key
@@ -10,14 +8,10 @@
 //!   * sign data / sign a to-be-signed (TBS) blob / sign a challenge
 //!   * decrypt data
 //!
-//! Every operation is executed by the *real* on-device hardware keymint (TEE)
-//! through `get_system_keymint` + `begin`/`update`/`finish`, so the produced
-//! signatures, decryptions and certificate chains are genuine TEE outputs.
-//!
-//! Key blobs and certificate chains are held in a process-local hot cache keyed by
-//! alias and persisted in a SQLite file (`/data/adb/ommega-b/sessions.db`, see
-//! [`session_db`]) so aliases survive a relay restart; the cache only keeps the
-//! recently used ones and the rest are read back from the database by alias.
+//! Key blobs and certificate chains live in a process-local hot cache keyed by
+//! alias and are persisted in SQLite (`/data/adb/ommega-b/sessions.db`, see
+//! [`session_db`]), so aliases survive a relay restart; only the recently used
+//! ones stay in memory and the rest are read back by alias.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -68,9 +62,8 @@ use crate::keymaster::relay_tee::{
 use super::attest_proxy::{SYSTEM_KEYMINT_DEFAULT, SYSTEM_KEYMINT_STRONGBOX};
 use super::session_db;
 
-/// How a generated key is meant to be used.  Mirrors the `KeyPurpose`s the
-/// legacy agent used. Only distinguishes EC vs RSA (used for begin()-parameter
-/// construction); the actual size/curve is carried in [`KeySpec`].
+/// Key family of a generated key. Only distinguishes EC vs RSA (drives
+/// begin()-parameter construction); the actual size/curve is in [`KeySpec`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KeyAlgorithm {
     #[default]
@@ -78,10 +71,9 @@ pub enum KeyAlgorithm {
     Rsa2048,
 }
 
-/// Key parameters requested by the A-side app, forwarded from the A-side
-/// KeyMint params. The real TEE mints a key matching these instead of a fixed
-/// default. Absent fields fall back to the legacy defaults (EC P-256, SHA-256,
-/// etc.).
+/// Key parameters requested by the A-side app, forwarded from its KeyMint
+/// params. The real TEE mints a key matching these; absent fields fall back to
+/// the defaults (EC P-256, SHA-256, etc.).
 #[derive(Clone, Debug, Default)]
 pub struct KeySpec {
     /// EC vs RSA key family (also drives later begin() parameter construction).
@@ -90,15 +82,14 @@ pub struct KeySpec {
     pub ec_curve: Option<KmEcCurve>,
     /// Key size in bits; defaults to 256 (EC) / 2048 (RSA).
     pub key_size: Option<u32>,
-    /// Requested purposes. For business keys `Sign` (and `Decrypt` for RSA) is
-    /// added so the relay's own sign/decrypt operations stay authorized; for an
-    /// App Attest Key (`PURPOSE_ATTEST_KEY`) the purpose is forwarded unchanged.
+    /// Requested purposes, forwarded as-is; an extra `Decrypt` is added for RSA
+    /// encryption paddings so the relay's own decrypt stays authorized.
     pub purposes: Vec<KmKeyPurpose>,
-    /// Requested digests. `Sha256` is always added (the relay signs with it).
+    /// Requested digests, forwarded as-is (never widened by the relay).
     pub digests: Vec<KmDigest>,
     /// Requested MGF1 digest (RSA-OAEP), when the app specified one.
     pub mgf_digest: Option<KmDigest>,
-    /// Requested paddings (RSA only). The relay's operation paddings are added.
+    /// Requested paddings (RSA only), forwarded as-is.
     pub paddings: Vec<KmPadding>,
     /// RSA public exponent; defaults to 65537.
     pub rsa_public_exponent: Option<u64>,
@@ -109,29 +100,17 @@ pub struct KeySpec {
     pub cert_not_after: Option<DateTime>,
     /// Certificate serial (A-side CERTIFICATE_SERIAL tag); optional.
     pub cert_serial: Option<Vec<u8>>,
-    /// Device-property / ID-attestation values requested by the app, as
-    /// `(KeyMint tag, value)` pairs (710..=717 plus 723, the second IMEI).
-    /// Forwarded verbatim into the real TEE request: Android 15's
-    /// `setDevicePropertiesAttestationIncluded`
-    /// fills brand/device/product/manufacturer/model from the *requesting*
-    /// device and classic ID attestation adds serial/IMEI/MEID. The TEE itself
-    /// validates every value against what it was provisioned with and fails with
-    /// `CannotAttestIds` when the values do not belong to *this* device, so a
-    /// heterogeneous B device rejects rather than attesting a foreign device.
+    /// Device-property / ID-attestation tags requested by the app, as `(KeyMint
+    /// tag, value)` pairs (710..=717 plus 723, the second IMEI). The TEE only
+    /// attests *its own* values and fails with `CannotAttestIds`, so the relay
+    /// substitutes this device's properties for the values it can read.
     pub attestation_ids: Vec<(u32, Vec<u8>)>,
-    /// User-authentication / authorization-list entries requested by the app, as
-    /// `(KeyMint tag, value)` pairs (502 `USER_SECURE_ID`, 503
-    /// `NO_AUTH_REQUIRED`, 504 `USER_AUTH_TYPE`, 505 `AUTH_TIMEOUT`, 506
-    /// `ALLOW_WHILE_ON_BODY`, 507 `TRUSTED_USER_PRESENCE_REQUIRED`, 508
-    /// `TRUSTED_CONFIRMATION_REQUIRED`, 509 `UNLOCKED_DEVICE_REQUIRED`).
-    ///
-    /// The A-side forwards these so the real TEE mints an auth-bound key with the
-    /// SAME policy the app asked for — the TEE enforces `USER_AUTH_TYPE` /
-    /// `AUTH_TIMEOUT` itself and stamps them into the leaf, so sending them is
-    /// also what keeps the minted chain's authorization list matching the
-    /// request (TrustAttestor: `hardware.attestation.user_auth_metadata` /
-    /// `user_auth_policy`). `USER_SECURE_ID` is required here even though it is
-    /// never attested: without it the TEE cannot bind the key to the user.
+    /// User-auth / authorization-list entries requested by the app, as `(KeyMint
+    /// tag, value)` pairs: 502 `USER_SECURE_ID`, 503 `NO_AUTH_REQUIRED`, 504
+    /// `USER_AUTH_TYPE`, 505 `AUTH_TIMEOUT`, 506 `ALLOW_WHILE_ON_BODY`, 507
+    /// `TRUSTED_USER_PRESENCE_REQUIRED`, 508 `TRUSTED_CONFIRMATION_REQUIRED`, 509
+    /// `UNLOCKED_DEVICE_REQUIRED`. The TEE enforces 504/505 and stamps them into
+    /// the leaf; 502 is never attested but is required to bind the key to the user.
     pub user_auth: Vec<(u32, i64)>,
     /// 调用方自带的证明密钥（App AttestKey 委派）。有值时这一把 key 的证书
     /// 必须由**真 TEE** 用那把已有的 ATTEST_KEY 原生签发
@@ -147,8 +126,7 @@ pub struct KeySpec {
 pub struct AttestationKeyRef {
     /// 证明密钥的 key blob 本体（AOSP `AttestationKey.keyBlob`）。
     ///
-    /// 有值时直接拿去给 HAL 签，不再查 session —— AK 不在本机铸（智能模式在
-    /// 服务端、或换了一台 B）时，只靠 alias 会直接报
+    /// 有值时直接拿去给 HAL 签，不再查 session：AK 不在本机铸时，只靠 alias 会报
     /// `issuer key ... is not available on this device`。
     pub key_blob: Option<Vec<u8>>,
     pub alias: String,
@@ -173,21 +151,11 @@ pub struct TeeSession {
 ///
 /// Key blob 是自包含的，重启之后照样能 begin/finish，所以每个铸出来的会话都落一份
 /// 到 `/data/adb/ommega-b/sessions.db`（见 [`super::session_db`]），A 端的 `isRemote`
-/// 钥匙跨重启仍然有效。
-///
-/// 2026-10-03 那条教训还在：淘汰按「最后使用时间」算。之前按文件 mtime 排，可取用时
-/// 从不刷新 mtime，于是「刚用过」和「几小时没用」在它眼里一样旧 —— 2000 个上限配
-/// 6.7 个/分钟的新增速率，有效保留窗只有 4 小时 46 分，正在用的 alias 照样被清，
-/// 紧接着签名就报 `no key for alias ... (call attest first)`（relay.log 里
-/// 6c9e18291df990e9、dc70e82803071c96 就是这么死的）。现在每次取用顺手写一下
-/// `used_ms`（有节流），清的才是真正没人用的。
-///
-/// 内存里只留最近用过的这么多条，其余的在库里按 alias 单查：原来那份 map 是全量常驻
-/// 的（实测到过 19967 条 × 8 KB ≈ 160 MB），一台手机的常驻进程不该背这个。
+/// 钥匙跨重启仍然有效。内存里只留最近用过的这么多条，其余的在库里按 alias 单查。
+/// 淘汰按「最后使用时间」（`used_ms`）算，不按文件 mtime。
 const SESSION_MEMORY_HOT: usize = 2_000;
 
-/// 距上次写 `used_ms` 多久才值得再写一次。取得比这更勤的会话不必每次都写：淘汰判的
-/// 是小时级的窗口，差几分钟无所谓，而一次 UPDATE 也顶不上白做。
+/// 距上次**真写库**多久才值得再写一次：淘汰判的是小时级窗口，差几分钟无所谓。
 const SESSION_TOUCH_MIN_AGE_MS: i64 = 5 * 60 * 1000;
 
 fn now_ms() -> i64 {
@@ -199,10 +167,8 @@ fn now_ms() -> i64 {
 
 /// 内存热缓存里的一格。
 ///
-/// `used_ms` 给 LRU（满了丢最旧的）和「刚用过」看；`db_ms` 是**上一次真写库**的时间，
-/// 写库节流只能比它。两个时间分开存是修一个 bug：以前只有 `used_ms`，而它每次命中都
-/// 刷成 now，`should_touch` 拿它比就变成「两次取用相隔 5 分钟才写库」—— 热 key 永远
-/// 不写，库里的 `used_ms` 冻在铸出来那天，7 天 TTL 一到被清，重启后签不了。
+/// `used_ms` 给 LRU 用；`db_ms` 是**上一次真写库**的时间，写库节流只能比它 —— 拿
+/// `used_ms` 比会让热 key 永不写库，库里的 TTL 一到就被清。
 struct Hot {
     used_ms: i64,
     db_ms: i64,
@@ -299,10 +265,8 @@ fn cache_note_db_write(alias: &str) {
 
 /// 命中内存就返回会话，并说明这次要不要把 `used_ms` 写回库里。
 ///
-/// 节流比的是 `db_ms`（上次真写库），不是 `used_ms`（上次取用）。拿取用时间比是错的：
-/// 那个值每次命中都刷成 now，于是一个几秒用一次的热 key 永远够不着 5 分钟阈值，库里
-/// 的 `used_ms` 冻在铸出来那天，7 天 TTL 一到就被 `prune_rows` 清掉；内存里那把还在
-/// 签，重启或者热缓存被挤掉之后才发现 `no key for alias`。
+/// 节流比的是 `db_ms`（上次真写库），不是 `used_ms`：后者每次命中都刷成 now，热 key
+/// 就永远够不着阈值，库里的 `used_ms` 冻住、被 TTL 清掉。
 fn cache_get(alias: &str) -> Option<(TeeSession, bool)> {
     let now = now_ms();
     let mut sessions = sessions()
@@ -343,11 +307,7 @@ fn session_get(alias: &str) -> Result<TeeSession> {
     Err(anyhow!("no key for alias '{alias}' (call attest first)"))
 }
 
-/// 启动时开库（库里空就先把旧目录导进来）并清一轮，不做全量加载。
-///
-/// 原来这里是「清一遍 + 全量加载」：别名被哈希进文件名、反推不出来，所以只能逐个读
-/// JSON 才能把 alias 填进 map —— 实测 19967 个文件要 12 秒。现在按 alias 主键单查，
-/// 那份热身既没用又白占 160 MB 内存，一并去掉了。
+/// 启动时开库（库里空就先把旧目录导进来）并清一轮；不做全量加载，别名按主键单查。
 pub fn load_all_sessions() {
     session_db::init();
 }
@@ -425,7 +385,6 @@ mod session_cache_tests {
         assert!(cache_get("does-not-exist").is_none());
 
         // 一直在用（used_ms 是新的），但上次写库已经过了节流窗口：这一下必须写。
-        // 旧实现拿 used_ms 比，这个用例是 false —— 热 key 永远不写库，TTL 一到就被清。
         cache_put(
             "alias",
             session(1),
@@ -637,8 +596,6 @@ pub fn generate_attest_key_on(
     static FLIGHTS: OnceLock<AliasFlights> = OnceLock::new();
     let session = FLIGHTS.get_or_init(AliasFlights::default).get_or_generate(
         alias,
-        // 同一个 alias 在 TEE 和 StrongBox 上是两把不同的钥匙：存着的会话如果来自另一个
-        // HAL，拿它当本次结果就是把 TEE 链当 StrongBox 交给调用方。只复用同一个 HAL 的。
         || reusable_session(session_get(alias).ok(), service),
         || mint_attest_key_on(service, challenge, app_id_der, spec),
         |session| session_put(alias, session.clone()),
@@ -660,8 +617,7 @@ fn mint_attest_key_on(
 
 /// 用调用方提供的 attestation key（keyblob）给子 key 出证。
 ///
-/// 只给自检用：确认本机 TA 到底认不认「一个不是它刚刚新生、但确实是它产的」keyblob
-/// 当 attestation key。验通了才能做 A 端 remote 侧的透传。
+/// 只给自检用：确认本机 TA 认不认「不是它刚新生、但确实是它产的」keyblob 当证明密钥。
 pub fn mint_with_attestation_key(
     service: &'static str,
     challenge: &[u8],
@@ -693,13 +649,11 @@ fn mint_attest_key_with(
     let km_version = probe_keymint_version(&keymint, service);
     let params = build_attestation_params(app_id_der, challenge, spec, km_version)?;
 
-    // 调用方自带的证明密钥（App AttestKey 委派）：先在本机找到那把 key，确认它
-    // 属于同一个 HAL、证书 Subject 与请求一致，然后交给**真 TEE** 原生签发子证书。
-    // 本进程不持有任何私钥，也不用自己的批量 key 冒充。
+    // 调用方自带的证明密钥（App AttestKey 委派）：先在本机找到那把 key，确认它属于
+    // 同一个 HAL、证书 Subject 与请求一致，再交给**真 TEE** 原生签发子证书。
     //
-    // **session 优先，key blob 兜底**：AK 就是本机铸的（跟随模式）时 session 里
-    // 有它，直接用最可靠；查不到再退回请求带过来的 blob，但那个 blob 也必须是
-    // 本机 TEE 能解的真机 blob，否则 `generateKey` 会直接 -33（INVALID_KEY_BLOB）。
+    // **session 优先，key blob 兜底**：查不到再退回请求带的 blob，但那个 blob 必须是
+    // 本机 TEE 能解的真机 blob，否则 `generateKey` 直接 -33（INVALID_KEY_BLOB）。
     let parent = match spec.attestation_key.as_ref() {
         Some(request) => match resolve_issuer(request, service) {
             Ok(parent) => Some(parent),
@@ -761,13 +715,10 @@ fn mint_attest_key_with(
         .map(|cert| cert.encodedCertificate)
         .collect();
 
-    // A HAL that reports generateKey() *success* together with an empty
-    // certificate chain must not be forwarded as a successful attestation:
-    // sending `cert_chain: []` means the operator cannot tell which side dropped
-    // the chain, and the empty session would also be persisted to
-    // /data/adb/ommega-b/sessions.db. Fail loudly instead: the relay server treats an
-    // error exactly like an empty chain (next layer / StrongBox demotion), so
-    // behaviour is unchanged.
+    // A HAL that reports generateKey() success together with an empty chain must
+    // not be forwarded as a successful attestation: `cert_chain: []` hides which
+    // side dropped it and would also be persisted. Fail loudly; the server treats
+    // an error like an empty chain anyway.
     if cert_chain.is_empty() {
         return Err(anyhow!(
             "real keymint {service} returned an empty certificate chain \
@@ -776,9 +727,8 @@ fn mint_attest_key_with(
         ));
     }
 
-    // 委派时 HAL 只回子证书（AIDL: "the returned certificate chain must contain
-    // only an attestation certificate signed with the specified key"），
-    // 父链由本端补上——A 端要靠它校验签发关系，校验完只把子证书交给调用方。
+    // 委派时 HAL 只回子证书（AIDL 规定只带一张由指定密钥签发的证明证书），父链由本端
+    // 补上 —— A 端要靠它校验签发关系，校验完只把子证书交给调用方。
     if let Some(parent) = parent.as_ref() {
         append_issuer_chain(&mut cert_chain, &parent.cert_chain)?;
     }
@@ -831,7 +781,7 @@ fn certificate_subject_der(cert_der: &[u8]) -> Result<Vec<u8>> {
 /// 用已有证明密钥走真 TEE 的原生委派：`generateKey(params, AttestationKey)`。
 ///
 /// 权限来自父 keyblob 的 ATTEST_KEY 用途，**不**做 PKIX 的 CA/keyCertSign 门槛
-/// （真机实测：那些叶子的 Key Usage 是 `Certificate Sign`，且没有 BasicConstraints）。
+/// （那些叶子的 Key Usage 是 `Certificate Sign`，没有 BasicConstraints）。
 fn generate_with_native_issuer(
     service: &'static str,
     keymint: &dyn IKeyMintDevice,
@@ -953,22 +903,13 @@ fn build_attestation_params(
         KeyParam::AttestationApplicationId(app_id_der.to_vec()),
     ];
 
-    // 用途原样下发（含 ATTEST_KEY）。
-    //
-    // 真机实测（2026-10-23，高通 sun/pineapple/taro/canoe/kalama、MTK mt6985/mt6991、
-    // Kirin）：**独占 ATTEST_KEY 是能铸的**，返回 purposes=[ATTEST_KEY]、
-    // Key Usage = Certificate Sign；只有 ATTEST_KEY+SIGN 同时要才回
-    // `-3 INCOMPATIBLE_PURPOSE`（历史注释里那句「qti 拒绝 ATTEST_KEY」其实说的
-    // 是这个混合形状）。以前把 ATTEST_KEY 翻成 SIGN 再补一个 SIGN，等于把「证明密钥」
-    // 换成一把普通签名密钥：链上看不到硬件 ATTEST_KEY 授权，调用方拿它当签发密钥
-    // 也只能走远程 SIGN 代签（真机恒被拒），所以那条路必须停掉。
+    // 用途原样下发（含 ATTEST_KEY）：独占 ATTEST_KEY 能铸，返回 purposes=[ATTEST_KEY]、
+    // Key Usage = Certificate Sign；ATTEST_KEY+SIGN 同时要才回
+    // `-3 INCOMPATIBLE_PURPOSE`。翻成 SIGN 等于把证明密钥换成普通签名密钥。
     let is_attest_key = spec.purposes.contains(&KmKeyPurpose::AttestKey);
     let mut purposes = spec.purposes.clone();
-    // DECRYPT 只在调用方真要求解密时才出现（RSA 加密类的 padding 说明它要
-    // decrypt）。之前无条件给每把 RSA key 都补一个 DECRYPT，导致同一次认证里
-    // RSA 叶子的授权列表比 EC 多一项 —— 检测方拿这个判
-    // `hardware.attestation.algorithm_differential`。调用方要解密时本来就带着
-    // DECRYPT purpose，这一补只是兜底。
+    // DECRYPT 只在调用方要解密（RSA 加密类 padding）时才补：无条件补会让 RSA 叶子
+    // 的授权列表比 EC 多一项，检测方据此判 `algorithm_differential`。
     if algo == KmAlgorithm::Rsa
         && !purposes.contains(&KmKeyPurpose::Decrypt)
         && spec
@@ -982,32 +923,17 @@ fn build_attestation_params(
         params.push(KeyParam::Purpose(p));
     }
 
-    // Digest set: 只发调用方要求的那些。
-    //
-    // 以前这里会额外补一个 SHA-256（注释说「relay 总用它签」），结果叶子授权列表比
-    // 请求多一项：调用方明明只要 SHA-384，证书里却拄着 SHA-256，而 A 端 KeyInfo 是
-    // 按请求参数生成的（`tag::extract_key_gen_characteristics`），两边一对就不一样。
-    // 服务端 keybox 层也一直是照拄请求（`fulfill.rs` 里的 `digest`），所以三层之间
-    // 还不自洽。那个理由已经失效了：签名摘要现在由算法串决定（`digest_for_algorithm`），
-    // 算法串来自调用方的 begin 参数；「拿 SIGN 代签子证书」那条路早就不用了。
-    // 真机对没有 DIGEST tag 的钥匙也不会补，这里跟着不补。
+    // Digest set: 只发调用方要求的那些。多补一项会让叶子授权列表跟请求不一致（A 端
+    // KeyInfo 按请求参数生成），签名摘要由算法串决定（`digest_for_algorithm`）。
     for d in spec.digests.iter().copied() {
         params.push(KeyParam::Digest(d));
     }
 
-    // 认证/授权列表：把调用方请求的策略**原样**下发给真 TEE。
-    //
-    // 以前这里一律只给一个 `NO_AUTH_REQUIRED`：因为 relay 签名给不出
-    // HardwareAuthToken，带 502/504 的 key 在 begin(SIGN) 会回 -26。可那是拿
-    // 「证书撒谎」换「操作能过」—— 请求要的是认证绑定，叶子却写着免认证，
-    // 检测方一眼就看出 `user_auth_metadata` / `user_auth_policy` 对不上，
-    // 顺便还把 USER_AUTH_TYPE 这类元信息抹掉了。
-    //
-    // 现在：请求里没有 502/503/504 才补一个 `NO_AUTH_REQUIRED`；有就照发（含
-    // 505~509）、未知 tag 直接报错，不降级成不设限的 key。代价是认证绑定的 key
-    // 在 B 上做硬件操作仍可能被拒（B 验不了 A 的 token）—— 那是明确失败，
-    // 比伪造链诚实。要回到旧行为可以给 relay.conf 设
-    // `OMMEGA_RELAY_USER_AUTH=force_no_auth`。
+    // 认证/授权列表：把调用方请求的策略**原样**下发给真 TEE。请求里没有
+    // 502/503/504 才补一个 `NO_AUTH_REQUIRED`；有就照发（含 505~509），未知 tag
+    // 直接报错，不降级成不设限的 key。代价是认证绑定的 key 在 B 上做硬件操作可能
+    // 被拒（B 验不了 A 的 token）—— 那是明确失败，比伪造链诚实。
+    // relay.conf 的 `OMMEGA_RELAY_USER_AUTH=force_no_auth` 可回到旧行为。
     params.extend(relay_authorization_params(&spec.user_auth)?);
 
     match algo {
@@ -1017,27 +943,18 @@ fn build_attestation_params(
             params.push(KeyParam::RsaPublicExponent(RsaExponent(
                 spec.rsa_public_exponent.unwrap_or(65537),
             )));
-            // Padding set: only the app's requested paddings. We used to force
-            // all four RSA paddings (PKCS1Sign/PSS/PKCS1Encrypt/OAEP) so the
-            // relay's own operations could always begin(), but that also lets
-            // *unauthorized* uses succeed, which a probe like DuckDetector's
-            // "RSA-PSS key must reject PKCS1 sign" rejects. The relay's begin
-            // padding always matches the app's (it derives from the A-side
-            // algorithm string, which derives from the app's begin params), so
-            // only the requested paddings are needed.
+            // Padding set: only the app's requested paddings. Forcing all four
+            // would let unauthorized uses succeed; the relay's own begin padding
+            // always derives from the same A-side algorithm string.
             for p in spec.paddings.iter() {
                 params.push(KeyParam::Padding(*p));
             }
             // 证明密钥不再靠本进程代签，所以也不再为它偷塞 PKCS1v15Sign：
             // 调用方要什么 padding 就发什么，否则叶子的授权列表比请求多一项。
             let _ = is_attest_key;
-            // MGF1 digest for RSA-OAEP. Always push an explicit MGF1 digest so
-            // the TEE's key authorization carries the tag. begin(DECRYPT)
-            // always sends RsaOaepMgfDigest (see decrypt_begin_params; SHA1 is
-            // the default when the app didn't set one). If the authorization
-            // omits the tag, the real TEE rejects the operation with
-            // INCOMPATIBLE_MGF_DIGEST (-78), whereas a local software keymint
-            // would never check it.
+            // MGF1 digest for RSA-OAEP. Always push an explicit MGF1 digest: if
+            // the key authorization omits the tag, the real TEE rejects
+            // begin(DECRYPT) with INCOMPATIBLE_MGF_DIGEST (-78).
             if spec.paddings.contains(&KmPadding::RsaOaep) {
                 let mgf = spec.mgf_digest.unwrap_or(KmDigest::Sha1);
                 params.push(KeyParam::RsaOaepMgfDigest(mgf));
@@ -1051,18 +968,10 @@ fn build_attestation_params(
         _ => {}
     }
 
-    // Device properties / ID attestation: forward the values the app asked to be
-    // attested. The A-side software path writes these from the device's own
-    // provisioned IDs (`cert::AttestationIds`), so a relay-minted chain that
-    // silently lacks KM_TAG_ATTESTATION_ID_* is immediately distinguishable from
-    // a real one (TrustAttestor: `hardware.attestation.device_properties`).
-    // A real TEE validates the values and answers `CannotAttestIds` (-75) when
-    // they are not this device's own; the A-side then falls back to its local
-    // software keybox, which is the honest answer for a foreign device.
-    // 真 TEE 只肯证明**本机自己的** ID：拿调用方（A 端那台手机）的值去问，HAL 一律
-    // 回 `CannotAttestIds`（-66），整笔就掉到服务端密钥层。所以这里把值换成 B 自己
-    // 那套：能读到的（brand/device/product/manufacturer/model/serial）用本机属性，
-    // 读不到的（IMEI/MEID/第二 IMEI）**不发** —— 少一项好过发个假值让 HAL 拒掉整笔。
+    // 真 TEE 只肯证明**本机自己的** ID：拿 A 端的值去问，HAL 一律回 `CannotAttestIds`
+    // （-66），整笔就掉到服务端密钥层。所以这里把值换成 B 自己那套：能读到的
+    // （brand/device/product/manufacturer/model/serial）用本机属性，读不到的
+    // （IMEI/MEID/第二 IMEI）**不发** —— 少一项好过发假值让 HAL 拒掉整笔。
     if !spec.attestation_ids.is_empty() {
         for (tag, _requested) in &spec.attestation_ids {
             if let Some(param) = local_attestation_id_param(*tag) {
@@ -1071,13 +980,7 @@ fn build_attestation_params(
         }
     }
 
-    // User-authentication / authorization-list entries. A real TEE is the
-    // authority on these: it validates `USER_AUTH_TYPE`/`AUTH_TIMEOUT`, retains
-    // `USER_SECURE_ID` inside the key blob (never in the attestation) and
-    // stamps 504/505 — but not 503 NO_AUTH_REQUIRED — into the leaf. Without
-    // them the minted chain contradicts an auth-bound request (TrustAttestor:
-    // `hardware.attestation.user_auth_metadata` / `user_auth_policy`).
-    // Authorization tags 已在上面统一下发（`relay_authorization_params`），这里不再重复。
+    // 授权 tag 已在上面统一下发（`relay_authorization_params`），这里不再重复。
 
     // Certificate validity bounds (app-specified or default now / now+10y);
     // real TEEs require NOT_BEFORE/NOT_AFTER (else MISSING_NOT_BEFORE -80).
@@ -1145,29 +1048,14 @@ pub fn device_prop(key: &str) -> Option<String> {
 // Read-only helpers.
 // ---------------------------------------------------------------------------
 
-/// Whether the relay still has to add `NO_AUTH_REQUIRED` itself.
-///
-/// The A-side forwards `NO_AUTH_REQUIRED` (503) for every ordinary key, so the
-/// relay adding a second one is a *duplicate tag*; and `USER_SECURE_ID` (502)
-/// is the opposite requirement, so `NO_AUTH_REQUIRED` next to it is a
-/// *contradiction*.  The qti TEE answers `ServiceSpecific(-40)` for both, which
-/// made every such request fail on the B side and fall through to the server
-/// keybox layer (whose public keybox is on Google's revocation list) instead of
-/// getting a real-TEE chain.  The A-side's keybox layer drops 503 in exactly the
-/// same situation (`server/src/cert.rs`), so this keeps both layers consistent.
-/// 远程代理模型下 relay 永远拿不到 A 端的 auth token，B 端真 TEE 锐的 key
-/// 必须一律 no-auth，否则 begin(SIGN) 返回 -26 (KeyUserNotAuthenticated)。
-/// App 带来的 502/504/505 只留在 A 端 keyblob / Keystore2 里做指纹校验，
-/// 不再往下传给真 TEE——否则证书说“要认证”，签名又给不出 token，死锁。
 /// 组装下发真 TEE 的认证/授权 tag。
 ///
-/// 默认：请求里**没有** 502/503/504（也就是压根没提认证策略）才补一个
-/// `NO_AUTH_REQUIRED`；有就按原 tag 照发（含 505~509），未知 tag 报错——
-/// 不降级成不设限的 key，也不悄悄把认证绑定的 key 改成免认证（叶子会撒谎）。
-///
-/// 代价：带 502 的 key 在本机 begin(SIGN) 会因拿不到 token 回 -26。想让
-/// 认证绑定的 key 在 B 上照旧能用（老行为，叶子写 NO_AUTH_REQUIRED），给
-/// relay.conf 设 `OMMEGA_RELAY_USER_AUTH=force_no_auth`。
+/// 默认：请求里**没有** 502/503/504（压根没提认证策略）才补一个 `NO_AUTH_REQUIRED`；
+/// 有就按原 tag 照发（含 505~509），未知 tag 报错 —— 不降级成不设限的 key，也不把
+/// 认证绑定的 key 改成免认证（证书内容与实际策略不符）。503 与 502 并存是矛盾 tag，qti TEE
+/// 对重复 tag 和矛盾 tag 都回 `ServiceSpecific(-40)`，A 端 keybox 层同样会丢掉 503。
+/// 代价：带 502 的 key 在本机 begin(SIGN) 会因拿不到 token 回 -26；
+/// relay.conf 的 `OMMEGA_RELAY_USER_AUTH=force_no_auth` 可让它回到旧行为。
 fn relay_authorization_params(user_auth: &[(u32, i64)]) -> Result<Vec<KeyParam>> {
     let force_no_auth = std::env::var("OMMEGA_RELAY_USER_AUTH")
         .map(|value| value.trim().eq_ignore_ascii_case("force_no_auth"))

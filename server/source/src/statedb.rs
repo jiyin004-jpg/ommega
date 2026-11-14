@@ -1,26 +1,15 @@
-//! 服务端「要长期保留的状态」统一放一个 SQLite 文件里。
-//!
-//! 为什么不用原来那两套 JSON（2026-10-03 实测）：
-//!
-//!   - `data/sessions.json` 73.9 MB / 11714 条 / 每条 7.9 KB，**每次新出证都整份
-//!     序列化重写一遍**，出证约 400 次/天 → 25~30 GB/天的写放大；进程启动还得
-//!     解析这 74 MB。
-//!   - `data/soter_slots.json` 178 KB，148 次/天整份重写，而且**没有 tmp+rename**
-//!     （会话表有）—— 崩在写盘中间就解不开，`load_slots` 直接按空算：钉子全丢、
-//!     层跟着抖。cap 抬到 512 之后这个文件还要往 MB 级长。
-//!
-//! SQLite 一条 INSERT/UPDATE 就把这几件事一起解决了：没有写放大、原子（WAL）、
-//! 崩不坏、要删按条件删、要数按条件数。
+//! 服务端「要长期保留的状态」统一放一个 SQLite 文件里：逐条写入、原子（WAL），
+//! 不会因为整份重写而在崩盘时丢内容。
 //!
 //! 表：
-//!   - `sessions`           —— 原来 `data/sessions.json` 那份（keybox / 自签会话）
-//!   - `soter_slots`        —— 原来 `data/soter_slots.json` 里的钉子（层 + 时间戳）
-//!   - `soter_slot_owners`  —— 原来钉子记录里的 `owners`，一个账号一行
+//!   - `sessions`           —— keybox / 自签会话（原 `data/sessions.json`）
+//!   - `soter_slots`        —— 槽位钉子（层 + 时间戳，原 `data/soter_slots.json`）
+//!   - `soter_slot_owners`  —— 钉子记录里的 `owners`，一个账号一行
 //!
-//! `sessions.leaf_key_pem` 里存的**就是原来落盘的那份密文**（Fernet），迁移是把
-//! 字节搬过去、不是重新加密 —— 所以拿旧文件回滚也读得回来。
+//! `sessions.leaf_key_pem` 里存的就是原来落盘的那份密文（Fernet）：迁移是搬字节、
+//! 不重新加密，所以拿旧文件回滚也读得回来。
 //!
-//! 内存里那份 map 仍然是权威（读路径一个 DB 查询都不加），这里是写穿 + 启动装载。
+//! 内存里那份 map 仍然是权威（读路径不加 DB 查询），这里是写穿 + 启动装载。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,28 +32,23 @@ pub const OWNER_FAMILY_CAP: usize = 512;
 
 /// 会话表条数上限。超了按「最久没用」淘汰。
 ///
-/// 2026-10-29 从 20_000 抬到 200_000：实测不到三天就撞满（审计类应用每次跑都
-/// 铸一大批 key），此时 LRU 会把**几小时前刚用过、A 端 keyblob 里还在引用**的
-/// 会话删掉，那些钥匙就永久废了（A 端签名时只能拿到 `no session`）。一条会话
-/// 6~8 KB，200_000 条 ≈ 1.2 GB，磁盘够；真要满也只能淘汰真闲置的，见
-/// [`SESSION_EVICT_MIN_IDLE_MS`]。
+/// 200_000 条 ≈ 1.2 GB（一条 6~8 KB）。撞满时 LRU 会删掉**几小时前刚用过、A 端
+/// keyblob 里还在引用**的会话，那些钥匙就永久废了（A 端签名时只能拿到 `no session`），
+/// 所以删谁必须有闲置下限，见 [`SESSION_EVICT_MIN_IDLE_MS`]。
 pub const SESSION_MAX: usize = 200_000;
 
 /// 多久没被用过才允许被 LRU 淘汰。
 ///
-/// 上限只决定「库里能放多少条」，但删谁必须有底线：正在被用的钥匙（A 端
-/// keyblob 里存着 alias、随时可能拿回来签名/解密）不能因为总量到顶就被当成
-/// 垃圾。所以只淘汰闲置超过这个时长的，比它新的宁可不删（宁可超上限）。
+/// 正在被用的钥匙（A 端 keyblob 里存着 alias，随时可能拿回来签名/解密）不能因为
+/// 总量到顶就被当成垃圾：只淘汰闲置超过这个时长的，更近的宁可不删（宁可超上限）。
 pub const SESSION_EVICT_MIN_IDLE_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 
-/// 一次 `DELETE` 最多删多少条会话。
-///
-/// 保留期到点的那一批可能一次就是十几万条（实测库里 307k 里 303k 都挤在 1~3 天
-/// 这个窗口），一条语句全删会把写锁和 WAL 撑得很大。限量删，剩下的下一轮扫再继续。
+/// 一次 `DELETE` 最多删多少条会话。保留期到点的那一批可能有十几万条，一条语句全删
+/// 会把写锁和 WAL 撑得很大；限量删，剩下的下一轮扫再继续。
 const DELETE_BATCH: i64 = 20_000;
 
-/// 启动时只把最近用过的这么多条会话装进内存。一条（链 + 私钥密文）实测 6~8 KB，
-/// 8000 条 ≈ 50 MB；没装进来的留在库里，取用时按 alias 单查一条（有索引）。
+/// 启动时只把最近用过的这么多条会话装进内存：一条（链 + 私钥密文）6~8 KB，
+/// 8000 条 ≈ 50 MB。没装进来的留在库里，取用时按 alias 单查（有索引）。
 pub const SESSION_MEMORY_HOT: usize = 8_000;
 
 /// v2：会话表加了 `used_epoch_ms`（最后一次使用）。TTL 和 LRU 都按它算，不再看创建时间。
@@ -201,7 +185,7 @@ impl StateDb {
         )
         .context("state db schema")?;
         // v1 -> v2：老库的会话表没有 `used_epoch_ms`。补上，并拿创建时间顶上
-        // （那时候我们唯一的「最后使用」证据就是它）。
+        // （迁移前唯一的「最后使用」证据就是它）。
         if !Self::has_column(&conn, "sessions", "used_epoch_ms")? {
             conn.execute_batch(
                 "ALTER TABLE sessions ADD COLUMN used_epoch_ms INTEGER NOT NULL DEFAULT 0;
@@ -213,11 +197,9 @@ impl StateDb {
             "CREATE INDEX IF NOT EXISTS idx_sessions_used ON sessions(used_epoch_ms);",
         )
         .context("state db index idx_sessions_used")?;
-        // 账号指纹的「最后见到」：从旧 JSON 导进来的那批当时写的是 0（那份 JSON 里
-        // 压根没有时间），0 一律按「未知」算。这行回填不能省 —— 直接挂上 TTL，0 会被
-        // 当成「过期了几辈子」，第一次启动就把整张表的账号记录清光（2026-10-03 真发生
-        // 过一次，5298 条剩 386 条）。拿当下顶上：我们至少知道它到这一刻还在库里。
-        // 只补 0 的行，正常记录动不着；补过之后这里每次都返回 0。
+        // 时间戳 0 表示「不知道什么时候见的」（旧 JSON 里没有时间）。这行回填不能省：
+        // 0 挂上 TTL 会被当成早就过期，第一次启动就把整张表的账号记录清光。拿当下顶上，
+        // 我们至少知道它到这一刻还在库里。只补 0 的行，补过之后这里每次都返回 0。
         let fixed = conn
             .execute(
                 "UPDATE soter_slot_owners SET first_seen_ms = ?1, last_seen_ms = ?1
@@ -329,7 +311,7 @@ impl StateDb {
         Ok(row.map(|(_, s)| s))
     }
 
-    /// 一条会话一行；原来这里是「整份 74 MB 重写一遍」。
+    /// 按 alias upsert 一条会话（一条一行，不再整份重写）。
     pub fn upsert_session(&self, alias: &str, row: &SessionRow) -> Result<()> {
         let conn = self.plain();
         conn.execute(
@@ -368,11 +350,8 @@ impl StateDb {
         Ok(())
     }
 
-    /// 过期的会话按「最后使用」删。返回删了几条。
-    ///
-    /// 单次最多删 `DELETE_BATCH` 条：过了保留期的会话可能一次就是十几万，
-    /// 一条 `DELETE` 全干会把写锁和 WAL 都撑得很大，中继那一瞬跟着堵。
-    /// 剩下的交给下一轮，反正调用方是周期性跑的。
+    /// 过期的会话按「最后使用」删，返回删了几条。单次最多删 `DELETE_BATCH` 条，
+    /// 剩下的交给下一轮（调用方是周期性跑的）。
     pub fn delete_sessions_expired_before(&self, cutoff_ms: i64) -> Result<usize> {
         let conn = self.plain();
         Ok(conn.execute(
@@ -460,9 +439,8 @@ impl StateDb {
     // -----------------------------------------------------------------------
     // SOTER 物料（服务端密钥模式自己铸的 ASK / AuthKey / 计数器）
     //
-    // 这些以前只活在进程内存里：服务端一重启，所有 uid 的 ASK 换成新的，而 App
-    // 手里缓存的公钥还是旧的 —— 拿新的 ASK 去验旧的 AuthKey，验不过就自删重来。
-    // 落盘之后重启不再换身份（`has_ask_already` 才敢如实回答）。
+    // 必须落盘：只活在内存里的话，重启就换 ASK，而 App 缓存的公钥是旧的，验不过
+    // AuthKey 就会自删重来。落盘之后重启不再换身份（`has_ask_already` 才敢如实回答）。
     // -----------------------------------------------------------------------
 
     /// 取一条物料的（种类, 私钥密文）。
@@ -575,8 +553,8 @@ impl StateDb {
 
     /// 拔钉子：**只删「钉层」这一行，账号记录留着**。
     ///
-    /// 账号记录是「这个槽位上还认得出几个号」的判据（连坐拦截用）。清钥匙的时候
-    /// 连它一起删，等于把「这里原本有好几个号」的证据也抹掉，下一次别人问就没法答。
+    /// 账号记录是「这个槽位上还认得出几个号」的判据（连坐拦截用）；清钥匙时连它一起
+    /// 删，就等于抹掉「这里原本有好几个号」的证据。
     pub fn delete_slot_pin(&self, slot_id: &str) -> Result<()> {
         let conn = self.plain();
         conn.execute(
@@ -598,11 +576,10 @@ impl StateDb {
         )?)
     }
 
-    /// 记一个账号指纹。
+    /// 记一个账号指纹：记过就只刷「最后见到」，没记过才插。
     ///
-    /// 记过就只刷「最后见到」；没记过才插。这一族满了（`cap` 条）不是拒收新的，
-    /// 而是把这一族里**最久没见到**的那条换出去 —— 丢的永远是最没用的那个，
-    /// 正在用的号不会被新号挤掉。
+    /// 这一族满了（`cap` 条）不是拒收新的，而是把这一族里**最久没见到**的那条换出去
+    /// —— 丢的永远是最没用的那个，正在用的号不会被新号挤掉。
     pub fn add_owner(
         &self,
         slot_id: &str,
@@ -691,8 +668,8 @@ impl StateDb {
 
     /// 导入本身（测试和演练都走这里）。两个路径都可以是 None。
     ///
-    /// 整个导入包在一个事务里：线上那份会话表一万多条，逐条 autocommit 又慢、中途断了
-    /// 还会导一半（库里一半、旧 JSON 一半，而下一次启动因为「库非空」就不导了）。
+    /// 整个导入包在一个事务里：逐条 autocommit 又慢，中途断了还会导一半 —— 库里一半、
+    /// 旧 JSON 一半，而下一次启动因为「库非空」就不再导了。
     pub fn import_legacy_json(
         &self,
         sessions_json: Option<&Path>,
@@ -877,9 +854,8 @@ fn legacy_slots(text: &str) -> Result<HashMap<String, LegacyPin>> {
 
 /// 进程里共用的那一个库（`fulfill` 和 `soter_mint` 用的是同一份）。
 ///
-/// 开不起来的时候**不**退化成内存库：会话表就是 A 端那批 `KeyMaterial::Remote`
-/// 的钥匙，静默丢掉等于让所有远程钥匙当场签不动（1.6.4 之前丢 `sessions.json`
-/// 就是这么坏的），所以宁可起不来，让日志和 systemd 直接说。
+/// 开不起来时**不**退化成内存库：会话表就是 A 端那批 `KeyMaterial::Remote` 的钥匙，
+/// 静默丢掉等于让所有远程钥匙当场签不动，所以宁可起不来，让日志和 systemd 直接说。
 static SHARED: OnceLock<Result<Arc<StateDb>, String>> = OnceLock::new();
 
 fn init() -> &'static Result<Arc<StateDb>, String> {
@@ -1132,7 +1108,7 @@ mod tests {
                 && family == "v2"
                 && token == "s1"
                 && *seen == 900));
-        // 被换出去的是 wx 那一族里最久没见的 acct，新进来的 x 在
+        // 被换出去的是 wx 那一族里最久没见的 acct，新来的 x 留着。
         assert!(snap.owners.iter().any(|(_, f, t, _)| f == "wx" && t == "x"));
         assert!(!snap
             .owners
@@ -1162,10 +1138,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 从旧 JSON 导进来的账号记录不能一挂上 TTL 就被清光。
-    ///
-    /// 那份 JSON 里根本没有时间，早先导的时候写的是 0 —— 而 0 在「按最后见到算过期」
-    /// 下等于「过期了几辈子」，2026-10-03 上线时真把线上 5298 条清成了 386 条。
+    /// 从旧 JSON 导进来的账号记录不能一挂上 TTL 就被清光：那份 JSON 里没有时间，
+    /// 若写 0，在「按最后见到算过期」下等于早就过期。
     #[test]
     fn imported_owner_records_survive_the_ttl() {
         let (db, dir) = tmp_db("import-owner-ttl");
@@ -1293,12 +1267,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 拿线上的真文件跑一遍（不放进 CI：CI 没有那份数据）。
-    ///
-    /// ```text
-    /// OMMEGA_DRILL_DIR=/path/to/dir cargo test -- --ignored --nocapture drill
-    /// ```
-    /// 目录里放 `sessions.json` 和 `soter_slots.json`。
     /// 拿线上的真库练一遍 v1→v2 迁移（不放进 CI：CI 没有那份数据）。
     ///
     /// ```text
@@ -1436,9 +1404,8 @@ mod tests {
         }
         println!("逐条核对 {checked} 条，链和私钥都逐字节一致");
 
-        // 全表校验：存进去的私钥解不解得出来、跟链配不配得上。
-        // 配不上的会话发回 A 端就是「签出来的东西验不过」—— 属于库里早就有的坏行，
-        // 跟搬迁无关（字段是逐字节搬的），但趁这次演练把规模量出来。
+        // 全表校验：存进去的私钥解不解得出来、跟链配不配得上。配不上的会话发回
+        // A 端就是「签出来的东西验不过」；字段是逐字节搬的，那是库里本来就有的坏行。
         crate::crypto::init_fernet(
             &std::env::var("OMMEGA_DRILL_FERNET").unwrap_or_else(|_| "drill".to_string()),
         );
@@ -1506,7 +1473,6 @@ mod tests {
         );
 
         // 导完马上跑一遍 TTL 清理：一条都不该掉（导入写的是「导入这一刻」，不是 0）。
-        // 这条正是 2026-10-03 上线时踩的坑，拿真数据再验一次。
         let cutoff = chrono::Utc::now().timestamp_millis() - 30 * 24 * 60 * 60 * 1000;
         assert_eq!(
             db.purge_owners_expired_before(cutoff).unwrap(),

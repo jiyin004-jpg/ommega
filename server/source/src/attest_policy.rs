@@ -1,27 +1,20 @@
 //! 认证层序的策略（运行时可变 + 落盘）。
 //!
-//! 层序默认**跟随模式**（`RELAY_ATTEST_SOURCE`）：本地出证模式 → 服务端 keybox 先，
-//! 物理模式 → 真机（B）先。这里只提供「排障时强制换一下」的两个覆盖开关，
-//! 三态：
+//! 层序默认跟随模式（`RELAY_ATTEST_SOURCE`）：本地出证模式 → 服务端 keybox 先，
+//! 物理模式 → 真机（B）先。三态：
+//! - `auto`：跟随模式，不做任何覆盖
+//! - `b_first`：强制 `b → keybox → self_signed`
+//! - `keybox_first`：强制 `keybox → b → self_signed`
 //!
-//! - `auto`（默认）：跟随模式，不做任何覆盖
-//! - `b_first`：强制真机优先（`b → keybox → self_signed`）
-//! - `keybox_first`：强制服务端优先（`keybox → b → self_signed`）
-//!
-//! 两个维度：
-//! - `attest_order`：普通 attest
-//! - `id_attest_order`：带 `attestation_ids`（设备 ID 认证）的 attest，`auto` 时与普通一致
-//!
-//! 以前这两个只读环境变量（`RELAY_ATTEST_KEYBOX_FIRST` /
-//! `RELAY_ID_ATTEST_SERVER_SIDE`），控制台上看不到、改完必须重启。现在运行时可变，
-//! 控制台一保存就生效，并落盘到 `data/attest_policy.json`；环境变量退化成初始值
-//! （`1` 映射成 `keybox_first`，其它映射成 `auto`，老部署行为不变）。
+//! 两个维度：`attest_order`（普通 attest）与 `id_attest_order`（带 `attestation_ids`
+//! 的设备 ID 认证，`auto` 时与普通一致）。控制台保存即生效并落盘到
+//! `data/attest_policy.json`；环境变量只作初始值（`1` → `keybox_first`，其它 → `auto`）。
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Once;
 
-/// 落盘位置。跟其它状态文件一样按进程工作目录算（systemd 的 WorkingDirectory=/opt/relay）。
+/// 落盘位置，按进程工作目录算（systemd 的 `WorkingDirectory=/opt/relay`）。
 pub const PATH: &str = "data/attest_policy.json";
 
 /// 层序策略。
@@ -73,18 +66,16 @@ static ID_ATTEST_ORDER: AtomicU8 = AtomicU8::new(Order::Auto as u8);
 static ATTEST_KEY_ORDER: AtomicU8 = AtomicU8::new(AttestKeyOrder::Smart as u8);
 static LOADED: Once = Once::new();
 
-/// 证明密钥（`PURPOSE_ATTEST_KEY` 的密钥）出证时走哪层。
-///
-/// 真机上证明密钥和普通密钥同一套 keybox，链根相同；而我们的物理模式下普通
-/// 认证走 B 真机、证明密钥留在本地，两边根会分叉。这个开关决定要不要把证明
-/// 密钥也送出去。
+/// 证明密钥（`PURPOSE_ATTEST_KEY`）出证时走哪层。
+/// 真机上证明密钥与普通密钥同一套 keybox，链根相同；物理模式下普通认证走 B、
+/// 证明密钥留在本地，两边链根会分叉，所以这个开关决定要不要把证明密钥送出去。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AttestKeyOrder {
-    /// 智能模式（默认）：证明密钥也走服务端 keybox（物理模式下不占用 B）。
-    /// 链来自服务端身份，稳定、快，但跟 B 那条链根不同。
+    /// 智能模式（默认）：证明密钥也走服务端 keybox，物理模式下不占用 B。
+    /// 链来自服务端身份，稳定快，但跟 B 那条链根不同。
     Smart = 0,
-    /// 跟随模式：跟普通认证一条路，物理模式下真的交给 B 真机。
+    /// 跟随模式：跟普通认证一条路，物理模式下交给 B 真机。
     /// 链根与普通认证一致（都是 B 的），代价是依赖 B 在线。
     Follow = 1,
 }
@@ -150,7 +141,7 @@ fn load_file() {
         return;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        // 文件写坏了就当没有：别让一个坏 JSON 把服务拖不起来。
+        // 坏 JSON 当作没有，不能让它把服务拖起来。
         return;
     };
     let read_order = |key: &str| {

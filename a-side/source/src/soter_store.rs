@@ -31,9 +31,9 @@ fn write_at(path: &str, text: &str) -> bool {
         let _ = std::fs::create_dir_all(dir);
     }
     // 这个文件是几个域一起写的：keystore 域里的 payload、hal_soter、还有 system_app
-    // 宿主。以前这里「保留原权限」，只要哪一次留下 0644，后面**不属同一 uid 的写者**
-    // 就全哑了，而且 rename 会把 0644 一直带下去 —— 实测到的症状就是 ASK/AuthKey 只
-    // 活在内存里、墓碑永远清不掉（导出 AuthKey 恒 -6）。所以落盘完统一 0666。
+    // 宿主。不能保留原权限：只要哪一次留下 0644，后面不属同一 uid 的写者就全哑了，
+    // 而且 rename 会把 0644 一直带下去（症状是 ASK/AuthKey 只活在内存里、墓碑永远
+    // 清不掉，导出 AuthKey 恒 -6）。所以落盘完统一 0666。
     let tmp = format!("{path}.rpc.tmp");
     let mut fail = None;
     match std::fs::write(&tmp, text.as_bytes()) {

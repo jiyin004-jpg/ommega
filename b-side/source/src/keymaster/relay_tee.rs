@@ -167,8 +167,8 @@ fn join_capped(items: &[String], max: usize, max_chars: usize) -> String {
 /// client libraries (i.e. is it an AIDL-KeyMint-less legacy device)?
 ///
 /// 体检本身要发 SM 查询、列服务、扫四个 HIDL 目录，不便宜；而一台机器上失败
-/// 原因基本不变。所以按 service 名缓存 10 秒 —— StrongBox 机型每个强箱请求都
-/// 会在查找失败后走到这里，一遍遍重算纯属浪费。
+/// 原因基本不变。所以按 service 名缓存 10 秒 —— StrongBox 机型每个强箱请求都会
+/// 在查找失败后走到这里，一遍遍重算纯属浪费。
 const DIAGNOSIS_TTL: Duration = Duration::from_secs(10);
 
 pub fn keymint_diagnosis(service: &str) -> String {
@@ -399,8 +399,7 @@ pub fn extract_km_error_code(status: &rsbinder::Status) -> Option<i32> {
 /// Falls back to `KEY_MINT_V5` if the probe itself fails.
 ///
 /// 结果按 HAL service 名缓存：`getHardwareInfo` 一辈子不会变，而这里每笔 attest 都会
-/// 走一次 —— 一次 binder 往返 + 一条 info 日志（同步写文件），几十笔叠起来就是可观测的
-/// 几毫秒，T04 那种卡在 120ms 线上的探针很在意这点。
+/// 走一次 —— 一次 binder 往返 + 一条 info 日志（同步写文件），叠起来就是可观测的几毫秒。
 pub fn probe_keymint_version(keymint: &Strong<dyn IKeyMintDevice>, service: &'static str) -> i32 {
     static CACHE: std::sync::OnceLock<MatchBTree> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));

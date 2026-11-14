@@ -1,38 +1,24 @@
-//! SOTER HAL 半死状态的自愈：连着几次失败就把这个服务重启一次。
+//! SOTER HAL 半死状态的自愈：连着几次失败就重启一次服务，TA 卡死时重启整机。
 //!
-//! 背景（PLC110 2026-09-30 实测）：HAL 会进一种半死状态 —— 建料类的 op
-//! （`generate_auth_key_pair` / `has_auth_key` / `export_auth_key_public_key`）
-//! 全都正常，只有走 TEE 会话的 `init_sign` 恒回 -18
-//! （`SOTER_ERROR_SECURE_HW_COMMUNICATION_FAILED`）。进程还活着、也不是 D 状态，
-//! 重启这个服务就好（实测 `setprop ctl.restart soter_hal`，旧 pid 退掉、init 拉新的）。
+//! 两种坏法必须分清：
 //!
-//! 但要分清两种坏法（2026-10-02 补）：
-//!
-//! - **HAL 进程半死**：`init_sign` 恒回 -18 —— 重启这个服务有效。
+//! - **HAL 进程半死**：建料类 op（`generate_auth_key_pair` / `has_auth_key` /
+//!   `export_auth_key_public_key`）都正常，进程活着也不是 D 状态，只有走 TEE 会话的
+//!   `init_sign` 恒回 -18（`SOTER_ERROR_SECURE_HW_COMMUNICATION_FAILED`）—— 重启这个
+//!   init 服务有效。
 //! - **TA 状态卡死在 TEE 里**：`init_sign` 回 0、`finish_sign` 恒回 258（0x102）。
-//!   用户态怎么重启服务都没用（2026-10-02 现场试了 3 次，pid 18055→27813→31557
-//!   全无效），**只有重启整台设备**才修得好。这一档自愈治不了，但至少不该去白杀
-//!   进程 —— 判据别被 `init_sign` 的成功糊弄。
+//!   重启用户态服务无效，只有重启整机才修得好；判据不能被 `init_sign` 的成功糊弄。
 //!
-//! 不收拾的后果是实打实的：服务端会按「这台结构性做不了」把这个槽位换到自签那两层，
-//! App 手里变成假料，拿到的还是个误导性的 -5（「这把钥匙不在」）—— Duck Detector
-//! 就是这么报 soter damaged 的，微信那边整轮开启都拿不到真材料。
+//! 不处理的后果：服务端按「这台结构性做不了」把槽位降到自签那两层，App 拿到假料。
 //!
-//! 计数规则（2026-10-02 改）：
+//! 计数规则：
 //!
-//! - **阈值 2**：一次失败可能只是偶然撞上，连着两次就动手，先把 HAL 拉回来再说。
-//! - **凡非 0 都算**，只有几个「正常业务答复」不算：-5 / -6 / -8（这个槽位还没建料，
-//!   新装的 App 天天问）、-26（这一笔的验证没过去，真应用那条路上就是 App 那步
-//!   生物认证没成）、-204（会话句柄已被顶掉）、-65528（这台机器上这个 uid 本来
-//!   就没料）。剩下的 -12/-13/-18/-20、258 以及一切没见过的码，都是「这台现在
-//!   真做不了」，一律计入。
-//! - **清零只认 `finish_sign` 的成功**。半死状态下不仅建料类 op 照样成功，
-//!   **`init_sign` 也照样回 0** —— 只有 `finish_sign` 会回 258。以前把 init_sign
-//!   也算「通道好」，结果探针每轮 init_sign(0) 都把计数清掉，PLC110 从 06:44
-//!   坏到 09:28，自愈一次都没触发过。
-//! - 冷却照旧：刚重启过就先不动，免得 HAL 真坏的时候每一笔都去 kill 一遍。
+//! - **阈值 2**：一次失败可能只是偶然，连着两次就动手。
+//! - **凡非 0 都算**，只有 `BENIGN_CODES` 里的正常业务答复不算。
+//! - **清零只认 `finish_sign` 的成功**：半死状态下建料类 op 与 `init_sign` 都照样回 0。
+//! - **冷却**：刚重启过就先不动，免得 HAL 真坏时每一笔都去 kill 一遍。
 //!
-//! 冷却用 `Instant`（单调钟，不含 suspend）就够 —— 它是防抖，不是精确调度。
+//! 冷却用 `Instant`（单调钟，不含 suspend）够用 —— 它是防抖，不是精确调度。
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -44,34 +30,21 @@ const FAILURE_LIMIT: u32 = 2;
 /// 两次重启之间的最短间隔。
 const RESTART_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
-/// 正常的业务答复，不参与计数：这个槽位还没建料（-5 ASK / -6 AuthKey / -8）、
-/// 这一笔的验证没过去（-26）、会话句柄已经被顶掉了（-204）、
-/// 这台机器上这个 uid 本来就没料（-65528）。
-///
-/// -8 是 2026-10-01 从生产日志里量出来的：40k 行里有 657 次，全是建料类 op
-/// （`has_auth_key` / `export_auth_key_public_key`），是 `-5` 同一种「还没准备」的意思。
-/// 不排掉它的话，App 每查几回就把阈值顶满。
-///
-/// -204（`OPERATEID_NULL`，会话句柄无效）是 2026-10-02 在 PLC110 上翻的案：
-/// 它是 TA 侧会话被别人顶掉的意思，**重启 SOTER HAL 根本修不了**，只会白丢材料
-/// —— 那天自愈正是被它连触两次，把好端端的 18055 kill 掉又毫无用处。
-///
-/// -65528（`TEE_ERROR_ITEM_NOT_FOUND`）同日对照量出来的：在**健康**设备上一样
-/// 大量出现（重启后的正常态里 `TEE_GenerateASKPair` 就回了 40 次），和 -5 是
-/// 同一种「这个 uid 没建过料」。所以别按 `0xFFFFxxxx` 段一刀切，会误伤。
+/// 正常业务答复，不参与计数：
+/// -5 / -6 / -8：这个槽位还没建料；-26：这一笔的验证没过去；
+/// -204（`OPERATEID_NULL`）：TA 侧会话句柄被顶掉，重启 SOTER HAL 修不了，只会白丢材料；
+/// -65528（`TEE_ERROR_ITEM_NOT_FOUND`）：这个 uid 没建过料，健康设备上同样大量出现，
+/// 不能按 `0xFFFFxxxx` 段一刀切。
 const BENIGN_CODES: &[i64] = &[-5, -6, -8, -26, -204, -65528];
 
-/// 只有真签出东西来才说明通道是好的。
-///
-/// 2026-10-02 定案：TA 状态卡死时不仅建料类 op 正常，**`init_sign` 也照样回 0**，
-/// 只有 `finish_sign` 恒回 258。所以「init_sign 成功 = 通道好」是错的。
+/// 只有真签出东西来（`finish_sign` 成功）才算通道是好的。
+/// TA 卡死时建料类 op 正常、`init_sign` 也照样回 0，只有 `finish_sign` 恒回 258。
 fn proves_channel_works(op: &str) -> bool {
     matches!(op, "finish_sign")
 }
 
-/// 候选服务名：各家 HAL 在 init 里注册的名字不一样，`getprop init.svc.<名字>` 有值的
-/// 那个才算（PLC110 上是 `soter_hal`，rc 文件名反而是 `vendor.trustonic.soter@1.0-service.rc`，
-/// 拿文件名去 `ctl.restart` 会被拒）。
+/// 候选 init 服务名：各家 HAL 注册名不同，`getprop init.svc.<名字>` 有值的那个才算。
+/// rc 文件名不是服务名，拿文件名去 `ctl.restart` 会被拒。
 const SERVICE_CANDIDATES: &[&str] = &[
     "soter_hal",
     "android.hardware.soter@1.0-service",
@@ -96,27 +69,16 @@ const HAL_PROCESS_CANDIDATES: &[&str] = &[
 static FAILURES: Mutex<u32> = Mutex::new(0);
 static LAST_RESTART: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// TA 卡在 TEE 里的证据码：`258`（读 anti-rollback 计数器失败）。
-///
-/// 2026-10-03 在 PLC110 上挖到底了：Trustonic 的 `tlTeeSOTER`（TA 镜像
-/// `/odm/vendor/app/mcRegistry/070f0000000000000000000000000a0a.tlbin`）把 RPMB
-/// session 3 打开之后不放手 —— dmesg 里 `rpmb session 3 is already opened by
-/// 070f0000-...-a0a0` 449/449 全是它自己，`Open session failed crSession =
-/// 0xffffffff` 452 次，`EXPORT_PUB_KEY read counter failed (258)` 451 次。TA 从此
-/// 读不到自己的持久存储，对外就是一大片 `-5`（说存在却导不出来、也建不了）加上
-/// `258`。
-///
-/// 这一档上面所有手段都是无效的，两轮实测都验过：2026-10-02 重启 HAL 进程
-/// （pid 18055→27813→31557），2026-10-03 直接 kill SOTER HAL 服务（持有者在 TEE
-/// 里，叫它松手根本不听）。**只有重启整机能松开。**
+/// TA 卡在 TEE 里的证据码：`258`，读 anti-rollback 计数器失败。
+/// TA 打开 RPMB session 后不放手，此后读不到自己的持久存储，对外表现为成片的 `-5`
+/// 加 `258`。这一档重启用户态 HAL 无效，只有重启整机能松开。
 const TEE_WEDGE_CODE: i64 = 258;
-/// 攒到这么多才认「卡住了」。卡住时 15 分钟里就有 138 条 258，两次很容易到；
-/// 而健康设备上这个码不该出现。
+/// 攒到这么多才认「卡住了」：卡住时 258 成串出现，健康设备上这个码不该出现。
 const WEDGE_LIMIT: u32 = 2;
 /// 两次自动重启之间至少隔这么久。
 const REBOOT_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
-/// 24 小时内最多自动重启几次。到顶就只上报（caps 里的 `soter_stuck`），不再动手
-/// —— 那是「重启也修不好」的最终态，不能变成无限重启循环。
+/// 24 小时内最多自动重启几次。到顶只上报（`soter_stuck`），不再动手 ——
+/// 那是「重启也修不好」的最终态，不能变成无限重启循环。
 const REBOOT_MAX_PER_DAY: usize = 3;
 /// 开机后多久才允许自动重启。刚起来又卡的话，这就是防重启循环的第一道闸。
 const REBOOT_BOOT_GRACE: Duration = Duration::from_secs(15 * 60);
@@ -137,10 +99,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// 一笔真活的结果。非 0 且不属于 `BENIGN_CODES` 的累加，够了就重启一次 HAL；
-/// TEE 会话 op 成功清零；其余一概不碰。
-///
-/// `258` 单独走一条路：它说明卡住的是 TEE 里那个 TA，重启用户态服务治不了，
-/// 得往上抬一级（重启整机，见 `try_self_reboot`）。
+/// 只有 `finish_sign` 成功清零；其余一概不碰。
+/// `258` 单独走一条路：卡住的是 TEE 里那个 TA，重启用户态服务治不了，得重启整机，
+/// 见 `try_self_reboot`。
 pub fn note(op: &str, error_code: i64) {
     if error_code == TEE_WEDGE_CODE {
         let signals = {
@@ -175,7 +136,7 @@ pub fn note(op: &str, error_code: i64) {
                 *lock(&FAILURES) = 0;
             }
             Err(error) => {
-                // 没重启成就不记冷却，下一笔再试（顺手把计数留在这儿，日志能看出次数）。
+                // 没重启成就不记冷却，计数留着，下一笔再试。
                 log::warn!("soter: 连续 {count} 次失败，想重启 SOTER HAL 但没成功：{error}");
             }
         },
@@ -184,7 +145,7 @@ pub fn note(op: &str, error_code: i64) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
-    /// 计数动了（或者没动），但什么都不做。
+    /// 不做任何动作（计数可能已累加）。
     Nothing,
     /// 通道证明是好的：计数清零。
     Reset,
@@ -195,9 +156,8 @@ enum Verdict {
 }
 
 /// 对外上报：这台现在是不是「TA 卡在 TEE 里、而且没能重启掉」。
-///
-/// 只有「卡住 + 现在动不了手」（次数到顶、开机宽限期里、或者重启命令失败）才为真
-/// —— 那正是操作员需要看见、需要手动接管的那个状态。
+/// 只有「卡住 + 现在动不了手」（次数到顶、开机宽限期里、或重启命令失败）才为真，
+/// 那是需要人工接管的状态。
 pub fn tee_wedged() -> bool {
     *lock(&WEDGE_UNRESOLVED)
 }
@@ -215,7 +175,7 @@ enum RebootVerdict {
     Booting,
 }
 
-/// 纯判定，拆出来是为了能直接测（不碰设备、不抢 static）。
+/// 纯判定，拆出来便于直接测试（不碰设备、不抢 static）。
 fn reboot_verdict(already: usize, uptime: Duration, since_last: Option<Duration>) -> RebootVerdict {
     if already >= REBOOT_MAX_PER_DAY {
         return RebootVerdict::DailyCap;
@@ -230,10 +190,8 @@ fn reboot_verdict(already: usize, uptime: Duration, since_last: Option<Duration>
 }
 
 /// TA 卡在 TEE 里时的最后一招：重启整机。
-///
-/// 刹车三道：开机宽限期（刚起来又卡就先不动）、6 小时间隔、24 小时最多 3 次。
-/// 任何一道拦住、或者重启命令没跑成，都把 `WEDGE_UNRESOLVED` 立起来对外上报
-/// —— 不吭声就 reboot 完了，操作员只会看到设备反复掉线却不知道为什么。
+/// 三道刹车：开机宽限期、6 小时间隔、24 小时最多 3 次。任何一道拦住或重启命令
+/// 没跑成，都立起 `WEDGE_UNRESOLVED` 对外上报，否则设备反复掉线无从解释。
 fn try_self_reboot(op: &str, signals: u32) {
     let uptime_secs = uptime().as_secs();
     let already = reboots_last_day();
@@ -244,9 +202,8 @@ fn try_self_reboot(op: &str, signals: u32) {
     }
     match verdict {
         RebootVerdict::Reboot => {
-            // 先记账再动手：`reboot` 一执行这台机器就下去了，`run()` 不一定回来得及。
-            // 反过来说，万一没重启成，也只是把一次假的算进今天的额度（宁可少重启，
-            // 不要多。）
+            // 先记账再动手：`reboot` 一执行机器就下去了，`run()` 未必返回；失败也只是
+            // 多记一次额度（宁可少重启）。
             record_self_reboot();
             match reboot_device() {
                 Ok(what) => {
@@ -316,8 +273,7 @@ fn reboots_last_day() -> usize {
         .unwrap_or(0)
 }
 
-/// 把这次自动重启写进记账文件（追加一行时间戳）。写不进去就罢了 —— 最坏只是上限
-/// 少拦一次。
+/// 把这次自动重启写进记账文件（追加一行时间戳）。写不进去只影响上限拦截。
 fn record_self_reboot() {
     let path = reboot_log_path();
     if let Some(parent) = path.parent() {
@@ -333,8 +289,8 @@ fn record_self_reboot() {
     }
 }
 
-/// 重启整机。Android 上 `reboot` 在 `/system/bin`，relay 是 init 拉起来的、PATH 不
-/// 一定全，所以两条都试。
+/// 重启整机。Android 上 `reboot` 在 `/system/bin`；relay 由 init 拉起、PATH 不一定全，
+/// 两条都试。
 fn reboot_device() -> Result<String, String> {
     let mut last_error = String::from("没有可用的 reboot 命令");
     for cmd in ["/system/bin/reboot", "reboot"] {
@@ -346,10 +302,8 @@ fn reboot_device() -> Result<String, String> {
     Err(last_error)
 }
 
-/// 纯判定：给定「这次是哪个 op / 什么结果 / 已有计数 / 距上次重启多久」，
-/// 回新的计数和该做什么。
-///
-/// 从 `note` 里拆出来是为了能直接测，不用去碰设备、也不用和别的测试抢那几个 static。
+/// 纯判定：给定「哪个 op / 什么结果 / 已有计数 / 距上次重启多久」，回新的计数和动作。
+/// 从 `note` 里拆出来便于直接测试，不碰设备、不抢 static。
 fn step(
     op: &str,
     error_code: i64,
@@ -377,7 +331,7 @@ fn step(
     }
 }
 
-/// 重启 SOTER HAL，返回人话描述（进日志）。所有路子都失败就回错误。
+/// 重启 SOTER HAL，返回实际用的命令（进日志）。所有路子都失败就回错误。
 fn restart_soter_hal() -> Result<String, String> {
     let mut last_error = String::from("没找到可用的 SOTER HAL 服务名");
     for name in SERVICE_CANDIDATES {
@@ -475,7 +429,7 @@ mod tests {
     fn only_a_real_signature_clears_the_count() {
         // 真签出东西来 = 通道确实好了。
         assert_eq!(step("finish_sign", 0, 2, None), (0, Verdict::Reset));
-        // init_sign 成功**不算**：TA 卡死时它照样回 0（PLC110 就是这么坏的）。
+        // init_sign 成功不算：TA 卡死时它照样回 0。
         assert_eq!(step("init_sign", 0, 2, None), (2, Verdict::Nothing));
         // 建料类 op 在半死状态下也会成功，更不能让它把计数清掉。
         assert_eq!(step("has_auth_key", 0, 2, None), (2, Verdict::Nothing));
@@ -491,8 +445,8 @@ mod tests {
 
     #[test]
     fn the_258_killer_still_reaches_the_threshold() {
-        // PLC110 2026-10-02 的真实形态：init_sign 回 0、finish_sign 恒回 258。
-        // 以前 init_sign 的成功会把计数清掉，这个序列永远攒不到 2。
+        // 真实形态：init_sign 回 0、finish_sign 恒回 258。若 init_sign 成功就清零，
+        // 这个序列永远攒不到 2。
         let (count, verdict) = step("init_sign", 0, 0, None);
         assert_eq!((count, verdict), (0, Verdict::Nothing));
         let (count, verdict) = step("finish_sign", 258, count, None);
@@ -552,13 +506,12 @@ mod tests {
 
     #[test]
     fn the_service_name_list_starts_with_the_one_plc110_uses() {
-        // PLC110 实测就是这个；顺序有意义（先试它，省一轮 getprop）。
+        // 顺序有意义：先试它，省一轮 getprop。
         assert_eq!(SERVICE_CANDIDATES[0], "soter_hal");
     }
 
-    /// `258` 是 TA 卡在 TEE 里的证据：`note()` 会在进 `step()` 之前把它拦下来
-    /// （去见 `try_self_reboot`）—— 那一档重启用户态 HAL 是无效的，两轮实测都验过。
-    /// 这里钉住两件事：码就是实测的那个，而且它绝不属于「正常业务答复」。
+    /// `258` 是 TA 卡在 TEE 里的证据：`note()` 在进 `step()` 前把它拦下转给
+    /// `try_self_reboot`。这里钉住两件事：码是 258，且它绝不属于「正常业务答复」。
     #[test]
     fn the_tee_wedge_code_is_the_measured_one_and_never_benign() {
         assert_eq!(

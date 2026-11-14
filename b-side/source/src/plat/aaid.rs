@@ -20,7 +20,7 @@ pub struct AttestationApplicationId {
 /// ```
 ///
 /// 系统 keystore2 生成的是这一种。两种都要认：只认 SET 会把标准格式的请求
-/// 判死，只认 SEQUENCE 会把我们 A 端的请求判死（实测两边都踩过）。
+/// 判死，只认 SEQUENCE 会把 A 端的请求判死。
 #[derive(der::Sequence, Debug)]
 pub struct AttestationApplicationIdSeq {
     pub package_info_records: Vec<PackageInfoRecord>,

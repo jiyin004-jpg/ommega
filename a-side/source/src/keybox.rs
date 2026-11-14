@@ -129,8 +129,7 @@ impl KeyBox {
         }
         // keybox 里的 RSA 私钥两种形状都有：PKCS#1（BEGIN RSA PRIVATE KEY，多数
         // keybox 就是这种）和 PKCS#8（BEGIN PRIVATE KEY，openssl genpkey 的默认输出）。
-        // 以前只认 PKCS#1，换个工具生成的 keybox 就直接报「failed to parse inner
-        // PKCS#1 key」，然后悄悄回落成内置模板。两种都试，失败才报。
+        // 两种都试，都失败才报错。
         let key = rsa::import_pkcs1_key(&entry.key_der)
             .or_else(|_| rsa::import_pkcs8_key(&entry.key_der))
             .map(|(key, _, _)| key)
@@ -206,11 +205,9 @@ impl KeyBox {
     fn signing_info(&self, key_type: SigningKeyType) -> Result<SigningInfoSnapshot, Error> {
         // 证书里的「签发者用哪种钥匙」跟「叶子用哪种钥匙」是两件独立的事：RSA 叶
         // 子完全可以由 EC 签发（反之亦然）。而大多数分发的 keybox 只有一个 EC 条目，
-        // 以前在这里只按 `algo_hint` 硬选，于是所有 RSA 钥匙的认证都报
-        // 「keybox has no Rsa signing key」—— Duck Detector 的 KeyMint crypto 项就
-        // 是靠这些 RSA 变体判红的。
+        // 所以只按 `algo_hint` 硬选会让所有 RSA 变体的认证失败。
         //
-        // 所以：要的那一种没有就用另一种顶上（优先 EC），链路和身份都不换。
+        // 要的那一种没有就用另一种顶上（优先 EC），链路和身份都不换。
         let wanted = match key_type.algo_hint {
             SigningAlgorithm::Rsa => "RSA",
             SigningAlgorithm::Ec => "EC",
@@ -920,7 +917,7 @@ mod tests {
             keybox.ec_info.as_ref().unwrap().chain
         );
         // 只有 EC 一枚时，RSA 请求也能拿到（用 EC 签）—— 证书签发者与叶子钥匙
-        // 算法本就是两件事，以前这里硬选才让 RSA 认证全部失败。
+        // 算法本就是两件事，硬选会让 RSA 认证全部失败。
         assert_eq!(
             parsed
                 .signing_info(SigningKeyType {

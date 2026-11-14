@@ -1,6 +1,6 @@
 //! HTTP handlers for all relay endpoints.
 //!
-//! Mirrors `relay_server/apps/relay_api/views.py`. Two fulfilment modes:
+//! Two fulfilment modes:
 //!   - physical (default): A-side creates a task, B-side polls & returns result
 //!   - server_keybox:      A-side requests are intercepted and fulfilled locally
 
@@ -172,15 +172,10 @@ async fn check_auth(
         return Err(Box::new(auth_fail()));
     }
 
-    // 限流按客户端 IP 算，不按 token 算。
-    //
-    // 为什么换成 IP：B 端是长轮询（poll + result 一轮两个请求），单台跑到 7 次/秒
-    // 很正常。按 token 限的时候，这一台自己的额度先被自己的轮询吃满，超了就 429；
-    // B 收到 429 会退避 1 秒，这一秒没人领任务，任务在服务端干等 —— Duck Detector
-    // 上那 1~3 秒的 rkp 等待就是这么来的。改成按 IP 之后，同一台设备不管拿哪个
-    // token 都算同一份额度，正常轮询永远吃不满。
+    // 限流按客户端 IP 算，不按 token 算：B 端是长轮询（poll + result 一轮两个请求），
+    // 按 token 限会先把这台自己的额度吃满，429 退避的那一秒没人领任务。按 IP 之后
+    // 同一台设备不管拿哪个 token 都算同一份额度。
     if !state.auth.allow(&ip) {
-        // 这行以前没有，429 打进日志 0 条，查了半天才发现是自己在限流。
         tracing::warn!(
             "rate limit hit ip={ip} role={} window={}s limit={}",
             role.unwrap_or("-"),
@@ -195,8 +190,7 @@ async fn check_auth(
     Ok(token)
 }
 
-/// 管理接口的会话校验。跟 `check_auth` 不是一回事：这里要的是控制台登录后的
-/// `X-Relay-Session`，不是 A/B 端的 API token。
+/// 管理接口的会话校验：要的是控制台登录后的 `X-Relay-Session`，不是 A/B 端 API token。
 fn require_admin_session(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     let sid = headers
         .get("x-relay-session")
@@ -211,11 +205,12 @@ fn require_admin_session(state: &AppState, headers: &HeaderMap) -> Option<Respon
     ))
 }
 
-/// Enqueue a task for an already-resolved target and wait for the B-side
-/// result.  Shared by the layer helper and the SOTER path (which resolves its
-/// target by capability instead of by load only).
-/// 入队并等 B 端结果。`timeout_secs` 由调用方给：认证（attest）要快速失败好让回退
-/// 阶梯接手，SOTER 反而要宽一点 —— 早一步换层等于给同一个槽位换了身份。
+/// Enqueue a task for an already-resolved target and wait for the B-side result.
+/// Shared by the layer helpers and the SOTER path (which resolves its target by
+/// capability instead of by load only).
+///
+/// `timeout_secs` 由调用方给：认证（attest）要快速失败好让回退阶梯接手，SOTER 反而
+/// 要宽一点 —— 早一步换层等于给同一个槽位换了身份。
 async fn enqueue_and_wait(
     state: &AppState,
     task_type: &str,
@@ -281,8 +276,8 @@ impl Drop for CancelSoterTask {
 /// Layer ① — B-device fulfilment: enqueue a task for the resolved target and
 /// wait for the result. Fails fast when no B device is online so the next layer
 /// can run without waiting. When the requested device is offline the balancer
-/// hands the task to another live B端 (intended: the real-device layer stays
-/// real hardware); the log line records requested vs. actual.
+/// hands the task to another live B device (the real-device layer stays real
+/// hardware); the log records requested vs. actual.
 async fn try_b_device_layer(
     state: &AppState,
     task_type: &str,
@@ -296,12 +291,9 @@ async fn try_b_device_layer(
         return Some(json!({ "error": "no B-side device online" }));
     }
     let target = state.store.resolve_online_target(device_id).await;
-    // 配对校验：两个卡种都过一遍 `allows`（`public` 只能配 `public`、`pair` 必须同组）。
-    //
-    // 以前这里写的是 `if a.kind == "pair"`，于是 public 卡整段跳过 —— `allows` 里那条
-    // 「公开卡不能指挥别人的私机」永远执行不到，任何一张白卡都能指挥任意一台私 B 出证、
-    // 签名、动 SOTER 槽位。两边有一方没登记（老客户端 / 静态 token）时 `b_meta` 为
-    // None，仍旧按历史行为放行。
+    // 配对校验：两个卡种都过一遍 `allows`（`public` 只能配 `public`、`pair` 必须同组），
+    // 所以这里不能只判 `kind == "pair"`。两边有一方没登记（老客户端 / 静态 token）时
+    // `b_meta` 为 None，此时放行。
     if let Some(a) = a_meta {
         let b_meta = state
             .store
@@ -329,12 +321,8 @@ async fn try_b_device_layer(
         }
     }
     // 这笔要用的私钥只在那台 B 上（`key_device_id`，A 端从 keyblob 的 RemoteRef 里带
-    // 上来）：它离线时不许换替身。
-    //
-    // 以前没有这个参数，多台 B 在线时 sign/decrypt 按负载挑一台，挑到没有这把钥匙的
-    // 那台就回 `no key for alias`，服务端再折成 `key_not_found`，App 拿这个结论把一把
-    // 好好的钥匙作废重建。`resolve_online_target` 那套「离线换替身」对认证有意义，对
-    // 已有的私钥没意义 —— 换台签不出同一个东西。
+    // 上来）：它离线时不许换替身 —— 换台签不出同一个东西，只会让 App 把一把好好的
+    // 钥匙作废重建。
     if pinned_key_device && target != device_id {
         tracing::info!(
             "b_layer: key owner {device_id} is offline; not re-routing this {task_type} to {target}"
@@ -346,11 +334,9 @@ async fn try_b_device_layer(
             "relay_error_kind": "key_device_offline",
         }));
     }
-    // B 心跳里报上来的 `skip_pkgs` 原本是「补丁日期不跟随」的名单（relay.conf 的
-    // OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS），不是「这些包不服务」。以前拿它当派发黑名单，
-    // 结果检测器/微信/QQ 这些包永远到不了真机，一律掉到服务端密钥层 —— 看起来就像
-    // 「远程还是本地伪造」。现在只当补丁跟随用；真要禁止某些包走真机，
-    // 在服务端设 RELAY_DISPATCH_SKIP=1（或干脆维护在 B 端 relay.conf 的 patchlevel 名单里）。
+    // B 心跳里报上来的 `skip_pkgs` 只是「补丁日期不跟随」名单（relay.conf 的
+    // OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS），不是「这些包不服务」，不能当派发黑名单用。
+    // 真要禁止某些包走真机，在服务端设 RELAY_DISPATCH_SKIP=1。
     if task_type == "attest" && std::env::var("RELAY_DISPATCH_SKIP").as_deref() == Ok("1") {
         let pkg = request_package(body);
         if !pkg.is_empty() {
@@ -367,8 +353,7 @@ async fn try_b_device_layer(
     }
     // Trace line: the requested device and the device that will actually serve
     // the task. They differ exactly when the requested one is not online and
-    // the balancer picked another live B端 — the chain will then come from that
-    // other device, which is intended but must be visible in the log.
+    // the balancer picked another live B device.
     if !device_id.is_empty() && target != device_id {
         tracing::warn!(
             "b_layer: requested device {device_id} is not online; task served by {target} instead"
@@ -391,16 +376,15 @@ async fn try_b_device_layer(
         state.cfg.wait_result_timeout_secs,
     )
     .await;
-    // B 端真机铸出来的 key 归 B 那边：同一个 alias 我们这边要是还留着旧 session，
-    // 那就是另一把私钥（叶证书都不是同一张），以后 keybox 层接手只会签出对不上号
-    // 的东西。所以只要 B 这一跳真铸成了，就把我们的那条丢掉。
+    // B 端真机铸出来的 key 归 B 那边：B 这一跳真铸成了就把我们这边的旧 session 丢掉，
+    // 否则以后 keybox 层接手只会签出对不上号的东西（叶证书都不是同一张）。
     if task_type == "attest" && v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
         if let Some(alias) = body.get("alias").and_then(Value::as_str) {
             state.fulfill.forget_session(alias);
         }
     }
-    // 告诉 A 端这张链是哪台 B 铸的：以后拿这把 AK 签子钥，得回到同一台，
-    // 否则另一台 B 没有它的 session（`issuer key ... is not available`）。
+    // 告诉 A 端这张链是哪台 B 铸的：以后拿这把 AK 签子钥得回到同一台，否则那台上
+    // 没有它的 session（`issuer key ... is not available`）。
     let mut v = v;
     if v.get("error").is_none() {
         if let Some(obj) = v.as_object_mut() {
@@ -455,14 +439,9 @@ fn attest_chain_empty(task_type: &str, v: &Value) -> bool {
 
 /// 这一层失败的原因（日志 + 最终返回给 A 端的错误都用它）。
 ///
-/// 各层回的东西有两个来源：`error`（B 端跑挂了、任务超时、keybox 层没这个
-/// 设备的身份）和一条空链（跑通了但没链）。以前先看空链 —— 于是 B 端明明回了
-/// `real keymint ... generateKey failed [km_error=-49]`，日志里照样写成
-/// "empty cert chain from B device"，真正的原因全被吞掉：分不清是 HAL 报错、
-/// 超时，还是真交了一条空链。现在 `error` 优先，只有它没给原因才说空链。
-///
-/// 注意跟成功判定分开：那边必须是 `error` 为空 **且** 链非空才算这一层过了，
-/// 这里只管失败时怎么描述。
+/// `error` 优先，只有它没给原因才说空链：反过来的话，B 端明明回了
+/// `real keymint ... generateKey failed [km_error=-49]` 也会被写成空链，真正的原因全被
+/// 吞掉。注意跟成功判定分开：那边要求 `error` 为空 **且** 链非空。
 fn layer_failure_msg(task_type: &str, layer: &str, v: &Value) -> String {
     if let Some(e) = v
         .get("error")
@@ -558,8 +537,8 @@ async fn run_layer_self_signed(
 }
 
 /// KeyMint security level (0 = software, 1 = TEE, 2 = StrongBox) of the leaf a
-/// relay minted, parsed out of the base64 DER chain.  Smart mode uses it to tell
-/// a real StrongBox chain from one the B side silently demoted to TEE.  `None`
+/// relay minted, parsed out of the base64 DER chain. Smart mode uses it to tell
+/// a real StrongBox chain from one the B side silently demoted to TEE. `None`
 /// when the chain is missing, unreadable, or carries no attestation extension.
 fn chain_attestation_security_level(v: &Value) -> Option<i64> {
     let leaf = v.get("cert_chain")?.as_array()?.first()?.as_str()?;
@@ -567,13 +546,11 @@ fn chain_attestation_security_level(v: &Value) -> Option<i64> {
 }
 
 /// Whether a failed B-side attest result carries a "the device HAS a StrongBox
-/// HAL but it is not usable" verdict that Smart mode must surface to the
-/// A-side app rather than mask. Matches the fixed wording emitted by the
-/// b-side binary relay (`b-side/source/src/bin/relay.rs`) for km errors -74
-/// (AttestationKeysNotProvisioned) and -68 (HardwareTypeUnavailable). Any
-/// other failure (HAL absent, timeout, empty chain, foreign error text) is not
-/// a definitive StrongBox-HAL verdict and returns `None` so the caller falls
-/// back to the server keybox / A-side local keybox.
+/// HAL but it is not usable" verdict that Smart mode must surface instead of
+/// mask. Matches the fixed wording emitted by the b-side relay for km errors -74
+/// (AttestationKeysNotProvisioned) and -68 (HardwareTypeUnavailable). Any other
+/// failure (HAL absent, timeout, empty chain, foreign error text) returns `None`
+/// so the caller falls back to the server keybox / A-side local keybox.
 fn strongbox_b_kind(v: &Value) -> Option<&'static str> {
     let s = v.get("error").and_then(Value::as_str)?;
     if s.contains("attestation keys not provisioned") {
@@ -588,13 +565,13 @@ fn strongbox_b_kind(v: &Value) -> Option<&'static str> {
 /// Smart (middle) StrongBox mode: serve a StrongBox attestation from the
 /// strongest honest source available.
 ///
-///   1. server_keybox mode mints from the stored per-device identity first.
+///   1. server_keybox mode mints from the stored per-device identity first;
+///      physical mode falls back to it when B gives no usable StrongBox verdict.
 ///   2. Otherwise ask the B device for its real StrongBox: success -> return it;
 ///      present-but-broken (keys not provisioned / no hardware type) -> return
-///      the B error with a `relay_error_kind` marker; anything else -> next step.
-///   3. In physical mode, fall back to the stored keybox identity.
-///   4. Nothing left -> error, so the A-side generates a StrongBox-level chain
-///      locally. `self_signed` is never used for a StrongBox request.
+///      the B error with a `relay_error_kind` marker; else -> next step.
+///   3. Nothing left -> error, so the A side mints a StrongBox chain locally;
+///      `self_signed` is never used for a StrongBox request.
 async fn run_smart_strongbox_attest(
     state: &AppState,
     device_id: &str,
@@ -622,13 +599,10 @@ async fn run_smart_strongbox_attest(
         {
             if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
                 // Only a chain that is itself StrongBox-tagged counts as the B
-                // device fulfilling the StrongBox request.  The b-app relay goes
-                // through the Android Keystore API, where `setIsStrongBoxBacked`
-                // silently degrades to TEE on a device without a StrongBox, so
-                // its chain comes back honestly tagged TEE.  Accepting that here
-                // would stop the fallback short of the server keybox — which can
-                // mint a properly StrongBox-tagged chain — and the calling app
-                // would end up with a TEE attestation after asking for StrongBox.
+                // device fulfilling the request: the b-app relay goes through the
+                // Android Keystore API, where `setIsStrongBoxBacked` silently
+                // degrades to TEE, so accepting a TEE chain here would stop the
+                // fallback short of the server keybox.
                 let level = chain_attestation_security_level(&v);
                 if level == Some(2) {
                     tracing::info!(
@@ -637,8 +611,7 @@ async fn run_smart_strongbox_attest(
                     return Json(v).into_response();
                 }
                 // Unreadable chains (`None`) take the same path: the next layer
-                // either succeeds or the A-side local keybox does, and both
-                // produce a StrongBox-tagged chain.
+                // either succeeds or the A-side local keybox does.
                 tracing::info!(
                     "run_smart_strongbox: B returned a non-StrongBox chain (attestation_security_level={level:?}) for device {device_id} -> continuing fallback"
                 );
@@ -679,8 +652,8 @@ async fn run_smart_strongbox_attest(
         }
     }
 
-    // Branch 4: the server cannot help — error so the A-side's local software
-    // keybox generates a StrongBox-level chain itself (never a self-signed one).
+    // Nothing left: error so the A-side's local software keybox generates a
+    // StrongBox-level chain itself (never a self-signed one).
     tracing::info!(
         "run_smart_strongbox: no StrongBox-capable fulfilment for device {device_id}; handing back to A-side local keybox"
     );
@@ -698,9 +671,7 @@ async fn run_smart_strongbox_attest(
 /// Nothing is minted on this path — no stored server keybox, no self-signed
 /// chain, and no silent hand-back to the A-side local software keybox (which
 /// would fabricate a StrongBox-tagged chain). The A side turns the
-/// `relay_error_kind` marker into the matching KeyMint error, so the calling app
-/// sees what AOSP shows on a device that advertises StrongBox but has no
-/// provisioned keys.
+/// `relay_error_kind` marker into the matching KeyMint error.
 async fn run_refuse_strongbox_attest(
     state: &AppState,
     device_id: &str,
@@ -732,8 +703,7 @@ async fn run_refuse_strongbox_attest(
             }
             // A chain did come back but it is not StrongBox-tagged: the B side
             // demoted the request to TEE. Refusing is the whole point of this
-            // mode, so say so instead of handing the app a TEE chain it did not
-            // ask for.
+            // mode, so say so instead of handing the app a TEE chain.
             tracing::info!(
                 "run_refuse_strongbox: B returned a non-StrongBox chain (attestation_security_level={level:?}) for device {device_id} -> refusing"
             );
@@ -781,22 +751,15 @@ fn refuse_strongbox_body(kind: &str, msg: &str) -> Response {
     Json(refuse_strongbox_json(kind, msg)).into_response()
 }
 
-/// Shared logic for A-side task endpoints.
+/// A 侧任务端点的三层回退：层序由当前模式定，physical 是 ① B 设备 → ② 服务端 keybox
+/// → ③ 自签，serverbox 是 ② → ① → ③；某层回了不带 `error` 的结果算过，全挂才回错。
 ///
-/// Three-layer fallback, with the order set by the active mode:
-///   physical:  ① B device -> ② stored keybox -> ③ self-signed
-///   serverbox: ② stored keybox -> ① B device -> ③ self-signed
-/// A layer "succeeds" when it returns a result without an `error` field;
-/// otherwise the next layer is tried, and only when every layer fails is an
-/// error returned.
 /// `RELAY_ATTEST_KEYBOX_FIRST=1`（或控制台策略开关）时 attest 回到「服务端密钥层优先」。
+/// 默认不开 = 跟随模式：本地出证模式 → 服务端 keybox 先；物理模式 → 真机先。策略值在
+/// [`crate::attest_policy`]（三态：auto / b_first / keybox_first，运行时可变 + 落盘）。
 ///
-/// 默认（不开）= 跟随模式：本地出证模式 → 服务端 keybox 先；物理模式 → 真机先。
-/// 策略值在 [`crate::attest_policy`] 里（三态：auto / b_first / keybox_first，
-/// 运行时可变 + 落盘），层序选择见 [`attest_layer_order`]。
-///
-/// 这个请求带没带设备 ID（看 A 端转过来的 `attestation_ids`）。
-/// A 端只在应用真要求 ID 证明时才放这个字段，所以「有」就是「这次要 ID」。
+/// 这个请求带没带设备 ID（看 A 端转过来的 `attestation_ids`）：A 端只在应用真要求 ID
+/// 证明时才放这个字段，所以「有」就是「这次要 ID」。
 fn request_has_attestation_ids(body: &Value) -> bool {
     for holder in [
         body,
@@ -816,17 +779,15 @@ fn request_has_attestation_ids(body: &Value) -> bool {
 
 /// 选这次请求的层序。
 ///
-/// 默认（`auto`）**只看模式**：
-/// - 本地出证（`RELAY_ATTEST_SOURCE=server_keybox`）→ `keybox → b → self_signed`
-/// - 物理模式（`physical`）                  → `b → keybox → self_signed`
-///
-/// 两个策略（普通 / 带设备 ID）都是三态，`auto` 时完全不介入；只有排障时才会被
-/// 强制成 `b_first` 或 `keybox_first`。
+/// 默认（`auto`）**只看模式**：本地出证（`RELAY_ATTEST_SOURCE=server_keybox`）→
+/// `keybox → b → self_signed`；物理模式（`physical`）→ `b → keybox → self_signed`。
+/// 两个策略（普通 / 带设备 ID）都是三态，`auto` 时完全不介入；只有排障时才会被强制成
+/// `b_first` 或 `keybox_first`。
 fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'static [&'static str] {
     const B_CHAIN: &[&str] = &["b", "keybox", "self_signed"];
     const KB_CHAIN: &[&str] = &["keybox", "b", "self_signed"];
-    // 强制模式是「只用这一层」：出不来就把错误抛回去，不回退。能回退的话就跟
-    // 模式自动分层没区别了，调试时也看不出到底是哪一层出的链。
+    // 强制模式是「只用这一层」：出不来就把错误抛回去，不回退 —— 能回退就跟模式自动
+    // 分层没区别了，调试时也看不出到底是哪一层出的链。
     const ONLY_B: &[&str] = &["b"];
     const ONLY_KB: &[&str] = &["keybox"];
     // 证明密钥的「智能模式」：不走 B，但允许回退到自签（不然 keybox 一时不可用
@@ -836,12 +797,11 @@ fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'stati
     if task_type != "attest" {
         return by_mode;
     }
-    // 证明密钥（`PURPOSE_ATTEST_KEY` = 64）：真机上它和普通密钥同一套 keybox，
-    // 根相同；我们物理模式下普通认证走 B、证明密钥留本地就让两边根分叉。
+    // 证明密钥（`PURPOSE_ATTEST_KEY` = 64）：真机上它和普通密钥同一套 keybox、根相同；
+    // 物理模式下普通认证走 B、证明密钥留本地，两边根就分叉了。
     if is_attest_key_request(body) {
-        // 用一把已有 AK 签子钥：不看当前策略，直接回那把 AK 的出生地。
-        // 政策随时会改，AK 却是早就铸好的 —— 跟着策略走就会「AK 在 keybox、子钥派给 B」
-        // 这种错配，B 那边没有它的私钥，只会报 `issuer key ... is not available`。
+        // 用一把已有 AK 签子钥：不看当前策略，直接回那把 AK 的出生地。政策随时会改，
+        // AK 却是早就铸好的 —— 跟着策略走就会「AK 在 keybox、子钥派给 B」这种错配。
         if let Some(issuer) = attestation_key_ref(body) {
             return if issuer.device_id.is_some() {
                 ONLY_B
@@ -894,15 +854,12 @@ fn attestation_key_ref(body: &Value) -> Option<AttestIssuer<'_>> {
     })
 }
 
-/// 是不是证明密钥相关的请求：铸 AK 本身（`KeyPurpose::AttestKey` = 64），
-/// 或者用一把 AK 签子钥（`attestation_key`）。
+/// 是不是证明密钥相关的请求：铸 AK 本身（`KeyPurpose::AttestKey` = 64），或者用一把
+/// AK 签子钥（`attestation_key`）。
 ///
-/// 注意 `AttestKey` 是 **64**（`VERIFY` 才是 8），写错会把普通签名请求当成
-/// 证明密钥 —— 那些请求就被拽到 keybox 层，而它们的 AK 在 B 那边铸的，
-/// 服务端自然找不到 session。
-///
-/// 两者必须走同一层 —— AK 铸在服务端 keybox、子钥却派给 B，B 那边找不到这把
-/// AK 的 session（`issuer key ... is not available on this device`），整笔就废了。
+/// 注意 `AttestKey` 是 **64**（`VERIFY` 才是 8），写错会把普通签名请求拽到 keybox 层，
+/// 而它们的 AK 铸在 B 那边，服务端自然找不到 session。两者必须走同一层：AK 铸在服务端
+/// keybox、子钥却派给 B 时，B 那边没有这把 AK 的 session，整笔就废了。
 fn is_attest_key_request(body: &Value) -> bool {
     // AOSP KeyMint: ATTEST_KEY = 0x40。
     const PURPOSE_ATTEST_KEY: i64 = 64;
@@ -924,11 +881,10 @@ async fn run_a_side_task(
     body: &Value,
     a_meta: Option<crate::auth::TokenMeta>,
 ) -> Response {
-    // A 端远程模式默认不带 `device_id`（模块装好就是留空，面板也不再占位一台设备）。
-    // 留空 = 「服务端挑一台」：这里在入口一次归一（控制台配的默认设备），然后整条链
-    // 路——physical / serverbox 两种模式的层序、StrongBox 分流、身份查找、队列派发——
-    // 看见的都是同一台具体设备，跟「A 端自己带了这个 id」一字不差。没配默认设备就
-    // 保持空，由 `resolve_online_target("")` 按负载挑一台在线的 B。
+    // A 端远程模式默认不带 `device_id`（模块装好就是留空）：留空 = 「服务端挑一台」。
+    // 这里在入口一次归一（控制台配的默认设备），整条链路看见的都是同一台具体设备，
+    // 跟「A 端自己带了这个 id」一字不差。没配默认设备就保持空，由
+    // `resolve_online_target("")` 按负载挑一台在线的 B。
     let body = crate::default_device::fill_in_body(crate::default_device::Chain::Keymint, body);
     let body = &body;
     let mut device_id = body
@@ -938,12 +894,9 @@ async fn run_a_side_task(
         .trim()
         .to_string();
     // 这把钥匙铸在哪台 B（`key_device_id`，A 端 sign/decrypt/agree 从 keyblob 的
-    // `RemoteRef::device_id` 带上来）：私钥只在那台上，必须钉回去。
-    //
-    // 以前整条链路都不带这个信息：attest 回来时 A 端把 `device_id` 存进了 keyblob，
-    // 但 sign/decrypt 的请求体里只有本机配的那台（默认还是空的），于是多台 B 在线时
-    // 按负载挑一台，挑到没有这把钥匙的那台就报 `key_not_found`，App 把一把好好的
-    // 钥匙作废重建。钉子只影响「哪一台」，不动卡身份、不换层。
+    // `RemoteRef::device_id` 带上来）：私钥只在那台上，必须钉回去，钉子只影响「哪一台」，
+    // 不动卡身份、不换层。不钉就会按负载挑到没有这把钥匙的那台，回 `key_not_found`，
+    // App 把一把好好的钥匙作废重建。
     let mut pinned_key_device = false;
     if let Some(owner) = key_device_pin(body) {
         if owner != device_id {
@@ -1018,10 +971,9 @@ async fn run_a_side_task(
     let connected = state.store.get_connected_devices().await;
     let any_b_online = !connected.is_empty();
 
-    // Smart (middle) mode: StrongBox attestations are served by the strongest
-    // honest source available (real B StrongBox -> stored per-device keybox ->
-    // A-side local keybox). A present-but-broken B StrongBox is surfaced to the
-    // app rather than masked; self_signed never substitutes a StrongBox request.
+    // Smart (middle) mode: StrongBox attestations come from the strongest honest
+    // source (real B StrongBox -> stored keybox -> A-side local keybox). A
+    // present-but-broken B StrongBox is surfaced, never masked by self_signed.
     if task_type == "attest"
         && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Smart
         && is_strongbox_request(body)
@@ -1043,25 +995,22 @@ async fn run_a_side_task(
 
     let serverbox = state.fulfill.is_enabled();
 
-    // StrongBox (security_level=2) requests follow the SAME layer order as TEE.
-    // Each layer handles them according to its own capability:
-    //   - server keybox layer: tags the attestation StrongBox using the
-    //     forwarded `attestation_security_level` and mints with the stored keybox.
-    //   - B-side layer: tries the B-side device's real StrongBox HAL; if that
-    //     device has none it returns an error and the next layer is attempted.
-    // Only when every layer fails does the request error, letting the A-side
-    // fall back to its local software keybox.
-    // 远程 attested 链只要真机在线就先让真机出：层序固定 B 端设备优先（物理模式与
-    // serverbox 模式都一样）。serverbox 的密钥层用的是服务端存的身份，叶子上的 device
-    // properties 却是调用方的，拼起来是四不像；所以这一层只当真机不可用时的兜底。
-    // sign/decrypt 仍按模式层序（否则会和已铸出的 keyblob 对不上）。
+    // StrongBox (security_level=2) requests follow the SAME layer order as TEE;
+    // each layer answers by its own capability:
+    //   - server keybox: tags the attestation StrongBox using the forwarded
+    //     `attestation_security_level` and mints with the stored keybox.
+    //   - B-side: tries the device's real StrongBox HAL; if it has none it errors
+    //     and the next layer is attempted.
+    // Only when every layer fails does the request error, letting the A side fall
+    // back to its local software keybox.
+    // attest 的服务端密钥层用的是服务端存的身份，叶子上的 device properties 却是调用方的，
+    // 拼起来是四不像，所以这一层只当真机不可用时的兜底；层序见 `attest_layer_order`。
     let order: &[&str] = attest_layer_order(task_type, body, serverbox);
 
     let mut last_error: Option<String> = None;
-    // 第一处「这台设备根本没有这个 alias 的私钥」的原因，原样带到最终错误里。
-    // A 端靠这段文本（或 error_kind=no_such_key）判断「不是网络/时序问题，而是 key 不在这」，
-    // 从而决定在原地重建或回确定错误码；只在 self_signed 那层含糊地写一句
-    // 「produced no result」会把原因丢掉，A 端就只能当普通失败无限重试。
+    // 第一处「这台设备根本没有这个 alias 的私钥」的原因，原样带到最终错误里：A 端靠它
+    // （或 error_kind=no_such_key）判断「不是网络/时序问题，而是 key 不在这」，从而决定
+    // 在原地重建还是回确定错误码。
     let mut key_missing: Option<String> = None;
     // 「这次请求是被黑名单打下来的」：B 那一跳没走，直接落到服务端密钥层；
     // 那种情况下密钥层的身份查找要先看自动源槽位（见 `identity_for`）。
@@ -1095,30 +1044,26 @@ async fn run_a_side_task(
             }
             Some(v) => {
                 // 层自带的「确定答复」：带 relay_error_kind 的不再往下层试，直接交给 A。
-                // （服务端密钥层找不到调用方那把证明密钥时就是这种：换层只会让链跟那把
-                // 钥匙彻底无关，A 收到标记后映射成 InvalidKeyBlob 让应用重建。）
+                // （服务端密钥层找不到调用方那把证明密钥时就这种：换层只会让链跟那把钥匙
+                // 彻底无关，A 收到标记后映射成 InvalidKeyBlob 让应用重建。）
                 if let Some(kind) = v.get("relay_error_kind").and_then(Value::as_str) {
                     tracing::info!(
                         "run_a_side_task: type={task_type} layer={layer} definitive error kind={kind}"
                     );
                     return Json(v).into_response();
                 }
-                // 失败原因交给 `layer_failure_msg`：各层回的 `error` 优先，只有它
-                // 没给原因时才说空链。`device` 是 *请求的* 设备 —— 正上方的
-                // `b_poll` 行会显示实际接管的是哪一台。
+                // 失败原因交给 `layer_failure_msg`（`error` 优先，没原因才说空链）。
+                // `device` 是 *请求的* 设备，实际接管的是哪一台看 `b_poll` 行。
                 let msg = layer_failure_msg(task_type, layer, &v);
                 tracing::info!(
                     "run_a_side_task: type={task_type} layer={layer} device={device_id} failed: {msg}"
                 );
-                // StrongBox robustness mode: a StrongBox attest that the B
-                // device cannot fulfil (capability error — not supported /
-                // keys not provisioned / HAL absent — or no cert chain at
-                // all) is transparently retried as a TEE request on the B
-                // side — the Android-standard silent fallback. The B side
-                // tags the downgraded chain TRUSTED_ENVIRONMENT, so this is
-                // an honest degradation, never a mislabelled StrongBox.
-                // When the mode is off, the failure propagates to the next
-                // layer exactly as before (strict native semantics).
+                // StrongBox robustness mode: a StrongBox attest the B device cannot
+                // fulfil (capability error / HAL absent / no cert chain) is retried
+                // transparently as a TEE request — the Android-standard silent
+                // fallback. The downgraded chain is tagged TRUSTED_ENVIRONMENT, so it
+                // is an honest degradation, never a mislabelled StrongBox. With the
+                // mode off the failure propagates to the next layer unchanged.
                 if layer == "b"
                     && task_type == "attest"
                     && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Robust
@@ -1158,18 +1103,14 @@ async fn run_a_side_task(
                     key_missing = Some(msg.clone());
                 }
                 // 设备自己说「这个 alias 的私钥不在我这」时，后面的顶替层
-                // （keybox / self_signed）一律不许接手：它们手里的钥匙跟 App
-                // 那把不是一对，签出来的东西 App 一验就废，只会原地无限重试
-                // （线上 `ommega-remote-80a3ffcdf5153abf` 就这么刷了 9 万条
-                // 日志，把 B 那条单线程队列占满，顺带拖慢所有远端 op）。
+                // （keybox / self_signed）一律不许接手：它们手里的钥匙跟 App 那把不是一对，
+                // 签出来 App 一验就废，只会原地无限重试并占满 B 的单线程队列。
                 // 把原因原样交回 A 端，让它在那台设备上原地重建。
                 if b_said_key_missing(layer, &msg) {
-                    // 「B 那台设备没有这把 key」不等于「这把 key 谁都没有」。命中黑名单的
-                    // 包走的是服务端 keybox 那一层，B 从头到尾没见过这把 attestation key，
-                    // 可同一个 alias 的 session 就在我们这边：里面那把叶子私钥跟 App 手上
-                    // 那张叶证书是同一对，签出来是能过验签的。所以先让 keybox 层自己认领
-                    // ——它只在 session 已经存在时才签（`try_handle_sign` 不会现造一把），
-                    // 真没 session 就还是照原来的路子把原因退回 A 端。
+                    // 「B 那台设备没有这把 key」不等于「这把 key 谁都没有」：命中黑名单的
+                    // 包走服务端 keybox 那一层，同一个 alias 的 session 就在我们这边，
+                    // 里面那把叶子私钥跟 App 手上那张叶证书是同一对。所以先让 keybox 层
+                    // 自己认领 —— 它只在 session 已存在时才签（`try_handle_sign` 不会现造）。
                     if task_type == "sign" || task_type == "decrypt" {
                         if let Some(v) =
                             run_layer_keybox(state, task_type, body, &device_id, false).await
@@ -1187,12 +1128,9 @@ async fn run_a_side_task(
                         "run_a_side_task: type={task_type} layer=b reported missing key; \
                          skipping keybox/self_signed substitution for {device_id}"
                     );
-                    // 「这台设备的这个 alias 没有私钥」是设备给的确定答复，不是层失败。
-                    // 用 200 + 因由回给 A 端，让它把这条路径跟「远端整个不可用」分开：
-                    // A 端会翻译成 KEY_NOT_FOUND，调用方据此作废自己那把 attestation
-                    // key 并重建。以前这里包成 HTTP 500，A 端只看得到「远端不可用」，
-                    // 一路退成 UNKNOWN_ERROR(-1000) 并且反复重试 —— 既补不齐证书链，
-                    // 又把这个错误码画像留在检测方那里。
+                    // 「这台设备的这个 alias 没有私钥」是设备给的确定答复，不是层失败，
+                    // 用 200 + 因由回给 A 端：它翻译成 KEY_NOT_FOUND，调用方据此作废自己
+                    // 那把 attestation key 并重建。包成 500 的话 A 端只看得到「远端不可用」。
                     return Json(json!({
                         "error": msg,
                         "relay_error_kind": "key_not_found",
@@ -1227,16 +1165,14 @@ async fn run_a_side_task(
 
 /// 设备层（`layer == "b"`）是否明确回了「这个 alias 没私钥」。
 ///
-/// 只认这一种措辞，因为它是「不是网络、不是时序，而是 key 真不在这」的意思：
-/// 真机说了这句之后，再把服务端自己那把 keybox 的签名顶上去就是另一把钥匙，
-/// 拿不回原样。
+/// 只认这一种措辞：它意味着「不是网络、不是时序，而是 key 真不在这」，此时再拿
+/// 服务端 keybox 的签名顶上去就是另一把钥匙，拿不回原样。
 fn b_said_key_missing(layer: &str, msg: &str) -> bool {
     layer == "b" && msg.contains("no key for alias")
 }
 
-/// 请求里「这把钥匙铸在哪台 B」（A 端 sign/decrypt/agree 带上来的）。
-///
-/// 空串 / 缺省都当没钉：老版本 A 端不带这个字段，行为跟以前一样由服务端挑。
+/// 请求里「这把钥匙铸在哪台 B」（A 端 sign/decrypt/agree 带上来的）。空串 / 缺省都当
+/// 没钉：老版本 A 端不带这个字段，由服务端挑。
 fn key_device_pin(body: &Value) -> Option<&str> {
     body.get("key_device_id")
         .and_then(Value::as_str)
@@ -1249,8 +1185,8 @@ mod key_pin_tests {
     use super::key_device_pin;
     use serde_json::json;
 
-    /// 只认非空 id：老版本 A 端根本不带这个字段，带了空串/空白的也不能当钉子用
-    /// （否则一个手滑的空值就把请求钉在名为 "" 的设备上，永远报离线）。
+    /// 只认非空 id：带了空串/空白不能当钉子用（否则请求就钉在名为 "" 的设备上，
+    /// 永远报离线），也不能拿通用 `device_id` 顶替。
     #[test]
     fn only_a_non_empty_id_pins_the_key() {
         assert_eq!(
@@ -1269,10 +1205,12 @@ mod key_pin_tests {
     }
 }
 
+/// 存活探测：固定回 `pong`。
 pub async fn ping() -> &'static str {
     "pong"
 }
 
+/// 未鉴权的健康检查：模式、任务计数、在线设备（不含 machine_id）。
 pub async fn health(State(state): State<AppState>) -> Response {
     let counts = state.store.counts().await;
     let devices = state.store.get_connected_devices().await;
@@ -1302,10 +1240,9 @@ pub async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// 管理诊断：把服务端当前生效的身份证书链打出来（需要 A/B token，不向匿名调用方
+/// 暴露 keybox 身份）。
 pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    // Diagnostic: dump stored server identity chain (admin diagnostic). Requires
-    // a valid A/B token so the keybox identity is not exposed to unauthenticated
-    // callers.
     if let Err(r) = check_auth(&state, &headers, None).await {
         return *r;
     }
@@ -1337,6 +1274,7 @@ pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) 
 // A-side task endpoints
 // ---------------------------------------------------------------------------
 
+/// A 端认证（出证）请求：鉴权后走三层回退，见 `run_a_side_task`。
 pub async fn attest(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1354,6 +1292,7 @@ pub async fn attest(
     .await
 }
 
+/// A 端签名请求：私钥在哪台 B 就钉回哪台，见 `run_a_side_task`。
 pub async fn sign(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1371,6 +1310,7 @@ pub async fn sign(
     .await
 }
 
+/// A 端解密请求：私钥在哪台 B 就钉回哪台，见 `run_a_side_task`。
 pub async fn decrypt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1421,8 +1361,8 @@ pub async fn soter(
     run_soter_task(&state, &body, a_meta.as_ref()).await
 }
 
-/// SOTER 入口；设备会话在 inner 的设备层补签之后按实际设备清理。
-/// 服务端回退层不消费其他设备的同号会话。
+/// SOTER 入口：按设备串行（`soter_device_guard`），设备 ID 在这里就归一。
+/// 设备会话在 inner 的设备层补签之后按实际设备清理，服务端回退层不消费其他设备的同号会话。
 async fn run_soter_task(
     state: &AppState,
     body: &Value,
@@ -1442,11 +1382,9 @@ async fn run_soter_task(
 
 /// 设备级串行锁：同一台 B 上的 SOTER 请求一个个来。
 ///
-/// 设备侧 TA 一台只保留一个会话（见 `soter_sign_sessions` 模块注释，2026-10-01 实测）：
-/// 两个 `init_sign` 同时在飞，后到的会把前一张会话顶掉，前一笔的 `finish_sign` 只能回
-/// -204 靠补签兜。现场表现就是“刚弄好，别人的请求进来把状态毁了”——而且补签要重跑
-/// 一遗，慢、偶尔还补不回来。按设备排队后，这种互顶从源头上就不会发生；不同设备
-/// 互不影响，排队时长由调用方自己的 deadline 卡着。
+/// 设备侧 TA 一台只保留一个会话（见 `soter_sign_sessions`）：两个 `init_sign` 同时在飞，
+/// 后到的会把前一张会话顶掉，前一笔的 `finish_sign` 只能回 -204 靠补签兜。按设备排队后
+/// 这种互顶从源头就不会发生；不同设备互不影响，排队时长由调用方自己的 deadline 卡着。
 static SOTER_DEVICE_LOCKS: LazyLock<
     Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -1477,8 +1415,7 @@ const REPAIR_RETRY_GAP: Duration = Duration::from_millis(150);
 /// `finish_sign` 回 -204 时的补救：拿 init 时缓存的参数重开一张会话再签一次。
 ///
 /// -204 的意思是这张会话被后来的一笔 `init_sign` 顶掉了（一台 TA 只保留一个会话）。
-/// 用同一个 uid / 别名 / challenge 重开一次，签出来的值是等价的，App 看到的是一次正常成功。
-///
+/// 用同一个 uid / 别名 / challenge 重开一次，签出来的值等价，App 看到的是正常成功。
 /// 只试 [`REPAIR_ATTEMPTS`] 次（间隔 [`REPAIR_RETRY_GAP`]），试不出来就把原来的 -204 还回去。
 async fn repair_clobbered_finish(
     state: &AppState,
@@ -1496,8 +1433,8 @@ async fn repair_clobbered_finish(
     let spec = match state.sign_sessions.lookup_for(device, requested, session) {
         Some(spec) => spec,
         None => {
-            // 这张会话没登记（init 不是设备层答的）或者登记已经过期 —— 补不了，只能把
-            // 原来的 -204 还回去。留一行日志，好知道到底哪种情况多。
+            // 这张会话没登记（init 不是设备层答的）或者登记已过期 —— 补不了，只能把
+            // 原来的 -204 还回去。
             tracing::warn!("soter: 会话 {session} 没在登记表里（没记上或已过期），补不了");
             return Ok(None);
         }
@@ -1660,8 +1597,8 @@ fn repair_reply_known(reply: &Value, actual: Option<&str>, target: Option<&str>)
     }
 }
 
-/// 把一笔 `finish_sign` 请求改写成「重开同一张槽位」的 `init_sign`：补签要的三个参数
-/// 全带上（App 的 finish 请求里只有 session，别的什么都没有）。
+/// 把一笔 `finish_sign` 请求改写成「重开同一张槽位」的 `init_sign`：补签要的 uid / alias /
+/// challenge 全带上（App 的 finish 请求里只有 session）。
 fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Value {
     let mut out = body.clone();
     if let Some(obj) = out.as_object_mut() {
@@ -1676,10 +1613,9 @@ fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Val
 
 /// SOTER 转发：跟认证共用同一套三层链，差别在三层的实现。
 ///
-/// 层序（两种模式只差优先级）：
-///   physical:  B 端设备层 -> 服务端密钥层(keybox) -> 服务端自签层
-///   serverbox: 服务端密钥层 -> B 端设备层 -> 服务端自签层
-/// 哪层没做成（没物料 / 没能力 / 失败）就回退下一层，三层都不行才回错给 A 端。
+/// 层序（两种模式只差优先级）：physical 是 B 端设备层 → 服务端密钥层(keybox) → 自签层；
+/// serverbox 是服务端密钥层 → B 端设备层 → 自签层。哪层没做成（没物料 / 没能力 / 失败）
+/// 就回退下一层，三层都不行才回错给 A 端。
 ///
 /// B 端层在线点名时不换设备；离线点名且没有已登记的会话路由时才按能力和负载选。
 /// finish 保留 init 的实际设备，不在另一台设备上拿同号句柄补签。
@@ -1691,21 +1627,13 @@ async fn run_soter_task_inner(
     if !body.is_object() {
         return json_err(StatusCode::BAD_REQUEST, "json object body required");
     }
-    // 入口闸门：同一个 uid 在 100ms 内重复来的 SOTER 请求直接回「本地作答」，
-    // 不再走后面的默认设备归一、会话路由和 DB。
-    //
-    // 为什么：探测机（春秋 / 鸭子）一刻不停地刷 SOTER，实测量级每秒几十笔，
-    // 每一笔都要过一遍路由 + 会话库，服务端 CPU 和 MySQL 被它吃掉，买卡页跟着变慢。
-    // 它们要的结论是固定的（local_only），100ms 内复用没有副作用；真应用（微信 /
-    // 支付宝）正常流程不会在同一 uid 上 100ms 内发第二笔，不受影响。
+    // 入口闸门：同一个 uid 在 100ms 内重复来的 SOTER 请求直接回「本地作答」，不再走
+    // 后面的默认设备归一、会话路由和 DB。探测机（春秋 / 鸭子）每秒几十笔，要的结论是
+    // 固定的 local_only，100ms 内复用没有副作用。
     if let Some(uid) = body.get("uid").and_then(Value::as_i64) {
-        // 真应用不过这道闸门。
-        //
-        // 闸门是为了探测机（春秋 / 鸭子，每秒几十笔）省 CPU 的；可它们要的结论是
-        // 固定的 local_only。真应用一轮流程里 ASK / generateAuthKey / export 的
-        // 间隔经常不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」——两边的
-        // cpu_id 和钥匙对不上，检测器 C5b（两次 cpuid 不一致）和 T10（建了导不出）
-        // 就是这么红的。所以先看名单，真应用直接放过去走正常路由。
+        // 真应用不过这道闸门：它们一轮流程里 ASK / generateAuthKey / export 的间隔经常
+        // 不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」，两边 cpu_id 和钥匙
+        // 对不上。所以先看名单，真应用直接走正常路由。
         let caller_pkg = body
             .get(crate::soter_probe::CALLER_PKG_FIELD)
             .and_then(Value::as_str);
@@ -1755,8 +1683,8 @@ async fn run_soter_task_inner(
         .and_then(Value::as_str)
         .unwrap_or("-")
         .to_string();
-    // 「按包名判」这条路到底盖没盖住这笔：带过来就写包名，没带就写 `-`。生产上就靠这一格
-    // 数覆盖率（A 端那条链：内核 uid → 本机翻包名 → caller_pkg）。
+    // 「按包名判」这条路盖没盖住这笔：带过来就写包名，没带就写 `-`（A 端那条链：
+    // 内核 uid → 本机翻包名 → caller_pkg）。
     let caller_pkg = body
         .get(crate::soter_probe::CALLER_PKG_FIELD)
         .and_then(Value::as_str)
@@ -1782,7 +1710,7 @@ async fn run_soter_task_inner(
         }
     );
     // 隔离进程（AOSP 90000..=99999）没有自己的身份，真机上这类进程也拿不到 keystore 里的
-    // 密钥。真报上来就是探测信号，记一笔留着看，不改变答复（老 A 端也可能这么报）。
+    // 密钥。真报上来就是探测信号，记一笔，不改变答复。
     if let Some(iso) = uid_ctx.filter(|u| u.is_isolated()) {
         tracing::warn!(
             "soter: 隔离进程在要 SOTER（uid={}），AOSP 里这种进程没有独立身份",
@@ -1790,10 +1718,8 @@ async fn run_soter_task_inner(
         );
     }
 
-    // 探测机（春秋 / 鸭子）的 SOTER 请求不落 B 端：用服务端内置物料就地作答。这两台探测器
-    // 把整套流程反复地跑，每一笔都要真机 TEE 陪着走一遍（实测当前每分钟十几到二十几笔），
-    // 而它们要的只是「SOTER 能不能用」。判据在 `soter_probe` 里（别人自己写的 A 端没有本地
-    // 兜底，这些流量只有服务端看得见）。attest 走的是另一条路，这里一个字都不动。
+    // 探测机（春秋 / 鸭子）的 SOTER 请求不落 B 端，用服务端内置物料就地作答：它们把整套
+    // 流程反复地跑，要的只是「SOTER 能不能用」。判据在 `soter_probe` 里；attest 走另一条路。
     let uid_arg = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     let probe_alias_arg = body.get("alias").and_then(Value::as_str);
     let session_arg = body.get("session").and_then(Value::as_i64);
@@ -1808,18 +1734,15 @@ async fn run_soter_task_inner(
     };
     let session_present =
         op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
-    // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`（跑检测时
-    // 前台往往是桌面），拿它判白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId
-    // 却退回本地，两个 `cpu_id` 一撞就是检测器那条 C5b。它跟 `finish_sign` 一样是会话类
-    // 调用，只看这台设备上一笔落在哪一层。    // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`（跑检测时
-    // 前台往往是桌面），拿它判白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId
-    // 却退回本地，两个 `cpu_id` 一撞就是检测器那条 C5b。怎么定它归哪一层见
-    // `soter_probe::get_device_id_side`（白名单优先，其次跟上这笔设备上一笔，最后才本地）。
+    // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`，拿它判
+    // 白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId 却退回本地，两个 `cpu_id`
+    // 一撞就是检测器那条 C5b。归哪一层见 `soter_probe::get_device_id_side`（白名单优先，
+    // 其次跟上这笔设备上一笔，最后才本地）。
     let caller_pkg_arg = body
         .get(crate::soter_probe::CALLER_PKG_FIELD)
         .and_then(Value::as_str);
-    // 计一笔“包名 → 24 小时请求次数”（页面在 /soter）。放这里而不是等到分支里：
-    // 后面这道探针闸门会把探测机直接打回本地，那些也算请求，得统计。
+    // 计一笔“包名 → 24 小时请求次数”（页面在 /soter）。必须放在这里而不是等到分支里：
+    // 下面这道探针闸门会把探测机直接打回本地，那些也算请求。
     crate::soter_stats::record(caller_pkg_arg.unwrap_or_default());
     let probe_verdict = if op == "get_device_id" {
         crate::soter_probe::get_device_id_side(
@@ -1841,23 +1764,13 @@ async fn run_soter_task_inner(
     if let Some(why) =
         probe_verdict.or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
     {
-        // 带会话号的 finishSign 不吃这套：它必须回到开会话的那一侧。
-        //
-        // 以前这里还豁免了 `soter_identity_op`（ASK/AuthKey/get_device_id 那几笔），
-        // 理由是「它们的料在 B 上、ASK 要拿去上报腾讯」。那个理由只对**真应用**成立；
-        // 对检测器恰好相反：它们要的是「料自洽」。当时的效果是 Duck 的 ASK 由 B 的真
-        // TEE 出、cpu_id 自然是 B 那台的，它一句「the device behind the default Soter
-        // relay」就把中继点破了（2026-11-02 实测）。
-        //
-        // 现在只留 finishSign 一个例外：非白名单调用者的身份类 op 也退回 A 本地作答，
-        // ASK / AuthKey / getDeviceId / cpu_id 全来自同一台机器，互相不矛盾；真应用
-        // 本来就在白名单里，根本走不到这个分支，腾讯那边照样能验。
+        // 只留 finishSign 一个例外（它必须回到开会话的那一侧）：非白名单调用者的身份类
+        // op 也退回 A 本地作答，ASK / AuthKey / getDeviceId / cpu_id 全来自同一台机器，
+        // 互相不矛盾；真应用本来就在白名单里，走不到这个分支，腾讯那边照样能验。
         if !session_present {
-            // 白名单外（检测器一类）：**不造料**，直接告诉 A 端「这笔你自己本地答」。
-            // 造料要现签名，几十台检测器一起刷就把 CPU 占满，真应用的请求只能排队；
-            // 退回 A 端本地后，工作负载分散到各台手机上，服务端只负责转发真应用。
-            // 旧 A 端不认识 `local_only`，会当成「答复形状不认识」放给真 HAL，
-            // 也就是本地能答就答 —— 方向一致，不会把人卡住。
+            // 白名单外（检测器一类）：**不造料**，直接告诉 A 端「这笔你自己本地答」。造料
+            // 要现签名，几十台检测器一起刷就把 CPU 占满；退回本地后负载分散到各台手机上。
+            // 旧 A 端不认识 `local_only`，会放给真 HAL 做本地作答 —— 方向一致。
             tracing::info!(
                 "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
              直接退回 A 端本地作答，不造料、不落 B"
@@ -1876,9 +1789,8 @@ async fn run_soter_task_inner(
     let gate_uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     let alias_arg = body.get("alias").and_then(Value::as_str);
     // 削峰：同一台设备上同一份只读 op（`has_auth_key` / `has_ask_already` / `export_*`）
-    // 会被 App 的 SOTER 初始化循环反复问，几秒内答案不会变；重建类 op 也会被反复重放。
-    // 命中的前提是上一次**真由这台设备答出来**（见 `soter_gate`），而且窗口极短，
-    // 设备一旦恢复下一笔就问得着。
+    // 会被 App 的 SOTER 初始化循环反复问，几秒内答案不会变。命中的前提是上一次**真由这台
+    // 设备答出来**（见 `soter_gate`），窗口极短，设备一旦恢复下一笔就问得着。
     if let Some(mut hit) = state.soter_gate.lookup(requested, op, gate_uid, alias_arg) {
         // 命中短 TTL 缓存的也要过一遍「ASK 毒化」改写：不然 App 在这 5 秒窗口里
         // 仍旧被告知「ASK 已存在」，白等一轮。
@@ -1982,14 +1894,12 @@ async fn run_soter_task_inner(
     } else {
         b_target
     };
-    // 服务端密钥模式不碰 B：候选一律作废，后面的写操作拦截、签名租约、能力挑选
-    // 都跟着走不着（那一整套是给真机那条路用的）。
+    // 服务端密钥模式不碰 B：候选一律作废，后面的写操作拦截、签名租约、能力挑选都
+    // 跟着走不着（那一整套是给真机那条路用的）。
     let b_target = if server_key_mode { None } else { b_target };
 
-    // 点名的 B 端能用就先走它，物理 / serverbox 两种模式一样：服务端那两层只在
-    // 这台接不了（离线、能力不足、或这一笔做不下去）时才接管。没点名、或点名那台
-    // 不可用时保持原来的模式顺序（serverbox 先服务端）。
-    // 点名的 B 能用、或者落到了兜底 B，都先走 B；两者都没有才按模式顺序。
+    // 点名那台能用（或者落到了配置的兜底 B）就先走 B；两者都没有才按策略层序。
+    // 服务端那两层只在 B 接不了（离线、能力不足、或这一笔做不下去）时才接管。
     let order: &[&str] = &order_owned;
 
     // Physical finish must never fall through to a fabricated session or repair
@@ -2008,18 +1918,15 @@ async fn run_soter_task_inner(
 
     // SOTER 的写操作只在 A 端点名的那台设备上做；点名那台接不了就明说，不换设备。
     //
-    // 换台做的后果我们已经在线上看过一遍了：钥匙状态改在别的设备上，然后因为「不是
-    // 点名那台」被判成「结果未知」，App 收到 -1000 —— 两头不落（2026-10-03，几十条/分钟）。
-    // 连「一台能接的设备都没有」（点名那台离线、或者服务端刚重启还没学到谁在线）
-    // 也算接不了：那种情况下照样判「结果未知」，App 拿到的 -1000 比确定的答复难处理。
+    // 换台做的后果：钥匙状态改在别的设备上，然后因为「不是点名那台」被判成「结果未知」，
+    // App 收到 -1000 —— 两头不落。「一台能接的设备都没有」也算接不了。
     //
-    // 但「点名那台离线、服务端已经给它登记了一台替代设备」是例外：那台替代是粘滞的
-    // （`soter_substitutes`，同一台 requested 在 TTL 内一直映射到同一台），而且签名
-    // 类已经限定为「实测真签过」（`soter_sign`）的设备。不让写操作跟过去，默认设备
-    // 一离线微信就整族失败（2026-10-22 实测：设备离线 → 建 ASK 全被拒 → 微信「系统错误」）。
+    // 例外是「点名那台离线、服务端已经给它登记了一台替代设备」：替代是粘滞的
+    // （`soter_substitutes`，同一台 requested 在 TTL 内一直映射到同一台），签名类还限定为
+    // 真签过的设备。不让写操作跟过去，默认设备一离线微信就整族失败。
     //
-    // 回什么见 `soter_off_target_reply`：写操作回 -5（这把钥匙不在这台，去原地重建），
-    // 要签名的回 -204（会话不在这台，就是 App 自己也会算出来的那个 `OPERATEID_NULL`）。
+    // 回什么见 `soter_off_target_reply`：写操作回 -5（去原地重建），要签名的回 -204
+    // （`OPERATEID_NULL`，App 自己也会算出这个）。
     let substituted = if b_target.as_deref() != Some(requested) && !requested.is_empty() {
         state.store.soter_substitute_of(requested).await.as_deref() == b_target.as_deref()
     } else {
@@ -2042,19 +1949,17 @@ async fn run_soter_task_inner(
         return Json(soter_off_target_reply(op)).into_response();
     }
 
-    // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：
-    // 只拿 `init_sign` 时缓存的参数重开一张会话再签一次。B 端自己的能力探针也会在这台
-    // 设备上跑 `init_sign`，那是另一条顶人的路子，已在 B 端给它加了空闲门
-    // （`b-side/source/src/caps.rs` 的 `SIGN_PROBE_QUIET`）。
+    // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：只拿 `init_sign`
+    // 时缓存的参数重开一张会话再签一次。B 端自己的能力探针也会在这台设备上跑
+    // `init_sign`，那是另一条顶人的路子，已在 B 端给它加了空闲门（`caps.rs` 的
+    // `SIGN_PROBE_QUIET`）。
 
     // 这个槽位已经定过层就把它排到最前面：同一槽位的材料必须只出自一层，否则 App
     // 手里会出现一半 B 的一半 keybox 的状态（导出的公钥和签名的私钥都对不上）。
     //
-    // 但钉子只在「B 端这层结构性地做不了」（一台能接的设备都没有）的时候才作数：
-    // 一次超时、一次 `-26`（这一笔的验证没过）都可能只是这一笔没答好，那种时候
-    // 把槽位挪到服务端自签那两层，App 手里就换成假料了，真机再也轮不上 —— 实测
-    // PLC110 的 uid 10490 就是这么被钉到 self_signed 上，之后每轮第一个 op 又把
-    // 钉子续上，一轮流程都回不到真机。
+    // 钉子只在「B 端这层结构性地做不了」（一台能接的设备都没有）时作数：一次超时、一次
+    // `-26` 都可能只是这一笔没答好，把槽位挪到服务端那两层，App 手里就换成假料了，
+    // 真机再也轮不上。
     let uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
     // 顺手记下这个槽位上是哪个微信号在用（`soter_mint::owner_token` 从别名里认）：
     // uid 级全清要不要拦下来，就看这里认出来几个账号。
@@ -2088,11 +1993,9 @@ async fn run_soter_task_inner(
     if layers.is_empty() {
         layers.extend(order.iter().copied());
     }
-    // `get_device_id` 钉回上一笔那一层。
-    //
-    // ASK 是服务端造料（`keybox` / `self_signed` / `attk`）时，这个 op 也必须由同一层答：
-    // 两边的 `cpu_id` 出自同一套材料，才不会一高一低（退回 A 端本地就是本机派生号，
-    // 跟 ATTK 的号差得远）。检测器那条 C5b 就是拿这两个数对的。
+    // `get_device_id` 钉回上一笔那一层。ASK 是服务端造料（`keybox` / `self_signed` /
+    // `attk`）时这个 op 也必须由同一层答：两边的 `cpu_id` 出自同一套材料，才不会一高一低
+    // （退回 A 端本地就是本机派生号，跟 ATTK 的号差得远）。
     if op == "get_device_id" {
         if let Some(layer) = crate::soter_probe::server_layer(requested) {
             if let Some(pos) = order.iter().position(|l| *l == layer) {
@@ -2107,12 +2010,10 @@ async fn run_soter_task_inner(
     }
     // ASK 身份类的 op 只走真机。
     //
-    // 微信把 ASK 的 (cpu_id, uid) 永久缓存在自己 prefs 里（`dm4/u.java`：两个都非空
-    // 就「directly return」，再也不读真 ASK），而且开启流程会把 ASK 公钥上传给腾讯
-    // 校验。服务端两层造的是**假 cpu_id** 的自洽产物，腾讯那边过不了；微信的
-    // `d36/p0.a(false)` 拿到这个结果就直接 `q26.a.r()` —— uid 级全清。所以这几个
-    // op 只要 B 端能接就一层都不往下换，宁可这一笔失败。B 端整层做不了（没有设备）
-    // 时照旧让下面两层兜底，那是极端情况。
+    // 微信把 ASK 的 (cpu_id, uid) 永久缓存在自己 prefs 里，而且开启流程会把 ASK 公钥上传
+    // 给腾讯校验。服务端两层造的是**假 cpu_id** 的自洽产物，腾讯那边过不了，微信拿到
+    // 这个结果就直接 uid 级全清。所以这几个 op 只要 B 端能接就一层都不往下换，宁可这
+    // 一笔失败；B 端整层做不了（没有设备）时照旧让下面两层兜底。
     if soter_identity_op(op) && b_target.is_some() {
         if layers.first() != Some(&"b") {
             tracing::info!(
@@ -2136,24 +2037,19 @@ async fn run_soter_task_inner(
     let mut b_error_reply: Option<Value> = None;
     let mut served_device: Option<String> = None;
     // 服务端密钥模式用哪把 ATTK：先看身份绑定规则（用户号 / 完整 uid / 用户内应用号 /
-    // 包名）；没命中就交给「请求那台设备」去匹配（设备 id 空的请求已经被控制台那个
-    // 默认 SOTER 设备 id 填过），最后才用控制台指定的兜底那把。
+    // 包名）；没命中就交给「请求那台设备」去匹配，最后才用控制台指定的兜底那把。
     let rule_attk = policy.rule_attk(uid_arg, caller_pkg_arg);
     let fallback_attk = policy.attk_id;
 
     for &layer in &layers {
         let result = match layer {
             "b" => {
-                // uid 级全清是微信自己会打的枪（见 `soter_mint::owner_token` 上的注释：
-                // `d36/p0.a(false)` 腾讯校验失败、`d36/m0` 的 `WechatASK` 状态脏、
-                // `d36/q0.f()` 生成被取消，三条都调 `q26.a.r()`）。真机上这个 uid 只有
-                // 一个号，清的是自己；我们这里十几个号挤一个 uid（实测一台 B 端最多 28
-                // 个 `WechatAuthKeyPay&<微信号>`），一枪下去同 uid 别人的开通记录全废，
-                // 而私钥只在 TA 里、重建出来是新的，腾讯存着的公钥对不上 —— 之后指纹
-                // 支付就一直失败。所以槽位上不止一个账号时，这一笔只答成功、不真清。
+                // uid 级全清是微信自己会打的枪（见 `soter_mint::owner_token` 的注释）。
+                // 真机上这个 uid 只有一个号，清的是自己；我们这里十几个号挤一个 uid，一枪
+                // 下去同 uid 别人的开通记录全废，而私钥只在 TA 里、重建出来是新的，腾讯存的
+                // 公钥对不上。所以槽位上不止一个账号时，这一笔只答成功、不真清。
                 //
-                // 跟在它后面的 `remove_auth_key`（微信会逐个删自己的 scene 别名）照常
-                // 转发，所以调用方自己想删的东西还是一样删掉。
+                // 跟在它后面的 `remove_auth_key`（微信逐个删自己的 scene 别名）照常转发。
                 if op == "remove_all_uid_key" {
                     if let Some(uid) = uid {
                         let owners = crate::soter_mint::owner_count(requested, uid);
@@ -2182,9 +2078,8 @@ async fn run_soter_task_inner(
                 let mut lease = if needs_sign {
                     match b_target.as_deref() {
                         Some(device) if op == "init_sign" => {
-                            // 抢不到租约不再直接回 -9：那会让 A 端连指纹圈都弹不出来
-                            // （2026-10-02 线上回归）。退成不带租约执行，让 TA 自己顶掉
-                            // 旧会话，收尾交给 -204 补救路径，性质跟 1.6.3 一致。
+                            // 抢不到租约也不直接回 -9：那会让 A 端连指纹圈都弹不出来。退成
+                            // 不带租约执行，让 TA 自己顶掉旧会话，收尾交给 -204 补救路径。
                             let lease = state
                                 .sign_sessions
                                 .acquire(device, requested, request_deadline)
@@ -2221,10 +2116,9 @@ async fn run_soter_task_inner(
                                 }
                             }
                         }
-                        // 没有 B 可派（服务端密钥模式、或者这一笔本来就落在服务端那两层）
-                        // 时不能拿它当会话过期：这张会话是服务端自己开的，签名也在服务端
-                        // 本地做，压根不需要 B 的租约。以前这里不看 server_owner，服务端
-                        // 密钥模式下每一笔 finish_sign 都被判成 -204。
+                        // 没有 B 可派（服务端密钥模式、或者这一笔本来就落在服务端那两层）时
+                        // 不能当会话过期：这张会话是服务端自己开的，签名也在服务端本地做，
+                        // 压根不需要 B 的租约。
                         None if op == "finish_sign" && server_owner.is_none() => {
                             return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response()
                         }
@@ -2252,9 +2146,8 @@ async fn run_soter_task_inner(
                                     return Some(soter_unknown_reply());
                                 }
                                 // generate_*/remove_*：没落在点名那台上就是确定的结论，
-                                // 不管是因为换台做完了、还是压根没派出去 / 被队列直接拒了。
-                                // 换台做过的那些更得说清楚 —— 那把钥匙其实没动，也不存在
-                                // A 端这台机器上。
+                                // 不管是换台做完了还是压根没派出去。换台做过的更得说清楚 ——
+                                // 那把钥匙其实没动，也不在 A 端这台机器上。
                                 tracing::warn!(
                                     "soter: op={op} uid={probe_uid} 点名设备 {} 上没做成\
                                      （device={:?}），回确定码不换层",
@@ -2342,10 +2235,9 @@ async fn run_soter_task_inner(
                                     .filter(|s| *s != 0);
                                 match (session, lease.as_mut()) {
                                     (Some(session), Some(guard)) => {
-                                        // 记账不是我们就只记一行警告 —— 会话是真的，
-                                        // 以前这里会把它改口成 -204，App 收到就自删重来一轮
-                                        // （一台设备上多路客户端抢同一张 TA 会话是常态，
-                                        // 2026-10-03 实测）。
+                                        // 记账不是我们就只记一行警告 —— 会话是真的，改口成 -204
+                                        // 会让 App 自删重来一轮（一台设备上多路客户端抢同一张
+                                        // TA 会话是常态）。
                                         if !guard.retain_session(session) {
                                             tracing::warn!(
                                                 "soter: init_sign uid={probe_uid} alias={probe_alias} \
@@ -2393,7 +2285,6 @@ async fn run_soter_task_inner(
         };
         match result {
             Some(v) if v.get("soter_outcome_unknown").and_then(Value::as_bool) == Some(true) => {
-                // 这条以前不打日志，线上只看得到「请求进来了、什么结果都没有」。
                 tracing::warn!(
                     "soter: op={op} uid={probe_uid} layer={layer} 结果未知（mutation outcome unknown），不落兜底层，原样回给 App"
                 );
@@ -2402,8 +2293,8 @@ async fn run_soter_task_inner(
             Some(mut v)
                 if layer == "b" && v.get("error_code").and_then(Value::as_i64) == Some(-9) =>
             {
-                // 这条也一样是静默的：`-9` = IS_AUTHING，设备说它那儿还有一张签名没收尾。
-                // `init_sign` 上吃到它就等于这一轮 App 弹不出指纹圈（2026-10-03 线上）。
+                // `-9` = IS_AUTHING，设备说它那儿还有一张签名没收尾：`init_sign` 上吃到它
+                // 就等于这一轮 App 弹不出指纹圈，原样递回。
                 tracing::warn!(
                     "soter: op={op} uid={probe_uid} layer=b 设备回了 -9（IS_AUTHING）原样递回；\
                      init_sign 上出这个 A 端就弹不出指纹圈"
@@ -2416,9 +2307,8 @@ async fn run_soter_task_inner(
             Some(mut v) if v.get("error").is_none() => {
                 // 服务端这两层的钥匙各是各的（`soter_mint` 的 `Store::auth` 按
                 // `{device}|{uid}|{alias}` 存），槽位建在 B 上的钥匙它们手里没有，于是
-                // 「用已有钥匙」的 op 会回 -5/-6/-8。那不是「做成了」，是「这层没这把
-                // 钥匙」；当成成功递出去，App 会以为钥匙丢了 —— 实测 Duck Detector 就是
-                // 这么报 soter damaged 的。这种答复不算数，接着往下走。
+                // 「用已有钥匙」的 op 会回 -5/-6/-8。那不是「做成了」，是「这层没这把钥匙」，
+                // 当成成功递出去 App 会以为钥匙丢了。这种答复不算数，接着往下走。
                 if let Some(code) = server_layer_missed_the_slot(layer, op, &v) {
                     let detail = format!(
                         "{layer}: 这层没有这个槽位的材料（{code} {}）",
@@ -2431,9 +2321,8 @@ async fn run_soter_task_inner(
                 let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
                 tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
                 // 这一笔归哪一层：`b` 是真机，`keybox` / `self_signed` / `attk` 是服务端
-                // 自己造的（用的是 A 端带上来的 cpu_id），A 端本地作答是第三种。
-                // `get_device_id` 那笔靠它决定跟哪边走 —— 三态不能归并：服务端造料跟
-                // A 端本地是两个不同的号。
+                // 自己造的（用的是 A 端带上来的 cpu_id），A 端本地作答是第三种。三态不能
+                // 归并 —— 服务端造料跟 A 端本地是两个不同的号，`get_device_id` 靠它决定跟哪边走。
                 crate::soter_probe::note_device_side(
                     requested,
                     if layer == "b" {
@@ -2512,9 +2401,7 @@ async fn run_soter_task_inner(
     if let Some(reply) = b_error_reply {
         // 服务端那两层接不了这笔（材料在真机上，它们手里没有），把设备层的答复还回去：
         // App 该看到的是「这台设备真实出了什么毛病」，而不是「这把钥匙不在这层」。
-        //
-        // 码先取出来：`tracing` 宏展开里自带一个叫 `Value` 的东西，写在宏参数里会被它抢走
-        // （`error[E0782]: expected a type, found a trait`）。
+        // 码先取出来：`tracing` 宏展开里自带一个叫 `Value` 的东西，写在宏参数里会被它抢走。
         let code = reply.get("error_code").and_then(Value::as_i64).unwrap_or(0);
         tracing::warn!(
             "soter: op={op} requested={requested} 服务端两层都接不了这个槽位（{detail}），\
@@ -2529,16 +2416,13 @@ async fn run_soter_task_inner(
     )
 }
 
-/// 「这笔写操作没落在 A 端点名的那台设备上」该回什么。
+/// 「这笔写操作没落在 A 端点名的那台设备上」该回什么。两种写操作 App 认的东西不一样：
 ///
-/// 两种写操作要分开说，因为 App 两边认得的东西不一样：
-///
-/// * 要签名的（`init_sign` / `finish_sign`）回 **-204**（`SOTER_ERROR_OPERATEID_NULL`）。
-///   这是 App 自己也会算出来的「这张会话不在了」，会走它自己的重试/补签那条路；
-///   回 -5（钥匙不在）反而可能让它以为要重新生成密钥。
-/// * 其余的（`generate_*` / `remove_*`）回 **-5**（`NOT_FOUND`）：跟 A 端本地兜底那个
-///   码一个意思 —— 这台设备上就是没有这把钥匙（或者这把钥匙没被改过），
-///   让 A 端在原地重建，别在别的设备上重做、也别让服务端两层替它造。
+/// * 要签名的（`init_sign` / `finish_sign`）回 **-204**（`SOTER_ERROR_OPERATEID_NULL`）：
+///   这是 App 自己也会算出来的「这张会话不在了」，会走它的重试/补签那条路；
+///   回 -5 反而可能让它以为要重新生成密钥。
+/// * 其余的（`generate_*` / `remove_*`）回 **-5**（`NOT_FOUND`）：这台设备上就是没有这把
+///   钥匙，让 A 端在原地重建，别在别的设备上重做、也别让服务端两层替它造。
 fn soter_off_target_reply(op: &str) -> Value {
     if crate::queue::soter_op_needs_sign(op) {
         json!({"error_code": -204, "relay_error_kind": "soter_device_mismatch"})
@@ -2549,9 +2433,8 @@ fn soter_off_target_reply(op: &str) -> Value {
 
 /// 这笔 SOTER 调用是不是「没落在 A 端点名的那台设备上」。
 ///
-/// 写操作（`generate_*` / `remove_*` / 要签名的 `init`、`finish`）落到别的设备上（或
-/// 者一台都没派出去）就等于没在点名那台上做：材料对不上，判据（`mutation_outcome_unknown`
-/// 看的就是点名设备）也判不到，只能回 -1000。所以只认点名那台。
+/// 写操作（`generate_*` / `remove_*` / 要签名的 `init`、`finish`）落到别的设备上，或者一台
+/// 都没派出去，就等于没在点名那台上做：材料对不上，`mutation_outcome_unknown` 也判不到。
 ///
 /// `session_routed` 是 `finish_sign` 带会话时的例外：那张会话本来就记在另一台设备上
 /// （`sign_sessions.route` 的结论），按它走是正常的，不算顶替。
@@ -2587,13 +2470,10 @@ fn consistent_soter_target(
     }
 }
 
-/// B 端设备层：只派给调用方已解析并校验过的设备。
-///
 /// 递给 B 端的那份 SOTER 请求体：把只给服务端看的字段摘掉，`None` = 原样发。
 ///
-/// 目前只有 `cpu_id` 一个。它是 A 端学来的**真机** cpu_id，用来让服务端那两层和 A 端
-/// 本地兜底跟真机报同一个号（见 `soter_mint::docs_cpu_id`）。B 端那个号是它自己 TA 报的，
-/// 我们既改不了也不用改，递过去只会多出一种说法。
+/// 目前只有 `cpu_id` 一个：它是 A 端学来的**真机** cpu_id，用来让服务端那两层和 A 端本地
+/// 兜底跟真机报同一个号（见 `soter_mint::docs_cpu_id`）。B 端那个号是它自己 TA 报的。
 fn device_soter_body(body: &Value) -> Option<Value> {
     let object = body.as_object()?;
     if !object.contains_key(crate::soter_mint::CPU_ID_FIELD) {
@@ -2606,8 +2486,10 @@ fn device_soter_body(body: &Value) -> Option<Value> {
     Some(copy)
 }
 
-/// 一台都没有不算"这层不管这个 op"，而是这层没做成，所以返回带 `error` 的对象，
-/// 让上层接着试服务端那两层。
+/// B 端设备层：只派给调用方已解析并校验过的设备，把这层的结论包成 `BSoterLayer`。
+///
+/// 一台都没有不算「这层不管这个 op」，而是这层没做成，所以返回带 `error` 的对象，让上层
+/// 接着试服务端那两层。
 async fn try_b_soter_layer(
     state: &AppState,
     body: &Value,
@@ -2626,13 +2508,9 @@ async fn try_b_soter_layer(
             hardware_reply: None,
         });
     };
-    // A/B 配对：跟 `/api/attest/` 那条路同一个判据 —— 两个卡种都过 `allows`。
-    // 两边有一方没登记（老客户端 / 老卡密 / 静态 token）就按历史行为放行。
-    //
-    // 这条以前只在认证那条路上有，SOTER 整条是裸的：任何一张 A 卡都能拿着 device_id
-    // 指挥别人客户的真机建料、签名。后来补了个门，但写成了 `if a.kind == "pair"`，
-    // public 卡又整段跳过一遍 —— 跟 `try_b_device_layer` 里那处同一个毛病。
-    // 不匹配时不碰那台设备，直接交给下面的服务端层（自签兜底不需要别人的真机）。
+    // A/B 配对：跟 `/api/attest/` 那条路同一个判据 —— 两个卡种都过 `allows`。两边有一方
+    // 没登记（老客户端 / 老卡密 / 静态 token）就按历史行为放行。不匹配时不碰那台设备，
+    // 直接交给下面的服务端层（自签兜底不需要别人的真机）。
     if let Some(a) = a_meta {
         let b_meta = state
             .store
@@ -2682,7 +2560,7 @@ async fn try_b_soter_layer(
     // table may already have been pruned. Never expose relay metadata to apps.
     let device = TaskStore::take_result_assigned_device(&mut reply).filter(|d| !d.is_empty());
     // 建料闸门关着的时候 B 端会按正常答复递一个带标记的 -5（见 b-side `soter::handle`）：
-    // 那是那台 B 的配置问题，不是「这台没料」—— 必须让操作员一眼看见，不能混进 -5 里。
+    // 那是那台 B 的配置问题，不是「这台没料」，操作员必须一眼看见，不能混进 -5 里。
     if reply
         .get("soter_mutation_disabled")
         .and_then(Value::as_bool)
@@ -2718,9 +2596,8 @@ async fn try_b_soter_layer(
             hardware_reply: Some(reply),
         });
     }
-    // 这里返回的是设备自己的答复，包括 `-26`「这一笔的验证没过」和超时 —— 那是
-    // 这笔没答好，不是这层做不了，得原样递给 App 让它重试。队列定向拒绝则是
-    // 明确的能力结论，和 resolve_soter_target 的在线能力拒绝保持同一回退策略。
+    // 这里返回的是设备自己的答复，包括 `-26`「这一笔的验证没过」和超时 —— 那是这笔没答好，
+    // 不是这层做不了，得原样递给 App 让它重试。队列定向拒绝则是明确的能力结论。
     let unavailable = soter_relay_marks_unavailable(&reply);
     Some(BSoterLayer {
         value: reply,
@@ -2732,17 +2609,15 @@ async fn try_b_soter_layer(
 
 /// B 端这一层的结论，外加「结构性地做不了」这个标记。
 ///
-/// 标记只影响槽位钉层：没在线设备 / 设备没报 SOTER / TA 结构性报错（没开、ATTK
-/// 没配、安全通道不通）算真做不了，可以考虑把钉子挪到服务端那两层；一次超时、
-/// 一次 `-26` 都不算。
+/// 标记只影响槽位钉层：没在线设备 / 设备没报 SOTER / TA 结构性报错（没开、ATTK 没配、
+/// 安全通道不通）算真做不了；一次超时、一次 `-26` 都不算。
 struct BSoterLayer {
     value: Value,
     /// Relay device that actually completed the queued task (not the TA device_id).
     device: Option<String>,
     unavailable: bool,
-    /// 结构性失败时设备层那个原始答复（带着真错误码）。服务端那两层接不了同一个
-    /// 槽位的时候要把它还给 App —— 该让人看见的是「这台设备真实出了什么毛病」，
-    /// 而不是「这把钥匙不在这层」的 -5。
+    /// 结构性失败时设备层那个原始答复（带着真错误码）。服务端那两层接不了同一个槽位的
+    /// 时候要把它还给 App，而不是递一个「这把钥匙不在这层」的 -5。
     hardware_reply: Option<Value>,
 }
 
@@ -2797,14 +2672,8 @@ impl BSoterLayer {
     }
 }
 
-/// 这一轮下来该把 `(device, uid)` 槽位钉在哪一层（`None` = 别碰钉子）。
-///
-/// 一句话：真机接了这个 op 就钉真机；只有真机结构性地做不了，兜底层才有资格拿到
-/// 钉子。真机接了却答个错（参数不齐、超时）时，钉子必须留在 `b` 上 —— 兜底层
-/// 抢走钉子等于以后每轮都拿服务端自签的假料，App 手里的身份跟着换（PLC110 的
-/// uid 10490 就是这么被钉到 self_signed 上的）。
-/// ASK 身份类的 op：它们给出的东西就是腾讯拿来认这台设备（ASK 公钥 + `cpu_id` +
-/// `uid`）的凭据，所以只能由真机给。
+/// ASK 身份类的 op：它们给出的东西就是腾讯拿来认这台设备（ASK 公钥 + `cpu_id` + `uid`）
+/// 的凭据，所以只能由真机给。
 fn soter_identity_op(op: &str) -> bool {
     matches!(
         op,
@@ -2818,6 +2687,9 @@ fn soter_identity_op(op: &str) -> bool {
     )
 }
 
+/// 这一轮下来 `(device, uid)` 槽位钉在哪一层（`None` = 别碰钉子）：真机接了这个 op 就钉
+/// 真机；只有真机结构性地做不了，兜底层才有资格拿到钉子。真机接了却答个错（参数不齐、
+/// 超时）时钉子必须留在 `b` 上，否则以后每轮都拿服务端自签的假料。
 fn layer_to_pin(served_layer: &str, b_structural: bool) -> Option<&str> {
     if served_layer == "b" || b_structural {
         Some(served_layer)
@@ -2826,19 +2698,6 @@ fn layer_to_pin(served_layer: &str, b_structural: bool) -> Option<&str> {
     }
 }
 
-/// 设备层答复里的 `error_code` 什么时候算「这层结构性地做不了」。
-///
-/// 只有结构性毛病才算：SOTER 没开（-12）、ATTK 没配（-13）、安全通道不通（-18）。
-/// 其余负码都是「这笔没成」，得原样递给 App，不然会误判一台好机器：
-///
-/// - `-26 VERIFICATION_FAILED`：这一笔的验证没过（真应用那条路上就是 App 那步
-///   生物认证没成），是这笔的状态，不是设备能力；
-/// - `-5` / `-6`：材料还没建，App 就是靠它决定要不要 generate；
-/// - `-7` / `-8` / `-9`：会话过期、没有匹配的 auth key、正在验证 —— 流程状态。
-///
-/// 把这些当成「这层没做成」，`run_soter_task` 就会把 `(device, uid)` 槽位挪到
-/// 服务端自签那两层：App 手里换成假料，真机再也轮不到（PLC110 的 uid 10490
-/// 就这么被钉到 self_signed 上，之后一轮流程都回不到真机）。
 /// Queue-directed relay verdicts that mean the B device cannot serve SOTER at all.
 /// Timeouts and ordinary SOTER operation errors deliberately do not match.
 fn soter_relay_marks_unavailable(reply: &Value) -> bool {
@@ -2848,6 +2707,11 @@ fn soter_relay_marks_unavailable(reply: &Value) -> bool {
     )
 }
 
+/// 设备层答复里的 `error_code` 什么时候算「这层结构性地做不了」。
+///
+/// 只有结构性毛病才算：SOTER 没开（-12）、ATTK 没配（-13）、安全通道不通（-18）。其余负码
+/// 都是「这笔没成」，得原样递给 App：`-26` 是这一笔验证没过、`-5`/`-6` 是材料还没建、
+/// `-7`/`-8`/`-9` 是流程状态。当成「这层没做成」会把槽位钉到服务端假料上，真机再也轮不上。
 fn soter_device_hard_failure(op: &str, reply: &Value) -> Option<i64> {
     let code = reply.get("error_code").and_then(Value::as_i64)?;
     if !matches!(
@@ -2909,11 +2773,10 @@ const SOTER_NO_AUTH_KEY_MATCHED: i64 = -8;
 /// 服务端那两层（keybox / self_signed）这答复算不算「没材料、干不了这一笔」。
 ///
 /// 这两层各自维护自己的 ASK/AuthKey，槽位在真机上建的钥匙它们手里没有，
-/// `init_sign` / `finish_sign` / `export_auth_key_public_key` 就会回 -5/-6/-8。
-/// 那不是说操作成功了，得当成「这层不管这一笔」继续往下试。
+/// `init_sign` / `finish_sign` / `export_auth_key_public_key` 就会回 -5/-6/-8。那不是操作
+/// 成功，得当成「这层不管这一笔」继续往下试。
 ///
-/// 设备层（`b`）不适用：那是这套流程里权威的那台，它的 -5 就是「这把钥匙不在」，
-/// 必须原样递给 App（`soter_device_hard_failure` 的注释里说的是同一件事）。
+/// 设备层（`b`）不适用：那是权威的那台，它的 -5 就是「这把钥匙不在」，必须原样递给 App。
 fn server_layer_missed_the_slot(layer: &str, op: &str, reply: &Value) -> Option<i64> {
     if layer == "b" || !SOTER_KEY_USING_OPS.contains(&op) {
         return None;
@@ -2927,14 +2790,14 @@ fn server_layer_missed_the_slot(layer: &str, op: &str, reply: &Value) -> Option<
 }
 
 /// 服务端那三层：
-///   - `keybox` 得先从库里把这台设备名下的服务端身份私钥拿出来（只有 RSA 才签得动
-///     SOTER），拿不到就让下一层试；
+///   - `keybox` 先从库里把这台设备的服务端身份私钥拿出来（只有 RSA 签得动 SOTER），
+///     拿不到就让下一层试；
 ///   - `attk` 是服务端密钥模式，按「身份规则 → 请求设备绑定 → 兜底」挑一把 ATTK
 ///     （私钥 + 它自己的 cpu_id）；
 ///   - `self_signed` 现生成一把。
 ///
-/// `uid` / `caller_pkg` 从 `body` 里就地取（日志用，不参与选路，选路在调用方算完
-/// 以 `attk_rule` / `attk_fallback` 递进来）。
+/// `uid` / `caller_pkg` 从 `body` 里就地取（日志用，不参与选路：选路在调用方算完，以
+/// `attk_rule` / `attk_fallback` 递进来）。
 async fn run_layer_soter(
     state: &AppState,
     layer: &str,
@@ -3037,6 +2900,7 @@ async fn run_layer_soter(
 // Client report (A-side diagnostics)
 // ---------------------------------------------------------------------------
 
+/// A 端诊断上报落库（没配 DB 时只回 ok，不落盘）。
 pub async fn client_report(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3104,9 +2968,8 @@ pub struct PollQuery {
     /// 设备能力声明（逗号分隔，例如 `soter,strongbox`）。缺失 = 没上报，
     /// 空串 = 上报了一个都没有。见 `queue::DeviceCaps::parse`。
     pub caps: Option<String>,
-    /// 这台 B 的「不跟随补丁日期」名单（逗号分隔的包名，来自 relay.conf
-    /// 的 OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS）。缺失 = 老版本 relay 没上报，
-    /// 沿用上次的结论。
+    /// 这台 B 的「不跟随补丁日期」名单（逗号分隔的包名，来自 relay.conf 的
+    /// OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS）。缺失 = 老版本 relay 没上报，沿用上次的结论。
     pub skip_pkgs: Option<String>,
     /// relay 自己的版本号（模块版本，例如 `1.7.0`）。缺失 = 老版本 relay 没上报。
     /// 状态页拿它显示，A 端「留空自己获取」拿它按版本挑设备。
@@ -3126,6 +2989,7 @@ pub struct PollQuery {
     pub fingerprint: Option<String>,
 }
 
+/// B 端长轮询：登记身份/能力后领一笔任务，没任务回 204。
 pub async fn b_poll(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3139,15 +3003,12 @@ pub async fn b_poll(
     }
     // 记下这台用的是哪种 token（配对 / 公开 / 老卡密），给 A 侧的配对校验用。
     //
-    // 返回 false 说明这笔心跳不被认：设备还在心跳（在线窗口内），来的却是另一个配对
-    // 组 —— 那是「有人拿着这台的 device_id 在心跳」。这种情况**既不写属性、也不派活**：
-    // 以前只跳过属性，派活照旧，于是这台机器照样被登记成在线（`pop_for_b` 会把它写进
-    // 设备表）、照样能领走派给这个 device_id 的任务 —— A 侧配对校验比的是旧分组，还是
-    // 通的，任务和请求体就这么落到别人的机器上。
+    // 返回 false 说明这笔心跳不被认：设备还在在线窗口内，来的却是另一个配对组 ——
+    // 那是「有人拿着这台的 device_id 在心跳」。这种情况**既不写属性、也不派活**，否则
+    // 这台机器会被登记成在线并领走派给这个 device_id 的任务。
     //
-    // 直接回 403 不会把人挡死：被拒的这一轮不刷新 last_seen，等这台设备在线窗口过去
-    // （120s，见 `queue::TOKEN_META_REBIND_AFTER_MS`）下一次心跳就能换组成功。换卡本来
-    // 就要重装/重启，多等这一个窗口能接受；B 端把非 200 当普通失败指数退避重试，不会退。
+    // 回 403 不会把人挡死：被拒的这一轮不刷新 last_seen，等在线窗口过去（120s，见
+    // `queue::TOKEN_META_REBIND_AFTER_MS`）下次心跳就能换组成功。
     if let Some(meta) = state.auth.token_meta(token_from_headers(&headers)) {
         if !state
             .store
@@ -3190,7 +3051,8 @@ pub async fn b_poll(
     let timeout_secs = q.timeout.unwrap_or(state.cfg.poll_timeout_secs);
     let timeout = Duration::from_secs(timeout_secs.min(120));
 
-    // 这台上报的「不跟随补丁日期」名单先记下来：命中名单的认证请求不再往它派。
+    // 这台上报的「不跟随补丁日期」名单先记下来（只用于补丁跟随，不是派发黑名单，见
+    // `try_b_device_layer`）。
     if let Some(raw) = q.skip_pkgs.as_deref() {
         state
             .store
@@ -3205,15 +3067,14 @@ pub async fn b_poll(
         .await;
 
     // 模块 relay 的心跳固定带 `skip_pkgs`（空名单也带）和 `ver`，手机 App
-    // （`org.ommega.deviceb`）两个都不带；用这个把两类设备分开，A 端面板
-    // 「留空自己获取」只挑模块那种。
+    // （`org.ommega.deviceb`）两个都不带；A 端面板「留空自己获取」只挑模块那种。
     state
         .store
         .set_device_from_module(&q.device_id, q.skip_pkgs.is_some() || q.ver.is_some())
         .await;
 
-    // 本机设备身份（brand/device/product/manufacturer/model/serial）：A 端「伪装参数
-    // → 从服务器同步」要用它，否则链是真机出的、本机属性还是调用方那台，两边对不上。
+    // 本机设备身份：A 端「伪装参数 → 从服务器同步」要用它，否则链是真机出的、本机属性
+    // 还是调用方那台，两边对不上。
     state
         .store
         .set_device_identity(
@@ -3272,6 +3133,7 @@ pub async fn b_poll(
     }
 }
 
+/// B 端回填任务结果（完成或失败）。
 pub async fn b_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3304,13 +3166,14 @@ pub async fn b_result(
     }
 }
 
+/// 管理操作：上传服务端出链用的设备身份（私钥 + 证书链）。
 pub async fn b_upload_keybox_identity(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    // 这条写的是服务端出链用的私钥和证书链，本质是管理操作。以前只要求一张 B 卡
-    // token，而 B 卡是公开卖的 —— 任何买家都能把任意 device_id 的身份换成自己的。
+    // 这条写的是服务端出链用的私钥和证书链，本质是管理操作：B 卡是公开卖的，只要求
+    // B 卡 token 的话任何买家都能把任意 device_id 的身份换成自己的。
     if let Some(r) = require_admin_session(&state, &headers) {
         return r;
     }
@@ -3346,6 +3209,7 @@ pub async fn b_upload_keybox_identity(
     }
 }
 
+/// 管理操作：下线某台设备的服务端身份。
 pub async fn b_revoke_server_identity(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3375,6 +3239,7 @@ pub async fn b_revoke_server_identity(
     }
 }
 
+/// 管理操作：取消一笔队列里的任务。
 pub async fn admin_cancel_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3401,18 +3266,15 @@ pub async fn admin_cancel_task(
 
 /// GET /api/keybox/public/ — 把服务端池子里的公开 keybox 发给 A 端。
 ///
-/// A 端那边是用 curl 取下来再 atob 的，所以这里直接回 base64 文本，不是 JSON。
-/// 匿名可取：里面的东西本来就是从公开仓库采的，没什么可保护的。
+/// A 端用 curl 取下来再 atob，所以这里直接回 base64 文本，不是 JSON。匿名可取：里面的
+/// 东西本来就是从公开仓库采的。
 pub async fn public_keybox(State(state): State<AppState>) -> Response {
     let Some(db) = state.db.as_ref() else {
         return json_err(StatusCode::SERVICE_UNAVAILABLE, "no database");
     };
-    // EC 和 RSA 各捞一份 —— 以前是「EC 优先，拿到就停」，A 端因此永远只拿到半套
-    // 材料，请求落到缺的那种算法上就只能报错。同一份 keybox 文件里的 EC/RSA 两段
-    // 入库时本就是分开的两行，这里按算法各扫一遍；只凑得到一种就发一种（A 端会用
-    // 自己内置的自签材料补缺）。采到的身份可能挂在主 device_id 上，也可能挂在
-    // -1/-2 这样的后缀上 —— 后缀范围跟着采集端的上限走，两边写死后加了一边另一边
-    // 就白搭。
+    // EC 和 RSA 各捞一份：同一份 keybox 文件里的 EC/RSA 两段入库时就是分开的两行，只凑
+    // 得到一种就发一种（A 端会用自己内置的自签材料补缺）。身份可能挂在主 device_id 上，
+    // 也可能挂在 -1/-2 这样的后缀上 —— 后缀范围跟着采集端的上限走，两边必须一致。
     let base = crate::autokeybox::device_id_for("public");
     let mut candidates = vec![base.clone()];
     for n in 1..crate::autokeybox::PUBLIC_MAX_IDENTITIES {
@@ -3457,10 +3319,9 @@ pub async fn public_keybox(State(state): State<AppState>) -> Response {
         }
     }
     if picked.is_empty() {
-        // 池子里一个能用的都没有：要么还没采到，要么采到的全进了吊销名单。
-        // 这里特意回「404 + 空 body」而不是 JSON 错误体 —— A 端拿 curl 取完只判断
-        // 「有没有输出」，输出为空它就弹自己那句「未找到有效密钥箱」；回 JSON 的话
-        // 对面 atob 会抛异常，弹出来的是「设置失败」，看着像服务端坏了。
+        // 池子里一个能用的都没有：要么还没采到，要么采到的全进了吊销名单。特意回
+        // 「404 + 空 body」而不是 JSON 错误体 —— A 端 curl 取完只判断「有没有输出」，
+        // 输出为空就弹「未找到有效密钥箱」；回 JSON 的话 atob 抛异常，弹「设置失败」。
         tracing::warn!("public_keybox 池子里没有可用身份（未采到或全被吊销），回 404 空 body");
         return (
             StatusCode::NOT_FOUND,
@@ -3625,10 +3486,7 @@ mod soter_device_layer_tests {
 
     #[test]
     fn a_sign_failure_that_is_not_structural_stays_an_answer() {
-        // 实测的两种误判，都把一个好好的机器弄瘸过：
-        // - 一加 11 的 `finish_sign` 回 -26：这一笔的验证没过（真应用那条路上就是
-        //   App 那步生物认证没成），是这笔的状态，不是设备能力；
-        // - PLC110 的 op 被 15s 超时打断，槽位从此挪到 self_signed。
+        // `-26`（这一笔验证没过）和超时都不是设备能力问题，不能算结构性失败。
         for op in ["init_sign", "finish_sign", "generate_auth_key_pair"] {
             for code in [-26, -25, -5, -6, -7, -8, -9, -20, -1000] {
                 assert_eq!(
@@ -3681,8 +3539,7 @@ mod soter_device_layer_tests {
         // 真机没接住（参数不齐 / 超时 / -26），兜底层接上了也不能留钉子。
         assert_eq!(layer_to_pin("self_signed", false), None);
         assert_eq!(layer_to_pin("keybox", false), None);
-        // 真机结构性地做不了（一台能接的设备都没有），兜底层把流程接上就该钉住，
-        // 下一轮别再拿同一份请求去碰一台做不了的机器。
+        // 真机结构性地做不了（一台能接的设备都没有），兜底层把流程接上就该钉住。
         assert_eq!(layer_to_pin("self_signed", true), Some("self_signed"));
         assert_eq!(layer_to_pin("keybox", true), Some("keybox"));
         assert_eq!(layer_to_pin("b", true), Some("b"));
@@ -3716,7 +3573,7 @@ mod soter_device_layer_tests {
     #[test]
     fn a_mutation_never_lands_on_another_device() {
         use super::soter_mutation_cross_served;
-        // 点 PLC110，却要派给别的 B：拿别人的密钥库替它作答，不许。
+        // 点名了一台，却要派给别的 B：拿别人的密钥库替它作答，不许。
         assert!(soter_mutation_cross_served(
             "generate_auth_key_pair",
             "device-b-a",
@@ -3912,11 +3769,10 @@ mod strongbox_smart_tests {
         assert_eq!(strongbox_b_kind(&json!({ "cert_chain": ["Zm9v"] })), None);
     }
 
-    /// Smart mode only accepts a chain that is itself StrongBox-tagged, so a
-    /// chain it cannot read has to come back `None` — that is what lets the
-    /// fallback continue to the server keybox instead of handing a
-    /// possibly-demoted chain to the app.  (Reading a real chain is covered by
-    /// the cert tests; what matters here is the unreadable case.)
+    /// Smart mode only accepts a chain that is itself StrongBox-tagged, so an
+    /// unreadable chain must come back `None` — that is what lets the fallback
+    /// continue to the server keybox instead of handing a possibly-demoted
+    /// chain to the app.
     #[test]
     fn unreadable_chains_have_no_security_level() {
         assert_eq!(chain_attestation_security_level(&json!({})), None);
@@ -3969,8 +3825,8 @@ mod layer_failure_msg_tests {
     use super::*;
     use serde_json::json;
 
-    /// 关键回归：B 端回了真实错误、且没交链 —— 报的必须是那个错误本身，
-    /// 不能再被吞成 "empty cert chain from B device"。
+    /// B 端回了真实错误、且没交链 —— 报的必须是那个错误本身，不能被吞成
+    /// "empty cert chain from B device"。
     #[test]
     fn error_wins_over_missing_chain() {
         let v = json!({
@@ -4069,8 +3925,8 @@ mod soter_slot_miss_tests {
         );
     }
 
-    /// 回归（2026-09-30，Duck Detector 那个 -5）：槽位的钥匙建在真机上，keybox 层
-    /// 手里没有，`init_sign` 回 -5 —— 这不是「签好了」，得接着往下试。
+    /// 槽位的钥匙建在真机上时 keybox 层手里没有，`init_sign` 回 -5 —— 这不是「签好了」，
+    /// 得接着往下试。
     #[test]
     fn a_server_layer_without_the_slot_material_is_not_a_success() {
         for layer in ["keybox", "self_signed"] {

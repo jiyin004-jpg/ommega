@@ -1,40 +1,31 @@
 //! SOTER 签名会话的登记表 —— `finish_sign` 回 -204 时补救的依据。
 //!
-//! 背景（2026-10-01 实测）：设备上的 SOTER TA **一台设备同时只保留一个有效签名会话**。
-//! 后开的那张会把前一张顶掉，跟槽位（uid + 别名）没关系：uid 10043 与 uid 10373、
-//! 别名也各不同，各 init 一次，回头按顺序 finish —— 先 init 的那笔必回 -204
-//! （`SOTER_ERROR_OPERATEID_NULL`），4 轮 4 次都是如此。B 端的 relay 只是把句柄透传给
-//! HAL / TA，自己根本没有会话表，这个「一个」改不动。
+//! 设备上的 SOTER TA 一台设备同时只保留一个有效签名会话：后开的那张把前一张顶掉，
+//! 跟槽位（uid + 别名）无关；先 init 的那笔回头 finish 必回 -204
+//! （`SOTER_ERROR_OPERATEID_NULL`）。B 端 relay 只把句柄透传给 HAL / TA，自己没有会话
+//! 表，这个「一个」改不动。
 //!
-//! 2026-10-06 又实测到一条，对「谁该去收尾」很关键：这张会话还认**开它的那个
-//! 调用者**。走 B 端 relay（一个常驻进程）`init_sign` + `finish_sign` 一次就成；
-//! 而拿 shell 拆成两个 `service call` 进程发（同一把 uid/别名/challenge、中间没人
-//! 插队）恒回 `-204`。所以 relay 必须自己开会话、自己收尾，别把这两步拆到不同
-//! 连接/不同调用者上去。
+//! 会话还认**开它的那个调用者**：relay 必须自己 init、自己 finish，别把这两步拆到不同
+//! 连接 / 不同调用者上去（拆开必回 -204）。
 //!
-//! `init_sign` 拿到会话时保存 (uid, 别名, challenge)，finish 回 -204 时可在同一次
-//! 设备占用内重开会话，签同一个 challenge。租约外的过期 finish 不再补签，以免顶掉
-//! 新流程；成功补签与原流程使用同一把钥匙、同一个挑战。
+//! `init_sign` 拿到会话时保存 (uid, 别名, challenge)，finish 回 -204 时可在同一次设备
+//! 占用内重开会话签同一个 challenge。租约外的过期 finish 不再补签，以免顶掉新流程；
+//! 成功补签与原流程使用同一把钥匙、同一个挑战。
 //!
-//! 实际设备由租约串行化：init 前占位，成功后 session TTL 60 秒；finish 原子消费
-//! requested+session，并在同一 guard 下补签。未知已派发结果隔离 60 秒；活跃 await
+//! 会话登记 TTL 15 分钟；init 成功后租约替这笔流程留 60 秒等 finish；未知已派发结果
+//! 隔离 60 秒。finish 原子消费 requested+session，并在同一 guard 下补签；活跃 await
 //! 的 guard 不因 TTL 被替换。HTTP 取消不能撤回已经进入 HAL 的操作。
 //!
-//! 租约只在「HAL 上有操作在飞」或者「正在收尾」的时候真挡人；`init_sign` 成功之后
-//! 搁着等 `finish_sign` 的那种，下一笔可以直接接管。2026-10-02 的线上回归就出在这里：
-//! 只 init 不 finish 的流程（B 端自检、第三方的能力探针）把租约空挂满 60 秒，真实用户
-//! `init_sign` 等 3 秒抢不到就吃到 -9（`IS_AUTHING`），A 端连指纹圈都弹不出来。
-//! 现在抢不到不再硬拒，退成不带租约执行，被顶掉的会话仍走 -204 补救 —— 也就是 1.6.3
-//! 的性质，把租约只当成优化。
+//! 租约只在「HAL 上有操作在飞」或「正在收尾」时真挡人：只 init 不 finish 的租约下一笔
+//! 可以直接接管；抢不到不硬拒，退成不带租约执行，被顶掉的会话仍走 -204 补救。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 一笔会话记多久。App 的 init->finish 正常是秒级，慢的时候是在等用户那一步
-/// （指纹/人脸，几十秒量级）。生产里能看到隔几分钟才收尾的（App 自己缓着 session
-/// 不急着签），所以给到 15 分钟；它保留路由/补救材料，不延长下面独立的 60 秒租约。
-/// 内存被 [`MAX_ENTRIES`] 卡着。
+/// 一笔会话记多久。init→finish 正常是秒级，慢的是在等用户的指纹 / 人脸那一步
+/// （几十秒），也有 App 缓着 session 隔几分钟才收尾，所以给到 15 分钟。
+/// 它只保留路由 / 补救材料，不延长独立的 60 秒租约；条数被 [`MAX_ENTRIES`] 卡着。
 const STASH_TTL: Duration = Duration::from_secs(900);
 
 /// 最多记多少条，挡住异常增长（正常随 `finish_sign` 清掉）。
@@ -43,9 +34,9 @@ const MAX_ENTRIES: usize = 8192;
 /// 抢设备租约最多等多久。还要被调用方自己的网络 deadline 卡着，取小的那个。
 const ACQUIRE_WAIT: Duration = Duration::from_secs(3);
 
-/// `init_sign` 成功之后，租约替这笔流程把会话留多久等 `finish_sign`。等用户那一步是
-/// 几十秒量级，所以留够。它是上限而不是保守期限：停在这儿等 finish 的租约下一笔 init
-/// 可以直接接管（见 [`SignSessions::acquire`]）。
+/// `init_sign` 成功之后，租约替这笔流程把会话留多久等 `finish_sign`。等用户是几十秒
+/// 量级，所以留够。它是上限而不是保守期限：停在这儿等 finish 的租约下一笔 init 可以
+/// 直接接管（见 [`SignSessions::acquire`]）。
 const LEASE_HOLD: Duration = Duration::from_secs(60);
 
 /// 补救需要的东西：重开一张会话得用同样的 uid、别名和挑战。
@@ -165,14 +156,12 @@ impl SignSessions {
 
     /// 占住已经解析好的那台物理设备。
     ///
-    /// 空位直接占；`init_sign` 成功、搁在那儿等 `finish_sign` 的租约也可以接管 ——
-    /// 只 init 不 finish 的流程本来就不会来收尾，让它把设备空挂满 [`LEASE_HOLD`] 正是
-    /// 2026-10-02 那次线上回归的直接原因。被接管的那一笔如果之后真来 finish，会走
-    /// [`LeaseMiss::NotOurs`] 退成不带租约执行，再靠 -204 补救。
+    /// 空位直接占；`init_sign` 成功、搁着等 `finish_sign` 的租约也可以接管 —— 只 init
+    /// 不 finish 的流程本来就不会来收尾，别让它把设备空挂满 [`LEASE_HOLD`]。被接管的
+    /// 那一笔之后真来 finish 会走 [`LeaseMiss::NotOurs`] 退成不带租约执行，再靠 -204 补救。
     ///
-    /// 派发过但结果不明的那种（quarantine，`session` 已经清掉）不碰：设备上可能真的
-    /// 还有一笔在跑。等待是异步的，同时被 [`ACQUIRE_WAIT`] 和调用方原来的网络 deadline
-    /// 卡着。
+    /// 派发过但结果不明的（quarantine，`session` 已经清掉）不碰：设备上可能真有一笔在
+    /// 跑。等待是异步的，同时被 [`ACQUIRE_WAIT`] 和调用方原来的网络 deadline 卡着。
     pub async fn acquire(
         self: &Arc<Self>,
         device: &str,
@@ -447,8 +436,7 @@ mod tests {
         assert!(first.retain_session(42));
         drop(first);
         let other = s.acquire("b", "caller", deadline).await.unwrap();
-        // 原来这一笔停在「等 finish」上，谁也别想进来；现在可以接管 —— 只 init
-        // 不 finish 的探针流程就卡在这个状态，不能让它把设备空挂满。
+        // 等 finish 的租约现在可以接管：只 init 不 finish 的探针就卡在这个状态。
         let mut takeover = s.acquire("a", "second", deadline).await.unwrap();
         takeover.dispatch();
         assert!(takeover.retain_session(42));
@@ -518,8 +506,7 @@ mod tests {
 
     /// 停在原地等 finish 的租约不挡人；真有一笔在飞的时候才挡。
     ///
-    /// 2026-10-02 的线上回归就出在前半句：探针只 init 不 finish，把这个状态空挂了
-    /// 60 秒，真实用户的 init 抢不到租约、A 端连指纹圈都弹不出来。
+    /// 只 init 不 finish 的探针会把这个状态空挂 60 秒，真实用户的 init 抢不到租约。
     #[tokio::test(start_paused = true)]
     async fn only_inflight_work_holds_the_device() {
         let s = Arc::new(SignSessions::new());

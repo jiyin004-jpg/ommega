@@ -61,9 +61,8 @@ pub(crate) fn resolve_hardware_profile(security_level: SecurityLevel) -> KeyMint
 ///
 /// 服务端 keybox 层手里没有本机 HAL 版本，只能按 ctx 的 `os_version` 猜
 /// （Android 16 → 400）。猜出来的值跟本机本地软件 KeyMint 铸出的链未必一致：
-/// 同一台设备的 EC 与 RSA 两次认证，只要一条落到服务端 keybox、另一条落到本地
-/// 或真机 TEE，两条链的 attestationVersion / keymasterVersion 就对不上
-/// （TrustAttestor: `hardware.attestation.algorithm_differential`）。这里按与
+/// 同一台设备的 EC 与 RSA 两次认证，若一条落到服务端 keybox、另一条落到本地或
+/// 真机 TEE，两条链的 attestationVersion / keymasterVersion 就对不上。这里按与
 /// `resolve_hardware_profile` 相同的优先级给出本机版本，随请求带给服务端。
 ///
 /// VINTF 那步要读清单文件，按安全等级只问一次；`security_level` 收请求里的原始值

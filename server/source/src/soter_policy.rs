@@ -1,31 +1,26 @@
 //! SOTER 的策略（运行时可变 + 落盘）。
 //!
 //! 控制台一保存就生效，落盘到 `data/soter_policy.json`；环境变量只当初始默认
-//! （`RELAY_SOTER_REAL_APP_PACKAGES` 那几份名单），老部署行为不变。
-//!
-//! 三块东西：
+//! （`RELAY_SOTER_REAL_APP_PACKAGES` 那几份名单）。
 //!
 //! 1. **模式**（`mode`）：
 //!    - `real`（真机模式，缺省）：`b → keybox → self_signed`。真应用按设备 id 交给 B，
-//!      B 处理不了（离线 / 没能力 / 这一笔真做不下去）才轮到服务端那两层。
+//!      B 处理不了（离线 / 没能力 / 这一笔真做不下去）才轮服务端那两层。
 //!    - `server_key`（服务端密钥模式）：`attk → self_signed`，**一次都不碰 B**。用控制台
-//!      上传的 ATTK（私钥 + 它对应的 cpuid）铸料，身份就是那把 ATTK 的。
+//!      上传的 ATTK（私钥 + 对应的 cpuid）铸料，身份就是那把 ATTK 的。
 //!
-//! 2. **身份绑定**（`identities`）：哪一笔用哪把 ATTK。默认是「跟着请求的设备 id 走」：
-//!    哪台 B 的请求就用哪台 B 上传的 ATTK（请求 device_id 空的，已经被控制台那个
-//!    「默认 SOTER 设备 id」填过，所以就是那台设备的 ATTK）。规则是按
-//!    `users`（AOSP 用户号：0 机主、10/11 工作资料、999 分身）、`uids`（完整 uid）、
-//!    `app_ids`（用户内应用号）、`packages`（包里那一格）四种条件挑的例外；同一格内是
-//!    「或」，不同格子之间是「且」。第一条命中的规则算数。
-//!
+//! 2. **身份绑定**（`identities`）：哪一笔用哪把 ATTK。默认跟着请求的设备 id 走 ——
+//!    哪台 B 的请求就用它上传的 ATTK（请求 device_id 为空的，已被控制台那个「默认
+//!    SOTER 设备 id」填过）。规则按 `users`（AOSP 用户号：0 机主、10/11 工作资料、
+//!    999 分身）、`uids`（完整 uid）、`app_ids`（用户内应用号）、`packages`（主包名）
+//!    四种条件挑例外：同一格内是「或」，格子之间是「且」，第一条命中的算数。
 //!    都不命中就按顺序退：请求设备绑定的那把 → `attk_id`（控制台显式兜底）→ ATTK 库里
-//!    标了默认/最早启用的那把。所以「指定」不是只能生效一把，它只是最后一级兜底。
-//!
+//!    标了默认 / 最早启用的那把；所以 `attk_id` 是最后一级兜底，不是「只能生效那把」。
 //!    四格全空的规则不算数（不许一条空规则把后面全吃了）。
 //!
 //! 3. **白名单覆盖**（`whitelist`）：包名 / 别名前缀 / 只许本地 / 只许真机 四份名单，
 //!    非空就盖掉环境变量那套。不在真应用白名单里的调用一律打回 A 端本地作答
-//!    （`local_only`），两种模式都一样 —— 两个模式的差别只在「谁来铸料」。
+//!    （`local_only`），两种模式都一样 —— 差别只在「谁来铸料」。
 
 use std::path::Path;
 use std::str::FromStr;
@@ -204,7 +199,6 @@ pub struct WhitelistPatch {
 pub struct Snapshot {
     pub mode: Mode,
     /// 服务端密钥模式的全局兜底 ATTK（`None` = 只用设备匹配 / 库里默认）。
-    /// 请求设备绑了 ATTK 时不会用到它 —— 它是最后一级兜底，不是「只能生效这一把」。
     pub attk_id: Option<i64>,
     pub whitelist: Whitelist,
     pub identities: Vec<IdentityRule>,

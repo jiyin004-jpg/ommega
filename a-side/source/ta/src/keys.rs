@@ -38,7 +38,6 @@ use x509_cert::ext::pkix::KeyUsages;
 const MAX_ATTESTATION_CHALLENGE_LEN: usize = 128;
 
 /// Contents of wrapping key data
-///
 /// ```asn1
 /// SecureKeyWrapper ::= SEQUENCE {
 ///     version                   INTEGER, # Value 0
@@ -72,7 +71,6 @@ pub struct SecureKeyWrapper<'a> {
 const SECURE_KEY_WRAPPER_VERSION: i32 = 0;
 
 /// Contents of key description.
-///
 /// ```asn1
 /// KeyDescription ::= SEQUENCE {
 ///     keyFormat    INTEGER, # Values from KeyFormat enum
@@ -243,15 +241,11 @@ impl crate::KeyMintTa {
                     remote_boot.as_ref().unwrap()
                 }
                 _ => {
-                    // 叶子由本机 keybox 签（ATTEST_KEY 子钥那条路径）。如果这台机器
-                    // 正在走远程，RKP 路径证书里的 RootOfTrust 是 B 的
-                    // （unlocked / Unverified），这里再用本机的（locked / Verified）
-                    // 就成了两条链说法不一 —— Duck Detector 的
-                    // `ROOT_OF_TRUST_DIVERGENCE` 抓的就是这个。
-                    //
-                    // 本地模式（remote 关）不跟：那时根本没有 RKP 路径，证书就该
-                    // 说本机自己的话；否则切回本地后还会被上次远程留下的
-                    // remote_identity 污染，把一台锁定的机器说成已解锁。
+                    // 本机 keybox 签的叶子要与远程 RKP 链持同一份 RootOfTrust，否则两条
+                    // 路径的 device_locked / verified_boot_state 说法不一，检测器报
+                    // `ROOT_OF_TRUST_DIVERGENCE`。
+                    // 仅远程开启时跟远程值；远程关闭时用本机值，避免被残留的
+                    // remote_identity 影响（把锁定的机器说成已解锁）。
                     remote_boot = if self
                         .dev
                         .remote
@@ -358,10 +352,8 @@ impl crate::KeyMintTa {
                 op.update(tbs_data)?;
                 op.finish()
             }
-            // ATTEST_KEY 是给原生证书生成用的，不是给 begin(SIGN) 用的。真机实测：
-            // 用证明密钥 begin(SIGN) 恒被拒（-2/-3/-12），所以这里不再把 TBS 转发给
-            // 远程 SIGN —— 那条路以前能跑通，只是因为 B 把 ATTEST_KEY 换成了 SIGN。
-            // 旧版遗留的远程 blob 若描述的是普通签名密钥，也不能用它发证书。
+            // ATTEST_KEY 只用于原生证书生成，不走 begin(SIGN)：用证明密钥做 SIGN 恒被拒
+            // （-2/-3/-12），因此 `KeyMaterial::Remote` 一律不能用来签 TBS。
             KeyMaterial::Remote(_) => Err(km_err!(
                 IncompatiblePurpose,
                 "remote certificate issuance is not supported by the SIGN transport"
@@ -401,34 +393,24 @@ impl crate::KeyMintTa {
         params: &[KeyParam],
         attestation_key: Option<AttestationKey>,
     ) -> Result<KeyCreationResult, Error> {
-        // Remote mode: if a remote backend is enabled and attestation is
+        // Remote mode: when a remote backend is enabled and attestation is
         // requested, mint the key on the B-side real TEE instead of locally.
-        //
-        // 调用方自带证明密钥（App AttestKey）时也走远程：B 端真 TEE 用那把已有的
-        // ATTEST_KEY 原生签发子证书（`generateKey(.., AttestationKey)`），而不是本端
-        // 拿远程 SIGN 代签。真机实测（2026-10-23）：用证明密钥走 `begin(SIGN)` 恒被拒
-        // （-2/-3/-12）—— 那条路以前能跑通，只是因为 B 把 ATTEST_KEY 偷偷换成了 SIGN。
-        //
-        // STRONGBOX requests follow the SAME path as TEE: when a remote
-        // backend is enabled they are forwarded to the relay, which tags the
-        // attestation extension with the forwarded `attestation_security_level`
-        // (= 2); otherwise they fall back to the local software keybox. The
-        // requesting security level only gates which signing key is chosen and
-        // how the attestation extension is tagged. Driving the device's real
-        // `/strongbox` HAL here was tried but failed on devices where that HAL
-        // is declared but not servable from the keystore context (Unknown error
-        // -1000), so it is not wired in.
-        // 调用方自带的证明密钥（App AttestKey 委派）：只有当它在本端是 `Remote`
-        // （私钥在 B 端真 TEE）时，才改由 B 的原生 KeyMint 用它签发子证书；
-        // 如果那是一把本地签发密钥（私钥在本机），仍旧走本地路径。
+        // A caller-supplied attestation key is delegated to B's native KeyMint
+        // (`generateKey(.., AttestationKey)`), never signed through remote SIGN:
+        // attest keys are refused on begin(SIGN) with -2/-3/-12. Delegation applies
+        // only when that key is `Remote` (private key on the B side); local signing
+        // keys stay on the local path.
+        // STRONGBOX requests follow the SAME path as TEE: when a remote backend is
+        // enabled they are forwarded to the relay, which tags the attestation
+        // extension with the forwarded `attestation_security_level` (= 2); otherwise
+        // they fall back to the local software keybox. The requesting security level
+        // only gates which signing key is chosen and how the attestation extension is
+        // tagged. The device's own `/strongbox` HAL is not wired in: it may be
+        // declared but not servable from the keystore context (Unknown error -1000).
         let wants_attest_challenge = get_opt_tag_value!(params, AttestationChallenge)?.is_some();
-        // 证明密钥（`PURPOSE_ATTEST_KEY`）生成时 App 一般不带 challenge（它是长期
-        // 密钥）。真机上它的链和普通密钥同一套 keybox，根相同；而物理模式下普通
-        // 认证走 B、证明密钥留本地，两边根就分叉了。
-        //
-        // 所以只有「远程开着」才把它也送出去（远程出证必须有 challenge，这里自己
-        // 造一个 32 字节随机值）。本地模式（remote 关）保持原样：直接用本地对应
-        // 级别的 keybox 出证。
+        // 证明密钥（`PURPOSE_ATTEST_KEY`）生成时通常不带 challenge，而远程出证必须有：
+        // 远程开启时补一个 32 字节随机 challenge 一并送出，本地模式仍用本地对应级别的
+        // keybox 出证。
         let is_attest_key_keygen = params
             .iter()
             .any(|p| matches!(p, KeyParam::Purpose(KeyPurpose::AttestKey)));
@@ -459,28 +441,22 @@ impl crate::KeyMintTa {
             }
             _ => None,
         };
-        // 认证绑定的 key 仍旧本地生成：B 端拿不到 A 的 auth token，远端铸出来也签不了
-        // （begin(SIGN) 必然 -26），而丢掉 504/505 又会让叶子与请求对不上。
-        // 认证密钥（PURPOSE_ATTEST_KEY）则改走远端：B 用调用方那把 ATTEST_KEY
-        // 原生签发子证书，不再需要本机拿它的私钥签 TBS（真机实测：独占 ATTEST_KEY
-        // 可铸，用它 begin(SIGN) 恒被拒）。
+        // 认证绑定的 key 恒本地生成：B 端拿不到 A 的 auth token，远程铸的 key 签名
+        // 必然 -26；丢掉 504/505 又会让叶子与请求对不上。
         let remote_attest = (wants_attest_challenge || auto_challenge)
             && !requests_user_auth(params)
             && !agrees_only(params)
             && self.dev.remote.as_ref().is_some_and(|r| r.enabled())
             && (attestation_key.is_none() || remote_issuer.is_some());
         if remote_attest {
-            // 证明密钥自己造了 challenge：远程出证要有它，但调用方看不到也无所谓
-            // （challenge 只影响叶子里的标签，没人会去校验它）。
             let mut owned; // 存住注入后的参数，作用域盖住下面两次调用
             let params: &[KeyParam] = if auto_challenge && !wants_attest_challenge {
                 owned = params.to_vec();
-                // 远程出证要求带 app id，而生成 ATTEST_KEY 时 App 通常不带 ——
-                // 自己补一个最小的合法 `AttestationApplicationId`（`SEQUENCE { SET {} }`，
-                // 空的 packageInfos），而不是因为这个可选字段把整笔转发放弃。
+                // 远程出证要求带 app id；调用方没给时补一个最小的合法
+                // `AttestationApplicationId`，而不是放弃整笔转发。
                 if !has_app_id {
-                    // 空 `SEQUENCE OF`：B 端 `check_app_id_der` 只认 SET OF / SEQUENCE OF
-                    // 两种编码，之前写的 `SEQUENCE { SET {} }` 会被判成非法。
+                    // 空 `SEQUENCE OF`（`[0x30, 0x00]`）：B 端 `check_app_id_der` 只认
+                    // SET OF / SEQUENCE OF 两种编码。
                     owned.push(KeyParam::AttestationApplicationId(vec![0x30, 0x00]));
                 }
                 let mut challenge = vec![0u8; 32];
@@ -495,12 +471,9 @@ impl crate::KeyMintTa {
             if let Some(result) = self.generate_key_remote(params, remote_issuer.as_ref())? {
                 return Ok(result);
             }
-            // 远程不可用时不再因为「调用方自带证明密钥」就硬失败：那把 key 的私钥在 B 端
-            // （KeyMaterial::Remote），本地拿不到，直接抛 UnknownError 的话应用侧只能看到
-            // 一个没头没脑的 -1000（2026-11-08 PKX110 实测：KeyAttestation 的「App Attest
-            // Key」就是这么挂在 security_level.rs:880 的）。只要 fallback_local 开着，
-            // 就落本地：忽略那把远程证明密钥，用本地 keybox 出证，链自洽，只是 issuer 与
-            // 调用方指定的那把不同。
+            // 远程不可用时按 fallback_local 决定：开着就用本地 keybox 出证，忽略那把私钥
+            // 在 B 端的证明密钥（issuer 因此与调用方指定的不同）；关着回 UnknownError
+            // （-1000）。
             if !self.dev.remote.as_ref().is_some_and(|r| r.fallback_local()) {
                 return Err(km_err!(
                     UnknownError,
@@ -509,10 +482,8 @@ impl crate::KeyMintTa {
             }
             log::warn!("remote attest unavailable; minting locally with the local keybox");
         }
-        // 走到这里就是本地出证。调用方自带的那把证明密钥要先看私钥在不在本机：
-        // 远程模式下它可能是 B 端的（KeyMaterial::Remote），本地模式下用到的也可能是
-        // 以前远程留下的同一把 —— 交给 finish_keyblob_creation 只会在签名那步抛
-        // IncompatiblePurpose。只有私钥在本机的才留着用。
+        // 本地出证：调用方自带的证明密钥若私钥不在本机（`KeyMaterial::Remote`），交给
+        // finish_keyblob_creation 只会在签名时抛 IncompatiblePurpose，必须先丢掉。
         let attestation_key = match attestation_key {
             None => None,
             Some(info) => {
@@ -541,7 +512,6 @@ impl crate::KeyMintTa {
     }
 
     /// Remote-mode key generation: the B-side TEE mints the attestation chain.
-    ///
     /// Returns `Ok(None)` when the remote backend is unavailable (so the caller
     /// may fall back to the local software keybox), and a hard `Err` only for
     /// genuine protocol failures that must not be masked.
@@ -583,20 +553,17 @@ impl crate::KeyMintTa {
         // Tag the relay-minted chain with the requesting security level so a
         // STRONGBOX request is not misreported as TEE by the relay's default.
         remote_params.security_level = Some(self.hw_info.security_level as i32);
-        // 设备 ID 证明：调用方要了就随请求带上，值取本机那套（见
-        // `remote_attestation_ids`）。不带的话中继铸出来的叶子里没有 710..717，
-        // 检查方直接报「Device Properties 返回异常」。
+        // 设备 ID 证明：调用方要了就随请求带上本机那套值（见 `remote_attestation_ids`），
+        // 否则中继铸出的叶子缺 710..717，校验方会报 Device Properties 异常。
         if needs_attestation_ids(params) {
             let ids = self
                 .get_attestation_ids()
                 .ok_or_else(|| km_err!(CannotAttestIds, "no attestation IDs provisioned"))?;
             remote_params.attestation_ids = remote_attestation_ids(params, &ids)?;
         }
-        // MODULE_HASH（tag 724）：本机软件 keybox 路径由 HAL 在
-        // `SetAdditionalAttestationInfo` 里塞进来（见 `keymint_device.rs` 的
-        // `KeyParam::ModuleHash`），远程路径要原样转发同一份摘要，否则中继铸出的
-        // 叶子缺 724，而 `getSupplementaryAttestationInfo(MODULE_HASH)` 仍返回本机
-        // 那 1213 字节 bundle —— 校验方会报 MODULE_HASH 缺失。
+        // MODULE_HASH（tag 724）：本机路径由 HAL 经 `SetAdditionalAttestationInfo`
+        // （`KeyParam::ModuleHash`）塞入；远程路径必须原样转发同一份摘要，否则叶子缺 724
+        // 而 `getSupplementaryAttestationInfo` 仍返回本机值，校验方报 MODULE_HASH 缺失。
         remote_params.module_hash =
             self.additional_attestation_info
                 .iter()
@@ -635,8 +602,8 @@ impl crate::KeyMintTa {
             return Ok(None);
         }
 
-        // 显式委派：B 必须真的用了调用方指定的那把证明密钥。旧版 B 会忽略这个
-        // 参数、改用本机批量 key 签一张无关证书，那种链必须拒掉（不能静默接受）。
+        // 显式委派：B 必须真的用了调用方指定的那把证明密钥，否则整条链拒掉
+        // （不能静默接受批量 key 签出的无关证书）。
         if let Some(issuer) = attestation_key {
             crate::cert::validate_remote_delegation(&chain, issuer)?;
         }
@@ -668,9 +635,8 @@ impl crate::KeyMintTa {
         self.add_keymint_tags(&mut chars, KeyOrigin::Generated)?;
         let _ = keygen_info;
         let root_of_trust = crate::cert::parse_remote_root_of_trust(leaf_der)?;
-        // 把 B 真机自己声明的设备身份落盘：root 侧的 `daemon` 会拿去做
-        // resetprop 对齐。链是真机出的，本机属性就必须说同一台机器，
-        // 否则检测器拿两边一对就报 device_properties / VBMeta 摘要不一致。
+        // 把 B 真机声明的设备身份落盘，root 侧 `daemon` 用它做 resetprop 对齐；链与
+        // 本机属性必须描述同一台机器，否则检测器报 device_properties 不一致。
         persist_remote_identity(leaf_der);
         let remote_key = KeyMaterial::Remote(crypto::RemoteRef {
             alias,
@@ -680,9 +646,8 @@ impl crate::KeyMintTa {
         });
 
         let mut certificate_chain = Vec::new();
-        // 未指定签发密钥时原样返回 B 的完整链；显式委派时只返回子证书 ——
-        // 调用方本来就持有自己的签发链（`setAttestKeyAlias`），它自己拼；AIDL 对
-        // `generateKey(.., AttestationKey)` 的要求也是只回这一张。
+        // 未指定签发密钥时返回 B 的完整链；显式委派时只返回子证书（调用方持有自己的
+        // 签发链，AIDL 对 `generateKey(.., AttestationKey)` 也只要求这一张）。
         let returned_chain = if attestation_key.is_some() {
             &chain[..1]
         } else {
@@ -1384,10 +1349,8 @@ fn self_hash_sha256(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// 从 `remote_identity` 里读回 B 真机的 RootOfTrust 字段，用来给**本地签的**
-/// 叶子证书对齐说法。文件里只有三条相关：`device_locked`、`verified_boot_state`、
-/// `vbmeta_digest`（TA 出远程链时自己写的）。没文件/没字段就返回 None，
-/// 本机继续用自己的值（本地模式不受影响）。
+/// 从 `remote_identity` 读回 B 真机的 `device_locked` / `verified_boot_state`，供本地
+/// 签的叶子证书对齐 RootOfTrust。无文件或无字段返回 None，本机值继续生效。
 fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::BootInfo> {
     let text = remote_identity_text()?;
     let mut locked: Option<i32> = None;
@@ -1403,10 +1366,8 @@ fn load_remote_boot_override(fallback: &keymint::BootInfo) -> Option<keymint::Bo
     let state = state?;
     let from_remote = keymint::VerifiedBootState::try_from(state)
         .unwrap_or(keymint::VerifiedBootState::Unverified);
-    // 只允许往「更严格」的方向抬。remote_identity 可能是很久以前写的（旧版本写的
-    // unlocked / Unverified，或者来自 B 真机那条链），拿它去盖掉本机已经锁定的说法，
-    // 链就会说「已解锁」而 daemon 早把 ro.boot.vbmeta.device_state / verifiedbootstate
-    // 锁成 locked / green 了 —— 自相矛盾，应用一看就见红。
+    // 只允许往「更严格」的方向抬：remote_identity 可能写着 unlocked / Unverified，
+    // 拿它盖掉本机已锁定的说法会与 daemon 锁定的 ro.boot.vbmeta 属性矛盾。
     let boot_state = if boot_state_rank(from_remote) > boot_state_rank(fallback.verified_boot_state)
     {
         fallback.verified_boot_state
@@ -1434,14 +1395,10 @@ fn boot_state_rank(state: keymint::VerifiedBootState) -> i32 {
     }
 }
 
-/// 读 `remote_identity` 的文本内容，存 5 秒。
-///
-/// 每笔本地铸证都会问一次（要跟 RKP 链对齐 RootOfTrust），而文件只有一百多字节；
-/// 5 秒的缓存已经能躲掉绝大多数重复读，同时保证 B 那边换了 boot 状态后很快跟上。
+/// 读 `remote_identity` 的文本内容并缓存 5 秒：每笔本地铸证都要读它对齐 RootOfTrust，
+/// 文件仅一百多字节；5 秒已能挡掉绝大多数重复读，又能跟上 B 侧的 boot 状态变化。
 fn remote_identity_text() -> Option<String> {
-    // 单一数据根：daemon 写在 /data/misc/ommega，TA 也从这读。
-    // 路径当时没跟着搬，还是 keystore 那份（已被迁移删掉），于是每次铸证都读不到，
-    // RootOfTrust 对不上 RKP 链 —— 现象就是一条链都不出。
+    // 单一数据根：daemon 与 TA 都读写 /data/misc/ommega。
     const PATH: &str = "/data/misc/ommega/remote_identity";
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
         std::sync::OnceLock::new();
@@ -1462,9 +1419,8 @@ fn remote_identity_text() -> Option<String> {
 }
 
 /// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写（避免触发重启循环）。
-///
-/// TA 跑在 keystore2 进程里（uid 1017），现在写 /data/misc/ommega（sepolicy 已放行 keystore 域）；
-/// 真正 resetprop + 重启 zygote 的是 root 侧的 daemon。
+/// TA 跑在 keystore2 进程（uid 1017），只写文件；resetprop 和重启 zygote 由 root 侧
+/// daemon 负责。
 fn persist_remote_identity(leaf_der: &[u8]) {
     const PATH: &str = "/data/misc/ommega/remote_identity";
     let Some(identity) = crate::cert::parse_remote_device_identity(leaf_der) else {
@@ -1500,17 +1456,13 @@ fn persist_remote_identity(leaf_der: &[u8]) {
             out.push('\n');
         }
     }
-    // boot 锁定状态：统一按我们对外宣称的 locked / Verified 写，不跟远端链的值走。
-    //
-    // 这个文件是本地签（ATTEST_KEY 子钥）唯一的 ROT 来源，而 daemon 的
-    // `lock_down_boot_state` 早把 ro.boot.vbmeta.device_state / verifiedbootstate 锁成
-    // locked / green 了。跟远端链写 unlocked / Unverified 的话，链跟属性就两个说法
-    // （应用会报「引导加载程序已解锁」）。远端那条链自己就是 unlocked 的情况（旧版本
-    // 写的，或 B 真机那条），也不该传染到我们本地签的链上。
+    // boot 锁定状态统一写 locked / Verified，不跟远端链的值走：本文件是本地签
+    // （ATTEST_KEY 子钥）唯一的 ROT 来源，必须与 daemon 的 `lock_down_boot_state`
+    // 锁定的 ro.boot.vbmeta.device_state / verifiedbootstate 一致。
     out.push_str("device_locked=1\n");
     out.push_str("verified_boot_state=0\n");
     if let Ok(Some(rot)) = crate::cert::parse_remote_root_of_trust(leaf_der) {
-        // 只记一笔，不采用：见上。排障时能看出远端到底声称了什么。
+        // 只记录、不采用：排障时可看出远端声称了什么。
         log::debug!(
             "remote ROT claims locked={} state={} (ignored, local claim wins)",
             rot.device_locked,
@@ -1566,7 +1518,6 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
             // `NO_AUTH_REQUIRED` for an auth-bound key (TrustAttestor:
             // `hardware.attestation.user_auth_metadata` /
             // `hardware.attestation.user_auth_policy`).
-            //
             // `UserSecureId` (502) *is* forwarded: the B-side real TEE needs it
             // to bind the key to a user, and it is the only auth tag the server
             // keybox layer deliberately skips when writing the leaf (AOSP emits
@@ -1585,12 +1536,9 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
     out
 }
 
-/// 调用方要求做设备 ID 证明时，算出要随请求带给中继的 `(tag, 值)` 列表。
-///
-/// 值一律取**本机那套**（`config [device]` / `AttestationIdInfo`），和 AOSP 的
-/// `AttestationIds::check_match` 一个口径：调用方上报的值对不上本机真值就回
-/// `CannotAttestIds`，绝不把调用方报的原值写进叶子 —— 拿一个投递的假值去问、
-/// 叶子把假值原样吐回来，是「软件代铸」最明显的特征。
+/// 算出设备 ID 证明要随请求带给中继的 `(tag, 值)` 列表。
+/// 值一律取本机那套（`config [device]` / `AttestationIdInfo`），调用方上报值对不上
+/// 本机真值即回 `CannotAttestIds`；绝不把调用方报的原值写进叶子。
 fn remote_attestation_ids(
     params: &[KeyParam],
     ids: &crate::AttestationIdInfo,
@@ -1616,7 +1564,7 @@ fn remote_attestation_ids(
             _ => continue,
         };
         if value.is_empty() {
-            // 本机没这项真值（比如没读到 IMEI）：那是「签不了这一项」，不是空字符串。
+            // 本机缺这项真值（如没读到 IMEI）即签不了这一项，回错误而不是空字符串。
             return Err(km_err!(
                 CannotAttestIds,
                 "no local value for attestation ID tag {}",
@@ -1628,26 +1576,19 @@ fn remote_attestation_ids(
     Ok(out)
 }
 
-/// 这次 generateKey 是不是在要一把「必须用户认证才能用」的 key。
-///
-/// 这类 key 交给远端铸是两头堵：B 端真 TEE 每次 begin(SIGN) 都要 auth token，而
-/// relay 在 B 侧拿不到 token（TEE 用硬件密钥签的 HMAC，伪造不了），签名必然 -26；
-/// 反过来把 504/505 丢掉，叶子又变成「不需要认证」，跟 app 的请求对不上 ——
-/// TrustAttestor 的 `hardware.attestation.user_auth_metadata` 就是这么判红的。
-/// 认证策略本来就是本机的事（指纹/锁屏由本机 Keystore2 管），所以这类 key 统一
-/// 本地生成，链走本地 keybox，授权列表完整。
+/// 此次 generateKey 是否要求「必须用户认证」的 key。
+/// 这类 key 一律本地生成、走本地 keybox：B 端拿不到 auth token（TEE 用硬件密钥签的
+/// HMAC，伪造不了），远程签名必然 -26；而丢掉 504/505 又会让叶子声称 NO_AUTH_REQUIRED。
+/// 认证策略本就由本机 Keystore2 管，本地路径能给出完整授权列表。
 fn requests_user_auth(params: &[KeyParam]) -> bool {
     params
         .iter()
         .any(|p| matches!(p, KeyParam::UserAuthType(_) | KeyParam::AuthTimeout(_)))
 }
 
-/// 只拿来跑 ECDH 的 key（`PURPOSE_AGREE_KEY`，而且没有签名/解密用途）。
-///
-/// 这类 key 不该走远程：私钥在 B 那边，每次 ECDH 都得把请求打到 B 的 TEE 上，
-/// 而 B 的 `AGREE_KEY` 在实测里会把 TEE 打进 `-49` 的坏状态（之后连签名都 -1000），
-/// 等于用一个探针把整条链拖死。本地软件 keybox 生成一把、本地算 ECDH 就够了 ——
-/// 这类探针只看协商出的 secret 是否一致，不验证书链。
+/// 只用于 ECDH 的 key（`PURPOSE_AGREE_KEY` 且无签名/解密用途）。
+/// 这类 key 恒本地生成、本地算 ECDH：B 的 `AGREE_KEY` 返回 -49 后 TEE 会进入坏状态
+/// （连签名都 -1000），而探针只看协商出的 secret，不验证书链。
 fn agrees_only(params: &[KeyParam]) -> bool {
     let mut purposes = params.iter().filter_map(|p| match p {
         KeyParam::Purpose(purpose) => Some(*purpose),

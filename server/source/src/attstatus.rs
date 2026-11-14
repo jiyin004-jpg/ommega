@@ -1,41 +1,30 @@
-//! Google 的 attestation 吊销名单。
+//! Google attestation 吊销名单。
 //!
-//! 名单本体是 `android.googleapis.com/attestation/status` 那份 JSON：键是证书序列号的
-//! **十进制**字符串，值是 `{status: REVOKED|SUSPENDED, reason: ...}`。keybox 里那套
-//! 私钥加证书链，就是被 KeyMint 拿去签 attestation 的东西，所以链上任何一张证书的
-//! 序列号都可能出现在这份名单里 —— 池子里留着被吊销的 keybox，出证时对面一查就拒，
-//! 还不如早点扔掉换一份。
+//! 名单 JSON 的键是证书序列号，值是 `{status: REVOKED|SUSPENDED, reason: ...}`。
+//! 链上任何一张证书都可能被列入，池子里留着这种 keybox，出证时对面一查就拒。
 //!
-//! 这台机器直连不到 googleapis（墙里），所以候选顺序是：
-//!   1. 本地磁盘缓存（够新就直接用，连请求都不发）
-//!   2. 我们自己仓库里的镜像（GitHub Actions 定时抓，服务器能直连 raw）
-//!   3. 本机的小代理出去问官方地址（mihomo 挂在 127.0.0.1:7890，实测 0.2 秒回）
-//!   4. 实在不行再直连官方地址兜一手（当前线路下走不通，留着备用）
-//!
-//! 拉不到就沿用上一次的，哪怕已经过期；一份都没有的时候不拦（`revoked_reason`
-//! 返回 None），只在日志里说明。采集和出证不能被这份名单的网络问题卡死。
-//!
-//! 名单是给「已经入库的身份」和「正要入库的身份」做体检用的，所以这里只读不写库。
+//! 候选顺序：磁盘缓存 → 仓库镜像 → 本机代理问官方 → 直连官方。
+//! 拉不到就沿用上一次的（哪怕过期）；一份都没有时不拦（`revoked_reason` 返回
+//! None），只在日志里说明 —— 采集和出证不能被名单的网络问题卡死。这里只读不写库。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 名单多新算够新。Google 那边大概一天动一次，六小时拉一回足够。
+/// 名单有效期 6 小时：Google 那边大约一天才动一次。
 const TTL: Duration = Duration::from_secs(6 * 60 * 60);
-/// 我们自己仓库里的镜像，由 `.github/workflows/relay-assets.yml` 定时刷新。
+/// 仓库镜像，由 `.github/workflows/relay-assets.yml` 定时刷新。
 const MIRROR: &str =
     "https://raw.githubusercontent.com/jiyin004-jpg/ommega/relay-assets/attestation-status.json";
 const OFFICIAL: &str = "https://android.googleapis.com/attestation/status";
-/// 本机出墙代理（mihomo，见 /etc/mihomo/config.yaml）。服务器直连官方地址是不通的，
-/// 走它就秒回；它自身不可用时退回直连，再不行才用磁盘缓存。
+/// 本机出口代理。服务器直连官方地址不通，走它才通。
 const PROXY_DEFAULT: &str = "http://127.0.0.1:7890";
-/// 拉下来的名单存这儿，重启不用重新联网。
+/// 名单磁盘缓存路径，重启不必重新联网。
 const CACHE_DEFAULT: &str = "/opt/relay/attestation_status.json";
 
 #[derive(Debug, Default)]
 pub struct StatusList {
-    /// 序列号（十进制字符串）-> `REVOKED(KEY_COMPROMISE)` 这种可读状态
+    /// 十进制序列号 -> `REVOKED(KEY_COMPROMISE)` 形式的可读状态
     entries: HashMap<String, String>,
     fetched_at: u64,
     source: String,
@@ -46,7 +35,7 @@ impl StatusList {
         self.entries.len()
     }
 
-    /// 表空不空。有 `len` 就得有它（clippy 的 `len_without_is_empty`）。
+    /// 有 `len` 就得有它（clippy 的 `len_without_is_empty`）。
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -72,14 +61,13 @@ fn cell() -> &'static RwLock<Option<Arc<StatusList>>> {
     LIST.get_or_init(|| RwLock::new(None))
 }
 
-/// 同一时刻只让一个线程去拉名单，别在同一秒里往外甩好几个请求。
+/// 同一时刻只允许一个线程拉名单，避免并发重复请求。
 fn fetch_lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
 }
 
-// 锁中毒（别的线程 panic 在里面）也接着用：这儿存的就是一份名单快照，
-// 真出问题大不了读到旧数据，比直接 panic 好。
+// 锁中毒也继续用：存的是名单快照，读到旧数据比 panic 好。
 fn read_cell() -> Option<Arc<StatusList>> {
     match cell().read() {
         Ok(g) => g.clone(),
@@ -108,10 +96,8 @@ pub fn cached() -> Option<Arc<StatusList>> {
 }
 
 /// 解析名单 JSON。
-///
-/// 键有两种写法，实测各占一半：一部分是十进制序列号（浅年头的 attestation 证书，
-/// 序列号才六十来位），一部分是十六进制（RKP 那些 128 位的）。所以每个键都要展开成
-/// 别名存着，查询那边只拿十进制去找 —— 光认十进制会漏掉一半条目。
+/// 键有两种写法：十进制序列号与十六进制（RKP 的 128 位）。查询侧只按十进制找，
+/// 所以每个键都要展开成别名，只认十进制会漏掉一大半。
 pub fn parse(body: &str, source: &str) -> anyhow::Result<StatusList> {
     let v: serde_json::Value = serde_json::from_str(body)?;
     let entries = v
@@ -151,10 +137,8 @@ pub fn parse(body: &str, source: &str) -> anyhow::Result<StatusList> {
     })
 }
 
-/// 一个名单键可能的所有含义：原样，以及把它当十六进制数读出来的十进制形式。
-///
-/// 纯数字的键放哪个筐里都不奇怪（偶数长度的纯数字既是合法十进制也是合法十六进制），
-/// 所以两种都存 —— 顶多多一个别名，不会漏。
+/// 一个名单键的所有可能含义：原样，以及按十六进制解出的十进制形式。
+/// 偶数长度的纯数字两种解释都合法，故都存 —— 顶多多一个别名，不会漏。
 fn key_aliases(key: &str) -> Vec<String> {
     let k = key.trim().to_ascii_lowercase();
     let mut out = vec![k.clone()];
@@ -181,15 +165,13 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 拉一份新名单。先把能用的候选按顺序试一遍，成功就落盘 + 进内存。
-///
-/// 磁盘缓存是最后兜底：网络全挂的时候，一份旧名单也比没有强。
+/// 拉一份新名单：按候选顺序逐个试，成功就落盘并进内存。
+/// 磁盘缓存是最后兜底 —— 网络全挂时旧名单也比没有强。
 pub fn fetch() -> anyhow::Result<StatusList> {
     let mut last_err: Option<anyhow::Error> = None;
     let proxy = proxy_url();
-    // 顺序有讲究：先走墙内镜像（远端 raw 偶尔要 10 秒才回，超时给宽点）；镜像还没上线
-    // 或拉不到时，直接经本地代理问 Google（实测 0.2 秒）；最后才是直连官方兜底
-    // —— 服务器到 android.googleapis.com 是连不通的，留着只是为了它哪天网络变好。
+    // 顺序：镜像（远端 raw 可能慢，超时放宽）→ 本地代理问官方 → 直连官方兜底。
+    // 服务器直连 android.googleapis.com 走不通，直连这项只是备用。
     let attempts = [
         (MIRROR, 30u64, false),
         (OFFICIAL, 20, true),
@@ -229,12 +211,12 @@ pub fn fetch() -> anyhow::Result<StatusList> {
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no status list URL")))
 }
 
-/// 从磁盘缓存读一份（启动时用，或网络全挂时兜底）。
+/// 从磁盘缓存读一份，启动或网络全挂时用。
 fn load_cache() -> Option<StatusList> {
     let path = cache_path();
     let meta = std::fs::metadata(&path).ok()?;
     let body = std::fs::read_to_string(&path).ok()?;
-    // 文件时间当抓取时间：判断新旧要看内容是什么时候抓的，不是什么时候读的。
+    // 用文件 mtime 当抓取时间：新旧看的是抓取时刻，不是读取时刻。
     let mtime = meta
         .modified()
         .ok()
@@ -253,20 +235,16 @@ fn load_cache() -> Option<StatusList> {
     }
 }
 
-/// 保证内存里有一份名单。
-///
-/// `force = false` 时只在「没有」或「过期」时才去拉；`force = true` 用于手动刷新。
-/// 返回当前可用的那份。
+/// 保证内存里有一份名单，返回当前可用的那份。
+/// `force = false` 仅在「没有」或「过期」时拉取；`force = true` 是手动刷新。
 pub fn ensure(force: bool) -> Option<Arc<StatusList>> {
-    // 启动那一瞬有两处会同时要名单（常驻刷新线程 + 采集/出证那条路），不加锁就
-    // 会各自往外发一次请求。拿住锁的人先再查一遍新鲜度，第二个人就直接拿现成的。
+    // 拿锁后重查新鲜度：并发调用者只会外发一次请求。
     let _guard = match fetch_lock().lock() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
     let current = cached();
-    // 刚启动时内存是空的，但磁盘上可能躺着一份还够新的（TTL 内），先拿它垫上，
-    // 重启就不用干等着联网了；断网的时候启动也不会为此卡一下。
+    // 内存为空时先读磁盘缓存垫上，重启和断网启动都不必等联网。
     let current = match current {
         Some(list) => Some(list),
         None => match load_cache() {
@@ -332,9 +310,8 @@ pub fn ensure(force: bool) -> Option<Arc<StatusList>> {
     }
 }
 
-/// 这批证书链里有没有被吊销的。命中就返回（序列号, 状态），没名单时返回 None。
-///
-/// 链上每张证书都查：泄露出去的多半是整条链，Google 那边挂哪一张都有可能。
+/// 链上任一证书被吊销就返回（序列号, 状态）；没有名单时返回 None。
+/// 每张证书都查：泄露的多半是整条链，Google 可能挂其中任意一张。
 pub fn revoked_reason(chain_pem: &str) -> Option<(String, String)> {
     let list = cached()?;
     lookup(&list, &chain_serials(chain_pem))
@@ -364,9 +341,8 @@ fn chain_serials(chain_pem: &str) -> Vec<String> {
     out
 }
 
-/// 序列号（大端字节）转十进制字符串 —— 名单里的键就是这个形式。
-///
-/// 手写而不是拉 BigInt 进来：序列号最多二十来个字节，这点乘加够用了。
+/// 序列号（大端字节）转十进制字符串，名单里的键就是这个形式。
+/// 手写代替 BigInt：序列号最多二十来个字节，这点乘加够用。
 fn serial_decimal(bytes: &[u8]) -> String {
     let mut digits: Vec<u8> = vec![0]; // 十进制位，低位在前
     for b in bytes {
@@ -396,7 +372,7 @@ mod tests {
 
     #[test]
     fn serial_decimal_matches_openssl() {
-        // 池子里那份 keybox 的根证书序列号，openssl 读出来是 D50FF25BA3F2D6B3
+        // 根证书序列号 D50FF25BA3F2D6B3 对应的十进制值
         assert_eq!(
             serial_decimal(&[0xD5, 0x0F, 0xF2, 0x5B, 0xA3, 0xF2, 0xD6, 0xB3]),
             "15352756130135856819"
@@ -423,8 +399,7 @@ mod tests {
         assert!(parse("{}", "test").is_err());
     }
 
-    /// 名单里两种写法混着（实测 977 个十进制 + 778 个十六进制），查询只拿十进制去找，
-    /// 所以十六进制键必须在加载时就转出十进制别名。
+    /// 十六进制键必须在加载时转出十进制别名，否则查询侧会漏。
     #[test]
     fn hex_and_decimal_keys_both_hit() {
         // 第一个键是十六进制写法：5cb838f1fe157a85 = 6681152659205225093
@@ -451,10 +426,9 @@ mod tests {
         assert_eq!(key_aliases("abc"), vec!["abc".to_string()]);
     }
 
-    /// 链上的序列号要转成十进制再查：名单的键就是这个形式。
     #[test]
     fn chain_serials_are_decimal() {
-        // 一条自签的假链，序列号是随机生的 —— 只验它转出来的是纯数字
+        // 自签假链，只验序列号转出来是纯数字
         let id = crate::cert::generate_self_signed("ec", 1).unwrap();
         let serials = chain_serials(&id.certificate_chain_pem);
         assert!(!serials.is_empty());

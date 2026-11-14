@@ -193,12 +193,11 @@ pub fn into_logged_binder(e: anyhow::Error) -> BinderStatus {
 
 /// 把客户端可见报错文本里的源码路径换成 AOSP keystore2 的相对路径。
 ///
-/// 我们这份影子本来就是 keystore2 那棵树改出来的，报错链里的 `file:line` 本来也就
-/// 来自那些文件；但构建机是 Windows，路径长成 `src\keymaster\security_level.rs`。
-/// 完整性检测器（TrustAttestor 的 `parameter_fingerprint` / `backend_provenance`）
-/// 就是拿这个字符串认「软件转发」的（它匹配 `src/keymaster/security_level.rs` 判
-/// OMK、匹配 `system/security/keystore2/src/security_level.rs` 判 AOSP）。写回
-/// AOSP 的相对路径：跟真机一致，也不再把自己的推导链摆给调用方看。
+/// 这份影子是从 keystore2 那棵树改出来的，报错链里的 `file:line` 本来也就来自那些文件，
+/// 但构建机是 Windows，路径长成 `src\keymaster\security_level.rs`。完整性检测器拿这个
+/// 字符串认「软件转发」（匹配 `src/keymaster/security_level.rs` 判 OMK、匹配
+/// `system/security/keystore2/src/security_level.rs` 判 AOSP）。写回 AOSP 的相对路径：
+/// 跟真机一致，也不把自己的推导链摆给调用方看。
 fn normalize_source_path(text: &str) -> String {
     text.replace("src\\keymaster\\", "system/security/keystore2/src/")
         .replace("src/keymaster/", "system/security/keystore2/src/")
