@@ -8,6 +8,7 @@
  *
  * 语法只认 sepolicy.rule 里用到的那几种：
  *     allow <类型>{集合} <类型>{集合} <类> <权限>{集合}|*
+ *     permissive <类型>{集合}
  * 集合可以写成单个名字，也可以写成 `{ a b c }`；目标写 `self` 表示源类型自己。
  * 规则的子集，不追求通用：不认 dontaudit / type_transition / 属性（attribute）展开。
  *
@@ -38,6 +39,7 @@
 #include <unistd.h>
 
 #include <sepol/policydb/avtab.h>
+#include <sepol/policydb/ebitmap.h>
 #include <sepol/policydb/hashtab.h>
 #include <sepol/policydb/policydb.h>
 #include <sepol/policydb/symtab.h>
@@ -261,6 +263,36 @@ static int add_allow(policydb_t *p, uint16_t src, uint16_t tgt, uint16_t cls,
     return 1;
 }
 
+/* `permissive <类型>{集合}`：把这些类型标成 permissive。类型不存在不算错，跟 allow 一样跳过。 */
+static int apply_permissive(policydb_t *p, char **tok, int ntok, int pos)
+{
+    struct nameset types;
+    int i;
+    int changed = 0;
+
+    if (parse_nameset(tok, ntok, &pos, &types) != 0) {
+        note("ommega-policy: permissive 的类型那一段看不懂");
+        return -1;
+    }
+    for (i = 0; i < types.count; i++) {
+        type_datum_t *t = find_type(p, types.name[i]);
+
+        if (!t) {
+            note("ommega-policy: 这份 policy 里没有类型 %s，跳过", types.name[i]);
+            continue;
+        }
+        if (ebitmap_get_bit(&p->permissive_map, t->s.value))
+            continue;
+        if (ebitmap_set_bit(&p->permissive_map, t->s.value, 1) != 0) {
+            note("ommega-policy: 置 permissive 位失败（%s，errno=%d）",
+                 types.name[i], errno);
+            return -1;
+        }
+        changed++;
+    }
+    return changed;
+}
+
 /* 一条规则。返回值：1 加了/改了规则，0 没动（已经有或全跳过），-1 出错。
  *
  * 类型/类/权限在 policy 里不存在时**不算错**：sepolicy.rule 本来就是「把各种机型的
@@ -288,8 +320,10 @@ static int apply_statement(policydb_t *p, char *line)
     ntok = tokenize(line, tok, MAX_TOKENS);
     if (ntok <= 0)
         return 0;
+    if (strcmp(tok[pos], "permissive") == 0)
+        return apply_permissive(p, tok, ntok, pos + 1);
     if (strcmp(tok[pos], "allow") != 0) {
-        note("ommega-policy: 不认的语句（只支持 allow）：%s", tok[pos]);
+        note("ommega-policy: 不认的语句（只支持 allow / permissive）：%s", tok[pos]);
         return -1;
     }
     pos++;
