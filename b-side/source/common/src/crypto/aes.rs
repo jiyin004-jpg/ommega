@@ -133,16 +133,6 @@ pub enum Mode {
     Aead(GcmMode),
 }
 
-impl Mode {
-    /// Indicate whether the AES mode is an AEAD.
-    pub fn is_aead(&self) -> bool {
-        match self {
-            Mode::Aead(_) => true,
-            Mode::Cipher(_) => false,
-        }
-    }
-}
-
 impl GcmMode {
     /// Return the tag length (in bytes) for an AES-GCM mode.
     pub fn tag_len(&self) -> usize {

@@ -165,24 +165,6 @@ pub fn characteristics_valid(characteristics: &[KeyParam]) -> Result<(), Error> 
     Ok(())
 }
 
-/// Copy anything in `src` that matches `tags` into `dest`.  Fails if any non-repeatable
-/// tags occur more than once with a different value.
-pub fn transcribe_tags(
-    dest: &mut Vec<KeyParam>,
-    src: &[KeyParam],
-    tags: &[Tag],
-) -> Result<(), Error> {
-    let mut dup_checker = DuplicateTagChecker::default();
-    for param in src {
-        let tag = param.tag();
-        dup_checker.add(tag)?;
-        if tags.contains(&tag) {
-            dest.try_push(param.clone())?;
-        }
-    }
-    Ok(())
-}
-
 /// Get the configured algorithm from a set of parameters.
 pub fn get_algorithm(params: &[KeyParam]) -> Result<Algorithm, Error> {
     get_tag_value!(params, Algorithm, ErrorCode::UnsupportedAlgorithm)

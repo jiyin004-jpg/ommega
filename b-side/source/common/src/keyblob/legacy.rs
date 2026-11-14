@@ -47,13 +47,6 @@ pub enum AuthEncryptedBlobFormat {
 }
 
 impl AuthEncryptedBlobFormat {
-    /// Indicate whether this format requires secure deletion support.
-    pub fn requires_secure_deletion(&self) -> bool {
-        matches!(
-            self,
-            Self::AesGcmWithSecureDeletion | Self::AesGcmWithSecureDeletionVersioned
-        )
-    }
     /// Indicate whether this format is versioned.
     pub fn is_versioned(&self) -> bool {
         matches!(

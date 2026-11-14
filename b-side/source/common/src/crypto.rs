@@ -185,11 +185,6 @@ impl KeyMaterial {
         }
     }
 
-    /// Indicate whether the key material is for a symmetric key.
-    pub fn is_symmetric(&self) -> bool {
-        !self.is_asymmetric()
-    }
-
     /// Return the public key information as an ASN.1 DER encodable `SubjectPublicKeyInfo`, as
     /// described in RFC 5280 section 4.1.
     ///
