@@ -502,6 +502,11 @@ fn clear_gone(key: &str) {
     forget_pem(GONE_SECTION, key);
 }
 
+/// 这个 key 删过（墓碑在）。
+fn is_gone(key: &str) -> bool {
+    read_store_pem(GONE_SECTION, key).is_some()
+}
+
 fn ask_gone_key(uid: i32) -> String {
     format!("ask:{uid}")
 }
@@ -594,6 +599,19 @@ fn current_attk() -> Option<Key> {
         }
     }
     Some(cached.clone())
+}
+
+/// 只看已有的 ASK（内存或盘上），不现造。
+fn ask_existing(state: &State, uid: i32) -> Option<Key> {
+    if let Some(key) = state.asks.lock().ok()?.get(&uid).cloned() {
+        return Some(key);
+    }
+    let pem = read_store_pem(ASK_SECTION, &uid.to_string())?;
+    let key = Key::from_pem(&pem)?;
+    if let Ok(mut map) = state.asks.lock() {
+        map.insert(uid, key.clone());
+    }
+    Some(key)
 }
 
 /// 取（必要时造）某个 uid 的 ASK。
@@ -1049,10 +1067,14 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // exportAskPublicKey(uid) —— 这个 uid 的 ASK 自描述，由 ATTK 签（ATTK 是 ASK 的根）
         1 => {
             let uid = call.uid?;
-            // 有料就导出，墓碑只挡「真的没有料」的那种。以前一看到墓碑就回空，
-            // 结果 hasAskAlready 答有、导出却是空 —— 检测器就卡在 askModel 上
-            // （UnifiedAudit 的 SOTER 项就是这么红的）。存在性与导出必须同源。
-            let Some(ask) = ask_for(state, uid) else {
+            // 有料就导出；没料但墓碑在就不现造（真机删了就是删了）。
+            // 存在性与导出同源：两边都只看料和墓碑。
+            let ask = match ask_existing(state, uid) {
+                Some(key) => Some(key),
+                None if is_gone(&ask_gone_key(uid)) => None,
+                None => ask_for(state, uid),
+            };
+            let Some(ask) = ask else {
                 return Some(Answer::Buffer {
                     code: NOT_FOUND,
                     data: None,
