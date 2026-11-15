@@ -61,9 +61,7 @@ pub struct FilterConfig {
     pub deny_packages: Vec<String>,
     pub block_android_package: bool,
     pub allow_unknown_package: bool,
-    /// Intercept every app, ignoring `scoop` and the package-resolution gates
-    /// ("全局作用域").  Set from the A-side WebUI.  Local-vs-remote handling is
-    /// NOT affected: this only widens which callers ommega handles.
+    /// 全局作用域：接管普通应用和绑定的系统 app 域，来自 A 端 WebUI。
     pub global_scope: bool,
     /// 系统 uid（< AID_APP_START）里额外放行接管的 SELinux 域前缀。
     /// 默认 `engineermode`。
@@ -102,9 +100,7 @@ impl Default for InjectorConfig {
 }
 
 fn default_scoop() -> Vec<String> {
-    // 出厂作用域是空的：作用域只从面板写的 `target.txt` 来。
-    // 全局开就接管普通应用（外加 `system_sid_packages` 里的系统 app 域）；
-    // 全局关就只接管 `target.txt` 里勾选的那些。
+    // 出厂作用域为空；作用域只来自面板写的 `target.txt`。
     Vec::new()
 }
 
@@ -124,8 +120,7 @@ impl Default for FilterConfig {
             deny_packages: Vec::new(),
             block_android_package: true,
             allow_unknown_package: false,
-            // 默认开：接管 app uid 和显式绑定的系统 app 域，系统进程始终留系统后端。
-            // 要恢复“只看 scoop / target.txt”就在面板里关掉。
+            // 默认开：接管 app uid 和绑定的系统 app 域。
             global_scope: true,
             allow_system_sids: vec!["engineermode".to_string()],
             system_sid_packages: BTreeMap::from([(

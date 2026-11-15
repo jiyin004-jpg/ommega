@@ -1,10 +1,5 @@
-# With `[filter].enabled = true`, a UID is intercepted when any package
-# sharing that UID is listed in the scope.
-#
-# 作用域（哪些包要接管）**只有一个来源**：面板写的
-# `/data/misc/keystore/ommega/target.txt`。这里不再另存一份包列表 ——
-# 两处都在表达作用域时只能靠“文件在不在”判优先级，没必要。
-# Filter deny settings still apply to every package resolved for the UID.
+# `[filter].enabled = true` 时，UID 下任一包在作用域里就接管。
+# 作用域只有一处来源：`/data/misc/keystore/ommega/target.txt`。
 
 version = 1
 
@@ -17,11 +12,8 @@ enabled = true
 deny_packages = []
 block_android_package = true
 allow_unknown_package = false
-# 全局作用域：默认开——普通应用（每用户 uid 10000–19999）和显式绑定的系统 app 域
-# （工程模式）都接管，不再要求写进 `scoop`；ROM 系统包和系统进程（init /
-# system_server / keystore / vold / root）仍然走系统后端。
-# 正常由模块 WebUI 控制（它把 `global_scope` 写进 A 端平铺 config，并覆盖这里的值），
-# 这里保留一项是为了 schema 完整、也便于没有 WebUI 的场景。
+# 全局作用域：接管普通应用和 `system_sid_packages` 绑定的系统应用域；
+# 其余 ROM 系统包和系统进程走系统后端。由面板写入。
 global_scope = true
 
 [intercept]

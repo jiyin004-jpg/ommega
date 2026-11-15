@@ -865,15 +865,10 @@ pub struct RemoteConfig {
     /// Defaults to false.
     #[serde(default)]
     pub soter_inject: bool,
-    /// SOTER uid 的替身映射，写 `A 端 uid=B 端 uid`（逗号分隔多条）。
-    /// SOTER 身份是 `(cpu_id, uid)` 一起绑的，B 的 store 里只有它自己那套应用的密钥，
-    /// 拿 A 端某个 uid 去问 B 必然答「没有」。没配就原样转发，不做任何推断。
+    /// SOTER uid 替身映射，写 `A 端 uid=B 端 uid`（逗号分隔多条）。空 = 原样转发。
     #[serde(default)]
     pub soter_uid_map: String,
-    /// 连 relay server 时把 socket 绑到哪块网卡（`/data/adb/ommega/config` 的 `bind_iface`）。
-    /// 空或缺省 = `auto`：系统默认那条路通就不绑，不通才挑一块真能打到服务端的网卡
-    /// （优先物理链路）。`none` / `off` 永不绑，`always` / `on` 无条件挑，其余当网卡名。
-    /// 见 `remote::desired_iface`。
+    /// 连 relay server 时绑哪块网卡：`auto`（缺省）/ `none` / `always` / 网卡名。
     #[serde(default)]
     pub bind_iface: String,
 }
@@ -886,15 +881,13 @@ impl Default for RemoteConfig {
             url: String::new(),
             token: String::new(),
             device_id: String::new(),
-            // The production relay serves a self-signed cert on :8443, so both the WebUI
-            // default and this fallback accept any server cert; pinning a CA means setting
-            // `tls_insecure = false`.
+            // 缺省不校验证书链；要钉 CA 就设 `tls_insecure = false`。
             tls_insecure: true,
             fallback_local: true,
             debug_logging: false,
             hide_strongbox: false,
             soter_hide: false,
-            // 默认接管 SOTER：接管后才能自己答 ASK/签名，不接管只能透传原厂 HAL。
+            // 缺省接管 SOTER。
             soter_inject: true,
             soter_uid_map: String::new(),
             bind_iface: String::new(),
@@ -902,10 +895,7 @@ impl Default for RemoteConfig {
     }
 }
 
-/// The flat A-side config's log switch (`debug_logging` / `debug` / `verbose`), read
-/// straight from the file instead of through the runtime [`config`], because
-/// `logging::init_logger()` runs before the runtime config exists. Unreadable file, missing
-/// key or non-truthy value all mean off, which silences every sink (file and logcat).
+/// 平铺 config 里的日志开关（`debug_logging` / `debug` / `verbose`），直接读文件。
 pub fn flat_debug_logging() -> bool {
     flat_config_truthy(&["debug_logging", "debug", "verbose"])
 }
