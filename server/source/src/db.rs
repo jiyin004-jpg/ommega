@@ -72,6 +72,23 @@ fn row_str(row: &mysql::Row, col: &str) -> String {
     row_str_opt(row, col).unwrap_or_default()
 }
 
+/// 数值列：NULL 或类型不符一律当 0。
+/// 不能用 `row.get::<i64>()` —— 它在值为 NULL 时直接 panic（不是返回 None）。
+fn row_i64(row: &mysql::Row, col: &str) -> i64 {
+    match row.get_opt::<i64, _>(col) {
+        Some(Ok(v)) => v,
+        _ => 0,
+    }
+}
+
+/// 可空数值列（如 `card_order.token_id` 在未支付时就是 NULL）。
+fn row_i64_opt(row: &mysql::Row, col: &str) -> Option<i64> {
+    match row.get_opt::<Option<i64>, _>(col) {
+        Some(Ok(v)) => v,
+        _ => None,
+    }
+}
+
 pub struct Db {
     pool: Pool,
 }
@@ -232,7 +249,7 @@ impl Db {
         let algorithm = row_str(&row, "algorithm");
         let certificate_chain_pem = row_str(&row, "certificate_chain_pem");
         let private_key_pem_cipher = row_str(&row, "private_key_pem_cipher");
-        let active: i64 = row.get("active").unwrap_or(0);
+        let active = row_i64(&row, "active");
         let machine_id = row_str(&row, "machine_id");
         let created_at = row_str(&row, "created_at");
         Ok(DeviceIdentity {
@@ -662,12 +679,12 @@ impl Db {
     // ---- ApiToken ----
 
     fn api_token_from_row(row: mysql::Row) -> anyhow::Result<ApiTokenRow> {
-        let id: i64 = row.get("id").unwrap_or(0);
+        let id = row_i64(&row, "id");
         let token = row_str(&row, "token");
         let role = row_str(&row, "role");
-        let duration_seconds: i64 = row.get("duration_seconds").unwrap_or(0);
+        let duration_seconds = row_i64(&row, "duration_seconds");
         let note = row_str(&row, "note");
-        let enabled: i64 = row.get("enabled").unwrap_or(0);
+        let enabled = row_i64(&row, "enabled");
         Ok(ApiTokenRow {
             id,
             token,
@@ -1040,15 +1057,15 @@ impl Db {
     // ---- Card orders ----
 
     fn card_order_from_row(row: mysql::Row) -> anyhow::Result<CardOrderRow> {
-        let id: i64 = row.get("id").unwrap_or(0);
+        let id = row_i64(&row, "id");
         let order_id = row_str(&row, "order_id");
         let card_type = row_str(&row, "card_type");
         let role = row_str(&row, "role");
-        let price_cents: i64 = row.get("price_cents").unwrap_or(0);
+        let price_cents = row_i64(&row, "price_cents");
         let status = row_str(&row, "status");
-        let bonus_draws: i64 = row.get("bonus_draws").unwrap_or(0);
+        let bonus_draws = row_i64(&row, "bonus_draws");
         let contact = row_str(&row, "contact");
-        let token_id: Option<i64> = row.get("token_id");
+        let token_id = row_i64_opt(&row, "token_id");
         Ok(CardOrderRow {
             id,
             order_id,
@@ -1180,7 +1197,7 @@ impl Db {
             anyhow::bail!("order not found");
         };
         let status = row_str(row, "status");
-        let token_id: Option<i64> = row.get("token_id");
+        let token_id = row_i64_opt(row, "token_id");
         if status == "delivered" {
             conn.query_drop("COMMIT")?;
             let token = token_id
