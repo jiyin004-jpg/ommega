@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 use crate::handlers::AppState;
 
@@ -21,6 +22,20 @@ const YEAR_PRICE_CENTS: i64 = 500; // 5.00 CNY
 
 fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
+}
+
+/// 把同步的 MySQL 调用挪到阻塞线程池：这组 handler 都在 async 上下文里，
+/// 直接调用会把 tokio worker 堵住。返回的 Err 已经是可直出的文案。
+async fn db_call<T, F>(db: Arc<crate::db::Db>, f: F) -> Result<T, String>
+where
+    F: FnOnce(&crate::db::Db) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || f(db.as_ref())).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("db error: {e}")),
+        Err(e) => Err(format!("join error: {e}")),
+    }
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
@@ -77,16 +92,25 @@ pub async fn card_order(State(state): State<AppState>, Json(body): Json<OrderBod
     };
     let order_id = generate_order_id();
     // Buying a year card grants 1 bonus lottery draw.
-    if let Err(e) = db.create_card_order(crate::db::NewCardOrder {
-        order_id: &order_id,
-        card_type: "year",
-        role: &body.role,
-        price_cents: YEAR_PRICE_CENTS,
-        bonus_draws: 1,
-        contact: body.contact.trim(),
-        pay_type,
-    }) {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"));
+    {
+        let oid = order_id.clone();
+        let role = body.role.clone();
+        let contact = body.contact.trim().to_string();
+        let created = db_call(db.clone(), move |db| {
+            db.create_card_order(crate::db::NewCardOrder {
+                order_id: &oid,
+                card_type: "year",
+                role: &role,
+                price_cents: YEAR_PRICE_CENTS,
+                bonus_draws: 1,
+                contact: &contact,
+                pay_type,
+            })
+        })
+        .await;
+        if let Err(e) = created {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e);
+        }
     }
 
     let mut resp = json!({
@@ -128,7 +152,9 @@ pub async fn card_order(State(state): State<AppState>, Json(body): Json<OrderBod
         };
         match crate::pay::submit_order(gw, order).await {
             Ok(pay_resp) => {
-                let _ = db.set_order_trade_no(&order_id, &pay_resp.trade_no);
+                let oid = order_id.clone();
+                let trade_no = pay_resp.trade_no.clone();
+                let _ = db_call(db.clone(), move |db| db.set_order_trade_no(&oid, &trade_no)).await;
                 let pay_url = if !pay_resp.url.is_empty() {
                     pay_resp.url
                 } else {
@@ -174,7 +200,13 @@ pub async fn card_lottery(State(state): State<AppState>, headers: HeaderMap) -> 
     let client_key = format!("ip:{ip}");
 
     // Strict daily limit: at most 3 draws per client per day.
-    match db.lottery_draws_today(&client_key, &today) {
+    let drawn_today = db_call(db.clone(), {
+        let key = client_key.clone();
+        let day = today.clone();
+        move |db| db.lottery_draws_today(&key, &day)
+    })
+    .await;
+    match drawn_today {
         Ok(n) if n >= 3 => {
             return json_err(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -182,20 +214,31 @@ pub async fn card_lottery(State(state): State<AppState>, headers: HeaderMap) -> 
             );
         }
         Ok(_) => {}
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 
     // Draw: 10% chance to win a 7-day A-side card.
     let won = draw_won();
     let card_type = if won { "week" } else { "none" };
 
-    if let Err(e) = db.insert_lottery_record(&client_key, &today, won, card_type) {
-        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"));
+    let recorded = db_call(db.clone(), {
+        let key = client_key.clone();
+        let day = today.clone();
+        move |db| db.insert_lottery_record(&key, &day, won, card_type)
+    })
+    .await;
+    if let Err(e) = recorded {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e);
     }
 
     if won {
         let token = crate::util::generate_token_string();
-        if let Err(e) = db.insert_api_token(&token, "a", crate::db::WEEK_SECS, "card:week") {
+        let issued = db_call(db.clone(), {
+            let token = token.clone();
+            move |db| db.insert_api_token(&token, "a", crate::db::WEEK_SECS, "card:week")
+        })
+        .await;
+        if let Err(e) = issued {
             return json_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("issue failed: {e}"),
@@ -271,6 +314,7 @@ pub async fn card_pay_callback(
 }
 
 /// Mark an order paid and deliver the card token. Idempotent for paid/delivered.
+/// 同步实现，必须在 `spawn_blocking` 里调（见 `db_call`）。
 fn pay_and_deliver(db: &crate::db::Db, order_id: &str) -> Result<Option<String>, String> {
     let order = match db.get_card_order(order_id) {
         Ok(Some(o)) => o,
@@ -323,7 +367,12 @@ async fn aggregate_pay_notify(
     if let Some(money) = params.get("money") {
         if let Ok(amt) = money.parse::<f64>() {
             let cents = (amt * 100.0).round() as i64;
-            if let Ok(Some(order)) = db.get_card_order(order_id) {
+            let looked_up = db_call(db.clone(), {
+                let oid = order_id.to_string();
+                move |db| db.get_card_order(&oid)
+            })
+            .await;
+            if let Ok(Some(order)) = looked_up {
                 if order.price_cents > 0 && cents != order.price_cents {
                     tracing::warn!(
                         "pay callback: amount mismatch order={order_id} expect={} got={cents}",
@@ -335,9 +384,18 @@ async fn aggregate_pay_notify(
         }
     }
     if let Some(trade_no) = params.get("trade_no") {
-        let _ = db.set_order_trade_no(order_id, trade_no);
+        let oid = order_id.to_string();
+        let tno = trade_no.clone();
+        let _ = db_call(db.clone(), move |db| db.set_order_trade_no(&oid, &tno)).await;
     }
-    match pay_and_deliver(db, order_id) {
+    let oid = order_id.to_string();
+    let delivered = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || pay_and_deliver(db.as_ref(), &oid)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("join error: {e}")));
+    match delivered {
         Ok(_) => "success".into_response(),
         Err(e) => {
             tracing::error!("pay callback deliver failed: {e}");
@@ -356,7 +414,14 @@ async fn legacy_pay_callback(state: AppState, body: PayCallbackBody) -> Response
     let Some(db) = &state.db else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
-    match pay_and_deliver(db, &body.order_id) {
+    let oid = body.order_id.clone();
+    let delivered = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || pay_and_deliver(db.as_ref(), &oid)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("join error: {e}")));
+    match delivered {
         Ok(Some(token)) => Json(json!({
             "status": "ok",
             "order_id": body.order_id,
@@ -365,7 +430,11 @@ async fn legacy_pay_callback(state: AppState, body: PayCallbackBody) -> Response
         .into_response(),
         Ok(None) => {
             // Already paid/delivered or still processing.
-            let order = db.get_card_order(&body.order_id).ok().flatten();
+            let oid = body.order_id.clone();
+            let order = db_call(db.clone(), move |db| db.get_card_order(&oid))
+                .await
+                .ok()
+                .flatten();
             let status = order.map(|o| o.status).unwrap_or_default();
             Json(json!({
                 "status": "already",
@@ -398,16 +467,22 @@ pub async fn card_order_status(
     let Some(db) = &state.db else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
-    let order = match db.get_card_order(&body.order_id) {
+    let oid = body.order_id.clone();
+    let order = db_call(db.clone(), move |db| db.get_card_order(&oid)).await;
+    let order = match order {
         Ok(Some(o)) => o,
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "order not found"),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
-    let token = order
-        .token_id
-        .and_then(|id| db.get_token_by_id(id).ok().flatten())
-        .map(|t| t.token)
-        .unwrap_or_default();
+    let token = match order.token_id {
+        Some(id) => db_call(db.clone(), move |db| db.get_token_by_id(id))
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.token)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
     Json(json!({
         "status": "ok",
         "order_id": order.order_id,
@@ -446,16 +521,17 @@ pub async fn card_query_by_contact(
             "rate limit exceeded, try again later",
         );
     }
-    let contact = body.contact.trim();
+    let contact = body.contact.trim().to_string();
     if contact.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "contact is required");
     }
     let Some(db) = &state.db else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
-    let orders = match db.find_orders_by_contact(contact) {
+    let found = db_call(db.clone(), move |db| db.find_orders_by_contact(&contact)).await;
+    let orders = match found {
         Ok(o) => o,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     if orders.is_empty() {
         return Json(json!({ "status": "ok", "cards": [] })).into_response();
@@ -463,11 +539,15 @@ pub async fn card_query_by_contact(
     // Resolve each order's token (if delivered).
     let mut cards: Vec<Value> = Vec::new();
     for o in &orders {
-        let token = o
-            .token_id
-            .and_then(|id| db.get_token_by_id(id).ok().flatten())
-            .map(|t| t.token)
-            .unwrap_or_default();
+        let token = match o.token_id {
+            Some(id) => db_call(db.clone(), move |db| db.get_token_by_id(id))
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.token)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
         cards.push(json!({
             "order_id": o.order_id,
             "role": o.role,
@@ -535,17 +615,22 @@ pub async fn card_lookup(
             "rate limit exceeded, try again later",
         );
     }
-    let token = body.token.trim();
+    let token = body.token.trim().to_string();
     if token.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "卡密不能为空");
     }
     let Some(db) = &state.db else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
-    let row = match db.get_api_token(token) {
+    let looked_up = db_call(db.clone(), {
+        let token = token.clone();
+        move |db| db.get_api_token(&token)
+    })
+    .await;
+    let row = match looked_up {
         Ok(Some(r)) => r,
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "卡密不存在"),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
 
     // 只有激活过才有到期时间；没激活的卡是「首次使用开始计时」。
@@ -606,17 +691,22 @@ pub async fn card_unbind(
             "rate limit exceeded, try again later",
         );
     }
-    let token = body.token.trim();
+    let token = body.token.trim().to_string();
     if token.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "卡密不能为空");
     }
     let Some(db) = &state.db else {
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
-    let row = match db.get_api_token(token) {
+    let looked_up = db_call(db.clone(), {
+        let token = token.clone();
+        move |db| db.get_api_token(&token)
+    })
+    .await;
+    let row = match looked_up {
         Ok(Some(r)) => r,
         Ok(None) => return json_err(StatusCode::NOT_FOUND, "卡密不存在"),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     if row.bound_serial.is_empty() && row.bound_sn.is_empty() && row.bound_imei.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "这张卡还没有绑定设备");
@@ -639,7 +729,12 @@ pub async fn card_unbind(
         return json_err(StatusCode::FORBIDDEN, UNBIND_REFUSED);
     }
 
-    match db.unbind_token_device_limited(token, UNBIND_MAX_TOTAL) {
+    let unbind_token = token.clone();
+    match db_call(db.clone(), move |db| {
+        db.unbind_token_device_limited(&unbind_token, UNBIND_MAX_TOTAL)
+    })
+    .await
+    {
         Ok(true) => Json(json!({
             "status": "ok",
             "message": "已解绑，下次使用会绑定到新的设备",
