@@ -899,73 +899,43 @@ impl RemoteRelay {
         );
         // Forward the app's key-generation parameters (mirroring client-a) so
         // the B-side TEE mints a key matching the request, not an EC-P256 default.
-        if let Some(algo) = params.key_algorithm {
-            ctx.insert("key_algorithm".to_string(), Value::from(algo));
-        }
-        if let Some(size) = params.key_size {
-            ctx.insert("key_size".to_string(), Value::from(size));
-        }
-        if let Some(curve) = params.ec_curve {
-            ctx.insert("ec_curve".to_string(), Value::from(curve));
-        }
-        if !params.purpose.is_empty() {
-            ctx.insert(
-                "purpose".to_string(),
-                Value::Array(params.purpose.iter().copied().map(Value::from).collect()),
-            );
-        }
-        if !params.digest.is_empty() {
-            ctx.insert(
-                "digest".to_string(),
-                Value::Array(params.digest.iter().copied().map(Value::from).collect()),
-            );
-        }
-        if !params.padding.is_empty() {
-            ctx.insert(
-                "padding".to_string(),
-                Value::Array(params.padding.iter().copied().map(Value::from).collect()),
-            );
-        }
-        if let Some(mgf) = params.mgf_digest {
-            ctx.insert("mgf_digest".to_string(), Value::from(mgf));
-        }
-        if let Some(exponent) = params.rsa_public_exponent {
-            ctx.insert("rsa_public_exponent".to_string(), Value::from(exponent));
-        }
-        if let Some(subject) = &params.certificate_subject {
-            ctx.insert(
-                "certificate_subject".to_string(),
-                Value::String(base64_encode(subject)),
-            );
-        }
-        if let Some(not_before) = params.certificate_not_before_ms {
-            ctx.insert(
-                "certificate_not_before_ms".to_string(),
-                Value::from(not_before),
-            );
-        }
-        if let Some(not_after) = params.certificate_not_after_ms {
-            ctx.insert(
-                "certificate_not_after_ms".to_string(),
-                Value::from(not_after),
-            );
-        }
-        if let Some(serial) = cert_serial {
-            ctx.insert(
-                "certificate_serial".to_string(),
-                Value::String(base64_encode(serial)),
-            );
-        }
+        put(&mut ctx, "key_algorithm", params.key_algorithm);
+        put(&mut ctx, "key_size", params.key_size);
+        put(&mut ctx, "ec_curve", params.ec_curve);
+        put_list(&mut ctx, "purpose", &params.purpose);
+        put_list(&mut ctx, "digest", &params.digest);
+        put_list(&mut ctx, "padding", &params.padding);
+        put(&mut ctx, "mgf_digest", params.mgf_digest);
+        put(&mut ctx, "rsa_public_exponent", params.rsa_public_exponent);
+        put(
+            &mut ctx,
+            "certificate_subject",
+            params.certificate_subject.as_deref().map(base64_encode),
+        );
+        put(
+            &mut ctx,
+            "certificate_not_before_ms",
+            params.certificate_not_before_ms,
+        );
+        put(
+            &mut ctx,
+            "certificate_not_after_ms",
+            params.certificate_not_after_ms,
+        );
+        put(
+            &mut ctx,
+            "certificate_serial",
+            cert_serial.map(base64_encode),
+        );
         // Forward the requesting security level (1 = TEE, 2 = StrongBox) so the
         // relay tags the attestation extension the same way the A-side reported
         // it. Without this a STRONGBOX request minted remotely is mislabelled as
         // TEE (the relay's `attestation_security_level` default is 1).
-        if let Some(security_level) = params.security_level {
-            ctx.insert(
-                "attestation_security_level".to_string(),
-                Value::from(i64::from(security_level)),
-            );
-        }
+        put(
+            &mut ctx,
+            "attestation_security_level",
+            params.security_level.map(i64::from),
+        );
         // User-authentication / authorization-list entries the app asked for, as
         // `[tag, value]` pairs (502/503/504/505/506/507/508/509; the value is
         // only meaningful for 504 USER_AUTH_TYPE and 505 AUTH_TIMEOUT, the rest
@@ -1014,9 +984,11 @@ impl RemoteRelay {
         // teeEnforced authorization list. Software attestations that omit these
         // two tags are flagged as tampered by self-check apps (e.g. 密钥认证
         // 1.7's `checkTagOrderMisordered` requires 704/705/706 all present).
-        let os_version = match config::config().read() {
-            Ok(g) => (g.trust.os_version.max(0) as u32) * 10000,
-            Err(_) => {
+        // 配置在本次请求里只读一次：四处开关来自同一快照。
+        let cfg = config::config().read().ok();
+        let os_version = match cfg.as_ref() {
+            Some(g) => (g.trust.os_version.max(0) as u32) * 10000,
+            None => {
                 (kmr_common::android_version::android_major_version().unwrap_or(16) as u32) * 10000
             }
         };
@@ -1047,15 +1019,15 @@ impl RemoteRelay {
                 Value::from(i64::from(record_version)),
             );
         }
-        let os_patch_level = match config::config().read() {
-            Ok(g) => patch_level_to_yyyymm(&g.trust.os_patchlevel),
-            Err(_) => None,
-        }
-        .or_else(|| {
-            patch_property("OMMEGA_PATCH_SECURITY", "ro.build.version.security_patch")
-                .as_deref()
-                .and_then(patch_level_to_yyyymm)
-        });
+        let os_patch_level = cfg
+            .as_ref()
+            .map(|g| patch_level_to_yyyymm(&g.trust.os_patchlevel))
+            .unwrap_or_default()
+            .or_else(|| {
+                patch_property("OMMEGA_PATCH_SECURITY", "ro.build.version.security_patch")
+                    .as_deref()
+                    .and_then(patch_level_to_yyyymm)
+            });
         if let Some(patch) = os_patch_level {
             ctx.insert("os_patch_level".to_string(), Value::from(patch));
         }
@@ -1071,9 +1043,9 @@ impl RemoteRelay {
             patch_property("OMMEGA_PATCH_VENDOR", "ro.vendor.build.security_patch")
                 .as_deref()
                 .and_then(patch_level_to_yyyymmdd)
-                .or_else(|| match config::config().read() {
-                    Ok(g) => patch_level_to_yyyymmdd(&g.trust.vendor_patchlevel),
-                    Err(_) => None,
+                .or_else(|| match cfg.as_ref() {
+                    Some(g) => patch_level_to_yyyymmdd(&g.trust.vendor_patchlevel),
+                    None => None,
                 })
                 .or(os_patch_level);
         if let Some(patch) = vendor_patch_level {
@@ -1085,8 +1057,8 @@ impl RemoteRelay {
         let boot_patch_level =
             patch_property("OMMEGA_PATCH_BOOT", "ro.boot.image.build.security_patch")
                 .or_else(|| patch_property("OMMEGA_PATCH_BOOT", "ro.boot.build.security_patch"))
-                .or_else(|| match config::config().read() {
-                    Ok(g) if !matches!(g.trust.boot_patchlevel.trim(), "auto" | "latest") => {
+                .or_else(|| match cfg.as_ref() {
+                    Some(g) if !matches!(g.trust.boot_patchlevel.trim(), "auto" | "latest") => {
                         Some(g.trust.boot_patchlevel.clone())
                     }
                     _ => None,
@@ -1208,6 +1180,27 @@ impl RemoteRelay {
 
 fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// 可选字段：有值才写。
+fn put<V: Into<Value>>(ctx: &mut serde_json::Map<String, Value>, key: &str, value: Option<V>) {
+    if let Some(v) = value {
+        ctx.insert(key.to_string(), v.into());
+    }
+}
+
+/// 非空列表才写。
+fn put_list<T: Copy + Into<Value>>(
+    ctx: &mut serde_json::Map<String, Value>,
+    key: &str,
+    items: &[T],
+) {
+    if !items.is_empty() {
+        ctx.insert(
+            key.to_string(),
+            Value::Array(items.iter().copied().map(Into::into).collect()),
+        );
+    }
 }
 
 /// 读一个属性，但**优先用 daemon 启动时传进来的环境变量**。

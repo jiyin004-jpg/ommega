@@ -1,54 +1,12 @@
 //! SOTER 那一族的识别与解析（A 端）。
 //!
-//! A 端的 SOTER 宿主是 `com.tencent.soter.soterserver`（system uid 1000，纯 Java）。
-//! 它把 App 的请求转成对高通 HAL 的 binder 调用 `vendor.qti.hardware.soter.ISoter`，
-//! 我们自己那份 hook 就装在宿主进程里，所以要认的是**写出去**的那条 transaction：
-//! data 开头的 interface token 是那个描述符，`code` 是下面表里的号。
+//! 两条路：出站是宿主 `com.tencent.soter.soterserver` 发往 HAL 的 `ISoter` 一族描述符，
+//! 入站是 App 发往宿主的 `ISoterService`。号码表见 [`describe`]；两边接口独立，号码不通用。
 //!
-//! 号码是从 APK 里 `ISoter$Stub$Proxy` 的 `transact(n, …)` 反查出来的（不是按声明
-//! 顺序猜的，声明顺序和号不一样）。常规那 11 个号跳着用，2 / 6 / 14 是产线 provisioning ——
-//! 也就是这版运行时 HAL 的 exportAttkPublicKey / generateAttkKeyPair / verifyAttkKeyPair
-//! 那三个在量产 provisioning 那条路上（工程模式那页的 SOTER 项就是 14 号），本地后端
-//! 同样写了实现。
+//! 认得出来的号由本地/远程后端写应答（`soter_local` / `soter_relay`），认不出或缺参数的
+//! 照旧透给真 HAL。日志格式 `event=soter …`。
 //!
-//! | code | 方法 | 入参 |
-//! |------|------|------|
-//! | 1  | exportAskPublicKey       | i32 uid |
-//! | 3  | exportAuthKeyPublicKey   | i32 uid, String alias |
-//! | 4  | finishSign               | i64 session |
-//! | 5  | generateAskKeyPair       | i32 uid |
-//! | 7  | generateAuthKeyPair      | i32 uid, String alias |
-//! | 8  | getDeviceId              | — |
-//! | 9  | hasAskAlready            | i32 uid |
-//! | 10 | hasAuthKey               | i32 uid, String alias |
-//! | 11 | initSign                 | i32 uid, String alias, String challenge |
-//! | 12 | removeAllUidKey          | i32 uid |
-//! | 13 | removeAuthKey            | i32 uid, String alias |
-//!
-//! 这一版既认也答：认得出来的号码就由本地/远程后端写应答（`soter_local`、`soter_relay`），
-//! 认不出来或者缺参数的照旧透给真 HAL。日志进 logcat，格式是 `event=soter …`，好过滤。
-//!
-//! 两边号码表得分开：两个接口是各自独立的 AIDL，号码不通用。App 面向那边
-//! （`ISoterService`，1..13 连着、没空号，9 号是腾讯自家拼错的 `initSigh`）：
-//!
-//! | code | 方法 | 入参 |
-//! |------|------|------|
-//! | 1  | generateAppSecureKey | i32 uid |
-//! | 2  | getAppSecureKey       | i32 uid |
-//! | 3  | hasAskAlready         | i32 uid |
-//! | 4  | generateAuthKey       | i32 uid, String alias |
-//! | 5  | removeAuthKey         | i32 uid, String alias |
-//! | 6  | getAuthKey            | i32 uid, String alias |
-//! | 7  | removeAllAuthKey      | i32 uid |
-//! | 8  | hasAuthKey            | i32 uid, String alias |
-//! | 9  | initSigh              | i32 uid, String alias, String challenge |
-//! | 10 | finishSign            | i64 session |
-//! | 11 | getDeviceId           | — |
-//! | 12 | getVersion            | — |
-//! | 13 | getExtraParam         | String key |
-//!
-//! uid 是 App 自己的（SoterService 用 `Binder.getCallingUid()`），不是 binder 的
-//! 调用者 uid；所以作用域判定要看这个参数。
+//! 参数里的 uid 是 App 自己填的；可信的调用者是事务头里的 `sender_euid`。
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -74,39 +32,26 @@ use crate::parcel::{
 
 /// 高通 HAL 的接口描述符（SoterService 发出去的那条）。
 pub(crate) const HAL_DESCRIPTOR: &str = "vendor.qti.hardware.soter.ISoter";
-/// Trustonic 那套 AIDL 的描述符。联发科机型上没有高通那个 HAL，宿主发出去的是这条
-/// （实测一加 PLC110：`vendor.trustonic.hardware.soter.ITrustonicSoter/default`，vintf 里声明成
-/// aidl）。方法号与高通那份同序同名，1..14 一张表就能盖住，所以解析那半段完全复用；
-/// 差别只在 2 / 6 / 14 这三个 provisioning 方法：联发科上是真实现，高通那边是空号。
+/// Trustonic 那套 AIDL 的描述符（联发科机型）。方法号与高通同序，1..14 共用一张表；
+/// 差别只在 2 / 6 / 14：联发科上是真实现，高通那边是空号。
 pub(crate) const TRUSTONIC_DESCRIPTOR: &str = "vendor.trustonic.hardware.soter.ITrustonicSoter";
-/// HIDL 那一版的描述符。名字里带版本号（`@1.0::`），跟 AIDL 那两条完全不是一回事：
-/// 宿主 dex 里两种代理类都在（`...@1.0::ISoter@Proxy` / `...@1.0::ITrustonicSoter@Proxy`），
-/// 哪条路通得看系统里装的是哪种实现；小米又是另一个包名（`vendor.xiaomi.hardware.soterservice`）。
-/// 这些 HIDL 描述符的号码、参数、回复形状是同一套（`.hal` 的声明顺序）。
+/// HIDL 那一版的描述符（`@1.0::`），跟 AIDL 那两条无关：号码、参数、回复形状都是
+/// `.hal` 的声明顺序，这几条 HIDL 描述符共用一套。
 pub(crate) const QTI_HIDL_DESCRIPTOR: &str = "vendor.qti.hardware.soter@1.0::ISoter";
 pub(crate) const TRUSTONIC_HIDL_DESCRIPTOR: &str =
     "vendor.trustonic.hardware.soter@1.0::ITrustonicSoter";
-/// 小米那套（天玑机型实测）：SOTER 单独一个 HIDL 服务 `vendor.xiaomi.hardware.soterservice`，
-/// 接口名、方法声明顺序跟上面两条 HIDL 一模一样，只是包名不同。
-/// 不认这条的话，小米机上宿主发往 HAL 的那条路就归到「不认识的流量」里，转不出去。
+/// 小米那套 HIDL：接口名与方法顺序跟上面两条一样，只有包名不同。
 pub(crate) const XIAOMI_HIDL_DESCRIPTOR: &str = "vendor.xiaomi.hardware.soterservice@1.0::ISoter";
-/// Microtrust's rubyx manifest and vendor stub confirm the HIDL contract,
-/// including initSign=13 and finishSign=14; not validated on-device.
+/// Microtrust 的 HIDL 契约（initSign=13、finishSign=14），未上机验证。
 pub(crate) const MICROTRUST_HIDL_DESCRIPTOR: &str = "vendor.microtrust.hardware.soter@1.0::ISoter";
 /// App 面向的接口描述符（App 发给 SoterService 的那条，走的是入站 transaction）。
 pub(crate) const APP_DESCRIPTOR: &str = "com.tencent.soter.soterserver.ISoterService";
 
-/// 描述符是哪一边的。
+/// 描述符是哪一边的。HIDL 单独一档，因为事务号、参数形状、答复布局全是另一套：
 ///
-/// HIDL 单独一档是因为那边的事务号、参数形状、答复布局跟 AIDL 全是两套东西。规格是从
-/// AOSP / libhidl 与宿主 dex 里抠出来的硬事实，别再从头猜：
-///
-/// - 事务号不是什么 hash，就是 `.hal` 里的声明顺序 1..14（宿主 dex 里是 `transact(4, ...)`
-///   这种字面量）。但**映射跟 AIDL 不是一套**（见 [`HIDL_TO_INTERNAL_CODE`]）。
-/// - 回包开头是一个 `Status`（一个 i32，0 即成功；非 0 时后面还跟一条 String16 的 message）。
-/// - 请求与回包里的 string / vector 走 binder 的 buffer 对象：parcel 里只躺对象，
-///   结构体和数据体都在 parcel 外面，靠对象里的地址去读。跟 AIDL 那种内联的
-///   「长度 + 字节 / String16」完全是两回事。
+/// - 事务号是 `.hal` 的声明顺序 1..14，映射见 [`HIDL_TO_INTERNAL_CODE`]，跟 AIDL 不通用。
+/// - 回包开头是 `Status`（i32，0 成功；非 0 后跟一条 String16 message）。
+/// - string / vector 走 binder buffer 对象：结构体与数据体在 parcel 外，按对象里的地址读。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
     Hal,
@@ -126,16 +71,13 @@ impl Side {
 pub(crate) struct SoterCall {
     /// 描述符是哪一边的：`true` = HAL（宿主发出去），`false` = App 面向。
     pub(crate) hal: bool,
-    /// 走的是 HIDL（`@1.0::` 那种描述符）。只影响拦截：HIDL 现在只观察。
+    /// 走的是 HIDL（`@1.0::` 那种描述符）：号码已换算成内部号，答复按 HIDL 布局另拼。
     pub(crate) hidl: bool,
-    /// 回包里「方法返回值」那一格有没有。这**只对 buffer 形状的那几个方法**成立（`finishSign`
-    /// 和几个 `export*` / `getDeviceId`）：高通那套签名是 `int xxx(..., out SoterBufferReturn)`、
-    /// 联发科是 `void`，错误码放哪、总长怎么算都跟着它走（见 `parcel::reply` 里那两个构造器）。
-    /// `initSign` 是例外，两家都没有这一格（高通返回 parcelable 本身），别拿它去拼 init 的回复。
+    /// 回包里有没有「方法返回值」那一格，只对 buffer 形状的方法成立（`finishSign` /
+    /// `export*` / `getDeviceId`）：高通是 `int`、联发科是 `void`。`initSign` 两家都没有。
     pub(crate) has_return_code: bool,
     pub(crate) code: u32,
-    /// 线上那个号。HIDL 那套号跟内部（AIDL）那套不是一个排列，解析时已经换算成内部号了，
-    /// 这里留一份原值只为看日志时对得上真实流量。
+    /// 线上原号（`code` 已是内部号）；只为日志对得上真实流量。
     pub(crate) wire_code: u32,
     pub(crate) op: &'static str,
     pub(crate) uid: Option<i32>,
@@ -144,15 +86,11 @@ pub(crate) struct SoterCall {
     pub(crate) session: Option<i64>,
     /// App 面向 13 号 `getExtraParam` 那个 key。
     pub(crate) key: Option<String>,
-    /// 真调用者是谁：App 侧那笔事务头里内核填的 `sender_euid`。
+    /// 真调用者：App 侧那笔事务头里内核填的 `sender_euid`，只有 HAL 侧才有；
+    /// 参数里那个 uid 是调用方自己填的，信不得。
     ///
-    /// 只有 HAL 侧（宿主发往 HAL 的那笔）才有。请求参数里那个 uid 是调用方自己填的
-    /// （实测探测机填过 Gmail 的号），只有这个内核值信得过。
-    ///
-    /// 这里**不翻包名**：uid→包名得问 `sec_key_att_app_id_provider`，而那个服务
-    /// 只认 Keystore/Credstore 的 uid，SOTER 宿主（uid 1000）一问就回
-    /// `This service can only be used by Keystore or Credstore`。翻包名放进 daemon
-    /// （它跑在 keystore uid）做 —— 反正它本来就在那儿把 AAID 解析出来。
+    /// 这里不翻包名（`sec_key_att_app_id_provider` 只认 Keystore/Credstore 的 uid），
+    /// 由跑在 keystore uid 的 daemon 做。
     pub(crate) caller_uid: Option<i32>,
     /// 请求体总字节数，写日志时对一眼就知道有没有漏掉参数。
     pub(crate) data_size: usize,
@@ -172,8 +110,7 @@ enum Args {
 /// 号码到（方法名、参数形状）。认不出来就是别人家的流量。
 fn describe(hal: bool, code: u32) -> Option<(&'static str, Args)> {
     if hal {
-        // 4 槽排布（2 / 6 / 14 空号）—— NX721J 上实测的形状：soterserver 发 code 5/9
-        // 时只带 uid（= generateAskKeyPair / hasAskAlready）。
+        // 4 槽排布，2 / 6 / 14 是空号；5 / 9 号只带 uid。
         Some(match code {
             1 => ("exportAskPublicKey", Args::Uid),
             3 => ("exportAuthKeyPublicKey", Args::UidAlias),
@@ -186,8 +123,7 @@ fn describe(hal: bool, code: u32) -> Option<(&'static str, Args)> {
             11 => ("initSign", Args::UidAliasChallenge),
             12 => ("removeAllUidKey", Args::Uid),
             13 => ("removeAuthKey", Args::UidAlias),
-            // 产线 provisioning 那三个。原厂 TA 对它们整族回 -20（这台机器没 provisioning），
-            // 而工程模式那页的 SOTER 项就是 14 号 verifyAttkKeyPair —— HIDL 线上是 2 号。
+            // 产线 provisioning 那三个（工程模式的 SOTER 项走 14 号）；本地后端也答。
             2 => ("exportAttkPublicKey", Args::Uid),
             6 => ("generateAttkKeyPair", Args::Uid),
             14 => ("verifyAttkKeyPair", Args::None),
@@ -213,10 +149,8 @@ fn describe(hal: bool, code: u32) -> Option<(&'static str, Args)> {
     }
 }
 
-/// 这个号会不会改设备上的钥匙（建 / 删）。观察阶段只用来标日志，接转发时这几个
-/// 必须走 mutation 开关。
-///
-/// App 面向的 9 号（`initSigh`）也算 —— B 端那边它可能顺手把 AuthKey 建出来。
+/// 这个号会不会改设备上的钥匙（建 / 删）：只用来标日志与 mutation 开关。
+/// App 面向的 9 号（`initSigh`）也算，B 端可能顺手建 AuthKey。
 pub(crate) fn is_mutation(hal: bool, code: u32) -> bool {
     if hal {
         matches!(code, 5 | 7 | 12 | 13)
@@ -225,11 +159,8 @@ pub(crate) fn is_mutation(hal: bool, code: u32) -> bool {
     }
 }
 
-/// 请求里那个 `binder_buffer_object`（HIDL 的 string / vector 走它）。
-///
-/// 字段照内核 uapi 的 `struct binder_buffer_object` 摆，`buffer` / `length` / `parent` /
-/// `parent_offset` 的宽度跟 ABI 走。解析一个字符串只用到 `type_`、`length` 和 `buffer`，
-/// 其余几个留着是为了跟结构体对得上（也方便以后要看 parent 链的时候用）。
+/// 请求里那个 `binder_buffer_object`（HIDL 的 string / vector 走它），字段照内核 uapi
+/// 的 `struct binder_buffer_object` 摆。解析只用到 `type_` / `length` / `buffer`。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct HidlBufferObject {
@@ -242,8 +173,7 @@ struct HidlBufferObject {
 }
 
 /// 一个只往前走、每一步都做边界检查的 parcel 读游标。
-///
-/// 读的是别的进程写下来的字节，宁可读不出来也不能越界。
+/// 读的是别的进程写下的字节，宁可读不出来也不能越界。
 struct Cursor<'a> {
     data: &'a [u8],
     at: usize,
@@ -309,11 +239,8 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// 一个 `binder_buffer_object`。
-    ///
-    /// 第二个 u32 是 buffer 自己的 flags（`BINDER_BUFFER_FLAG_HAS_PARENT` 在这一格），
-    /// 不是 `hdr.flags` —— 内核的定义是 `{hdr{type}, flags, buffer, length, parent,
-    /// parent_offset}`，别把这两格弄反了。
+    /// 一个 `binder_buffer_object`。第二个 u32 是 buffer 自己的 flags
+    /// （`BINDER_BUFFER_FLAG_HAS_PARENT` 在这一格），不是 `hdr.flags`，别弄反。
     fn hidl_buffer_object(&mut self) -> Option<HidlBufferObject> {
         let type_ = self.u32()?;
         let flags = self.u32()?;
@@ -339,14 +266,11 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// HIDL 的 `hidl_string`：parcel 里只躺两个对象 —— 一个指向那 16 字节的
-    /// `hidl_string` 结构体（`hidl_pointer mBuffer`(8) + `uint32_t mSize`(4) + 补位），
-    /// 一个指向字符本身（长度是 size+1，尾巴上有 NUL）。结构体和字符都在 parcel 外面，
-    /// 只能按对象里写的地址去读。
+    /// HIDL 的 `hidl_string`：parcel 里两个对象 —— 一个指向 16 字节的 `hidl_string` 结构体
+    /// （`hidl_pointer mBuffer`(8) + `uint32_t mSize`(4) + 补位），一个指向字符本体（含 NUL）。
+    /// 两者都在 parcel 外，按对象里的地址读。
     ///
-    /// 那些地址就是我们自己这个进程里的（宿主就是发这笔 transaction 的那个进程，
-    /// 是它自己的 libhwbinder 写下的指针），但仍旧走 `process_vm_readv` 去读：读不动
-    /// 就当认不出来，不能为了解析一串日志把宿主读崩。
+    /// 地址是本进程的（宿主自己写的），但仍走 `process_vm_readv`：读不动就当认不出来。
     fn hidl_string(&mut self) -> Option<String> {
         let parent = self.hidl_buffer_object()?;
         let child = self.hidl_buffer_object()?;
@@ -378,7 +302,9 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// interface token 在真实流量里见过这几种前缀（里面都是 i32）：
+/// 从 data 开头认接口 token，返回（哪一边、buffer 形状方法带不带 int 返回值、参数区起点）。
+///
+/// 见过的前缀（里面都是 i32）：
 ///
 /// ```text
 ///  0 字节：[CString + 4-byte padding]                  libhwbinder / HIDL
@@ -388,15 +314,9 @@ impl<'a> Cursor<'a> {
 /// 12 字节：[strict-mode policy][work source]['SYST'][String16]
 /// ```
 ///
-/// 最后一个就是真机实测的 app_process 布局：`writeInterfaceToken` 出来的是
-/// `[policy][workSource]['SYST'][len][字符][0][参数]`，注意这里的 `len` 是**字符数**，
-/// 结尾那个 0 是**单另一个 u32**；而老的 String16 写法把结尾 0 算进 `len` 里。
-/// 两种都试，谁的 UTF-16 解出来正好等于我们认的串就用谁。
-/// 别省这一步：少了 12 字节那个前缀，App 侧的 SOTER 流量一条都认不出来。
-///
-/// 第二个返回值是「这个接口的 buffer 形状方法带不带 int 返回值」，跟着描述符一起定：
-/// 高通那两条（AIDL 与 HIDL）都是 `int`，联发科那两条都是 `void`。
-/// `initSign` 两家都不带（高通直接返回 `SoterInitReturn`），所以那个号的回复不走这一格。
+/// 12 字节那个是 app_process 的布局：`len` 是字符数，结尾 0 是另一个 u32；老写法把结尾
+/// 0 算进 `len`，两种都试。第二个返回值：高通两条是 `int`，联发科两条是 `void`，
+/// `initSign` 两家都不带。
 fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
     // libhwbinder writeInterfaceToken -> writeCString writes strlen + 1 bytes,
     // padded to four bytes, without any libbinder policy/work-source prefix.
@@ -445,8 +365,8 @@ fn match_descriptor(data: &[u8]) -> Option<(Side, bool, usize)> {
     None
 }
 
-/// Recognise only an exact, unprefixed HIDL CString token. Do not search arbitrary
-/// payload bytes or accept AIDL descriptors in the CString encoding.
+/// Recognise only an exact, unprefixed HIDL CString token: no scanning of arbitrary
+/// payload bytes, no AIDL descriptor in the CString encoding.
 fn read_hidl_token(data: &[u8]) -> Option<(bool, usize)> {
     for (descriptor, has_return_code) in [
         (QTI_HIDL_DESCRIPTOR, true),
@@ -490,10 +410,8 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
         .take_while(|unit| *unit != 0)
         .collect();
     let text = String::from_utf16(&units).ok()?;
-    // Android 的 writeString16 是「字符 + 一个 NUL」，再把 (len+1)*2 补到 4 字节对齐。
-    // 空串也带着这个 NUL。之前空串直接返回、非空串只按 2*len 补位，两种情况下游标都少走
-    // 4 字节，于是紧跟在字符串后面的那个字段被读成空串 —— 微信 initSigh 的 challenge
-    // （50 多个字符）就是这么丢的，B 端签出来的 JSON 里 raw 是空的。
+    // Android 的 writeString16 是「字符 + 一个 NUL」，再补到 4 字节对齐（空串也带）。
+    // 漏这一步游标会少走 4 字节，紧跟在字符串后的字段会被读成空串。
     cursor.take(2)?;
     cursor.skip_padding(len * 2 + 2)?;
     Some((text, cursor.at))
@@ -501,15 +419,9 @@ fn read_string16(data: &[u8], at: usize) -> Option<(String, usize)> {
 
 /// HIDL 的号对到内部（AIDL）那套号码上。
 ///
-/// `.hal` 里 14 个方法按声明顺序拿号：1 generateAttkKeyPair、2 verifyAttkKeyPair、
-/// 3 exportAttkPublicKey、4 getDeviceId、5 generateAskKeyPair、6 exportAskPublicKey、
-/// 7 removeAllUidKey、8 hasAskAlready、9 generateAuthKeyPair、10 exportAuthKeyPublicKey、
-/// 11 removeAuthKey、12 hasAuthKey、13 initSign、14 finishSign。
-/// AIDL 那套的声明顺序是另一个排列，这张表是宿主 dex 里两个代理类各自的
-/// `transact(n, …)` 字面量对出来的（HIDL 4 = AIDL 8 getDeviceId、HIDL 6 = AIDL 1
-/// exportAskPublicKey …），不是按名字猜的，别重排。
-/// 1/2/3 落到 AIDL 的 6/14/2 上，那是运行时没有的 provisioning 号，所以照旧认不出来
-/// —— 跟 AIDL 那半边一致。
+/// `.hal` 里 14 个方法按声明顺序拿号（1 generateAttkKeyPair … 13 initSign、14 finishSign），
+/// 跟 AIDL 的排列不同，这张表是两边 proxy 的 `transact(n, …)` 字面量对出来的，别重排。
+/// 1/2/3 落到 AIDL 的 6/14/2（provisioning 号），照旧认不出来。
 const HIDL_TO_INTERNAL_CODE: [u32; 14] = [6, 14, 2, 8, 5, 1, 12, 9, 7, 3, 13, 10, 11, 4];
 
 fn hidl_internal_code(code: u32) -> Option<u32> {
@@ -533,8 +445,7 @@ pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
     let (side, has_return_code, args_at) = match_descriptor(data)?;
     let hal = side.is_hal();
     let hidl = side == Side::HalHidl;
-    // HIDL 的号是 `.hal` 的声明顺序，跟 AIDL 那套不是一个排列。认出来之后就换算成内部号：
-    // 参数形状、下面那几层分派（本地/远程、mutation 开关）全都只看内部号。
+    // HIDL 的号换算成内部号，之后的分派全只看内部号。
     let wire_code = code;
     let code = if hidl {
         hidl_internal_code(code)?
@@ -574,20 +485,13 @@ pub(crate) fn parse(data: &[u8], code: u32) -> Option<SoterCall> {
     })
 }
 
-/// App 面向那笔请求带来的调用者 uid 只在这段时间内算数。
-///
-/// 一笔 App 调用和它引发的 HAL 调用是同一个线程上前后脚，实测毫秒级；2 秒足够，
-/// 又短到不会把上一笔 App 的 uid 借给下一笔无关的 HAL 调用，串了台。
+/// App 面向那笔请求带来的调用者 uid 只在这么长的时间内算数：一笔 App 调用和它引发的
+/// HAL 调用是同一线程前后脚（毫秒级），2 秒足够又不会串到下一笔无关的调用。
 const APP_CALLER_WINDOW: Duration = Duration::from_millis(2000);
 
 thread_local! {
-    /// 本线程上「刚进来的那笔 App 面向 SOTER 请求」的真调用者（内核填的 `sender_euid`）
-    /// 和它到来的时刻。
-    ///
-    /// 为什么按线程记：宿主进程收到 App 发来的 SOTER 请求（读侧那条 BR_TRANSACTION）
-    /// 之后，就在同一个 binder 线程上同步去调 HAL（写侧那条 BC_TRANSACTION）。所以出站
-    /// 那笔紧接着入站那笔、落在同一个线程，这就是把「调用者到底是谁」接到 HAL 调用上的
-    /// 唯一凭据 —— 请求参数里那个 uid 是调用方自己填的，信不得。
+    /// 本线程「刚进来的那笔 App 面向 SOTER 请求」的真调用者（内核填的 `sender_euid`）与时刻。
+    /// 宿主收完 App 请求会在同一个 binder 线程上同步调 HAL，所以出站那笔靠这个接上调用者。
     static APP_CALLER: RefCell<Option<(i32, Instant)>> = const { RefCell::new(None) };
 }
 
@@ -611,11 +515,7 @@ fn take_app_caller_uid() -> Option<i32> {
 }
 
 /// 一笔 App 面向调用留下的凭据：谁在调 + 这笔请求长什么样。
-///
-/// 只记 uid 不够。真机上实测（2026-10-04，`keymint.log`）：103 笔 HAL 调用里只有 30 笔
-/// 能从「同线程紧接着那笔」借到 uid（29%），其余全空 —— 宿主换个线程去调 HAL、或者一笔
-/// App 请求引出好几笔 HAL 调用（同线程那个槽取走即清，后面那几笔就没了）都会丢。
-/// 丢了这个 uid，daemon 就翻不出包名，服务端只能退回按别名/槽位猜。
+/// 光记 uid 不够：宿主可能换线程调 HAL，一笔 App 请求也可能引出好几笔 HAL 调用。
 #[derive(Debug, Clone)]
 struct AppCaller {
     uid: i32,
@@ -641,11 +541,10 @@ impl AppCaller {
 /// 最近几笔 App 面向调用的凭据。按**进程**记，不按线程。
 static RECENT_APP_CALLERS: Mutex<Vec<AppCaller>> = Mutex::new(Vec::new());
 
-/// 凭据在进程级列表里留多久。比同线程那个 2 秒的窗长：宿主把出站那几笔排在后面点也还赶得上，
-/// 又短到串不到下一轮无关的调用上。
+/// 凭据在进程级列表里留多久。比同线程那个 2 秒窗长，宿主把出站那几笔排后面也还赶得上。
 const APP_CALLER_TTL: Duration = Duration::from_secs(10);
 
-/// 列表最长多少笔（满了丢最旧的）。一轮流程本来就只有十来笔，32 够得很。
+/// 列表最长多少笔（满了丢最旧的）。
 const APP_CALLER_CAP: usize = 32;
 
 /// 记一笔 App 面向调用，给出站那几笔回查用。`uid` 是内核填的 `sender_euid`。
@@ -667,11 +566,8 @@ fn remember_app_caller(call: &SoterCall, uid: i32) {
     }
 }
 
-/// 从最近几笔凭据里挑一笔给出站的 HAL 调用用。抽成纯函数好测。
-///
-/// 顺序：先按 alias 认（`has_auth_key` / `init_sign` 这类带别名的最多），再按会话号认
-/// （`finish_sign` 只有会话号），最后两边都是「没别名没会话」时拿最近一笔 —— 那些 op
-/// 本来就前后脚，认别的东西反而认不出来。
+/// 从最近几笔凭据里挑一笔给出站 HAL 调用用。抽成纯函数好测。
+/// 顺序：别名 → 会话号 → 两边都没有时拿最近一笔。
 fn pick_recent_caller(list: &[AppCaller], call: &SoterCall, now: Instant) -> Option<i32> {
     let fresh = |entry: &AppCaller| now.saturating_duration_since(entry.at) <= APP_CALLER_TTL;
     let alias = call.alias.as_deref().filter(|alias| !alias.is_empty());
@@ -698,24 +594,17 @@ fn pick_recent_caller(list: &[AppCaller], call: &SoterCall, now: Instant) -> Opt
             return Some(hit.uid);
         }
     }
-    // 最后一道：“认不出接口名/号”留下的那笔（无别名无会话）在 2 秒内可以去顶**任意形状**
-    // 的出站调用。这一道是为那些换了一套 App 面向接口的宿主准备的（实测小米那台的宿主是
-    // 2.0，号表跟我们不一样 → 那几笔我们解析不了，但它仍然是 App 发进来的，内核 uid 在
-    // 事务头上、跟接口名毫无关系）。没有这一道，他那台的关键几笔（`hasAuthKey` / `initSign`
-    // 带别名）就永远拿不到 uid，包名整条链断在起点。
-    //
-    // 边界：只收“无别名无会话”的凭据 —— 已经解析出来、属于**别的钥匙**的凭据不许顶
-    //（那才是真错：会把 A 的调用算到 B 的调用上）。窗口 2 秒 + 只收 app uid + 同一宿主进程。
+    // 最后一道：“认不出接口名/号”留下的那笔（无别名无会话）在 2 秒内可以去顶任意形状的
+    // 出站调用（宿主换了一套 App 面向接口时只有这条路能拿到调用者）。
+    // 边界：只收无别名无会话的凭据，属于别的钥匙的凭据不许顶。
     list.iter()
         .rev()
         .find(|entry| now.saturating_duration_since(entry.at) <= RAW_APP_CALLER_TTL && entry.bare())
         .map(|entry| entry.uid)
 }
 
-/// 记一笔“认不出接口名、但确实是 App 发进来的”调用者。
-///
-/// 它没有别名/会话可对（我们连这笔请求的形状都不知道），所以只能走时间窗那条路；
-/// 用它是**推断**：只在前面三样（同线程、别名、会话号）都对不上时才拿出来用。
+/// 记一笔“认不出接口名、但确实是 App 发进来的”调用者。它没有别名/会话可对，
+/// 只能走时间窗（是推断，前面三条都对不上时才用）。
 fn remember_raw_app_caller(uid: i32) {
     let Ok(mut list) = RECENT_APP_CALLERS.lock() else {
         return;
@@ -733,8 +622,7 @@ fn remember_raw_app_caller(uid: i32) {
     }
 }
 
-/// 「认不出接口名/号」那种凭据（无别名无会话）能在多短的时间窗内去顶一笔出站调用。
-/// 它是估的，所以窗口要比 `APP_CALLER_TTL` 短得多。
+/// 「认不出接口名/号」那种凭据能在多短的窗内去顶一笔出站调用；它是估的。
 const RAW_APP_CALLER_TTL: Duration = Duration::from_secs(2);
 
 /// 出站那笔该带谁：先问本线程刚记下的那笔（最近、最准），再回查进程级那份列表。
@@ -748,16 +636,14 @@ fn borrow_app_caller(call: &SoterCall) -> Option<i32> {
             return Some(uid);
         }
     }
-    // 最后按别名找主人：宿主自己也会发几笔「没有 App 在调」的带别名请求（开机一套、
-    // 后台建/清钥匙那套），这些没人可借；按别名认主人之后，它们跟 App 自己那几笔同源。
+    // 最后按别名找主人：宿主自己发的、没有 App 在调的带别名请求（开机一套、后台建/清钥匙）
+    // 就靠这个归到同一主人。
     let alias = call.alias.as_deref().filter(|alias| !alias.is_empty())?;
     let owners = ALIAS_OWNERS.lock().ok()?;
     pick_alias_owner(&owners, alias, now)
 }
 
-/// 「这把别名是谁的」：别名 → 内核填的 uid。
-///
-/// 比一轮流程活得久：App 那几笔给出来的主人，后面宿主自己发的同别名请求也用得上。
+/// 「这把别名是谁的」：别名 → 内核填的 uid。比一轮流程活得久，宿主自己发的同别名请求也用得上。
 #[derive(Debug, Clone)]
 struct AliasOwner {
     alias: String,
@@ -767,8 +653,7 @@ struct AliasOwner {
 
 static ALIAS_OWNERS: Mutex<Vec<AliasOwner>> = Mutex::new(Vec::new());
 
-/// 别名主人记多久。SOTER 的钥匙就那几个别名，App 一天里会用很多轮，10 分钟够跨好几轮，
-/// 又短到 App 卸载/清数据后不会一直把新主人认错。
+/// 别名主人记多久：够跨好几轮 App 使用，又不至于 App 卸载/清数据后一直认错主人。
 const ALIAS_OWNER_TTL: Duration = Duration::from_secs(600);
 
 /// 最多记多少把别名。
@@ -826,17 +711,10 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data, inbound: bool) -> Opt
     }) {
         Some(call) => call,
         None => {
-            // 认不出来的接口 token 里，看着像 SOTER 的记一条。
-            //
-            // 为什么要这个：实测有些 ROM（小米那台）我们只看到 side=hal、side=app 一条都没有 ——
-            // 也就是 App 面向那套名字没认出来，于是拿不到内核给的调用者、包名整条链断在起点。
-            // 日志里只有“认不出”这个事实可不够，得知道它叫什么。
-            //
-            // 只在调试日志开着时才写得出来：这行走 debug 级，日志关掉时被丢掉（不会上线上刷屏）。
+            // 认不出的接口 token 里，看着像 SOTER 的记一条（只在 debug 级日志开着时）。
             note_unrecognised_soter_token(data, tr.code);
-            // 称呼不出来也得把调用者留下：`sender_euid` 是内核在事务头上填的，跟接口名毫无关系。
-            // 宿主自己发往 HAL 的那笔 sender 是宿主（uid 1000），**只有 App 发进来的那笔**才是
-            // 应用 uid —— 所以这一条就足够分辨方向，不需要认得接口。
+            // 认不出接口名也得把调用者留下：`sender_euid` 跟接口名无关，只有 App 发进来的
+            // 那笔才是应用 uid（宿主自己发往 HAL 的是 1000），足以分辨方向。
             if is_app_uid(tr.sender_euid) {
                 note_app_caller(tr.sender_euid);
                 remember_raw_app_caller(tr.sender_euid);
@@ -845,14 +723,12 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data, inbound: bool) -> Opt
         }
     };
     if call.hal {
-        // 宿主发往 HAL 的那笔：把上一笔 App 面向请求的真调用者 uid 接到这笔上，
-        // 转发时带给 daemon（由它翻包名、由服务端按包名白名单判）。
+        // 宿主发往 HAL 的那笔：接上上一笔 App 请求的真调用者，转发时带给 daemon。
         call.caller_uid = borrow_app_caller(&call);
         note_hal_activity();
     } else {
-        // App 面向那笔：`tr.sender_euid` 是内核填的，调用方改不了，记下来给出站那几笔用。
-        // 两处都记：本线程那份给出站那一笔用（最近、最准），进程级那份给换了线程、或者
-        // 一笔 App 请求引出好几笔 HAL 调用的那几笔用。
+        // App 面向那笔：`sender_euid` 调用方改不了，两处都记 —— 本线程那份给出站那一笔用，
+        // 进程级那份给换了线程、或一笔 App 请求引出好几笔 HAL 调用时用。
         note_app_caller(tr.sender_euid);
         if tr.sender_euid >= 0 {
             remember_app_caller(&call, tr.sender_euid);
@@ -860,8 +736,7 @@ pub(crate) unsafe fn observe(tr: &binder_transaction_data, inbound: bool) -> Opt
                 remember_alias_owner(alias, tr.sender_euid);
             }
         }
-        // 宿主待会儿就在这个线程上回它：留一份，BC_REPLY 出来时对号。
-        // 异步事务没有回复，不记。
+        // 宿主待会儿在这个线程上回它：留一份，BC_REPLY 出来时对号；异步事务不记。
         if (tr.flags & TF_ONE_WAY) == 0 {
             stash_pending_app(&call, tr.sender_euid);
         }
@@ -890,15 +765,10 @@ fn self_cmdline() -> &'static str {
     })
 }
 
-/// 能不能走「认不出接口名也把 App 面向那笔认下来」这条兜底。
-///
-/// 三条硬约束，缺一不可：
-///   1. `sender_euid` 是应用 —— 内核在事务头上填的，调用方改不了。宿主自己发往
-///      HAL 的那笔 sender 是 1000，探针也伪造不了这个值。
-///   2. 当前进程不是 keystore2 —— `IKeystoreService` 的方法号也在 1..13 里，无 token
-///      时放宽会把 keystore 的调用当成 SOTER 请求，那是真事故。
-///   3. 当前进程看着是 SOTER 那一族的（cmdline 带 soter/tencent）。注进来的 HAL 客户端
-///      （例如一加的 cryptoeng）收得到入站应用调用，但它们不是宿主，不放宽。
+/// 能不能走「认不出接口名也把 App 面向那笔认下来」这条兜底。三条硬约束，缺一不可：
+///   1. `sender_euid` 是应用（内核填的，伪造不了）；
+///   2. 当前进程不是 keystore2 —— `IKeystoreService` 的号也在 1..13 里；
+///   3. 当前进程看着是 SOTER 一族（cmdline 带 soter/tencent），HAL 客户端不算。
 fn untokened_app_allowed(sender_uid: i32, cmdline: &str) -> bool {
     if !is_app_uid(sender_uid) {
         return false;
@@ -906,8 +776,8 @@ fn untokened_app_allowed(sender_uid: i32, cmdline: &str) -> bool {
     if cmdline.contains("keystore") {
         return false;
     }
-    // HAL 进程（`vendor.*.soter-service` / `@1.0-service`）名字里也带 soter，但它们收到
-    // 的是宿主转过去的出站调用，不是 App 直接调的；放宽只给宿主类进程。
+    // HAL 进程（`vendor.*.soter-service` / `@1.0-service`）名字里也带 soter，但它们收到的
+    // 是宿主转过去的出站调用；放宽只给宿主类进程。
     if cmdline.contains("-service") {
         return false;
     }
@@ -915,11 +785,8 @@ fn untokened_app_allowed(sender_uid: i32, cmdline: &str) -> bool {
 }
 
 /// 认不出接口名时仍然把 App 面向那笔认下来（只在入站方向用）。
-///
-/// 有的 ROM 把宿主服务的接口名整个换掉（token 对不上），但方法号还是腾讯那套、
-/// 参数形状也没变。这时候就靠 [`untokened_app_allowed`] 那三条硬约束 + 下面这层
-/// 形状校验把事情坐实：参数从哪个偏移开始并不知道（token 长度随包名变），
-/// 就把每个四字节对齐位置都当候选起点试一遍，只收「解出来像真的」那个。
+/// ROM 可能把接口名整个换掉，但方法号与参数形状没变；起始偏移不知道（token 长度随包名变），
+/// 就把每个四字节对齐位置当候选起点试一遍，只收形状对得上的那个。
 fn parse_untokened_app(data: &[u8], code: u32, sender_uid: i32) -> Option<SoterCall> {
     let allowed = untokened_app_allowed(sender_uid, self_cmdline());
     parse_untokened_with(data, code, sender_uid, allowed)
@@ -935,8 +802,7 @@ fn parse_untokened_with(
     if !allowed {
         return None;
     }
-    // 12/13 号（getVersion / getExtraParam）无参或只有一把 key，没有形状可验，
-    // 放宽了很容易撞上别的服务 —— 那两个宿主本来自己答，不差这一条。
+    // 12/13 号无参或只有一把 key，没有形状可验，放宽了容易撞上别的服务。
     if matches!(code, 12 | 13) {
         return None;
     }
@@ -956,8 +822,7 @@ fn parse_untokened_with(
                 _ => continue,
             },
             Args::Session => match cursor.i64() {
-                // 会话号是毫秒级时间戳或真机开的号，不会是小整数；0 和小数往往是
-                // 别的服务在同一偏移上碰出来的垃圾。
+                // 会话号不会是小整数；小值往往是别的服务在同一偏移上碰出来的垃圾。
                 Some(session) if session.unsigned_abs() > 1_000_000_000 => {
                     (None, None, None, Some(session), None)
                 }
@@ -987,11 +852,8 @@ fn parse_untokened_with(
     None
 }
 
-/// 候选起点：每个四字节对齐位置，而且它前面得看着是一个字段的尾巴（零填充）。
-///
-/// App 面向请求的 token 是 `[policy][worksource]['SYST'][len][字符...][0]`（或 HIDL 那种
-/// CString），终点尾巴上总有四字节的 0；不要求这一条的话，参数中间随便一个位置
-/// 都可能被当成起点，解出一堆看似合理的数字。
+/// 候选起点：每个四字节对齐位置，且它前面得是四字节零填充（一个字段的尾巴）。
+/// 不要求这一条的话，参数中间任意位置都可能被当成起点，解出一堆看似合理的数字。
 fn untokened_starts(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
     (8..data.len().saturating_sub(8)).filter(move |start| {
         let start = *start;
@@ -1006,8 +868,7 @@ fn plausible_untokened(uid: Option<i32>, alias: Option<&str>, challenge: Option<
             return false;
         }
     } else if alias.is_none() && challenge.is_none() {
-        // 一点形状都没有的（例如只有会话号的那类）靠上一层的 session 范围把关，
-        // 这里不再重复判。
+        // 一点形状都没有的（例如只有会话号的那类）靠上一层的 session 范围把关。
         return true;
     }
     if let Some(alias) = alias {
@@ -1032,10 +893,8 @@ fn plausible_untokened(uid: Option<i32>, alias: Option<&str>, challenge: Option<
     true
 }
 
-/// 这个 uid 看着是不是应用（不是系统身份）。
-///
-/// 认不出接口名时要靠它分辨方向：宿主自己发往 HAL 那笔的 sender 是宿主（uid 1000），
-/// 只有 App 发进来的那笔 sender 才是应用 uid。分身（999xxxxx）和多用户（10xxxxx）也 ≥ 这个值。
+/// 这个 uid 看着是不是应用：分身（999xxxxx）与多用户（10xxxxx）也算。
+/// 认不出接口名时靠它分辨方向（宿主自己发往 HAL 的 sender 是 1000）。
 fn is_app_uid(uid: i32) -> bool {
     uid >= AID_APP_START
 }
@@ -1049,9 +908,7 @@ fn interface_token_of(data: &[u8]) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
-/// 认不出来的接口 token 里，看着像 SOTER/滕讯的都记一条 —— 用来兜住那些换了描述符的 ROM。
-///
-/// 只在调试日志开着时才输出：先问 log 层，关着就直接返回，一个字都不写。
+/// 认不出的接口 token 里，看着像 SOTER/腾讯的记一条（debug 级日志关着就不写）。
 fn note_unrecognised_soter_token(data: &[u8], code: u32) {
     if !log::log_enabled!(log::Level::Debug) {
         return;
@@ -1103,7 +960,7 @@ fn log_call(call: &SoterCall) {
         .map(|uid| format!(" caller_uid={uid}"))
         .unwrap_or_default();
     let line = format!("{line}{caller_uid}{wire_code}");
-    // logcat/日志文件之外，同一条还顺 RPC 送一份给 daemon。
+    // logcat 之外，同一条还顺 RPC 送一份给 daemon。
     info!("{line}");
     crate::ipc::report_event(line);
     if call.challenge.is_some() {
@@ -1111,12 +968,8 @@ fn log_call(call: &SoterCall) {
     }
 }
 
-/// 这条出站请求，我们自己答还是放它去真 HAL。
-///
-/// 拦截范围就是本地后端写了实现的那 11 个号码：这台机器的真 HAL 对整族 ATTK 都是
-/// -20（连 provisioning 都拒），留着它只会把宿主一路坑下去；而这 11 个号码无论最后
-/// 是远程答、本地答还是配置说不许兜底，走的都是同一套拦截与回填。号码不认识、参数
-/// 不够的仍在 `intercept_soter_call` 里原样透传，不会把宿主挂住。
+/// 这条出站请求我们自己答还是放它去真 HAL：范围就是本地后端有实现的号码。
+/// 号不认识、参数不够的由 `intercept_soter_call` 原样透传，不会把宿主挂住。
 pub(crate) fn interceptable(call: &SoterCall) -> bool {
     call.hal && soter_local::answerable(call.code)
 }
@@ -1125,30 +978,25 @@ pub(crate) fn interceptable(call: &SoterCall) -> bool {
 // App 面向那一半：宿主自己不干活的时候，由我们把它的答复顶掉
 // ---------------------------------------------------------------------------------
 //
-// 有些 ROM 把 `com.tencent.soter.soterserver` 整个换成一个壳（Oppo/ColorOS 实测：
-// `SoterService.apk` 只有 17 KB，13 个事务一律回 -200 并打一行 `soter unsupported`）。
-// 那种机器上我们去顶 SOTER HAL 的服务名一点用都没有 —— 宿主压根不发 HAL 请求，
-// App 拿到的永远是 -200。唯一的办法是在宿主进程里，把它对 App 的那笔 BC_REPLY 换掉。
+// 有些 ROM 把 `com.tencent.soter.soterserver` 换成壳（13 个事务一律回 -200，不发 HAL 请求），
+// 那种机器上只能在宿主进程里把它对 App 的那笔 BC_REPLY 换掉。
 //
-// 为什么换答复而不换请求：宿主这个壳没有任何副作用（不回就是回），先在原位看它回什么、
-// 再把 copy 源指到我们自己的 parcel 上，比在 read 阶段抢过入站事务、自己拼 BC_REPLY
-// 要安全得多（后者要跟内核的 transaction_stack 与 BC_FREE_BUFFER 双重对账）。
+// 换答复而不换请求：壳没有副作用，在原位看完它回什么再把 copy 源指到我们的 parcel，
+// 比抢入站事务自己拼 BC_REPLY 安全（后者要跟 transaction_stack 与 BC_FREE_BUFFER 对账）。
 
 /// 面板/手工留的开关：`1` 强制接、`0` 强制不接。文件不在就是自动判。
 const APP_SERVE_SWITCH: &str = "/data/misc/ommega/soter_app_serve";
 
 /// root 侧（`daemon-injector` 的 `sync_soter_host_state`）写下的宿主体检结论：
-/// `stub` = 这个宿主压根不发 HAL 请求（它自己的 APK 里连 SOTER HAL 的服务名都没有），
-/// `real` = 正常宿主。宿主进程自己按 `/proc/self/maps` 猜 APK 会猜错（那里面几十个
-/// overlay 的 apk，自己的不在第一），所以这件事交给能跑 `pm path` 的 root 侧做。
+/// `stub` = 宿主不发 HAL 请求，`real` = 正常宿主。这件事得由能跑 `pm path` 的 root 侧做
+/// （进程里按 `/proc/self/maps` 猜 APK 会猜错）。
 const HOST_STATE: &str = "/data/misc/ommega/soter_host_state";
 
 /// 真看见宿主回 -200 之后也当它是壳（root 侧那份没写出来时的退路）。
 static HOST_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 运行期现场证据攒出来的自动接管：App 面向请求的答复窗口里宿主没去碰任何我们认识的
-/// HAL 描述符，就认定这条腿在我们这儿是瞎的（描述符换了名字、或者宿主压根不走
-/// binder HAL），改由我们直接答 App 面向那一半。判据在 [`take_app_answer`] 里攒。
+/// 运行期现场证据攒出来的自动接管：App 面向请求的答复窗口里宿主没碰任何我们认识的
+/// HAL 描述符，就认定它在这条腿上瞎（描述符换了名或不走 binder HAL），改由我们直接答。
 static AUTO_APP_SERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 「宿主瞎」的连击计数，攒满 [`APP_AUTO_SERVE_THRESHOLD`] 才动手。
@@ -1165,14 +1013,12 @@ pub(crate) fn auto_serve_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// 一笔首请求就接管：误接管的代价是拿我们的统一供料换掉宿主的答案（格式同原厂、
-/// 身份同源），不比宿主差；漏判的代价是检测器那轮直接判红。所以不做多重确认，
-/// 只把「本来就不该有 HAL 调用」的 12/13 号排除在外。
+/// 一笔首请求就接管：误接管的代价只是换一份同源的统一供料，漏判的代价是检测器那轮判红。
+/// 只排除「本来就不该有 HAL 调用」的 12/13 号。
 const APP_AUTO_SERVE_THRESHOLD: usize = 1;
 
-/// 最后一笔「宿主发往我们认识的 SOTER HAL 描述符」的时刻。有的宿主会把 HAL 调用
-/// 派到别的线程去，单靠本线程的记号会冤枉它，所以记进程级的时刻拿去跟 App 请求
-/// 的时刻比。
+/// 最后一笔「宿主发往我们认识的 SOTER HAL 描述符」的时刻。
+/// 有的宿主把 HAL 调用派到别的线程，所以记进程级时刻跟 App 请求的时刻比。
 static LAST_HAL_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// 认一个开关值：`1/true/on/stub` = 开，`0/false/off/real` = 关。
@@ -1192,16 +1038,14 @@ fn switch_state(path: &str) -> Option<bool> {
 /// `manual_switch` 的进程内缓存：开关只读一次。
 static MANUAL_SWITCH: std::sync::Mutex<Option<Option<bool>>> = std::sync::Mutex::new(None);
 
-/// 这台机器上 App 面向的 SOTER 由我们答吗。
-///
-/// 手工开关（环境变量或文件）写的什么，`None` = 没写。进程起来只读一次：开关的意思是
-/// 「开机时要不要接管」，运行期再跟着文件变，就成了同一台机器一会儿接一会儿不接。
+/// 这台机器上 App 面向的 SOTER 由我们答吗。`None` = 手工开关没写。
+/// 进程起来只读一次：开关意思是「开机时要不要接管」，运行期跟着文件变会一会接一会不接。
 fn manual_switch() -> Option<bool> {
     let mut cached = MANUAL_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(value) = *cached {
         return value;
     }
-    // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1` 强制开、`=0` 强制关。
+    // 环境变量是给运维/测试的直通口：`OMMEGA_SOTER_APP_SERVE=1/0`。
     let value = std::env::var("OMMEGA_SOTER_APP_SERVE")
         .ok()
         .and_then(|value| switch_state_text(&value))
@@ -1219,10 +1063,9 @@ pub(crate) fn reset_manual_switch_for_test() {
 /// 一旦成立就不再回头：开关、宿主体检结论、现场证据全不用看了。
 static MATERIAL_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 优先级：接管已成立 → 手工开关（`soter_app_serve`）→ 运行期攒出来的自动接管 → root 侧
-/// 那份宿主体检结论 → 现场见过 -200。手工文件是唯一能压住自动接管的口：写了 `0`
-/// 就是不接，写了 `1` 则不管现场证据一律接。体检说 `real` 只是照着 APK 里有没有
-/// HAL 服务名猜的，描述符换了名字的机型照样漏，所以排在现场证据后面。
+/// 接管已成立 → 手工开关 → 运行期自动接管 → root 侧的宿主体检结论 → 现场见过 -200。
+/// 手工文件是唯一能压住自动接管的扣：写 `0` 就不接，写 `1` 不管现场证据一律接。
+/// 体检结论排在现场证据后面：它只是照着 APK 里有没有 HAL 服务名猜的。
 pub(crate) fn app_serving_enabled() -> bool {
     if MATERIAL_ENGAGED.load(Ordering::Relaxed) {
         return true;
@@ -1237,16 +1080,13 @@ pub(crate) fn app_serving_enabled() -> bool {
 }
 
 /// 「读我们造的料」的那几笔：2 = `getAppSecureKey`、6 = `getAuthKey`。
-/// ASK/AuthKey 都是我们 HAL 腿里现造的，原生宿主自己缓存里根本没有，问它只会回空。
+/// ASK/AuthKey 都是我们现造的，原生宿主缓存里没有，问它只会回空。
 fn reads_our_material(code: u32) -> bool {
     matches!(code, 2 | 6)
 }
 
-/// 这一笔 App 面向的请求归不归我们答。
-///
-/// 接管成立（`serving_enabled`）就一律归我们，开关不再参与；还没成立时，手工开关是
-/// 开机时的意见（写了 `0` 就是不接），没写的话 2/6 号默认归我们 —— 它们是读我们自己
-/// 造的料，让给宿主只会回空。
+/// 这一笔 App 面向的请求归不归我们答。接管成立就一律归我们，开关不再参与；
+/// 还没成立时手工开关优先，没写的话 2/6 号默认归我们（它们读的是我们自己造的料）。
 fn app_reply_ours(code: u32, manual: Option<bool>, serving_enabled: bool) -> bool {
     match (serving_enabled, manual) {
         (true, _) => true,
@@ -1268,9 +1108,7 @@ pub(crate) fn clear_app_call_for_test() {
 }
 
 /// 宿主回给 App 的答复里出现它自己的 `ERR_HAL_UNAVAILABLE`（-200）就记下来。
-///
-/// 形状：`[Status i32][...]`，接口返回值与 parcelable 的 resultCode 都是 i32，
-/// 偏移 4 或 8 处那几个字节就够看了。判错的方向是「多接一笔」，不会把真宿主顶掉。
+/// 形状 `[Status i32][…]`，看偏移 4 / 8 处那几个字节就够；判错的方向是「多接一笔」。
 ///
 /// # Safety
 ///
@@ -1297,8 +1135,7 @@ pub(crate) unsafe fn note_host_reply(tr: &binder_transaction_data) {
     }
 }
 
-/// 测试用：把自动接管的现场证据全清零。`HOST_REFUSED` 也算现场证据的一部分，
-/// 不清的话前面哪个测试点亮过它，后面的 `app_serving_enabled()` 就一律为 true。
+/// 测试用：把自动接管的现场证据全清零（`HOST_REFUSED` 也算，否则会污染后面的判定）。
 #[cfg(test)]
 pub(crate) fn reset_auto_serve_for_test() {
     AUTO_APP_SERVE.store(false, Ordering::Relaxed);
@@ -1326,12 +1163,12 @@ struct PendingApp {
     at: Instant,
 }
 
-/// 宿主回一笔 App 请求要在一眨眼之内（真机是毫秒级）；超时就不认了。
+/// 宿主回一笔 App 请求的时限（真机是毫秒级）；超时就不认了。
 const APP_REPLY_WINDOW: Duration = Duration::from_secs(10);
 
 thread_local! {
-    /// 本线程最近一笔 App 面向的 SOTER 请求。宿主收进来之后就在同一个 binder 线程上
-    /// 写 BC_REPLY，所以按线程记；一笔同步事务没回完，那个线程不会接下一笔。
+    /// 本线程最近一笔 App 面向的 SOTER 请求。宿主收进来就在同一个 binder 线程上写 BC_REPLY，
+    /// 一笔同步事务没回完那个线程不会接下一笔。
     static PENDING_APP: RefCell<Option<PendingApp>> = const { RefCell::new(None) };
 }
 
@@ -1363,12 +1200,8 @@ fn app_code_to_hal(code: u32) -> Option<u32> {
     })
 }
 
-/// 本线程看见宿主往我们认识的 SOTER HAL 描述符发了请求 —— 这台机器的 HAL 腿是
-/// 活的，「宿主瞎」的连击清零，自动接管也不用考虑。
-///
-/// 自动接管已经开着的时候看到一个活着的 HAL 腿，说明当初那个判定是误判（或者宿主
-/// 变了）：把它撤掉、静默一段，回到「只管壳宿主」那条老路。方向选的是宁可少接
-/// 一笔，也不顶着好宿主的答复不放。
+/// 本线程看见宿主往我们认识的 SOTER HAL 描述符发了请求：HAL 腿是活的，连击清零，
+/// 自动接管也撤掉并静默一段（宁可少接一笔，也不顶着好宿主的答复不放）。
 fn note_hal_activity() {
     if let Ok(mut slot) = LAST_HAL_ACTIVITY.lock() {
         *slot = Some(Instant::now());
@@ -1385,10 +1218,10 @@ fn note_hal_activity() {
     }
 }
 
-/// 我们自己答不上时的重试间隔。没这一条的话，B 端离线 + 本地不许兜底的时候，
-/// 每一笔 App 请求都要问一遍 daemon、吃满一次 relay 往返，比不接管还慢。
+/// 我们自己答不上时的重试间隔：否则 B 端离线 + 本地不许兜底时，每一笔 App 请求
+/// 都要吃满一次 relay 往返。
 const PROBE_RETRY_AFTER: Duration = Duration::from_secs(60);
-/// 自动接管被撤销之后的冷却。别让「接一笔、撤一笔」来回抖动。
+/// 自动接管被撤销之后的冷却，避免「接一笔、撤一笔」来回抖动。
 const AUTO_REVOKE_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// 静默期截止时刻（之前一律不探、直接按旧行为放过）。
@@ -1405,15 +1238,10 @@ fn probes_silenced(until: Option<Instant>, now: Instant) -> bool {
     until.is_some_and(|deadline| now < deadline)
 }
 
-/// App 腿自动兜底的判据（serving 还没开的时候走这儿）。
-///
-/// 这笔请求从进来到宿主回话之间宿主要去碰过我们认识的 HAL 描述符，那这台机器的
-/// 接管是好的，别多事；要是一笔 HAL 都没有（描述符换了名字、或者宿主压根不走
-/// binder HAL），它回给 App 的就是真 TA 的坏话 —— 这种连击攒满阈值就由我们把
-/// App 面向那一半接过来。12/13 号宿主本来就自己答（不碰 HAL），不算数。
-///
-/// 我们自己答不上（B 不在、本地又不许兜底）的时候连击清零、静默一分钟再来，
-/// 不硬接也不拖慢：这期间行为跟没做自动接管前一模一样。
+/// App 腿自动兜底的判据（serving 还没开时走）。
+/// 请求进来到宿主回话之间宿主没碰过我们认识的 HAL 描述符 → 它回给 App 的就是真 TA 的坏话，
+/// 连击攒满阈值就由我们接管。12/13 号宿主本来就不碰 HAL，不算数。
+/// 我们自己答不上时连击清零、静默一分钟，行为跟没做自动接管前一样。
 fn auto_serve_probe(pending: &PendingApp) -> Option<OwnedReply> {
     let now = Instant::now();
     let silenced = PROBE_SILENT_UNTIL
@@ -1459,17 +1287,15 @@ fn auto_serve_probe(pending: &PendingApp) -> Option<OwnedReply> {
     Some(reply)
 }
 
-/// 宿主要写 BC_REPLY 了：上一笔 App 请求归我们答的话，把答复 parcel 交出去，
-/// 调用方把 `data.ptr.buffer` 指到它上面。`None` = 别动，让宿主自己那份过去。
-///
+/// 宿主要写 BC_REPLY 了：上一笔 App 请求归我们答就把答复 parcel 交出去（`None` = 别动）。
 /// 返回的 parcel 得活到 `ioctl` 返回之后（内核在这期间从它里面拷字节），调用方负责。
 pub(crate) fn take_app_answer() -> Option<OwnedReply> {
     let pending = PENDING_APP.with(|slot| slot.borrow_mut().take())?;
     if pending.at.elapsed() > APP_REPLY_WINDOW {
         return None;
     }
-    // 料是我们造的、导出却交给宿主，本身就是自相矛盾（检测器那个 askModel 就卡在
-    // 宿主回空上），所以 2/6 号默认由我们答；答成了就等于接管成立，之后不再看开关。
+    // 料是我们造的、导出却交给宿主是自相矛盾，所以 2/6 号默认由我们答；
+    // 答成了就等于接管成立，之后不再看开关。
     if !app_reply_ours(pending.call.code, manual_switch(), app_serving_enabled()) {
         return auto_serve_probe(&pending);
     }
@@ -1499,9 +1325,8 @@ pub(crate) fn take_app_answer() -> Option<OwnedReply> {
     Some(reply)
 }
 
-/// 拼一笔 App 面向的答复。答不了就返回 `None`（宿主自己那份答复照旧过去）。
 /// 一笔 App 面向调用该答什么。内容与渲染分开：宿主里是顶掉它的 BC_REPLY（拼成 parcel），
-/// 自测端点里是直接往 rsbinder 的 reply 里写 —— 两边用的是同一张答案。
+/// 自测端点里是直接写 rsbinder 的 reply —— 两边用同一张答案。
 #[derive(Debug)]
 pub(crate) enum AppAnswer {
     /// 只有返回值的（`generate*` / `has*` / `remove*` / `getVersion`）。
@@ -1514,9 +1339,8 @@ pub(crate) enum AppAnswer {
     Extra(i32),
 }
 
-/// 原厂宿主服务层在把请求发给 HAL 之前自己回的码：空别名 -202、空 challenge -203。
-/// 真机的 SoterService 对这两类请求**根本不发到 TA**，服务层先校验、直接回错。留到下一步
-/// 才处理的话，宿主是壳（只回 -200）的机型上就变成 -200，检测器一眼能看出不是原厂词汇。
+/// 原厂宿主服务层在发往 HAL 之前自己回的码：空别名 -202、空 challenge -203。
+/// 漏到下一步处理的话，壳宿主机型上会变成 -200，一眼不是原厂词汇。
 const APP_ERR_EMPTY_ALIAS: i32 = -202;
 const APP_ERR_EMPTY_CHALLENGE: i32 = -203;
 
@@ -1537,8 +1361,8 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
         }
         _ => {}
     }
-    // 空参数先按原厂宿主的口径挡掉，顺序也跟原厂一样：别名先、challenge 后。
-    // `hasAuthKey` 例外 —— 原厂对空别名不报错，只回 false。
+    // 空参数按原厂口径挡掉，顺序也一样：别名先、challenge 后。`hasAuthKey` 例外
+    // （原厂对空别名不报错，只回 false）。
     let alias_empty = call.alias.as_deref().unwrap_or("").is_empty();
     match call.code {
         4 | 5 | 6 | 9 if alias_empty => {
@@ -1565,9 +1389,8 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
     }
     let hal_code = app_code_to_hal(call.code)?;
     let (op, _) = describe(true, hal_code)?;
-    // uid 一律用调用者那个：真宿主也是拿 `Binder.getCallingUid()` 盖掉参数，
-    // 参数里那个 uid 是 App 自己填的（检测器的 T4 就是照这个判分的）。
-    // uid 能没有：`getDeviceId` / `getVersion` 这类根本没这个参数，本地后端也不用它。
+    // uid 一律用调用者那个（真宿主也拿 `Binder.getCallingUid()` 盖掉参数）。
+    // 可以不有：`getDeviceId` / `getVersion` 这类根本没这个参数。
     let uid = if caller_uid >= 0 {
         Some(caller_uid)
     } else {
@@ -1589,7 +1412,7 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
         data_size: call.data_size,
     };
     // finishSign 的会话要是本进程开的（init 那笔本地答的），这一笔也必须本地答：
-    // 去问远程就是 B 端不认识这个句柄，直接 -204。
+    // 问远程就是 B 端不认识这个句柄，直接 -204。
     let local_session = hal_code == 4 && hal_call.session.is_some_and(soter_local::has_session);
     let answer = if local_session {
         soter_local::answer(&hal_call)
@@ -1620,12 +1443,8 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
     })
 }
 
-/// App 面向那半边把「缺料」的码位对齐到原厂 TA 的词汇。
-///
-/// 同一件事在不同链路上有三个写法：原厂对「没这把 AuthKey」回 -6；走 B 端时拿到的是
-/// B 自己的 -8，本地兜底是 -5；未知会话号原厂回 -1000，B 不认识句柄时回 -204。
-/// App 只当它们都是失败，但检测器会把别的号码判成「别家的词汇」（T5 / T6 / T13 那几条
-/// warn 就是这么来的）。对外就统一成原厂那套，内部日志里还是原值。
+/// App 面向那半边把「缺料」的码位对齐到原厂 TA 的词汇（内部日志里还是原值）。
+/// -6 = 没这把 AuthKey（B 端给 -8、本地给 -5）；-1000 = 未知会话号（B 端给 -204）。
 fn vendor_export_code(app_code: u32, code: i32) -> i32 {
     match (app_code, code) {
         (6, -5 | -8) => -6,
@@ -1659,41 +1478,24 @@ fn build_app_answer(pending: &PendingApp) -> Option<OwnedReply> {
 
 /// 把一笔答复拼成宿主能直接吃的内核命令字节流，连同一块得活着的 parcel 一起交出去。
 ///
-/// 答复从哪来由 [`crate::hook::soter_relay`] 定：远程（B 端 TEE）优先，配置允许就退回
-/// A 端本地自签，两边都没有就返回 `None` 让调用方透传。
+/// 答复源由 [`crate::hook::soter_relay`] 定：远程优先，配置允许就退回本地自签，都没有就 `None`（透传）。
 ///
-/// 形状是 `[BR_TRANSACTION_COMPLETE][BR_REPLY]`。为什么前面那条也得给：宿主
-/// `waitForResponse` 的写法是「读一个 cmd，碰到 COMPLETE 就 break 出 switch 回循环顶部」，
-/// 接着它再调一次 `talkWithDriver`；那一刻 `mIn` 里还剩 68 字节没读，libbinder 算出的
-/// `needRead = dataPosition >= dataSize` 为假，于是那次 ioctl 的 read_size 是 0，
-/// 内核直接返回、不会覆盖缓冲区，第二次才把 BR_REPLY 收下。少给前一条也不会卡
-/// （``dataAvail()`` 非 0 就会接着读），补上只是更像真机上同步调用的节奏。
-///
-/// 返回的字节流里 `data.ptr.buffer` 指的是第二个返回值的 parcel，所以**调用方得把这块
-/// parcel 一直留到宿主把 `BC_FREE_BUFFER` 交回来为止** —— 这两个返回值是一个整体。
-/// `OwnedReply` 里装的是堆上的 `Parcel`，移交给调用方不会挪动数据本身，指针依旧有效。
+/// 形状 `[BR_TRANSACTION_COMPLETE][BR_REPLY]`（前者补上只为更像真机同步调用的节奏，少了也不卡）。
+/// `data.ptr.buffer` 指的是第二个返回值的 parcel，所以**调用方得把这块 parcel 留到宿主把
+/// `BC_FREE_BUFFER` 交回来为止** —— 两个返回值是一个整体。
 pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> {
     let answer = crate::hook::soter_relay::answer(call)?;
     note_sign_success(call, &answer);
     frame_br_reply(call, answer)
 }
 
-/// 「这台机器的 SOTER 能签」的记录文件。宿主是 app 域（uid 1000），写不进 keystore
-/// 那棵目录，而 daemon 会把这个文件预先建好、改成 0666（跟它自己那份日志一个待遇），
-/// 所以主机侧只要追加一行就行。
+/// 「这台机器的 SOTER 能签」的记录文件。daemon 会预先建好、改成 0666，宿主侧只追加一行。
 const SIGN_OK_PATH: &str = "/data/misc/ommega/soter_ok";
 
-/// 签名成功就落一条记录，面板据此显示「SOTER 可用」—— 重启后加载时直接就有结论，
-/// 不用再等某一笔新调用。
-///
-/// **哪一层答的（远程真机 TEE / 本地自签 / 服务器自签）都算**：对 App 来说签出来
-/// 了就是能用，不关心背后是谁签的。
-///
-/// 只写本地文件：**不碰网络、不碰 TEE、不阻塞**。写失败就算了（顶多面板显示不准），
-/// 签名这条路上不能因为它多发一次请求或者多等一瞬。
+/// 签名成功就落一条记录，面板据此显示「SOTER 可用」，重启后不用等新调用。
+/// 哪一层答的都算。只写本地文件：不碰网络、不碰 TEE、不阻塞，写失败就算了。
 fn note_sign_success(call: &SoterCall, answer: &Answer) {
-    // 只认真正出签名的那两笔（跟 B 端判据一致：init_sign + finish_sign 都回 0）：
-    // 4 = finishSign，11 = init_sign。
+    // 只认真正出签名的那两笔（4 = finishSign，11 = init_sign）。
     if call.code != 4 && call.code != 11 {
         return;
     }
@@ -1794,10 +1596,8 @@ mod tests {
     use super::*;
     use crate::hook::binder::TF_STATUS_CODE;
 
-    /// 造一条现代的 interface token（含 strict-mode policy 前缀）。
-    ///
-    /// 长度写的是**字符数，不含 NUL**，后面才是 NUL 和补齐 —— 跟 `push_string` 一样
-    /// 跟着 Android `writeString16` 的真实布局来，别再写成「长度含 NUL」那套。
+    /// 造一条现代的 interface token（含 strict-mode policy 前缀）。长度是字符数、不含 NUL，
+    /// 之后是 NUL 与补齐（跟 `push_string` 一致）。
     fn interface_token(descriptor: &str) -> Vec<u8> {
         let units: Vec<u16> = descriptor.encode_utf16().collect();
         let mut out = Vec::new();
@@ -1821,8 +1621,7 @@ mod tests {
         out.extend_from_slice(&value.to_le_bytes());
     }
 
-    /// AIDL 的 String16：字符数 + UTF-16LE + NUL 终结符 + 补齐。（跟 Cursor::string 一份
-    /// 布局，别再造一套出来，不然测试绿着、真机流量照样读错。）
+    /// AIDL 的 String16：字符数 + UTF-16LE + NUL 终结符 + 补齐（跟 `Cursor::string` 一份布局）。
     fn push_string(out: &mut Vec<u8>, value: &str) {
         let units: Vec<u16> = value.encode_utf16().collect();
         push_i32(out, units.len() as i32);
@@ -1843,14 +1642,11 @@ mod tests {
         data
     }
 
-    /// `'S' 'Y' 'S' 'T'`，现代 libbinder 在 strict-mode policy 之后写的那个魔数
-    /// （放进 u32 里是最低位是 'T'）。
+    /// `'S' 'Y' 'S' 'T'`：现代 libbinder 在 strict-mode policy 之后写的魔数。
     const INTERFACE_HEADER: u32 = 0x5359_5354;
 
     /// 造一条带指定前缀字数的 token：0 / 1 / 2 / 3 个 i32 头，然后 String16 + 参数。
-    ///
-    /// 1 个 = 老 libbinder；2 个 = policy + 'SYST'；3 个 = 真机实测的 app_process 布局
-    /// （policy、work source=-1、'SYST'，然后长度字段是字符数、结尾单另一个 0）。
+    /// 1 = 老 libbinder；2 = policy + 'SYST'；3 = app_process 布局（policy、work source=-1、'SYST'）。
     fn token_with_header(headers: usize, args: &dyn Fn(&mut Vec<u8>)) -> Vec<u8> {
         let mut out = Vec::new();
         let policy = 0x8000_0000u32;
@@ -1893,8 +1689,7 @@ mod tests {
         out
     }
 
-    /// 四种前缀都得认得出来，尤其是 2 个头那个（app_process 实测就是这个，
-    /// 少了它 App 侧的 SOTER 流量一条都认不出来）。
+    /// 四种前缀都得认得出来（app_process 用的是 2 个头那个）。
     #[test]
     fn matches_every_interface_token_layout() {
         for headers in [0usize, 1, 2, 3] {
@@ -1942,8 +1737,7 @@ mod tests {
         assert_eq!(call.challenge.as_deref(), Some("0102030405"));
     }
 
-    /// 真机上的 alias 正好是 34 个字符（偶数长度），后面紧跟 challenge。之前少算 4 字节
-    /// 补齐，读出来的 challenge 是空串 —— 这条专门盯住那个坑。
+    /// 真机 alias 正好 34 字符（偶数），后面紧跟 challenge；少算 4 字节补齐会把 challenge 读成空串。
     #[test]
     fn a_challenge_after_a_34_char_alias_is_not_swallowed() {
         let alias = "SoterAuthKeyV2_salt11d8ba34_scene1";
@@ -2010,8 +1804,8 @@ mod tests {
         assert_eq!(call.caller_uid, None);
     }
 
-    /// 产线 provisioning 三个号（2 / 6 / 14）现在是我们的，真正不认识的号还是不认。
-    /// 注意 2 / 6 号是 Args::Uid，空参数解析不出来，得带 uid；14 号无参。
+    /// 产线 provisioning 三个号（2 / 6 / 14）是我们的，真不认识的号还是不认。
+    /// 2 / 6 是 Args::Uid，得带 uid；14 无参。
     #[test]
     fn provisioning_codes_are_ours_but_unknown_codes_are_not() {
         for code in [2u32, 6] {
@@ -2080,8 +1874,7 @@ mod tests {
             ),
             None
         );
-        // 带别名的出站调用：窗口内“认不出接口”的凭据（无别名无会话）可以顶它 ——
-        // 那些“App 面向接口换了一套”的宿主就只有这一条路能拿到调用者。
+        // 带别名的出站调用：窗口内“认不出接口”的凭据（无别名无会话）可以顶它。
         assert_eq!(
             pick_recent_caller(
                 &[entry(10490, 1, None, None)],
@@ -2200,8 +1993,7 @@ mod tests {
         assert_eq!(pick_alias_owner(&reused, "", now), None);
     }
 
-    /// uid 是不是应用的判据：分身（999xxxxx）和多用户（10xxxxx）都算应用，
-    /// init/system_server/root/shell（0 / 1000 / 2000）不算。
+    /// uid 是不是应用：分身（999xxxxx）和多用户（10xxxxx）都算，0 / 1000 / 2000 不算。
     #[test]
     fn only_app_uids_count_as_the_caller() {
         assert!(is_app_uid(10490));
@@ -2297,9 +2089,8 @@ mod tests {
 
     #[test]
     fn the_hidl_descriptors_are_recognised_and_intercepted() {
-        // 宿主 dex 里 HIDL 那套代理类（`...@1.0::ISoter@Proxy`）也在，描述符跟 AIDL 不是
-        // 同一条。现在照样拦 —— 答复换成 HIDL 的布局（`build_hidl_*`），不再只观察。
-        // hasAuthKey 在 HIDL 线上是声明顺序的第 12 个，AIDL 那边是 10。
+        // 宿主 dex 里 HIDL 那套代理类也在，描述符跟 AIDL 不是同一条；现在照样拦，
+        // 答复换成 HIDL 布局（`build_hidl_*`）。hasAuthKey 在 HIDL 线上是 12。
         for descriptor in [
             QTI_HIDL_DESCRIPTOR,
             TRUSTONIC_HIDL_DESCRIPTOR,
@@ -2494,7 +2285,7 @@ mod tests {
 
     #[test]
     fn every_code_the_local_backend_can_answer_is_intercepted() {
-        // 本地后端写了实现的 11 个号码全部拦下来自己回。
+        // 本地后端有实现的号码全部拦下来自己回；2 / 6 带 uid，14 无参。
         for code in [1u32, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13] {
             let data = token_with_header(3, &|out| {
                 push_i32(out, 10373);
@@ -2505,8 +2296,7 @@ mod tests {
             assert!(interceptable(&call), "code {code} must be intercepted");
         }
 
-        // 2 / 6 / 14 是产线 provisioning（工程模式那页在用），本地后端同样答，照样拦。
-        // 2 / 6 号是 Args::Uid 要带 uid，14 号无参。
+        // 2 / 6 / 14 是产线 provisioning，本地后端同样答、照样拦；2 / 6 带 uid，14 无参。
         for code in [2u32, 6] {
             let data = request(&|out| push_i32(out, 10373));
             let call = parse(&data, code).unwrap_or_else(|| panic!("code {code} must parse"));
@@ -2519,7 +2309,6 @@ mod tests {
     #[test]
     fn empty_alias_and_challenge_keep_the_vendors_codes() {
         // 原厂宿主在服务层就把这两类挡掉、不发 HAL：空别名 -202、空 challenge -203。
-        // 我们要是在这层漏过去，宿主是壳（只回 -200）的机型上就变成 -200 了。
         fn call(code: u32, alias: &str, challenge: Option<&str>) -> SoterCall {
             SoterCall {
                 hal: false,
@@ -2672,8 +2461,7 @@ mod tests {
         }
     }
 
-    /// 一个 `binder_buffer_object`：`{hdr{type}, flags, buffer, length, parent, parent_offset}`，
-    /// 后面四格宽度跟 ABI 走。
+    /// 一个 `binder_buffer_object`：`{hdr{type}, flags, buffer, length, parent, parent_offset}`。
     fn push_hidl_buffer_object(
         out: &mut Vec<u8>,
         buffer: usize,
@@ -2690,9 +2478,7 @@ mod tests {
     }
 
     /// HIDL 的一个 string 参数：parcel 里两个对象，结构体和字符在外面。
-    ///
-    /// `keep` 是那些外面那块内存的持有者 —— 对象里写的是它们的地址，解析的时候真去 deref，
-    /// 所以调用方得让它们活到 parse 完。
+    /// `keep` 持有那些内存，得活到 parse 完。
     fn push_hidl_string(out: &mut Vec<u8>, keep: &mut Vec<Box<[u8]>>, value: &str) {
         let mut chars = value.as_bytes().to_vec();
         chars.push(0);
@@ -2919,8 +2705,7 @@ mod tests {
     #[test]
     fn hidl_provisioning_codes_are_recognised_too() {
         // 1/2/3（generateAttkKeyPair / verifyAttkKeyPair / exportAttkPublicKey）换算过去
-        // 是 AIDL 的 6/14/2 —— provisioning 三个号现在都认，本地后端也答。
-        // 6 / 2 号是 Args::Uid 要带 uid，14 号无参。
+        // 是 AIDL 的 6/14/2，本地后端也答；2 / 6 带 uid，14 无参。
         let with_uid = {
             let mut data = hidl_token(QTI_HIDL_DESCRIPTOR);
             push_i32(&mut data, 10373);
@@ -2988,8 +2773,7 @@ mod tests {
         assert_eq!(type_, BINDER_TYPE_PTR, "8 那里就该是对象 A");
     }
 
-    /// App 号 → HAL 号的表得对得上：11 个运行时方法都有落点，而且落到的号码本地后端
-    /// 都答得了；12/13 号宿主本就不发 HAL 请求，不该出现在这张表里。
+    /// App 号 → HAL 号的表：1..11 都得落到本地后端答得了的号上；12/13 号不发 HAL 请求。
     #[test]
     fn every_app_transaction_maps_to_a_hal_number_the_local_backend_answers() {
         for code in 1..=11u32 {
@@ -3004,8 +2788,7 @@ mod tests {
     }
 
     /// App 面向的答复字节流：`[Status][…]`，跟宿主自己写的那份一模一样。
-    /// 写错一格客户端就会把字段读歪（`exportData` 成 null、session 成 0），
-    /// 所以这里直接把字节钉住。
+    /// 写错一格客户端就会把字段读歪，所以这里直接把字节钉住。
     #[test]
     fn the_app_facing_replies_match_the_host_wire_layout() {
         let raw = |reply: &OwnedReply| unsafe {
@@ -3083,18 +2866,16 @@ mod tests {
         }
     }
 
-    /// 这三个自动接管测试共用一份进程级现场证据（AUTO_APP_SERVE / 连击计数），
-    /// 并行跑会互相清零。拿这把锁把整个测试体串行化。
+    /// 这三个自动接管测试共用一份进程级现场证据，并行跑会互相清零，拿这把锁串行化。
     use super::auto_serve_test_lock;
 
-    /// 自动接管开了没有。只看进程内那个标记，不渗文件/环境变量那头（那是
-    /// `app_serving_enabled()` 的事，本组要验的是兜底逻辑本身）。
+    /// 自动接管开了没有。只看进程内那个标记，不渗文件/环境变量那头。
     fn auto_serve_on() -> bool {
         AUTO_APP_SERVE.load(Ordering::Relaxed)
     }
 
-    /// 2/6 号读的是我们自己造的料，没写过开关时默认就归我们答；手工写了 `0` 还是不接；
-    /// 接管一旦成立，开关就不参与判断了。
+    /// 2/6 号读的是我们自己造的料，没写过开关时默认归我们答；写 `0` 就是不接；
+    /// 接管成立后开关不参与判断。
     #[test]
     fn reads_our_material_is_served_by_default() {
         assert!(app_reply_ours(2, None, false));
@@ -3159,8 +2940,7 @@ mod tests {
         reset_auto_serve_for_test();
     }
 
-    /// 误判之后能自己退回来：接管开着的时候又看到宿主碰了我们认识的 HAL，
-    /// 就把接管撤掉并静默一段，回到旧行为。
+    /// 误判之后能自己退回来：接管开着时又看到宿主碰了我们认识的 HAL，就撤掉并静默一段。
     #[test]
     fn a_revoked_auto_serve_backs_off_instead_of_flapping() {
         let _guard = auto_serve_test_lock();
@@ -3195,8 +2975,7 @@ mod tests {
         assert!(!probes_silenced(Some(now - Duration::from_secs(1)), now));
     }
 
-    /// 接口名被 ROM 换掉时也能把 App 面向那笔认下来：只靠 sender 是应用 +
-    /// 参数形状对得上，不要求 token 匹配。
+    /// 接口名被 ROM 换掉时也能把 App 面向那笔认下来：只靠 sender 是应用 + 参数形状对得上。
     #[test]
     fn an_unknown_interface_name_still_yields_the_app_side() {
         let mut data = interface_token("com.example.rom.soter.IRenamed");

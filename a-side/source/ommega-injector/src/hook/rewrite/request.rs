@@ -358,32 +358,9 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         } else {
             route_for_service_request(&request, &cfg.intercept)
         };
+        // 不通过就转给 System；详细字段在下面的 `event=decision` 里打一次。
         if !decision.allowed && !allow_ommega_grant {
-            info!(
-                "event=decision command={} service_method={:?} code=0x{:x} uid={} pid={} sid='{}' packages={:?} allowed=false reason={:?}; routing request to System",
-                command_name,
-                method,
-                original_code,
-                caller.uid,
-                caller.pid,
-                caller.sid,
-                decision.packages,
-                decision.reason,
-            );
             route = RouteTarget::System;
-        }
-        if allow_ommega_grant {
-            info!(
-                "event=decision command={} service_method={:?} code=0x{:x} uid={} pid={} sid='{}' packages={:?} allowed=true reason={:?} ommega_grant=true",
-                command_name,
-                method,
-                original_code,
-                caller.uid,
-                caller.pid,
-                caller.sid,
-                decision.packages,
-                decision.reason,
-            );
         }
 
         let precomputed_service_reply = if route == RouteTarget::Ommega
@@ -414,7 +391,7 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
         let request_rewritten = precomputed_service_reply.is_some();
 
         info!(
-            "event=decision command={} service_method={:?} code=0x{:x} uid={} pid={} sid='{}' packages={:?} allowed={} reason={:?}",
+            "event=decision command={} service_method={:?} code=0x{:x} uid={} pid={} sid='{}' packages={:?} allowed={} reason={:?} ommega_grant={}",
             command_name,
             method,
             original_code,
@@ -422,8 +399,9 @@ pub(in crate::hook) unsafe fn handle_br_transaction(
             caller.pid,
             caller.sid,
             decision.packages,
-            decision.allowed,
+            decision.allowed || allow_ommega_grant,
             decision.reason,
+            allow_ommega_grant,
         );
         info!(
             "event=route method={:?} uid={} pid={} route={:?}",

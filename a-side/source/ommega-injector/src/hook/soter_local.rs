@@ -8,15 +8,14 @@
 //! ```
 //!
 //! - `exportAskPublicKey`：ASK 自描述，用 ATTK 私钥签；
-//! - `exportAuthKeyPublicKey`：AuthKey 自描述，用 ASK 私钥签（App 拿 ASK 公钥验它）；
+//! - `exportAuthKeyPublicKey`：AuthKey 自描述，用 ASK 私钥签；
 //! - `finishSign`：签名现场 JSON，用 AuthKey 签**原文**，不是 challenge 的字节。
 //!
-//! 键序和字段名照真机现场，`uid` 是字符串。设备信息（`cpu_id` / `fid` / `tee_*` / `fp_*`）
-//! 按本机属性推：`cpu_id` 只认本地这份身份（ATTK force 号，否则按序列号派生），不用转发
-//! 链路学来的 B 端号。
+//! 键序和字段名照真机现场，`uid` 是字符串。设备信息只按本机属性推，不用转发链路学来的
+//! B 端号；读不到就报空串，不编造。
 //!
-//! 边界：自签链只在本机自洽，过不了业务服务端的证书校验；私钥就编在 binary 里 —— 这是
-//! 兜底，不是安全方案。错误码跟真机宿主一致（-5 = 钥匙不在这台设备上）。
+//! 边界：自签链只能本机自洽，过不了业务服务端的证书校验，私钥就在 binary 里。
+//! 错误码跟真机宿主一致（-5 = 钥匙不在这台设备上）。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -36,43 +35,32 @@ use crate::hook::soter;
 
 /// SOTER 的成功码。
 const OK: i32 = 0;
-/// "这把钥匙不在这台设备上"。实测 hasAskAlready / exportAuthKeyPublicKey 都回它。
+/// "这把钥匙不在这台设备上"（hasAskAlready / exportAuthKeyPublicKey 都回它）。
 const NOT_FOUND: i32 = -5;
-/// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
+/// AuthKey 还没建（AUTH_KEY_NOT_READY）；答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长。腾讯按 JSON 里的 `rsa_pss_saltlen` 验签。
-///
-/// 32 是实测值：PLC110（MTK Kinibi，Android 16）真机 TA 的 ASK / AuthKey / 签名现场
-/// 三份文档都写 `"rsa_pss_saltlen":32`，签名也真的是 32。本地兜底跟它对齐（声明和
-/// 签名一把钥匙，客户端按声明验总能过）。
+/// ASK 里写死的盐长，腾讯按 JSON 里的 `rsa_pss_saltlen` 验签；声明与签名用同一个值。
 const SALT_LEN: i32 = 32;
-/// 编译进来的 ATTK（构建时按当时时间现生成的一把自签 RSA）。
-/// ASK 不内置：每个 uid 的 ASK 都是用到时现生成、落盘复用。
+/// 编译进来的 ATTK（构建时现生成的自签 RSA）。ASK 不内置：每个 uid 用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
-/// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM，`openssl genpkey` / `openssl genrsa` 的都行）。
-/// 存在且解析得过就用它，跟 keybox 一个路子：丢文件进去、重启 SOTER 宿主就生效。
+/// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM）：存在且解析得过就用它。
 ///
-/// 唯一位置是 `/data/misc/ommega/`：它的 context 是 `system_data_file`，
-/// app 域（SOTER 宿主是 uid 1000）和 keystore 域都读得到，不需要在两个目录各存一份。
+/// 唯一位置是 `/data/misc/ommega/`（`system_data_file`）：app 域和 keystore 域都读得到。
 const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
-/// counter 起点：换 ATTK 时它会被清掉（连同 ASK/authkey/App 开通状态），
-/// 之后每个 App 第一次请求现造 ASK，counter 从 1 开始严格 +1。
-/// ATTK 换了就是新身份（新 cpu_id），腾讯那边也是新记录，从 1 合理。
+/// counter 起点：换 ATTK 时会连同 ASK/authkey/App 开通状态一起清掉，之后每个 App
+/// 第一次请求现造 ASK，counter 从 1 开始严格 +1（新身份、腾讯那边也是新记录）。
 const COUNTER_BASE: u64 = 1;
 
 /// 强制覆盖 cpu_id 的文件；daemon 不写这个文件。
 const CPU_ID_OVERRIDE: &str = "/data/misc/ommega/soter_cpu_id.force";
-/// `fid` 在序列号读不到时的兜底种子。`cpu_id` **不用**它 —— 那个号只从真实属性来，
-/// 读不到就不报，绝不编一个（见 [`cpu_id`]）。
+/// `fid` 在序列号读不到时的兜底种子。`cpu_id` **不用**它（读不到就不报，绝不编一个）。
 const FALLBACK_SEED: &str = "ommega-a-side-local";
 
 /// 从一段可能夹着注释的文件里抽出 PEM 本体（`-----BEGIN` 到 `-----END`）。
-///
-/// WebUI 导入的 ATTK 文件可以在里面写一行 `cpu_id: 09000000…`，daemon 会拿它设
-/// `soter_cpu_id.force`；这里把这些非 PEM 行滤掉再交给解析器。
+/// WebUI 导入的 ATTK 文件里可以带一行 `cpu_id: …`，这里把非 PEM 行滤掉。
 fn pem_block(pem: &str) -> String {
     let mut out = String::with_capacity(pem.len());
     let mut inside = false;
@@ -101,10 +89,9 @@ struct Key {
 
 impl Key {
     fn from_pem(pem: &str) -> Option<Self> {
-        // 文件里允许带 `cpu_id: 09000000…` 这类注释行（WebUI 导入时 daemon 靠它设 force），
-        // PEM 解析器不认那些行，先只取 BEGIN…END 之间那段。
+        // 文件里允许带 `cpu_id: …` 这类注释行（daemon 靠它设 force），先只取 BEGIN…END 那段。
         let block = pem_block(pem);
-        // PKCS#8 和 PKCS#1 都认：`openssl genpkey` 给前者，`openssl genrsa` 给后者。
+        // PKCS#8 和 PKCS#1 都认。
         let private = RsaPrivateKey::from_pkcs8_pem(block.trim())
             .or_else(|_| RsaPrivateKey::from_pkcs1_pem(block.trim()))
             .ok()?;
@@ -123,7 +110,7 @@ impl Key {
         Some(Self { private, pem })
     }
 
-    /// RSA-PSS-SHA256，盐长 = `SALT_LEN`（跟真机 TA 对齐的 20），JSON 里那个字段也是它。
+    /// RSA-PSS-SHA256，盐长 = `SALT_LEN`（JSON 里那个字段也是它）。
     fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
         let signing =
             PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), SALT_LEN as usize);
@@ -132,9 +119,7 @@ impl Key {
     }
 }
 
-/// 本地签名自检：拿当前生效的 ASK 签一段固定文本，再用它的公钥验一遍。
-///
-/// 只走本地密码学，不碰网络和 TEE。失败只说明这次没成。
+/// 本地签名自检：拿当前生效的 ASK 签一段固定文本再验一遍。不走网络和 TEE。
 pub(crate) fn selftest() -> anyhow::Result<()> {
     state().ok_or_else(|| anyhow::anyhow!("soter local state unavailable"))?;
     let message: &[u8] = b"ommega-soter-selftest";
@@ -155,8 +140,7 @@ pub(crate) fn selftest() -> anyhow::Result<()> {
 struct SignSession {
     uid: i32,
     alias: String,
-    /// 挑战原文，宿主传下来什么样就存什么样。真机把它写进签名 JSON 的 `raw` 里，
-    /// 我们照做，不去解它（解了反而签的不是 App 要的东西）。
+    /// 挑战原文，宿主传下来什么样就存什么样。真机把它写进签名 JSON 的 `raw`，不去解它。
     raw: String,
     /// 会话开启时刻；超过服务端那 60 秒就作废。
     created: Instant,
@@ -165,8 +149,8 @@ struct SignSession {
 }
 
 impl SignSession {
-    /// 这次调用还能不能花掉这个会话：在 TTL 内，且调用方就是开它的那个。
-    /// 两边都拿得到 caller 才比 —— 拿不到就不拿它当拒绝理由。
+    /// 这次调用能不能花掉这个会话：在 TTL 内，且调用方就是开它的那个。
+    /// 两边都拿得到 caller 才比。
     fn is_usable(&self, caller: Option<i32>) -> bool {
         if self.created.elapsed() > SESSION_TTL {
             return false;
@@ -180,10 +164,9 @@ impl SignSession {
 
 /// 后端状态。签发用的 key 一开始就加载好（编译进来的，失败就是编坏了）。
 struct State {
-    /// 签名根（ATTK）。本地模式里它就是 `exportAttkPublicKey` 吐的那把，全设备只有一把。
-    /// 外面用 [`current_attk`] 取，文件换了会现读，跟 keybox 一个路子。
+    /// 签名根（ATTK），全设备只一把；外面用 [`current_attk`] 取（文件换了会现读）。
     attk: Mutex<Key>,
-    /// 对外导出的 ASK。真机是一把 ATTK 挂 N 把 ASK、每个 uid 一把，这里按 uid 存。
+    /// 对外导出的 ASK，每个 uid 一把（真机是 ATTK 下挂 N 把 ASK）。
     asks: Mutex<HashMap<i32, Key>>,
     /// `{uid}|{alias}` -> AuthKey。
     auth: Mutex<HashMap<String, Key>>,
@@ -222,9 +205,8 @@ pub(crate) fn ask_origin() -> Option<String> {
     }
 }
 
-/// 按候选顺序找一把可用的 ATTK：环境变量指定的文件 → 两个候选文件 → 编进来的那把。
-///
-/// `override_path` 是给测试用的显式覆盖（不去碰进程环境变量，免得多线程下互相干扰）。
+/// 按候选顺序找一把可用的 ATTK：环境变量指定的文件 → 候选文件 → 编进来的那把。
+/// `override_path` 是测试用的显式覆盖（不碰进程环境变量）。
 fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key, String)> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let from_env =
@@ -240,7 +222,7 @@ fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key,
         };
         match Key::from_pem(&pem) {
             Some(key) => return Some((key, path.display().to_string())),
-            // 文件在那儿但读不出私钥：别当没事，也别拿它顶，继续往下找。
+            // 文件在那儿但读不出私钥：不当它没事，也不拿它顶，继续往下找。
             None => log::warn!(
                 "soter local attk at {} is not a usable RSA PEM; ignoring it",
                 path.display()
@@ -262,7 +244,6 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
 }
 
 /// 所有 uid 的 ASK 和 AuthKey 存在这一个文件里，不要按 uid/alias 散成一堆 pem。
-/// 结构是两层：
 ///
 /// ```json
 /// { "asks": { "10496": "<pem>" }, "authkeys": { "10496|SoterAuthKey": "<pem>" } }
@@ -271,9 +252,8 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
 /// 位置唯一：`/data/misc/ommega/`（`system_data_file`，app 域和 keystore 域都读得到）。
 const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
 
-/// store 路径。`OMMEGA_SOTER_ASK_STORE` 是给真机单测的隔离口：测试跟线上模块共用
-/// 同一个文件会互相踩（测试刚写的墓碑被活着的载荷用它的内存态盖掉，测试断言就随
-/// 着模块忙不忙随机挂），跑测试时把它指到 /data/local/tmp 下的临时文件。
+/// store 路径。`OMMEGA_SOTER_ASK_STORE` 是真机单测的隔离口（测试与线上模块共用同一个
+/// 文件会互相踩），跑测试时指到 /data/local/tmp 下的临时文件。
 fn ask_store_path() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
@@ -320,8 +300,8 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
                     || key == GONE_SECTION
                     || key == ATTK_FIELD
             });
-            // 指纹对不上（换了 ATTK）或者是没记指纹的旧 store：整份作废，让调用方
-            // 重新生成。留着只会拿旧 ATTK 签的链去跑，本地能过、腾讯不认。
+            // 指纹对不上（换了 ATTK）或没记指纹的旧 store：整份作废，让调用方重新生成 ——
+            // 留着只会拿旧 ATTK 签的链去跑，本地能过、腾讯不认。
             let want = attk_fingerprint();
             let got = map.get(ATTK_FIELD).and_then(|v| v.as_str());
             if !matches!((want.as_deref(), got), (Some(w), Some(g)) if w == g) {
@@ -352,9 +332,8 @@ fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<S
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // 写临时文件再 rename：中途掉电也不会留个半个 json。
-    // 落盘统一 0666：这份 store 是几个域一起写的（keystore 域的 payload、hal_soter、
-    // system_app 宿主）。谁把 tmp 用默认 0644 rename 上去，另外几家就写不动了。
+    // 写临时文件再 rename：中途掉电不会留个半个 json。落盘统一 0666：这份 store 是几个域
+    // 一起写的，谁把 tmp 用默认 0644 rename 上去，另外几家就写不动了。
     let tmp = format!("{path}.tmp");
     if std::fs::write(&tmp, text.as_bytes()).is_ok() {
         let _ = std::fs::set_permissions(
@@ -366,9 +345,8 @@ fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<S
         }
     }
     let _ = std::fs::remove_file(&tmp);
-    // app 域（SOTER 宿主是 platform_app、带 MLS 类别）写不动这个文件：MLS 的写约束
-    // 要求主体和客体级别相等。整份文本交给 daemon 代写，它跑在 s0 上，写得进去。
-    // 测试用的临时 store（`OMMEGA_SOTER_ASK_STORE`）不走 RPC：那里根本没有 daemon。
+    // app 域写不动这个文件（MLS 要求主体与客体级别相等），整份文本交给跑在 s0 上的 daemon 代写。
+    // 测试用的临时 store 不走 RPC（那里没有 daemon）。
     if path == ASK_STORE_PATH {
         match crate::ipc::write_soter_store(&text) {
             Ok(true) => {
@@ -409,14 +387,13 @@ fn read_store_pem(section: &str, key: &str) -> Option<String> {
     }
 }
 
-/// AUTH 段最多留这么多把 AuthKey（每把约 1.7KB PEM）。超过之后挤掉最早的一批：
+/// AUTH 段最多留这么多把 AuthKey（每把约 1.7KB PEM），超了按 key 顺序挤掉一批。
 /// 被挤掉的那把下次 `has_auth_key` 回 false，App 自己重签。
 const MAX_AUTH_KEYS: usize = 1024;
 const AUTH_KEYS_KEEP: usize = MAX_AUTH_KEYS * 3 / 4;
 /// 未完成的 initSign 会话最多留这么多条，超了整表清。
 const MAX_SIGN_SESSIONS: usize = 256;
-/// 一个签名会话的生命周期。真机的会话不是永久的，服务端那边按 60 秒算，
-/// 本地兜底也跟这个数：过期就当没这个号，让上层去重开。
+/// 一个签名会话的生命周期（跟服务端一致 60 秒）；过期就当没这个号，让上层重开。
 const SESSION_TTL: Duration = Duration::from_secs(60);
 /// 内存里那层 AuthKey 缓存，它只是 store 的缓存，满了清掉就回盘上重读。
 const MAX_AUTH_CACHE: usize = MAX_AUTH_KEYS;
@@ -453,11 +430,8 @@ fn forget_pem(section: &str, key: &str) {
     }
 }
 
-/// 「删过了」的墓碑段（落盘，重启也黏着）。
-///
-/// 真机删了就是删了：`removeAllUidKey` / `removeAuthKey` 之后，后面的 `export*` 不能
-/// 现造一把新的顶上 —— 我们的实现在那之前就是“要就现生成”，于是删完还能导出，
-/// 跟真机不一样（检测器就测这个）。键：`ask:<uid>` / `auth:<uid>|<alias>`。
+/// 「删过了」的墓碑段（落盘，重启也黏着）：`removeAllUidKey` / `removeAuthKey` 之后，
+/// 后面的 `export*` 不能现造一把顶上。键：`ask:<uid>` / `auth:<uid>|<alias>`。
 const GONE_SECTION: &str = "gone";
 
 fn mark_gone(key: &str) {
@@ -496,9 +470,7 @@ fn forget_uid_keys(uid: i32) {
     }
 }
 
-/// 测试用：把本地兜底的内存态和 store 全部清掉，让“这把钥匙还没建”这类前提
-/// 在重复跑时也成立。真机上手动重跑测试时，上一遍留下的 ASK/AuthKey/墓碑会把
-/// 断言带偏（典型：期望 -6 拿到 0）。
+/// 测试用：把本地兜底的内存态和 store 全清掉，让「这把钥匙还没建」这类前提在重复跑时也成立。
 #[cfg(test)]
 pub(crate) fn reset_local_state_for_test() {
     if let Some(state) = state() {
@@ -521,7 +493,7 @@ pub(crate) fn reset_local_state_for_test() {
     let _ = std::fs::remove_file(ask_store_path());
 }
 
-/// ATTK 文件的 mtime。换文件（WebUI 写新的、用户手放）时靠它判断要不要重读。
+/// ATTK 文件的 mtime，用来判断要不要重读。
 static ATTK_STAMP: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
 
 fn attk_stamp() -> Option<std::time::SystemTime> {
@@ -542,10 +514,8 @@ fn current_attk() -> Option<Key> {
         if let Some((key, origin)) = load_attk_key() {
             *cached = key.clone();
             *known = stamp;
-            // ATTK 换了 = 新身份。内存里缓存的 ASK / AuthKey / counter / 「已建过 ASK」
-            // 全是拿旧 ATTK 签的，不清的话宿主会继续拿旧链应答（本地验得过、服务端不认，
-            // 典型表现就是「不重启就能用、一重启就不行」）。磁盘 store 那边有指纹校验会
-            // 自己作废，这里把内存这一半补齐。
+            // ATTK 换了 = 新身份：内存里的 ASK / AuthKey / counter / 已建 ASK 全是旧链，
+            // 必须清（磁盘 store 那边有指纹校验会自己作废）。
             if let Ok(mut map) = state.asks.lock() {
                 map.clear();
             }
@@ -580,10 +550,7 @@ fn ask_existing(state: &State, uid: i32) -> Option<Key> {
     Some(key)
 }
 
-/// 取（必要时造）某个 uid 的 ASK。
-///
-/// 真机的形状是一把 ATTK 下挂 N 把 ASK、每个 uid 一把，这里照做：
-/// 先看内存，再按 uid 读文件，再兼容旧的全局文件，最后现生成一对并落盘。
+/// 取（必要时造）某个 uid 的 ASK：先看内存，再读 store / 旧文件，最后现生成并落盘。
 fn ask_for(state: &State, uid: i32) -> Option<Key> {
     if let Some(key) = state.asks.lock().ok()?.get(&uid).cloned() {
         return Some(key);
@@ -603,8 +570,7 @@ fn ask_for(state: &State, uid: i32) -> Option<Key> {
     Some(key)
 }
 
-/// 读某个 uid 的 ASK：环境变量 → 单文件 store → 旧的 per-uid 文件（读到就迁走）→
-/// 旧的全局文件 → 现生成并写进 store。
+/// 读某个 uid 的 ASK：store → 旧的 per-uid 文件（读到就迁走）→ 现生成并写进 store。
 fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
     if let Some(pem) = read_store_pem(ASK_SECTION, &uid.to_string()) {
         match Key::from_pem(&pem) {
@@ -639,8 +605,7 @@ fn load_or_generate_ask(uid: i32) -> Option<(Key, String)> {
     generate_ask_for(uid)
 }
 
-/// 给某个 uid 现生成一把 ASK，写进 [`ASK_STORE_PATHS`] 的单文件 store。
-/// 落盘失败时只留在内存里，并告警。
+/// 给某个 uid 现生成一把 ASK 并写进 store；落盘失败就只留内存里，并告警。
 fn generate_ask_for(uid: i32) -> Option<(Key, String)> {
     let key = Key::generate()?;
     let private_pem = key.private.to_pkcs8_pem(LineEnding::LF).ok()?;
@@ -684,10 +649,8 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// 一台"看起来像真机"的设备号：`09000000` + 12 字节十六进制。
-///
-/// 两个真实来源：daemon 写下的那份文件，或按本机真实序列号现派生；一个都拿不到就
-/// 是空串（不编号，本地这条路也就不答，见 [`answer`]）。
+/// 一台"看起来像真机"的设备号：平台前缀 + 12 字节十六进制。
+/// 两个来源：daemon 写下的文件，或按本机序列号现派生；都拿不到就是空串（本地这条路不答）。
 pub(crate) fn device_id() -> String {
     cpu_id()
 }
@@ -695,12 +658,10 @@ pub(crate) fn device_id() -> String {
 /// 本地兜底报的 cpu_id。
 ///
 /// 1. `soter_cpu_id.force`：这份 ATTK 自带的号；
-/// 2. 本机序列号派生：本地 ATTK 是现造的，身份就是这台机器。
+/// 2. 本机序列号派生（本地 ATTK 是现造的，身份就是这台机器）。
 ///
-/// 不读 `/data/misc/ommega/soter_cpu_id`（那是转发链路学来的 B 端号）。序列号在部分域
-/// 读不到，这时用 [`LOCAL_CPU_ID_PATH`] 那份缓存。
-///
-/// 一个来源都拿不到就报空串：这层宁可不答，也不编一个号（编出来的一眼假）。
+/// 不读 `/data/misc/ommega/soter_cpu_id`（那是转发链路学来的 B 端号）；序列号在部分域
+/// 读不到时用 [`LOCAL_CPU_ID_PATH`] 那份缓存。都拿不到就报空串，不编造。
 fn cpu_id() -> String {
     let forced = std::fs::read_to_string(CPU_ID_OVERRIDE).ok();
     let derived = device_info().derived_cpu_id.as_deref();
@@ -760,10 +721,8 @@ extern "C" {
     fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
 }
 
-/// 读一条系统属性。
-///
-/// 走 `getprop` 命令：payload 里 `__system_property_get` 拿不到值。app 域（SOTER 宿主）
-/// 连 fork 都会被拒，那种进程只能靠 [`LOCAL_CPU_ID_PATH`] 的缓存，见 [`cpu_id`]。
+/// 读一条系统属性（走 `getprop`：payload 里 `__system_property_get` 拿不到值）。
+/// app 域连 fork 都会被拒，那种进程只能靠 [`LOCAL_CPU_ID_PATH`] 的缓存。
 #[cfg(target_os = "android")]
 pub(crate) fn prop(name: &str) -> Option<String> {
     let output = std::process::Command::new("/system/bin/getprop")
@@ -777,7 +736,7 @@ pub(crate) fn prop(name: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// 非 Android（开发机上 `cargo check` 这种）读不到属性，一律当没有，走兜底值。
+/// 非 Android（开发机上 `cargo check`）读不到属性，一律当没有，走兜底值。
 #[cfg(not(target_os = "android"))]
 fn prop(_name: &str) -> Option<String> {
     None
@@ -785,8 +744,7 @@ fn prop(_name: &str) -> Option<String> {
 
 /// 这台机器的 SOTER 设备信息。属性只读一次，之后复用。
 struct DeviceInfo {
-    /// 按本机真实序列号派生的号，`09000000` + 12 字节十六进制。
-    /// 本地这条路报的就是它（除非这份 ATTK 自带一个 force 号）；序列号读不到就是 `None`。
+    /// 按本机真实序列号派生的号（平台前缀 + 12 字节十六进制）；序列号读不到就是 `None`。
     derived_cpu_id: Option<String>,
     fp_n: String,
     fp_v: String,
@@ -817,8 +775,7 @@ fn device_info() -> &'static DeviceInfo {
     })
 }
 
-/// 一台像真机的设备号：平台前缀（高通 `00000000` / MTK `09000000`）+ 12 字节十六进制。
-/// 只拿真实序列号算，没有就不算。
+/// 一台像真机的设备号：平台前缀（高通 `00000000` / MTK `09000000`）+ 12 字节十六进制，只拿真实序列号算。
 fn cpu_id_from(serial: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -832,8 +789,7 @@ fn cpu_id_from(serial: &str) -> String {
     out
 }
 
-/// 指纹 id。真值在 TA 里，本地拿不到 —— 按本机派生一个稳定的十进制串，形状跟真机
-/// 一致（B 端是 `3650688678` 这种十位）。
+/// 指纹 id：真值在 TA 里拿不到，按本机派生一个稳定的十位十进制串。
 fn fid_from(serial: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -844,8 +800,7 @@ fn fid_from(serial: Option<&str>) -> String {
     (1_000_000_000u64 + n as u64).to_string()
 }
 
-/// 指纹厂商。厂商名归一成原厂那几种拼法（真机上就是 `FPC` / `Goodix` 这种），
-/// 认不出来就用平台默认 —— 不要报 `unknown`，那跟报自己名字一个性质：一眼壳。
+/// 指纹厂商，归一成原厂那几种拼法；认不出来就用平台默认。不能报 `unknown`（一眼壳）。
 fn fingerprint_name() -> String {
     if prop("ro.vendor.feature.zte_fingerprint_default_goodix_g7_aidl").is_some()
         || prop("ro.vendor.feature.zte_fingerprint_default_goodix_gf96xx_g7_cali").is_some()
@@ -897,22 +852,18 @@ fn tee_version() -> String {
     platform().tee_v.to_string()
 }
 
-/// 后端给出来的一笔应答。
-///
-/// 三个分支跟 HAL 的方法签名一一对应，别混：形状错了宿主解出来的是垃圾。
+/// 后端给出来的一笔应答。三个分支跟 HAL 的方法签名一一对应，别混：形状错了宿主解出来的是垃圾。
 pub(crate) enum Answer {
     /// 只有返回值的那些 op（generate* / has* / remove*）。
     Code(i32),
-    /// 签名里带 `out SoterBufferReturn` 的那些（exportXxxPublicKey / finishSign /
-    /// getDeviceId）：返回值加一份数据。`data` 为 `None` 就是「这个 out 是空的」，
-    /// 那 4 字节非空标记写 0 —— 形状不能省。
+    /// 带 `out SoterBufferReturn` 的那些（exportXxxPublicKey / finishSign / getDeviceId）：
+    /// 返回值加一份数据。`data` 为 `None` 时那 4 字节非空标记写 0，形状不能省。
     Buffer { code: i32, data: Option<Vec<u8>> },
     /// `initSign` 的回复，它返回的是 `SoterInitReturn`（status + session）。
     Init { status: i32, session: i64 },
 }
 
-/// 本地后端实现了的 HAL 号码：2 / 6 / 14。
-/// 2 / 6 / 14 是产线 provisioning，工程模式的 SOTER key 走 14 号。
+/// 本地后端实现了的 HAL 号码（1..14 全部）。
 pub(crate) const HANDLED_CODES: [u32; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
 /// 这个号码本地有没有实现。参数不够时 `answer` 仍返回 `None`，由上层透给真 HAL。
@@ -920,10 +871,8 @@ pub(crate) fn answerable(code: u32) -> bool {
     HANDLED_CODES.contains(&code)
 }
 
-/// 这个会话号是不是本进程开的。
-///
-/// `initSign` 那笔要是服务端说「你本地答」（白名单外的检测器一类），会话就存在这里；
-/// 那 `finishSign` 也必须回来本地答 —— 去问远程就是 B 端不认识这个句柄，直接回 -204。
+/// 这个会话号是不是本进程开的：本进程开的 `initSign`，它对应的 `finishSign` 也必须本地答
+/// （问远程就是 B 端不认识这个句柄，直接回 -204）。
 pub(crate) fn has_session(session: i64) -> bool {
     state()
         .and_then(|state| {
@@ -935,13 +884,11 @@ pub(crate) fn has_session(session: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// 按号码算一笔应答。认不出来、或者少参数就返回 `None`，让上层透给真 HAL。///
-/// 只处理 HAL 那半边（`call.hal`）：App 面向那半边是宿主自己的事，它会把我们的
-/// 结果原样包成 `SoterExportResult` 递给 App，不用我们操心。
+/// 按号码算一笔应答。认不出来、或少参数就返回 `None`，让上层透给真 HAL。///
+/// 只处理 HAL 那半边（`call.hal`）：App 面向那半边由宿主自己包成 `SoterExportResult` 给 App。
 pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
     let result = answer_inner(call);
-    // 记一笔应答。光看「调用进去了」不够 —— 得知道它回来了什么，
-    // 才能分清是没答（透传）还是答错（形状/码不对）。`data` 只记长度，不刷字节。
+    // 记一笔应答：得知道它回来了什么，才能分清是没答（透传）还是答错。`data` 只记长度。
     match &result {
         Some(Answer::Code(code)) => {
             log::info!("event=soter local answer op={} code={}", call.code, code)
@@ -978,8 +925,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
     if !call.hal {
         return None;
     }
-    // 产线 provisioning 三兄弟最先处理：不碰本机身份、也不建钥匙，跟 cpu_id 那条
-    // 前置检查无关（工程模式跑在 vendor 域，那份 cpu_id 文件它常常读不到）。
+    // 产线 provisioning 三兄弟最先处理：不碰本机身份、也不建钥匙，所以不用过 cpu_id 前置检查
+    // （工程模式跑在 vendor 域，那份 cpu_id 文件它常常读不到）。
     match call.code {
         14 => return Some(Answer::Code(OK)),
         6 => return Some(Answer::Code(OK)),
@@ -998,8 +945,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         ));
         return None;
     };
-    // 没有任何真实来源（daemon 那份没读到、本机序列号也读不到）时，这台机器没有可报的
-    // 身份。不许编一个（编出来的号在业务侧一眼假），这一笔干脆不答，让上层去透传。
+    // 没有任何真实身份来源（daemon 那份没读到、序列号也读不到）时这一笔不答，让上层透传。
+    // 不许编一个（编出来的号在业务侧一眼假）。
     if cpu_id().is_empty() {
         log::warn!("event=soter local has no real cpu_id; not answering this call locally");
         crate::ipc::report_event(format!(
@@ -1013,7 +960,6 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         1 => {
             let uid = call.uid?;
             // 有料就导出；没料但墓碑在就不现造（真机删了就是删了）。
-            // 存在性与导出同源：两边都只看料和墓碑。
             let ask = match ask_existing(state, uid) {
                 Some(key) => Some(key),
                 None if is_gone(&ask_gone_key(uid)) => None,
@@ -1055,8 +1001,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             clear_gone(&ask_gone_key(uid));
             let counter = bump_counter(state, uid);
             let document = auth_json(&key, uid, counter);
-            // 这层必须用 **该 uid 的 ASK** 签：App 手里只有这个 uid 的 ASK 公钥。
-            // （ASK 自己那一层才是 ATTK 签的，两者别搞混。）
+            // 这层必须用 **该 uid 的 ASK** 签：App 手里只有这个 uid 的 ASK 公钥
+            //（ASK 自己那一层才是 ATTK 签的）。
             let signature = ask_for(state, uid)?.sign(&document)?;
             Some(Answer::Buffer {
                 code: OK,
@@ -1067,10 +1013,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 拿 AuthKey 签，回「JSON + 签名」的信封。
         4 => {
             let session = call.session?;
-            // 先取授权 key，确认拿得到再摘会话。反过来做的话，auth_key 这次失败
-            // （store 临时读不到 / PEM 坏了）会话就已经从表里没了，宿主拿同一个
-            // session 重试也找不到，这一轮签名直接失败且不可重试。
-            // 会话过期了就顺手从表里抹掉；调用方对不上的不动它（那可能是别人正在用的号）。
+            // 先取授权 key、确认拿得到再摘会话（反过来做的话 store 一失败会话就没了、不可重试）。
+            // 过期的会话顺手抹掉；调用方对不上的不动它。
             let peeked = state.sessions.lock().ok()?.get(&session).cloned();
             if peeked
                 .as_ref()
@@ -1092,16 +1036,12 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                         data: Some(envelope(&document, &signature)),
                     })
                 }
-                // 本地没这个会话：说明 initSign 是托管端落的号，这边的会话表里压根没有。
-                // 回 -1000 会让「远端建会话、本地收尾」那条路永远签不成（检测器的
-                // T12 就是这么挂的），得退回去让上层转给托管端。
+                // 本地没这个会话：initSign 是托管端落的号，得透出去让上层转给托管端（回 -1000 就永远签不成）。
                 None => None,
             }
         }
-        // generateAskKeyPair(uid) 按平台分两种：
-        //   高通：每次重铸、回 0；MTK：已有就回 -5、不重铸。
-        // MTK 只在本会话建过/碰过（`ask_built`）后才回 -5：9 号在上报之前一直答“没有”，
-        // 5 号也直接 -5 的话应用会「问→没有→建→-5→删→再问」锁死。
+        // generateAskKeyPair(uid)：高通每次重铸回 0；MTK 已有则回 -5。
+        // MTK 只在本会话建过/碰过（`ask_built`）后才回 -5，否则应用会「问→没有→建→-5→删」锁死。
         // counter 不能重置 —— 回退会被 App 当重放。
         5 => {
             let uid = call.uid?;
@@ -1141,27 +1081,23 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 return Some(Answer::Code(NOT_FOUND));
             }
             let key = Key::generate()?;
-            // 落盘：真机的 AuthKey 重启还在，我们也不能只吊在内存里。
+            // 落盘：真机的 AuthKey 重启还在。
             if let Ok(private_pem) = key.private.to_pkcs8_pem(LineEnding::LF) {
                 store_pem(AUTH_SECTION, &auth_id(uid, alias), &private_pem);
             }
             state.auth.lock().ok()?.insert(auth_id(uid, alias), key);
             Some(Answer::Code(OK))
         }
-        // getDeviceId()
-        //
-        // 真机回 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（33 字节），不是 16 字节二进制；
-        // 形状要跟真机一致。
+        // getDeviceId()：真机回 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（33 字节，MTK）或
+        // 16 字节二进制（高通），形状要跟真机一致。
         8 => Some(Answer::Buffer {
             code: OK,
             data: Some(device_id_reply(&device_id())),
         }),
-        // hasAskAlready(uid) 必须答「没有」：本地 ASK 是自签的，腾讯不认；而应用只在
-        // 「没有 ASK」时才上报。答「有」会让它跳过上报、拿假 ASK 建 AuthKey → 被拒 → 自删重试。
+        // hasAskAlready(uid)：本地 ASK 是自签的，答「有」会让应用跳过上报、拿假 ASK 建 AuthKey
+        // → 被拒 → 自删重试。
         9 => {
-            // 本地这把 ASK 一直在（内置或自定义），「这个 uid 有没有料」就看内存/盘上
-            // 真有没有，不能只看本会话建没建过：只看 `ask_built` 会出现「答没有、但
-            // 导出却有料」的反向不一致，检测器那边同样是 keyPrep 失败。
+            // 看内存/盘上真有没有，不能只看 `ask_built`（会出现「答没有、但导出却有料」的不一致）。
             let uid = call.uid?;
             Some(Answer::Code(if ask_exists(state, uid) {
                 OK
@@ -1190,8 +1126,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             *next += 1;
             let session = *next;
             {
-                // 没走完成功的 initSign 会话不会自己消失（探测机、App 中退、进程被杀），
-                // 不清就只增不减。清了最多让那次签名重来，不会弄错任何数据。
+                // 未完成的会话不会自己消失（探测机、App 中退、进程被杀），不清就只增不减。
+                // 清了最多让那次签名重来，不会弄错数据。
                 let mut sessions = state.sessions.lock().ok()?;
                 if sessions.len() >= MAX_SIGN_SESSIONS {
                     // 先清过期的，还超才整表清。
@@ -1216,8 +1152,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 session,
             })
         }
-        // removeAllUidKey(uid) —— 连同该 uid 的 ASK 一起删（ASK 是 per-uid 的），
-        // 下次 9 号就答「没有」，App 重建料并重新上报。
+        // removeAllUidKey(uid)：连同该 uid 的 ASK 一起删（ASK 是 per-uid 的），下次 9 号答「没有」。
         12 => {
             let uid = call.uid?;
             let prefix = format!("{uid}|");
@@ -1251,10 +1186,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
     }
 }
 
-/// 产线 provisioning（2 号 `exportAttkPublicKey`）要的那份 ATTK 自描述：
-/// `pub_key` 就是 ATTK 的公钥，签名用 ATTK 自己那把私钥 —— 真机上 ATTK 是这条链的根，
-/// 它自签、ATTK 再签 ASK。注意这跟 1 号（ASK 证书）不是同一份东西：1 号的 `pub_key`
-/// 是该 uid 的 ASK。
+/// 产线 provisioning（2 号 `exportAttkPublicKey`）要的 ATTK 自描述：`pub_key` 是 ATTK 自己，
+/// 签名也用 ATTK 私钥（链的根，它自签）。跟 1 号不同：1 号的 `pub_key` 是该 uid 的 ASK。
 pub(crate) fn ask_public_document(uid: i32) -> Vec<u8> {
     let Some(state) = state() else {
         return Vec::new();
@@ -1276,9 +1209,8 @@ fn auth_id(uid: i32, alias: &str) -> String {
     format!("{uid}|{alias}")
 }
 
-/// 这个 uid 的 ASK 在不在（内存缓存或盘上那份都算）。
-///
-/// 给 `generateAskKeyPair` 用：真机对“已经有 ASK”的请求回 -5，不重铸。
+/// 这个 uid 的 ASK 在不在（内存缓存或盘上那份都算）。给 `generateAskKeyPair` 用：
+/// 真机对已有 ASK 的请求回 -5，不重铸。
 fn ask_exists(state: &State, uid: i32) -> bool {
     if state
         .asks
@@ -1291,8 +1223,7 @@ fn ask_exists(state: &State, uid: i32) -> bool {
     read_store_pem(ASK_SECTION, &uid.to_string()).is_some()
 }
 
-/// 取某个 uid 的 AuthKey。内存里没有（payload 重新注入过）就从 store 读回来，
-/// 读到了缓进内存，下次不用再碰磁盘。
+/// 取某个 uid 的 AuthKey；内存里没有（payload 重新注入过）就从 store 读回来并缓存。
 fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
     let id = auth_id(uid, alias);
     if let Some(key) = state.auth.lock().ok()?.get(&id).cloned() {
@@ -1313,9 +1244,7 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
 
 fn bump_counter(state: &State, uid: i32) -> u64 {
     // counter 必须单调递增、重启不能回退：App 记着上次看到的值，小回去就当重放删钥匙。
-    //
-    // 所有 App 共用一个文件（每行 `uid=counter`），读-改-写放在文件锁里：injector 同时跑在
-    // keystore 和 SOTER 宿主几个进程里，不加锁会互相覆盖。
+    // 所有 App 共用一个文件（每行 `uid=counter`），读-改-写放在文件锁里（几个进程共用）。
     const PATH: &str = "/data/misc/ommega/soter_counter";
 
     let mem = state
@@ -1336,22 +1265,21 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            // 文件里没这个 uid 就从 1 开始：换 ATTK 就是新身份（新 ASK、新 cpu_id），
-            // App 侧开通状态也一并清了，1 是正确起点；不接内存里的旧值。
+            // 文件里没这个 uid 就从 1 开始（换 ATTK = 新身份），不接内存里的旧值。
             let next = match counter_for(&text, uid) {
                 Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
                 None => COUNTER_BASE,
             };
             let updated = set_counter(&text, uid, next);
             let _ = file.seek(SeekFrom::Start(0));
-            // 先写后截。反过来（先 set_len(0)）的话，write_all 一旦失败（ENOSPC/EDQUOT）
-            // 文件就空了，所有 uid 的计数一起丢，下轮全部从 1 开始，日志里还看不出。
+            // 先写后截：反过来一旦 write_all 失败（ENOSPC/EDQUOT）文件就空了，
+            // 所有 uid 的计数一起丢，下轮全部从 1 开始。
             if file.write_all(updated.as_bytes()).is_ok() {
                 let _ = file.set_len(updated.len() as u64);
             }
             next
         }
-        // 开不了文件（权限异常）：只能拿内存里的值兜一下，至少不回退到比本进程见过的更小。
+        // 开不了文件（权限异常）：拿内存值兜一下，至少不回退。
         Err(_) => mem.max(COUNTER_BASE) + 1,
     };
 
@@ -1394,8 +1322,7 @@ fn set_counter(text: &str, uid: i32, value: u64) -> String {
     out
 }
 
-/// 包 SOTER 的信封：`[i32 le JSON 长度][JSON][签名]`。三处回信封的地方都走它，
-/// 字节序跟真机一致（小端）。
+/// 包 SOTER 的信封：`[i32 le JSON 长度][JSON][签名]`（小端，跟真机一致）。
 fn envelope(document: &[u8], signature: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + document.len() + signature.len());
     out.extend_from_slice(&(document.len() as i32).to_le_bytes());
@@ -1417,22 +1344,15 @@ fn auth_json(key: &Key, uid: i32, counter: u64) -> Vec<u8> {
     .into_bytes()
 }
 
-/// 签名现场那份 JSON。字段名和键序照真机：`raw` 在最前，一个字段都不能少 ——App 会
-/// 把它们存下来当设备指纹。形状按平台分：
-///
-/// | | 高通 | MTK |
-/// |---|---|---|
-/// | `cpu_id` | `00000000…` | `09000000…` |
-/// | `getDeviceId` | 16 字节 raw | 32 个 ASCII hex + NUL |
-/// | 盐长字段 | 无 | `rsa_pss_saltlen:32` |
-/// | 已有料时 `generate` | 重铸、回 0 | 回 -5、不重铸 |
+/// 签名现场那份 JSON。字段名和键序照真机：`raw` 在最前，一个字段都不能少（App 拿它当设备指纹）。
+/// 平台差异见 [`platform`]。
 struct Platform {
     cpu_prefix: &'static str,
     device_id_ascii: bool,
     declares_salt: bool,
     generate_rotates: bool,
     /// 签名文档（`sign_json`）里报的 TEE / 指纹身份：真机上这四格是 TA 报的原厂值，
-    /// 本地拿不到真值时就按平台报原厂那套，别写我们自己的名字和版本。
+    /// 本地拿不到真值就报平台那套，不写自己的名字和版本。
     tee_n: &'static str,
     tee_v: &'static str,
     fp_n: &'static str,
@@ -1473,7 +1393,7 @@ fn platform() -> &'static Platform {
     })
 }
 
-/// 一份自描述文档的尾巴：盐长字段（高通那套不放这个字段，验签方按默认的摘要长度 32 算）。
+/// 一份自描述文档的尾巴：盐长字段（高通那套不放，验签方按默认的摘要长度算）。
 fn salt_field() -> String {
     if platform().declares_salt {
         format!(",\"rsa_pss_saltlen\":{SALT_LEN}")
@@ -1501,7 +1421,7 @@ fn sign_json(uid: i32, raw: &str, counter: u64) -> Vec<u8> {
 }
 
 /// ASK 那份 JSON。键序照现场抓到的来，`uid` 是字符串别写成数字。
-/// `pub_pem` 是 **ASK 自己的公钥**（可能是独立的一把，也可能是 ATTK）。
+/// `pub_pem` 是 **ASK 自己的公钥**（也可能是 ATTK）。
 fn ask_json(pub_pem: &str, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
     let document = format!(
         "{{\"pub_key\":{},\"cpu_id\":\"{}\",\"counter\":{},\"uid\":\"{}\"{}}}",
@@ -1670,8 +1590,7 @@ mod tests {
         assert!(answer(&c).is_none(), "only the HAL side is ours to answer");
     }
 
-    /// 2 号（exportAttkPublicKey）现在由我们自己答（产线 provisioning 三兄弟之一），
-    /// 不再透传；只有真没实现的号才交给真 HAL。
+    /// 2 号（exportAttkPublicKey）由我们自己答；只有真没实现的号才交给真 HAL。
     #[test]
     fn unimplemented_codes_fall_through_to_the_real_hal() {
         assert!(
@@ -1704,13 +1623,13 @@ mod tests {
     fn device_id_answer_follows_the_platform_shape() {
         let data = as_buffer(answer(&call(8, None, None)));
         if platform().device_id_ascii {
-            // MTK（实测 MT6991）：33 字节 = 32 个 ASCII hex + `\0`。
+            // MTK：33 字节 = 32 个 ASCII hex + `\0`。
             assert_eq!(data.len(), 33);
             assert_eq!(&data[..32], device_id().as_bytes());
             assert_eq!(data[32], 0, "末尾那个字节是 NUL");
             assert!(data[..32].iter().all(|b| b.is_ascii_hexdigit()));
         } else {
-            // 高通（实测 SM8635）：16 字节 raw，hex 出来就是 cpu_id。
+            // 高通：16 字节 raw，hex 出来就是 cpu_id。
             assert_eq!(data.len(), 16);
             let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(hex, device_id());
@@ -1852,8 +1771,7 @@ mod tests {
 
     #[test]
     fn finish_sign_with_an_unknown_session_falls_through() {
-        // 不认识的会话号不能本地硬回 -1000：那可能正是托管端落的号，
-        // 得放行出去让它接着答。
+        // 不认识的会话号不能本地硬回 -1000：那可能正是托管端落的号，得放行。
         let mut c = call(4, None, None);
         c.session = Some(1);
         assert!(answer(&c).is_none());
@@ -1908,8 +1826,7 @@ mod tests {
         let (document, signature) = split_envelope(&envelope);
         let text = String::from_utf8(document.clone()).unwrap();
 
-        // 字段名和键序照真机抓的来；盐长那格只有声明盐的platform（MTK 那套）才有，
-        // 高通机型上这份文档根本没有 rsa_pss_saltlen，不能硬要求。
+        // 字段名和键序照真机抓的来；盐长那格只有 MTK 那套才有，高通机型不能硬要求。
         let mut keys = vec!["pub_key", "cpu_id", "counter", "uid"];
         if platform().declares_salt {
             keys.push("rsa_pss_saltlen");
@@ -1930,8 +1847,7 @@ mod tests {
         );
     }
 
-    /// 2 号（exportAttkPublicKey）的 ATTK 自描述：`pub_key` 就是 ATTK，签名也是 ATTK 自己。
-    /// 拿 ATTK 公钥验得过，拿这个 uid 的 ASK 公钥验不过。
+    /// 2 号（exportAttkPublicKey）的 ATTK 自描述：`pub_key` 是 ATTK，签名也是 ATTK 自己。
     #[test]
     fn the_attk_certificate_is_self_signed() {
         let uid = 6401;
@@ -1955,8 +1871,7 @@ mod tests {
         );
     }
 
-    /// 本地兜底也跟着 uid 分家（跟真机 TA 一样）：
-    /// 机主 10490 和工作资料 1010490 是两个槽位，ASK 两把、AuthKey 各管各的。
+    /// 本地兜底也跟着 uid 分家（跟真机 TA 一样）：机主与工作资料是两个槽位。
     #[test]
     fn local_material_is_per_uid() {
         let (owner, work_profile) = (10490, 1_010_490);
@@ -2045,8 +1960,7 @@ mod tests {
         }
     }
 
-    /// 删过了就是删过了：`removeAllUidKey` / `removeAuthKey` 之后 `export*` 不能现造
-    /// 一把新的顶上（真机的删除是黏的，检测器就测这个）。
+    /// 删过了就是删过了：`removeAllUidKey` / `removeAuthKey` 之后 `export*` 不能现造一把顶上。
     #[test]
     fn a_deleted_key_does_not_grow_back() {
         let uid = 4801;
@@ -2096,8 +2010,7 @@ mod tests {
         assert!(!info.fp_v.is_empty());
         assert!(!info.tee_n.is_empty());
         assert!(!info.tee_v.is_empty());
-        // 这四格是检测器（SoterChecker C8）直接摊给人看的，只能像原厂报的那样：
-        // 不能出现我们自己的名字、版本号，也不要 `unknown` 这种一看就是壳的占位。
+        // 这四格是检测器直接摊给人看的：只能是原厂拼法，不能有我们自己的名字/版本/`unknown`。
         for value in [&info.tee_n, &info.tee_v, &info.fp_n, &info.fp_v] {
             assert!(
                 !value.eq_ignore_ascii_case("unknown"),
@@ -2121,8 +2034,7 @@ mod tests {
         assert!(info.fid.chars().all(|c| c.is_ascii_digit()));
     }
 
-    /// 本地这条路的号只认两份：这份 ATTK 自带的那份（force 文件）、本机派生那份。
-    /// 转发链路学来的 B 端真机号**不参与** —— 那是另一份身份的数字。
+    /// 本地这条路的号只认两份：ATTK 自带的 force 号、本机派生号；B 端学来的号不参与。
     #[test]
     fn the_local_cpu_id_belongs_to_the_local_identity() {
         let forced = "090000005171734c42866bea148b21f5";
