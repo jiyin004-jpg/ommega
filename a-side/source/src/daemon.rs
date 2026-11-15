@@ -356,6 +356,11 @@ fn sync_aaid_table() -> bool {
         return false;
     };
     let entries = package_entries();
+    // 包名 → 条目：直接查表，不要在每行上线性扫一遍。
+    let by_package: std::collections::HashMap<&str, &PackageEntry> = entries
+        .iter()
+        .map(|entry| (entry.package.as_str(), entry))
+        .collect();
     let mut body =
         String::from("# uid package versionCode sigDigest  (from packages.list + APK)\n");
     let mut count = 0usize;
@@ -368,7 +373,7 @@ fn sync_aaid_table() -> bool {
         else {
             continue;
         };
-        let entry = entries.iter().find(|entry| entry.package == name);
+        let entry = by_package.get(name).copied();
         let version = entry.map(|entry| entry.version).unwrap_or(1);
         let digest = entry
             .and_then(|entry| signing_cert_digest(&entry.apk))

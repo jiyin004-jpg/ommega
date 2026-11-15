@@ -1,6 +1,6 @@
 use std::mem::size_of;
 
-use log::info;
+use log::debug;
 
 mod native;
 
@@ -256,7 +256,8 @@ pub(crate) fn _ioc_size(cmd: u32) -> usize {
 }
 
 pub(crate) unsafe fn log_write_transaction(command_name: &str, tr: &binder_transaction_data) {
-    info!(
+    // 每笔出站事务都走这里，只用 debug 级。
+    debug!(
         "<<< {} | target: {}, code: 0x{:x}, flags: 0x{:x}{}{}, data_size: {}, offsets_size: {}, parcel: {}",
         command_name,
         format_target(tr),
@@ -284,14 +285,16 @@ pub(crate) unsafe fn preview_transaction_parcel(tr: &binder_transaction_data) ->
     let preview_len = data_size.min(128);
     let bytes = std::slice::from_raw_parts(buffer, preview_len);
     let mut preview = String::new();
+    let mut n = 0usize;
 
     for byte in bytes {
         for ch in byte.escape_ascii() {
-            if preview.chars().count() >= PARCEL_PREVIEW_CHARS {
+            if n >= PARCEL_PREVIEW_CHARS {
                 preview.push('…');
                 return preview;
             }
             preview.push(ch as char);
+            n += 1;
         }
     }
 
