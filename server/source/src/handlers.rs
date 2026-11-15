@@ -1568,66 +1568,52 @@ fn repair_init_body(body: &Value, uid: i64, alias: &str, challenge: &str) -> Val
     out
 }
 
-/// SOTER 转发：跟认证共用同一套三层链，差别在三层的实现。
-///
-/// 层序（两种模式只差优先级）：physical 是 B 端设备层 → 服务端密钥层(keybox) → 自签层；
-/// serverbox 是服务端密钥层 → B 端设备层 → 自签层。哪层没做成（没物料 / 没能力 / 失败）
-/// 就回退下一层，三层都不行才回错给 A 端。
-///
-/// B 端层在线点名时不换设备；离线点名且没有已登记的会话路由时才按能力和负载选。
-/// finish 保留 init 的实际设备，不在另一台设备上拿同号句柄补签。
-async fn run_soter_task_inner(
-    state: &AppState,
-    body: &Value,
-    a_meta: Option<&crate::auth::TokenMeta>,
-) -> Response {
-    if !body.is_object() {
-        return json_err(StatusCode::BAD_REQUEST, "json object body required");
+/// 入口闸门：同一个 uid 在 100ms 内重复来的 SOTER 请求直接回「本地作答」，不再走
+/// 后面的默认设备归一、会话路由和 DB。探测机（春秋 / 鸭子）每秒几十笔，要的结论是
+/// 固定的 local_only，100ms 内复用没有副作用。
+fn soter_duplicate_gate(state: &AppState, body: &Value) -> Option<Response> {
+    let uid = body.get("uid").and_then(Value::as_i64)?;
+    // 真应用不过这道闸门：它们一轮流程里 ASK / generateAuthKey / export 的间隔经常
+    // 不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」，两边 cpu_id 和钥匙
+    // 对不上。所以先看名单，真应用直接走正常路由。
+    let caller_pkg = body
+        .get(crate::soter_probe::CALLER_PKG_FIELD)
+        .and_then(Value::as_str);
+    if crate::soter_probe::is_listed_real_app(&state.cfg, caller_pkg) {
+        return None;
     }
-    // 入口闸门：同一个 uid 在 100ms 内重复来的 SOTER 请求直接回「本地作答」，不再走
-    // 后面的默认设备归一、会话路由和 DB。探测机（春秋 / 鸭子）每秒几十笔，要的结论是
-    // 固定的 local_only，100ms 内复用没有副作用。
-    if let Some(uid) = body.get("uid").and_then(Value::as_i64) {
-        // 真应用不过这道闸门：它们一轮流程里 ASK / generateAuthKey / export 的间隔经常
-        // 不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」，两边 cpu_id 和钥匙
-        // 对不上。所以先看名单，真应用直接走正常路由。
-        let caller_pkg = body
-            .get(crate::soter_probe::CALLER_PKG_FIELD)
-            .and_then(Value::as_str);
-        if !crate::soter_probe::is_listed_real_app(&state.cfg, caller_pkg) {
-            use std::sync::{LazyLock, Mutex};
-            const GATE_MS: u64 = 100;
-            static LAST_BY_UID: LazyLock<Mutex<std::collections::HashMap<i64, u64>>> =
-                LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            if let Ok(mut gate) = LAST_BY_UID.lock() {
-                let too_soon = gate
-                    .get(&uid)
-                    .is_some_and(|prev| now.saturating_sub(*prev) < GATE_MS);
-                if too_soon {
-                    let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
-                    return Json(json!({
-                        "op": op,
-                        "local_only": true,
-                        "error_code": -1001,
-                    }))
-                    .into_response();
-                }
-                if gate.len() > 4096 {
-                    gate.clear();
-                }
-                gate.insert(uid, now);
-            }
-        }
+    use std::sync::{LazyLock, Mutex};
+    const GATE_MS: u64 = 100;
+    static LAST_BY_UID: LazyLock<Mutex<std::collections::HashMap<i64, u64>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut gate = LAST_BY_UID.lock().ok()?;
+    let too_soon = gate
+        .get(&uid)
+        .is_some_and(|prev| now.saturating_sub(*prev) < GATE_MS);
+    if too_soon {
+        let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+        return Some(
+            Json(json!({
+                "op": op,
+                "local_only": true,
+                "error_code": -1001,
+            }))
+            .into_response(),
+        );
     }
-    // 跟 attest 一个口径，而且同样在入口归一：A 端留空 + 配了默认设备 = 等同于
-    // 它带了那个 id，SOTER 的探测判据、槽位钉子、签名会话路由、写操作跨设备拦截
-    // 看见的 `requested` 都是同一台具体设备。
-    let body = crate::default_device::fill_in_body(crate::default_device::Chain::Soter, body);
-    let body = &body;
+    if gate.len() > 4096 {
+        gate.clear();
+    }
+    gate.insert(uid, now);
+    None
+}
+
+/// 请求字段解析 + 入口那一行日志（uid 拆成 AOSP 那套上下文只在这里用）。
+fn soter_request_meta(body: &Value) -> (&str, &str, String, String) {
     let requested = body.get("device_id").and_then(Value::as_str).unwrap_or("");
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
     let probe_uid = body
@@ -1674,12 +1660,24 @@ async fn run_soter_task_inner(
             iso.label()
         );
     }
+    (requested, op, probe_uid, probe_alias)
+}
 
-    // 探测机（春秋 / 鸭子）的 SOTER 请求不落 B 端，用服务端内置物料就地作答：它们把整套
-    // 流程反复地跑，要的只是「SOTER 能不能用」。判据在 `soter_probe` 里；attest 走另一条路。
-    let uid_arg = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+/// 探针闸门：白名单外的身份类 op 直接告诉 A 端「这笔你自己本地答」；归哪一层由
+/// `soter_probe` 判，这里只负责把结论变成答复，顺带记一笔请求次数。
+async fn soter_probe_gate(
+    state: &AppState,
+    body: &Value,
+    requested: &str,
+    op: &str,
+    probe_uid: &str,
+    probe_alias: &str,
+    uid_arg: Option<i32>,
+    caller_pkg_arg: Option<&str>,
+    session_arg: Option<i64>,
+    session_present: bool,
+) -> Option<Response> {
     let probe_alias_arg = body.get("alias").and_then(Value::as_str);
-    let session_arg = body.get("session").and_then(Value::as_i64);
     // `finish_sign` 只有会话号：它必须回到开会话的那一侧，不能拿“没别名”就判成内置。
     let forced_local = if op == "finish_sign" {
         session_arg
@@ -1689,15 +1687,10 @@ async fn run_soter_task_inner(
     } else {
         false
     };
-    let session_present =
-        op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
     // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`，拿它判
     // 白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId 却退回本地，两个 `cpu_id`
-    // 一撞就是检测器那条 C5b。归哪一层见 `soter_probe::get_device_id_side`（白名单优先，
-    // 其次跟上这笔设备上一笔，最后才本地）。
-    let caller_pkg_arg = body
-        .get(crate::soter_probe::CALLER_PKG_FIELD)
-        .and_then(Value::as_str);
+    // 一撞就是检测器那条 C5b。
+    //
     // 计一笔“包名 → 24 小时请求次数”（页面在 /soter）。必须放在这里而不是等到分支里：
     // 下面这道探针闸门会把探测机直接打回本地，那些也算请求。
     crate::soter_stats::record(caller_pkg_arg.unwrap_or_default());
@@ -1734,17 +1727,57 @@ async fn run_soter_task_inner(
             );
             // 这一笔在 A 端本地答：记下来，`get_device_id` 那笔跟着走，别半路换号。
             crate::soter_probe::note_device_side(requested, crate::soter_probe::Side::Local);
-            return Json(json!({
-                "op": op,
-                "local_only": true,
-                "error_code": -1001,
-            }))
-            .into_response();
+            return Some(
+                Json(json!({
+                    "op": op,
+                    "local_only": true,
+                    "error_code": -1001,
+                }))
+                .into_response(),
+            );
         }
     }
+    None
+}
 
-    let gate_uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
-    let alias_arg = body.get("alias").and_then(Value::as_str);
+/// 这一笔定下来的执行计划：层序、B 端候选、签名会话归属，外加两把服务端密钥的取法。
+struct SoterPlan {
+    /// 能接这笔活的 B（没设备 / 服务端密钥模式 = `None`）。
+    b_target: Option<String>,
+    /// `finish_sign` 那张会话在服务端 mint 层上的归属（`None` = 不是服务端开的）。
+    server_owner: Option<String>,
+    /// 按策略和钉子排好的层序。
+    layers: Vec<String>,
+    /// 整笔请求的截止时刻（设备租约和设备派发都按它）。
+    request_deadline: tokio::time::Instant,
+    /// 服务端密钥模式用哪把 ATTK：身份绑定规则命中的那把 / 控制台指定的兜底那把。
+    rule_attk: Option<i64>,
+    fallback_attk: Option<i64>,
+    /// 槽位上的 uid（钉层、账号计数、会话登记都要它）。
+    uid: Option<i32>,
+    needs_sign: bool,
+}
+
+/// 跨层带出去的现场：B 端这层是不是结构性地做不了、设备层那个原答复、真正干活的设备。
+struct SoterLayerFlags {
+    b_structural: bool,
+    b_error_reply: Option<Value>,
+    served_device: Option<String>,
+}
+
+/// 执行计划：会话路由、写操作拦截、槽位钉层，最后排出层序（任一步定案就提前回）。
+async fn resolve_soter_plan(
+    state: &AppState,
+    body: &Value,
+    requested: &str,
+    op: &str,
+    probe_uid: &str,
+    session_present: bool,
+    gate_uid: Option<i32>,
+    alias_arg: Option<&str>,
+    uid_arg: Option<i32>,
+    caller_pkg_arg: Option<&str>,
+) -> Result<SoterPlan, Response> {
     // 削峰：同一台设备上同一份只读 op（`has_auth_key` / `has_ask_already` / `export_*`）
     // 会被 App 的 SOTER 初始化循环反复问，几秒内答案不会变。命中的前提是上一次**真由这台
     // 设备答出来**（见 `soter_gate`），窗口极短，设备一旦恢复下一笔就问得着。
@@ -1763,7 +1796,7 @@ async fn run_soter_task_inner(
             "soter: op={op} uid={probe_uid} alias={} coalesced (short-TTL window)",
             alias_arg.unwrap_or("-")
         );
-        return Json(hit).into_response();
+        return Err(Json(hit).into_response());
     }
 
     let request_deadline =
@@ -1774,7 +1807,6 @@ async fn run_soter_task_inner(
     let policy = crate::soter_policy::snapshot();
     let server_key_mode = policy.mode == crate::soter_policy::Mode::ServerKey;
     let order_owned = policy.layers();
-    let mut last_error: Option<String> = None;
 
     // B 端这一层有没有能接活的设备，先问一次：没有就是「这层结构性地做不了」，
     // 顺带让下面不用再解析一遍。
@@ -1863,8 +1895,10 @@ async fn run_soter_task_inner(
         None
     };
     if op == "finish_sign" && remembered.is_none() && server_owner.is_none() {
-        return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"}))
-            .into_response();
+        return Err(
+            Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"}))
+                .into_response(),
+        );
     }
 
     // SOTER 的写操作只在 A 端点名的那台设备上做；点名那台接不了就明说，不换设备。
@@ -1897,7 +1931,7 @@ async fn run_soter_task_inner(
              （b_target={:?} requested_online={requested_online}），不换设备、不落兜底层",
             b_target
         );
-        return Json(soter_off_target_reply(op)).into_response();
+        return Err(Json(soter_off_target_reply(op)).into_response());
     }
 
     // `finish_sign` 回来 -204 时的补救在 `repair_clobbered_finish` 里：只拿 `init_sign`
@@ -1917,7 +1951,7 @@ async fn run_soter_task_inner(
     if let (Some(uid), Some(alias)) = (uid, alias_arg) {
         crate::soter_mint::note_owner(requested, uid, alias);
     }
-    let mut layers: Vec<&str> = Vec::with_capacity(order.len());
+    let mut layers: Vec<String> = Vec::with_capacity(order.len());
     if let (false, Some(uid)) = (requested.is_empty(), uid) {
         if let Some(pinned) = crate::soter_mint::pinned_layer(requested, uid) {
             let honour = pinned == "b" || b_target.is_none();
@@ -1929,20 +1963,20 @@ async fn run_soter_task_inner(
             }
             if honour {
                 if let Some(pos) = order.iter().position(|layer| *layer == pinned) {
-                    layers.push(order[pos]);
+                    layers.push(order[pos].to_string());
                     layers.extend(
                         order
                             .iter()
                             .enumerate()
                             .filter(|(i, _)| *i != pos)
-                            .map(|(_, layer)| *layer),
+                            .map(|(_, layer)| (*layer).to_string()),
                     );
                 }
             }
         }
     }
     if layers.is_empty() {
-        layers.extend(order.iter().copied());
+        layers.extend(order.iter().map(|layer| (*layer).to_string()));
     }
     // `get_device_id` 钉回上一笔那一层。ASK 是服务端造料（`keybox` / `self_signed` /
     // `attk`）时这个 op 也必须由同一层答：两边的 `cpu_id` 出自同一套材料，才不会一高一低
@@ -1951,8 +1985,8 @@ async fn run_soter_task_inner(
         if let Some(layer) = crate::soter_probe::server_layer(requested) {
             if let Some(pos) = order.iter().position(|l| *l == layer) {
                 let pinned = order[pos];
-                layers.retain(|l| *l != pinned);
-                layers.insert(0, pinned);
+                layers.retain(|l| l.as_str() != pinned);
+                layers.insert(0, pinned.to_string());
                 tracing::info!(
                     "soter: get_device_id 跟着上一笔的层 {layer} 走（换层 cpu_id 就不一致）"
                 );
@@ -1966,388 +2000,438 @@ async fn run_soter_task_inner(
     // 这个结果就直接 uid 级全清。所以这几个 op 只要 B 端能接就一层都不往下换，宁可这
     // 一笔失败；B 端整层做不了（没有设备）时照旧让下面两层兜底。
     if soter_identity_op(op) && b_target.is_some() {
-        if layers.first() != Some(&"b") {
+        if layers.first().map(|layer| layer.as_str()) != Some("b") {
             tracing::info!(
                 "soter: op={op} uid={probe_uid} 是 ASK 身份类（谁给的 ASK 决定腾讯那边的校验），B 端能接就只走 B"
             );
         }
-        layers = vec!["b"];
+        layers = vec!["b".to_string()];
     }
     if op == "finish_sign" {
         layers.clear();
         if let Some(owner) = finish_owner_layer(remembered.as_deref(), server_owner.as_deref()) {
-            layers.push(owner);
+            layers.push(owner.to_string());
         }
     }
 
-    // B 端这层到底是不是结构性地做不了（没有设备、设备没报 SOTER、TA 结构性报错）。
-    // 只有它成立，服务端那两层接上之后才允许把槽位挪过去。
-    let mut b_structural = b_target.is_none();
-    // 设备层那个失败答复（结构性失败也带着真错误码）。服务端两层都接不了这个槽位的时候
-    // 把它原样还回去 —— 比递一个「钥匙不在这层」的 -5 准得多。
-    let mut b_error_reply: Option<Value> = None;
-    let mut served_device: Option<String> = None;
     // 服务端密钥模式用哪把 ATTK：先看身份绑定规则（用户号 / 完整 uid / 用户内应用号 /
     // 包名）；没命中就交给「请求那台设备」去匹配，最后才用控制台指定的兜底那把。
     let rule_attk = policy.rule_attk(uid_arg, caller_pkg_arg);
     let fallback_attk = policy.attk_id;
+    Ok(SoterPlan {
+        b_target,
+        server_owner,
+        layers,
+        request_deadline,
+        rule_attk,
+        fallback_attk,
+        uid,
+        needs_sign,
+    })
+}
 
-    for &layer in &layers {
-        let result = match layer {
-            "b" => {
-                // uid 级全清是微信自己会打的枪（见 `soter_mint::owner_token` 的注释）。
-                // 真机上这个 uid 只有一个号，清的是自己；我们这里十几个号挤一个 uid，一枪
-                // 下去同 uid 别人的开通记录全废，而私钥只在 TA 里、重建出来是新的，腾讯存的
-                // 公钥对不上。所以槽位上不止一个账号时，这一笔只答成功、不真清。
-                //
-                // 跟在它后面的 `remove_auth_key`（微信逐个删自己的 scene 别名）照常转发。
-                if op == "remove_all_uid_key" {
-                    if let Some(uid) = uid {
-                        let owners = crate::soter_mint::owner_count(requested, uid);
-                        // A 端自愈会带 `force_scope_wipe`：它已经先把应用侧那份
-                        // `soter_status.xml` 删了，就是要把这个槽位清干净重走一遍。
-                        // 这是运营侧看得见的一笔（下面一条 warn），普通请求不能伪造。
-                        let forced = body
-                            .get("force_scope_wipe")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        if forced {
-                            tracing::warn!(
-                                "soter: op=remove_all_uid_key uid={probe_uid} requested={requested} \
-                                 A 端自愈要求真清（槽位上有 {owners} 个账号），放行这一笔"
-                            );
-                        } else if crate::soter_mint::scope_wipe_enabled() && owners >= 2 {
-                            tracing::warn!(
-                                "soter: op=remove_all_uid_key uid={probe_uid} requested={requested} \
-                                 这个槽位上有 {owners} 个账号，uid 级全清会连坐，只答成功不真清 \
-                                 （RELAY_SOTER_SCOPE_WIPE=0 可关掉这条）"
-                            );
-                            return Json(json!({"op": op, "error_code": 0})).into_response();
-                        }
-                    }
-                }
-                let mut lease = if needs_sign {
-                    match b_target.as_deref() {
-                        Some(device) if op == "init_sign" => {
-                            // 抢不到租约也不直接回 -9：那会让 A 端连指纹圈都弹不出来。退成
-                            // 不带租约执行，让 TA 自己顶掉旧会话，收尾交给 -204 补救路径。
-                            let lease = state
-                                .sign_sessions
-                                .acquire(device, requested, request_deadline)
-                                .await;
-                            if lease.is_none() {
-                                tracing::warn!(
-                                    "soter: 设备 {} 的签名租约没抢到，请求 {} 这单不带租约执行",
-                                    device,
-                                    requested
-                                );
-                            }
-                            lease
-                        }
-                        Some(device) => {
-                            // 租约不是这一笔的（会话被顶掉 / 被接管 / 早过期了）也照旧送
-                            // 设备，让它自己回 -204，再由补救路径重开补签；只有同一笔
-                            // finish 已经在收尾时才真拒，免得同一张会话签两遍。
-                            let miss = body
-                                .get("session")
-                                .and_then(Value::as_i64)
-                                .map(|s| state.sign_sessions.finish(device, requested, s, request_deadline));
-                            match miss {
-                                Some(Ok(lease)) => Some(lease),
-                                Some(Err(LeaseMiss::Busy)) => {
-                                    return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response();
-                                }
-                                Some(Err(LeaseMiss::NotOurs)) | None => {
-                                    tracing::warn!(
-                                        "soter: finish 没配上 {} 上属于 {} 的活跃租约，照旧送设备等它自己回 -204",
-                                        device,
-                                        requested
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        // 没有 B 可派（服务端密钥模式、或者这一笔本来就落在服务端那两层）时
-                        // 不能当会话过期：这张会话是服务端自己开的，签名也在服务端本地做，
-                        // 压根不需要 B 的租约。
-                        None if op == "finish_sign" && server_owner.is_none() => {
-                            return Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response()
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                let deadline = lease
-                    .as_ref()
-                    .map(|l| l.deadline.min(request_deadline))
-                    .unwrap_or(request_deadline);
-                let work = async {
-                    if let Some(guard) = lease.as_mut() {
-                        guard.dispatch();
-                    }
-                    match try_b_soter_layer(state, body, requested, b_target.as_deref(), a_meta)
-                        .await
-                    {
-                        Some(mut b) => {
-                            if b.mutation_outcome_unknown(op, b_target.as_deref()) {
-                                if crate::queue::soter_op_needs_sign(op) {
-                                    // init/finish：真说不清（超时、会话被顶、队列没派出去）
-                                    // 时保持原样，不让 App 以为这把钥匙没了。
-                                    return Some(soter_unknown_reply());
-                                }
-                                // generate_*/remove_*：没落在点名那台上就是确定的结论，
-                                // 不管是换台做完了还是压根没派出去。换台做过的更得说清楚 ——
-                                // 那把钥匙其实没动，也不在 A 端这台机器上。
-                                tracing::warn!(
-                                    "soter: op={op} uid={probe_uid} 点名设备 {} 上没做成\
-                                     （device={:?}），回确定码不换层",
-                                    requested,
-                                    b.device
-                                );
-                                return Some(soter_off_target_reply(op));
-                            }
-                            if needs_sign
-                                && b.device.as_deref() == b_target.as_deref()
-                                && b.value.get("error_code").and_then(Value::as_i64) == Some(-9)
-                            {
-                                // B's local active lease rejected init without touching HAL.
-                                // This is a definite result, not unknown dispatch; release
-                                // only our server reservation, never the B active session.
-                                if let Some(guard) = lease.as_mut() {
-                                    guard.completed();
-                                }
-                                return Some(b.value);
-                            }
-                            if needs_sign
-                                && b.value.get("error").is_none()
-                                && b.device.as_deref() != b_target.as_deref()
-                            {
-                                return Some(
-                                    json!({"error_code": -204, "relay_error_kind": "soter_device_mismatch"}),
-                                );
-                            }
-                            b_structural = b.unavailable;
-                            served_device = b.device.clone();
-                            if let Some(reply) = b.hardware_reply.clone() {
-                                b_error_reply = Some(reply);
-                            }
-                            // -204（`SOTER_ERROR_OPERATEID_NULL`）在这台设备上就一个意思：这张
-                            // 会话被后来的一笔 `init_sign` 顶掉了（TA 一台设备只留一个会话）。
-                            // 拿 init 时缓存的参数重开一张、用同一个 challenge 再签一次。
-                            if op == "finish_sign"
-                                && b.value.get("error_code").and_then(Value::as_i64) == Some(-204)
-                            {
-                                match repair_clobbered_finish(
-                                    state,
-                                    body,
-                                    requested,
-                                    b.device.as_deref(),
-                                    a_meta,
-                                )
-                                .await
-                                {
-                                    Ok(Some(fixed)) => b.value = fixed,
-                                    Ok(None) => {}
-                                    Err(()) => return Some(soter_unknown_reply()),
-                                }
-                            }
-                            if op == "finish_sign" {
-                                if let (Some(device), Some(session)) = (
-                                    b.device.as_deref(),
-                                    body.get("session").and_then(Value::as_i64),
-                                ) {
-                                    state.sign_sessions.forget_for(device, requested, session);
-                                }
-                            }
-                            if b.completed_on(b_target.as_deref()) || b.definitely_not_dispatched()
-                            {
-                                if let Some(guard) = lease.as_mut() {
-                                    guard.completed();
-                                }
-                                // Structural HAL failures are wrapped for init fallback,
-                                // but finish must stay on its session's owner layer and
-                                // return the device's actual code, not an unknown verdict.
-                                if op == "finish_sign" {
-                                    if let Some(reply) = b.hardware_reply.take() {
-                                        b.value = reply;
-                                    }
-                                }
-                            } else if needs_sign {
-                                return Some(soter_unknown_reply());
-                            }
-                            if op == "init_sign"
-                                && b.value.get("error_code").and_then(Value::as_i64) == Some(0)
-                            {
-                                let session = b
-                                    .value
-                                    .get("session")
-                                    .and_then(Value::as_i64)
-                                    .filter(|s| *s != 0);
-                                match (session, lease.as_mut()) {
-                                    (Some(session), Some(guard)) => {
-                                        // 记账不是我们就只记一行警告 —— 会话是真的，改口成 -204
-                                        // 会让 App 自删重来一轮（一台设备上多路客户端抢同一张
-                                        // TA 会话是常态）。
-                                        if !guard.retain_session(session) {
-                                            tracing::warn!(
-                                                "soter: init_sign uid={probe_uid} alias={probe_alias} \
-                                                 拿到的会话 {session} 记账时租约已经换人了，照旧回给 App"
-                                            );
-                                        }
-                                    }
-                                    // 答了成功却没有会话号：这张会话在 TA 里根本没建起来，
-                                    // 递上去 App 只会拿到 session=0（微信那边直接判 -204）。
-                                    (None, _) => return Some(json!({"error_code": -204})),
-                                    (Some(_), None) => {}
-                                }
-                            }
-                            Some(b.value)
-                        }
-                        None => None,
-                    }
-                };
-                match tokio::time::timeout_at(deadline, work).await {
-                    Ok(result) => result,
-                    Err(_) if crate::queue::soter_op_is_mutation(op) => {
-                        return Json(soter_unknown_reply()).into_response();
-                    }
-                    Err(_) => return Json(json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_deadline"})).into_response(),
-                }
-            }
-            "keybox" | "self_signed" | "attk" => {
-                // `attk` 层：规则命中的那把优先；finish 必须回到开这张会话的那把 ATTK 上
-                // —— 同一层换一把就是另一套 ASK/AuthKey，拿别的钥匙签回来的会话 App 验不过。
-                let (attk_rule, attk_fallback) = if layer == "attk" {
-                    let rule = if op == "finish_sign" {
-                        session_arg
-                            .and_then(|s| crate::soter_mint::session_attk(requested, s))
-                            .or(rule_attk)
-                    } else {
-                        rule_attk
-                    };
-                    (rule, fallback_attk)
-                } else {
-                    (None, None)
-                };
-                run_layer_soter(state, layer, body, requested, attk_rule, attk_fallback).await
-            }
-            _ => None,
-        };
-        match result {
-            Some(v) if v.get("soter_outcome_unknown").and_then(Value::as_bool) == Some(true) => {
+/// B 端设备层：签名租约、设备派发、超时和结果分类。`Err(reply)` = 这一笔到此为止，
+/// `Ok(result)` = 这层的结论，交给 `apply_soter_layer_result` 判成败。
+async fn run_soter_b_layer(
+    state: &AppState,
+    body: &Value,
+    requested: &str,
+    op: &str,
+    probe_uid: &str,
+    probe_alias: &str,
+    b_target: Option<&str>,
+    a_meta: Option<&crate::auth::TokenMeta>,
+    server_owner: Option<&str>,
+    needs_sign: bool,
+    request_deadline: tokio::time::Instant,
+    uid: Option<i32>,
+    flags: &mut SoterLayerFlags,
+) -> Result<Option<Value>, Response> {
+    // uid 级全清是微信自己会打的枪（见 `soter_mint::owner_token` 的注释）。
+    // 真机上这个 uid 只有一个号，清的是自己；我们这里十几个号挤一个 uid，一枪
+    // 下去同 uid 别人的开通记录全废，而私钥只在 TA 里、重建出来是新的，腾讯存的
+    // 公钥对不上。所以槽位上不止一个账号时，这一笔只答成功、不真清。
+    //
+    // 跟在它后面的 `remove_auth_key`（微信逐个删自己的 scene 别名）照常转发。
+    if op == "remove_all_uid_key" {
+        if let Some(uid) = uid {
+            let owners = crate::soter_mint::owner_count(requested, uid);
+            // A 端自愈会带 `force_scope_wipe`：它已经先把应用侧那份
+            // `soter_status.xml` 删了，就是要把这个槽位清干净重走一遍。
+            // 这是运营侧看得见的一笔（下面一条 warn），普通请求不能伪造。
+            let forced = body
+                .get("force_scope_wipe")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if forced {
                 tracing::warn!(
-                    "soter: op={op} uid={probe_uid} layer={layer} 结果未知（mutation outcome unknown），不落兜底层，原样回给 App"
+                    "soter: op=remove_all_uid_key uid={probe_uid} requested={requested} \
+                     A 端自愈要求真清（槽位上有 {owners} 个账号），放行这一笔"
                 );
-                return Json(v).into_response();
-            }
-            Some(mut v)
-                if layer == "b" && v.get("error_code").and_then(Value::as_i64) == Some(-9) =>
-            {
-                // `-9` = IS_AUTHING，设备说它那儿还有一张签名没收尾：`init_sign` 上吃到它
-                // 就等于这一轮 App 弹不出指纹圈，原样递回。
+            } else if crate::soter_mint::scope_wipe_enabled() && owners >= 2 {
                 tracing::warn!(
-                    "soter: op={op} uid={probe_uid} layer=b 设备回了 -9（IS_AUTHING）原样递回；\
-                     init_sign 上出这个 A 端就弹不出指纹圈"
+                    "soter: op=remove_all_uid_key uid={probe_uid} requested={requested} \
+                     这个槽位上有 {owners} 个账号，uid 级全清会连坐，只答成功不真清 \
+                     （RELAY_SOTER_SCOPE_WIPE=0 可关掉这条）"
                 );
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("retryable".to_owned(), json!(true));
-                }
-                return Json(v).into_response();
-            }
-            Some(mut v) if v.get("error").is_none() => {
-                // 服务端这两层的钥匙各是各的（`soter_mint` 的 `Store::auth` 按
-                // `{device}|{uid}|{alias}` 存），槽位建在 B 上的钥匙它们手里没有，于是
-                // 「用已有钥匙」的 op 会回 -5/-6/-8。那不是「做成了」，是「这层没这把钥匙」，
-                // 当成成功递出去 App 会以为钥匙丢了。这种答复不算数，接着往下走。
-                if let Some(code) = server_layer_missed_the_slot(layer, op, &v) {
-                    let detail = format!(
-                        "{layer}: 这层没有这个槽位的材料（{code} {}）",
-                        soter_error_name(code)
-                    );
-                    tracing::info!("soter: op={op} layer={layer} cannot serve this slot: {detail}");
-                    last_error = Some(detail);
-                    continue;
-                }
-                let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
-                tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
-                // 这一笔归哪一层：`b` 是真机，`keybox` / `self_signed` / `attk` 是服务端
-                // 自己造的（用的是 A 端带上来的 cpu_id），A 端本地作答是第三种。三态不能
-                // 归并 —— 服务端造料跟 A 端本地是两个不同的号，`get_device_id` 靠它决定跟哪边走。
-                crate::soter_probe::note_device_side(
-                    requested,
-                    if layer == "b" {
-                        crate::soter_probe::Side::Real
-                    } else {
-                        crate::soter_probe::Side::Server(layer.to_string())
-                    },
-                );
-                // 这个槽位的 ASK 被毒化（App 在自删自建）：把「有 ASK」改写成「没有」，
-                // 逼 App 重新生成并上报腾讯。只动这一种答案，别的 op 不碰。
-                if state
-                    .soter_gate
-                    .poison_ask_answer(requested, op, gate_uid, &mut v)
-                {
-                    tracing::warn!(
-                        "soter: op={op} uid={probe_uid} 槽位 ASK 被别的时候铸过（App 在自删自建），\
-                         这笔答案改成「没有 ASK」，逼 App 重新走一遍「生成 ASK → 上报腾讯」"
-                    );
-                }
-                // 真签出来了才算这轮走通：撤掉标记，别再骗它。
-                if op == "finish_sign" && code == 0 {
-                    state.soter_gate.clear_ask_poison(requested, gate_uid);
-                }
-                if let Some(note) =
-                    state
-                        .soter_gate
-                        .record(requested, op, gate_uid, alias_arg, layer == "b", &v)
-                {
-                    // App 在自删自建：这不是设备故障，得让操作员看见原因和处置。
-                    tracing::warn!("{note}");
-                }
-                if let Some(uid) = uid {
-                    if let Some(pin) = layer_to_pin(layer, b_structural) {
-                        crate::soter_mint::pin_layer(requested, uid, pin);
-                    }
-                }
-                // 设备层的会话记下来：被顶掉的时候还能用同样的参数补一次（见
-                // `repair_clobbered_finish`）。
-                if layer == "b" && op == "init_sign" && code == 0 && served_device.is_some() {
-                    if let Some(session) =
-                        v.get("session").and_then(Value::as_i64).filter(|s| *s != 0)
-                    {
-                        state.sign_sessions.record(
-                            served_device.as_deref().unwrap(),
-                            requested,
-                            session,
-                            body.get("uid").and_then(Value::as_i64),
-                            alias_arg,
-                            body.get("challenge").and_then(Value::as_str),
-                        );
-                        tracing::info!(
-                            "soter: 记下会话 {session}（uid={probe_uid} alias={probe_alias}），被顶掉时可以重签"
-                        );
-                    }
-                }
-                return Json(v).into_response();
-            }
-            Some(v) => {
-                let msg = v
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error")
-                    .to_string();
-                tracing::info!("soter: op={op} layer={layer} failed: {msg}");
-                last_error = Some(format!("{layer}: {msg}"));
-            }
-            None => {
-                tracing::info!("soter: op={op} layer={layer} 不管这个 op");
-                last_error = Some(format!("{layer}: op '{op}' not handled by this layer"));
+                return Err(Json(json!({"op": op, "error_code": 0})).into_response());
             }
         }
     }
+    let mut lease = if needs_sign {
+        match b_target.as_deref() {
+            Some(device) if op == "init_sign" => {
+                // 抢不到租约也不直接回 -9：那会让 A 端连指纹圈都弹不出来。退成
+                // 不带租约执行，让 TA 自己顶掉旧会话，收尾交给 -204 补救路径。
+                let lease = state
+                    .sign_sessions
+                    .acquire(device, requested, request_deadline)
+                    .await;
+                if lease.is_none() {
+                    tracing::warn!(
+                        "soter: 设备 {} 的签名租约没抢到，请求 {} 这单不带租约执行",
+                        device,
+                        requested
+                    );
+                }
+                lease
+            }
+            Some(device) => {
+                // 租约不是这一笔的（会话被顶掉 / 被接管 / 早过期了）也照旧送
+                // 设备，让它自己回 -204，再由补救路径重开补签；只有同一笔
+                // finish 已经在收尾时才真拒，免得同一张会话签两遍。
+                let miss = body.get("session").and_then(Value::as_i64).map(|s| {
+                    state
+                        .sign_sessions
+                        .finish(device, requested, s, request_deadline)
+                });
+                match miss {
+                    Some(Ok(lease)) => Some(lease),
+                    Some(Err(LeaseMiss::Busy)) => {
+                        return Err(Json(json!({"error_code": -204, "relay_error_kind": "soter_session_expired"})).into_response());
+                    }
+                    Some(Err(LeaseMiss::NotOurs)) | None => {
+                        tracing::warn!(
+                            "soter: finish 没配上 {} 上属于 {} 的活跃租约，照旧送设备等它自己回 -204",
+                            device,
+                            requested
+                        );
+                        None
+                    }
+                }
+            }
+            // 没有 B 可派（服务端密钥模式、或者这一笔本来就落在服务端那两层）时
+            // 不能当会话过期：这张会话是服务端自己开的，签名也在服务端本地做，
+            // 压根不需要 B 的租约。
+            None if op == "finish_sign" && server_owner.is_none() => {
+                return Err(Json(
+                    json!({"error_code": -204, "relay_error_kind": "soter_session_expired"}),
+                )
+                .into_response())
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let deadline = lease
+        .as_ref()
+        .map(|l| l.deadline.min(request_deadline))
+        .unwrap_or(request_deadline);
+    let work = async {
+        if let Some(guard) = lease.as_mut() {
+            guard.dispatch();
+        }
+        match try_b_soter_layer(state, body, requested, b_target.as_deref(), a_meta).await {
+            Some(mut b) => {
+                if b.mutation_outcome_unknown(op, b_target.as_deref()) {
+                    if crate::queue::soter_op_needs_sign(op) {
+                        // init/finish：真说不清（超时、会话被顶、队列没派出去）
+                        // 时保持原样，不让 App 以为这把钥匙没了。
+                        return Some(soter_unknown_reply());
+                    }
+                    // generate_*/remove_*：没落在点名那台上就是确定的结论，
+                    // 不管是换台做完了还是压根没派出去。换台做过的更得说清楚 ——
+                    // 那把钥匙其实没动，也不在 A 端这台机器上。
+                    tracing::warn!(
+                        "soter: op={op} uid={probe_uid} 点名设备 {} 上没做成\
+                         （device={:?}），回确定码不换层",
+                        requested,
+                        b.device
+                    );
+                    return Some(soter_off_target_reply(op));
+                }
+                if needs_sign
+                    && b.device.as_deref() == b_target.as_deref()
+                    && b.value.get("error_code").and_then(Value::as_i64) == Some(-9)
+                {
+                    // B's local active lease rejected init without touching HAL.
+                    // This is a definite result, not unknown dispatch; release
+                    // only our server reservation, never the B active session.
+                    if let Some(guard) = lease.as_mut() {
+                        guard.completed();
+                    }
+                    return Some(b.value);
+                }
+                if needs_sign
+                    && b.value.get("error").is_none()
+                    && b.device.as_deref() != b_target.as_deref()
+                {
+                    return Some(
+                        json!({"error_code": -204, "relay_error_kind": "soter_device_mismatch"}),
+                    );
+                }
+                flags.b_structural = b.unavailable;
+                flags.served_device = b.device.clone();
+                if let Some(reply) = b.hardware_reply.clone() {
+                    flags.b_error_reply = Some(reply);
+                }
+                // -204（`SOTER_ERROR_OPERATEID_NULL`）在这台设备上就一个意思：这张
+                // 会话被后来的一笔 `init_sign` 顶掉了（TA 一台设备只留一个会话）。
+                // 拿 init 时缓存的参数重开一张、用同一个 challenge 再签一次。
+                if op == "finish_sign"
+                    && b.value.get("error_code").and_then(Value::as_i64) == Some(-204)
+                {
+                    match repair_clobbered_finish(
+                        state,
+                        body,
+                        requested,
+                        b.device.as_deref(),
+                        a_meta,
+                    )
+                    .await
+                    {
+                        Ok(Some(fixed)) => b.value = fixed,
+                        Ok(None) => {}
+                        Err(()) => return Some(soter_unknown_reply()),
+                    }
+                }
+                if op == "finish_sign" {
+                    if let (Some(device), Some(session)) = (
+                        b.device.as_deref(),
+                        body.get("session").and_then(Value::as_i64),
+                    ) {
+                        state.sign_sessions.forget_for(device, requested, session);
+                    }
+                }
+                if b.completed_on(b_target.as_deref()) || b.definitely_not_dispatched() {
+                    if let Some(guard) = lease.as_mut() {
+                        guard.completed();
+                    }
+                    // Structural HAL failures are wrapped for init fallback,
+                    // but finish must stay on its session's owner layer and
+                    // return the device's actual code, not an unknown verdict.
+                    if op == "finish_sign" {
+                        if let Some(reply) = b.hardware_reply.take() {
+                            b.value = reply;
+                        }
+                    }
+                } else if needs_sign {
+                    return Some(soter_unknown_reply());
+                }
+                if op == "init_sign" && b.value.get("error_code").and_then(Value::as_i64) == Some(0)
+                {
+                    let session = b
+                        .value
+                        .get("session")
+                        .and_then(Value::as_i64)
+                        .filter(|s| *s != 0);
+                    match (session, lease.as_mut()) {
+                        (Some(session), Some(guard)) => {
+                            // 记账不是我们就只记一行警告 —— 会话是真的，改口成 -204
+                            // 会让 App 自删重来一轮（一台设备上多路客户端抢同一张
+                            // TA 会话是常态）。
+                            if !guard.retain_session(session) {
+                                tracing::warn!(
+                                    "soter: init_sign uid={probe_uid} alias={probe_alias} \
+                                     拿到的会话 {session} 记账时租约已经换人了，照旧回给 App"
+                                );
+                            }
+                        }
+                        // 答了成功却没有会话号：这张会话在 TA 里根本没建起来，
+                        // 递上去 App 只会拿到 session=0（微信那边直接判 -204）。
+                        (None, _) => return Some(json!({"error_code": -204})),
+                        (Some(_), None) => {}
+                    }
+                }
+                Some(b.value)
+            }
+            None => None,
+        }
+    };
+    match tokio::time::timeout_at(deadline, work).await {
+        Ok(result) => Ok(result),
+        Err(_) if crate::queue::soter_op_is_mutation(op) => {
+            Err(Json(soter_unknown_reply()).into_response())
+        }
+        Err(_) => Err(Json(json!({"error_code": if op == "finish_sign" { -204 } else { -9 }, "relay_error_kind": "soter_deadline"})).into_response()),
+    }
+}
 
-    // 三层都没接住（init_sign 的话就是一张会话都没拿到）。
+/// 服务端那两层（`keybox` / `self_signed` / `attk`）：挑钥匙，剩下的交给 `run_layer_soter`。
+async fn run_soter_server_layer(
+    state: &AppState,
+    layer: &str,
+    body: &Value,
+    requested: &str,
+    op: &str,
+    session_arg: Option<i64>,
+    rule_attk: Option<i64>,
+    fallback_attk: Option<i64>,
+) -> Option<Value> {
+    // `attk` 层：规则命中的那把优先；finish 必须回到开这张会话的那把 ATTK 上
+    // —— 同一层换一把就是另一套 ASK/AuthKey，拿别的钥匙签回来的会话 App 验不过。
+    let (attk_rule, attk_fallback) = if layer == "attk" {
+        let rule = if op == "finish_sign" {
+            session_arg
+                .and_then(|s| crate::soter_mint::session_attk(requested, s))
+                .or(rule_attk)
+        } else {
+            rule_attk
+        };
+        (rule, fallback_attk)
+    } else {
+        (None, None)
+    };
+    run_layer_soter(state, layer, body, requested, attk_rule, attk_fallback).await
+}
+
+/// 单层结论落地：结果未知 / `-9` / 成功（毒化改写、钉层、会话登记）/ 失败都在这。
+/// `Some(reply)` = 这一笔就此定案，`None` = 这层没接住，带 `last_error` 换下一层。
+fn apply_soter_layer_result(
+    state: &AppState,
+    body: &Value,
+    layer: &str,
+    op: &str,
+    probe_uid: &str,
+    probe_alias: &str,
+    requested: &str,
+    gate_uid: Option<i32>,
+    alias_arg: Option<&str>,
+    uid: Option<i32>,
+    result: Option<Value>,
+    flags: &mut SoterLayerFlags,
+    last_error: &mut Option<String>,
+) -> Option<Response> {
+    match result {
+        Some(v) if v.get("soter_outcome_unknown").and_then(Value::as_bool) == Some(true) => {
+            tracing::warn!(
+                "soter: op={op} uid={probe_uid} layer={layer} 结果未知（mutation outcome unknown），不落兜底层，原样回给 App"
+            );
+            Some(Json(v).into_response())
+        }
+        Some(mut v) if layer == "b" && v.get("error_code").and_then(Value::as_i64) == Some(-9) => {
+            // `-9` = IS_AUTHING，设备说它那儿还有一张签名没收尾：`init_sign` 上吃到它
+            // 就等于这一轮 App 弹不出指纹圈，原样递回。
+            tracing::warn!(
+                "soter: op={op} uid={probe_uid} layer=b 设备回了 -9（IS_AUTHING）原样递回；\
+                 init_sign 上出这个 A 端就弹不出指纹圈"
+            );
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("retryable".to_owned(), json!(true));
+            }
+            Some(Json(v).into_response())
+        }
+        Some(mut v) if v.get("error").is_none() => {
+            // 服务端这两层的钥匙各是各的（`soter_mint` 的 `Store::auth` 按
+            // `{device}|{uid}|{alias}` 存），槽位建在 B 上的钥匙它们手里没有，于是
+            // 「用已有钥匙」的 op 会回 -5/-6/-8。那不是「做成了」，是「这层没这把钥匙」，
+            // 当成成功递出去 App 会以为钥匙丢了。这种答复不算数，接着往下走。
+            if let Some(code) = server_layer_missed_the_slot(layer, op, &v) {
+                let detail = format!(
+                    "{layer}: 这层没有这个槽位的材料（{code} {}）",
+                    soter_error_name(code)
+                );
+                tracing::info!("soter: op={op} layer={layer} cannot serve this slot: {detail}");
+                *last_error = Some(detail);
+                return None;
+            }
+            let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+            tracing::info!("soter: op={op} layer={layer} ok error_code={code}");
+            // 这一笔归哪一层：`b` 是真机，`keybox` / `self_signed` / `attk` 是服务端
+            // 自己造的（用的是 A 端带上来的 cpu_id），A 端本地作答是第三种。三态不能
+            // 归并 —— 服务端造料跟 A 端本地是两个不同的号，`get_device_id` 靠它决定跟哪边走。
+            crate::soter_probe::note_device_side(
+                requested,
+                if layer == "b" {
+                    crate::soter_probe::Side::Real
+                } else {
+                    crate::soter_probe::Side::Server(layer.to_string())
+                },
+            );
+            // 这个槽位的 ASK 被毒化（App 在自删自建）：把「有 ASK」改写成「没有」，
+            // 逼 App 重新生成并上报腾讯。只动这一种答案，别的 op 不碰。
+            if state
+                .soter_gate
+                .poison_ask_answer(requested, op, gate_uid, &mut v)
+            {
+                tracing::warn!(
+                    "soter: op={op} uid={probe_uid} 槽位 ASK 被别的时候铸过（App 在自删自建），\
+                     这笔答案改成「没有 ASK」，逼 App 重新走一遍「生成 ASK → 上报腾讯」"
+                );
+            }
+            // 真签出来了才算这轮走通：撤掉标记，别再骗它。
+            if op == "finish_sign" && code == 0 {
+                state.soter_gate.clear_ask_poison(requested, gate_uid);
+            }
+            if let Some(note) =
+                state
+                    .soter_gate
+                    .record(requested, op, gate_uid, alias_arg, layer == "b", &v)
+            {
+                // App 在自删自建：这不是设备故障，得让操作员看见原因和处置。
+                tracing::warn!("{note}");
+            }
+            if let Some(uid) = uid {
+                if let Some(pin) = layer_to_pin(layer, flags.b_structural) {
+                    crate::soter_mint::pin_layer(requested, uid, pin);
+                }
+            }
+            // 设备层的会话记下来：被顶掉的时候还能用同样的参数补一次（见
+            // `repair_clobbered_finish`）。
+            if layer == "b" && op == "init_sign" && code == 0 && flags.served_device.is_some() {
+                if let Some(session) = v.get("session").and_then(Value::as_i64).filter(|s| *s != 0)
+                {
+                    state.sign_sessions.record(
+                        flags.served_device.as_deref().unwrap(),
+                        requested,
+                        session,
+                        body.get("uid").and_then(Value::as_i64),
+                        alias_arg,
+                        body.get("challenge").and_then(Value::as_str),
+                    );
+                    tracing::info!(
+                        "soter: 记下会话 {session}（uid={probe_uid} alias={probe_alias}），被顶掉时可以重签"
+                    );
+                }
+            }
+            Some(Json(v).into_response())
+        }
+        Some(v) => {
+            let msg = v
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string();
+            tracing::info!("soter: op={op} layer={layer} failed: {msg}");
+            *last_error = Some(format!("{layer}: {msg}"));
+            None
+        }
+        None => {
+            tracing::info!("soter: op={op} layer={layer} 不管这个 op");
+            *last_error = Some(format!("{layer}: op '{op}' not handled by this layer"));
+            None
+        }
+    }
+}
+
+/// 三层都没接住时的收尾：能还设备层那个真答复就还，否则回 503。
+fn finish_soter_task(
+    op: &str,
+    requested: &str,
+    last_error: Option<String>,
+    b_error_reply: Option<Value>,
+) -> Response {
     let detail = last_error.unwrap_or_else(|| "no layer could serve the request".to_string());
     if let Some(reply) = b_error_reply {
         // 服务端那两层接不了这笔（材料在真机上，它们手里没有），把设备层的答复还回去：
@@ -2365,6 +2449,161 @@ async fn run_soter_task_inner(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("no layer could serve SOTER op '{op}' ({detail})"),
     )
+}
+
+/// SOTER 转发：跟认证共用同一套三层链，差别在三层的实现。
+///
+/// 层序（两种模式只差优先级）：physical 是 B 端设备层 → 服务端密钥层(keybox) → 自签层；
+/// serverbox 是服务端密钥层 → B 端设备层 → 自签层。哪层没做成（没物料 / 没能力 / 失败）
+/// 就回退下一层，三层都不行才回错给 A 端。
+///
+/// B 端层在线点名时不换设备；离线点名且没有已登记的会话路由时才按能力和负载选。
+/// finish 保留 init 的实际设备，不在另一台设备上拿同号句柄补签。
+async fn run_soter_task_inner(
+    state: &AppState,
+    body: &Value,
+    a_meta: Option<&crate::auth::TokenMeta>,
+) -> Response {
+    if !body.is_object() {
+        return json_err(StatusCode::BAD_REQUEST, "json object body required");
+    }
+    if let Some(reply) = soter_duplicate_gate(state, body) {
+        return reply;
+    }
+    // 跟 attest 一个口径，而且同样在入口归一：A 端留空 + 配了默认设备 = 等同于
+    // 它带了那个 id，SOTER 的探测判据、槽位钉子、签名会话路由、写操作跨设备拦截
+    // 看见的 `requested` 都是同一台具体设备。
+    let normalized = crate::default_device::fill_in_body(crate::default_device::Chain::Soter, body);
+    let body = &normalized;
+    let (requested, op, probe_uid, probe_alias) = soter_request_meta(body);
+
+    // 探测机（春秋 / 鸭子）的 SOTER 请求不落 B 端，用服务端内置物料就地作答：它们把整套
+    // 流程反复地跑，要的只是「SOTER 能不能用」。判据在 `soter_probe` 里；attest 走另一条路。
+    let uid_arg = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+    let session_arg = body.get("session").and_then(Value::as_i64);
+    let session_present =
+        op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
+    // `get_device_id` 没有 uid 参数，A 端只能拿「当前前台应用」凑 `caller_pkg`，拿它判
+    // 白名单等于抛硬币：同一个 uid 的 ASK 走了 B、getDeviceId 却退回本地，两个 `cpu_id`
+    // 一撞就是检测器那条 C5b。
+    let caller_pkg_arg = body
+        .get(crate::soter_probe::CALLER_PKG_FIELD)
+        .and_then(Value::as_str);
+    if let Some(reply) = soter_probe_gate(
+        state,
+        body,
+        requested,
+        op,
+        &probe_uid,
+        &probe_alias,
+        uid_arg,
+        caller_pkg_arg,
+        session_arg,
+        session_present,
+    )
+    .await
+    {
+        return reply;
+    }
+
+    let gate_uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
+    let alias_arg = body.get("alias").and_then(Value::as_str);
+    let mut last_error: Option<String> = None;
+    let plan = match resolve_soter_plan(
+        state,
+        body,
+        requested,
+        op,
+        &probe_uid,
+        session_present,
+        gate_uid,
+        alias_arg,
+        uid_arg,
+        caller_pkg_arg,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(reply) => return reply,
+    };
+    let SoterPlan {
+        b_target,
+        server_owner,
+        layers,
+        request_deadline,
+        rule_attk,
+        fallback_attk,
+        uid,
+        needs_sign,
+    } = plan;
+    // B 端这层到底是不是结构性地做不了（没有设备、设备没报 SOTER、TA 结构性报错）。
+    // 只有它成立，服务端那两层接上之后才允许把槽位挪过去。
+    //
+    // 设备层那个失败答复（结构性失败也带着真错误码）。服务端两层都接不了这个槽位的时候
+    // 把它原样还回去 —— 比递一个「钥匙不在这层」的 -5 准得多。
+    let mut flags = SoterLayerFlags {
+        b_structural: b_target.is_none(),
+        b_error_reply: None,
+        served_device: None,
+    };
+
+    for layer in &layers {
+        let result = match layer.as_str() {
+            "b" => {
+                run_soter_b_layer(
+                    state,
+                    body,
+                    requested,
+                    op,
+                    &probe_uid,
+                    &probe_alias,
+                    b_target.as_deref(),
+                    a_meta,
+                    server_owner.as_deref(),
+                    needs_sign,
+                    request_deadline,
+                    uid,
+                    &mut flags,
+                )
+                .await
+            }
+            "keybox" | "self_signed" | "attk" => Ok(run_soter_server_layer(
+                state,
+                layer,
+                body,
+                requested,
+                op,
+                session_arg,
+                rule_attk,
+                fallback_attk,
+            )
+            .await),
+            _ => Ok(None),
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(reply) => return reply,
+        };
+        if let Some(reply) = apply_soter_layer_result(
+            state,
+            body,
+            layer,
+            op,
+            &probe_uid,
+            &probe_alias,
+            requested,
+            gate_uid,
+            alias_arg,
+            uid,
+            result,
+            &mut flags,
+            &mut last_error,
+        ) {
+            return reply;
+        }
+    }
+
+    finish_soter_task(op, requested, last_error, flags.b_error_reply)
 }
 
 /// 「这笔写操作没落在 A 端点名的那台设备上」该回什么。两种写操作 App 认的东西不一样：
