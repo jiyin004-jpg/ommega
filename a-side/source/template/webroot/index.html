@@ -1483,6 +1483,8 @@ function buildTextRow(f, value, host){
 /* 令牌默认打码：输入框里存的还是真值（收集、保存都不用改），只是文字透明，
    上面一层镜像默认显示等长 *；点眼睛露出真值，横向拖动时也由这层镜像承载文字，
    避免逐帧滚输入框触发内部文字重排。 */
+/* 令牌是否显示为明文：重渲染（窗口重新获焦、配置刷新）后要沿用。 */
+var TOKEN_REVEALED = false;
 function buildTokenMask(inp){
   var wrap = el("div", "pw-wrap");
   var field = el("div", "pw-field");
@@ -1493,7 +1495,10 @@ function buildTokenMask(inp){
 
   /* 拖动状态先声明：syncScroll 里要判断是否正在拖，不能等下面 var 执行到才初始化。 */
   var panX = null, panY = 0, panLeft = 0, panMax = 0, panAxis = 0, panTarget = 0;
-  var panFrame = 0, syncFrame = 0, willTimer = 0, starX = null, isMasked = true;
+  var panFrame = 0, syncFrame = 0, willTimer = 0, starX = null;
+  /* 显示状态跟着面板活，不跟着这一次渲染活：窗口重新获得焦点会重渲染一遍，
+     新输入框如果每次都从打码开始，刚点出来的明文会当场被盖回去。 */
+  var isMasked = !TOKEN_REVEALED;
 
   /* 星号层只做 translate3d，不改 scrollLeft：外层负责裁剪，内层负责位移，
      这样每帧只走合成，不用重排星号文字，裁剪框也不会跟着一起移动。
@@ -1539,7 +1544,7 @@ function buildTokenMask(inp){
     if (panFrame){ cancelAnimationFrame(panFrame); panFrame = 0; }
   }
 
-  inp.classList.add("masked");
+  if (isMasked) inp.classList.add("masked");
   /* 输入法拼字期间露出真值：组合中的字还没 commit，打码后只看得到星号多了一个，
      看不出在打什么。去掉 .masked 后星号层自动隐掉（见 `.pw-field input:not(.masked) ~ .pw-stars`）。 */
   inp.addEventListener("compositionstart", function(){
@@ -1639,11 +1644,12 @@ function buildTokenMask(inp){
   eye.onclick = function(){
     var revealed = inp.classList.toggle("masked") === false;
     isMasked = !revealed;
+    TOKEN_REVEALED = revealed;
     eye.setAttribute("aria-pressed", revealed ? "true" : "false");
     paintEye(revealed);
     sync();
   };
-  paintEye(false);
+  paintEye(TOKEN_REVEALED);
   field.appendChild(inp);
   field.appendChild(stars);
   wrap.appendChild(field);
