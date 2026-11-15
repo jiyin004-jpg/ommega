@@ -1485,7 +1485,28 @@ fn json_string(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 测试一律把 store 指到临时文件：默认位置在 /data/misc/ommega，
+    /// 属主是 keystore，测试进程写不进去（删了也白删，删完还能导出）。
+    /// 已经由外部指定就不覆盖。
+    fn use_temp_store() {
+        use std::sync::OnceLock;
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            if std::env::var_os("OMMEGA_SOTER_ASK_STORE").is_some() {
+                return;
+            }
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "ommega_soter_asks_test_{}.json",
+                std::process::id()
+            ));
+            // SAFETY: 仅在测试里、且只设一次（OnceLock 兵）。
+            unsafe { std::env::set_var("OMMEGA_SOTER_ASK_STORE", path) };
+        });
+    }
+
     fn call(code: u32, uid: Option<i32>, alias: Option<&str>) -> soter::SoterCall {
+        use_temp_store();
         soter::SoterCall {
             hal: true,
             hidl: false,
