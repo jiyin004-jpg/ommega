@@ -36,6 +36,42 @@ fn engineermode_domain_is_intercepted_on_system_uid() {
 }
 
 #[test]
+fn engineermode_domain_is_intercepted_on_global_scope_without_listing() {
+    // 全局作用域 + 空作用域：engineermode 域照样接管。
+    let mut config = base_config();
+    config.global_scope = true;
+
+    let decision = evaluate_with_sid(
+        &[],
+        &config,
+        1000,
+        "u:r:engineermode_app:s0",
+        PackageResolution::Unknown,
+    );
+    assert!(decision.allowed, "engineermode should be intercepted");
+    assert_eq!(decision.reason, FilterReason::GlobalScope);
+}
+
+#[test]
+fn other_rom_package_stays_out_on_global_scope() {
+    // 其他厂商系统包：全局作用域也不接管。
+    let mut config = base_config();
+    config.global_scope = true;
+
+    let decision = evaluate(
+        &[],
+        &config,
+        10123,
+        PackageResolution::Known(vec!["com.oplus.settings".to_string()]),
+    );
+    assert!(
+        !decision.allowed,
+        "other ROM packages stay on the system backend"
+    );
+    assert_eq!(decision.reason, FilterReason::RejectedSystemPackage);
+}
+
+#[test]
 fn engineermode_domain_is_intercepted_without_global_scope_when_listed() {
     // 没开全局作用域：只按 scoop 判定。uid 1000 解析不出包名（packages=[]），
     // 所以靠 `system_sid_packages` 把域映射回包名，让它跟普通 app 一样命中 scoop。

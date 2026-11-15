@@ -114,13 +114,9 @@ pub struct FilterDecision {
     pub packages: Vec<String>,
 }
 
-/// 系统 uid（< AID_APP_START）里额外放行接管的那部分调用方。
+/// 系统 uid（< AID_APP_START）里额外放行接管的 app 域。
 ///
-/// 这些进程 uid 落在 system 范围，但 SELinux 域是 `u:r:xxx_app:s0`，也就是 ROM
-/// 自带的 app（一加/OPPO 的工程模式就是 `engineermode_app`），不是 system_server
-/// / init / keystore 那种平台进程——接管它们的 keystore 流量不会把系统拖进 boot
-/// loop。默认只放 `engineermode`（它现场建 test_key 用完就删，不依赖旧 blob）；
-/// 别的 ROM 组件要接管，往 config 的 `allow_system_sids` 里加域前缀。
+/// 只认 `u:r:xxx_app:s0` 形式的域，按 `allow_system_sids` 做前缀匹配。
 fn sid_allows_system_uid(sid: &str, config: &FilterConfig) -> bool {
     let domain = sid.split(':').nth(2).unwrap_or("");
     if !domain.ends_with("_app") {
@@ -179,7 +175,8 @@ pub fn evaluate_with_sid(
     // 判定两头不占好——`android` 前缀会把每笔调用当平台流量拒掉，scoop 里也永远
     // 对不上。sid 命中映射时就用映射的包名整个换掉，之后照常走 scope 判定。
     let mapped = sid_mapped_packages(sid, config);
-    if !mapped.is_empty() {
+    let sid_bound = !mapped.is_empty();
+    if sid_bound {
         resolution = PackageResolution::Known(mapped);
     }
 
@@ -222,16 +219,8 @@ pub fn evaluate_with_sid(
             },
         };
     }
-    // Global scope ("全局作用域", toggled in the A-side WebUI's remote config)
-    // intercepts ordinary apps, and *also* whatever is listed in the scope
-    // explicitly (so Google Play / GMS components keep being handled).  ROM
-    // system packages that were never listed are left on the system backend:
-    // they already hold keys in the system keystore, so taking them over breaks
-    // their blobs - a ROM service failing like that has already taken a device
-    // into a boot loop (`com.zte.usebalance`).  `deny_packages` stays the
-    // escape hatch on top of that.  Only the master switch turns interception
-    // off entirely; whether a handled request is served locally or remotely is
-    // decided elsewhere and is not affected by this setting.
+    // 全局作用域：接管普通应用、作用域里显式列出的组件，以及 system_sid_packages
+    // 绑定的系统应用域；其余 ROM 系统包留在系统后端。deny_packages 优先以上全部。
     if config.global_scope {
         let packages = match resolution {
             PackageResolution::Known(packages) => packages,
@@ -243,10 +232,7 @@ pub fn evaluate_with_sid(
             .iter()
             .any(|pkg| config.deny_packages.contains(pkg));
         let system_like = packages.iter().any(|pkg| is_system_package_name(pkg));
-        // deny_packages 是安全阀（防开机循环那类事故），必须压过 scoop 显式收录
-        // ——与非全局路径（denylist 先于 scope）口径一致，否则 target.txt 并入
-        // scoop 后 overlap 的 deny 条目会静默失效。
-        let allowed = !denied && (explicitly_in_scope || !system_like);
+        let allowed = !denied && (explicitly_in_scope || !system_like || sid_bound);
         return FilterDecision {
             allowed,
             reason: if allowed {

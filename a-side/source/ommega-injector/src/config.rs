@@ -66,15 +66,9 @@ pub struct FilterConfig {
     /// NOT affected: this only widens which callers ommega handles.
     pub global_scope: bool,
     /// 系统 uid（< AID_APP_START）里额外放行接管的 SELinux 域前缀。
-    ///
-    /// 默认 `engineermode`：一加/OPPO 工程模式跑在 system uid 的 `engineermode_app`
-    /// 域上，需要被接管。只认以 `_app` 结尾的域，system_server / init /
-    /// keystore 这类平台进程不受影响。
+    /// 默认 `engineermode`。
     pub allow_system_sids: Vec<String>,
-    /// 系统 uid 的 app 域对应哪个包：`域前缀 -> 包名列表`。
-    ///
-    /// uid 1000 的 `getKeyAttestationApplicationId` 返回空，包名解析不出来，按包判定
-    /// 的 scope 命不中；映射回包名后照常走 `scoop` / `deny_packages` / `global_scope`。
+    /// 系统 uid 的 app 域对应哪些包：`域前缀 -> 包名列表`。
     pub system_sid_packages: BTreeMap<String, Vec<String>>,
 }
 

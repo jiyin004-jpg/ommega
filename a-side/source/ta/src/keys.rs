@@ -37,11 +37,7 @@ use x509_cert::ext::pkix::KeyUsages;
 /// Maximum size of an attestation challenge value.
 const MAX_ATTESTATION_CHALLENGE_LEN: usize = 128;
 
-/// 本地软件出证时补的耗时。
-///
-/// 真机 TEE 出一份证明要走 HAL、在 TEE 里签整条链，带 challenge 的建钥比不带
-/// 多几十毫秒；我们在 keystore2 进程里签，只多签一张 batch 证书的两三毫秒，
-/// 比建钥本身的抖动还小。按真机的量级补 5ms，让这一笔的耗时对得上。
+/// 本地出证返回前等待的时长。
 const LOCAL_ATTEST_DELAY: core::time::Duration = core::time::Duration::from_millis(5);
 
 /// Contents of wrapping key data
@@ -516,7 +512,7 @@ impl crate::KeyMintTa {
             key_material,
             keyblob::SlotPurpose::KeyGeneration,
         )?;
-        // 出证走的是本地 keybox，补足到真机的耗时量级；远程出证在上面已经返回。
+        // 本地出证走这条路径；远程出证在上面已经返回。
         if wants_attest_challenge {
             std::thread::sleep(LOCAL_ATTEST_DELAY);
         }
