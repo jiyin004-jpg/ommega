@@ -29,11 +29,7 @@ pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
     }
 }
 
-/// 问 daemon 这笔该怎么答。
-///
-/// 走真机、服务端还是本地兜底只能由 daemon 决定：只有它看得到「远程 keymint」开关和真
-/// 应用名单。所以**问不到的时候不能默认本地** —— 白名单内的真应用本该由 B 签，一旦这里
-/// 用 A 端自己的料签，同一轮里 `cpu_id` 和密钥就会一半来自 A、一半来自 B。
+/// 问 daemon 这笔该怎么答。走真机、服务端还是本地兜底都由 daemon 决定。
 fn resolve(call: &SoterCall) -> Outcome {
     let Some(request) = request(call) else {
         // 号码不在转发表里（空号、app 侧那套号码）：老规矩，本地能答就本地答。
@@ -106,8 +102,7 @@ fn cache_get(key: &str) -> Option<Vec<u8>> {
 }
 
 fn cache_put(key: &str, blob: &[u8], outcome: &Outcome) {
-    // 只缓存「成功且非空」的答复：失败码（比如 -8 没这把钥匙）不能存，
-    // 否则刚生成的钥匙会被旧答案盖住。
+    // 只缓存成功且非空的答复。
     let ok = matches!(outcome, Outcome::Buffer { code, .. } if *code == 0)
         || matches!(outcome, Outcome::Code(0));
     let mut guard = match READ_CACHE.lock() {
@@ -184,9 +179,8 @@ fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
             push_json_string(&mut out, &pkg);
         }
     } else if let Some(uid) = call.uid.filter(|uid| *uid > 0) {
-        // 没有内核给的 sender_euid：接管的是 HAL 层，到这里调用方已经是 soterserver，App
-        // 身份早不在 binder 头里。只能拿 SOTER 参数里那个 uid（App 自己填的，探测机会伪造），
-        // 所以必须带 `caller_pkg_src=arg`：服务端只拿它做负向判断，绝不用它放行真机。
+        // 没有 sender_euid：调用方已是 soterserver，只能拿 SOTER 参数里的 uid，
+        // 必须带 `caller_pkg_src=arg`。
         let pkg = match table {
             Some(table) => lookup_in_table(table, uid as u32),
             None => caller_package_for_uid(uid as u32),
@@ -205,8 +199,7 @@ fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
     Some(out)
 }
 
-/// root 侧（`daemon-injector`）写的世界可读副本：一行 `<uid> <包名>`。不用 0770 的
-/// keystore 目录，因为宿主域（指纹进程/应用）打不开它。
+/// root 侧（`daemon-injector`）写的世界可读副本：一行 `<uid> <包名>`。
 const UID_TABLE_FALLBACK: &str = "/data/misc/ommega/uid_packages";
 /// 表只在装/卸应用时变，缓存一分钟；前台那份短一点，别拿刚才那个应用去顶现在这笔。
 const UID_TABLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -373,9 +366,7 @@ mod tests {
         );
     }
 
-    /// **请求里那个 `uid` 也拿来翻一把，但必须带 `caller_pkg_src=arg`**：那是应用填的、
-    /// 探测机会伪造。服务端只拿它做负向判断（包名不在真应用白名单就不派真机、就地
-    /// 作答），绝不能当真调用者放行 —— 所以这个标记不能丢。
+    /// 请求里那个 `uid` 也翻一把，必须带 `caller_pkg_src=arg`（应用填的，可能被伪造）。
     #[test]
     fn the_request_uid_lookup_is_marked_as_arg() {
         let call = call(11, Some(10490), Some("SoterAuthKey"), Some("0a1b"));

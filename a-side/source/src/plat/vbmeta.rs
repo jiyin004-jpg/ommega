@@ -241,8 +241,7 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
     let property_boot_patch = boot_patchlevel_from_env()
         .or_else(|| resetprop::read_string_property(BOOT_PATCH_PROP))
         .or_else(|| read_build_prop_value(BOOT_PATCH_PROP))
-        // AOSP 名是 `ro.boot.build.security_patch`，厂商习惯 `ro.vendor.boot_security_patch`。
-        // 两个都认，否则面板写了值、证书里还是 boot 镜像编译日期。
+        // AOSP 名 `ro.boot.build.security_patch` 与厂商名 `ro.vendor.boot_security_patch` 两个都认。
         .or_else(|| resetprop::read_string_property(BOOT_PATCH_ALT_PROP))
         .or_else(|| read_build_prop_value(BOOT_PATCH_ALT_PROP))
         // 检测器 A13 直接读这个名字，三个变体都认，保证写的和查的是同一个。

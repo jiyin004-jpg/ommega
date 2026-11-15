@@ -132,9 +132,7 @@ impl crypto::EmittingOperation for OmmegaDesOperation {
         // Buffer until a full block is available.
         self.pending.extend_from_slice(data);
         let mut usable = self.pending.len() / BLOCK * BLOCK;
-        // PKCS#7 解密：最后一块带着 padding，必须留到 finish 才能验，不能在 update
-        // 里提前吐出去 —— 否则 finish 拿到空 buffer，解填充直接报 empty block
-        // （KmProbe 的 DESede/CBC 就是这么挂的：doFinal(ct) 走 update + finish）。
+        // PKCS#7 解密：最后一块留到 finish 再验，update 阶段不吐。
         if self.dir == crypto::SymmetricOperation::Decrypt
             && matches!(
                 self.mode,

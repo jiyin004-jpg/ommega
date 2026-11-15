@@ -115,8 +115,7 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
 
     let mut completion_commands = Vec::new();
     let mut freed_inbound_shadows = Vec::new();
-    // 顶掉宿主那笔 BC_REPLY 时用的 parcel：内核在下面那次 ioctl 里从它里面拷字节，
-    // 所以得活到 ioctl 返回之后（这里就是它们的生命周期）。
+    // 顶掉宿主那笔 BC_REPLY 时用的 parcel，活到 ioctl 返回之后。
     let mut app_replies: Vec<crate::parcel::OwnedReply> = Vec::new();
     // 我们自己的 parcel 被宿主释放时那条 BC_FREE_BUFFER 会被整条抹掉，write 缓冲就短了。
     let mut dropped_write_bytes = 0usize;
@@ -324,14 +323,8 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
 
 /// 报给宿主的 `write_consumed`。
 ///
-/// 被我们吞掉的那几条命令（宿主释放我们合成的 parcel 时那条 BC_FREE_BUFFER，内核
-/// 对那个指针一无所知）驱动压根没看见，所以驱动报回来的消费量会短掉这一截。可宿主的
-/// libbinder 只认「我写出去的字节全被收下了」：`IPCThreadState::talkWithDriver` 里一旦
-/// `write_consumed < write_size`，它会直接 abort —— `Driver did not consume write buffer.
-/// err: OK consumed: 80 of 92` 就是这个，宿主当场没。
-///
-/// 那些字节我们确实处理过了（自己把 parcel 收回、命令抹掉），只是没转给驱动，所以替驱动
-/// 认下来，别让它短。上限是宿主给的 write_size，不越界。
+/// 被吞掉的命令没转给驱动，消费量会短一截；libbinder 见到
+/// `write_consumed < write_size` 会直接 abort，所以按宿主给的 write_size 补齐。
 fn reported_write_consumed(
     input_write_consumed: usize,
     driver_write_consumed: usize,

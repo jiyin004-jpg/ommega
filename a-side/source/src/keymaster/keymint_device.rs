@@ -191,9 +191,7 @@ impl KeyMintDevice {
     /// Version number of KeyMintDevice@V5
     pub const KEY_MINT_V5: i32 = 500;
 
-    /// 这个错误是不是"该 security level 的 HAL 根本拿不到"？两种情况会命中：
-    /// 硬件上压根没有，或者 hide_strongbox 把它藏起来了。GC 和 level 0 key
-    /// 选源都要按它分流，所以单独拎出来。
+    /// 这个错误是不是「该 security level 的 HAL 拿不到」（硬件没有或被 hide_strongbox 藏了）。
     pub fn is_hardware_type_unavailable(e: &anyhow::Error) -> bool {
         matches!(
             e.root_cause().downcast_ref::<Error>(),
@@ -1462,11 +1460,8 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         return Err(Error::Km(ErrorCode::UNKNOWN_ERROR)).context(err!("Failed to set HAL version"));
     }
 
-    // MODULE_HASH（724）是 KeyMint 4 才有的标签，反查接口
-    // `getSupplementaryAttestationInfo` 也是 4 才有的 AIDL 方法。老 HAL（V3）上
-    // 只 bootstrap 不声明版本，就会落得「证书里有 724、反查却说 INFO_NOT_AVAILABLE」
-    // 的自相矛盾（Duck Detector 的 MODULE_HASH 项正是抓这个）。所以按本机 VINTF
-    // 声明的版本走：V4+ 才写，V3 保持与真机一致（没有 724）。
+    // MODULE_HASH（724）与 `getSupplementaryAttestationInfo` 都是 KeyMint 4 才有，
+    // 按本机 VINTF 声明的版本走：V4+ 才写，V3 不写。
     if profile.version_number < 400 {
         info!(
             "moduleHash attestation skipped: KeyMint version {} is below 4",

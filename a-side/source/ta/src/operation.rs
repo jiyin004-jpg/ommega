@@ -70,9 +70,8 @@ pub(crate) enum CryptoOperation {
         alias: String,
         algorithm: String,
         data: Vec<u8>,
-        /// 这把钥匙铸在哪台 B（keyblob 里 `RemoteRef::device_id`）。私钥只在那台上，
-        /// 转发时得带上，否则多台 B 在线时服务端会按负载挑一台，挑错了就报
-        /// `no key for alias`。`None` = 铸在服务端 keybox 层，不钉设备。
+        /// 这把钥匙铸在哪台 B（keyblob 里 `RemoteRef::device_id`），转发时带上。
+        /// `None` = 铸在服务端 keybox 层，不钉设备。
         device_id: Option<String>,
         /// `NONEwithECDSA` 时要的域宽：真 TEE 对输入长度很挑，太短太长都可能拒；
         /// 本地软件 TA 是 pad/truncate 处理，两边不统一就会出现「本地能签、远程报错」。
@@ -85,10 +84,7 @@ pub(crate) enum CryptoOperation {
         data: Vec<u8>,
         /// 同上：这把钥匙的出生设备。
         device_id: Option<String>,
-        /// RSA 的模长（字节）。真 TEE 收到长度不对的密文会回自己的错误码（QTI 上是
-        /// `-33 INVALID_KEY_BLOB`），本地软件 TA 回 `-30 VERIFICATION_FAILED` ——
-        /// 同一台机上本地/远程两边不一致就是检测器能看到的差异。所以在这里先按模长
-        /// 拦一道，行为以本地为准。
+        /// RSA 的模长（字节）。按模长先拦一道，错误码以本地为准。
         expected_len: Option<usize>,
         /// RSA 的模数 n（大端）。NoPadding 解密要先比一下 c < n（远程私钥在 B 端，
         /// 真机 KeyMint（含 AOSP 原版）不查这一点，得在转发前拦）。
@@ -538,9 +534,7 @@ impl crate::KeyMintTa {
                 let in_len = data.len();
                 if let Some(expected) = expected_len {
                     if in_len != expected {
-                        // 本地那条路是 update 阶段按最大输入长度拦的，回
-                        // `INVALID_INPUT_LENGTH`（测出来的 -21）；这里跟着它走，
-                        // 否则同一个请求本地/远程两边错误类别不一样。
+                        // 跟本地一样回 `INVALID_INPUT_LENGTH`（-21）。
                         error!(
                             "remote_decrypt rejected alias={alias} algorithm={algorithm} in={in_len} expected={expected}"
                         );
@@ -927,10 +921,8 @@ impl crate::KeyMintTa {
 
 /// 把 `NONEwithECDSA` 的输入整理成正好一个域宽。
 ///
-/// ECDSA 把输入当大整数：短的左边补 0、长的取最左边 `len` 字节（RFC 6979 的 bits2int）。
-/// 本地软件 TA 本来就是这个规则，但远程那条路是把原始字节直接交给 B 的真 TEE，各家的
-/// HAL 对「不是域宽」的输入表现不一致（有的直接拒），于是同一个请求本地能签、远程报错。
-/// 所以在转发前统一成域宽，两条路的语义才一致。
+/// ECDSA 把输入当大整数：短的左边补 0、长的取最左边 `len` 字节。
+/// 转发前统一成域宽，本地与远程语义一致。
 fn raw_digest_fitted(data: &[u8], len: usize) -> Vec<u8> {
     if data.len() == len {
         return data.to_vec();

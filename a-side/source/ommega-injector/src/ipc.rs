@@ -25,10 +25,7 @@ const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
 const PM_SERVICE: &str = "sec_key_att_app_id_provider";
 
-// 进程内那份起不来时，头一笔等满 15 秒是值得的 —— 两套服务同时写一个钥匙库是错的。
-// 等过一次就说明这条路上暂时没戏，之后每笔再干等 15 秒就是纯浪费（keystore2 到 HAL 的
-// generateKey 每笔都被拖成 15000ms，检测器一轮十几分钟）。
-// 所以只等第一笔。之后只做非阻塞的 `ready()` 判断：它自己的启动线程该完就会完。
+// 只有第一笔等启动结论；之后只做非阻塞的 `ready()` 判断。
 static INPROC_WAIT_GAVE_UP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const INPROC_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -496,8 +493,8 @@ pub fn get_ommega() -> Result<Strong<dyn IKeymintService>> {
     get_rpc_binder(rpc::SERVICE, "failed to connect to ommega service", false)
 }
 
-/// 到影子那条 RPC 连接的代数。每次重连、每次因为调用失败把缓存会话丢掉，都会 +1。
-/// 所以代数变了就等于「影子进程换了一代」，它内存里的东西（CE 超密钥之类）也都没了。
+/// 到影子那条 RPC 连接的代数。每次重连或丢掉缓存会话都会 +1。
+/// 代数变了表示影子进程换了一代，它内存里的状态也没了。
 pub fn rpc_generation() -> u64 {
     RPC_CACHE.lock().expect("RPC cache poisoned").generation
 }
@@ -641,8 +638,7 @@ fn send_event(message: &str) -> Result<()> {
 
 /// 把一笔 SOTER 请求交给 daemon，拿回它的结论（blob 布局见 `hook::soter_relay`）。
 ///
-/// 跟 [`report_event`] 不一样，这条是要**等结果**的：宿主拦下的那笔调用正挂着等答复，
-/// 所以在此线程上同步走 RPC；失败就由调用方退回本地兜底，行不了一直重试。
+/// 跟 [`report_event`] 不一样，这条同步等结果；失败就由调用方退回本地兜底。
 pub fn forward_soter(request: &str) -> Result<Vec<u8>> {
     ensure_process_state();
     with_ommega_maintenance_once(|maintenance| {

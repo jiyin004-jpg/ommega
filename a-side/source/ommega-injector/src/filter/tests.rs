@@ -1,8 +1,7 @@
 use super::*;
 
 fn base_config() -> FilterConfig {
-    // 默认值现在是「全局作用域开」，而这个文件里绝大多数用例测的是**列表模式**，
-    // 所以基线配置里显式关掉；要测全局模式的用例自己置 true。
+    // 基线关掉全局作用域；测全局模式的用例自己置 true。
     FilterConfig {
         global_scope: false,
         ..FilterConfig::default()
@@ -73,8 +72,7 @@ fn other_rom_package_stays_out_on_global_scope() {
 
 #[test]
 fn engineermode_domain_is_intercepted_without_global_scope_when_listed() {
-    // 没开全局作用域：只按 scoop 判定。uid 1000 解析不出包名（packages=[]），
-    // 所以靠 `system_sid_packages` 把域映射回包名，让它跟普通 app 一样命中 scoop。
+    // 没开全局作用域：uid 1000 解析不出包名，靠 `system_sid_packages` 映射回包名后按 scoop 判。
     let config = base_config();
     let scope = vec!["com.oplus.engineermode".to_string()];
 
@@ -111,7 +109,7 @@ fn engineermode_domain_stays_out_when_not_listed() {
 
 #[test]
 fn platform_domain_on_system_uid_stays_on_system_backend() {
-    // system_server / init / keystore 这些平台域一律不接管（boot loop 前车之鉴）。
+    // system_server / init / keystore 这些平台域一律不接管。
     let mut config = base_config();
     config.global_scope = true;
 
@@ -156,8 +154,7 @@ fn disabled_filter_reports_disabled_and_allows() {
     assert_eq!(decision.reason, FilterReason::Disabled);
 }
 
-/// 主开关关着也不能把系统进程接过来：否则 `enabled = false` 一改就变成“开机期
-/// keystore 流量全拐到我们”，系统拿到用不了的回复就是重启。
+/// 主开关关着也要把系统进程留在系统后端。
 #[test]
 fn disabled_filter_still_rejects_non_app_callers() {
     let mut config = base_config();
@@ -355,8 +352,7 @@ fn global_scope_keeps_non_app_uids_on_the_system_backend() {
 
 #[test]
 fn global_scope_leaves_unlisted_rom_packages_alone() {
-    // A ROM service holds keys minted before ommega ran; taking it over broke
-    // the device (com.zte.usebalance -> boot loop), so global scope skips it.
+    // 未列出的 ROM 系统包留在系统后端。
     let mut config = base_config();
     config.global_scope = true;
 

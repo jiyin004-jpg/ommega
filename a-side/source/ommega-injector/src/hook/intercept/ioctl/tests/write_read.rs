@@ -206,7 +206,7 @@ fn dropped_free_buffer_bytes_are_acknowledged_to_the_host() {
         DRIVER_SEEN_WRITE_SIZE.load(Ordering::SeqCst),
         original_write_size - dropped
     );
-    // ……但宿主得被告知「你写出去的全被收下了」，否则它自己的 libbinder 会把进程 abort 掉。
+    // 宿主必须看到「写出去的字节全被收下」。
     assert_eq!(bwr.write_size, original_write_size);
     assert_eq!(bwr.write_consumed, original_write_size);
 

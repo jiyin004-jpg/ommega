@@ -193,9 +193,7 @@ fn replay_standing_device_unlocks() -> anyhow::Result<()> {
         };
         match result {
             Ok(()) => {
-                // feed 回 Ok 不代表真解开了：影子里 `unlock_or_initialize_user` 失败只记一行
-                // error，binder 照旧返回成功。回查一次真实状态，CeUnlocked 才算数，
-                // 否则材料会被当成"已喂过"再也不会重试。
+                // feed 回 Ok 也要回查真实状态，CeUnlocked 才算数。
                 match query_user_state(user_id, &caller) {
                     Ok(state) if state == USER_STATE_UNLOCKED => {
                         clear_rejects(user_id);

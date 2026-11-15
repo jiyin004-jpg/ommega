@@ -66,7 +66,7 @@ pub fn refresh_switch() -> bool {
         // 装过了，把级别抬回来就行。
         log::set_max_level(level);
     } else if let Err(error) = init_logger_inner(level) {
-        // 补装失败不能把开关留在「开」上，不然会一直以为在写日志。
+        // 补装失败就把开关置回「关」。
         ENABLED.store(false, Ordering::Relaxed);
         eprintln!("keymint logging failed to enable: {error:#}");
     }

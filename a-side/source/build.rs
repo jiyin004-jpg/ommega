@@ -78,8 +78,7 @@ fn main() {
             &format!("\n#[allow(clippy::all)]\n#[allow(unused_imports)]\npub mod {module} {{"),
         );
     }
-    // 绑定住在 lib 里，注入进 keystore2 的 payload 要靠这些 transaction code
-    // 认拦截到的是哪个方法，所以生成的条目得跨 crate 可见。
+    // 这些 transaction code 的绑定放在 lib 里，生成条目跨 crate 可见。
     patched_content = patched_content.replace("pub(crate) ", "pub ");
 
     println!("Generated AIDL content:\n{}", generated_path.display());

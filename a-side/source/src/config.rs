@@ -173,9 +173,7 @@ fn bootstrap_config_file_to_path(path: &Path) -> Result<ConfigFile> {
     Ok(config_file)
 }
 
-/// 配置被写坏时的兜底：把坏文件改名留档，拿 `config.toml.bak` 顶上。
-/// 恢复不了就直接把错往上抛，不静默兜底成一份空配置（否则守护每 5 秒重拉一次、
-/// 永远起不来）。
+/// 配置被写坏时：坏文件改名留档，拿 `config.toml.bak` 顶上；恢复不了就把错往上抛。
 fn recover_from_broken_config(path: &Path, error: &anyhow::Error) -> Result<String> {
     let file_name = path
         .file_name()

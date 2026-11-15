@@ -355,8 +355,7 @@ fn write_names(map: &HashMap<String, String>) {
     use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = Path::new(NAMES_FILE).parent() {
         let _ = fs::create_dir_all(dir);
-        // 降权后的进程（HAL 的 resetprop 辅助进程跑在 keystore uid）也要读得到，
-        // 否则它拿不到自己的伪装名，comm 就只能跟着父进程走（两个同名进程）。
+        // 降权后的 resetprop 辅助进程也要读得到这个文件。
         let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
     }
     let mut roles: Vec<&String> = map.keys().collect();
@@ -551,10 +550,8 @@ pub fn exec_hidden(real: &str, argv0: &str, extra_args: &[String]) -> bool {
 }
 
 /// 把一段 shell 脚本从 memfd 起成伪装进程：`/system/bin/sh -s` 从标准输入读脚本，
-/// 于是 cmdline 里只剩伪装名和 `-s`，看不到模块里的脚本路径。
-///
-/// `$0` 变成 "sh"，脚本里靠 `$0` 推模块目录的地方已经改成 `${OMMEGA_MODDIR:-固定路径}`，
-/// 所以这里不需要再往环境里塞变量。
+/// cmdline 里只有伪装名和 `-s`。
+/// `$0` 是 "sh"，模块目录靠 `${OMMEGA_MODDIR:-固定路径}` 取。
 pub fn exec_script_hidden(script: &str, argv0: &str, extra_args: &[String], _moddir: &str) -> bool {
     let Some(fd) = memfd_from(Path::new(script), &basename(argv0)) else {
         return false;

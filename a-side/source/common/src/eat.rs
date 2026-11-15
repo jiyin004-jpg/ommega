@@ -33,7 +33,7 @@ pub mod claim {
     pub const OFFICIAL_BUILD: i64 = -82_006;
 }
 
-/// 递归深度上限，防止手工构造的链把栈撑爆。
+/// 递归深度上限。
 const MAX_DEPTH: usize = 16;
 
 /// 解出来的 CBOR 值。只保留 claim 用得到的形状，别的都归 `Other`。

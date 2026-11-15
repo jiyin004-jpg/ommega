@@ -18,8 +18,7 @@ pub mod sys;
 pub mod tracker;
 pub mod utils;
 
-// AIDL 绑定跟 keymint 主体共用一份（由 ommega lib 生成），否则进程内那个本地对象
-// 对不上具体类型，FromIBinder 只能走远端代理。
+// AIDL 绑定与 keymint 主体共用 ommega lib 生成的那一份。
 pub use ommega::{android, top, vendor};
 
 /// 主目标：KeyMint 的客户端进程，这个注不进去就算启动失败。
@@ -42,9 +41,7 @@ const SOTER_HAL_PROCESSES: [&str; 5] = [
     "vendor.microtrust.hardware.soter@1.0-service",
 ];
 
-/// 已注过的目标不能再注第二遍：重复 dlopen 会得到第二份代码与全局状态，初始化互相
-/// 干扰并可能导致 SIGABRT。判据是目标进程里有没有下面这些 payload 自己起的线程名，
-/// 与注入方式（文件或 memfd）无关。
+/// 是否已经注过：按 payload 自己起的线程名判断，与注入方式无关。
 const PAYLOAD_THREAD_NAMES: [&str; 3] = ["injector-config", "ommega-mirror-r", "ommega-binder-p"];
 
 fn payload_thread_names_match(name: &str) -> bool {
@@ -74,8 +71,7 @@ const SOTER_HAL_CANDIDATES: [(&str, &str); 2] = [
         "vendor.trustonic.hardware.soter.ITrustonicSoter",
     ),
 ];
-/// ISoter.getDeviceId(out SoterBufferReturn)。挑它做自检是因为纯只读：不建密钥、
-/// 不动 TEE 里的任何东西。
+/// ISoter.getDeviceId(out SoterBufferReturn)，自检只用它（纯只读）。
 const SOTER_HAL_GET_DEVICE_ID: u32 = 8;
 
 fn in_soter_host() -> bool {
@@ -161,9 +157,7 @@ fn discover_soter_hal_processes() -> Vec<String> {
         };
         let text = String::from_utf8_lossy(&raw).replace('\0', " ");
         let lower = text.to_ascii_lowercase();
-        // 含 soter，但排除自己人：soterserver（腾讯宿主，已单独注入）、
-        // soterta-serve / soterta-ta（自家守护）、ommega-inject（自身），
-        // 否则会把自己当成 HAL 目标注进去。
+        // 含 soter，排除 soterserver、soterta-serve / soterta-ta、ommega-inject。
         if !lower.contains("soter")
             || lower.contains("soterserver")
             || lower.contains("soterta-serve")
@@ -328,8 +322,8 @@ fn inject_named_process(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 诊断用：只注其中几个目标，逗号分隔（`keystore2` / `soter` / `soter-hidl`），`all` 或没设
-/// 就是全都注。认不出来的名字当作进程名，额外再注一份 —— 临时目标不用为了它改代码。
+/// 诊断用：只注其中几个目标，逗号分隔（`keystore2` / `soter` / `soter-hidl`）；
+/// `all` 或没设就是全都注，认不出来的名字当作进程名额外注一份。
 fn selected_targets() -> (bool, bool, bool, Vec<String>) {
     let Ok(value) = std::env::var("OMMEGA_INJECT_TARGETS") else {
         return (true, true, true, Vec::new());
@@ -366,9 +360,7 @@ fn log_runtime_identity(role: &str) {
 }
 
 fn main() {
-    // 独立 HAL / 守护 / 启动器模式：转给 KeyMint 本体。必须在 hide_self 之前判，
-    // 那边会自举成 injector 的名字。自举后 `--daemon` 只在环境变量里，
-    // 所以判据还要带上 `daemon_mode()`。
+    // 独立 HAL / 守护 / 启动器模式转给 KeyMint 本体，判据还要带 `daemon_mode()`。
     if ommega::stealth::daemon_mode()
         || std::env::args().any(|arg| {
             matches!(
@@ -482,8 +474,7 @@ fn main() {
         info!("keystore2 target skipped by OMMEGA_INJECT_TARGETS");
     }
 
-    // SOTER 的宿主进程也注一份。它没在跑（或者注入失败）只记一条日志：
-    // keystore2 那条主路已经成了，模块不该因为这个起不来。
+    // SOTER 宿主也注一份；没在跑或注入失败只记日志。
     if inject_soter {
         match inject_named_process(SOTER_HOST_PROCESS) {
             Ok(()) => info!("soter host injection completed"),
@@ -598,8 +589,7 @@ pub extern "C" fn entry(handle: *const c_void) -> bool {
         ipc::enable_inproc_keymint();
         ommega::inproc::request_start();
     }
-    // RPC 会话不通不代表 hook 没用：SOTER 观察路径不碰网络，KeyMint 路径在 ommega
-    // 不可用时本就会回退到系统服务。所以只记日志，照样装 hook。
+    // RPC 会话不通只记日志，照样装 hook。
     if let Err(error) = ipc::install_direct_rpc_session() {
         error!("failed to initialize ommega RPC session: {error:#}; installing the hook anyway");
     }
@@ -670,7 +660,7 @@ mod tests {
 
     #[test]
     fn target_selection_keeps_unknown_names_as_extra_processes() {
-        // 环境变量是进程级的，两个测试分开写会互相踩，所以挤在一个里串完。
+        // 环境变量是进程级的，两个用例写在一个测试里串完。
         std::env::set_var("OMMEGA_INJECT_TARGETS", "keystore2,soter_hal_probe");
         let (keystore2, soter, soter_hidl, extras) = selected_targets();
         assert!(keystore2);

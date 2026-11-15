@@ -63,8 +63,7 @@ struct PendingTransactionCompletion {
 
 /// 一条被我们扣下的出站 SOTER 调用。
 ///
-/// 它在写阶段被换成了一个无效 handle，所以内核会照自己的规矩回一个 `BR_FAILED_REPLY`；
-/// 我们在读阶段拿`framed` 把那 4 字节替掉，宿主就看到一笔正常的回复。
+/// 写阶段换成无效 handle，内核回 `BR_FAILED_REPLY`；读阶段拿 `framed` 把那 4 字节替掉。
 struct InterceptedSoter {
     /// 拼好的 `BR_TRANSACTION_COMPLETE` + `BR_REPLY` 字节流。
     framed: Vec<u8>,
@@ -94,10 +93,8 @@ thread_local! {
     static PENDING_IOCTL_COPYBACKS: RefCell<HashMap<BinderStateKey, PendingIoctlCopyback>> = RefCell::default();
     /// 等着替换成真回复的 SOTER 调用，按 connection 分开、先进先出。
     ///
-    /// 靠顺序而不靠 handle 对号：内核回 `BR_FAILED_REPLY` 的时候不带任何标识，
-    /// 而同一个线程上一次只会有一个同步调用在等（它阻塞在 ioctl 里），所以 FIFO 就够。
-    /// 队首那个的 parcel 得一直留着 —— 宿主释放它时发过来的 `BC_FREE_BUFFER`
-    /// 就指着这个地址，见 `is_soter_owned_buffer`。
+    /// 按 FIFO 对号（同一个线程一次只有一个同步调用在等）。
+    /// 队首的 parcel 要留到 `BC_FREE_BUFFER` 回来，见 `is_soter_owned_buffer`。
     static INTERCEPTED_SOTER: RefCell<HashMap<BinderStateKey, VecDeque<InterceptedSoter>>> = RefCell::default();
 }
 
@@ -195,8 +192,7 @@ pub(super) fn release_intercepted_soter(connection: BinderStateKey, buffer: usiz
     });
 }
 
-/// 这个地址是不是我们自己合成回复时分配的（那它的 `BC_FREE_BUFFER` 就得整条抹掉，
-/// 因为内核对这个指针一无所知，让它发出去就是 binder_user_error + EINVAL）。
+/// 这个地址是不是我们自己合成回复时分配的（它的 `BC_FREE_BUFFER` 要整条抹掉）。
 pub(super) fn is_soter_owned_buffer(connection: BinderStateKey, buffer: usize) -> bool {
     INTERCEPTED_SOTER.with(|slot| {
         slot.borrow().get(&connection).is_some_and(|queue| {

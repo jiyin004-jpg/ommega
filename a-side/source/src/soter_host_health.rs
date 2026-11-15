@@ -4,7 +4,7 @@
 //! [`MIN_APP_OPS`]、其中至少 [`MIN_MUTATIONS`] 笔 `mutation=1`，而 HAL 侧一笔都没有，
 //! 就判它哑了。`getVersion` / `getExtraParam` 这类不碰 HAL 的调用不计入。
 //!
-//! daemon 跑在 keystore uid，杀不动 system 域的宿主，所以只写 [`STUCK_PATH`] 让 root
+//! daemon 杀不动 system 域的宿主，只写 [`STUCK_PATH`] 让 root
 //! 启动器去重启宿主；[`STATUS_PATH`] 是每窗口一份的计数，日志关掉时靠它排查。
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,8 +161,7 @@ pub fn start() {
     }
 }
 
-/// 记一笔观测。由 `IMaintenanceService::reportHookEvent` 调用，跑在 binder 线程上，
-/// 所以这里只做整数累加，不碰文件、不做判断。
+/// 记一笔观测。跑在 binder 线程上，只做整数累加，不碰文件。
 pub fn observe(message: &str) {
     let Some(sample) = classify(message) else {
         return;

@@ -21,12 +21,8 @@ pub const RPC_SOCKET_CONTEXT: &str = "u:r:keystore:s0";
 /// matches against. Written by `ommega-injector` (the path is named there too).
 pub const RPC_PEER_STATE: &str = "/data/misc/keystore/ommega/rpc.peers";
 
-/// 远端（B 真机）链里声明的设备身份落盘到这个文件，由 root 侧的 `daemon` 脚本读走
-/// 并用 resetprop 对齐到本机——否则「链是 B 的、属性是本机的」，检测器会报
-/// `device_properties` / VBMeta 摘要不一致。
-///
-/// 写在 keystore 状态目录里（0700 keystore）：TA 跑在 keystore2 进程内，只有这个
-/// 目录可写。
+/// 远端链里声明的设备身份落盘到这个文件，root 侧 `daemon` 读走并用 resetprop 对齐本机。
+/// 文件写在 keystore 状态目录（0700 keystore）。
 pub const REMOTE_IDENTITY_STATE: &str = "/data/misc/ommega/remote_identity";
 
 /// Second RPC rendezvous point, on the abstract unix namespace.

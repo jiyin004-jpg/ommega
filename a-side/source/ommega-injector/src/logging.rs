@@ -23,10 +23,9 @@ const APP_DOMAIN_LOG_PATH: &str = LOG_PATH;
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} [{h({l})}] [{P}/{T}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
-/// 实际装上 logger 的那个位置（两个候选里先成的那个）。给诊断用：用 `entry` 里
-/// 那条 RPC 报给 daemon 记一笔，不然 app 域的进程只能靠猜。
+/// 实际装上 logger 的位置（两个候选里先成的那个），随 RPC 报给 daemon。
 static ACTIVE_PATH: Mutex<Option<String>> = Mutex::new(None);
-/// 两个位置都没装上时记下的原因。同上，只为了能看见。
+/// 两个位置都没装上时记下的原因。
 static INIT_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 /// 每个候选日志路径的自开结果（`<path>: ok` 或 `<path>: <errno>`）。
@@ -123,12 +122,9 @@ fn spawn_switch_watcher() {
 }
 
 /// Fallback logger setup.  `configured_level` is the `[main] log_level` from
-/// `injector.toml`; which value comes in does not matter when the WebUI log
-/// switch is off — then nothing at all is written, from no process, at no level.
+/// `injector.toml`; when the WebUI log switch is off nothing is written.
 ///
-/// 开关本身走 `clienta_debug_logging()`：它先看 daemon-injector 落下的那份副本，
-/// 因为这段跑在 config 之前，而且目标进程（SOTER 宿主是 uid 1000）未必进得去
-/// keystore 那个目录。两处都读不到就当关着。
+/// 开关走 `clienta_debug_logging()`，先读 daemon-injector 落下的副本；读不到就当关着。
 pub fn init_logger_fallback(level: LevelFilter) {
     let _ = LOGGER_INIT.get_or_init(|| {
         if let Ok(mut guard) = DESIRED_LEVEL.lock() {
@@ -145,12 +141,9 @@ pub fn init_logger_fallback(level: LevelFilter) {
 }
 
 fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
-    // 只落文件。不用 logcat：那条线在 app 域里本来就不可靠，而且 A 端的日志
-    // 统一走文件。两个候选现在指向同一个位置（见 [`LOG_PATH`]），第一个就成了。
+    // 只落文件，不用 logcat。两个候选指向同一个位置（见 [`LOG_PATH`]），第一个就成了。
     //
-    // 先自己开一次，只为了把 errno 记下来：appender 那边把错误咽了（只 eprintln，
-    // 而注入进去的进程 stderr 根本没人看），光靠“没写出来”分不清是 DAC、SELinux
-    // 还是路径本身不对。这份探针文本会顺 RPC 报给 daemon。
+    // 先自己开一次把 errno 记下来，探针文本顺 RPC 报给 daemon。
     let mut last_error: Option<anyhow::Error> = None;
     let mut probes: Vec<String> = Vec::new();
     // 开关关着的时候不要顺手把日志文件建出来（面板那边的契约是「关着不建 log」）。

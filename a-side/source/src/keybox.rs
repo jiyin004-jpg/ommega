@@ -203,11 +203,7 @@ impl KeyBox {
     }
 
     fn signing_info(&self, key_type: SigningKeyType) -> Result<SigningInfoSnapshot, Error> {
-        // 证书里的「签发者用哪种钥匙」跟「叶子用哪种钥匙」是两件独立的事：RSA 叶
-        // 子完全可以由 EC 签发（反之亦然）。而大多数分发的 keybox 只有一个 EC 条目，
-        // 所以只按 `algo_hint` 硬选会让所有 RSA 变体的认证失败。
-        //
-        // 要的那一种没有就用另一种顶上（优先 EC），链路和身份都不换。
+        // 要的那种签发者没有就用另一种顶上（优先 EC），链路和身份都不换。
         let wanted = match key_type.algo_hint {
             SigningAlgorithm::Rsa => "RSA",
             SigningAlgorithm::Ec => "EC",
@@ -548,7 +544,7 @@ pub fn ensure_keybox_file(path: &str) -> Result<()> {
     write_bundled_keybox(path)
 }
 
-/// StrongBox 那份也补盘：文件不在就写内置的，不然面板上看不到，重启后又被当成没配。
+/// StrongBox 那份文件不在就写内置的。
 fn ensure_strongbox_keybox_file() {
     if Path::new(STRONGBOX_KEYBOX_PATH).exists() {
         return;
@@ -681,9 +677,7 @@ fn reload_from_disk_inner(retire_db_entries: bool) -> Result<bool> {
     let changed = install_keybox(keybox, retire_db_entries, !used_fallback);
     // StrongBox 那份：没有文件就用内置的，读坏了也一样，永不回落到主 keybox。
     let sb = load_strongbox_keybox();
-    // 换了 StrongBox 的链也要把已缓存的 attestation key 清掉，否则 kmr-ta 会继续用
-    // 上一次初始化好的叶子，面板里换了文件也看不到变化（只有主 keybox 变化才清的
-    // 旧逻辑漏掉了这一边）。
+    // 换了 StrongBox 的链也要清掉已缓存的 attestation key。
     let sb_changed = {
         let old = KEYBOX_SB
             .read()

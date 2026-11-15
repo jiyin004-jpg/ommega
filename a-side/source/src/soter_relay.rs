@@ -56,9 +56,7 @@ fn forward_inner(request: &str) -> Vec<u8> {
     // App 拿着脏缓存自删自建（见 `note_churn_and_maybe_heal`）：第 2 次删 AuthKey 就判。
     note_churn_and_maybe_heal(&value, &op);
 
-    // WebUI 的「SOTER 走远程」关着：本地自签兜底。这一行走 info，因为关掉之后日志里就
-    // 没有 "answered remotely" 了。这个开关与 KeyMint 的远程开关完全分开（`remote`
-    // 只管出证）。
+    // 「SOTER 走远程」关着：本地自签兜底。与 KeyMint 的远程开关互不影响。
     if !soter_remote_enabled() {
         log::info!("event=soter relay op={op} soter remote disabled; using the local backend");
         return Outcome::Local.encode();
@@ -294,16 +292,13 @@ pub const CALLER_UID_FIELD: &str = "caller_uid";
 /// uid 翻出来的包名（共享 uid 会有好几个，逗号连起来）。转发给服务端时用这个字段名。
 pub const CALLER_PKG_FIELD: &str = "caller_pkg";
 
-/// uid → 翻出来的包名 + 什么时候翻的。只有装/卸应用才会变，所以缓存一分钟。
+/// uid → 包名 + 缓存时刻。
 type CallerNames = std::sync::Mutex<Vec<(u32, std::time::Instant, Option<String>)>>;
 static CALLER_NAMES: CallerNames = std::sync::Mutex::new(Vec::new());
 
-/// uid → 包名（逗号连起来），带一层短缓存：它每笔 SOTER 调用都要问一次系统，而那个映射
-/// 只有装/卸应用才会变。
+/// uid → 包名（逗号连起来），带短缓存。
 fn caller_package_for_uid(uid: i64) -> Option<String> {
-    // 翻成功记一分钟（只有装/卸应用才会变）；翻不出来只记几秒 —— 那多半是系统那一刻
-    // 没答上来（AAID 服务刚起来、查不到这个 uid），不值得用一分钟的负面缓存挡住
-    // 「按包名判」这条路。
+    // 翻成功缓存一分钟，翻不出来只缓存几秒。
     const OK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
     const MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -364,10 +359,7 @@ fn with_caller_pkg(mut value: Value) -> Value {
         .and_then(Value::as_i64)
         .and_then(caller_package_for_uid)
         .or_else(|| {
-            // `caller_uid` 只有「注在宿主进程里」那条路才有意义：`soterta-ta` 是独立 HAL，
-            // 调它的是 soterserver（uid 1000），内核那格拿到的不是 App（还会把一堆共享 uid
-            // 的系统包一起翻出来）。SOTER 接口本来就把 App uid 当参数传（原厂 TA 也只认这个），
-            // 宿主就是拿它转发进来的，所以退一级用它翻。
+            // 独立 HAL 模式下内核给的调用者是 soterserver，退一级用 SOTER 参数里的 App uid。
             app_uid.and_then(caller_package_for_uid)
         })
         .or_else(|| {
@@ -386,11 +378,7 @@ fn with_caller_pkg(mut value: Value) -> Value {
     value
 }
 
-/// 远程没给出答案时的分岔：配置允许退回本地就退回，否则把这笔调用放给真 HAL。
-///
-/// 用的是「是否远程」之外的第二个开关 `local_hw`
-/// （`RemoteConfig::fallback_local`，缺省为真）：B 端不在线时默认拿 A 端自签把流程走完，
-/// 而不是让 app 拿到真 HAL 那整族 -20 的答复。
+/// 远程没给出答案时：`fallback_local` 为真就本地自签，否则放给真 HAL。
 fn no_remote_answer(op: &str, reason: &str) -> Vec<u8> {
     if fallback_local() {
         log::warn!("event=soter relay op={op} {reason}; falling back to the local backend");
@@ -413,12 +401,8 @@ fn out_bytes(outcome: &Outcome) -> usize {
     }
 }
 
-/// SOTER 的身份是 `(cpu_id, uid)` 一起绑的：B 的密钥库里只有它自己那套应用的密钥，
-/// 其余 uid 全 `-5`，所以设备替身这条线上拿 A 端那个 uid 去问 B 必然问不到 —— 得按 B 自己
-/// 的身份问。
-///
-/// 这就是那张表存在的理由（`soter_uid_map: 10490=10373`，逗号/分号/空格分隔多条，每条的
-/// `A=B` 里 `=` 也可以写成 `:` 或 `->`）。没配就不动：uid 猜错了答出来的东西比「没有」更坑。
+/// SOTER uid 替身映射（`soter_uid_map: 10490=10373`，逗号/分号/空格分隔多条，
+/// `=` 也可以写成 `:` 或 `->`）。没配就不动。
 fn apply_uid_map(value: &Value, raw: &str) -> Option<Value> {
     let from = value.get("uid").and_then(Value::as_i64)?;
     let to = parse_uid_map(raw).into_iter().find(|(a, _)| *a == from)?.1;
@@ -701,7 +685,7 @@ mod tests {
         // 调用方自己带着就不动（`get_device_id` 这类探针时手动指定的场合）。
         let explicit = json!({"op": "get_device_id", "cpu_id": "09000000aabbccddeeff001122334455"});
         assert_eq!(with_cpu_id(explicit.clone(), Some(some)), explicit);
-        // 不是对象的请求照原样递过去，不能因为它把整条链路弄崩。
+        // 不是对象的请求照原样递过去。
         assert_eq!(with_cpu_id(json!("nope"), None), json!("nope"));
     }
 

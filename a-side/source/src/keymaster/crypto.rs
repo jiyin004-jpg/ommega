@@ -295,8 +295,7 @@ mod test {
     }
 
     /// 照 `decrypt_message_ommega_legacy` 的路子派一把 legacy 的 AES key。
-    /// sender / recipient 两个公钥得分开传，因为旧版那个适配器把它们当两次盐使，
-    /// 加密侧和解密侧的顺序是反的，这里按解密侧的写法来。
+    /// sender / recipient 两个公钥分开传，顺序按解密侧来。
     fn legacy_aes_key(
         salt: &[u8],
         self_key: &ECDHPrivateKey,

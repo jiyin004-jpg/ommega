@@ -375,10 +375,7 @@ fn gcm_decrypt(
 }
 
 /// 按 (密钥长度, tag 长度) 分派到 `aes-gcm` 的对应实例。
-///
-/// ring 的 `AES_*_GCM` 只认 16 字节 tag、也没有 AES-192，所以这里整段换成
-/// `aes-gcm`：tag 12/13/14/15/16 都是 AOSP 允许的（`GCMParameterSpec(96, iv)`），
-/// 192 位密钥也是（AOSP 同时支持 128/192/256）。
+/// 支持 tag 12..16 与 128/192/256 位密钥。
 macro_rules! gcm_dispatch {
     ($key:expr, $tag_len:expr, $op:ident, $nonce:expr, $aad:expr, $input:expr) => {{
         use aes_gcm::aead::consts::{U12, U13, U14, U15, U16};

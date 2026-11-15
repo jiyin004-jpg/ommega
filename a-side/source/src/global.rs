@@ -46,18 +46,14 @@ static GC: LazyLock<Arc<Gc>> = LazyLock::new(|| {
             Box::new(|uuid, blob| {
                 let security_level = match uuid.to_security_level() {
                     Some(level) => level,
-                    // DB 里这条记录的 uuid 认不出对应的 HAL（数据损坏或者旧版本
-                    // 遗留），不知道该找谁去删，直接跳过。别在这儿 unwrap。
+                    // uuid 认不出对应的 HAL：直接跳过，不在这 unwrap。
                     None => return Ok(()),
                 };
 
                 let km_dev = match get_keymint_wrapper(security_level) {
                     Ok(dev) => dev,
-                    // 这个 level 的 HAL 拿不到（硬件上没有，或者被 hide_strongbox
-                    // 藏了），绑在上面的旧 blob 也就没法再 invalidate，当"不用失效"
-                    // 放行，让 DB 行正常删掉。不能在这儿 unwrap：release 下是
-                    // panic=abort，会把整个 keymint 进程打崩；而 blob 行因为没提交
-                    // 会留到下次开机，于是每次启动都再崩一次。
+                    // 这个 level 的 HAL 拿不到：当「不用失效」放行，让 DB 行正常删掉。
+                    // 不能 unwrap（panic=abort 会打崩 keymint 进程）。
                     Err(e) if KeyMintDevice::is_hardware_type_unavailable(&e) => return Ok(()),
                     Err(e) => {
                         return Err(e)

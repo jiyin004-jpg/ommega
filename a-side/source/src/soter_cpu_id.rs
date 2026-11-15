@@ -5,8 +5,7 @@
 //! （`ro.boot.serialno` / `ro.serialno`），读不到序列号就不报号、也不编一个 —— 转发
 //! 干脆不带 `cpu_id`，由服务端按当时的年月日时分现造。
 //!
-//! 落盘是因为 SOTER 宿主是 uid 1000，读不到 daemon 的域。算法必须和 payload 里的
-//! `soter_local::cpu_id_from` 一致，否则同一条兜底路会因为文件在不在而报两个号。
+//! 落盘给 SOTER 宿主（uid 1000）读。算法与 payload 里的 `soter_local::cpu_id_from` 一致。
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -22,8 +21,7 @@ const SEED: &str = "ommega-a-side-soter:";
 static DERIVED: Mutex<Option<String>> = Mutex::new(None);
 static STARTED: OnceLock<()> = OnceLock::new();
 
-/// 起派生线程（幂等）。
-/// 只读属性 + 写一个小文件，不发请求；放后台是因为它定期看一眼序列号，热路径只读缓存。
+/// 起派生线程（幂等）。只读属性 + 写一个小文件，不发请求。
 pub fn start() {
     if STARTED.set(()).is_err() {
         return;
@@ -68,8 +66,8 @@ fn forget() {
     }
 }
 
-/// 当前该报给服务端的 cpu_id；没有真实来源返回 `None`，转发时不带这个字段。
-/// 不发请求：内存有就用内存，否则看副本文件，再否则现派生；没有序列号就 `None`。
+/// 当前该报给服务端的 cpu_id；没有真实来源返回 `None`。
+/// 顺序：内存 → 副本文件 → 现派生。
 pub fn current() -> Option<String> {
     if let Some(value) = cached() {
         return Some(value);
@@ -191,8 +189,7 @@ mod tests {
         assert_eq!(local_id_from_serial("320143945328").len(), 32);
     }
 
-    /// 读不到序列号就没有号：不拿写死的种子编一个（否则每台机器报同一个号）。
-    /// 转发时不带 cpu_id，交给服务端按时间造。
+    /// 读不到序列号就返回 `None`，转发时不带 cpu_id。
     #[test]
     fn a_missing_serial_yields_no_id_at_all() {
         assert_eq!(id_for_serial(None), None);
@@ -217,7 +214,7 @@ mod tests {
             kmr_common::soter_relay::parse_cpu_id(&body).as_deref(),
             Some(value)
         );
-        // 第二次写同样内容：文件不该被重写（不然启动器每轮都会镜像一遍）。
+        // 第二次写同样内容，文件不重写。
         let first = std::fs::metadata(path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         write_mirror_to(path, "soter_cpu_id", value).unwrap();

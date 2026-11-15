@@ -181,10 +181,7 @@ pub fn evaluate_with_sid(
     }
 
     if !config.enabled {
-        // 主开关关着 ≠“谁都能接”：系统进程（init / system_server / keystore /
-        // vold / root）一律留在系统后端，否则开机期的 keystore 流量会全拐到我们这里，
-        // 系统拿到它用不了的回复就是开机即重启。普通应用（每用户 10000–19999）
-        // 和显式绑定的系统 app 域照旧放行。
+        // 主开关关着：放行普通应用和绑定的系统 app 域，其余调用方走系统后端。
         let app_uid = uid % AID_USER_OFFSET >= AID_APP_START;
         let allowed = app_uid || sid_allows_system_uid(sid, config);
         return FilterDecision {

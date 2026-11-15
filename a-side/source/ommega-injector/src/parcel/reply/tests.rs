@@ -224,11 +224,7 @@ fn soter_init_reply_has_no_return_value_slot_and_the_error_code_comes_first() {
 
 #[test]
 fn a_return_value_slot_in_the_init_reply_makes_the_host_read_a_null_session() {
-    // 回归防线。给这份回复多写一格「方法返回值」的话，宿主 `readTypedObject` 读到的
-    // 第一个 i32 就是那个错误码 —— 成功的时候它恰好吃到 0，于是整个 parcelable 被判成
-    // null；soterserver 里 `if (initSign != null)` 不成立，`SoterSessionResult` 留在默认值
-    // （resultCode = 0、session = 0）交回微信，微信拿 0 去 finishSign，又被它自己那句
-    // `if (j == 0) resultCode = -204;` 挡下，开通就失败。
+    // 回归：多写一格「方法返回值」会让宿主把 parcelable 判成 null。
     let mut parcel = Parcel::new();
     parcel.write(&Status::from(StatusCode::Ok)).unwrap();
     parcel.write(&0i32).unwrap();

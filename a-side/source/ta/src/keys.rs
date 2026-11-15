@@ -244,11 +244,7 @@ impl crate::KeyMintTa {
                     remote_boot.as_ref().unwrap()
                 }
                 _ => {
-                    // 本机 keybox 签的叶子要与远程 RKP 链持同一份 RootOfTrust，否则两条
-                    // 路径的 device_locked / verified_boot_state 说法不一，检测器报
-                    // `ROOT_OF_TRUST_DIVERGENCE`。
-                    // 仅远程开启时跟远程值；远程关闭时用本机值，避免被残留的
-                    // remote_identity 影响（把锁定的机器说成已解锁）。
+                    // 远程开启时叶子沿用远程链的 RootOfTrust，关闭时用本机值。
                     remote_boot = if self
                         .dev
                         .remote
@@ -561,17 +557,15 @@ impl crate::KeyMintTa {
         // Tag the relay-minted chain with the requesting security level so a
         // STRONGBOX request is not misreported as TEE by the relay's default.
         remote_params.security_level = Some(self.hw_info.security_level as i32);
-        // 设备 ID 证明：调用方要了就随请求带上本机那套值（见 `remote_attestation_ids`），
-        // 否则中继铸出的叶子缺 710..717，校验方会报 Device Properties 异常。
+        // 设备 ID 证明：调用方要了就随请求带上本机那套值（`remote_attestation_ids`）。
         if needs_attestation_ids(params) {
             let ids = self
                 .get_attestation_ids()
                 .ok_or_else(|| km_err!(CannotAttestIds, "no attestation IDs provisioned"))?;
             remote_params.attestation_ids = remote_attestation_ids(params, &ids)?;
         }
-        // MODULE_HASH（tag 724）：本机路径由 HAL 经 `SetAdditionalAttestationInfo`
-        // （`KeyParam::ModuleHash`）塞入；远程路径必须原样转发同一份摘要，否则叶子缺 724
-        // 而 `getSupplementaryAttestationInfo` 仍返回本机值，校验方报 MODULE_HASH 缺失。
+        // MODULE_HASH（tag 724）：本机路径经 `SetAdditionalAttestationInfo` 进来，
+        // 远程路径原样转发同一份摘要。
         remote_params.module_hash =
             self.additional_attestation_info
                 .iter()
@@ -610,8 +604,7 @@ impl crate::KeyMintTa {
             return Ok(None);
         }
 
-        // 显式委派：B 必须真的用了调用方指定的那把证明密钥，否则整条链拒掉
-        // （不能静默接受批量 key 签出的无关证书）。
+        // 显式委派：B 必须用了调用方指定的那把证明密钥，否则整条链拒掉。
         if let Some(issuer) = attestation_key {
             crate::cert::validate_remote_delegation(&chain, issuer)?;
         }
@@ -643,8 +636,7 @@ impl crate::KeyMintTa {
         self.add_keymint_tags(&mut chars, KeyOrigin::Generated)?;
         let _ = keygen_info;
         let root_of_trust = crate::cert::parse_remote_root_of_trust(leaf_der)?;
-        // 把 B 真机声明的设备身份落盘，root 侧 `daemon` 用它做 resetprop 对齐；链与
-        // 本机属性必须描述同一台机器，否则检测器报 device_properties 不一致。
+        // 把 B 真机声明的设备身份落盘，root 侧 `daemon` 用它做 resetprop 对齐。
         persist_remote_identity(leaf_der);
         let remote_key = KeyMaterial::Remote(crypto::RemoteRef {
             alias,
@@ -1426,9 +1418,8 @@ fn remote_identity_text() -> Option<String> {
     Some(text)
 }
 
-/// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写（避免触发重启循环）。
-/// TA 跑在 keystore2 进程（uid 1017），只写文件；resetprop 和重启 zygote 由 root 侧
-/// daemon 负责。
+/// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写。
+/// TA 只写文件，resetprop 和重启 zygote 由 root 侧 daemon 负责。
 fn persist_remote_identity(leaf_der: &[u8]) {
     const PATH: &str = "/data/misc/ommega/remote_identity";
     let Some(identity) = crate::cert::parse_remote_device_identity(leaf_der) else {

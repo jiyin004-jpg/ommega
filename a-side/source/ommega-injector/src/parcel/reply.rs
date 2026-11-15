@@ -27,7 +27,7 @@ pub struct OwnedReply {
     /// HIDL 答复里 `binder_buffer_object` 的 `buffer` 指向这些堆块：内核不认识这些指针，
     /// 宿主直接按地址读，块必须活到 `BC_FREE_BUFFER` 交回为止。AIDL 那条路留空。
     ///
-    /// 没人读这些块，纯靠它活着，所以标记成别管 lint。
+    /// 这些块只用来维持生命周期。
     #[allow(dead_code)]
     storage: Vec<Box<[u8]>>,
 }

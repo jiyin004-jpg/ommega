@@ -287,8 +287,7 @@ fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
 
 /// root 侧（`daemon-injector`）周期性写出来的「当前前台应用」：一行 `<epoch 秒> <包名>`。
 ///
-/// 最后一道兜底，比前面三层弱：前台是谁不等于谁在调 SOTER（可能在子进程/后台），
-/// 所以还要过新鲜度阀（见 `FOREGROUND_TTL_SECS`），文件不存在就等于没数据。
+/// 最后一道兜底，过新鲜度阀（见 `FOREGROUND_TTL_SECS`），文件不存在等于没数据。
 const FOREGROUND_PATH: &str = "/data/misc/ommega/foreground";
 
 /// 前台信息算多新鲜才能用。写侧开机阶段每 3 秒、之后每 5 秒采一次，

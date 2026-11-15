@@ -118,10 +118,7 @@ fn repair_ommega_data_files() {
 }
 
 fn prepare_android_storage() {
-    // 目录 0771 而非 0770：读的一方不只 keystore 域，SOTER 宿主跑在 uid 1000，
-    // 要按已知路径进目录读 ATTK / cpu_id，所以 other 必须有 x（能按名访问、不能列举）。
-    // logs 必须是 1777 而不是 0777：注入到 app 域的 payload 要往这里落日志，光靠
-    // group 写不够；sticky 位禁止删除/改名或拿软链顶替别人的日志文件，写内容仍允许。
+    // 状态目录 0771，logs 目录 1777（带 sticky 位）。
     for (dir, mode) in [
         (root_path!(), 0o771),
         (root_path!("logs"), 0o1777),
@@ -162,8 +159,7 @@ fn prepare_android_storage() {
         }
     }
 
-    // 已有日志文件一律 0666（app 域要读）。文件由 payload 在运行时新建、默认 0600，
-    // 所以每次启动都得重设一遍。
+    // 已有日志文件统一重设成 0666。
     if let Ok(entries) = std::fs::read_dir(root_path!("logs")) {
         for entry in entries.flatten() {
             let path = entry.path();

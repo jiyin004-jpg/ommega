@@ -271,7 +271,7 @@ pub(crate) fn extract_subject(cert: &keymint::Certificate) -> Result<Vec<u8>, Er
 /// 远端链声明的设备身份：brand/device/product/serial/manufacturer/model、
 /// verified boot hash、bootPatchlevel 与设备锁状态。
 ///
-/// 子叶子的 ROOT_OF_TRUST 必须逐字沿用远端链，否则与证明密钥对不上，会被判为篡改。
+/// 子叶子的 ROOT_OF_TRUST 逐字沿用远端链。
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RemoteDeviceIdentity {
     pub brand: Option<Vec<u8>>,
@@ -408,9 +408,7 @@ fn x509_oid(oid: ObjectIdentifier) -> Result<X509ObjectIdentifier, Error> {
 
 /// 校验一张「证明密钥」证书是否为硬件 ATTEST_KEY。
 ///
-/// 原生 KeyMint 的签发权限来自 keyblob 的用途而不是 PKIX 的 CA 属性：真机铸出的
-/// ATTEST_KEY 叶子 `Key Usage` 只有 Certificate Sign（可能再加 digitalSignature），
-/// 且没有 BasicConstraints。所以只认证书里硬件授权的用途：
+/// 只认证书里硬件授权的用途：
 ///
 /// * `hw_enforced.purpose` 恰好是 `[ATTEST_KEY]`（混了别的用途就不是证明密钥），
 /// * `keymint_security_level` 是 TEE / StrongBox 且与 `attestation_security_level` 一致。
@@ -703,11 +701,8 @@ pub(crate) fn attestation_extension<'a>(
         keymint::SecurityLevel::Software => (params, &[]),
         _ => (&[], params),
     };
-    // 两个列表都把 `attestation_ids` 传进去（第三个参数）：那是**已固化的设备身份**，
-    // 只用于校验（AOSP 里是 `check_attestation_id!` 宏，对不上回 CannotAttestIds），
-    // 不是写进列表的值。真正写进去的是 `AuthorizationList::new` 里从 keygen_params
-    // 抽出来的那几项：级别非 Software 时 params 全给了 hw_enforced，所以 710..717
-    // 天然只落在 teeEnforced（`device_ids_are_hardware_enforced_only` 钉住了这一点）。
+    // `attestation_ids` 是已固化的设备身份，只用于校验，不写进列表；
+    // 写进列表的是 `AuthorizationList::new` 从 keygen_params 抽的那几项。
     let mut sw_enforced = AuthorizationList::new(
         sw_chars,
         sw_params,
@@ -716,14 +711,7 @@ pub(crate) fn attestation_extension<'a>(
         Some(app_id),
         additional_attestation_info,
     )?;
-    // 兜底：软件强制列表里一个设备 ID 都不许有。
-    //
-    // 设备属性（brand/device/product/manufacturer/model）是**硬件层证明的事实**，真机
-    // （TEE 和 SE 都一样）只把它写进 teeEnforced；一加/OPPO 工程模式的「StrongBox
-    // Attestation Key ID Modify」把 softwareEnforced 里出现 710/711/712/716/717 直接
-    // 判 Fail（日志写 Device properties should not be software enforced）。
-    // 上面那条路径本来就落不到这儿，这道清空是为了 chars 里万一混进 ID tag（它不属
-    // key_characteristic，理论上不会）时叶子仍然只有硬件那侧带设备属性。
+    // 软件强制列表里不放设备 ID：700..717 只落在 teeEnforced 那侧。
     sw_enforced.ids = AttestationIds::default();
     let hw_enforced = AuthorizationList::new(
         hw_chars,
@@ -2349,7 +2337,7 @@ mod tests {
             .expect("extension encodes");
             assert_eq!(ext.attestation_security_level as u32, want);
             assert_eq!(ext.keymint_security_level as u32, want);
-            // 也不能因为级别不同就丢掉 hw_enforced 里的内容：级别只影响标哪个值。
+            // 级别只影响标哪个值，hw_enforced 的内容照留。
             let der = asn1_der_encode(&ext).expect("extension serializes");
             let parsed = AttestationExtension::from_der(&der).expect("round-trips");
             assert_eq!(parsed.attestation_security_level as u32, want);

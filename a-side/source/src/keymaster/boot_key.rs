@@ -110,9 +110,7 @@ fn get_level_zero_key_km_and_strategy() -> Result<(KeyMintDevice, DenyLaterStrat
                 DenyLaterStrategy::EarlyBootOnly,
             ))
         } else {
-            // 注意这里用的是探测真实硬件的版本：hide_strongbox 把强盒对上层藏起来
-            // 之后，level 0 key 的选源不能跟着变。不然原本选 StrongBox 的设备会
-            // 改选 TEE，super key 换源，既有 blob 就全解不开了。
+            // 这里用探测真实硬件的版本，`hide_strongbox` 不改变 level 0 key 的选源。
             match KeyMintDevice::get_or_none_probing_real_hardware(SecurityLevel::STRONGBOX)
                 .context(err!("Get Strongbox instance failed."))?
             {

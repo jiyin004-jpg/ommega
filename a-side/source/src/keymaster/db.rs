@@ -1172,9 +1172,7 @@ impl KeystoreDB {
             let Ok(leaf_cert) = Certificate::from_der(&leaf_cert) else {
                 return Ok(());
             };
-            // EAT（2.1.25）链的密钥同样要打回收元数据，否则换 keybox 时这些
-            // 旧绑定永远不被 retire（元数据是 retire_stale_keybox_bound_entries
-            // 的唯一判据）。
+            // EAT（2.1.25）链的密钥也要打回收元数据。
             if !leaf_cert
                 .tbs_certificate()
                 .extensions()

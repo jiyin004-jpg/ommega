@@ -413,11 +413,7 @@ fn bits2int(msg: &[u8], curve: ec::NistCurve) -> Vec<u8> {
     out
 }
 
-/// 大端字节串整体右移 `bits` 位。
-///
-/// 大端下「位 0」是最高位：右移之后结果的最低位来自原串更靠后的位，所以结果第 `pos`
-/// 位（从最高位数）对应原串第 `pos - bits` 位，负数补 0。别把方向搞反 —— 反了会把
-/// 62 个 0xFF 右移成 0xFF 而不是 0x01FF…（我第一次就写反了）。
+/// 大端字节串整体右移 `bits` 位，右侧补 0。
 fn shift_right_be(buf: &mut [u8], bits: usize) {
     let total = buf.len() * 8;
     if bits == 0 {
@@ -446,12 +442,10 @@ fn shift_right_be(buf: &mut [u8], bits: usize) {
 }
 /// Sign a digest directly with ECDSA, returning a DER signature.
 ///
-/// 两件事必须跟 AOSP 的 BoringSSL 一致，否则检测器一眼能看出这不是 TEE 的行为：
+/// 跟 AOSP 的 BoringSSL 保持一致：
 ///
 /// - 输入按 `bits2int` 处理（最左边阶位数的位），见 [`bits2int`]；
-/// - **每次签名取随机 k**。RustCrypto 的 `sign_prehash`/`SigningKey::sign` 走 RFC 6979，
-///   同一把钥匙同一个消息签两次字节完全一样；BoringSSL 是 `ECDSA_do_sign` 取随机 k，
-///   两次不一样。真机缺口探针 E04 就是拿这个判的。
+/// - 每次签名取随机 k，同一把钥匙同一个消息签两次结果不同。
 fn sign_ecdsa_prehashed(key: &Key, curve: ec::NistCurve, msg: &[u8]) -> Result<Vec<u8>, Error> {
     use ecdsa::hazmat::SignPrimitive as _;
     use elliptic_curve::ff::Field as _;

@@ -30,10 +30,7 @@ fn write_at(path: &str, text: &str) -> bool {
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // 这个文件是几个域一起写的：keystore 域里的 payload、hal_soter、还有 system_app
-    // 宿主。不能保留原权限：只要哪一次留下 0644，后面不属同一 uid 的写者就全哑了，
-    // 而且 rename 会把 0644 一直带下去（症状是 ASK/AuthKey 只活在内存里、墓碑永远
-    // 清不掉，导出 AuthKey 恒 -6）。所以落盘完统一 0666。
+    // 这个文件由几个域一起写，落盘完统一 0666。
     let tmp = format!("{path}.rpc.tmp");
     let mut fail = None;
     match std::fs::write(&tmp, text.as_bytes()) {

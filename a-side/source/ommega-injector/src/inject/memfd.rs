@@ -21,12 +21,10 @@ use super::payload_fd::remote_c_int_result;
 
 /// Linux 的 memfd 标志：exec 时关掉（别漏给以后 exec 出去的东西）。
 const MFD_CLOEXEC: usize = 0x0001;
-/// Android 内核自己加的位。没这个位，memfd 出来就是不可执行的（mmap PROT_EXEC 被拒），
-/// 而 dlopen 必须能 exec 那段代码。老内核不认这个位（EINVAL），所以要退回去重试一次。
+/// Android 内核加的 memfd 可执行位；老内核不认（EINVAL）就退回重试一次。
 const MFD_EXEC: usize = 0x0010;
 
-/// 一次搬多少字节。真正贵的是每块一次远程 write()（每块都得让目标停下来再走），
-/// 所以块别太小；30 多 KB 一次 process_vm_writev 搬得动。
+/// 一次搬多少字节（每块一次远程 `process_vm_writev`）。
 const CHUNK: usize = 32 * 1024;
 
 /// 在目标栈上占一块固定大小的暂存区，之后每块都写回这一处。千万不能把每块都当成一次
