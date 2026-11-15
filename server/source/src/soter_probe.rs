@@ -270,8 +270,7 @@ fn uid_listed(device: &str, uid: i32, list: &str) -> bool {
 /// `caller_pkg` 字段名：A 端把「真正调用者是谁」的包名带过来（设备本地解析，精确）。
 /// 带了就按它判白名单；没带（老 A 端）就沿用下面那套别名/槽位逻辑。
 pub const CALLER_PKG_FIELD: &str = "caller_pkg";
-/// `caller_pkg` 的来源：`arg` 表示从 SOTER 参数里 App 自己填的 uid 翻出来的，
-/// 不可信 —— 只做负向拦截（不在白名单就服务端作答），绝不用它放行真机。
+/// `caller_pkg` 的来源：`arg` = 请求参数里 App 填的 uid 翻出来的，`foreground` = 用前台应用兜底。
 pub const CALLER_PKG_SRC_FIELD: &str = "caller_pkg_src";
 
 /// 真应用的包名白名单：这些才交给真机，其余一律内置料。
@@ -359,6 +358,16 @@ fn same_app(listed: &str, caller: &str) -> bool {
     !a.is_empty() && a == b
 }
 
+/// 真应用别名前缀名单的生效值（控制台改过就用控制台的）。
+fn real_prefixes_of(cfg: &Config) -> String {
+    let fallback = if cfg.soter_real_app_prefixes.trim().is_empty() {
+        DEFAULT_REAL_APP_PREFIXES.to_string()
+    } else {
+        cfg.soter_real_app_prefixes.clone()
+    };
+    crate::soter_policy::real_prefixes(&fallback)
+}
+
 /// 带「调用者包名」的 [`reason`]：带了包名就按白名单判（精确），没带就退回别名/槽位逻辑。
 pub fn reason_with_caller(
     cfg: &Config,
@@ -368,7 +377,10 @@ pub fn reason_with_caller(
     caller_pkg: Option<&str>,
     caller_pkg_src: Option<&str>,
 ) -> Option<String> {
-    let pkg_is_arg = caller_pkg_src.is_some_and(|src| src.trim().eq_ignore_ascii_case("arg"));
+    let pkg_is_arg = caller_pkg_src.is_some_and(|src| {
+        let src = src.trim();
+        src.eq_ignore_ascii_case("arg") || src.eq_ignore_ascii_case("foreground")
+    });
     if let Some(pkg) = caller_pkg.map(str::trim).filter(|p| !p.is_empty()) {
         let packages = if cfg.soter_real_app_packages.trim().is_empty() {
             DEFAULT_REAL_APP_PACKAGES.to_string()
@@ -408,12 +420,7 @@ fn reason_without_caller(
     alias: Option<&str>,
 ) -> Option<String> {
     let alias = alias.unwrap_or("").trim();
-    let real_prefixes = if cfg.soter_real_app_prefixes.trim().is_empty() {
-        DEFAULT_REAL_APP_PREFIXES.to_string()
-    } else {
-        cfg.soter_real_app_prefixes.clone()
-    };
-    let real_prefixes = crate::soter_policy::real_prefixes(&real_prefixes);
+    let real_prefixes = real_prefixes_of(cfg);
     let local_only_prefixes =
         crate::soter_policy::local_only_prefixes(&cfg.soter_local_only_prefixes);
     let local_only_uids = crate::soter_policy::local_only_uids(&cfg.soter_local_only_uids);
@@ -694,7 +701,7 @@ mod tests {
         );
     }
 
-    /// 一个 uid 挂着好几个包时，A 端逗号连起来一起报；命中任意一个就算真应用。
+    /// `arg` 来源的包名照常按白名单判。
     #[test]
     fn an_arg_sourced_package_is_trusted() {
         let cfg = Config::default();
@@ -708,7 +715,7 @@ mod tests {
                 Some("arg")
             ),
             None,
-            "arg 来源的白名单包名来自真实 uid，应当放行"
+            "arg 来源的白名单包名应当放行"
         );
         let why = reason_with_caller(
             &cfg,

@@ -354,26 +354,31 @@ fn with_caller_pkg(mut value: Value) -> Value {
         return value;
     }
     let app_uid = value.get("uid").and_then(Value::as_i64);
-    let pkg = value
+    // 第二个元素是包名来源：`None` = 内核给的调用者 uid；`Some(src)` = 从请求参数或前台应用
+    // 凑出来的，报给服务端时带上 `caller_pkg_src`。
+    let resolved = value
         .get(CALLER_UID_FIELD)
         .and_then(Value::as_i64)
         .and_then(caller_package_for_uid)
+        .map(|pkg| (pkg, None))
         .or_else(|| {
-            // 独立 HAL 模式下内核给的调用者是 soterserver，退一级用 SOTER 参数里的 App uid。
-            app_uid.and_then(caller_package_for_uid)
+            app_uid
+                .and_then(caller_package_for_uid)
+                .map(|pkg| (pkg, Some("arg")))
         })
         .or_else(|| {
-            // 两个都没有：用 root 侧写的「当前前台应用」兜底。这一步必须放在这里 ——
-            // 没有 `caller_uid` 是更早的 return，接在别处就永远走不到。
-            crate::plat::utils::foreground_package().inspect(|pkg| {
-                log::info!("event=soter caller 用前台应用兜底 -> {pkg}");
-            })
+            crate::plat::utils::foreground_package()
+                .inspect(|pkg| log::info!("event=soter caller 用前台应用兜底 -> {pkg}"))
+                .map(|pkg| (pkg, Some("foreground")))
         });
-    let Some(pkg) = pkg else {
+    let Some((pkg, src)) = resolved else {
         return value;
     };
     if let Some(map) = value.as_object_mut() {
         map.insert(CALLER_PKG_FIELD.to_string(), Value::from(pkg));
+        if let Some(src) = src {
+            map.insert("caller_pkg_src".to_string(), Value::from(src));
+        }
     }
     value
 }
