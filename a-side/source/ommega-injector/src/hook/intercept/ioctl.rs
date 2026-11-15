@@ -91,21 +91,26 @@ pub(in crate::hook) unsafe fn new_ioctl(fd: c_int, request: c_int, arg: *mut c_v
         else {
             return fail_before_ioctl(libc::EFAULT);
         };
-        let Some(_) = (original_write_buffer as usize).checked_add(original_write_size) else {
+        if (original_write_buffer as usize)
+            .checked_add(original_write_size)
+            .is_none()
+        {
             return fail_before_ioctl(libc::EFAULT);
-        };
+        }
         host_write = match copy_process_buffer(write_address, write_remaining) {
             Ok(write) => write,
             Err(error) => return fail_before_ioctl(error),
         };
     }
-    if read_remaining > 0 {
-        let Some(_) = (original_read_buffer as usize).checked_add(input_read_consumed) else {
-            return fail_before_ioctl(libc::EFAULT);
-        };
-        let Some(_) = (original_read_buffer as usize).checked_add(original_read_size) else {
-            return fail_before_ioctl(libc::EFAULT);
-        };
+    if read_remaining > 0
+        && ((original_read_buffer as usize)
+            .checked_add(input_read_consumed)
+            .is_none()
+            || (original_read_buffer as usize)
+                .checked_add(original_read_size)
+                .is_none())
+    {
+        return fail_before_ioctl(libc::EFAULT);
     }
     if !write_process_value(arg.cast::<binder_write_read>(), &bwr) {
         return fail_before_ioctl(libc::EFAULT);
