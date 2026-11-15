@@ -104,21 +104,34 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// 见 `try_self_reboot`。
 pub fn note(op: &str, error_code: i64) {
     if error_code == TEE_WEDGE_CODE {
-        let signals = {
-            let mut guard = lock(&WEDGE_SIGNALS);
-            *guard += 1;
-            *guard
+        // 加一、判阈值、清零全在同一个 guard 里：分开 lock 的话，两个 worker 各自
+        // 加到 1 就都不够阈值，`258` 成串出现也永远等不到重启。
+        let reached = {
+            let mut signals = lock(&WEDGE_SIGNALS);
+            *signals += 1;
+            if *signals >= WEDGE_LIMIT {
+                let reached = *signals;
+                *signals = 0;
+                Some(reached)
+            } else {
+                None
+            }
         };
-        if signals >= WEDGE_LIMIT {
-            *lock(&WEDGE_SIGNALS) = 0;
+        if let Some(signals) = reached {
             try_self_reboot(op, signals);
         }
         return;
     }
-    let count_before = *lock(&FAILURES);
-    let since_restart = lock(&LAST_RESTART).map(|at| at.elapsed());
-    let (count, verdict) = step(op, error_code, count_before, since_restart);
-    *lock(&FAILURES) = count;
+    // 读计数、算下一笔、写回去也在同一个 guard 里：拆成「先读锁再单独写锁」时，
+    // 并发的两笔会读到同一个旧值，其中一笔记账就丢了。
+    let (count, since_restart, verdict) = {
+        let mut failures = lock(&FAILURES);
+        let count_before = *failures;
+        let since_restart = lock(&LAST_RESTART).map(|at| at.elapsed());
+        let (count, verdict) = step(op, error_code, count_before, since_restart);
+        *failures = count;
+        (count, since_restart, verdict)
+    };
     match verdict {
         // 真签出东西来 = 连存储一起好了：把「卡住」的牌子摘掉。
         Verdict::Reset => *lock(&WEDGE_UNRESOLVED) = false,

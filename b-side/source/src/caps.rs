@@ -113,38 +113,59 @@ fn soter_usable() -> bool {
 /// 上没材料、`-204` 是会话被顶掉。服务端接了这个结论会把一台明明能签的机器从
 /// 签名链路上踢掉，比不报还糟。
 fn probe_sign_capability(target: Option<&SignProbeTarget>) {
-    // sign_probe atomically checks the session lease and reserves HAL access.
-    let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, cached)) = cache.as_ref() {
-        // 已经挣到结论就不用再探了；另外同一个目标 5 分钟内也不重复探。
-        if soter::sign_state() != soter::SignState::Unknown
-            || (cached.as_ref() == target && at.elapsed() < SOTER_PROBE_TTL)
-        {
-            return;
+    // 锁内只做「该不该探」的判定，并顺手把这次探针的时间戳占上：`sign_probe` 要开
+    // HAL、走一遍 TA（可能好几秒），把 `SIGN_PROBED_AT` 攥那么久会把所有 worker 的
+    // 心跳一起堵住。先占时间戳是为了让并发的 worker 看见「这个目标刚探过」直接跳过，
+    // 而不是一起冲进 HAL。
+    let reserved = Instant::now();
+    let previous = {
+        let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, cached)) = cache.as_ref() {
+            // 已经挣到结论就不用再探了；另外同一个目标 5 分钟内也不重复探。
+            if soter::sign_state() != soter::SignState::Unknown
+                || (cached.as_ref() == target && at.elapsed() < SOTER_PROBE_TTL)
+            {
+                return;
+            }
         }
-    }
-    match target {
+        let previous = cache.take();
+        *cache = Some((reserved, target.cloned()));
+        previous
+    };
+    // 锁已经丢了，下面这段真开 HAL。
+    let measured = match target {
         Some(target) => {
+            // sign_probe atomically checks the session lease and reserves HAL access.
             let probe = soter::sign_probe(target.uid, &target.alias);
             if probe["skipped"].as_bool() == Some(true) {
                 log::debug!(
                     "soter sign capability probe: skipped, the device is signing right now"
                 );
-                return; // No HAL measurement: do not consume the probe TTL.
-            }
-            let verdict = soter::SignVerdict::from_probe(&probe);
-            if verdict != soter::SignVerdict::Signed {
-                // 探不出能签就把原因写进日志：光看 caps 里没有 `soter_sign`，谁也
-                // 不知道是槽位上没材料、还是 TA 非要指纹。
-                log::info!("soter sign capability probe: {verdict} ({probe})");
+                false // No HAL measurement: do not consume the probe TTL.
+            } else {
+                let verdict = soter::SignVerdict::from_probe(&probe);
+                if verdict != soter::SignVerdict::Signed {
+                    // 探不出能签就把原因写进日志：光看 caps 里没有 `soter_sign`，谁也
+                    // 不知道是槽位上没材料、还是 TA 非要指纹。
+                    log::info!("soter sign capability probe: {verdict} ({probe})");
+                }
+                true
             }
         }
         None => {
             // 手上没有能试的槽位：什么都不说，等服务端派活或者学到一个槽位。
             log::debug!("soter sign capability probe: no slot to try yet");
+            true
         }
+    };
+    let mut cache = SIGN_PROBED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if measured {
+        *cache = Some((Instant::now(), target.cloned()));
+    } else if cache.as_ref() == Some(&(reserved, target.cloned())) {
+        // 这一笔根本没量（设备正在签）：把时间戳退回去，别白吃掉 5 分钟的探针额度。
+        // 只退回自己那一条：期间别的 worker 可能已经把它的结论写进去了。
+        *cache = previous;
     }
-    *cache = Some((Instant::now(), target.cloned()));
 }
 
 /// StrongBox is a second instance of the KeyMint HAL, so its presence is a

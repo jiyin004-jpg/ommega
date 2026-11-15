@@ -338,7 +338,52 @@ where
         send(reply)
     };
 
-    // 0. 设备号。后面几份文档里的 cpu_id 必须跟它一致，不然微信 / 检测器都当成换了设备。
+    probe_device(&mut send, &mut acc)?;
+    reset_slot(
+        &mut send,
+        &mut acc,
+        opts.uid,
+        opts.reset,
+        opts.allow_mutation,
+    )?;
+
+    let ask_ok = ensure_ask(&mut send, &mut acc, opts.uid, &alias, opts.allow_mutation)?;
+
+    let auth_ok = ensure_auth(
+        &mut send,
+        &mut acc,
+        opts.uid,
+        &alias,
+        opts.allow_mutation,
+        opts.force_regen,
+    )?;
+
+    let signed = finish_and_sign(
+        &mut send,
+        &mut acc,
+        opts.uid,
+        &alias,
+        opts.skip_sign,
+        &opts.challenge,
+    )?;
+
+    Ok(Report {
+        steps: acc.steps,
+        ask_ok,
+        auth_ok,
+        signed,
+        cpu_ids: acc.cpu_ids,
+        artifacts: acc.artifacts,
+    })
+}
+
+/// 第 0 步（`w36.j.l()` / `getExtraParam`）：把设备号拿到手。
+///
+/// 后面几份文档里的 cpu_id 必须跟它一致，不然微信 / 检测器都当成换了设备。
+fn probe_device<F>(send: &mut F, acc: &mut Collected) -> Result<()>
+where
+    F: FnMut(Value) -> Result<Value>,
+{
     let device = send(json!({ "op": "get_device_id" })).context("get_device_id 没拿到答复")?;
     let cpu_id = answer_text(&device).unwrap_or_default();
     acc.cpu_ids.push(("设备号", cpu_id.clone()));
@@ -356,10 +401,22 @@ where
             format!("cpu_id={cpu_id}")
         },
     ));
+    Ok(())
+}
 
-    // 0.5 可选的清场（微信自救那一步：清整个 uid 的槽位）。
-    if opts.reset {
-        if !opts.allow_mutation {
+/// 第 0.5 步：可选的清场（微信自救那一步：清整个 uid 的槽位）。
+fn reset_slot<F>(
+    send: &mut F,
+    acc: &mut Collected,
+    uid: i32,
+    reset: bool,
+    allow_mutation: bool,
+) -> Result<()>
+where
+    F: FnMut(Value) -> Result<Value>,
+{
+    if reset {
+        if !allow_mutation {
             acc.steps.push(Step::new(
                 "s36.a.r() 清场",
                 "remove_all_uid_key",
@@ -367,7 +424,7 @@ where
                 "关掉了建料/删料，不执行",
             ));
         } else {
-            let reply = send(json!({ "op": "remove_all_uid_key", "uid": opts.uid }))
+            let reply = send(json!({ "op": "remove_all_uid_key", "uid": uid }))
                 .context("remove_all_uid_key 没拿到答复")?;
             acc.steps.push(Step::new(
                 "s36.a.r() 清场",
@@ -377,9 +434,25 @@ where
             ));
         }
     }
+    Ok(())
+}
 
+/// 第 1–3 步：看有没有 ASK、能不能用，不可用就按微信的顺序建一份。
+///
+/// 回微信那边的「ASK 可用」（`s36.a.j()`）。`alias` 只是转交给 `ensure_material`
+/// （`ask` 那一支用不到它，建料的参数形状由那个函数按 tag 分）。
+fn ensure_ask<F>(
+    send: &mut F,
+    acc: &mut Collected,
+    uid: i32,
+    alias: &str,
+    allow_mutation: bool,
+) -> Result<bool>
+where
+    F: FnMut(Value) -> Result<Value>,
+{
     // 1. 有没有 ASK（微信 `s36.a.h()` = `hasAskAlready`）：只有 0 算「有」。
-    let has_ask = send(json!({ "op": "has_ask_already", "uid": opts.uid }))
+    let has_ask = send(json!({ "op": "has_ask_already", "uid": uid }))
         .context("has_ask_already 没拿到答复")?;
     let ask_present = code_of(&has_ask) == 0;
     acc.steps.push(Step::new(
@@ -397,13 +470,13 @@ where
     let mut ask_ok = false;
     if ask_present {
         let (doc, step) = export_check(
-            &mut send,
-            &mut acc,
+            send,
+            acc,
             "ask",
             "export_ask_public_key",
-            json!({ "uid": opts.uid }),
+            json!({ "uid": uid }),
             "ASK",
-            opts.uid,
+            uid,
         )?;
         ask_ok = doc.is_some();
         acc.steps.push(Step::new(
@@ -427,7 +500,7 @@ where
 
     // 3. ASK 不可用 → 微信建一份（`f46.q0.g()` 判不过就排 TaskPrepareAppSecureKey）。
     if !ask_ok {
-        if !opts.allow_mutation {
+        if !allow_mutation {
             acc.steps.push(Step::new(
                 "f46.q0 → f46.o0",
                 "generate_ask_key_pair",
@@ -435,21 +508,37 @@ where
                 "关掉了建料/删料；微信这一步会真去建，而这里没建",
             ));
         } else if let Some(ok) = ensure_material(
-            &mut send,
-            &mut acc,
+            send,
+            acc,
             "generate_ask_key_pair",
             "export_ask_public_key",
             "ask",
             "ASK",
-            opts.uid,
-            &alias,
+            uid,
+            alias,
         )? {
             ask_ok = ok;
         }
     }
+    Ok(ask_ok)
+}
 
+/// 第 4–6 步：看有没有 AuthKey、能不能用，不可用或者要求重建就按微信的顺序建一份。
+///
+/// 回微信那边的「AuthKey 可用」（`s36.a.l()`）。
+fn ensure_auth<F>(
+    send: &mut F,
+    acc: &mut Collected,
+    uid: i32,
+    alias: &str,
+    allow_mutation: bool,
+    force_regen: bool,
+) -> Result<bool>
+where
+    F: FnMut(Value) -> Result<Value>,
+{
     // 4. 有没有 AuthKey（`s36.a.i(alias)`）。
-    let has_auth = send(json!({ "op": "has_auth_key", "uid": opts.uid, "alias": alias }))
+    let has_auth = send(json!({ "op": "has_auth_key", "uid": uid, "alias": alias }))
         .context("has_auth_key 没拿到答复")?;
     let auth_present = code_of(&has_auth) == 0;
     acc.steps.push(Step::new(
@@ -467,13 +556,13 @@ where
     let mut auth_ok = false;
     if auth_present {
         let (doc, step) = export_check(
-            &mut send,
-            &mut acc,
+            send,
+            acc,
             "auth",
             "export_auth_key_public_key",
-            json!({ "uid": opts.uid, "alias": alias }),
+            json!({ "uid": uid, "alias": alias }),
             "AuthKey",
-            opts.uid,
+            uid,
         )?;
         auth_ok = doc.is_some();
         acc.steps.push(Step::new(
@@ -504,8 +593,8 @@ where
     }
 
     // 6. 不可用或者要求重建 → 建一份（`f46.u0.g()` → TaskPrepareAuthKey）。
-    if !auth_ok || opts.force_regen {
-        if !opts.allow_mutation {
+    if !auth_ok || force_regen {
+        if !allow_mutation {
             acc.steps.push(Step::new(
                 "f46.u0 → f46.s0",
                 "generate_auth_key_pair",
@@ -513,25 +602,39 @@ where
                 "关掉了建料/删料；微信这一步会真去建",
             ));
         } else if let Some(ok) = ensure_material(
-            &mut send,
-            &mut acc,
+            send,
+            acc,
             "generate_auth_key_pair",
             "export_auth_key_public_key",
             "auth",
             "AuthKey",
-            opts.uid,
-            &alias,
+            uid,
+            alias,
         )? {
             auth_ok = ok;
         }
     }
+    Ok(auth_ok)
+}
 
-    // 7. 开签名会话。微信这里要 session 非 0（`f46.z` → `w36.j.i()`）。
-    //
-    // `--no-sign` 整段跳过：设备同一时刻只留一张签名会话，只是想看一眼料的时候别把
-    // 人家正在用的那张顶掉。
+/// 第 7–8 步：开签名会话、收尾签名。回「真出了一笔签名」。
+///
+/// 微信这里要 session 非 0（`f46.z` → `w36.j.i()`）。`skip_sign`（`--no-sign`）
+/// 整段跳过：设备同一时刻只留一张签名会话，只是想看一眼料的时候别把人家正在用的
+/// 那张顶掉。
+fn finish_and_sign<F>(
+    send: &mut F,
+    acc: &mut Collected,
+    uid: i32,
+    alias: &str,
+    skip_sign: bool,
+    challenge: &str,
+) -> Result<bool>
+where
+    F: FnMut(Value) -> Result<Value>,
+{
     let mut signed = false;
-    if opts.skip_sign {
+    if skip_sign {
         acc.steps.push(Step::new(
             "f46.z → w36.j.i()",
             "init_sign",
@@ -545,14 +648,14 @@ where
             "同上",
         ));
     } else {
-        let challenge = if opts.challenge.is_empty() {
+        let challenge = if challenge.is_empty() {
             fresh_challenge()
         } else {
-            opts.challenge.clone()
+            challenge.to_string()
         };
         let init = send(json!({
             "op": "init_sign",
-            "uid": opts.uid,
+            "uid": uid,
             "alias": alias,
             "challenge": challenge,
         }))
@@ -593,9 +696,9 @@ where
                 Some((raw, Ok(envelope))) => {
                     signed = true;
                     acc.artifacts.push(("sign".to_string(), raw));
-                    let detail = check_doc(&envelope.doc, opts.uid, "签名现场");
+                    let detail = check_doc(&envelope.doc, uid, "签名现场");
                     if detail.is_ok() {
-                        record_cpu(&mut acc, "签名现场", &envelope.doc);
+                        record_cpu(acc, "签名现场", &envelope.doc);
                     }
                     acc.steps.push(Step::new(
                         "w36.j.a() → SoterCore.finishSign",
@@ -641,15 +744,7 @@ where
             ));
         }
     }
-
-    Ok(Report {
-        steps: acc.steps,
-        ask_ok,
-        auth_ok,
-        signed,
-        cpu_ids: acc.cpu_ids,
-        artifacts: acc.artifacts,
-    })
+    Ok(signed)
 }
 
 fn record_cpu(acc: &mut Collected, where_: &'static str, doc: &Value) {
