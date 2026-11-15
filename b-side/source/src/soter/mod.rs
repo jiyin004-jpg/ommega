@@ -394,16 +394,6 @@ fn remember_probe_target(uid: i32, alias: &str) {
     }
 }
 
-/// 恒 `false`：本机不替服务端判「这份材料签不了」。
-///
-/// `-26` 只是这一笔没签成（这一笔的验证没过去，真应用就是 App 那步生物认证没成），
-/// 材料本身没毛病。拒服务这个槽位只会把 App 推向服务端那两层自签的假料；TA 的答复
-/// 原样递上去，要不要换层由服务端按错误码性质决定。
-fn is_hard_slot_failure(op: &str, result: &Value) -> bool {
-    let _ = (op, result);
-    false
-}
-
 /// `-5` / `-6`：TA 说这个槽位上的 ASK / AuthKey 没就绪 —— 这两码才值得原地重建。
 /// 别的非零码（-18 安全通道、-8、-26 验证没过）动设备状态只会更糟。
 ///
@@ -669,10 +659,7 @@ pub fn handle(payload: &Value, allow_mutation: bool, max_concurrent: u32) -> Res
     };
     let result = result?;
 
-    // 设备层不替服务端下结论：`-26` 是 TA 对「这一笔」的答复，原样递上去。换不换层、
-    // 要不要把某个槽位钉到服务端自签那两层，由服务端看错误码性质定（见
-    // `is_hard_slot_failure`）。
-    let _ = is_hard_slot_failure(op, &result);
+    // 设备层不替服务端下结论：`-26` 是 TA 对「这一笔」的答复，原样递上去。
 
     // 顺手把这笔的结果喂给 HAL 自愈：连着两笔真失败（-5/-6/-26 这几个正常答复除外）
     // 就重启一次那个服务，否则卡成「建料类 op 全正常、只有签名恒 -18」时，服务端会把
@@ -995,19 +982,6 @@ mod tests {
             }
         };
         assert!(!text.contains("not served by this device"), "err: {text}");
-    }
-
-    #[test]
-    fn a_verification_failure_is_never_a_hard_sign_failure() {
-        // -26 只是「这笔没签成」，材料没毛病：本机不替服务端判「这层做不了」。
-        for op in ["finish_sign", "init_sign", "has_auth_key", "get_device_id"] {
-            for code in [-26, 0, -5, -6, -7, -9, -1000] {
-                assert!(
-                    !is_hard_slot_failure(op, &json!({ "error_code": code })),
-                    "{op} {code} must stay the device's own answer"
-                );
-            }
-        }
     }
 
     /// 只有「真签出来」算证据：失败码再多也不许变成「这台签不了」。

@@ -542,7 +542,7 @@ impl HwBinder {
             .map_err(|_| anyhow::anyhow!("hwbinder 连接锁中毒"))?;
         // 上一轮收下的应答 buffer 这时候才交回：它的数据体调用方已经读完了。
         self.flush_pending_free();
-        let mut tr = BinderTransactionData {
+        let tr = BinderTransactionData {
             target: handle as u64,
             cookie: 0,
             code,
@@ -560,10 +560,6 @@ impl HwBinder {
                 parcel.offsets().as_ptr() as u64
             },
         };
-        if tr.data_buffer == 0 {
-            // 给非空地址更省心（内核按 0 长度处理）。
-            tr.data_buffer = parcel.data().as_ptr() as u64;
-        }
 
         let mut out = Vec::with_capacity(4 + std::mem::size_of::<BinderTransactionData>() + 8);
         out.extend_from_slice(&BC_TRANSACTION_SG.to_le_bytes());

@@ -394,7 +394,6 @@ where
     ));
 
     // 2. 有 ASK 能不能用（微信 `s36.a.j()` 的第二半：模型解析得出来）。
-    let mut ask_doc = None;
     let mut ask_ok = false;
     if ask_present {
         let (doc, step) = export_check(
@@ -407,7 +406,6 @@ where
             opts.uid,
         )?;
         ask_ok = doc.is_some();
-        ask_doc = doc;
         acc.steps.push(Step::new(
             "s36.a.c() / w36.j.d()",
             "export_ask_public_key",
@@ -469,7 +467,6 @@ where
                     opts.uid,
                 )?;
                 ask_ok = doc.is_some();
-                ask_doc = doc;
                 acc.steps.push(Step::new(
                     "f46.o0.onSuccess → s36.a.c()",
                     "export_ask_public_key",
@@ -483,7 +480,6 @@ where
             }
         }
     }
-    let _ = &ask_doc;
 
     // 4. 有没有 AuthKey（`s36.a.i(alias)`）。
     let has_auth = send(json!({ "op": "has_auth_key", "uid": opts.uid, "alias": alias }))
