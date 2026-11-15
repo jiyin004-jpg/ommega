@@ -66,8 +66,7 @@ pub fn run(extra: Vec<String>) -> ! {
         log("another instance is running; exiting");
         std::process::exit(0);
     }
-    // 锁目录被清、pid 归属对不上时两个实例都会认为自己抢到锁，所以再按
-    // 「伪装名 + memfd + pid 更小」兜一道：看到比自己早起的同名实例就退。
+    // 抢到锁后再核一道：同名的更早实例还在就退。
     if let Some(name) = crate::stealth::cached_name("daemon") {
         if let Some(old) = older_same_name(&name) {
             log(&format!("older daemon pid {old} is alive; exiting"));
@@ -100,8 +99,7 @@ pub fn run(extra: Vec<String>) -> ! {
                 idle_tick(&mut last_sync);
                 continue;
             }
-            // payload 已经明确报错（比如 boot key 在进程内找不到）：别再等 90 秒
-            // 宽限 + 20 拍，直接退到独立 HAL，否则开机这段时间 keystore 完全接不上。
+            // payload 明确报错时直接退到独立 HAL，不再等宽限期。
             if let Ok(reason) = fs::read_to_string(INPROC_FAILED_PATH) {
                 let reason = reason.trim();
                 if !reason.is_empty() {
@@ -409,9 +407,8 @@ struct PackageEntry {
     apk: PathBuf,
 }
 
-/// `pm list packages -f --show-versioncode` 一趟拿全：
+/// `pm list packages -f --show-versioncode` 的输出解析：
 /// `package:/data/app/~~xxxx/base.apk=com.foo versionCode:123`。
-/// 带 `-f` 才有 APK 路径，不然得去猜 `/data/app` 下那串目录名。
 fn package_entries() -> Vec<PackageEntry> {
     let output = match Command::new("/system/bin/pm")
         .args(["list", "packages", "-f", "--show-versioncode"])
@@ -813,7 +810,7 @@ fn spawn_keymint(target: &Path, extra: &[String]) -> std::io::Result<Child> {
         .stderr(Stdio::null())
         .spawn()
         .inspect(|_| {
-            // 子进程已经拿到自己那份 fd，父进程这份要关掉，不然每轮重启漏一个。
+            // 子进程已拿到 fd，父进程这份要关掉。
             if let Some(fd) = memfd {
                 unsafe { libc::close(fd) };
             }
@@ -851,8 +848,7 @@ fn supervisor_loop() {
     }
 }
 
-/// 拉起来的子进程必须有人 wait，否则退出后会留一堆僵尸 —— 而这个线程不 wait，
-/// 所以每个子进程配一个等待线程（它退出后线程自然结束）。
+/// 每个子进程配一个等待线程，收掉退出状态。
 fn reap_later(child: std::io::Result<Child>) {
     match child {
         Ok(mut child) => {
@@ -1089,9 +1085,7 @@ fn normalize_identity_props() {
     }
 }
 
-/// os / vendor 补丁清掉伪装后回 build.prop 的真值。
-/// 这两个没有分区级的“真值”：props.conf 那行没了，属性却停在旧值，没人拉得回去，
-/// 所以每次归一都跟 build.prop 对一遍。
+/// os / vendor 补丁清掉伪装后回 build.prop 的真值，每次归一都对一遍。
 fn normalize_patch_props() {
     for prop in [
         "ro.build.version.security_patch",
@@ -1115,8 +1109,6 @@ fn normalize_patch_props() {
 }
 
 /// 开机把三个 boot 补丁属性变体统一到 boot 分区的真值上。
-/// 属性是 bootloader 的快照，厂商不跟 OTA 刷 bootloader 就会停在旧日期，
-/// 且会被 `remote_identity` 反写回来，所以开机对齐一次。
 fn normalize_boot_patch() {
     // 优先级：props.conf 里的伪装 > config.toml 的显式值 > boot 分区真值。
     // 有伪装时要把三个变体都刷成伪装值，面板保存时那次 resetprop 不一定每条都写成。
@@ -1267,8 +1259,7 @@ fn sync_remote_identity() {
         return;
     }
 
-    // 只有 device_id 与 token 都配好才拿 identity 刷属性：否则链其实本地出的，
-    // 属性会被 B（或上一次）的旧值刷回去，boot 补丁就此锁死。
+    // 只有 device_id 与 token 都配好才拿 identity 刷属性。
     let remote_ready = ["device_id", "token"]
         .iter()
         .all(|key| config_value(&configured, key).is_some_and(|v| !v.trim().is_empty()));
@@ -1352,8 +1343,7 @@ fn sync_remote_identity() {
         let brand = applied_value(&applied, "brand").unwrap_or_default();
         let model = applied_value(&applied, "model").unwrap_or_default();
         log(&format!("remote identity applied: {brand}/{model}"));
-        // 只落标记，**绝不自动重启 zygote**：身份文件是 TA 每次出链都写的，
-        // 自动重启会变成「重启 → App 重启 → 又认证 → 又写文件 → 又重启」的死循环。
+        // 只落标记，不自动重启 zygote。
         let _ = fs::write(REMOTE_IDENTITY_UPDATED, format!("{brand}/{model}\n"));
     }
 }

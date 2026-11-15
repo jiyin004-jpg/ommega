@@ -752,9 +752,7 @@ impl RemoteRelay {
         Ok(r.token)
     }
 
-    /// 要落哪台 B。留空是正常状态：A 端装好默认就是空的，服务端会用控制台里配的
-    /// 「默认设备 id」，没配就按负载挑一台在线的。这里只做去空白，不再把它当错误
-    /// —— 以前空值直接报错，请求连发都不发，链就悄悄落回本地那条 AOSP 软件链。
+    /// 要落哪台 B。留空时服务端用控制台配的默认设备 id，没配就按负载挑一台在线的。
     pub(crate) fn device_id() -> Result<String> {
         let r = Self::remote()?;
         Ok(r.device_id.trim().to_string())
@@ -782,11 +780,9 @@ impl RemoteRelay {
             );
         }
         let body_str = serde_json::to_string(body)?;
-        // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验（换机要解绑）。
-        // `ro.serialno` 与 `ro.boot.serialno` 在大多数机器上相同，但个别机型只
-        // 有一个 —— 两个都带上，服务端会各自比对非空的那项。
-        // IMEI1 是硬件写死的，伪装层改不动它，所以服务端拿它当第一绑手：
-        // 序列号被改过、只对得上 IMEI 也放行。
+        // 设备指纹：服务端拿它给私卡做首次绑定与后续一致性校验。
+        // `ro.serialno` 与 `ro.boot.serialno` 两个都带上，服务端比对非空的那项。
+        // IMEI1 作为第一绑手：序列号被改过、只对得上 IMEI 也放行。
         let dev_serial =
             crate::plat::resetprop::read_string_property("ro.serialno").unwrap_or_default();
         let dev_sn =
@@ -801,16 +797,8 @@ impl RemoteRelay {
                 crate::plat::device_ids::imei1(),
             ),
         ];
-        // Transient transport failures (connect timeout, network jitter, TLS
-        // handshake) are retried once before giving up. Without the retry a
-        // single dropped attempt falls back to the local software keybox and
-        // briefly emits a self-signed chain. HTTP error responses are NOT
-        // retried — the server answered, and its body carries the real result.
-        //
-        // 主路走 `get_client()`（它按 `bind_iface` 选/验证接口）：配了 wlan0 就该真的
-        // 从 Wi-Fi 出去 —— 实测 Wi-Fi 30ms、蜂窝 67ms 还带 200ms 尾巴。以前这里先拿
-        // `unbound_client()`（不绑、走 OS 默认路由）直发，bind_iface 只在重试时才生效，
-        // 等于白配。不通时再退回不绑的客户端，让 OS 自己挑路。
+        // 传输层失败（连接超时、网络抖动、TLS 握手）重试一次；HTTP 错误响应不重试。
+        // 主路走 `get_client()`（按 `bind_iface` 选/验证接口），不通时退回不绑的客户端。
         let (status, resp) = match http_request_with(
             &get_client()?,
             "POST",
@@ -1091,14 +1079,9 @@ impl RemoteRelay {
         if let Some(patch) = vendor_patch_level {
             ctx.insert("vendor_patch_level".to_string(), Value::from(patch));
         }
-        // 719 必须跟本地链上的那个用同一个来源，不然「本机出链 20260601、转发出去
-        // 变成 202606」这种两边自相矛盾就会出现在 A14 上。
-        //
-        // 顺序跟 plat::vbmeta::resolve_patch_levels 对齐：先吃 daemon 传进来的
-        // `OMMEGA_PATCH_BOOT`（shell 域读的 `ro.boot.image.build.security_patch`），
-        // 再读属性，再退回面板里显式写的值，最后才用 os_patch_level 兜底。
-        // 以前这里只读 `ro.boot.build.security_patch`，keymint 在自己的域里读不到，
-        // 直接就退到 os_patch_level（YYYYMM）了 —— 那是个月级值，跟本地链差一天都算不对。
+        // 719 跟本地链用同一个来源，两边补丁日期必须一致。
+        // 顺序与 plat::vbmeta::resolve_patch_levels 一致：`OMMEGA_PATCH_BOOT` → 属性 →
+        // 面板显式值 → os_patch_level。
         let boot_patch_level =
             patch_property("OMMEGA_PATCH_BOOT", "ro.boot.image.build.security_patch")
                 .or_else(|| patch_property("OMMEGA_PATCH_BOOT", "ro.boot.build.security_patch"))
@@ -1272,12 +1255,7 @@ fn patch_level_to_yyyymm(value: &str) -> Option<u32> {
     None
 }
 
-/// Convert a "YYYY-MM-DD" patch level string to the YYYYMMDD integer the relay
-/// expects for KM_TAG_VENDOR_PATCH_LEVEL / KM_TAG_BOOT_PATCH_LEVEL (718/719).
-///
-/// 这两个 tag 的格式是 YYYYMMDD，跟 706 的 YYYYMM 不一样。以前这里也用
-/// `patch_level_to_yyyymm`，上报出去就成了 202606 —— 落到服务端 keybox 层，
-/// 链上 tag 718 就只有年到月，没那个日。
+/// "YYYY-MM-DD" 的补丁日期转成 relay 要的 YYYYMMDD 整数（718/719 用这个格式，706 是 YYYYMM）。
 fn patch_level_to_yyyymmdd(value: &str) -> Option<u32> {
     let s = value.trim();
     // 带破折号的写法：给了日就用它（哪怕是 05），没给日才补 01。
@@ -1416,10 +1394,7 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             log::warn!("remote attest returned empty cert chain");
             return Ok(None);
         }
-        // 显式委派：服务端若不认识那把证明密钥会返回标记错误（上面已处理）。
-        // 但老版本服务端仍可能静默给一张普通链 —— 显式委派拿到只有一张的链，
-        // 说明签发密钥不是调用方指定那把，同样按 InvalidKeyBlob 处理，
-        // 让应用重建，而不是笼统的 VerificationFailed。
+        // 显式委派拿到只有一张的链，说明签发密钥不是调用方指定那把，按 InvalidKeyBlob 处理。
         if params.attestation_key.is_some() && chain.len() < 2 {
             log::warn!(
                 "remote delegation returned {} certs only; treating the issuer as gone",
@@ -1452,10 +1427,7 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
             return Ok(None);
         };
         let result = resp.get("result").cloned().unwrap_or(resp);
-        // 远端明确回「这个 alias 的私钥不在我这」时，把因由带出去。调用方（
-        // `KeyMaterial::Remote` 那条 attestation-key 签名路径）据此回
-        // KEY_NOT_FOUND，让调用方知道那把 attestation key 已经作废；以前一律退成
-        // UNKNOWN_ERROR(-1000)，调用方把它当“远端不可用”无限重试，证书链永远补不上。
+        // 远端回「这个 alias 的私钥不在我这」时把原因带出去，让调用方回 KEY_NOT_FOUND。
         if let Some(kind) = result.get("relay_error_kind").and_then(Value::as_str) {
             let msg = result
                 .get("error")
@@ -1573,8 +1545,7 @@ impl kmr_ta::device::RemoteBackend for RemoteRelayBackend {
 mod iface_choice_tests {
     use super::*;
 
-    /// SOTER 走不走远程只看它自己的开关：`remote` 关着时，SOTER 这条仍然得拿到地址，
-    /// 否则两个开关又绑在一起（面板上「只开 SOTER」就等于什么都不走）。
+    /// SOTER 走不走远程只看它自己的开关，地址照常要拿。
     #[test]
     fn soter_url_does_not_need_the_keymint_remote_switch() {
         let r = config::RemoteConfig {

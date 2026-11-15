@@ -5,7 +5,7 @@
 //!
 //! 域边界：keystore 域读得到 keymaster.db 和系统属性、能在 /system/bin 里 exec，但
 //! 读不了 /data/system/packages.list、写不了系统属性；AOSP 原版不给它 inet，而远程
-//! 出证必须从本进程发，所以 sepolicy 里单独开了 tcp + netd。AAID 读 daemon 落的表。
+//! 出证从本进程发出，AAID 读 daemon 落的表。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +56,7 @@ pub fn service(name: &str) -> Option<SIBinder> {
     state.services.as_ref()?.get(name).cloned()
 }
 
-/// 后台起一次（幂等）。宿主进程的启动路径不能被我们拖住，所以放线程里。
+/// 后台起一次（幂等），放线程里。
 pub fn request_start() {
     STARTED.call_once(|| {
         std::thread::Builder::new()
@@ -85,8 +85,7 @@ pub fn request_start() {
             })
             .ok();
 
-        // 看门狗：过了宽限期还没有结论就判它起不来。否则每个调用方都要干等 15 秒，
-        // 一整轮检测能被拖到十几分钟。
+        // 看门狗：过了宽限期还没有结论就判它起不来。
         std::thread::Builder::new()
             .name("inproc-gate".to_string())
             .spawn(|| {
@@ -139,8 +138,7 @@ pub fn wait_ready(timeout: Duration) -> bool {
 /// 根侧落的「开机已完成」标记。
 const BOOT_DONE_PATH: &str = "/data/misc/ommega/boot_done";
 
-/// 从开始到必须有结论的宽限期。开库那一步在别的进程占着库时会一直睡下去（上游实现
-/// 如此，改成带超时的重试会让整个 keystore2 abort），所以得由外部下结论。
+/// 从开始到必须有结论的宽限期。
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn boot_done_present() -> bool {
@@ -236,8 +234,7 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
     if boot_done_present() {
         replay_early_boot_ended();
     } else {
-        // 宿主常比注入器守护先起，这一刻 boot_done 还没落。等它出现再重放，
-        // 否则 EARLY_BOOT_ONLY 的钥匙开机之后仍然能 import。
+        // 宿主常比注入器守护先起，这一刻 boot_done 还没落。等它出现再重放。
         let spawned = std::thread::Builder::new()
             .name("inproc-boot-wait".to_string())
             .spawn(|| {
@@ -278,7 +275,7 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
 }
 
 /// 把本地服务挂到抽象 socket 上，给 app 域的调用方（SOTER 宿主）。
-/// 名字被独立 HAL 占着时绑定会失败，这是预期情况，所以是带退避的循环而非错误。
+/// 名字被独立 HAL 占着时绑定会失败，带退避循环重试。
 fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
     // 绑不上（名字被 HAL 占着）是预期情况，只在原因变化时记一笔，免得刷掉有用日志。
     let mut last_error = String::new();
@@ -303,8 +300,7 @@ fn serve_app_rpc(services: HashMap<&'static str, SIBinder>) {
                         warn!("in-process RPC stopped: {error:#}");
                     }
                 }
-                // 没挂全或 run() 已返回都说明 app 域没人应答，rpc 字段必须回 false，
-                // 否则 daemon 会一直认为进程内健康、不去拉独立 HAL。
+                // 没挂全或 run() 已返回：rpc 字段回 false。
                 RPC_READY.store(false, Ordering::Relaxed);
             }
             Err(error) => {
@@ -340,8 +336,7 @@ fn bind_app_rpc() -> Result<Arc<rsbinder::rpc::RpcServer>> {
     }
 }
 
-/// 抽象 socket 的准入判断（file socket 那套在本域名里用不了，所以单独一份）：
-/// keystore 自己、root（软件 SOTER TA）、被注入过的进程。
+/// 抽象 socket 的准入判断：keystore 自己、root（软件 SOTER TA）、被注入过的进程。
 fn app_authorizer() -> impl Fn(&rsbinder::rpc::PeerIdentity) -> bool + Send + Sync + 'static {
     move |peer| {
         let allowed = match peer {

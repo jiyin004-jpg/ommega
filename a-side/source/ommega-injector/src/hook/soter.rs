@@ -294,13 +294,6 @@ impl<'a> Cursor<'a> {
 
     /// AIDL 的 String 就是 String16，跟 interface token 里的描述符一个格式：
     /// `[i32 字符数][UTF-16LE 2*字符数 字节][补到 4 字节]`（0 = 空串，-1 = null）。
-    ///
-    /// 以前这里按「字节长度 + 字符数 + 字节」读，还拿 `from_utf8_lossy` 解 —— 两处都错：
-    /// 那第二个 i32 其实是 UTF-16 数据的前 4 个字节（等于白吃掉头两个字符），而 UTF-16
-    /// 的字节被当 UTF-8 逐字节收下，`\0` 就全留在串里了。日志里那串
-    /// `alias="t\0e\0r\0A\0u\0t\0h\0K\0e\0y\0V\02\0_\0s\0a\0l\0t"`（真名
-    /// `SoterAuthKeyV2_salt`）就是这两个错叠出来的，而且串被截成一半。别名是本地
-    /// 后端的键、也是要转给 B 端的东西，必须一个字节不差。
     fn string(&mut self) -> Option<String> {
         let (text, at) = read_string16(self.data, self.at)?;
         self.at = at;
@@ -1110,8 +1103,7 @@ fn log_call(call: &SoterCall) {
         .map(|uid| format!(" caller_uid={uid}"))
         .unwrap_or_default();
     let line = format!("{line}{caller_uid}{wire_code}");
-    // 本地那一路（logcat / 日志文件）在 app 域的进程里是哑的，所以同一条还顺 RPC 送一份给
-    // daemon 记：宿主的观测只有这一条路能看见。
+    // logcat/日志文件之外，同一条还顺 RPC 送一份给 daemon。
     info!("{line}");
     crate::ipc::report_event(line);
     if call.challenge.is_some() {
