@@ -1665,6 +1665,7 @@ fn soter_request_meta(body: &Value) -> (&str, &str, String, String) {
 
 /// 探针闸门：白名单外的身份类 op 直接告诉 A 端「这笔你自己本地答」；归哪一层由
 /// `soter_probe` 判，这里只负责把结论变成答复，顺带记一笔请求次数。
+#[allow(clippy::too_many_arguments)]
 async fn soter_probe_gate(
     state: &AppState,
     body: &Value,
@@ -1766,6 +1767,7 @@ struct SoterLayerFlags {
 }
 
 /// 执行计划：会话路由、写操作拦截、槽位钉层，最后排出层序（任一步定案就提前回）。
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn resolve_soter_plan(
     state: &AppState,
     body: &Value,
@@ -2032,6 +2034,7 @@ async fn resolve_soter_plan(
 
 /// B 端设备层：签名租约、设备派发、超时和结果分类。`Err(reply)` = 这一笔到此为止，
 /// `Ok(result)` = 这层的结论，交给 `apply_soter_layer_result` 判成败。
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn run_soter_b_layer(
     state: &AppState,
     body: &Value,
@@ -2079,7 +2082,7 @@ async fn run_soter_b_layer(
         }
     }
     let mut lease = if needs_sign {
-        match b_target.as_deref() {
+        match b_target {
             Some(device) if op == "init_sign" => {
                 // 抢不到租约也不直接回 -9：那会让 A 端连指纹圈都弹不出来。退成
                 // 不带租约执行，让 TA 自己顶掉旧会话，收尾交给 -204 补救路径。
@@ -2142,9 +2145,9 @@ async fn run_soter_b_layer(
         if let Some(guard) = lease.as_mut() {
             guard.dispatch();
         }
-        match try_b_soter_layer(state, body, requested, b_target.as_deref(), a_meta).await {
+        match try_b_soter_layer(state, body, requested, b_target, a_meta).await {
             Some(mut b) => {
-                if b.mutation_outcome_unknown(op, b_target.as_deref()) {
+                if b.mutation_outcome_unknown(op, b_target) {
                     if crate::queue::soter_op_needs_sign(op) {
                         // init/finish：真说不清（超时、会话被顶、队列没派出去）
                         // 时保持原样，不让 App 以为这把钥匙没了。
@@ -2162,7 +2165,7 @@ async fn run_soter_b_layer(
                     return Some(soter_off_target_reply(op));
                 }
                 if needs_sign
-                    && b.device.as_deref() == b_target.as_deref()
+                    && b.device.as_deref() == b_target
                     && b.value.get("error_code").and_then(Value::as_i64) == Some(-9)
                 {
                     // B's local active lease rejected init without touching HAL.
@@ -2173,10 +2176,7 @@ async fn run_soter_b_layer(
                     }
                     return Some(b.value);
                 }
-                if needs_sign
-                    && b.value.get("error").is_none()
-                    && b.device.as_deref() != b_target.as_deref()
-                {
+                if needs_sign && b.value.get("error").is_none() && b.device.as_deref() != b_target {
                     return Some(
                         json!({"error_code": -204, "relay_error_kind": "soter_device_mismatch"}),
                     );
@@ -2214,7 +2214,7 @@ async fn run_soter_b_layer(
                         state.sign_sessions.forget_for(device, requested, session);
                     }
                 }
-                if b.completed_on(b_target.as_deref()) || b.definitely_not_dispatched() {
+                if b.completed_on(b_target) || b.definitely_not_dispatched() {
                     if let Some(guard) = lease.as_mut() {
                         guard.completed();
                     }
@@ -2269,6 +2269,7 @@ async fn run_soter_b_layer(
 }
 
 /// 服务端那两层（`keybox` / `self_signed` / `attk`）：挑钥匙，剩下的交给 `run_layer_soter`。
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn run_soter_server_layer(
     state: &AppState,
     layer: &str,
@@ -2298,6 +2299,7 @@ async fn run_soter_server_layer(
 
 /// 单层结论落地：结果未知 / `-9` / 成功（毒化改写、钉层、会话登记）/ 失败都在这。
 /// `Some(reply)` = 这一笔就此定案，`None` = 这层没接住，带 `last_error` 换下一层。
+#[allow(clippy::too_many_arguments)]
 fn apply_soter_layer_result(
     state: &AppState,
     body: &Value,

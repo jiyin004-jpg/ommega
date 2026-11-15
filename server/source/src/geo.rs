@@ -146,6 +146,19 @@ fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
     ]))
 }
 
+/// Parse a dotted-quad IPv4 string into 4 bytes, or None if invalid.
+fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<u8>().ok()?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod province_tests {
     use super::{province_of, same_province};
@@ -175,17 +188,4 @@ mod province_tests {
         assert!(same_province("广东省", ""));
         assert!(same_province("", ""));
     }
-}
-
-/// Parse a dotted-quad IPv4 string into 4 bytes, or None if invalid.
-fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = ip.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let mut out = [0u8; 4];
-    for (i, p) in parts.iter().enumerate() {
-        out[i] = p.parse::<u8>().ok()?;
-    }
-    Some(out)
 }

@@ -438,7 +438,7 @@ impl AuthState {
                     // A、B 两端都绑（只给 A 端绑的话 B 卡换机器照样能用）；公开卡不绑。
                     if role.is_some()
                         && Self::is_private_card(&row)
-                        && !self.device_binding_ok(db, &row, fp, &ip)
+                        && !self.device_binding_ok(db, &row, fp, ip)
                     {
                         tracing::warn!(
                             "check_token: device mismatch token={} bound=({},{},{}) got=({},{},{})",
