@@ -73,16 +73,34 @@
   .row.stacked .name{flex:0 0 100%}
   .row.stacked input[type=text]{flex:0 0 100%;margin-top:6px}
   /* 令牌输入框：默认真值透明、上面盖一层等长的 *，点右边的眼睛才露出来 */
-  .row .pw-wrap{flex:0 0 100%;margin-top:6px;display:flex;align-items:center;gap:8px;position:relative}
-  .row .pw-wrap input[type=text]{flex:1 1 auto;min-width:0;margin-top:0;padding:7px 9px;
-      border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);
-      font-size:13px;font-family:inherit}
-  .row .pw-wrap input.masked{color:transparent;caret-color:transparent}
+  .row .pw-wrap{flex:0 0 100%;margin-top:6px;display:flex;align-items:center;gap:8px}
+  /* 输入框和星号共用一个盒子：边框画在 .pw-field 上，星号 inset:0 正好盖住输入框。
+     以前 .pw-stars 写死 right:44px（眼睛按钮的宽度），按钮尺寸/语言一变就错位；
+     现在宽度交给 flex 分配，星号位置自动跟着输入框走。 */
+  .pw-field{position:relative;flex:1 1 auto;min-width:0;display:flex;
+      border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+  .pw-field:focus-within{border-color:var(--accent)}
+  .row .pw-wrap input[type=text]{flex:1 1 auto;min-width:0;margin:0;padding:7px 9px;
+      border:0;border-radius:8px;background:transparent;color:var(--fg);
+      /* 等宽字体：一个 * 的步进 = 一个被藏起来的字符，星号层横向滚动才对得齐。 */
+      font-size:13px;line-height:1.6;font-family:ui-monospace,monospace;
+      touch-action:pan-y}
+  .row .pw-wrap input.masked{color:transparent;caret-color:transparent;
+      -webkit-text-fill-color:transparent}
   .row .pw-wrap input.masked::selection{background:transparent;color:transparent}
-  .pw-wrap .pw-stars{position:absolute;left:0;right:44px;top:0;bottom:0;padding:7px 9px;
-      font-size:13px;font-family:inherit;color:var(--fg);display:flex;align-items:center;
-      overflow:hidden;white-space:nowrap;pointer-events:none}
-  .pw-wrap input:not(.masked) ~ .pw-stars{display:none}
+  /* 露出真值拖动时也走镜像层：先把输入框文字藏起来，拖完再显示。 */
+  .row .pw-wrap input.panning{color:transparent;caret-color:transparent;
+      -webkit-text-fill-color:transparent}
+  .row .pw-wrap input.panning::selection{background:transparent;color:transparent}
+  .pw-field .pw-stars{position:absolute;inset:0;padding:7px 9px;
+      font-size:13px;line-height:1.6;font-family:ui-monospace,monospace;color:var(--fg);
+      display:flex;align-items:center;overflow:hidden;white-space:nowrap;pointer-events:none}
+  /* 内层只做 translate3d，外层负责裁剪；这样位移可以走合成层，不用每帧重排星号文字。 */
+  .pw-stars-in{flex:0 0 auto;display:block;white-space:nowrap}
+  .pw-field input:not(.masked) ~ .pw-stars{opacity:0}
+  /* 露出真值拖动期间把镜像层露出来，显示的是真值而不是星号。
+     用 opacity 而不是 display:none：文字布局和图层一直热着，起拖时不用现场重排/建层。 */
+  .pw-field input.panning ~ .pw-stars{opacity:1}
   .pw-eye{flex:0 0 36px;height:34px;display:flex;align-items:center;justify-content:center;
       padding:0;border:1px solid var(--line);border-radius:8px;background:var(--bg);
       color:var(--dim);cursor:pointer}
@@ -1462,17 +1480,140 @@ function buildTextRow(f, value, host){
   (host || document.getElementById("grp-remote")).appendChild(row);
 }
 /* 令牌默认打码：输入框里存的还是真值（收集、保存都不用改），只是文字透明，
-   另一层等长的 * 盖在上面；点眼睛才把真值露出来。 */
+   上面一层镜像默认显示等长 *；点眼睛露出真值，横向拖动时也由这层镜像承载文字，
+   避免逐帧滚输入框触发内部文字重排。 */
 function buildTokenMask(inp){
   var wrap = el("div", "pw-wrap");
+  var field = el("div", "pw-field");
   var stars = el("span", "pw-stars");
+  var starsIn = el("span", "pw-stars-in");
   stars.setAttribute("aria-hidden", "true");
-  function sync(){
-    stars.textContent = new Array(inp.value.length + 1).join("*");
+  stars.appendChild(starsIn);
+
+  /* 拖动状态先声明：syncScroll 里要判断是否正在拖，不能等下面 var 执行到才初始化。 */
+  var panX = null, panY = 0, panLeft = 0, panMax = 0, panAxis = 0, panTarget = 0;
+  var panFrame = 0, syncFrame = 0, willTimer = 0, starX = null, isMasked = true;
+
+  /* 星号层只做 translate3d，不改 scrollLeft：外层负责裁剪，内层负责位移，
+     这样每帧只走合成，不用重排星号文字，裁剪框也不会跟着一起移动。
+     跟 movePill 一样把上次的值记下来，位移没变就不重复写样式。 */
+  function setStarOffset(x){
+    if (x === starX) return;
+    starX = x;
+    starsIn.style.transform = "translate3d(" + (-x) + "px,0,0)";
   }
+  function clearWill(){
+    if (willTimer){ clearTimeout(willTimer); willTimer = 0; }
+    starsIn.style.willChange = "";
+  }
+  function syncScroll(){
+    /* 拖动中由 paintPan 统一写，避免这里再读一次 scrollLeft 触发同步布局。 */
+    if (panX !== null || syncFrame) return;
+    syncFrame = requestAnimationFrame(function(){
+      syncFrame = 0;
+      /* 这一帧可能是在按下之前排的，等它执行时已经进入拖动；这时交给 paintPan，
+         否则会把拖动刚写的位置又拉回旧的 scrollLeft，起手会抖一下。 */
+      if (panX !== null) return;
+      setStarOffset(inp.scrollLeft);
+    });
+  }
+  function sync(){
+    /* 打码时镜像层是星号；露出真值时镜像层放真值（平时藏着，拖动时露出来）。 */
+    starsIn.textContent = isMasked
+      ? new Array(inp.value.length + 1).join("*")
+      : inp.value;
+    syncScroll();
+  }
+  /* 一帧只写一次：touchmove 在 120Hz 屏上可能来两次，跟 wireTabs 的 queueDrag 一个路子。 */
+  function paintPan(){
+    panFrame = 0;
+    setStarOffset(panTarget);
+    /* 两种状态都只动镜像层，不逐帧滚输入框：输入框内部的文字重排正是卡顿来源。
+       露出真值时用 .panning 把输入框文字藏起来，松手时补一次 scrollLeft 再显示。 */
+  }
+  function queuePan(){
+    if (!panFrame) panFrame = requestAnimationFrame(paintPan);
+  }
+  function stopPanFrame(){
+    if (panFrame){ cancelAnimationFrame(panFrame); panFrame = 0; }
+  }
+
   inp.classList.add("masked");
   inp.addEventListener("input", sync);
+  /* input 内部的文字滚动不一定每次都发 scroll，能接的都接上，成本可以忽略。 */
+  inp.addEventListener("scroll", syncScroll, {passive: true});
+  inp.addEventListener("keydown", function(){ requestAnimationFrame(syncScroll); });
+  inp.addEventListener("keyup", syncScroll);
+  inp.addEventListener("click", syncScroll);
+  inp.addEventListener("focus", function(){
+    syncScroll();
+    requestAnimationFrame(syncScroll);
+  });
   sync();
+
+  /* 文字溢出时手指横向拖 = 手动滚 token。纵向优先就放行，页面照常上下滚；
+     .pages 上已经设了 touch-action:pan-y，横向平移本来就不会交给浏览器，所以打码和
+     露出真值时都走这一套。
+     移动过程只记目标值，真正的 DOM 写入合并到 requestAnimationFrame；
+     panMax 在按下时量一次，move 里不再读 scrollWidth/scrollLeft。
+     起手阈值从 8px 降到 2px：轻小幅度拖动时 8px 相当于先空走三到六帧，看着就是卡顿。*/
+  inp.addEventListener("touchstart", function(e){
+    if (e.touches.length !== 1) return;
+    panX = null;
+    /* 没溢出就别拦，横向手势留给外面的分页。 */
+    panMax = inp.scrollWidth - inp.clientWidth;
+    if (panMax <= 0){ panMax = 0; return; }
+    /* 提前把合成层建好：等到第一次 move 再设 will-change，首帧要现场栅格化，
+       低端机上正好就是那几帧卡顿。松手/超时再撤掉，别长期占一层。 */
+    starsIn.style.willChange = "transform";
+    if (willTimer) clearTimeout(willTimer);
+    willTimer = setTimeout(clearWill, 10000);
+    /* 输入框自己要横向滚，别让分页手势同时接管这次触摸。 */
+    e.stopPropagation();
+    panX = e.touches[0].clientX;
+    panY = e.touches[0].clientY;
+    panLeft = inp.scrollLeft;
+    panTarget = panLeft;
+    panAxis = 0;
+  }, {passive: true});
+  inp.addEventListener("touchmove", function(e){
+    if (panX === null || e.touches.length !== 1) return;
+    var dx = e.touches[0].clientX - panX;
+    var dy = e.touches[0].clientY - panY;
+    if (!panAxis){
+      if (Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+      panAxis = Math.abs(dx) > Math.abs(dy) ? 1 : 2;
+      if (panAxis === 2){ panX = null; clearWill(); return; }
+      /* 露出真值时先把输入框文字藏起来，镜像层显示真值；打码时本来就是星号层。 */
+      if (!isMasked){
+        setStarOffset(panLeft);
+        inp.classList.add("panning");
+      }
+    }
+    var left = panLeft - dx;
+    if (left < 0) left = 0;
+    else if (left > panMax) left = panMax;
+    panTarget = left;
+    queuePan();
+    if (e.cancelable) e.preventDefault();
+  }, {passive: false});
+  function panEnd(){
+    if (panX === null) return;
+    var moved = panAxis === 1;
+    panX = null; panAxis = 0;
+    if (!moved){ clearWill(); return; }
+    /* 把还没画出去的那一帧补上，松手位置才不会被吞掉；补完再撤 will-change。 */
+    stopPanFrame();
+    setStarOffset(panTarget);
+    /* 先把输入框滚到松手位置，再把 .panning 撤掉 —— 这样真值出现时已经在正确位置。 */
+    inp.scrollLeft = panTarget;
+    inp.classList.remove("panning");
+    clearWill();
+    syncScroll();
+  }
+  inp.addEventListener("touchend", panEnd, {passive: true});
+  inp.addEventListener("touchcancel", panEnd, {passive: true});
+
   var eye = el("button", "pw-eye");
   eye.type = "button";
   eye.dataset.i18nTitle = "f.token.show";
@@ -1487,12 +1628,15 @@ function buildTokenMask(inp){
   }
   eye.onclick = function(){
     var revealed = inp.classList.toggle("masked") === false;
+    isMasked = !revealed;
     eye.setAttribute("aria-pressed", revealed ? "true" : "false");
     paintEye(revealed);
+    sync();
   };
   paintEye(false);
-  wrap.appendChild(inp);
-  wrap.appendChild(stars);
+  field.appendChild(inp);
+  field.appendChild(stars);
+  wrap.appendChild(field);
   wrap.appendChild(eye);
   return wrap;
 }
