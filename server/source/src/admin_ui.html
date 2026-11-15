@@ -1217,7 +1217,7 @@ function renderTokens() {
       <td>${t.last_used_at ? fmtTimeStr(t.last_used_at) : '—'}</td>
       <td>${esc(t.note || '—')}</td>
       <td class="mono">${(t.bound_serial || t.bound_sn)
-        ? `${esc(t.bound_serial || '—')}<br><span class="muted">${esc(t.bound_sn || '—')}</span>`
+        ? `${esc(t.bound_serial || '—')}<br><span class="muted">${esc(t.bound_sn || '—')}${t.bound_province ? ' · ' + esc(t.bound_province) : ''}</span>`
         : '<span class="muted">未绑定</span>'}</td>
       <td>
         <button class="btn small" onclick="viewTokenIps('${encodeURIComponent(t.token)}')">查看 IP</button>

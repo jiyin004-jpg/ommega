@@ -34,6 +34,11 @@ impl Ip2Region {
         })
     }
 
+    /// 这个 IP 落在哪个省；没库、没命中、境外都返回空串。
+    pub fn province(&self, ip: &str) -> String {
+        self.search(ip).map(|r| province_of(&r)).unwrap_or_default()
+    }
+
     /// Look up an IPv4 address (dotted-quad string). Returns the region string
     /// `国家|区域|省份|城市|ISP`, or `None` if not found / not IPv4.
     pub fn search(&self, ip: &str) -> Option<String> {
@@ -93,6 +98,37 @@ impl Ip2Region {
     }
 }
 
+/// 地区串 `国家|区域|省份|城市|ISP` 里的省份那一段。
+/// 空串 / `0`（ip2region 对保留段的取值）都当没识别出来。
+pub fn province_of(region: &str) -> String {
+    let raw = region.split('|').nth(2).unwrap_or("").trim();
+    if raw.is_empty() || raw == "0" {
+        return String::new();
+    }
+    raw.to_string()
+}
+
+/// 省份主体名：去掉行政区划后缀，`广东省` 和 `广东` 算同一个。
+fn province_core(province: &str) -> &str {
+    let p = province.trim();
+    for suffix in ["特别行政区", "自治区", "省", "市"] {
+        if let Some(stripped) = p.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    p
+}
+
+/// 两次请求是不是同一个省。
+///
+/// 任一边没识别出省份（境外 IP、VPN、没装库）就当「判断不了」放行 ——
+/// 不能因为解析不出来把人锁在卡片外面。
+pub fn same_province(a: &str, b: &str) -> bool {
+    let a = province_core(a);
+    let b = province_core(b);
+    a.is_empty() || b.is_empty() || a == b
+}
+
 fn read_region(buf: &[u8], ptr: usize, len: usize) -> Option<String> {
     let end = ptr.checked_add(len)?;
     if end > buf.len() {
@@ -112,6 +148,37 @@ fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
         *buf.get(off + 2)?,
         *buf.get(off + 3)?,
     ]))
+}
+
+#[cfg(test)]
+mod province_tests {
+    use super::{province_of, same_province};
+
+    #[test]
+    fn province_of_takes_the_third_field() {
+        assert_eq!(province_of("中国|0|广东省|深圳市|电信"), "广东省");
+        assert_eq!(province_of("中国|0|北京市|北京市|联通"), "北京市");
+        // 保留段 / 境外 / 空串：一律当没识别出来
+        assert_eq!(province_of("中国|0|0|0|0"), "");
+        assert_eq!(province_of(""), "");
+        assert_eq!(province_of("0|0|0|0|0"), "");
+        assert_eq!(province_of("乱写的"), "");
+    }
+
+    #[test]
+    fn same_province_ignores_suffix_and_unknown() {
+        assert!(same_province("广东省", "广东"));
+        assert!(same_province("北京市", "北京"));
+        assert!(same_province("香港特别行政区", "香港"));
+        assert!(same_province("广东省", "广东省"));
+        // 真是两个省：不许
+        assert!(!same_province("广东省", "河南省"));
+        assert!(!same_province("广东", "河南"));
+        // 任一边识别不出来：放行，别把人锁死
+        assert!(same_province("", "河南省"));
+        assert!(same_province("广东省", ""));
+        assert!(same_province("", ""));
+    }
 }
 
 /// Parse a dotted-quad IPv4 string into 4 bytes, or None if invalid.

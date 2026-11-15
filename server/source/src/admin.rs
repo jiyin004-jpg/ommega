@@ -573,6 +573,7 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
                     "bound_serial": t.bound_serial,
                     "bound_sn": t.bound_sn,
                     "bound_imei": t.bound_imei,
+                    "bound_province": t.bound_province,
                     "bound_at": t.bound_at,
                 })
             })

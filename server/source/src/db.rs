@@ -4,6 +4,7 @@
 //!   - `device_server_identity`: DeviceServerIdentity (server_keybox keybox)
 //!   - `api_token`: ApiToken (issued A/B tokens)
 //!   - `token_usage_log`: token -> IP usage history
+//!   - `token_unbind_log`: 自助解绑流水（解绑次数按月数就是数它）
 //!   - `card_order`: card orders
 //!   - `card_lottery`: card lottery records
 //!   - `client_report`: ClientReport (diagnostics from A-side)
@@ -128,6 +129,9 @@ pub struct ApiTokenRow {
     /// 首次激活时绑定的 IMEI1（硬件写死）。与 `bound_sn` 互为备份，任意一项对得上
     /// 就算同一台机器。空 = 绑定时没读到。
     pub bound_imei: String,
+    /// 绑定时那台设备所在省份（请求方 IP 走 ip2region 解析出来的）。
+    /// 解绑要求同省，跨省不给自助解绑。空 = 当时没识别出来。
+    pub bound_province: String,
     /// 绑定的时间（北京时间字符串）。
     pub bound_at: String,
 }
@@ -682,6 +686,7 @@ impl Db {
             bound_serial: row_str(&row, "bound_serial"),
             bound_sn: row_str(&row, "bound_sn"),
             bound_imei: row_str(&row, "bound_imei"),
+            bound_province: row_str(&row, "bound_province"),
             bound_at: row_str(&row, "bound_at"),
         })
     }
@@ -730,7 +735,7 @@ impl Db {
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
                     created_at, last_ip, last_used_at, pair_id, kind,
-                    bound_serial, bound_sn, bound_imei, bound_at
+                    bound_serial, bound_sn, bound_imei, bound_province, bound_at
              FROM api_token ORDER BY id DESC",
             (),
         )?;
@@ -747,7 +752,7 @@ impl Db {
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
                     created_at, last_ip, last_used_at, pair_id, kind,
-                    bound_serial, bound_sn, bound_imei, bound_at
+                    bound_serial, bound_sn, bound_imei, bound_province, bound_at
              FROM api_token WHERE token = :token LIMIT 1",
             params! {
                 "token" => token,
@@ -769,16 +774,19 @@ impl Db {
         serial: &str,
         sn: &str,
         imei: &str,
+        province: &str,
     ) -> anyhow::Result<bool> {
         let mut conn = self.conn()?;
         conn.exec_drop(
             "UPDATE api_token
-                SET bound_serial = :serial, bound_sn = :sn, bound_imei = :imei, bound_at = NOW()
+                SET bound_serial = :serial, bound_sn = :sn, bound_imei = :imei,
+                    bound_province = :province, bound_at = NOW()
               WHERE token = :token AND (bound_serial IS NULL OR bound_serial = '')",
             params! {
                 "serial" => serial,
                 "sn" => sn,
                 "imei" => imei,
+                "province" => province,
                 "token" => token,
             },
         )?;
@@ -790,11 +798,67 @@ impl Db {
         let mut conn = self.conn()?;
         conn.exec_drop(
             "UPDATE api_token
-                SET bound_serial = NULL, bound_sn = NULL, bound_imei = NULL, bound_at = NULL
+                SET bound_serial = NULL, bound_sn = NULL, bound_imei = NULL,
+                    bound_province = NULL, bound_at = NULL
               WHERE token = :token",
             params! { "token" => token },
         )?;
         Ok(conn.affected_rows() > 0)
+    }
+
+    /// 自助解绑：把「还能解几次」的判定和解绑一起放进事务，
+    /// 并发请求不会都看到「还剩一次」。
+    ///
+    /// 两个额度：`max_total` 是这张卡的累计上限，`max_per_month` 是自然月（北京时间）。
+    /// 返回 `Ok(true)` = 真解绑了；`Ok(false)` = 额度用完，什么都没动。
+    pub fn unbind_token_device_limited(
+        &self,
+        token: &str,
+        province: &str,
+        ip: &str,
+        max_total: i64,
+        max_per_month: i64,
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.conn()?;
+        let txn = (|| -> anyhow::Result<bool> {
+            conn.query_drop("BEGIN")?;
+            let mut rows: Vec<mysql::Row> = conn.exec(
+                "SELECT CAST(COUNT(*) AS SIGNED),
+                        CAST(COALESCE(SUM(DATE_FORMAT(created_at, '%Y-%m')
+                                       = DATE_FORMAT(NOW(), '%Y-%m')), 0) AS SIGNED)
+                   FROM token_unbind_log WHERE token = :token",
+                params! { "token" => token },
+            )?;
+            let row = rows.pop();
+            let used_total: i64 = row.as_ref().and_then(|r| r.get(0)).unwrap_or(0);
+            let used_month: i64 = row.and_then(|r| r.get(1)).unwrap_or(0);
+            if used_total >= max_total || used_month >= max_per_month {
+                conn.query_drop("ROLLBACK")?;
+                return Ok(false);
+            }
+            conn.exec_drop(
+                "UPDATE api_token
+                    SET bound_serial = NULL, bound_sn = NULL, bound_imei = NULL,
+                        bound_province = NULL, bound_at = NULL
+                  WHERE token = :token",
+                params! { "token" => token },
+            )?;
+            conn.exec_drop(
+                "INSERT INTO token_unbind_log (token, province, client_ip)
+                 VALUES (:token, :province, :ip)",
+                params! {
+                    "token" => token,
+                    "province" => province,
+                    "ip" => ip,
+                },
+            )?;
+            conn.query_drop("COMMIT")?;
+            Ok(true)
+        })();
+        if txn.is_err() {
+            let _ = conn.query_drop("ROLLBACK");
+        }
+        txn
     }
 
     /// 同一台设备换了伪装串号后，把绑定记录跟到当前指纹。
@@ -807,16 +871,19 @@ impl Db {
         serial: &str,
         sn: &str,
         imei: &str,
+        province: &str,
     ) -> anyhow::Result<()> {
         let mut conn = self.conn()?;
         conn.exec_drop(
             "UPDATE api_token
-                SET bound_serial = :serial, bound_sn = :sn, bound_imei = :imei
+                SET bound_serial = :serial, bound_sn = :sn, bound_imei = :imei,
+                    bound_province = :province
               WHERE token = :token",
             params! {
                 "serial" => serial,
                 "sn" => sn,
                 "imei" => imei,
+                "province" => province,
                 "token" => token,
             },
         )?;
@@ -846,6 +913,10 @@ impl Db {
                 "ALTER TABLE api_token ADD COLUMN bound_imei VARCHAR(64) NULL",
             ),
             (
+                "bound_province",
+                "ALTER TABLE api_token ADD COLUMN bound_province VARCHAR(64) NULL",
+            ),
+            (
                 "bound_at",
                 "ALTER TABLE api_token ADD COLUMN bound_at DATETIME NULL",
             ),
@@ -856,6 +927,24 @@ impl Db {
             conn.query_drop(ddl)?;
             tracing::info!("api_token: added column {col}");
         }
+        Ok(())
+    }
+
+    /// 自助解绑流水表（一个月最多解几次就靠它数）。服务端没有 migration，启动时 ensure。
+    pub fn ensure_token_unbind_log_table(&self) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.query_drop(
+            r#"
+            CREATE TABLE IF NOT EXISTS token_unbind_log (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                token VARCHAR(128) NOT NULL,
+                province VARCHAR(64) NULL,
+                client_ip VARCHAR(64) NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_token_unbind (token, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            "#,
+        )?;
         Ok(())
     }
 

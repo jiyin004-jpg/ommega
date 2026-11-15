@@ -128,6 +128,8 @@ pub struct AuthState {
     /// 一次 poll 都要鉴权，全在关键路径上；卡密的 role/kind/enabled/绑定几秒内不会变，
     /// 所以值得缓存，代价是运营改卡 / 用户解绑最多晚 `TOKEN_CACHE_TTL` 生效。
     token_cache: Arc<Mutex<HashMap<String, (crate::db::ApiTokenRow, Instant)>>>,
+    /// 离线 IP 库：绑卡时把请求方所在省份记到卡上（解绑要同省才给自助）。
+    geo: Option<Arc<crate::geo::Ip2Region>>,
 }
 
 /// Admin session TTL: 12 hours of inactivity.
@@ -162,7 +164,22 @@ impl AuthState {
             ip_filter_list: Arc::new(Mutex::new(HashSet::new())),
             auth_required,
             token_cache: Arc::new(Mutex::new(HashMap::new())),
+            geo: None,
         }
+    }
+
+    /// 挂上离线 IP 库（没挂就一律当「省份识别不出来」）。
+    pub fn with_geo(mut self, geo: Option<Arc<crate::geo::Ip2Region>>) -> Self {
+        self.geo = geo;
+        self
+    }
+
+    /// 请求方 IP 落在哪个省，识别不出来给空串。
+    fn ip_province(&self, ip: &str) -> String {
+        self.geo
+            .as_ref()
+            .map(|g| g.province(ip))
+            .unwrap_or_default()
     }
 
     /// Attach the DB handle (set once after `Db::open`).
@@ -430,7 +447,7 @@ impl AuthState {
                     // A、B 两端都绑（只给 A 端绑的话 B 卡换机器照样能用）；公开卡不绑。
                     if role.is_some()
                         && Self::is_private_card(&row)
-                        && !self.device_binding_ok(db, &row, fp)
+                        && !self.device_binding_ok(db, &row, fp, &ip)
                     {
                         tracing::warn!(
                             "check_token: device mismatch token={} bound=({},{},{}) got=({},{},{})",
@@ -497,6 +514,9 @@ impl AuthState {
     /// - 库里全空：只绑定不检查；不传指纹的老 A 端仍能用，但永远绑不上；
     /// - 旧库只记了其中一项：只比非空的那项。
     ///
+    /// 绑定时顺手把请求方所在省份记到卡上（`bound_province`），解绑要求同省；
+    /// 老记录没省份的，在指纹对上的那次请求里补上。
+    ///
     /// 绑定仲裁走 `bind_token_device` 的乐观锁：`Ok(false)` 说明另一台设备先绑上了，
     /// 必须回库确认库里记的确实是自己的指纹才放行；写绑定失败也按不通过处理，
     /// 别让一次数据库异常把私卡退化成不绑定。
@@ -505,23 +525,27 @@ impl AuthState {
         db: &Arc<Db>,
         row: &crate::db::ApiTokenRow,
         fp: Option<&DeviceFp>,
+        ip: &str,
     ) -> bool {
         let bound_serial = row.bound_serial.trim();
         let bound_sn = row.bound_sn.trim();
         let bound_imei = row.bound_imei.trim();
+        let bound_province = row.bound_province.trim();
+        let province = self.ip_province(ip);
 
         if bound_serial.is_empty() && bound_sn.is_empty() && bound_imei.is_empty() {
             let Some(fp) = fp else { return true };
             if fp.is_empty() {
                 return true;
             }
-            match db.bind_token_device(&row.token, &fp.serial, &fp.sn, &fp.imei) {
+            match db.bind_token_device(&row.token, &fp.serial, &fp.sn, &fp.imei, &province) {
                 Ok(true) => {
                     // 更新缓存：本机接下来的请求不该拿旧行去撞自己的绑定。
                     let mut bound = row.clone();
                     bound.bound_serial = fp.serial.clone();
                     bound.bound_sn = fp.sn.clone();
                     bound.bound_imei = fp.imei.clone();
+                    bound.bound_province = province;
                     self.remember_token(&row.token, &bound);
                     true
                 }
@@ -580,13 +604,31 @@ impl AuthState {
             } else {
                 bound_imei.to_string()
             };
-            if new_serial != bound_serial || new_sn != bound_sn || new_imei != bound_imei {
-                match db.refresh_token_device(&row.token, &new_serial, &new_sn, &new_imei) {
+            // 省份只补空，不拿当前请求的盖掉首次绑定的（别的机器拿着同一张卡
+            // 换个省也不能把绑定省份改写）。
+            let new_province = if bound_province.is_empty() {
+                province.clone()
+            } else {
+                bound_province.to_string()
+            };
+            if new_serial != bound_serial
+                || new_sn != bound_sn
+                || new_imei != bound_imei
+                || new_province != bound_province
+            {
+                match db.refresh_token_device(
+                    &row.token,
+                    &new_serial,
+                    &new_sn,
+                    &new_imei,
+                    &new_province,
+                ) {
                     Ok(()) => {
                         let mut current = row.clone();
                         current.bound_serial = new_serial;
                         current.bound_sn = new_sn;
                         current.bound_imei = new_imei;
+                        current.bound_province = new_province;
                         self.remember_token(&row.token, &current);
                         tracing::info!(
                             "check_token: refreshed device fingerprint token={} was=({},{},{}) now=({},{},{})",
