@@ -204,6 +204,26 @@ struct RelayConfig {
     patchlevel_skip_pkgs: Vec<String>,
 }
 
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            device_id: String::new(),
+            machine_id: String::new(),
+            token: String::new(),
+            soter_allow_mutation: false,
+            soter_concurrency: DEFAULT_SOTER_CONCURRENCY,
+            soter_probe: None,
+            bind_iface: "auto".to_string(),
+            path_probe: true,
+            wakelock: true,
+            patchlevel_follow_a: false,
+            patchlevel_method: ommegaclient_b::plat::spl_live::Method::Prop,
+            patchlevel_skip_pkgs: Vec::new(),
+        }
+    }
+}
+
 impl RelayConfig {
     fn validate(&self) -> Result<()> {
         if self.server.is_empty() {
@@ -276,57 +296,43 @@ fn load_config_from_file() -> Result<RelayConfig> {
             }
         }
     }
-    let server = m
-        .get("OMMEGA_RELAY_SERVER")
-        .cloned()
-        .context("OMMEGA_RELAY_SERVER missing in relay.conf")?;
-    let device_id = m
-        .get("OMMEGA_RELAY_DEVICE_ID")
-        .cloned()
-        .context("OMMEGA_RELAY_DEVICE_ID missing in relay.conf")?;
-    let token = m
-        .get("OMMEGA_RELAY_TOKEN")
-        .cloned()
-        .context("OMMEGA_RELAY_TOKEN missing in relay.conf")?;
-    let machine_id = m
-        .get("OMMEGA_RELAY_MACHINE_ID")
-        .cloned()
-        .unwrap_or_default();
-    let soter_allow_mutation = m
-        .get("OMMEGA_RELAY_SOTER_MUTATION")
-        .is_some_and(|v| parse_bool(v));
-    let soter_concurrency = m
-        .get("OMMEGA_RELAY_SOTER_CONCURRENCY")
+    parse_cfg(|k| m.get(k).cloned(), "missing in relay.conf")
+}
+
+/// 13 个键的解析。取值方式由调用方给：文件分支查 `HashMap`，环境分支查 `std::env`。
+/// 键名和默认值两边必须逐字一致，只有「缺键」时报错的尾巴由 `missing` 补。
+fn parse_cfg(lookup: impl Fn(&str) -> Option<String>, missing: &str) -> Result<RelayConfig> {
+    let required =
+        |key: &str| -> Result<String> { lookup(key).with_context(|| format!("{key} {missing}")) };
+    let server = required("OMMEGA_RELAY_SERVER")?;
+    let device_id = required("OMMEGA_RELAY_DEVICE_ID")?;
+    let token = required("OMMEGA_RELAY_TOKEN")?;
+    let machine_id = lookup("OMMEGA_RELAY_MACHINE_ID").unwrap_or_default();
+    let soter_allow_mutation =
+        lookup("OMMEGA_RELAY_SOTER_MUTATION").is_some_and(|v| parse_bool(&v));
+    let soter_concurrency = lookup("OMMEGA_RELAY_SOTER_CONCURRENCY")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(DEFAULT_SOTER_CONCURRENCY);
     let soter_probe = parse_probe_target(
-        m.get("OMMEGA_RELAY_SOTER_PROBE_UID").map(|s| s.as_str()),
-        m.get("OMMEGA_RELAY_SOTER_PROBE_ALIAS").map(|s| s.as_str()),
+        lookup("OMMEGA_RELAY_SOTER_PROBE_UID").as_deref(),
+        lookup("OMMEGA_RELAY_SOTER_PROBE_ALIAS").as_deref(),
     );
     // 没配就是 `auto`：先走系统默认路由，通了就什么都不用绑（一台正常机器到这儿
     // 就结束了，系统自己的 WiFi→蜂窝 切换也留着）；默认那条打不通时才去挑网卡。
     // 想完全不绑配 `none`，想总是挑配 `always`，也可以直接写网卡名。
-    let bind_iface = m
-        .get("OMMEGA_RELAY_BIND_IFACE")
-        .cloned()
-        .unwrap_or_else(|| "auto".to_string());
-    let path_probe = m
-        .get("OMMEGA_RELAY_PATH_PROBE")
-        .map(|v| parse_bool(v))
+    let bind_iface = lookup("OMMEGA_RELAY_BIND_IFACE").unwrap_or_else(|| "auto".to_string());
+    let path_probe = lookup("OMMEGA_RELAY_PATH_PROBE")
+        .map(|v| parse_bool(&v))
         .unwrap_or(true);
-    let wakelock = m
-        .get("OMMEGA_RELAY_WAKELOCK")
-        .map(|v| parse_bool(v))
+    let wakelock = lookup("OMMEGA_RELAY_WAKELOCK")
+        .map(|v| parse_bool(&v))
         .unwrap_or(true);
-    let patchlevel_follow_a = m
-        .get(ommegaclient_b::plat::patchlevel::FOLLOW_KEY)
-        .is_some_and(|v| parse_bool(v));
+    let patchlevel_follow_a =
+        lookup(ommegaclient_b::plat::patchlevel::FOLLOW_KEY).is_some_and(|v| parse_bool(&v));
     let patchlevel_method = ommegaclient_b::plat::spl_live::Method::parse(
-        m.get(ommegaclient_b::plat::spl_live::METHOD_KEY)
-            .map(|s| s.as_str()),
+        lookup(ommegaclient_b::plat::spl_live::METHOD_KEY).as_deref(),
     );
-    let patchlevel_skip_pkgs = m
-        .get(ommegaclient_b::plat::patchlevel::FOLLOW_PKGS_KEY)
+    let patchlevel_skip_pkgs = lookup(ommegaclient_b::plat::patchlevel::FOLLOW_PKGS_KEY)
         .map(|v| {
             v.split(',')
                 .map(|s| s.trim().to_string())
@@ -427,57 +433,7 @@ fn load_config() -> Result<(RelayConfig, &'static str)> {
         cfg.validate()?;
         return Ok((cfg, "file"));
     }
-    let server = env("OMMEGA_RELAY_SERVER")
-        .context("OMMEGA_RELAY_SERVER not set and relay.conf unreadable")?;
-    let device_id = env("OMMEGA_RELAY_DEVICE_ID")
-        .context("OMMEGA_RELAY_DEVICE_ID not set and relay.conf unreadable")?;
-    let token = env("OMMEGA_RELAY_TOKEN")
-        .context("OMMEGA_RELAY_TOKEN not set and relay.conf unreadable")?;
-    let machine_id = env("OMMEGA_RELAY_MACHINE_ID").unwrap_or_default();
-    let soter_allow_mutation = env("OMMEGA_RELAY_SOTER_MUTATION").is_some_and(|v| parse_bool(&v));
-    let soter_concurrency = env("OMMEGA_RELAY_SOTER_CONCURRENCY")
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_SOTER_CONCURRENCY);
-    let soter_probe = parse_probe_target(
-        env("OMMEGA_RELAY_SOTER_PROBE_UID").as_deref(),
-        env("OMMEGA_RELAY_SOTER_PROBE_ALIAS").as_deref(),
-    );
-    let bind_iface = env("OMMEGA_RELAY_BIND_IFACE").unwrap_or_else(|| "auto".to_string());
-    let path_probe = env("OMMEGA_RELAY_PATH_PROBE")
-        .map(|v| parse_bool(&v))
-        .unwrap_or(true);
-    let wakelock = env("OMMEGA_RELAY_WAKELOCK")
-        .map(|v| parse_bool(&v))
-        .unwrap_or(true);
-    let patchlevel_follow_a =
-        env(ommegaclient_b::plat::patchlevel::FOLLOW_KEY).is_some_and(|v| parse_bool(&v));
-    let patchlevel_method = ommegaclient_b::plat::spl_live::Method::parse(
-        env(ommegaclient_b::plat::spl_live::METHOD_KEY).as_deref(),
-    );
-    let patchlevel_skip_pkgs = env(ommegaclient_b::plat::patchlevel::FOLLOW_PKGS_KEY)
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-    let server = server.trim_end_matches('/').to_string();
-    let cfg = RelayConfig {
-        server,
-        device_id,
-        machine_id,
-        token,
-        soter_allow_mutation,
-        soter_concurrency,
-        soter_probe,
-        bind_iface,
-        path_probe,
-        wakelock,
-        patchlevel_follow_a,
-        patchlevel_method,
-        patchlevel_skip_pkgs,
-    };
+    let cfg = parse_cfg(env, "not set and relay.conf unreadable")?;
     cfg.validate()?;
     Ok((cfg, "env"))
 }
@@ -1191,44 +1147,37 @@ fn handle_generate_attest(cfg: &RelayConfig, _task_type: &str, payload: &Value) 
     }))
 }
 
-fn handle_sign(_task_type: &str, payload: &Value) -> Result<Value> {
+/// `sign` / `decrypt` 除了默认算法和真正调的那个 TEE 操作之外逐行相同。
+fn handle_tee_op(
+    payload: &Value,
+    default_algo: &str,
+    f: impl Fn(&str, &[u8], &str) -> Result<Vec<u8>>,
+) -> Result<Value> {
     let alias = alias_of(payload, "attest");
     let algorithm = payload
         .get("algorithm")
         .and_then(Value::as_str)
-        .unwrap_or("SHA256withECDSA")
+        .unwrap_or(default_algo)
         .to_string();
     let data = b64_decode(
         payload
             .get("data")
             .ok_or_else(|| anyhow!("payload missing data"))?,
     )?;
-    let sig = tee_ops::sign(&alias, &data, &algorithm)?;
+    let out = f(&alias, &data, &algorithm)?;
     Ok(json!({
         "alias": alias,
         "algorithm": algorithm,
-        "data": b64(&sig),
+        "data": b64(&out),
     }))
 }
 
+fn handle_sign(_task_type: &str, payload: &Value) -> Result<Value> {
+    handle_tee_op(payload, "SHA256withECDSA", tee_ops::sign)
+}
+
 fn handle_decrypt(_task_type: &str, payload: &Value) -> Result<Value> {
-    let alias = alias_of(payload, "attest");
-    let algorithm = payload
-        .get("algorithm")
-        .and_then(Value::as_str)
-        .unwrap_or("RSA/ECB/PKCS1Padding")
-        .to_string();
-    let data = b64_decode(
-        payload
-            .get("data")
-            .ok_or_else(|| anyhow!("payload missing data"))?,
-    )?;
-    let plain = tee_ops::decrypt(&alias, &data, &algorithm)?;
-    Ok(json!({
-        "alias": alias,
-        "algorithm": algorithm,
-        "data": b64(&plain),
-    }))
+    handle_tee_op(payload, "RSA/ECB/PKCS1Padding", tee_ops::decrypt)
 }
 
 fn handle_agree(_task_type: &str, payload: &Value) -> Result<Value> {
@@ -1517,21 +1466,7 @@ fn main() {
     // process state must be up before we start serving tasks.
     let _ = rsbinder::ProcessState::init_default();
     {
-        let g = shared.read().map(|g| g.clone()).unwrap_or(RelayConfig {
-            server: String::new(),
-            device_id: String::new(),
-            machine_id: String::new(),
-            token: String::new(),
-            soter_allow_mutation: false,
-            soter_concurrency: DEFAULT_SOTER_CONCURRENCY,
-            soter_probe: None,
-            bind_iface: "auto".to_string(),
-            path_probe: true,
-            wakelock: true,
-            patchlevel_follow_a: false,
-            patchlevel_method: ommegaclient_b::plat::spl_live::Method::Prop,
-            patchlevel_skip_pkgs: Vec::new(),
-        });
+        let g = shared.read().map(|g| g.clone()).unwrap_or_default();
         log::info!(
             "relay daemon starting (config from {source}) server={} device={} machine={}",
             g.server,

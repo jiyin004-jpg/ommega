@@ -270,7 +270,7 @@ pub fn client_version_ok(payload: &Value) -> bool {
 }
 
 /// 是否要改：目标值与本机值一致就不动，避免为一笔请求重启 HAL 和 keystore2。
-fn value_matches(_prop: &str, base: &str, want: &str) -> bool {
+fn value_matches(base: &str, want: &str) -> bool {
     base.trim() == want.trim()
 }
 
@@ -349,7 +349,7 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
         };
         // 只以当前值为准：一致就不动、不弹 HAL；不一致（包括改回本机原值）就写回去
         // 再重读。不能拿 baseline 比 want，否则 want 回到原值时属性会停在旧值上。
-        if value_matches(prop, &current, &want) {
+        if value_matches(&current, &want) {
             continue;
         }
         if let Err(e) = resetprop(prop, &want) {
@@ -560,9 +560,9 @@ mod tests {
     /// 跟本机值一样就不动（A 端已全同步），不一样才动。
     #[test]
     fn decides_by_local_original_value() {
-        assert!(value_matches(OS_PROP, "2026-08-01", "2026-08-01"));
-        assert!(!value_matches(OS_PROP, "2026-08-01", "2026-09-01"));
-        assert!(!value_matches(OS_PROP, "2026-08-01", ""));
+        assert!(value_matches("2026-08-01", "2026-08-01"));
+        assert!(!value_matches("2026-08-01", "2026-09-01"));
+        assert!(!value_matches("2026-08-01", ""));
     }
 
     #[test]

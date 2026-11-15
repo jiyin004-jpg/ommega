@@ -75,10 +75,6 @@ const SLOT_REBUILD_OPS: &[&str] = &[
 /// SOTER_ERROR_VERIFICATION_FAILED（-26）：这一笔的验证没过去，不是「还没建好」。
 const SOTER_VERIFICATION_FAILED: i64 = -26;
 
-/// SOTER_ASK_NOT_READY / SOTER_AUTH_KEY_NOT_READY：这个槽位上还没有对应材料。
-const SOTER_ASK_NOT_READY: i64 = -5;
-const SOTER_AUTH_KEY_NOT_READY: i64 = -6;
-
 /// SOTER 结构性不可用：没开（-12）、ATTK 没配（-13）、安全通道不通（-18）、
 /// TA 拿不到（-20）。这些是「这台现在真做不了」，跟「这次没签成」不是一回事。
 const SOTER_NOT_ENABLED: i64 = -12;
@@ -134,7 +130,12 @@ impl SignVerdict {
         match code {
             0 => SignVerdict::Signed,
             SOTER_VERIFICATION_FAILED => SignVerdict::BiometricRequired,
-            SOTER_ASK_NOT_READY | SOTER_AUTH_KEY_NOT_READY => SignVerdict::NoMaterial,
+            // 缺料那两个码只有 i32 常量（跟 HAL 的返回类型一致），比较前先转宽。
+            code if code == i64::from(SOTER_ASK_NOT_READY_CODE)
+                || code == i64::from(SOTER_AUTH_KEY_NOT_READY_CODE) =>
+            {
+                SignVerdict::NoMaterial
+            }
             SOTER_NOT_ENABLED
             | SOTER_ATTK_NOT_PROVISIONED
             | SOTER_SECURE_HW_FAILED

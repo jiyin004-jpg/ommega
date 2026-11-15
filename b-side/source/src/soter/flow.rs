@@ -434,50 +434,17 @@ where
                 Verdict::Skipped,
                 "关掉了建料/删料；微信这一步会真去建，而这里没建",
             ));
-        } else {
-            let gen = send(json!({ "op": "generate_ask_key_pair", "uid": opts.uid }))
-                .context("generate_ask_key_pair 没拿到答复")?;
-            let gen_ok = ok_code(&gen) == Verdict::Ok;
-            acc.steps.push(Step::new(
-                "f46.q0 → f46.o0",
-                "generate_ask_key_pair",
-                if gen_ok {
-                    Verdict::Ok
-                } else {
-                    Verdict::WechatFails
-                },
-                format!(
-                    "error_code={}{}",
-                    code_of(&gen),
-                    if gen_ok {
-                        ""
-                    } else {
-                        "；微信会调 s36.a.r() 把 ASK 删掉再来"
-                    }
-                ),
-            ));
-            if gen_ok {
-                let (doc, step) = export_check(
-                    &mut send,
-                    &mut acc,
-                    "ask",
-                    "export_ask_public_key",
-                    json!({ "uid": opts.uid }),
-                    "ASK",
-                    opts.uid,
-                )?;
-                ask_ok = doc.is_some();
-                acc.steps.push(Step::new(
-                    "f46.o0.onSuccess → s36.a.c()",
-                    "export_ask_public_key",
-                    if ask_ok {
-                        Verdict::Ok
-                    } else {
-                        Verdict::WechatFails
-                    },
-                    step,
-                ));
-            }
+        } else if let Some(ok) = ensure_material(
+            &mut send,
+            &mut acc,
+            "generate_ask_key_pair",
+            "export_ask_public_key",
+            "ask",
+            "ASK",
+            opts.uid,
+            &alias,
+        )? {
+            ask_ok = ok;
         }
     }
 
@@ -545,51 +512,17 @@ where
                 Verdict::Skipped,
                 "关掉了建料/删料；微信这一步会真去建",
             ));
-        } else {
-            let gen =
-                send(json!({ "op": "generate_auth_key_pair", "uid": opts.uid, "alias": alias }))
-                    .context("generate_auth_key_pair 没拿到答复")?;
-            let gen_ok = ok_code(&gen) == Verdict::Ok;
-            acc.steps.push(Step::new(
-                "f46.u0 → f46.s0",
-                "generate_auth_key_pair",
-                if gen_ok {
-                    Verdict::Ok
-                } else {
-                    Verdict::WechatFails
-                },
-                format!(
-                    "alias={alias} error_code={}{}",
-                    code_of(&gen),
-                    if gen_ok {
-                        String::new()
-                    } else {
-                        "；微信会调 s36.a.s(alias, true)（连 ASK 一起删）".to_string()
-                    }
-                ),
-            ));
-            if gen_ok {
-                let (doc, step) = export_check(
-                    &mut send,
-                    &mut acc,
-                    "auth",
-                    "export_auth_key_public_key",
-                    json!({ "uid": opts.uid, "alias": alias }),
-                    "AuthKey",
-                    opts.uid,
-                )?;
-                auth_ok = doc.is_some();
-                acc.steps.push(Step::new(
-                    "f46.s0.onSuccess → s36.a.e()",
-                    "export_auth_key_public_key",
-                    if auth_ok {
-                        Verdict::Ok
-                    } else {
-                        Verdict::WechatFails
-                    },
-                    step,
-                ));
-            }
+        } else if let Some(ok) = ensure_material(
+            &mut send,
+            &mut acc,
+            "generate_auth_key_pair",
+            "export_auth_key_public_key",
+            "auth",
+            "AuthKey",
+            opts.uid,
+            &alias,
+        )? {
+            auth_ok = ok;
         }
     }
 
@@ -777,6 +710,84 @@ where
         }
         Err(why) => Ok((None, format!("error_code=0，但{why}"))),
     }
+}
+
+/// 「缺料 → generate → 再 export → push Step」：ASK 和 AuthKey 各有一份，形状一样，
+/// 只有 op 名、步骤名和提示语按 `tag` 分。
+///
+/// `Ok(Some(ok))` = 建料成功，`ok` 是重新导出的结果；`Ok(None)` = 建料本身没成功
+/// （调用方保持原来的结论不动）。
+#[allow(clippy::too_many_arguments)]
+fn ensure_material<F>(
+    send: &mut F,
+    acc: &mut Collected,
+    gen_op: &'static str,
+    export_op: &'static str,
+    tag: &'static str,
+    what: &str,
+    uid: i32,
+    alias: &str,
+) -> Result<Option<bool>>
+where
+    F: FnMut(Value) -> Result<Value>,
+{
+    let is_ask = tag == "ask";
+    let gen_step = if is_ask {
+        "f46.q0 → f46.o0"
+    } else {
+        "f46.u0 → f46.s0"
+    };
+    let export_step = if is_ask {
+        "f46.o0.onSuccess → s36.a.c()"
+    } else {
+        "f46.s0.onSuccess → s36.a.e()"
+    };
+    let hint = if is_ask {
+        "；微信会调 s36.a.r() 把 ASK 删掉再来"
+    } else {
+        "；微信会调 s36.a.s(alias, true)（连 ASK 一起删）"
+    };
+    let args = if is_ask {
+        json!({ "uid": uid })
+    } else {
+        json!({ "uid": uid, "alias": alias })
+    };
+    let gen =
+        send(with_op(gen_op, args.clone())).with_context(|| format!("{gen_op} 没拿到答复"))?;
+    let gen_ok = ok_code(&gen) == Verdict::Ok;
+    let verdict = if gen_ok {
+        Verdict::Ok
+    } else {
+        Verdict::WechatFails
+    };
+    let lead = if is_ask {
+        String::new()
+    } else {
+        format!("alias={alias} ")
+    };
+    let tail = if gen_ok { "" } else { hint };
+    acc.steps.push(Step::new(
+        gen_step,
+        gen_op,
+        verdict,
+        format!("{lead}error_code={}{tail}", code_of(&gen)),
+    ));
+    if !gen_ok {
+        return Ok(None);
+    }
+    let (doc, step) = export_check(send, acc, tag, export_op, args, what, uid)?;
+    let ok = doc.is_some();
+    acc.steps.push(Step::new(
+        export_step,
+        export_op,
+        if ok {
+            Verdict::Ok
+        } else {
+            Verdict::WechatFails
+        },
+        step,
+    ));
+    Ok(Some(ok))
 }
 
 fn code_of(reply: &Value) -> i64 {

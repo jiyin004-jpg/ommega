@@ -219,6 +219,25 @@ pub struct SoterSession {
     pub session: i64,
 }
 
+/// AIDL / HIDL 两套后端的同一副骨架：AIDL 那边自己拼 parcel 再 `call_*`，HIDL 那边
+/// 直接叫同名方法。第一个参数是 `call_data` / `call_error` / `call_session`。
+macro_rules! dispatch {
+    // 不带参数：AIDL 那边发空 parcel，HIDL 那边调同名方法。
+    ($this:ident, $call:ident, $tx:expr, $method:ident()) => {
+        match &$this.inner {
+            Inner::Aidl { .. } => $this.$call($tx, |_| Ok(())),
+            Inner::Hidl { proxy, .. } => proxy.$method(),
+        }
+    };
+    // 带参数：parcel 怎么写由调用方给，HIDL 那边同名方法接同样的参数。
+    ($this:ident, $call:ident, $tx:expr, |$p:pat_param| $write:expr, $method:ident($($arg:expr),*)) => {
+        match &$this.inner {
+            Inner::Aidl { .. } => $this.$call($tx, |$p| $write),
+            Inner::Hidl { proxy, .. } => proxy.$method($($arg),*),
+        }
+    };
+}
+
 /// A live SOTER HAL proxy.
 pub struct Soter {
     inner: Inner,
@@ -400,113 +419,142 @@ impl Soter {
         read_error_code(&mut reply)
     }
 
+    fn call_session<F>(&self, code: u32, write_args: F) -> Result<SoterSession>
+    where
+        F: FnOnce(&mut Parcel) -> Result<()>,
+    {
+        let backend = self.backend();
+        let mut reply = self.call(code, write_args)?;
+        read_soter_session(&mut reply, backend)
+    }
+
     /// Stable device id (32 hex characters).
     pub fn get_device_id(&self) -> Result<SoterData> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_data(TX_GET_DEVICE_ID, |_| Ok(())),
-            Inner::Hidl { proxy, .. } => proxy.get_device_id(),
-        }
+        dispatch!(self, call_data, TX_GET_DEVICE_ID, get_device_id())
     }
 
     /// ATTK (attestation key) public key as a PEM block.
     pub fn export_attk_public_key(&self) -> Result<SoterData> {
         self.attk_only("export_attk_public_key")?;
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_data(TX_EXPORT_ATTK_PUBLIC_KEY, |_| Ok(())),
-            Inner::Hidl { proxy, .. } => proxy.export_attk_public_key(),
-        }
+        dispatch!(
+            self,
+            call_data,
+            TX_EXPORT_ATTK_PUBLIC_KEY,
+            export_attk_public_key()
+        )
     }
 
     /// ASK (app signing key) public key plus TEE signature for `uid`.
     pub fn export_ask_public_key(&self, uid: i32) -> Result<SoterData> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_data(TX_EXPORT_ASK_PUBLIC_KEY, |p| {
+        dispatch!(
+            self,
+            call_data,
+            TX_EXPORT_ASK_PUBLIC_KEY,
+            |p| {
                 p.write_i32(uid)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.export_ask_public_key(uid),
-        }
+            },
+            export_ask_public_key(uid)
+        )
     }
 
     /// Per-uid auth key public key.
     pub fn export_auth_key_public_key(&self, uid: i32, alias: &str) -> Result<SoterData> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_data(TX_EXPORT_AUTH_KEY_PUBLIC_KEY, |p| {
+        dispatch!(
+            self,
+            call_data,
+            TX_EXPORT_AUTH_KEY_PUBLIC_KEY,
+            |p| {
                 p.write_i32(uid)?;
                 p.write::<str>(alias)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.export_auth_key_public_key(uid, alias),
-        }
+            },
+            export_auth_key_public_key(uid, alias)
+        )
     }
 
     /// Complete a signing session started by [`Self::init_sign`].
     pub fn finish_sign(&self, session: i64) -> Result<SoterData> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_data(TX_FINISH_SIGN, |p| {
+        dispatch!(
+            self,
+            call_data,
+            TX_FINISH_SIGN,
+            |p| {
                 p.write_i64(session)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.finish_sign(session),
-        }
+            },
+            finish_sign(session)
+        )
     }
 
     /// Start a signing session against a per-uid auth key.
     pub fn init_sign(&self, uid: i32, alias: &str, challenge: &str) -> Result<SoterSession> {
-        if let Inner::Hidl { proxy, .. } = &self.inner {
-            return proxy.init_sign(uid, alias, challenge);
-        }
-        let backend = self.backend();
-        let mut reply = self.call(TX_INIT_SIGN, |p| {
-            p.write_i32(uid)?;
-            p.write::<str>(alias)?;
-            p.write::<str>(challenge)?;
-            Ok(())
-        })?;
-        read_soter_session(&mut reply, backend)
+        dispatch!(
+            self,
+            call_session,
+            TX_INIT_SIGN,
+            |p| {
+                p.write_i32(uid)?;
+                p.write::<str>(alias)?;
+                p.write::<str>(challenge)?;
+                Ok(())
+            },
+            init_sign(uid, alias, challenge)
+        )
     }
 
     /// 0 when `uid` already owns an ASK, -5 when it does not.
     pub fn has_ask_already(&self, uid: i32) -> Result<i32> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_HAS_ASK_ALREADY, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_HAS_ASK_ALREADY,
+            |p| {
                 p.write_i32(uid)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.has_ask_already(uid),
-        }
+            },
+            has_ask_already(uid)
+        )
     }
 
     /// 0 when the auth key exists.
     pub fn has_auth_key(&self, uid: i32, alias: &str) -> Result<i32> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_HAS_AUTH_KEY, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_HAS_AUTH_KEY,
+            |p| {
                 p.write_i32(uid)?;
                 p.write::<str>(alias)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.has_auth_key(uid, alias),
-        }
+            },
+            has_auth_key(uid, alias)
+        )
     }
 
     /// Verify the device ATTK key pair.
     pub fn verify_attk_key_pair(&self) -> Result<i32> {
         self.attk_only("verify_attk_key_pair")?;
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_VERIFY_ATTK_KEY_PAIR, |_| Ok(())),
-            Inner::Hidl { proxy, .. } => proxy.verify_attk_key_pair(),
-        }
+        dispatch!(
+            self,
+            call_error,
+            TX_VERIFY_ATTK_KEY_PAIR,
+            verify_attk_key_pair()
+        )
     }
 
     /// Create the ASK for `uid`.  **Device state change.**
     pub fn generate_ask_key_pair(&self, uid: i32) -> Result<i32> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_GENERATE_ASK_KEY_PAIR, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_GENERATE_ASK_KEY_PAIR,
+            |p| {
                 p.write_i32(uid)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.generate_ask_key_pair(uid),
-        }
+            },
+            generate_ask_key_pair(uid)
+        )
     }
 
     /// Create the device ATTK.  **Device state change.**
@@ -516,48 +564,60 @@ impl Soter {
     /// marshal a scalar `byte`).  HIDL 那边声明的是 `uint8_t copyNum`，同様 4 字节。
     pub fn generate_attk_key_pair(&self, user_id: i8) -> Result<i32> {
         self.attk_only("generate_attk_key_pair")?;
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_GENERATE_ATTK_KEY_PAIR, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_GENERATE_ATTK_KEY_PAIR,
+            |p| {
                 p.write_i32(i32::from(user_id))?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.generate_attk_key_pair(user_id),
-        }
+            },
+            generate_attk_key_pair(user_id)
+        )
     }
 
     /// Create a per-uid, per-alias auth key.  **Device state change.**
     pub fn generate_auth_key_pair(&self, uid: i32, alias: &str) -> Result<i32> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_GENERATE_AUTH_KEY_PAIR, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_GENERATE_AUTH_KEY_PAIR,
+            |p| {
                 p.write_i32(uid)?;
                 p.write::<str>(alias)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.generate_auth_key_pair(uid, alias),
-        }
+            },
+            generate_auth_key_pair(uid, alias)
+        )
     }
 
     /// Remove every key belonging to `uid`.  **Device state change.**
     pub fn remove_all_uid_key(&self, uid: i32) -> Result<i32> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_REMOVE_ALL_UID_KEY, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_REMOVE_ALL_UID_KEY,
+            |p| {
                 p.write_i32(uid)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.remove_all_uid_key(uid),
-        }
+            },
+            remove_all_uid_key(uid)
+        )
     }
 
     /// Remove one auth key.  **Device state change.**
     pub fn remove_auth_key(&self, uid: i32, alias: &str) -> Result<i32> {
-        match &self.inner {
-            Inner::Aidl { .. } => self.call_error(TX_REMOVE_AUTH_KEY, |p| {
+        dispatch!(
+            self,
+            call_error,
+            TX_REMOVE_AUTH_KEY,
+            |p| {
                 p.write_i32(uid)?;
                 p.write::<str>(alias)?;
                 Ok(())
-            }),
-            Inner::Hidl { proxy, .. } => proxy.remove_auth_key(uid, alias),
-        }
+            },
+            remove_auth_key(uid, alias)
+        )
     }
 
     /// HAL interface version (every vendor here ships version 1).

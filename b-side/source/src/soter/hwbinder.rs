@@ -448,7 +448,13 @@ impl HwBinder {
         let fd: OwnedFd = file.into();
         let mut version = BinderVersion::default();
         // SAFETY: fd 是刚打开的设备，BINDER_VERSION 只读 4 字节。
-        let rc = unsafe { libc_ioctl(fd.as_raw_fd(), BINDER_VERSION, &mut version) };
+        let rc = unsafe {
+            ffi::ioctl(
+                fd.as_raw_fd(),
+                BINDER_VERSION,
+                &mut version as *mut BinderVersion,
+            )
+        };
         if rc != 0 {
             let err = io::Error::last_os_error();
             bail!("BINDER_VERSION on {path} failed: {err}");
@@ -464,7 +470,7 @@ impl HwBinder {
         // mmap 供接收：内核把应答 parcel 映射进来，事务里给的地址落在这里。
         // SAFETY: fd 有效，map_len 非零，属性跟 AOSP 的 ProcessState::open_driver 一致。
         let map = unsafe {
-            libc_mmap(
+            ffi::mmap(
                 std::ptr::null_mut(),
                 map_len,
                 PROT_READ,
@@ -581,7 +587,13 @@ impl HwBinder {
             code,
             |wwr| {
                 // SAFETY: out and the heap inbox remain valid throughout this ioctl.
-                let rc = unsafe { libc_ioctl_wwr(self.fd.as_raw_fd(), wwr) };
+                let rc = unsafe {
+                    ffi::ioctl(
+                        self.fd.as_raw_fd(),
+                        BINDER_WRITE_READ,
+                        wwr as *mut BinderWriteRead,
+                    )
+                };
                 if rc != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -797,7 +809,7 @@ impl Drop for HwBinder {
         if !self.map.is_null() {
             // SAFETY: map 是 open 时 mmap 出来、还没解映射的。
             unsafe {
-                libc_munmap(self.map as *mut std::ffi::c_void, self.map_len);
+                let _ = ffi::munmap(self.map as *mut std::ffi::c_void, self.map_len);
             }
         }
     }
@@ -827,7 +839,7 @@ fn send_u32_command(fd: i32, cmd: u32, value: u32) -> io::Result<()> {
         ..BinderWriteRead::default()
     };
     // SAFETY: out 活到这次调用返回；只写不读，read_size 是 0。
-    let rc = unsafe { libc_ioctl_wwr(fd, &mut wwr) };
+    let rc = unsafe { ffi::ioctl(fd, BINDER_WRITE_READ, &mut wwr as *mut BinderWriteRead) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -846,7 +858,7 @@ fn free_reply_buffers(fd: i32, ptrs: &[BinderSize]) {
         ..BinderWriteRead::default()
     };
     // SAFETY: cmd 活到这次调用返回；只写不读，read_size 是 0。
-    let rc = unsafe { libc_ioctl_wwr(fd, &mut wwr) };
+    let rc = unsafe { ffi::ioctl(fd, BINDER_WRITE_READ, &mut wwr as *mut BinderWriteRead) };
     if rc != 0 {
         log::warn!(
             "BC_FREE_BUFFER({ptrs:?}) failed: {}",
@@ -888,33 +900,8 @@ const MAP_NORESERVE: i32 = 0x4000;
 
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 
-/// `ioctl` 是变参函数，Rust 里没法直接包一层；这里按每个请求的形状分别包。
-/// SAFETY: 调用方保证 `arg` 指向的内存对这次请求来说大小和可写性都对。
-unsafe fn libc_ioctl(fd: i32, request: u64, arg: *mut BinderVersion) -> i32 {
-    ffi::ioctl(fd, request, arg)
-}
-
-/// SAFETY: 调用方保证 `wwr` 指向的内存按 `BINDER_WRITE_READ` 的形状初始化过，
-/// 且 `write_buffer` / `read_buffer` 指向的内存在这次调用期间有效。
-unsafe fn libc_ioctl_wwr(fd: i32, wwr: *mut BinderWriteRead) -> i32 {
-    ffi::ioctl(fd, BINDER_WRITE_READ, wwr)
-}
-
-unsafe fn libc_mmap(
-    addr: *mut c_void,
-    length: usize,
-    prot: i32,
-    flags: i32,
-    fd: i32,
-    offset: i64,
-) -> *mut c_void {
-    ffi::mmap(addr, length, prot, flags, fd, offset)
-}
-
-/// SAFETY: `addr` / `length` 必须来自一次成功的 mmap。
-unsafe fn libc_munmap(addr: *mut c_void, length: usize) {
-    let _ = ffi::munmap(addr, length);
-}
+// `ioctl` 是变参函数，Rust 里没法直接包一层：调用点各自按那笔请求的形状直接调
+// `ffi::ioctl`，SAFETY 就写在每个调用点上。
 
 /// 保留暂未使用的 uapi 常量（`BC_ENTER_LOOPER` 等），避免 dead_code 告警。
 #[allow(dead_code)]
