@@ -89,6 +89,10 @@
   .row .pw-wrap input.masked{color:transparent;caret-color:var(--fg);
       -webkit-text-fill-color:transparent}
   .row .pw-wrap input.masked::selection{background:transparent;color:transparent}
+  /* 输入法拼字期间临时露出真值：组合里的字还没 commit，打码后看不见在打什么。
+     用独立的 .composing，不去动 .masked——否则拼字时点眼睛，那一下 toggle 会反过来。 */
+  .row .pw-wrap input.composing{color:var(--fg);-webkit-text-fill-color:var(--fg)}
+  .pw-field input.composing ~ .pw-stars{opacity:0}
   /* 露出真值拖动时也走镜像层：先把输入框文字藏起来，拖完再显示。 */
   .row .pw-wrap input.panning{color:transparent;
       -webkit-text-fill-color:transparent}
@@ -1545,13 +1549,12 @@ function buildTokenMask(inp){
   }
 
   if (isMasked) inp.classList.add("masked");
-  /* 输入法拼字期间露出真值：组合中的字还没 commit，打码后只看得到星号多了一个，
-     看不出在打什么。去掉 .masked 后星号层自动隐掉（见 `.pw-field input:not(.masked) ~ .pw-stars`）。 */
+  /* 输入法拼字期间临时露出真值；不动 .masked，打完字自动回打码。 */
   inp.addEventListener("compositionstart", function(){
-    inp.classList.remove("masked");
+    inp.classList.add("composing");
   });
   inp.addEventListener("compositionend", function(){
-    if (isMasked) inp.classList.add("masked");
+    inp.classList.remove("composing");
     sync();
   });
   inp.addEventListener("input", sync);
@@ -1642,11 +1645,12 @@ function buildTokenMask(inp){
     eye.setAttribute("aria-label", t(k));
   }
   eye.onclick = function(){
-    var revealed = inp.classList.toggle("masked") === false;
-    isMasked = !revealed;
-    TOKEN_REVEALED = revealed;
-    eye.setAttribute("aria-pressed", revealed ? "true" : "false");
-    paintEye(revealed);
+    /* 显式按状态设置，不用 toggle：拼字组件/拖动都可能改动 class，toggle 会解读。 */
+    isMasked = !isMasked;
+    TOKEN_REVEALED = !isMasked;
+    inp.classList.toggle("masked", isMasked);
+    eye.setAttribute("aria-pressed", isMasked ? "false" : "true");
+    paintEye(!isMasked);
     sync();
   };
   paintEye(TOKEN_REVEALED);
