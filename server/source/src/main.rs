@@ -97,14 +97,9 @@ fn build_router(cfg: &Arc<Config>) -> Router {
     } else {
         match Db::open(&cfg.mysql_url) {
             Ok(d) => {
-                // 旧库补列：卡密绑设备用的 bound_serial / bound_sn / bound_at。
-                // 建表是手工做的（没 DDL 文件），所以启动时自己对齐。
+                // 旧库补列：卡密绑设备 + 自助解绑额度（线上 api_token 是手工建的，没 DDL）。
                 if let Err(e) = d.ensure_token_device_columns() {
                     tracing::warn!("api_token device-binding columns not ensured: {e}");
-                }
-                // 自助解绑的流水表（一个月几次就是数它）。
-                if let Err(e) = d.ensure_token_unbind_log_table() {
-                    tracing::warn!("token_unbind_log table not ensured: {e}");
                 }
                 // SOTER 服务端密钥模式的 ATTK 库（新表，启动时自己建）。
                 if let Err(e) = d.ensure_soter_attk_table() {
@@ -119,7 +114,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         }
     };
     // Load the offline IP-to-region database (non-fatal if missing).
-    // 绑卡时要用它记省份，所以得在构造 auth 前加载。
+    // 绑卡要记省份，所以得在构造 auth 之前加载。
     let geo = relay_rs::geo::Ip2Region::load(&cfg.geo_db_path).map(Arc::new);
     if geo.is_none() {
         tracing::warn!(

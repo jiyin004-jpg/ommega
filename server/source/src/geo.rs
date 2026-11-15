@@ -98,9 +98,8 @@ impl Ip2Region {
     }
 }
 
-/// 地区串 `国家|区域|省份|城市|ISP` 里的省份那一段。
-/// 空串 / `0`（ip2region 对保留段的取值）都当没识别出来。
-pub fn province_of(region: &str) -> String {
+/// 地区串 `国家|区域|省份|城市|ISP` 里的省份；空串 / `0` 都当没识别出来。
+fn province_of(region: &str) -> String {
     let raw = region.split('|').nth(2).unwrap_or("").trim();
     if raw.is_empty() || raw == "0" {
         return String::new();
@@ -119,10 +118,7 @@ fn province_core(province: &str) -> &str {
     p
 }
 
-/// 两次请求是不是同一个省。
-///
-/// 任一边没识别出省份（境外 IP、VPN、没装库）就当「判断不了」放行 ——
-/// 不能因为解析不出来把人锁在卡片外面。
+/// 两次请求是不是同一个省；任一边没识别出来就当判断不了，放行。
 pub fn same_province(a: &str, b: &str) -> bool {
     let a = province_core(a);
     let b = province_core(b);

@@ -605,18 +605,14 @@ pub async fn card_lookup(
     .into_response()
 }
 
-/// 自助解绑额度：一张卡累计最多 3 次，且一个自然月（北京时间）只能解 1 次。
-/// 管理员在控制台解绑不受这两条限制。
+/// 自助解绑额度：累计 3 次，且本月只能解 1 次。控制台解绑不受限。
 const UNBIND_MAX_TOTAL: i64 = 3;
-const UNBIND_MAX_PER_MONTH: i64 = 1;
 
-/// 不给解绑门槛时统一的回话：不解释是哪条限制，只说去找人。
+/// 不给解绑门槛时统一的回话。
 const UNBIND_REFUSED: &str = "暂时无法自助解绑，请联系管理员或群主处理";
 
 /// POST /api/card/unbind/ — 凭卡密解绑设备。只清指纹，不动激活时间与有效期。
-///
-/// 两道门槛都对外不吭声：卡绑在哪个省就只能在那个省解；一张卡累计 3 次、
-/// 每个月 1 次。哪一条没过都回同一句话（找管理员或群主）。
+/// 三道门槛（同省 / 累计 3 次 / 本月 1 次）没过都回同一句话。
 pub async fn card_unbind(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -645,7 +641,7 @@ pub async fn card_unbind(
         return json_err(StatusCode::BAD_REQUEST, "这张卡还没有绑定设备");
     }
 
-    // 跨省不给解：绑在哪省就在哪省解。任一边识别不出省份时按「判断不了」放行。
+    // 跨省不给解；任一边识别不出省份就放行。
     let province = state
         .geo
         .as_ref()
@@ -662,13 +658,7 @@ pub async fn card_unbind(
         return json_err(StatusCode::FORBIDDEN, UNBIND_REFUSED);
     }
 
-    match db.unbind_token_device_limited(
-        token,
-        &province,
-        &ip,
-        UNBIND_MAX_TOTAL,
-        UNBIND_MAX_PER_MONTH,
-    ) {
+    match db.unbind_token_device_limited(token, UNBIND_MAX_TOTAL) {
         Ok(true) => Json(json!({
             "status": "ok",
             "message": "已解绑，下次使用会绑定到新的设备",
@@ -678,10 +668,7 @@ pub async fn card_unbind(
         }))
         .into_response(),
         Ok(false) => {
-            tracing::warn!(
-                "card unbind: quota used token={} limit_total={UNBIND_MAX_TOTAL} limit_month={UNBIND_MAX_PER_MONTH} ip={ip}",
-                token
-            );
+            tracing::warn!("card unbind: quota used token={token} ip={ip}");
             json_err(StatusCode::FORBIDDEN, UNBIND_REFUSED)
         }
         Err(e) => {
