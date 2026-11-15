@@ -85,11 +85,12 @@
       /* 等宽字体：一个 * 的步进 = 一个被藏起来的字符，星号层横向滚动才对得齐。 */
       font-size:13px;line-height:1.6;font-family:ui-monospace,monospace;
       touch-action:pan-y}
-  .row .pw-wrap input.masked{color:transparent;caret-color:transparent;
+  /* 打码只藏字符、不藏光标：输入时得看得出插在哪。 */
+  .row .pw-wrap input.masked{color:transparent;caret-color:var(--fg);
       -webkit-text-fill-color:transparent}
   .row .pw-wrap input.masked::selection{background:transparent;color:transparent}
   /* 露出真值拖动时也走镜像层：先把输入框文字藏起来，拖完再显示。 */
-  .row .pw-wrap input.panning{color:transparent;caret-color:transparent;
+  .row .pw-wrap input.panning{color:transparent;
       -webkit-text-fill-color:transparent}
   .row .pw-wrap input.panning::selection{background:transparent;color:transparent}
   .pw-field .pw-stars{position:absolute;inset:0;padding:7px 9px;
@@ -1539,6 +1540,15 @@ function buildTokenMask(inp){
   }
 
   inp.classList.add("masked");
+  /* 输入法拼字期间露出真值：组合中的字还没 commit，打码后只看得到星号多了一个，
+     看不出在打什么。去掉 .masked 后星号层自动隐掉（见 `.pw-field input:not(.masked) ~ .pw-stars`）。 */
+  inp.addEventListener("compositionstart", function(){
+    inp.classList.remove("masked");
+  });
+  inp.addEventListener("compositionend", function(){
+    if (isMasked) inp.classList.add("masked");
+    sync();
+  });
   inp.addEventListener("input", sync);
   /* input 内部的文字滚动不一定每次都发 scroll，能接的都接上，成本可以忽略。 */
   inp.addEventListener("scroll", syncScroll, {passive: true});
