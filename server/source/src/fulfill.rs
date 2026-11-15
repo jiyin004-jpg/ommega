@@ -204,15 +204,20 @@ impl Fulfill {
         }
     }
 
-    /// 过期会话按条件从库里删掉，并把库里条数按 LRU 压到上限；不整表重写。
-    fn purge_if_due(&self, map: &mut HashMap<String, Session>) {
-        let now_ms = Utc::now().timestamp_millis() as u64;
+    /// 到点就先把内存里的过期会话清掉，并返回「这轮该不该清库」。
+    fn purge_if_due(&self, map: &mut HashMap<String, Session>, now_ms: u64) -> bool {
         let last = LAST_PURGE.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) < PURGE_INTERVAL_MS {
-            return;
+            return false;
         }
         LAST_PURGE.store(now_ms, Ordering::Relaxed);
         map.retain(|_, s| !Self::session_expired_at(s, now_ms));
+        true
+    }
+
+    /// 库里的过期会话与超限淘汰。
+    /// 调用方必须在锁外调：这里会做 SQLite 读写，不能把整层请求堵在会话锁上。
+    fn purge_store(&self, now_ms: u64) {
         let cutoff_ms = now_ms.saturating_sub(SESSION_TTL.as_millis() as u64) as i64;
         // 单条 `DELETE` 已按 `statedb::DELETE_BATCH` 限量，这里多打几轮推进积压。
         for _ in 0..PURGE_BATCH_ROUNDS {
@@ -310,9 +315,10 @@ impl Fulfill {
     /// 每次取用都更新「最后使用」（库里按 `SESSION_TOUCH_MIN_MS` 节流）。
     fn get_session(&self, alias: &str) -> Option<Session> {
         let now_ms = Utc::now().timestamp_millis() as u64;
+        let due;
         let cached = {
             let mut inner = crate::util::mu(&self.inner);
-            self.purge_if_due(&mut inner.sessions);
+            due = self.purge_if_due(&mut inner.sessions, now_ms);
             if inner
                 .sessions
                 .get(alias)
@@ -328,6 +334,9 @@ impl Fulfill {
                 (s.clone(), stale)
             })
         };
+        if due {
+            self.purge_store(now_ms);
+        }
         if let Some((session, stale)) = cached {
             if stale {
                 self.touch_persisted(alias, now_ms);
@@ -383,17 +392,26 @@ impl Fulfill {
             s.used_epoch_ms = now_ms;
         }
         let mut inner = crate::util::mu(&self.inner);
-        self.purge_if_due(&mut inner.sessions);
+        let due = self.purge_if_due(&mut inner.sessions, now_ms);
         // First successful publication wins, even if a caller bypasses the gate.
-        if let Some(existing) = inner
+        let existing = inner
             .sessions
             .get(alias)
             .filter(|s| !Self::session_expired(s))
-        {
-            return existing.clone();
+            .cloned();
+        if let Some(existing) = existing {
+            drop(inner);
+            if due {
+                self.purge_store(now_ms);
+            }
+            return existing;
         }
         inner.sessions.insert(alias.to_string(), s.clone());
         Self::enforce_memory_cap(&mut inner.sessions);
+        drop(inner);
+        if due {
+            self.purge_store(now_ms);
+        }
         s
     }
 

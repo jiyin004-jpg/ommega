@@ -386,8 +386,7 @@ impl AuthState {
             // 静态 env token / 没有 token：不参与配对，按老行为放行。
             return None;
         }
-        let db = self.db.as_ref()?;
-        let _ = db;
+        self.db.as_ref()?;
         let row = self.lookup_token(token)?;
         if !row.enabled {
             return None;

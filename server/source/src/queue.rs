@@ -1650,8 +1650,8 @@ impl TaskStore {
 
     /// 一次扫描算出各设备的活动任务数，避免每个候选设备各扫一次 tasks。
     /// target 和 assigned 相同时只计一次，保持原来的 OR 计数口径。
-    fn active_counts_locked(inner: &Inner) -> HashMap<String, usize> {
-        let mut counts = HashMap::new();
+    fn active_counts_locked(inner: &Inner) -> HashMap<&str, usize> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
         for task in inner.tasks.values() {
             if !matches!(task.status, TaskStatus::Pending | TaskStatus::Assigned) {
                 continue;
@@ -1664,9 +1664,6 @@ impl TaskStore {
             }
         }
         counts
-            .into_iter()
-            .map(|(id, count)| (id.to_string(), count))
-            .collect()
     }
 
     /// Resolve the target for a SOTER task. 优先级：
