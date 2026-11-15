@@ -241,32 +241,27 @@ fn remember_finished(
     );
 }
 
-/// Only an exact requested-device/session owner may route a server finish.
-pub fn session_layer(requested: &str, session: i64) -> Option<String> {
+/// 这张会话的归属：`(layer, attk_id)`。只有 exact requested-device 的持有者才认；
+/// 会话签完落到 `finished` 里也照样认（幂等重放要沿用同一层、同一把 ATTK）。
+fn session_owner(requested: &str, session: i64) -> Option<(String, Option<i64>)> {
     let sessions = store().sessions.lock().ok()?;
     if let Some(owner) = sessions.get(&session) {
-        return (owner.requested == requested).then(|| owner.layer.clone());
+        return (owner.requested == requested).then(|| (owner.layer.clone(), owner.attk_id));
     }
     drop(sessions);
     let finished = store().finished.lock().ok()?;
     let owner = finished.get(&session)?;
-    (owner.requested == requested).then(|| owner.layer.clone())
+    (owner.requested == requested).then(|| (owner.layer.clone(), owner.attk_id))
+}
+
+/// Only an exact requested-device/session owner may route a server finish.
+pub fn session_layer(requested: &str, session: i64) -> Option<String> {
+    session_owner(requested, session).map(|(layer, _)| layer)
 }
 
 /// 这张会话当初是哪把 ATTK 开的（`attk` 层之外的会话回 `None`）。
 pub fn session_attk(requested: &str, session: i64) -> Option<i64> {
-    let sessions = store().sessions.lock().ok()?;
-    if let Some(owner) = sessions.get(&session) {
-        return (owner.requested == requested)
-            .then_some(owner.attk_id)
-            .flatten();
-    }
-    drop(sessions);
-    let finished = store().finished.lock().ok()?;
-    let owner = finished.get(&session)?;
-    (owner.requested == requested)
-        .then_some(owner.attk_id)
-        .flatten()
+    session_owner(requested, session).and_then(|(_, attk_id)| attk_id)
 }
 
 /// 控制台上传的 ATTK：私钥 + 它对应的 `cpu_id`（SOTER 的身份就是这两样）。
@@ -340,19 +335,8 @@ fn material(
 }
 
 /// 这一层的物料挂在哪份身份下，ASK / AuthKey 缓存键的前缀。
-fn material_scope(layer: &str, attk: Option<&AttkMaterial>) -> String {
-    match layer {
-        "attk" => attk
-            .map(|a| format!("attk:{}", a.id))
-            .unwrap_or_else(|| "attk:none".to_string()),
-        "keybox" => "keybox".to_string(),
-        "builtin" => "builtin".to_string(),
-        _ => "self_signed".to_string(),
-    }
-}
-
-/// 会话收尾时按「当初开它的那把身份」算 scope（`attk` 层要回到同一把 ATTK 上）。
-fn moment_scope(layer: &str, attk_id: Option<i64>) -> String {
+/// `attk` 层按那把 ATTK 的 id 分；会话收尾时用同一个口径（传当初开的 `attk_id`）。
+fn material_scope(layer: &str, attk_id: Option<i64>) -> String {
     match layer {
         "attk" => match attk_id {
             Some(id) => format!("attk:{id}"),
@@ -960,7 +944,7 @@ pub fn run_layer(
         return None;
     }
 
-    let scope = material_scope(layer, attk);
+    let scope = material_scope(layer, attk.map(|a| a.id));
 
     let key = match material(layer, key_pem, attk) {
         Ok(key) => key,
@@ -1193,8 +1177,8 @@ pub fn run_layer(
                         None => return Ok(code_result(op, SESSION_UNKNOWN)),
                     },
                 };
-                // 按会话当初的身份取 AuthKey。
-                let session_scope = moment_scope(layer, sign_session.attk_id);
+                // 按会话当初的身份（同一把 ATTK）取 AuthKey。
+                let session_scope = material_scope(layer, sign_session.attk_id);
                 let key = match store().auth.lock().ok().and_then(|m| {
                     m.get(&format!(
                         "{session_scope}|{device_id}|{}|{}",
@@ -1769,7 +1753,7 @@ mod tests {
         let first = ask_pub();
 
         // 模拟进程重启：内存里那把丢掉，库里那份还在。
-        let scope = material_scope("attk", Some(&material));
+        let scope = material_scope("attk", Some(material.id));
         let slot = format!("{scope}|{uid}|attk");
         store().ask.lock().expect("ask map").remove(&slot);
         assert_eq!(code("has_ask_already"), json!(0), "重启后仍然算有");

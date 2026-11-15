@@ -193,6 +193,11 @@ impl DeviceEntry {
             None => None,
         }
     }
+
+    /// 这台能不能接这一步 SOTER：没明说不支持，且（签名类的 op）没明说签名做不了。
+    pub fn can_serve_soter(&self, needs_sign: bool) -> bool {
+        self.supports_soter != Some(false) && !(needs_sign && self.soter_nosign == Some(true))
+    }
 }
 
 /// 逗号分隔的包名列表（心跳里的 `skip_pkgs`）。
@@ -1685,9 +1690,9 @@ impl TaskStore {
         if !requested_did.is_empty() {
             if let Some(d) = inner.devices.get(requested_did) {
                 if now.saturating_sub(d.last_seen_ms) < 120_000 {
-                    return (d.supports_soter != Some(false)
-                        && !(needs_sign && d.soter_nosign == Some(true)))
-                    .then(|| requested_did.to_string());
+                    return d
+                        .can_serve_soter(needs_sign)
+                        .then(|| requested_did.to_string());
                 }
             }
         }
@@ -1696,9 +1701,7 @@ impl TaskStore {
                 if let Some(d) = inner.devices.get(target) {
                     if now.saturating_sub(d.last_seen_ms) < 120_000 {
                         // 能力变化不能把同一身份的下一步搬到另一台 TEE。
-                        return (d.supports_soter != Some(false)
-                            && !(needs_sign && d.soter_nosign == Some(true)))
-                        .then(|| target.clone());
+                        return d.can_serve_soter(needs_sign).then(|| target.clone());
                     }
                 }
             }

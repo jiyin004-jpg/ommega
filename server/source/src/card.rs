@@ -488,25 +488,6 @@ pub struct CardTokenBody {
     pub token: String,
 }
 
-/// 北京时间字符串 → unix 秒（库里的 DATETIME 都是 +08:00）。
-fn parse_bj(ts: &str) -> Option<i64> {
-    let s = ts.trim();
-    let s = if let Some(dot) = s.find('.') {
-        &s[..dot]
-    } else {
-        s
-    };
-    if s.is_empty() {
-        return None;
-    }
-    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()?;
-    let off = chrono::FixedOffset::east_opt(8 * 3600)?;
-    naive
-        .and_local_timezone(off)
-        .single()
-        .map(|dt| dt.timestamp())
-}
-
 fn fmt_bj(unix: i64) -> String {
     let off = match chrono::FixedOffset::east_opt(8 * 3600) {
         Some(o) => o,
@@ -571,7 +552,7 @@ pub async fn card_lookup(
     let now = chrono::Utc::now().timestamp();
     let mut expires_at = String::new();
     let mut remaining_seconds: i64 = -1;
-    if let Some(act) = parse_bj(&row.activated_at) {
+    if let Some(act) = crate::util::parse_bj_seconds(&row.activated_at) {
         if row.duration_seconds > 0 {
             let end = act + row.duration_seconds;
             expires_at = fmt_bj(end);

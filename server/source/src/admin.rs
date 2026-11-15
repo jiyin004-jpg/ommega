@@ -63,6 +63,33 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>
     }
 }
 
+/// Run one DB operation on the blocking pool and turn every failure into the
+/// `(status, message)` pair the handlers answer with, so each handler only
+/// carries its business closure:
+///   * no DB configured -> `404 no db`
+///   * db error         -> `500 db error: ..`
+///   * join error       -> `500 join error: ..`
+async fn db_call<T, F>(
+    db: Option<std::sync::Arc<crate::db::Db>>,
+    f: F,
+) -> Result<T, (StatusCode, String)>
+where
+    F: FnOnce(std::sync::Arc<crate::db::Db>) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let Some(db) = db else {
+        return Err((StatusCode::NOT_FOUND, "no db".to_string()));
+    };
+    match tokio::task::spawn_blocking(move || f(db)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}"))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("join error: {e}"),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Login / logout / session
 // ---------------------------------------------------------------------------
@@ -478,26 +505,16 @@ pub async fn admin_set_device_active(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
     let active = body.active;
     let device_id_clone = device_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| {
         db.set_device_identity_active(&device_id_clone, active)
     })
-    .await;
-    match result {
-        Ok(Ok(())) => {
-            Json(json!({ "status": "ok", "device_id": device_id, "active": body.active }))
-                .into_response()
-        }
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    .await
+    {
+        return json_err(status, &msg);
     }
+    Json(json!({ "status": "ok", "device_id": device_id, "active": body.active })).into_response()
 }
 
 pub async fn admin_delete_device(
@@ -508,20 +525,15 @@ pub async fn admin_delete_device(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
     let device_id_clone = device_id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || db.delete_device_identity(&device_id_clone)).await;
-    match result {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "device_id": device_id })).into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| {
+        db.delete_device_identity(&device_id_clone)
+    })
+    .await
+    {
+        return json_err(status, &msg);
     }
+    Json(json!({ "status": "ok", "device_id": device_id })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -549,45 +561,34 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
+    let rows = match db_call(state.db.clone(), |db| db.list_api_tokens()).await {
+        Ok(rows) => rows,
+        Err((status, msg)) => return json_err(status, &msg),
     };
-    let result = tokio::task::spawn_blocking(move || db.list_api_tokens()).await;
-    let tokens: Vec<Value> = match result {
-        Ok(Ok(rows)) => rows
-            .iter()
-            .map(|t| {
-                json!({
-                    "id": t.id,
-                    "token": t.token,
-                    "role": t.role,
-                    "duration_seconds": t.duration_seconds,
-                    "note": t.note,
-                    "enabled": t.enabled,
-                    "activated_at": t.activated_at,
-                    "created_at": t.created_at,
-                    "last_ip": t.last_ip,
-                    "last_used_at": t.last_used_at,
-                    "kind": t.kind,
-                    "pair_id": t.pair_id,
-                    "bound_serial": t.bound_serial,
-                    "bound_sn": t.bound_sn,
-                    "bound_imei": t.bound_imei,
-                    "bound_province": t.bound_province,
-                    "bound_at": t.bound_at,
-                })
+    let tokens: Vec<Value> = rows
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "token": t.token,
+                "role": t.role,
+                "duration_seconds": t.duration_seconds,
+                "note": t.note,
+                "enabled": t.enabled,
+                "activated_at": t.activated_at,
+                "created_at": t.created_at,
+                "last_ip": t.last_ip,
+                "last_used_at": t.last_used_at,
+                "kind": t.kind,
+                "pair_id": t.pair_id,
+                "bound_serial": t.bound_serial,
+                "bound_sn": t.bound_sn,
+                "bound_imei": t.bound_imei,
+                "bound_province": t.bound_province,
+                "bound_at": t.bound_at,
             })
-            .collect(),
-        Ok(Err(e)) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
-        }
-        Err(e) => {
-            return json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("join error: {e}"),
-            )
-        }
-    };
+        })
+        .collect();
     Json(json!({ "status": "ok", "tokens": tokens })).into_response()
 }
 
@@ -651,9 +652,6 @@ pub async fn admin_generate_token(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
     if body.role != "a" && body.role != "b" {
         return json_err(StatusCode::BAD_REQUEST, "role must be 'a' or 'b'");
     }
@@ -682,7 +680,7 @@ pub async fn admin_generate_token(
     let duration = body.duration_seconds;
     let kind_owned = kind.clone();
     let pair_owned = pair_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| {
         db.insert_api_token_full(
             &token_clone,
             &role,
@@ -692,23 +690,19 @@ pub async fn admin_generate_token(
             &kind_owned,
         )
     })
-    .await;
-    match result {
-        Ok(Ok(())) => Json(json!({
-            "status": "ok",
-            "token": token,
-            "role": body.role,
-            "kind": body.kind.clone().unwrap_or_default(),
-            "pair_id": body.pair_id.clone().unwrap_or_default(),
-            "duration_seconds": body.duration_seconds,
-        }))
-        .into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    .await
+    {
+        return json_err(status, &msg);
     }
+    Json(json!({
+        "status": "ok",
+        "token": token,
+        "role": body.role,
+        "kind": body.kind.clone().unwrap_or_default(),
+        "pair_id": body.pair_id.clone().unwrap_or_default(),
+        "duration_seconds": body.duration_seconds,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -731,12 +725,9 @@ pub async fn admin_toggle_token(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
     let enabled = body.enabled;
     let pair_id = body.pair_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| {
         if let Some(e) = enabled {
             db.set_token_enabled(id, e)?;
         }
@@ -745,21 +736,17 @@ pub async fn admin_toggle_token(
         }
         Ok::<(), anyhow::Error>(())
     })
-    .await;
-    match result {
-        Ok(Ok(())) => Json(json!({
-            "status": "ok",
-            "id": id,
-            "enabled": body.enabled,
-            "pair_id": body.pair_id,
-        }))
-        .into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    .await
+    {
+        return json_err(status, &msg);
     }
+    Json(json!({
+        "status": "ok",
+        "id": id,
+        "enabled": body.enabled,
+        "pair_id": body.pair_id,
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -771,34 +758,26 @@ pub async fn admin_soter_attk_list(State(state): State<AppState>, headers: Heade
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
+    let rows = match db_call(state.db.clone(), |db| db.list_soter_attks()).await {
+        Ok(rows) => rows,
+        Err((status, msg)) => return json_err(status, &msg),
     };
-    match tokio::task::spawn_blocking(move || db.list_soter_attks()).await {
-        Ok(Ok(rows)) => {
-            let items: Vec<Value> = rows
-                .into_iter()
-                .map(|r| {
-                    json!({
-                        "id": r.id,
-                        "name": r.name,
-                        "device_id": r.device_id,
-                        "cpu_id": r.cpu_id,
-                        "enabled": r.enabled,
-                        "is_default": r.is_default,
-                        "remark": r.remark,
-                        "created_at": r.created_at,
-                    })
-                })
-                .collect();
-            Json(json!({ "items": items })).into_response()
-        }
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
-    }
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "name": r.name,
+                "device_id": r.device_id,
+                "cpu_id": r.cpu_id,
+                "enabled": r.enabled,
+                "is_default": r.is_default,
+                "remark": r.remark,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Json(json!({ "items": items })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -822,9 +801,6 @@ pub async fn admin_soter_attk_upload(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
     // 只收 RSA 私钥：SOTER 的签名是 RSA-PSS，EC 签不动。
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
@@ -850,18 +826,15 @@ pub async fn admin_soter_attk_upload(
         );
     }
     let remark = body.remark.trim().to_string();
-    match tokio::task::spawn_blocking(move || {
+    let id = match db_call(state.db.clone(), move |db| {
         db.insert_soter_attk(&name, &device_id, &cpu_id, &pem, &remark)
     })
     .await
     {
-        Ok(Ok(id)) => Json(json!({ "status": "ok", "id": id })).into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
-    }
+        Ok(id) => id,
+        Err((status, msg)) => return json_err(status, &msg),
+    };
+    Json(json!({ "status": "ok", "id": id })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -879,18 +852,15 @@ pub async fn admin_soter_attk_active(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
     let enabled = body.enabled;
-    match tokio::task::spawn_blocking(move || db.set_soter_attk_active(id, enabled)).await {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id, "enabled": enabled })).into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| {
+        db.set_soter_attk_active(id, enabled)
+    })
+    .await
+    {
+        return json_err(status, &msg);
     }
+    Json(json!({ "status": "ok", "id": id, "enabled": enabled })).into_response()
 }
 
 /// POST /api/admin/soter_attk/:id/default/ — 指定默认那把（同时会把它启用）。
@@ -902,17 +872,12 @@ pub async fn admin_soter_attk_default(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
-    match tokio::task::spawn_blocking(move || db.set_soter_attk_default(id)).await {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id })).into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    if let Err((status, msg)) =
+        db_call(state.db.clone(), move |db| db.set_soter_attk_default(id)).await
+    {
+        return json_err(status, &msg);
     }
+    Json(json!({ "status": "ok", "id": id })).into_response()
 }
 
 /// DELETE /api/admin/soter_attk/:id/ — 删一把。
@@ -924,21 +889,13 @@ pub async fn admin_soter_attk_delete(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
-    match tokio::task::spawn_blocking(move || db.delete_soter_attk(id)).await {
-        Ok(Ok(())) => {
-            // 同时丢物料缓存：它签出的 ASK/AuthKey 作废；重传同一把是新行新 id。
-            crate::soter_mint::forget_attk(id);
-            Json(json!({ "status": "ok", "id": id })).into_response()
-        }
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| db.delete_soter_attk(id)).await
+    {
+        return json_err(status, &msg);
     }
+    // 同时丢物料缓存：它签出的 ASK/AuthKey 作废；重传同一把是新行新 id。
+    crate::soter_mint::forget_attk(id);
+    Json(json!({ "status": "ok", "id": id })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,18 +1061,10 @@ pub async fn admin_delete_token(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
-    let result = tokio::task::spawn_blocking(move || db.delete_token(id)).await;
-    match result {
-        Ok(Ok(())) => Json(json!({ "status": "ok", "id": id })).into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
+    if let Err((status, msg)) = db_call(state.db.clone(), move |db| db.delete_token(id)).await {
+        return json_err(status, &msg);
     }
+    Json(json!({ "status": "ok", "id": id })).into_response()
 }
 
 /// GET /api/admin/tokens/:token/ips/ — historical IPs used by a token, with
@@ -1128,20 +1077,9 @@ pub async fn admin_token_ips(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
-    };
-    let rows = match tokio::task::spawn_blocking(move || db.token_usage_ips(&token)).await {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(e)) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
-        }
-        Err(e) => {
-            return json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("join error: {e}"),
-            )
-        }
+    let rows = match db_call(state.db.clone(), move |db| db.token_usage_ips(&token)).await {
+        Ok(rows) => rows,
+        Err((status, msg)) => return json_err(status, &msg),
     };
     // Attach region info for each IP.
     let geo = state.geo.as_ref();
@@ -1302,21 +1240,16 @@ pub async fn admin_autokeybox_cover_toggle(
         .into_response()
     } else {
         crate::autokeybox::set_cover_enabled(false);
-        let result =
-            tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db)).await;
-        match result {
-            Ok(Ok(cleared)) => Json(json!({
-                "status": "ok",
-                "cover_enabled": false,
-                "cleared": cleared,
-            }))
-            .into_response(),
-            Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-            Err(e) => json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("join error: {e}"),
-            ),
-        }
+        let cleared = match db_call(Some(db), |db| crate::autokeybox::clear_auto_cover(&db)).await {
+            Ok(cleared) => cleared,
+            Err((status, msg)) => return json_err(status, &msg),
+        };
+        Json(json!({
+            "status": "ok",
+            "cover_enabled": false,
+            "cleared": cleared,
+        }))
+        .into_response()
     }
 }
 
@@ -1329,19 +1262,15 @@ pub async fn admin_autokeybox_cover_clear(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
+    let cleared = match db_call(state.db.clone(), |db| {
+        crate::autokeybox::clear_auto_cover(&db)
+    })
+    .await
+    {
+        Ok(cleared) => cleared,
+        Err((status, msg)) => return json_err(status, &msg),
     };
-    let result =
-        tokio::task::spawn_blocking(move || crate::autokeybox::clear_auto_cover(&db)).await;
-    match result {
-        Ok(Ok(cleared)) => Json(json!({ "status": "ok", "cleared": cleared })).into_response(),
-        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
-        Err(e) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("join error: {e}"),
-        ),
-    }
+    Json(json!({ "status": "ok", "cleared": cleared })).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -1416,41 +1345,30 @@ pub async fn admin_card_orders(State(state): State<AppState>, headers: HeaderMap
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let Some(db) = state.db.clone() else {
-        return json_err(StatusCode::NOT_FOUND, "no db");
+    let rows = match db_call(state.db.clone(), |db| db.list_card_orders()).await {
+        Ok(rows) => rows,
+        Err((status, msg)) => return json_err(status, &msg),
     };
-    let result = tokio::task::spawn_blocking(move || db.list_card_orders()).await;
-    let orders: Vec<Value> = match result {
-        Ok(Ok(rows)) => rows
-            .iter()
-            .map(|o| {
-                json!({
-                    "id": o.id,
-                    "order_id": o.order_id,
-                    "card_type": o.card_type,
-                    "role": o.role,
-                    "price_cents": o.price_cents,
-                    "status": o.status,
-                    "bonus_draws": o.bonus_draws,
-                    "contact": o.contact,
-                    "token_id": o.token_id,
-                    "created_at": o.created_at,
-                    "paid_at": o.paid_at,
-                    "pay_type": o.pay_type,
-                    "trade_no": o.trade_no,
-                })
+    let orders: Vec<Value> = rows
+        .iter()
+        .map(|o| {
+            json!({
+                "id": o.id,
+                "order_id": o.order_id,
+                "card_type": o.card_type,
+                "role": o.role,
+                "price_cents": o.price_cents,
+                "status": o.status,
+                "bonus_draws": o.bonus_draws,
+                "contact": o.contact,
+                "token_id": o.token_id,
+                "created_at": o.created_at,
+                "paid_at": o.paid_at,
+                "pay_type": o.pay_type,
+                "trade_no": o.trade_no,
             })
-            .collect(),
-        Ok(Err(e)) => {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}"))
-        }
-        Err(e) => {
-            return json_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("join error: {e}"),
-            )
-        }
-    };
+        })
+        .collect();
     Json(json!({ "status": "ok", "orders": orders })).into_response()
 }
 

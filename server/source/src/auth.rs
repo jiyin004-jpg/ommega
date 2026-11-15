@@ -765,7 +765,7 @@ fn token_is_valid(row: &crate::db::ApiTokenRow, duration_seconds: i64) -> bool {
     }
     // activated_at is stored as `YYYY-MM-DD HH:MM:SS` in Beijing time
     // (MySQL session time_zone = +08:00). Parse it and add duration_seconds.
-    let act = match parse_beijing_datetime(&row.activated_at) {
+    let act = match crate::util::parse_bj_seconds(&row.activated_at) {
         Some(t) => t,
         None => return false,
     };
@@ -774,32 +774,6 @@ fn token_is_valid(row: &crate::db::ApiTokenRow, duration_seconds: i64) -> bool {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     now <= act + duration_seconds
-}
-
-/// Parse `YYYY-MM-DD HH:MM:SS` (Beijing time, +08:00) into a unix timestamp
-/// (seconds). MySQL DATETIME columns are stored in local Beijing time.
-fn parse_beijing_datetime(s: &str) -> Option<i64> {
-    // Strip fractional seconds if present (e.g. `2026-08-14 12:00:00.123456`).
-    let s = s.trim();
-    let s = if let Some(dot) = s.find('.') {
-        &s[..dot]
-    } else {
-        s
-    };
-    let parts: Vec<&str> = s.split([' ', ':', '-']).collect();
-    if parts.len() < 6 {
-        return None;
-    }
-    use chrono::TimeZone;
-    let y: i32 = parts[0].parse().ok()?;
-    let mo: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-    let h: u32 = parts[3].parse().ok()?;
-    let mi: u32 = parts[4].parse().ok()?;
-    let sec: u32 = parts[5].parse().ok()?;
-    let offset = chrono::FixedOffset::east_opt(8 * 3600)?;
-    let dt = offset.with_ymd_and_hms(y, mo, d, h, mi, sec).single()?;
-    Some(dt.timestamp())
 }
 
 #[cfg(test)]

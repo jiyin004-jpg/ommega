@@ -461,38 +461,6 @@ fn layer_failure_msg(task_type: &str, layer: &str, v: &Value) -> String {
     "unknown error".to_string()
 }
 
-/// Layer ② — server keybox (stored identity) local fulfilment.
-/// Synchronous version that takes &Fulfill directly, for use inside spawn_blocking.
-fn try_keybox_layer_sync(
-    fulfill: &crate::fulfill::Fulfill,
-    task_type: &str,
-    body: &Value,
-    device_id: &str,
-    prefer_slot: bool,
-) -> Option<Value> {
-    match task_type {
-        "attest" => fulfill.try_handle_attest(device_id, body, prefer_slot),
-        "sign" => fulfill.try_handle_sign(device_id, body),
-        "decrypt" => fulfill.try_handle_decrypt(device_id, body),
-        "agree" => fulfill.try_handle_agree(device_id, body),
-        _ => None,
-    }
-}
-
-/// Layer ③ — server self-signed identity (extreme-case fallback, attest only).
-/// Synchronous version that takes &Fulfill directly, for use inside spawn_blocking.
-fn try_self_signed_layer_sync(
-    fulfill: &crate::fulfill::Fulfill,
-    task_type: &str,
-    body: &Value,
-    device_id: &str,
-) -> Option<Value> {
-    if task_type == "attest" {
-        return fulfill.try_handle_attest_self_signed(device_id, body);
-    }
-    None
-}
-
 /// Layer ② (server keybox / stored identity) as an async step, wrapped in
 /// spawn_blocking so the expensive crypto runs off the async runtime.
 async fn run_layer_keybox(
@@ -506,8 +474,12 @@ async fn run_layer_keybox(
     let tt = task_type.to_string();
     let b = body.clone();
     let did = device_id.to_string();
-    match tokio::task::spawn_blocking(move || {
-        try_keybox_layer_sync(&fulfill, &tt, &b, &did, prefer_slot)
+    match tokio::task::spawn_blocking(move || match tt.as_str() {
+        "attest" => fulfill.try_handle_attest(&did, &b, prefer_slot),
+        "sign" => fulfill.try_handle_sign(&did, &b),
+        "decrypt" => fulfill.try_handle_decrypt(&did, &b),
+        "agree" => fulfill.try_handle_agree(&did, &b),
+        _ => None,
     })
     .await
     {
@@ -528,8 +500,14 @@ async fn run_layer_self_signed(
     let tt = task_type.to_string();
     let b = body.clone();
     let did = device_id.to_string();
-    match tokio::task::spawn_blocking(move || try_self_signed_layer_sync(&fulfill, &tt, &b, &did))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        if tt == "attest" {
+            fulfill.try_handle_attest_self_signed(&did, &b)
+        } else {
+            None
+        }
+    })
+    .await
     {
         Ok(v) => v,
         Err(e) => Some(json!({ "error": format!("spawn_blocking join error: {e}") })),
@@ -1274,22 +1252,28 @@ pub async fn cert_chain_dump(State(state): State<AppState>, headers: HeaderMap) 
 // A-side task endpoints
 // ---------------------------------------------------------------------------
 
+/// A 端 `/api/{attest,sign,decrypt,agree}/` 的公共躯干：同一套鉴权 + 同一套
+/// 三层回退，只有 `kind`（任务类型）不同。四个 handler 只做一行转发。
+async fn a_task(state: AppState, headers: HeaderMap, body: Value, kind: &str) -> Response {
+    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
+        return *r;
+    }
+    run_a_side_task(
+        &state,
+        kind,
+        &body,
+        state.auth.token_meta(token_from_headers(&headers)),
+    )
+    .await
+}
+
 /// A 端认证（出证）请求：鉴权后走三层回退，见 `run_a_side_task`。
 pub async fn attest(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
-        return *r;
-    }
-    run_a_side_task(
-        &state,
-        "attest",
-        &body,
-        state.auth.token_meta(token_from_headers(&headers)),
-    )
-    .await
+    a_task(state, headers, body, "attest").await
 }
 
 /// A 端签名请求：私钥在哪台 B 就钉回哪台，见 `run_a_side_task`。
@@ -1298,16 +1282,7 @@ pub async fn sign(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
-        return *r;
-    }
-    run_a_side_task(
-        &state,
-        "sign",
-        &body,
-        state.auth.token_meta(token_from_headers(&headers)),
-    )
-    .await
+    a_task(state, headers, body, "sign").await
 }
 
 /// A 端解密请求：私钥在哪台 B 就钉回哪台，见 `run_a_side_task`。
@@ -1316,16 +1291,7 @@ pub async fn decrypt(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
-        return *r;
-    }
-    run_a_side_task(
-        &state,
-        "decrypt",
-        &body,
-        state.auth.token_meta(token_from_headers(&headers)),
-    )
-    .await
+    a_task(state, headers, body, "decrypt").await
 }
 
 /// POST /api/agree/ — ECDH agreement against a remote (B-side) key.
@@ -1334,16 +1300,7 @@ pub async fn agree(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers, Some("a")).await {
-        return *r;
-    }
-    run_a_side_task(
-        &state,
-        "agree",
-        &body,
-        state.auth.token_meta(token_from_headers(&headers)),
-    )
-    .await
+    a_task(state, headers, body, "agree").await
 }
 
 /// POST /api/soter/ — SOTER 转发的入口，鉴权后交给 `run_soter_task`。
@@ -1844,9 +1801,7 @@ async fn run_soter_task_inner(
             connected
                 .iter()
                 .find(|d| d.device_id == actual)
-                .filter(|d| {
-                    d.supports_soter != Some(false) && !(needs_sign && d.soter_nosign == Some(true))
-                })
+                .filter(|d| d.can_serve_soter(needs_sign))
                 .map(|d| d.device_id.clone())
         })
     } else if requested_online {
@@ -1855,9 +1810,7 @@ async fn run_soter_task_inner(
         connected
             .iter()
             .find(|d| d.device_id == route_request)
-            .filter(|d| {
-                d.supports_soter != Some(false) && !(needs_sign && d.soter_nosign == Some(true))
-            })
+            .filter(|d| d.can_serve_soter(needs_sign))
             .map(|d| d.device_id.clone())
     } else {
         state
@@ -1882,9 +1835,7 @@ async fn run_soter_task_inner(
         connected
             .iter()
             .find(|d| d.device_id == want)
-            .filter(|d| {
-                d.supports_soter != Some(false) && !(needs_sign && d.soter_nosign == Some(true))
-            })
+            .filter(|d| d.can_serve_soter(needs_sign))
             .map(|d| d.device_id.clone())
     } else {
         None
