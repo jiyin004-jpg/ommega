@@ -10,7 +10,6 @@ name = "ommega"
 path = "src/lib.rs"
 
 [dependencies]
-syscalls = "0.8.1"
 kmr-derive = { path = "derive" }
 kmr-common = { path = "common" }
 kmr-crypto-ommega = { path = "crypto" }

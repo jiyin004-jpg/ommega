@@ -881,6 +881,7 @@ fn tee_version() -> String {
 }
 
 /// 后端给出来的一笔应答。三个分支跟 HAL 的方法签名一一对应，别混：形状错了宿主解出来的是垃圾。
+#[derive(Debug)]
 pub(crate) enum Answer {
     /// 只有返回值的那些 op（generate* / has* / remove*）。
     Code(i32),

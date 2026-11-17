@@ -45,6 +45,7 @@ const KINIBI_SESSION_UNKNOWN: i32 = -204;
 /// `finish_sign` 拿到一个不存在的 session（真机 TA 的 -1000）。
 const SESSION_UNKNOWN: i32 = -1000;
 /// MTK（Kinibi）那套的盐长：文档里声明、签名也用它。高通是 20，且不声明。
+#[cfg(test)]
 const ASK_SALT_LEN: i32 = 32;
 
 // ---------------------------------------------------------------------------
