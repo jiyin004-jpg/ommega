@@ -1005,17 +1005,13 @@ pub fn run_layer(
                 if ask_is_gone(&scope, device_id, uid) {
                     return Ok(code_result(op, NOT_FOUND));
                 }
-                let id = format!("{scope}|{uid}|{layer}");
-                let in_memory = store()
-                    .ask
-                    .lock()
-                    .map(|map| map.contains_key(&id))
-                    .unwrap_or(false);
-                let on_disk =
-                    !in_memory && statedb::shared().mint_key_get(&id).ok().flatten().is_some();
                 Ok(code_result(
                     op,
-                    if in_memory || on_disk { OK } else { NOT_FOUND },
+                    if ask_present(&scope, uid, layer) {
+                        OK
+                    } else {
+                        NOT_FOUND
+                    },
                 ))
             }
             "verify_attk_key_pair" => Ok(code_result(op, OK)),
@@ -1044,6 +1040,10 @@ pub fn run_layer(
                 None => Ok(code_result(op, auth_missing_code(&product))),
             },
             "generate_auth_key_pair" => {
+                // 天玑那边已有就不重铸（回 -5）；高通每次重铸回 0。
+                if is_kinibi(&product) && auth_key(device_id, &scope, body).is_some() {
+                    return Ok(code_result(op, NOT_FOUND));
+                }
                 let fresh = std::sync::Arc::new(
                     MintKey::generate().context("RSA keygen for the auth key failed")?,
                 );
@@ -1092,9 +1092,15 @@ pub fn run_layer(
             }
             // 重建 ASK：只换 ASK，不动 ATTK。
             "generate_ask_key_pair" => {
-                clear_ask_gone(&scope, device_id, uid_of(body)?);
-                rotate_layer_ask_key(&scope, uid_of(body)?, layer)?;
-                unpin_layer(device_id, uid_of(body)?);
+                let uid = uid_of(body)?;
+                clear_ask_gone(&scope, device_id, uid);
+                // 天玑那边已有就不重铸（回 -5）。只对 attk 层这做：其余层的 has_ask_already
+                // 是刻意恒回 -5 的，这里再回 -5 就把应用锁在「问→没有→建→-5」里。
+                if layer == "attk" && is_kinibi(&product) && ask_present(&scope, uid, layer) {
+                    return Ok(code_result(op, NOT_FOUND));
+                }
+                rotate_layer_ask_key(&scope, uid, layer)?;
+                unpin_layer(device_id, uid);
                 Ok(code_result(op, OK))
             }
             "generate_attk_key_pair" => {
@@ -1367,6 +1373,17 @@ fn auth_missing_code(cpu_id: &str) -> i32 {
     } else {
         AUTH_KEY_NOT_READY
     }
+}
+
+/// 这个 uid 的 ASK 现在有没有（内存或落盘）。
+fn ask_present(scope: &str, uid: i32, layer: &str) -> bool {
+    let id = format!("{scope}|{uid}|{layer}");
+    let in_memory = store()
+        .ask
+        .lock()
+        .map(|map| map.contains_key(&id))
+        .unwrap_or(false);
+    in_memory || statedb::shared().mint_key_get(&id).ok().flatten().is_some()
 }
 
 /// initSign 缺钥匙的答复码：天玑 0xFFFF0008，高通 -6。
