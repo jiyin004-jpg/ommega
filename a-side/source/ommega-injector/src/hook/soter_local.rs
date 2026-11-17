@@ -39,8 +39,10 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建（AUTH_KEY_NOT_READY）；答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
-/// ASK 里写死的盐长，腾讯按 JSON 里的 `rsa_pss_saltlen` 验签；声明与签名用同一个值。
-const SALT_LEN: i32 = 32;
+/// 高通（QSEE）那套的 RSA-PSS 盐长：真机实测 20（文档里不声明这个字段）。
+const QCOM_SALT_LEN: usize = 20;
+/// MTK（Kinibi）那套的盐长：文档声明 32，签名也用 32。
+const MTK_SALT_LEN: usize = 32;
 /// 编译进来的 ATTK（构建时现生成的自签 RSA）。ASK 不内置：每个 uid 用到时现生成、落盘复用。
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
 /// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM）：存在且解析得过就用它。
@@ -112,10 +114,10 @@ impl Key {
         Some(Self { private, pem })
     }
 
-    /// RSA-PSS-SHA256，盐长 = `SALT_LEN`（JSON 里那个字段也是它）。
+    /// RSA-PSS-SHA256，盐长跟本平台真机一致（MTK 32 / 高通 20）。
     fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
         let signing =
-            PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), SALT_LEN as usize);
+            PssSigningKey::<PssSha256>::new_with_salt_len(self.private.clone(), salt_len());
         let mut rng = OsRng;
         Some(signing.sign_with_rng(&mut rng, message).to_bytes().to_vec())
     }
@@ -132,7 +134,7 @@ pub(crate) fn selftest() -> anyhow::Result<()> {
     let signature = rsa::pss::Signature::try_from(raw.as_slice())
         .map_err(|error| anyhow::anyhow!("malformed signature: {error}"))?;
     let public = rsa::RsaPublicKey::from(&attk.private);
-    PssVerifyingKey::<PssSha256>::new_with_salt_len(public, SALT_LEN as usize)
+    PssVerifyingKey::<PssSha256>::new_with_salt_len(public, salt_len())
         .verify(message, &signature)
         .map_err(|error| anyhow::anyhow!("the signature did not verify: {error}"))
 }
@@ -1359,6 +1361,8 @@ struct Platform {
     cpu_prefix: &'static str,
     device_id_ascii: bool,
     declares_salt: bool,
+    /// RSA-PSS 盐长：真机上 MTK 是 32、高通是 20（与是否声明字段无关）。
+    salt_len: usize,
     generate_rotates: bool,
     /// 签名文档（`sign_json`）里报的 TEE / 指纹身份：真机上这四格是 TA 报的原厂值，
     /// 本地拿不到真值就报平台那套，不写自己的名字和版本。
@@ -1381,6 +1385,7 @@ fn platform() -> &'static Platform {
                 cpu_prefix: "09000000",
                 device_id_ascii: true,
                 declares_salt: true,
+                salt_len: MTK_SALT_LEN,
                 generate_rotates: false,
                 tee_n: "Kinibi-FFA-A-610a-V008-20240926_141444_120597_6923a",
                 tee_v: "10018",
@@ -1392,6 +1397,7 @@ fn platform() -> &'static Platform {
                 cpu_prefix: "00000000",
                 device_id_ascii: false,
                 declares_salt: false,
+                salt_len: QCOM_SALT_LEN,
                 generate_rotates: true,
                 tee_n: "QSEE",
                 tee_v: "5",
@@ -1402,10 +1408,15 @@ fn platform() -> &'static Platform {
     })
 }
 
-/// 一份自描述文档的尾巴：盐长字段（高通那套不放，验签方按默认的摘要长度算）。
+/// 本平台真机用的 RSA-PSS 盐长。
+fn salt_len() -> usize {
+    platform().salt_len
+}
+
+/// 一份自描述文档的尾巴：盐长字段（高通那套不放，验签方按它自己的默认算）。
 fn salt_field() -> String {
     if platform().declares_salt {
-        format!(",\"rsa_pss_saltlen\":{SALT_LEN}")
+        format!(",\"rsa_pss_saltlen\":{}", salt_len())
     } else {
         String::new()
     }
@@ -1603,7 +1614,7 @@ mod tests {
         use rsa::signature::Verifier;
         let verifying = PssVerifyingKey::<PssSha256>::new_with_salt_len(
             rsa::RsaPublicKey::from(&current_attk().unwrap().private),
-            SALT_LEN as usize,
+            salt_len(),
         );
         verifying
             .verify(
@@ -1833,7 +1844,7 @@ mod tests {
         let Ok(signature) = PssSignature::try_from(signature) else {
             return false;
         };
-        PssVerifyingKey::<PssSha256>::new_with_salt_len(public, SALT_LEN as usize)
+        PssVerifyingKey::<PssSha256>::new_with_salt_len(public, salt_len())
             .verify(message, &signature)
             .is_ok()
     }

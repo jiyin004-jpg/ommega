@@ -38,7 +38,7 @@ const NOT_FOUND: i32 = -5;
 const AUTH_KEY_NOT_READY: i32 = -6;
 /// `finish_sign` 拿到一个不存在的 session（真机 TA 的 -1000）。
 const SESSION_UNKNOWN: i32 = -1000;
-/// ASK 文档声明、签名时用的盐长（32）。
+/// MTK（Kinibi）那套的盐长：文档里声明、签名也用它。高通是 20，且不声明。
 const ASK_SALT_LEN: i32 = 32;
 
 // ---------------------------------------------------------------------------
@@ -87,12 +87,9 @@ impl MintKey {
             .to_string())
     }
 
-    /// RSA-PSS-SHA256 签名，盐长 `ASK_SALT_LEN`（与文档里的 `rsa_pss_saltlen` 一致）。
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-        let signing = PssSigningKey::<Sha256>::new_with_salt_len(
-            (*self.private).clone(),
-            ASK_SALT_LEN as usize,
-        );
+    /// RSA-PSS-SHA256 签名，盐长跟这个平台真机一致（MTK 32 / 高通 20）。
+    fn sign(&self, message: &[u8], salt_len: usize) -> Result<Vec<u8>> {
+        let signing = PssSigningKey::<Sha256>::new_with_salt_len((*self.private).clone(), salt_len);
         let mut rng = rand::rngs::OsRng;
         Ok(signing.sign_with_rng(&mut rng, message).to_bytes().to_vec())
     }
@@ -1033,7 +1030,7 @@ pub fn run_layer(
                     let ask = layer_ask_key(&scope, uid_of(body)?, layer)?;
                     let counter = counter_for(&counter_key(&scope, device_id, uid_of(body)?));
                     let document = key_doc(&auth.attk_pem, &product, counter, uid_of(body)?)?;
-                    let signature = ask.sign(&document)?;
+                    let signature = ask.sign(&document, profile_of(&product).salt_len)?;
                     let mut out = envelope_result(op, &document, &signature)?;
                     out["layer"] = json!(layer);
                     Ok(out)
@@ -1194,7 +1191,7 @@ pub fn run_layer(
                 let counter =
                     counter_for(&counter_key(&session_scope, device_id, sign_session.uid));
                 let document = sign_doc(&product, sign_session.uid, &sign_session.raw, counter)?;
-                match key.sign(&document) {
+                match key.sign(&document, profile_of(&product).salt_len) {
                     Ok(signature) => {
                         let reply = envelope_result(op, &document, &signature)?;
                         remember_finished(
@@ -1365,6 +1362,8 @@ fn counter_key(scope: &str, device_id: &str, uid: i32) -> String {
 struct Platform {
     declares_salt: bool,
     device_id_ascii: bool,
+    /// RSA-PSS 盐长：真机上 MTK 是 32、高通是 20（与是否声明字段无关）。
+    salt_len: usize,
     /// 签名文档里报的 TEE 身份，用原厂那套拼法。
     tee_n: &'static str,
     tee_v: &'static str,
@@ -1378,6 +1377,7 @@ fn profile_of(cpu_id: &str) -> Platform {
         Platform {
             declares_salt: true,
             device_id_ascii: true,
+            salt_len: 32,
             tee_n: "Kinibi-FFA-A-610a-V008-20240926_141444_120597_6923a",
             tee_v: "10018",
             fp_n: "FPC",
@@ -1387,6 +1387,7 @@ fn profile_of(cpu_id: &str) -> Platform {
         Platform {
             declares_salt: false,
             device_id_ascii: false,
+            salt_len: 20,
             tee_n: "QSEE",
             tee_v: "5",
             fp_n: "fingerprint",
@@ -1398,14 +1399,15 @@ fn profile_of(cpu_id: &str) -> Platform {
 /// 一份自描述文档（ASK / AuthKey 共用）。键序 `pub_key` / `cpu_id` / `counter` / `uid`，
 /// `uid` 是字符串。
 fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result<Vec<u8>> {
+    let profile = profile_of(device_id);
     let mut doc = json!({
         "pub_key": pub_key_pem,
         "cpu_id": device_id,
         "counter": counter,
         "uid": uid.to_string(),
     });
-    if profile_of(device_id).declares_salt {
-        doc["rsa_pss_saltlen"] = json!(ASK_SALT_LEN);
+    if profile.declares_salt {
+        doc["rsa_pss_saltlen"] = json!(profile.salt_len);
     }
     serde_json::to_vec(&doc).context("failed to serialize the key document")
 }
@@ -1427,7 +1429,7 @@ fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64) -> Result<Vec<u8>> 
         "uid": uid.to_string(),
     });
     if profile.declares_salt {
-        doc["rsa_pss_saltlen"] = json!(ASK_SALT_LEN);
+        doc["rsa_pss_saltlen"] = json!(profile.salt_len);
     }
     serde_json::to_vec(&doc).context("failed to serialize the sign document")
 }
@@ -1467,7 +1469,7 @@ fn ask_result(
 ) -> Result<Value> {
     let counter = counter_for(&counter_key(scope, device_id, uid));
     let document = key_doc(&ask.attk_pem, device_id, counter, uid)?;
-    let signature = attk.sign(&document)?;
+    let signature = attk.sign(&document, profile_of(device_id).salt_len)?;
     let mut out = envelope_result(op, &document, &signature)?;
     out["layer"] = json!(layer);
     Ok(out)
@@ -2105,6 +2107,36 @@ mod tests {
             "高通不带盐长字段: {text}"
         );
         assert!(text.contains(&format!("\"cpu_id\":\"{cpu}\"")), "{text}");
+
+        // 盐长：真机实测 20（文档里不声明）。用 ASK 公钥验 AuthKey 文档的签名。
+        let ask = run(
+            "self_signed",
+            device,
+            &json!({ "op": "export_ask_public_key", "uid": uid, "cpu_id": cpu }),
+            None,
+        )
+        .expect("handled");
+        let (ask_doc, _) = split_envelope(&data_of(&ask));
+        let ask_pem = pem_of(&String::from_utf8(ask_doc).expect("json is utf-8"));
+        let auth = run(
+            "self_signed",
+            device,
+            &json!({
+                "op": "export_auth_key_public_key", "uid": uid,
+                "alias": alias, "cpu_id": cpu,
+            }),
+            None,
+        )
+        .expect("handled");
+        let (auth_doc_bytes, auth_sig) = split_envelope(&data_of(&auth));
+        assert!(
+            verifies_with(&ask_pem, &auth_doc_bytes, &auth_sig, 20),
+            "高通的盐长是 20"
+        );
+        assert!(
+            !verifies_with(&ask_pem, &auth_doc_bytes, &auth_sig, 32),
+            "按 32 验不应通过"
+        );
     }
 
     /// A 端把真机 cpu_id 转过来了就得原样落进文档，不能自己再派生一个 —— 同一台设备上
@@ -2295,6 +2327,11 @@ mod tests {
 
     /// 拿一把 PEM 公钥验一段签名（RSA-PSS-SHA256，盐长按 `ASK_SALT_LEN` 严卡）。
     fn verifies(pem: &str, message: &[u8], signature: &[u8]) -> bool {
+        verifies_with(pem, message, signature, ASK_SALT_LEN as usize)
+    }
+
+    /// 指定盐长的验签（高通那套是 20）。
+    fn verifies_with(pem: &str, message: &[u8], signature: &[u8], salt_len: usize) -> bool {
         use pkcs8::DecodePublicKey as _;
         let Ok(public) = rsa::RsaPublicKey::from_public_key_pem(pem) else {
             return false;
@@ -2302,7 +2339,7 @@ mod tests {
         let Ok(signature) = PssSignature::try_from(signature) else {
             return false;
         };
-        PssVerifyingKey::<Sha256>::new_with_salt_len(public, ASK_SALT_LEN as usize)
+        PssVerifyingKey::<Sha256>::new_with_salt_len(public, salt_len)
             .verify(message, &signature)
             .is_ok()
     }

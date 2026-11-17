@@ -38,6 +38,7 @@ fn main() -> Result<()> {
     let mut uid = DEFAULT_UID;
     let mut alias = DEFAULT_ALIAS.to_string();
     let mut export = false;
+    let mut vnd = false;
     let mut repeat = 1u32;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -56,6 +57,8 @@ fn main() -> Result<()> {
             }
             "--alias" => alias = args.next().context("--alias wants a value")?,
             "--export" => export = true,
+            // 供应商 AIDL HAL 挂在 vndbinder 上，默认的 servicemanager 里查不到。
+            "--vnd" => vnd = true,
             "--repeat" => {
                 repeat = args
                     .next()
@@ -68,7 +71,12 @@ fn main() -> Result<()> {
     }
 
     // A binder process state has to exist before any transaction is possible.
-    let _ = rsbinder::ProcessState::init_default();
+    if vnd {
+        rsbinder::ProcessState::init("/dev/vndbinder", 0)
+            .map_err(|error| anyhow::anyhow!("binder init on /dev/vndbinder failed: {error}"))?;
+    } else {
+        let _ = rsbinder::ProcessState::init_default();
+    }
 
     let binder = rsbinder::hub::check_service(&service)
         .with_context(|| format!("{service} is not registered"))?;
