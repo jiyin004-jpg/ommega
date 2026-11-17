@@ -21,3 +21,7 @@ allow shell adb_data_file file { open read getattr map execute execute_no_trans 
 # Modify: Fail」）。只补这一个权限，use_dev_id 那些更宽的一个都不给。
 # 没有这个域的机型上 kernel 会直接跳过这行，不影响别家。
 allow engineermode_app keystore keystore2_key { gen_unique_id }
+
+# 从 shell / root 直接调 vendor HAL 的 AIDL：relay 的 HAL 后端与现场探针都要。
+allow { shell ksu magisk su } vndbinder_device chr_file { read write open ioctl }
+allow { shell ksu magisk su } vndservicemanager binder { call transfer }

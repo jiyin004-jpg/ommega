@@ -47,5 +47,20 @@ allow keystore system_app_data_file file { read open getattr write create }
 # 远程出证的连接收尾（reqwest 关闭 tcp）。
 allow keystore self tcp_socket { shutdown }
 
+# SOTER 宿主（soterserver，platform_app）里的 payload 也要读写 /data/misc/ommega：
+# cpu_id 副本、ASK/AuthKey 料库、认证时间戳。
+allow platform_app system_data_file file { read open getattr write create }
+allow platform_app system_app_data_file dir { read open search getattr lock write add_name }
+allow platform_app system_app_data_file file { read open getattr write create }
+
+# SOTER HAL 里的 payload（vendor 域）同一套文件。
+allow { hal_soter hal_soter_default hal_soter_qti hal_soter_trustonic hal_soter_service vendor_hal_soter_qti } system_data_file file { read open getattr write create }
+allow { hal_soter hal_soter_default hal_soter_qti hal_soter_trustonic hal_soter_service vendor_hal_soter_qti } system_app_data_file dir { read open search getattr lock write add_name }
+allow { hal_soter hal_soter_default hal_soter_qti hal_soter_trustonic hal_soter_service vendor_hal_soter_qti } system_app_data_file file { read open getattr write create }
+
+# 从 su/shell 直接调 vendor HAL 的 AIDL（现场验证与探针工具用，运行期用不到）。
+allow { shell ksu magisk su } vndbinder_device chr_file { read write open ioctl }
+allow { shell ksu magisk su } vndservicemanager binder { call transfer }
+
 # 工程模式建 ID attestation 钥匙时检查调用方的 gen_unique_id。
 allow engineermode_app keystore keystore2_key { gen_unique_id }
