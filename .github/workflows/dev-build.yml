@@ -1,0 +1,128 @@
+# 测试分支（dev）的构建：只编产物、只上传 Actions artifact，不碰 GitHub Release。
+#
+# 和 release.yml 的分工：
+#   - dev 分支 push       → 这里，产物进 artifact（保留 3 天），随看随掉
+#   - 打 tag + 手动派发   → release.yml，产物挂到正式 Release
+#
+# 只编 arm64：测试机上都是这台/那台 8 核 64 位，四 ABI 全编只是白等时间。
+name: dev-build
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  module:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: a-side
+            ws: a-side/source
+          - name: b-side
+            ws: b-side/source
+    env:
+      ANDROID_NDK_ROOT: /home/runner/android-ndk-r27d
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android
+
+      - name: 装 protoc
+        if: matrix.name == 'a-side'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+
+      - name: 取 NDK 缓存
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/android-ndk-r27d
+          key: android-ndk-r27d-linux
+
+      - name: 下 NDK r27d
+        if: steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 --max-time 900 -o /tmp/ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q /tmp/ndk.zip -d /home/runner
+          rm -f /tmp/ndk.zip
+
+      - name: 生成 .cargo/config.toml
+        working-directory: ${{ matrix.ws }}
+        run: python3 scripts/setup_cargo_config.py
+
+      - name: 取 cargo 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ matrix.ws }}/target
+          key: cargo-dev-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.ws)) }}
+          restore-keys: |
+            cargo-dev-${{ runner.os }}-${{ matrix.name }}-
+
+      - name: 打包（arm64）
+        working-directory: ${{ matrix.ws }}
+        run: python3 build.py --release --abi arm64-v8a
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-${{ matrix.name }}-${{ github.sha }}
+          path: ${{ matrix.ws }}/target/ommega-*-release-*.zip
+          retention-days: 3
+
+  server:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装工具链
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      - name: 取 cargo 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/source/target
+          key: cargo-dev-${{ runner.os }}-server-${{ hashFiles('server/source/Cargo.lock') }}
+          restore-keys: |
+            cargo-dev-${{ runner.os }}-server-
+
+      - name: 编 musl 二进制
+        working-directory: server/source
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-server-${{ github.sha }}
+          path: server/source/target/x86_64-unknown-linux-musl/release/relay_rs
+          retention-days: 3
