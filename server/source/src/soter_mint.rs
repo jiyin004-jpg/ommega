@@ -38,6 +38,8 @@ const NOT_FOUND: i32 = -5;
 const AUTH_KEY_NOT_READY: i32 = -6;
 /// 天玑（Kinibi）那边「这把钥匙不在这台设备上」的码；高通那边是 -6。
 const KINIBI_KEY_NOT_FOUND: i32 = -8;
+/// 天玑那边 initSign 缺钥匙时回的 TEE 码（0xFFFF0008）；高通那边是 -6。
+const KINIBI_ITEM_NOT_FOUND: i32 = 0xFFFF_0008u32 as i32;
 /// 天玑那边「这张会话不存在」的码；高通那边是 -1000。
 const KINIBI_SESSION_UNKNOWN: i32 = -204;
 /// `finish_sign` 拿到一个不存在的 session（真机 TA 的 -1000）。
@@ -1113,8 +1115,8 @@ pub fn run_layer(
                 let uid = uid_of(body)?;
                 let alias = alias_of(body)?;
                 if auth_key(device_id, &scope, body).is_none() {
-                    // AuthKey 没建，答 -6（真机口径）。
-                    return Ok(code_result(op, AUTH_KEY_NOT_READY));
+                    // AuthKey 没建：天玑回 TEE 的 0xFFFF0008，高通 -6。
+                    return Ok(code_result(op, init_missing_code(&product)));
                 }
                 let raw = body
                     .get("challenge")
@@ -1362,6 +1364,15 @@ struct Platform {
 fn auth_missing_code(cpu_id: &str) -> i32 {
     if is_kinibi(cpu_id) {
         KINIBI_KEY_NOT_FOUND
+    } else {
+        AUTH_KEY_NOT_READY
+    }
+}
+
+/// initSign 缺钥匙的答复码：天玑 0xFFFF0008，高通 -6。
+fn init_missing_code(cpu_id: &str) -> i32 {
+    if is_kinibi(cpu_id) {
+        KINIBI_ITEM_NOT_FOUND
     } else {
         AUTH_KEY_NOT_READY
     }
@@ -2783,7 +2794,8 @@ mod tests {
         assert_eq!(
             call(json!({"op": "init_sign", "uid": uid, "alias": alias, "challenge": "0a1b"}))
                 ["error_code"],
-            json!(AUTH_KEY_NOT_READY)
+            json!(init_missing_code(&time_device_id(None))),
+            "initSign 缺钥匙回平台自己的码"
         );
 
         assert_eq!(

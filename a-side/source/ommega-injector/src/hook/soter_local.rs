@@ -39,6 +39,8 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建（AUTH_KEY_NOT_READY）；答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
+/// 天玑那边 initSign 找不到这把钥匙时回的 TEE 码（TEE_ERROR_ITEM_NOT_FOUND 0xFFFF0008）。
+const KINIBI_ITEM_NOT_FOUND: i32 = 0xFFFF_0008u32 as i32;
 /// 天玑（Kinibi）那边「这把钥匙不在这台设备上」的码；高通那边同一个场景用 -6。
 const KINIBI_KEY_NOT_FOUND: i32 = -8;
 /// 天玑那边「这张会话不存在」的码；高通那边是 -1000（托管端答）。
@@ -1161,7 +1163,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
             if auth_key(state, uid, alias).is_none() {
                 return Some(Answer::Init {
-                    status: AUTH_KEY_NOT_READY,
+                    status: init_missing_code(),
                     session: 0,
                 });
             }
@@ -1461,6 +1463,15 @@ fn is_kinibi() -> bool {
 fn auth_missing_code() -> i32 {
     if is_kinibi() {
         KINIBI_KEY_NOT_FOUND
+    } else {
+        AUTH_KEY_NOT_READY
+    }
+}
+
+/// initSign 缺钥匙时的状态码：天玑回 TEE 的 0xFFFF0008，高通 -6。
+fn init_missing_code() -> i32 {
+    if is_kinibi() {
+        KINIBI_ITEM_NOT_FOUND
     } else {
         AUTH_KEY_NOT_READY
     }
@@ -1850,8 +1861,8 @@ mod tests {
         let mut c = call(11, Some(7777), Some("NoSuchKey"));
         c.challenge = Some("00".to_string());
         assert!(
-            matches!(answer(&c), Some(Answer::Init { status, .. }) if status == AUTH_KEY_NOT_READY),
-            "a missing auth key must come back as a -6 status"
+            matches!(answer(&c), Some(Answer::Init { status, .. }) if status == init_missing_code()),
+            "缺钥匙要回平台自己的码（天玑 0xFFFF0008 / 高通 -6）"
         );
     }
 
