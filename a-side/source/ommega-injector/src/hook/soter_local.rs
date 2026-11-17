@@ -154,6 +154,8 @@ struct SignSession {
     raw: String,
     /// 会话开启时刻；超过服务端那 60 秒就作废。
     created: Instant,
+    /// 同一时刻的墙钟毫秒，用来和认证时间戳比先后。
+    created_ms: i64,
     /// 开这笔会话的调用方（内核填的 `sender_euid`）。本地兜底有时拿不到，那就只靠 TTL。
     caller: Option<i32>,
 }
@@ -659,6 +661,12 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// 会话开始之后有没有发生过生物认证（keystore 那边收到 HAT 时落的盘）。
+fn auth_since(created_ms: i64) -> bool {
+    created_ms > 0
+        && kmr_common::soter_relay::read_last_auth().is_some_and(|last| last >= created_ms)
+}
+
 /// 一台"看起来像真机"的设备号：平台前缀 + 12 字节十六进制。
 /// 两个来源：daemon 写下的文件，或按本机序列号现派生；都拿不到就是空串（本地这条路不答）。
 pub(crate) fn device_id() -> String {
@@ -1045,9 +1053,9 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 .and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
             match found {
                 Some((s, key)) => {
-                    // 高通真机这个会话得走过生物认证才给签（无指纹回 -26）；兜底没有认证信号，
-                    // 按平台照真机答。
-                    if !is_kinibi() {
+                    // 高通真机这张会话得走过生物认证才给签。认证信号由 keystore2 那边投 HAT
+                    // 时落盘，这里比会话开始时刻：会话之后认证过就放行，没认证过才回 -26。
+                    if !is_kinibi() && !auth_since(s.created_ms) {
                         state.sessions.lock().ok()?.remove(&session);
                         return Some(Answer::Buffer {
                             code: QCOM_VERIFICATION_FAILED,
@@ -1180,6 +1188,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                         alias: alias.to_string(),
                         raw,
                         created: Instant::now(),
+                        created_ms: now_millis(),
                         caller: call.caller_uid,
                     },
                 );

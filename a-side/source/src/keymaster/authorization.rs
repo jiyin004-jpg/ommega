@@ -342,6 +342,8 @@ impl AuthorizationManager {
         let localized = localize_auth_token_for_ommega(auth_token)
             .context(ks_err!("localizing trusted auth token for ommega"))?;
         ENFORCEMENTS.add_auth_token(localized);
+        // 记一笔认证时刻：SOTER 宿主那边靠它判「这张会话期间有没有走过生物认证」。
+        kmr_common::soter_relay::publish_last_auth(auth_token.timestamp.milliSeconds);
         Ok(())
     }
 

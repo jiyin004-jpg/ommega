@@ -31,6 +31,7 @@ pub fn start() {
     if STARTED.set(()).is_err() {
         return;
     }
+    ensure_last_auth_file();
     std::thread::spawn(|| loop {
         // 已有号（服务端学过或人工写的）不能被本地序列号算出的值覆盖：SOTER 身份必须
         // 是 B 端 TEE 那个号，两边不一致判证方就会判「设备换了」。只有什么都没有时才
@@ -54,6 +55,17 @@ pub fn start() {
         }
         std::thread::sleep(TICK);
     });
+}
+
+/// 认证时间戳落点：root 侧预建成 0666。keystore 域只在拿到 HAT 时写它、system 域的
+/// SOTER 宿主读它，两边都没权限建文件、只能写/读现成的这一个。
+fn ensure_last_auth_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = kmr_common::soter_relay::LAST_AUTH_PATH;
+    if !std::path::Path::new(path).exists() {
+        let _ = std::fs::write(path, "last_auth: 0\n");
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
 }
 
 /// 没有真实属性可报时：清掉缓存并删掉写下的副本，留着它等于继续报一个不成立的身份。

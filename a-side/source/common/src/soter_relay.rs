@@ -97,6 +97,50 @@ pub const CPU_ID_WRITE_PATH: &str = "/data/misc/ommega/soter_cpu_id";
 /// 环境变量覆盖（测试、临时探针用）。
 pub const CPU_ID_ENV: &str = "OMMEGA_SOTER_CPU_ID";
 
+/// 最近一次硬件认证（HAT）的时间戳落点，内容是 `last_auth: <unix 毫秒>`。
+///
+/// keystore2 那边拿到认证 token 时写（生物认证成功、系统投递 HAT 的那一刻），SOTER
+/// 宿主那边读：高通真机的 finishSign 要求这张会话开始之后发生过认证，靠它判。
+/// 文件由 root 侧提前建好并放开到 0666，两个域都能碰。
+pub const LAST_AUTH_PATH: &str = "/data/misc/ommega/last_auth";
+
+/// 解析 `last_auth: <毫秒>`；裸毫秒数也认。
+pub fn parse_last_auth(text: &str) -> Option<i64> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let value = match line.split_once(':') {
+            Some((key, value)) if key.trim() == "last_auth" => value.trim(),
+            Some(_) => continue,
+            None => line,
+        };
+        if let Ok(ms) = value.parse::<i64>() {
+            if ms > 0 {
+                return Some(ms);
+            }
+        }
+    }
+    None
+}
+
+/// 读最近一次认证时刻。
+pub fn read_last_auth() -> Option<i64> {
+    parse_last_auth(&std::fs::read_to_string(LAST_AUTH_PATH).ok()?)
+}
+
+/// 把认证时刻写进落点文件。
+///
+/// 直接覆盖写（不 rename）：文件由 root 侧预建成 0666，keystore 域没权限在目录里新建
+/// 文件，但能写进这个文件本体。写失败只是没信号，不影响认证本身。
+pub fn publish_last_auth(ms: i64) {
+    if ms <= 0 {
+        return;
+    }
+    let _ = std::fs::write(LAST_AUTH_PATH, format!("last_auth: {ms}\n"));
+}
+
 /// 真机 cpu_id 的形状：32 个十六进制字符。
 ///
 /// 不卡 `09000000` 前缀：换代次或换 TEE 实现后号头不一样，卡死会把真值当废值丢掉。
@@ -226,6 +270,19 @@ impl Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 认证时间戳那份文件：扁平写法与裸毫秒都认，0 当没有。
+    #[test]
+    fn last_auth_parses_both_forms() {
+        assert_eq!(
+            parse_last_auth("last_auth: 1700000000000\n"),
+            Some(1700000000000)
+        );
+        assert_eq!(parse_last_auth("1700000000000"), Some(1700000000000));
+        assert_eq!(parse_last_auth("last_auth: 0\n"), None);
+        assert_eq!(parse_last_auth("# comment\n"), None);
+        assert_eq!(parse_last_auth(""), None);
+    }
 
     #[test]
     fn only_32_hex_digits_count_as_a_cpu_id() {
