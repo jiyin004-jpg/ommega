@@ -39,6 +39,12 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建（AUTH_KEY_NOT_READY）；答 -5 会被当成 ASK 没就绪。
 const AUTH_KEY_NOT_READY: i32 = -6;
+/// 天玑（Kinibi）那边「这把钥匙不在这台设备上」的码；高通那边同一个场景用 -6。
+const KINIBI_KEY_NOT_FOUND: i32 = -8;
+/// 天玑那边「这张会话不存在」的码；高通那边是 -1000（托管端答）。
+const KINIBI_SESSION_UNKNOWN: i32 = -204;
+/// 高通那边「没经过生物认证不许签」的码（真机无指纹 finishSign 就回它）。
+const QCOM_VERIFICATION_FAILED: i32 = -26;
 /// 高通（QSEE）那套的 RSA-PSS 盐长：真机实测 20（文档里不声明这个字段）。
 const QCOM_SALT_LEN: usize = 20;
 /// MTK（Kinibi）那套的盐长：文档声明 32，签名也用 32。
@@ -1005,7 +1011,7 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             // 有料就导出，跟 ASK（1 号）同源：都看 store，不看墓碑。
             let Some(key) = auth_key(state, uid, alias) else {
                 return Some(Answer::Buffer {
-                    code: AUTH_KEY_NOT_READY,
+                    code: auth_missing_code(),
                     data: None,
                 });
             };
@@ -1039,6 +1045,15 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 .and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
             match found {
                 Some((s, key)) => {
+                    // 高通真机这个会话得走过生物认证才给签（无指纹回 -26）；兜底没有认证信号，
+                    // 按平台照真机答。
+                    if !is_kinibi() {
+                        state.sessions.lock().ok()?.remove(&session);
+                        return Some(Answer::Buffer {
+                            code: QCOM_VERIFICATION_FAILED,
+                            data: None,
+                        });
+                    }
                     state.sessions.lock().ok()?.remove(&session);
                     let counter = bump_counter(state, s.uid);
                     let document = sign_json(s.uid, &s.raw, counter);
@@ -1048,8 +1063,18 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                         data: Some(envelope(&document, &signature)),
                     })
                 }
-                // 本地没这个会话：initSign 是托管端落的号，得透出去让上层转给托管端（回 -1000 就永远签不成）。
-                None => None,
+                // 本地没这个会话：天玑真机回 -204；高通那个号归托管端（回 -1000），
+                // 所以高通分支仍透传，让上层转出去。
+                None => {
+                    if is_kinibi() {
+                        Some(Answer::Buffer {
+                            code: KINIBI_SESSION_UNKNOWN,
+                            data: None,
+                        })
+                    } else {
+                        None
+                    }
+                }
             }
         }
         // generateAskKeyPair(uid)：高通每次重铸回 0；MTK 已有则回 -5。
@@ -1414,6 +1439,20 @@ fn salt_len() -> usize {
     platform().salt_len
 }
 
+/// 是不是天玑（Kinibi）那套。两家在几处错误码上不一样。
+fn is_kinibi() -> bool {
+    platform().cpu_prefix == "09000000"
+}
+
+/// 未知 AuthKey 的答复码：天玑真机 -8，高通 -6。
+fn auth_missing_code() -> i32 {
+    if is_kinibi() {
+        KINIBI_KEY_NOT_FOUND
+    } else {
+        AUTH_KEY_NOT_READY
+    }
+}
+
 /// 一份自描述文档的尾巴：盐长字段（高通那套不放，验签方按它自己的默认算）。
 fn salt_field() -> String {
     if platform().declares_salt {
@@ -1759,6 +1798,17 @@ mod tests {
 
         let mut finish = call(4, None, None);
         finish.session = Some(session);
+        if !is_kinibi() {
+            // 高通真机这张会话要走过生物认证才给签；兜底没有认证信号，按平台回 -26。
+            match answer(&finish) {
+                Some(Answer::Buffer { code, data }) => {
+                    assert_eq!(code, QCOM_VERIFICATION_FAILED);
+                    assert!(data.is_none(), "-26 不该带签名");
+                }
+                other => panic!("高通 finishSign 期望 -26，拿到 {other:?}"),
+            }
+            return;
+        }
         let envelope = as_buffer(answer(&finish));
         let (document, signature) = split_envelope(&envelope);
         assert_eq!(signature.len(), 256, "RSA-2048 signature is 256 bytes");
@@ -1794,10 +1844,21 @@ mod tests {
 
     #[test]
     fn finish_sign_with_an_unknown_session_falls_through() {
-        // 不认识的会话号不能本地硬回 -1000：那可能正是托管端落的号，得放行。
         let mut c = call(4, None, None);
         c.session = Some(1);
-        assert!(answer(&c).is_none());
+        if is_kinibi() {
+            // 天玑真机对不存在的会话直接回 -204。
+            match answer(&c) {
+                Some(Answer::Buffer { code, data }) => {
+                    assert_eq!(code, KINIBI_SESSION_UNKNOWN);
+                    assert!(data.is_none(), "不存在的会话不该带数据");
+                }
+                other => panic!("天玑未知会话期望 -204，拿到 {other:?}"),
+            }
+        } else {
+            // 高通那边这个号归托管端（-1000），本地不能硬回。
+            assert!(answer(&c).is_none());
+        }
     }
 
     /// 拆信封：`[i32 le JSON 长度][JSON][签名]`。
@@ -1954,6 +2015,14 @@ mod tests {
         };
         let mut finish = call(4, None, None);
         finish.session = Some(session);
+        if !is_kinibi() {
+            // 高通真机不按指纹不给签，兜底照做；字段形状只在天玑这条路上验。
+            match answer(&finish) {
+                Some(Answer::Buffer { code, .. }) => assert_eq!(code, QCOM_VERIFICATION_FAILED),
+                other => panic!("高通 finishSign 期望 -26，拿到 {other:?}"),
+            }
+            return;
+        }
         let (document, _) = split_envelope(&as_buffer(answer(&finish)));
         let text = String::from_utf8(document).unwrap();
 

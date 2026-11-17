@@ -36,6 +36,10 @@ const OK: i32 = 0;
 const NOT_FOUND: i32 = -5;
 /// AuthKey 还没建（-6，`AUTH_KEY_NOT_READY`）。
 const AUTH_KEY_NOT_READY: i32 = -6;
+/// 天玑（Kinibi）那边「这把钥匙不在这台设备上」的码；高通那边是 -6。
+const KINIBI_KEY_NOT_FOUND: i32 = -8;
+/// 天玑那边「这张会话不存在」的码；高通那边是 -1000。
+const KINIBI_SESSION_UNKNOWN: i32 = -204;
 /// `finish_sign` 拿到一个不存在的 session（真机 TA 的 -1000）。
 const SESSION_UNKNOWN: i32 = -1000;
 /// MTK（Kinibi）那套的盐长：文档里声明、签名也用它。高通是 20，且不声明。
@@ -1025,7 +1029,7 @@ pub fn run_layer(
                 // 回「AuthKey 自描述 + 签名」的信封，签名用 ASK 私钥。
                 Some(auth) => {
                     if ask_is_gone(&scope, device_id, uid_of(body)?) {
-                        return Ok(code_result(op, AUTH_KEY_NOT_READY));
+                        return Ok(code_result(op, auth_missing_code(&product)));
                     }
                     let ask = layer_ask_key(&scope, uid_of(body)?, layer)?;
                     let counter = counter_for(&counter_key(&scope, device_id, uid_of(body)?));
@@ -1035,7 +1039,7 @@ pub fn run_layer(
                     out["layer"] = json!(layer);
                     Ok(out)
                 }
-                None => Ok(code_result(op, AUTH_KEY_NOT_READY)),
+                None => Ok(code_result(op, auth_missing_code(&product))),
             },
             "generate_auth_key_pair" => {
                 let fresh = std::sync::Arc::new(
@@ -1173,7 +1177,7 @@ pub fn run_layer(
                     // 这张会话刚签过：把上次那串信封原样还回去。
                     None => match replay_finished(session, requested_now, device_id, layer) {
                         Some(reply) => return Ok(reply),
-                        None => return Ok(code_result(op, SESSION_UNKNOWN)),
+                        None => return Ok(code_result(op, session_unknown_code(&product))),
                     },
                 };
                 // 按会话当初的身份（同一把 ATTK）取 AuthKey。
@@ -1352,6 +1356,29 @@ struct Platform {
     /// 指纹身份。
     fp_n: &'static str,
     fp_v: &'static str,
+}
+
+/// 未知 AuthKey 的答复码：天玑真机 -8，高通 -6。
+fn auth_missing_code(cpu_id: &str) -> i32 {
+    if is_kinibi(cpu_id) {
+        KINIBI_KEY_NOT_FOUND
+    } else {
+        AUTH_KEY_NOT_READY
+    }
+}
+
+/// 未知 session 的答复码：天玑真机 -204，高通 -1000。
+fn session_unknown_code(cpu_id: &str) -> i32 {
+    if is_kinibi(cpu_id) {
+        KINIBI_SESSION_UNKNOWN
+    } else {
+        SESSION_UNKNOWN
+    }
+}
+
+/// 这个身份号是不是天玑（Kinibi）那套。
+fn is_kinibi(cpu_id: &str) -> bool {
+    cpu_id.starts_with("09000000")
 }
 
 fn profile_of(cpu_id: &str) -> Platform {
@@ -2567,9 +2594,18 @@ mod tests {
         assert_eq!(session_layer("other", session), None);
         assert_eq!(session_layer(device, -987654321), None);
         let finish = json!({"device_id": device, "op": "finish_sign", "session": session});
-        // 别的设备不能把这张会话拿走
+        // 别的设备不能把这张会话拿走（带个高通身份，走那边 -1000 的码）
         assert_eq!(
-            run("self_signed", "other", &finish, None).unwrap()["error_code"],
+            run(
+                "self_signed",
+                "other",
+                &json!({
+                    "device_id": device, "op": "finish_sign", "session": session,
+                    "cpu_id": "000000002325e2ecd52f0a3d0a179395"
+                }),
+                None
+            )
+            .unwrap()["error_code"],
             json!(SESSION_UNKNOWN)
         );
         let first = run("self_signed", device, &finish, None).unwrap();
