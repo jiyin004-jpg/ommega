@@ -1,4 +1,4 @@
-//! 服务端侧的三层 SOTER：`keybox`（服务端存的设备身份）、`attk`（控制台上传的 ATTK）、
+﻿//! 服务端侧的三层 SOTER：`keybox`（服务端存的设备身份）、`attk`（控制台上传的 ATTK）、
 //! `self_signed`（现生成、进程内复用），另有 `builtin` 供探测机就地作答。
 //!
 //! SOTER 的"证书"是 `[i32 le JSON 长度][JSON][256 字节 RSA-PSS 签名]`，
@@ -966,14 +966,14 @@ pub fn run_layer(
                 "device_id": product,
             })),
             "get_device_id" => {
-                // 带上层名。形状：高通 16 字节 raw，MTK 32 个 ASCII 十六进制字符 + `\0`。
+                // 带上层名。形状：MTK 32 个 ASCII 十六进制字符 + `\0`；高通那个接口不给数据。
                 let profile = profile_of(&product);
                 let raw = if profile.device_id_ascii {
                     let mut bytes = product.as_bytes().to_vec();
                     bytes.push(0);
                     bytes
                 } else {
-                    hex_bytes(&product).unwrap_or_default()
+                    Vec::new()
                 };
                 let mut out = data_result(op, OK, &raw);
                 out["layer"] = json!(layer);
@@ -1271,24 +1271,6 @@ fn is_soter_cpu_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// 32 字符 hex 转 16 字节（高通 getDeviceId 的形状）。
-#[allow(dead_code)]
-fn hex_bytes(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16)?;
-        let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Some(out)
-}
-
 /// 造号时的号头：MTK（Kinibi）`09000000`，高通（QSEE）`00000000`。
 /// 平台线索是 A 端转发时带的 `soc` 字段；没带就按 MTK 那套（带转发的老 A 端都是天玑机）。
 fn soc_prefix(soc: Option<&str>) -> &'static str {
@@ -1390,7 +1372,7 @@ fn profile_of(cpu_id: &str) -> Platform {
             salt_len: 20,
             tee_n: "QSEE",
             tee_v: "5",
-            fp_n: "fingerprint",
+            fp_n: "Stargate",
             fp_v: "1",
         }
     }
@@ -2014,7 +1996,7 @@ mod tests {
         );
     }
 
-    /// 高通那套：`cpu_id` 以 `00000000` 开头，`getDeviceId` 回 16 字节 raw，
+    /// 高通那套：`cpu_id` 以 `00000000` 开头，`getDeviceId` 不给数据（空 buffer），
     /// ASK 文档里**不带** `rsa_pss_saltlen` 字段。
     #[test]
     fn a_qti_cpu_id_switches_to_the_qti_shape() {
@@ -2031,9 +2013,7 @@ mod tests {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(id["data"].as_str().expect("data"))
             .expect("base64");
-        assert_eq!(raw.len(), 16, "高通回 16 字节 raw");
-        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, cpu);
+        assert!(raw.is_empty(), "高通这个接口不给设备号: {raw:02x?}");
 
         let ask = run(
             "self_signed",
@@ -2100,7 +2080,7 @@ mod tests {
         let text = String::from_utf8(document).expect("json is utf-8");
         assert!(text.contains("\"tee_n\":\"QSEE\""), "{text}");
         assert!(text.contains("\"tee_v\":\"5\""), "{text}");
-        assert!(text.contains("\"fp_n\":\"fingerprint\""), "{text}");
+        assert!(text.contains("\"fp_n\":\"Stargate\""), "{text}");
         assert!(text.contains("\"fp_v\":\"1\""), "{text}");
         assert!(
             !text.contains("rsa_pss_saltlen"),

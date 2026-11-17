@@ -820,6 +820,7 @@ fn fingerprint_name() -> String {
         ("silead", "Silead"),
         ("egis", "Egis"),
         ("qbt", "QBT"),
+        ("stargate", "Stargate"),
     ] {
         if hardware.contains(needle) {
             return name.to_string();
@@ -1099,8 +1100,8 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             state.auth.lock().ok()?.insert(auth_id(uid, alias), key);
             Some(Answer::Code(OK))
         }
-        // getDeviceId()：真机回 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（33 字节，MTK）或
-        // 16 字节二进制（高通），形状要跟真机一致。
+        // getDeviceId()：MTK 真机回 **32 个 ASCII 十六进制字符 + 结尾 `\0`**（33 字节）；
+        // 高通那个接口不给数据（空 buffer、errcode 0），形状要跟真机一致。
         8 => Some(Answer::Buffer {
             code: OK,
             data: Some(device_id_reply(&device_id())),
@@ -1401,7 +1402,7 @@ fn platform() -> &'static Platform {
                 generate_rotates: true,
                 tee_n: "QSEE",
                 tee_v: "5",
-                fp_n: "fingerprint",
+                fp_n: "Stargate",
                 fp_v: "1",
             }
         }
@@ -1454,31 +1455,14 @@ fn ask_json(pub_pem: &str, uid: i32, counter: u64) -> Result<Vec<u8>, ()> {
     Ok(document.into_bytes())
 }
 
-/// 32 个 hex 字符转 16 字节。
-fn hex_bytes(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16)?;
-        let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Some(out)
-}
-
-/// `getDeviceId` 的答复字节：高通回 16 字节 raw，MTK 回 32 个 ASCII hex + NUL。
+/// `getDeviceId` 的答复字节：MTK 回 32 个 ASCII hex + NUL；高通真机这个接口不给数据。
 fn device_id_reply(cpu: &str) -> Vec<u8> {
     if platform().device_id_ascii {
         let mut out = cpu.as_bytes().to_vec();
         out.push(0);
         out
     } else {
-        hex_bytes(cpu).unwrap_or_default()
+        Vec::new()
     }
 }
 
@@ -1670,10 +1654,8 @@ mod tests {
             assert_eq!(data[32], 0, "末尾那个字节是 NUL");
             assert!(data[..32].iter().all(|b| b.is_ascii_hexdigit()));
         } else {
-            // 高通：16 字节 raw，hex 出来就是 cpu_id。
-            assert_eq!(data.len(), 16);
-            let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(hex, device_id());
+            // 高通：真机那个接口不给设备号（errcode 0、buffer 为空），兜底照做。
+            assert!(data.is_empty(), "高通回空: {data:02x?}");
         }
     }
 
