@@ -914,6 +914,8 @@ pub fn run_layer(
 ) -> Option<Value> {
     purge_owners_if_due();
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+    // 平台线索：A 端转发时带的 `soc`，只在要现造号时用得上。
+    let soc = body.get("soc").and_then(Value::as_str);
     // 身份号（cpu_id）：`attk` 层用上传 ATTK 自己的；其余层用 A 端转来的真机号，
     // 没给或形状不对时按当前时间现造。
     let product = if layer == "attk" {
@@ -925,7 +927,7 @@ pub fn run_layer(
                 "soter: attk 层的 cpu_id {own:?} 形状不对（要 32 个十六进制字符），\
                  先按当前时间现造一个顶上"
             );
-            time_device_id()
+            time_device_id(soc)
         }
     } else {
         docs_cpu_id(body).unwrap_or_else(|| {
@@ -936,7 +938,7 @@ pub fn run_layer(
                 );
             }
             // 按当前年月日时分现造，同一分钟内稳定。
-            time_device_id()
+            time_device_id(soc)
         })
     };
 
@@ -1290,15 +1292,24 @@ fn hex_bytes(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 现造的设备号：`09000000` + `sha256("ommega-server-soter-time:" + YYYYMMDDHHMM)` 前 12 字节。
+/// 造号时的号头：MTK（Kinibi）`09000000`，高通（QSEE）`00000000`。
+/// 平台线索是 A 端转发时带的 `soc` 字段；没带就按 MTK 那套（带转发的老 A 端都是天玑机）。
+fn soc_prefix(soc: Option<&str>) -> &'static str {
+    match soc.map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("qcom") | Some("qualcomm") | Some("qti") => "00000000",
+        _ => "09000000",
+    }
+}
+
+/// 现造的设备号：`<平台号头>` + `sha256("ommega-server-soter-time:" + YYYYMMDDHHMM)` 前 12 字节。
 /// 按分钟稳定。
-fn time_device_id() -> String {
+fn time_device_id(soc: Option<&str>) -> String {
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M").to_string();
     let mut hasher = Sha256::new();
     hasher.update(b"ommega-server-soter-time:");
     hasher.update(stamp.as_bytes());
     let digest = hasher.finalize();
-    let mut out = String::from("09000000");
+    let mut out = String::from(soc_prefix(soc));
     for byte in &digest[..12] {
         out.push_str(&format!("{byte:02x}"));
     }
@@ -1367,10 +1378,10 @@ fn profile_of(cpu_id: &str) -> Platform {
         Platform {
             declares_salt: true,
             device_id_ascii: true,
-            tee_n: "Kinibi",
+            tee_n: "Kinibi-FFA-A-610a-V008-20240926_141444_120597_6923a",
             tee_v: "10018",
             fp_n: "FPC",
-            fp_v: "1",
+            fp_v: "6516",
         }
     } else {
         Platform {
@@ -1399,8 +1410,9 @@ fn key_doc(pub_key_pem: &str, device_id: &str, counter: u64, uid: i32) -> Result
     serde_json::to_vec(&doc).context("failed to serialize the key document")
 }
 
-/// 签名现场那份 JSON，`raw` 在最前。`tee_n` / `tee_v` / `fp_n` / `fp_v` 按平台报原厂值
-/// （高通 `QSEE`/`5`、MTK `Kinibi`/`10018`）。
+/// 签名现场那份 JSON，`raw` 在最前。`tee_n` / `tee_v` / `fp_n` / `fp_v` 按平台报原厂值，
+/// 真机值见 2026-11-16 PLC110 实测：MTK 报 Kinibi 的完整版本串与 FPC 固件号，
+/// 高通报 `QSEE`/`5`。
 fn sign_doc(cpu_id: &str, uid: i32, raw: &str, counter: u64) -> Result<Vec<u8>> {
     let profile = profile_of(cpu_id);
     let mut doc = json!({
@@ -2076,7 +2088,7 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(device_id_text(&plain), time_device_id());
+        assert_eq!(device_id_text(&plain), time_device_id(None));
         assert_eq!(plain["layer"], json!("self_signed"));
         assert_ne!(
             device_id_text(&plain),
@@ -2114,7 +2126,11 @@ mod tests {
             assert_ne!(text, virtual_device_id(device), "{bad:?}");
         }
         // 同一分钟里两次调用应当一样（一轮 ASK / AuthKey 不会中途换号）。
-        assert_eq!(time_device_id(), time_device_id());
+        assert_eq!(time_device_id(None), time_device_id(None));
+        // 号头跟平台线索走：天玑给 09，高通给 00。
+        assert!(time_device_id(Some("mtk")).starts_with("09000000"));
+        assert!(time_device_id(Some("qcom")).starts_with("00000000"));
+        assert_eq!(time_device_id(Some("qcom")).len(), 32);
     }
 
     #[test]
@@ -2372,7 +2388,7 @@ mod tests {
             "签名文档里不能出现服务端版本号: {text}"
         );
         assert!(
-            text.contains("\"tee_n\":\"QSEE\"") || text.contains("\"tee_n\":\"Kinibi\""),
+            text.contains("\"tee_n\":\"QSEE\"") || text.contains("\"tee_n\":\"Kinibi"),
             "tee_n 得是原厂拼法: {text}"
         );
 

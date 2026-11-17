@@ -56,6 +56,8 @@ const COUNTER_BASE: u64 = 1;
 
 /// 强制覆盖 cpu_id 的文件；daemon 不写这个文件。
 const CPU_ID_OVERRIDE: &str = "/data/misc/ommega/soter_cpu_id.force";
+/// `tee_n` 覆盖文件：一行完整的原厂 TEE 名（Kinibi 版本串随机型/批次变）。
+const TEE_NAME_OVERRIDE: &str = "/data/misc/ommega/soter_tee_name";
 /// `fid` 在序列号读不到时的兜底种子。`cpu_id` **不用**它（读不到就不报，绝不编一个）。
 const FALLBACK_SEED: &str = "ommega-a-side-local";
 
@@ -842,8 +844,15 @@ fn fingerprint_version() -> String {
     platform().fp_v.to_string()
 }
 
-/// TEE 名字，取平台定义的原厂名（高通 QSEE / MTK Kinibi）。
+/// TEE 名字，取平台定义的原厂名（高通 QSEE / MTK 那串完整 Kinibi 版本）。
+/// `TEE_NAME_OVERRIDE` 里写了一行就用它——不同批次的 Kinibi 版本串不一样。
 fn tee_name() -> String {
+    if let Ok(text) = std::fs::read_to_string(TEE_NAME_OVERRIDE) {
+        let value = text.trim();
+        if !value.is_empty() && value.len() <= 96 {
+            return value.to_string();
+        }
+    }
     platform().tee_n.to_string()
 }
 
@@ -1373,10 +1382,10 @@ fn platform() -> &'static Platform {
                 device_id_ascii: true,
                 declares_salt: true,
                 generate_rotates: false,
-                tee_n: "Kinibi",
+                tee_n: "Kinibi-FFA-A-610a-V008-20240926_141444_120597_6923a",
                 tee_v: "10018",
                 fp_n: "FPC",
-                fp_v: "1",
+                fp_v: "6516",
             }
         } else {
             Platform {
@@ -2047,7 +2056,7 @@ mod tests {
             );
         }
         assert!(
-            info.tee_n == "QSEE" || info.tee_n == "Kinibi",
+            info.tee_n == "QSEE" || info.tee_n.starts_with("Kinibi"),
             "tee_n 得是原厂拼法: {}",
             info.tee_n
         );

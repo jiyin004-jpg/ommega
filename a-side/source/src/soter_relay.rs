@@ -463,7 +463,22 @@ fn request_value(value: &Value, op: &str) -> Value {
         }
         None => value.clone(),
     };
-    with_cpu_id(mapped, crate::soter_cpu_id::current())
+    with_soc(with_cpu_id(mapped, crate::soter_cpu_id::current()))
+}
+
+/// 把本机平台塞进转发请求：服务端没拿到真机号、要现造一个时按这个选号头，
+/// 免得在高通机上造出一个 MTK 形状的号。调用方自己带了这个字段就不动。
+fn with_soc(mut value: Value) -> Value {
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    if !map.contains_key("soc") {
+        map.insert(
+            "soc".to_string(),
+            Value::from(crate::soter_cpu_id::soc_hint()),
+        );
+    }
+    value
 }
 
 /// 把真机 cpu_id 塞进要转发的请求（`None` = 还没学到，就不带这个字段）。
@@ -675,6 +690,18 @@ mod tests {
         assert_eq!(parse_uid_map("10490=abc"), Vec::new());
         // 坏了一条，好的那一条还得留着。
         assert_eq!(parse_uid_map("乱写,10490=10373"), vec![(10490, 10373)]);
+    }
+
+    #[test]
+    fn a_forwarded_request_carries_the_platform() {
+        let value = with_soc(json!({"op": "get_device_id"}));
+        let soc = value["soc"].as_str().expect("soc is a string");
+        assert!(soc == "mtk" || soc == "qcom", "soc = {soc}");
+        // 调用方自己带着就不动。
+        let explicit = json!({"op": "get_device_id", "soc": "qcom"});
+        assert_eq!(with_soc(explicit.clone()), explicit);
+        // 不是对象的请求照原样递过去。
+        assert_eq!(with_soc(json!("nope")), json!("nope"));
     }
 
     #[test]

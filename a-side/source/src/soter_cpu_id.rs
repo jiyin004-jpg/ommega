@@ -18,6 +18,11 @@ const TICK: Duration = Duration::from_secs(60);
 /// 派生用的前缀，跟 payload 那份一字不差。
 const SEED: &str = "ommega-a-side-soter:";
 
+/// MTK（Kinibi）的号头。
+const MTK_PREFIX: &str = "09000000";
+/// 高通（QSEE）的号头。
+const QCOM_PREFIX: &str = "00000000";
+
 static DERIVED: Mutex<Option<String>> = Mutex::new(None);
 static STARTED: OnceLock<()> = OnceLock::new();
 
@@ -134,11 +139,37 @@ fn serial() -> Option<String> {
     None
 }
 
-/// 一台像真机的号：`09000000` + `sha256("ommega-a-side-soter:" + serial)` 前 12 字节。
+/// 平台前缀，跟 payload 的 `soter_local::platform()` 同一套判据：MTK（Kinibi）报
+/// `09000000`，其余报 `00000000`。派生号的号头必须和本地兜底那条路一致，不然同一台
+/// 机器两边报两个号。
+fn platform_prefix() -> &'static str {
+    let soc = rsproperties::get_or("ro.soc.manufacturer", String::new()).to_lowercase();
+    let board = rsproperties::get_or("ro.board.platform", String::new()).to_lowercase();
+    if soc.contains("mediatek") || soc.contains("mtk") || board.starts_with("mt") {
+        MTK_PREFIX
+    } else {
+        QCOM_PREFIX
+    }
+}
+
+/// 转发时告诉服务端这台机器的平台，服务端在没收到真机号、要现造一个时按它选号头。
+pub fn soc_hint() -> &'static str {
+    if platform_prefix() == MTK_PREFIX {
+        "mtk"
+    } else {
+        "qcom"
+    }
+}
+
+/// 一台像真机的号：平台前缀 + `sha256("ommega-a-side-soter:" + serial)` 前 12 字节。
 /// 跟 payload 的 `soter_local::cpu_id_from` 同一个算法。
 fn local_id_from_serial(serial: &str) -> String {
+    local_id_with_prefix(serial, platform_prefix())
+}
+
+fn local_id_with_prefix(serial: &str, prefix: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, format!("{SEED}{serial}").as_bytes());
-    let mut out = String::from("09000000");
+    let mut out = String::from(prefix);
     for byte in &digest.as_ref()[..12] {
         out.push_str(&format!("{byte:02x}"));
     }
@@ -179,14 +210,27 @@ mod tests {
     use super::*;
 
     /// 算法钉死：这个序列号必须派生出这个号，payload 那边算出来得是同一个
-    /// （两边算法一字不差）。
+    /// （两边算法一字不差），号头按平台换。
     #[test]
     fn the_derived_id_matches_the_payload_one() {
         assert_eq!(
-            local_id_from_serial("320143945328"),
+            local_id_with_prefix("320143945328", MTK_PREFIX),
             "09000000043df759af14a088ee5307dc"
         );
-        assert_eq!(local_id_from_serial("320143945328").len(), 32);
+        assert_eq!(
+            local_id_with_prefix("320143945328", QCOM_PREFIX),
+            "00000000043df759af14a088ee5307dc"
+        );
+        assert_eq!(local_id_with_prefix("320143945328", MTK_PREFIX).len(), 32);
+    }
+
+    /// 现编的号跟着平台走，不能被写死成 MTK 那套。
+    #[test]
+    fn the_derived_id_carries_the_platform_prefix() {
+        let id = local_id_from_serial("320143945328");
+        assert!(id.starts_with(platform_prefix()), "id = {id}");
+        assert_eq!(id.len(), 32);
+        assert!(soc_hint() == "mtk" || soc_hint() == "qcom");
     }
 
     /// 读不到序列号就返回 `None`，转发时不带 cpu_id。
@@ -195,7 +239,7 @@ mod tests {
         assert_eq!(id_for_serial(None), None);
         assert_eq!(
             id_for_serial(Some("320143945328")),
-            Some("09000000043df759af14a088ee5307dc".to_string())
+            Some(local_id_from_serial("320143945328"))
         );
     }
 
