@@ -1405,8 +1405,12 @@ fn platform() -> &'static Platform {
             .unwrap_or_default()
             .to_lowercase();
         let board = prop("ro.board.platform").unwrap_or_default().to_lowercase();
-        let mtk = soc.contains("mediatek") || soc.contains("mtk") || board.starts_with("mt");
-        if mtk {
+        // 只有明确是高通才走高通那套；天玑、展锐、三星这类认不出来的平台一律按天玑的规则。
+        let qcom = soc.contains("qcom")
+            || soc.contains("qualcomm")
+            || soc.contains("qti")
+            || board.starts_with("qcom");
+        if qcom {
             Platform {
                 cpu_prefix: "09000000",
                 device_id_ascii: true,

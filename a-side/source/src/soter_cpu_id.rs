@@ -139,25 +139,30 @@ fn serial() -> Option<String> {
     None
 }
 
-/// 平台前缀，跟 payload 的 `soter_local::platform()` 同一套判据：MTK（Kinibi）报
-/// `09000000`，其余报 `00000000`。派生号的号头必须和本地兜底那条路一致，不然同一台
-/// 机器两边报两个号。
+/// 平台前缀，跟 payload 的 `soter_local::platform()` 同一套判据：明确是高通才报
+/// `00000000`，其余（天玑、展锐、三星这类认不出来的）一律按天玑的 `09000000`。
+/// 派生号的号头必须和本地兜底那条路一致，不然同一台机器两边报两个号。
 fn platform_prefix() -> &'static str {
     let soc = rsproperties::get_or("ro.soc.manufacturer", String::new()).to_lowercase();
     let board = rsproperties::get_or("ro.board.platform", String::new()).to_lowercase();
-    if soc.contains("mediatek") || soc.contains("mtk") || board.starts_with("mt") {
-        MTK_PREFIX
-    } else {
+    let qcom = soc.contains("qcom")
+        || soc.contains("qualcomm")
+        || soc.contains("qti")
+        || board.starts_with("qcom");
+    if qcom {
         QCOM_PREFIX
+    } else {
+        MTK_PREFIX
     }
 }
 
 /// 转发时告诉服务端这台机器的平台，服务端在没收到真机号、要现造一个时按它选号头。
+/// 只有明确是高通才报 `qcom`，其余都按天玑那套。
 pub fn soc_hint() -> &'static str {
-    if platform_prefix() == MTK_PREFIX {
-        "mtk"
-    } else {
+    if platform_prefix() == QCOM_PREFIX {
         "qcom"
+    } else {
+        "mtk"
     }
 }
 
