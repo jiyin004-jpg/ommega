@@ -2048,6 +2048,65 @@ mod tests {
         );
     }
 
+    /// 高通签名文档那四格照真机（2026-11-16 NX721J / SM8635 实测）：`QSEE` / `5` /
+    /// `fingerprint` / `1`，且不带盐长字段。
+    #[test]
+    fn a_qti_sign_document_reports_the_qti_identity() {
+        let cpu = "000000002325e2ecd52f0a3d0a179395";
+        let device = "device-a-qti-sign";
+        let uid = 10_315;
+        let alias = "probe-alias";
+
+        // init_sign 要求这个槽位已经有 AuthKey。
+        let generate = run(
+            "self_signed",
+            device,
+            &json!({
+                "op": "generate_auth_key_pair", "uid": uid,
+                "alias": alias, "cpu_id": cpu,
+            }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(
+            generate["error_code"],
+            json!(0),
+            "generate_auth_key_pair: {generate}"
+        );
+
+        let init = run(
+            "self_signed",
+            device,
+            &json!({
+                "op": "init_sign", "uid": uid, "alias": alias,
+                "challenge": "0a1b2c3d", "cpu_id": cpu,
+            }),
+            None,
+        )
+        .expect("handled");
+        assert_eq!(init["error_code"], json!(0), "init_sign: {init}");
+        let session = init["session"].as_i64().expect("session is a number");
+
+        let finish = run(
+            "self_signed",
+            device,
+            &json!({ "op": "finish_sign", "session": session, "cpu_id": cpu }),
+            None,
+        )
+        .expect("handled");
+        let (document, _) = split_envelope(&data_of(&finish));
+        let text = String::from_utf8(document).expect("json is utf-8");
+        assert!(text.contains("\"tee_n\":\"QSEE\""), "{text}");
+        assert!(text.contains("\"tee_v\":\"5\""), "{text}");
+        assert!(text.contains("\"fp_n\":\"fingerprint\""), "{text}");
+        assert!(text.contains("\"fp_v\":\"1\""), "{text}");
+        assert!(
+            !text.contains("rsa_pss_saltlen"),
+            "高通不带盐长字段: {text}"
+        );
+        assert!(text.contains(&format!("\"cpu_id\":\"{cpu}\"")), "{text}");
+    }
+
     /// A 端把真机 cpu_id 转过来了就得原样落进文档，不能自己再派生一个 —— 同一台设备上
     /// 本地兜底、服务端两层、真机三处报同一个号，检测器才不报「两次 cpuid 不一致」。
     #[test]
