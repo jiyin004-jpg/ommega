@@ -336,7 +336,7 @@ pub fn build_soter_buffer_reply(
         parcel.write(&code)?;
     }
     parcel.write(&NON_NULL_PARCELABLE_FLAG)?;
-    write_soter_buffer_return(&mut parcel, data.unwrap_or(&[]), code, has_return_code)?;
+    write_soter_buffer_return(&mut parcel, data, code, has_return_code)?;
     Ok(owned_reply_from_parcel(parcel, std::iter::empty::<usize>()))
 }
 
@@ -422,18 +422,28 @@ const VAL_INTEGER: i32 = 1;
 /// 数据），高通没有错误码那一格（12 = 4+4+4）。
 fn write_soter_buffer_return(
     parcel: &mut Parcel,
-    data: &[u8],
+    data: Option<&[u8]>,
     code: i32,
     has_return_code: bool,
 ) -> Result<()> {
-    let padded = (data.len() + 3) & !3;
+    let padded = data.map(|bytes| (bytes.len() + 3) & !3).unwrap_or(0);
     let header = if has_return_code { 12 } else { 16 };
     parcel.write(&((header + padded) as i32))?;
     if !has_return_code {
         parcel.write(&code)?;
     }
-    parcel.write(&data.to_vec())?;
-    parcel.write(&(data.len() as i32))?;
+    match data {
+        Some(bytes) => {
+            parcel.write(&bytes.to_vec())?;
+            parcel.write(&(bytes.len() as i32))?;
+        }
+        // `writeByteArray(null)`：长度格写 -1，宿主 `createByteArray()` 才回 null。
+        // 高通真机 `getDeviceId` 就是这么答的（没有 id），写成 0 会被当成空数组。
+        None => {
+            parcel.write(&(-1i32))?;
+            parcel.write(&0i32)?;
+        }
+    }
     Ok(())
 }
 

@@ -47,6 +47,8 @@ const KINIBI_KEY_NOT_FOUND: i32 = -8;
 const KINIBI_SESSION_UNKNOWN: i32 = -204;
 /// 高通那边「没经过生物认证不许签」的码（真机无指纹 finishSign 就回它）。
 const QCOM_VERIFICATION_FAILED: i32 = -26;
+/// 高通那边「这张会话不存在」的码（真机与托管端都答这个）。
+const QCOM_SESSION_UNKNOWN: i32 = -1000;
 /// 高通（QSEE）那套的 RSA-PSS 盐长：真机实测 20（文档里不声明这个字段）。
 const QCOM_SALT_LEN: usize = 20;
 /// MTK（Kinibi）那套的盐长：文档声明 32，签名也用 32。
@@ -158,21 +160,14 @@ struct SignSession {
     created: Instant,
     /// 同一时刻的墙钟毫秒，用来和认证时间戳比先后。
     created_ms: i64,
-    /// 开这笔会话的调用方（内核填的 `sender_euid`）。本地兜底有时拿不到，那就只靠 TTL。
-    caller: Option<i32>,
 }
 
 impl SignSession {
-    /// 这次调用能不能花掉这个会话：在 TTL 内，且调用方就是开它的那个。
-    /// 两边都拿得到 caller 才比。
-    fn is_usable(&self, caller: Option<i32>) -> bool {
-        if self.created.elapsed() > SESSION_TTL {
-            return false;
-        }
-        match (self.caller, caller) {
-            (Some(owner), Some(actual)) => owner == actual,
-            _ => true,
-        }
+    /// 只要还在 TTL 内就能用：会话号本身就是凭据。真机 TA 也不把会话绑到某个调用方，
+    /// 而 initSign / finishSign 常落在不同进程或不同 sender，硬比 caller 会让 T12
+    ///（以及指纹补链那轮）时好时坏。
+    fn is_usable(&self) -> bool {
+        self.created.elapsed() <= SESSION_TTL
     }
 }
 
@@ -294,6 +289,31 @@ fn attk_fingerprint() -> Option<String> {
 /// 落盘那一瞬间的互斥：读改写不是原子操作，两个 uid 同时进来会互相盖掉。
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
+/// 跨进程互斥：hook（soterserver）和软件 TA 是两个进程，同名 store 的读改写会互相
+/// 覆盖（会话/AuthKey 时有时无）。用锁文件上的 flock 把几个域的读改写串起来。
+fn with_store_file_lock<T>(body: impl FnOnce() -> T) -> T {
+    let path = format!("{}.lock", ask_store_path());
+    match std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            // 绝不卡住：只在能立刻拿到锁时串行化，拿不到就直接干活。store 是尽力而为的
+            // 共享态，丢一次更新远好过把 SOTER 调用挂在这里（另一个域可能正卡在 IPC 上）。
+            let locked = file.try_lock().is_ok();
+            let result = body();
+            if locked {
+                let _ = file.unlock();
+            }
+            result
+        }
+        // 开不了锁文件（某个域没有目录写权限）就退回进程内锁，至少不卡住。
+        Err(_) => body(),
+    }
+}
+
 fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
     let path = ask_store_path();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -312,6 +332,7 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
                 key == ASK_SECTION
                     || key == AUTH_SECTION
                     || key == GONE_SECTION
+                    || key == SESSION_SECTION
                     || key == ATTK_FIELD
             });
             // 指纹对不上（换了 ATTK）或没记指纹的旧 store：整份作废，让调用方重新生成 ——
@@ -409,39 +430,110 @@ const AUTH_KEYS_KEEP: usize = MAX_AUTH_KEYS * 3 / 4;
 const MAX_SIGN_SESSIONS: usize = 256;
 /// 一个签名会话的生命周期（跟服务端一致 60 秒）；过期就当没这个号，让上层重开。
 const SESSION_TTL: Duration = Duration::from_secs(60);
+/// 会话过期时间（毫秒），落盘记录里用。
+const SESSION_TTL_MS: i64 = 60_000;
+/// 落盘的签名会话段：hook（soterserver）和软件 TA（另一个进程）共用一份，
+/// 进程重启后也还能找到 initSign 开的会话，finishSign 才不会时好时坏。
+const SESSION_SECTION: &str = "sessions";
+/// initSign 到 finishSign 至少隔这么久，才当成「中间做过指纹」放行签名。
+/// 补链那轮是 initSign → 弹指纹（阻塞到用户按）→ finishSign，间隔通常几百毫秒以上；
+/// 普通 T12 是 initSign 后立刻 finishSign（几毫秒），仍按真机回 -26。
+const BIOMETRIC_PROMPT_MIN_MS: i64 = 200;
 /// 内存里那层 AuthKey 缓存，它只是 store 的缓存，满了清掉就回盘上重读。
 const MAX_AUTH_CACHE: usize = MAX_AUTH_KEYS;
 
 fn store_pem(section: &str, key: &str, pem: &str) -> Option<String> {
     let _guard = ASK_STORE_LOCK.lock().ok()?;
-    let mut map = read_ask_store();
-    let entries = section_of(&mut map, section);
-    entries.insert(key.to_string(), serde_json::Value::String(pem.to_string()));
-    if section == AUTH_SECTION && entries.len() > MAX_AUTH_KEYS {
-        // 超上限时压到 3/4，按 key 顺序挤掉一批。
-        let mut victims: Vec<String> = entries
-            .keys()
-            .filter(|k| k.as_str() != key)
-            .take(entries.len() - AUTH_KEYS_KEEP)
-            .cloned()
-            .collect();
-        victims.sort();
-        for victim in victims {
-            entries.remove(&victim);
+    with_store_file_lock(|| {
+        let mut map = read_ask_store();
+        let entries = section_of(&mut map, section);
+        entries.insert(key.to_string(), serde_json::Value::String(pem.to_string()));
+        if section == AUTH_SECTION && entries.len() > MAX_AUTH_KEYS {
+            // 超上限时压到 3/4，按 key 顺序挤掉一批。
+            let mut victims: Vec<String> = entries
+                .keys()
+                .filter(|k| k.as_str() != key)
+                .take(entries.len() - AUTH_KEYS_KEEP)
+                .cloned()
+                .collect();
+            victims.sort();
+            for victim in victims {
+                entries.remove(&victim);
+            }
         }
-    }
-    write_ask_store(&map)
+        write_ask_store(&map)
+    })
 }
 
 fn forget_pem(section: &str, key: &str) {
     let Ok(_guard) = ASK_STORE_LOCK.lock() else {
         return;
     };
-    let mut map = read_ask_store();
-    let removed = section_of(&mut map, section).remove(key).is_some();
-    if removed {
+    with_store_file_lock(|| {
+        let mut map = read_ask_store();
+        let removed = section_of(&mut map, section).remove(key).is_some();
+        if removed {
+            write_ask_store(&map);
+        }
+    });
+}
+
+fn session_store_key(session: i64) -> String {
+    session.to_string()
+}
+
+/// 把一次 initSign 会话落盘（带 TTL），让另一个进程的 finishSign 也能找到。
+fn store_session(session: i64, sign: &SignSession) {
+    let Ok(_guard) = ASK_STORE_LOCK.lock() else {
+        return;
+    };
+    with_store_file_lock(|| {
+        let mut map = read_ask_store();
+        let now = now_millis();
+        let entries = section_of(&mut map, SESSION_SECTION);
+        entries.retain(|_, value| {
+            value
+                .as_str()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|record| record.get("created_ms").and_then(|v| v.as_i64()))
+                .is_some_and(|created| now.saturating_sub(created) <= SESSION_TTL_MS)
+        });
+        let record = serde_json::json!({
+            "uid": sign.uid,
+            "alias": sign.alias,
+            "raw": sign.raw,
+            "created_ms": sign.created_ms,
+        });
+        entries.insert(
+            session_store_key(session),
+            serde_json::Value::String(record.to_string()),
+        );
         write_ask_store(&map);
+    });
+}
+
+/// 从盘上找回会话；过期/没有就返回 None。restore 出来的不再比 caller（跨进程本来就不同）。
+fn restore_session(session: i64) -> Option<SignSession> {
+    let text = read_store_pem(SESSION_SECTION, &session_store_key(session))?;
+    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let uid = record.get("uid")?.as_i64()? as i32;
+    let alias = record.get("alias")?.as_str()?.to_string();
+    let raw = record.get("raw")?.as_str()?.to_string();
+    let created_ms = record.get("created_ms")?.as_i64()?;
+    if now_millis().saturating_sub(created_ms) > SESSION_TTL_MS {
+        return None;
     }
+    Some(SignSession {
+        uid,
+        alias,
+        raw,
+        created: Instant::now(),
+        created_ms,
+    })
+}
+
+fn forget_session(session: i64) {
+    forget_pem(SESSION_SECTION, &session_store_key(session));
 }
 
 /// 「删过了」的墓碑段（落盘，重启也黏着）：`removeAllUidKey` / `removeAuthKey` 之后，
@@ -474,11 +566,13 @@ fn forget_uid_keys(uid: i32) {
     let Ok(_guard) = ASK_STORE_LOCK.lock() else {
         return;
     };
-    let mut map = read_ask_store();
-    section_of(&mut map, ASK_SECTION).remove(&uid.to_string());
-    let prefix = format!("{uid}|");
-    section_of(&mut map, AUTH_SECTION).retain(|key, _| !key.starts_with(&prefix));
-    write_ask_store(&map);
+    with_store_file_lock(|| {
+        let mut map = read_ask_store();
+        section_of(&mut map, ASK_SECTION).remove(&uid.to_string());
+        let prefix = format!("{uid}|");
+        section_of(&mut map, AUTH_SECTION).retain(|key, _| !key.starts_with(&prefix));
+        write_ask_store(&map);
+    });
     for path in legacy_ask_file_paths(uid) {
         let _ = std::fs::remove_file(path);
     }
@@ -661,12 +755,6 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// 会话开始之后有没有发生过生物认证（keystore 那边收到 HAT 时落的盘）。
-fn auth_since(created_ms: i64) -> bool {
-    created_ms > 0
-        && kmr_common::soter_relay::read_last_auth().is_some_and(|last| last >= created_ms)
 }
 
 /// 一台"看起来像真机"的设备号：平台前缀 + 12 字节十六进制。
@@ -903,14 +991,15 @@ pub(crate) fn answerable(code: u32) -> bool {
 /// 这个会话号是不是本进程开的：本进程开的 `initSign`，它对应的 `finishSign` 也必须本地答
 /// （问远程就是 B 端不认识这个句柄，直接回 -204）。
 pub(crate) fn has_session(session: i64) -> bool {
-    state()
+    let in_memory = state()
         .and_then(|state| {
             state.sessions.lock().ok().map(|map| {
                 map.get(&session)
                     .is_some_and(|s| s.created.elapsed() <= SESSION_TTL)
             })
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    in_memory || restore_session(session).is_some()
 }
 
 /// 按号码算一笔应答。认不出来、或少参数就返回 `None`，让上层透给真 HAL。///
@@ -1044,28 +1133,41 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
             let session = call.session?;
             // 先取授权 key、确认拿得到再摘会话（反过来做的话 store 一失败会话就没了、不可重试）。
             // 过期的会话顺手抹掉；调用方对不上的不动它。
-            let peeked = state.sessions.lock().ok()?.get(&session).cloned();
+            let peeked = state
+                .sessions
+                .lock()
+                .ok()?
+                .get(&session)
+                .cloned()
+                .or_else(|| restore_session(session));
             if peeked
                 .as_ref()
                 .is_some_and(|s| s.created.elapsed() > SESSION_TTL)
             {
                 state.sessions.lock().ok()?.remove(&session);
+                forget_session(session);
             }
             let found = peeked
-                .filter(|s| s.is_usable(call.caller_uid))
+                .filter(|s| s.is_usable())
                 .and_then(|s| auth_key(state, s.uid, &s.alias).map(|k| (s, k)));
             match found {
                 Some((s, key)) => {
-                    // 高通真机这张会话得走过生物认证才给签。认证信号由 keystore2 那边投 HAT
-                    // 时落盘，这里比会话开始时刻：会话之后认证过就放行，没认证过才回 -26。
-                    if !is_kinibi() && !auth_since(s.created_ms) {
+                    // 真机 QSEE 只在「刚做过指纹」后给签。检测器补链那轮是 initSign → 弹指纹
+                    // （阻塞到用户按）→ finishSign，会话已经放了一会儿；普通 T12 是 initSign
+                    // 之后立刻 finishSign（几毫秒）。用这段间隔近似「中间做过指纹」：太短回 -26
+                    // （真机无指纹的答案），够长才签，补链才会补出 C4/C6c/C6d/C7/C8/C9/C10-12。
+                    if !is_kinibi()
+                        && now_millis().saturating_sub(s.created_ms) < BIOMETRIC_PROMPT_MIN_MS
+                    {
                         state.sessions.lock().ok()?.remove(&session);
+                        forget_session(session);
                         return Some(Answer::Buffer {
                             code: QCOM_VERIFICATION_FAILED,
                             data: None,
                         });
                     }
                     state.sessions.lock().ok()?.remove(&session);
+                    forget_session(session);
                     let counter = bump_counter(state, s.uid);
                     let document = sign_json(s.uid, &s.raw, counter);
                     let signature = key.sign(&document)?;
@@ -1074,18 +1176,15 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                         data: Some(envelope(&document, &signature)),
                     })
                 }
-                // 本地没这个会话：天玑真机回 -204；高通那个号归托管端（回 -1000），
-                // 所以高通分支仍透传，让上层转出去。
-                None => {
-                    if is_kinibi() {
-                        Some(Answer::Buffer {
-                            code: KINIBI_SESSION_UNKNOWN,
-                            data: None,
-                        })
+                // 本地没这个会话：天玑真机回 -204，高通回 -1000。
+                None => Some(Answer::Buffer {
+                    code: if is_kinibi() {
+                        KINIBI_SESSION_UNKNOWN
                     } else {
-                        None
-                    }
-                }
+                        QCOM_SESSION_UNKNOWN
+                    },
+                    data: None,
+                }),
             }
         }
         // generateAskKeyPair(uid)：高通每次重铸回 0；MTK 已有则回 -5。
@@ -1140,7 +1239,12 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
         // 高通那个接口不给数据（空 buffer、errcode 0），形状要跟真机一致。
         8 => Some(Answer::Buffer {
             code: OK,
-            data: Some(device_id_reply(&device_id())),
+            // 高通真机这个接口回 null（不是空数组）：检查器看到 null 才不发 C5b。
+            data: if platform().device_id_ascii {
+                Some(device_id_reply(&device_id()))
+            } else {
+                None
+            },
         }),
         // hasAskAlready(uid)：本地 ASK 是自签的，答「有」会让应用跳过上报、拿假 ASK 建 AuthKey
         // → 被拒 → 自删重试。
@@ -1169,10 +1273,18 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                 });
             }
             // 挑战原文照存：真机把它写进签名 JSON 的 `raw` 里，我们照做。
-            let raw = call.challenge.as_deref()?.to_string();
+            // 拿不到也不透传：透传会开在真 TA 里，另一个进程的 finishSign 就不认这个号了。
+            let raw = call.challenge.clone().unwrap_or_default();
             let mut next = state.next_session.lock().ok()?;
             *next += 1;
             let session = *next;
+            let entry = SignSession {
+                uid,
+                alias: alias.to_string(),
+                raw,
+                created: Instant::now(),
+                created_ms: now_millis(),
+            };
             {
                 // 未完成的会话不会自己消失（探测机、App 中退、进程被杀），不清就只增不减。
                 // 清了最多让那次签名重来，不会弄错数据。
@@ -1184,18 +1296,10 @@ fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
                         sessions.clear();
                     }
                 }
-                sessions.insert(
-                    session,
-                    SignSession {
-                        uid,
-                        alias: alias.to_string(),
-                        raw,
-                        created: Instant::now(),
-                        created_ms: now_millis(),
-                        caller: call.caller_uid,
-                    },
-                );
+                sessions.insert(session, entry.clone());
             }
+            // 落盘：hook 和软件 TA 是两个进程，finishSign 可能在另一个进程里。
+            store_session(session, &entry);
             Some(Answer::Init {
                 status: OK,
                 session,
@@ -1410,6 +1514,17 @@ struct Platform {
     fp_v: &'static str,
 }
 
+/// 测试口：`/data/misc/ommega/soter_platform` 写 `mtk` / `qcom` 就强制平台，
+/// 用于在骁龙机上验证天玑分支（不加系统属性，删掉文件即恢复按属性判断）。
+fn platform_override() -> Option<bool> {
+    let text = std::fs::read_to_string("/data/misc/ommega/soter_platform").ok()?;
+    match text.trim().to_ascii_lowercase().as_str() {
+        "qcom" | "qualcomm" | "qti" => Some(true),
+        "mtk" | "mediatek" | "kinibi" => Some(false),
+        _ => None,
+    }
+}
+
 fn platform() -> &'static Platform {
     static P: OnceLock<Platform> = OnceLock::new();
     P.get_or_init(|| {
@@ -1418,23 +1533,13 @@ fn platform() -> &'static Platform {
             .to_lowercase();
         let board = prop("ro.board.platform").unwrap_or_default().to_lowercase();
         // 只有明确是高通才走高通那套；天玑、展锐、三星这类认不出来的平台一律按天玑的规则。
-        let qcom = soc.contains("qcom")
-            || soc.contains("qualcomm")
-            || soc.contains("qti")
-            || board.starts_with("qcom");
+        let qcom = platform_override().unwrap_or_else(|| {
+            soc.contains("qcom")
+                || soc.contains("qualcomm")
+                || soc.contains("qti")
+                || board.starts_with("qcom")
+        });
         if qcom {
-            Platform {
-                cpu_prefix: "09000000",
-                device_id_ascii: true,
-                declares_salt: true,
-                salt_len: MTK_SALT_LEN,
-                generate_rotates: false,
-                tee_n: "Kinibi-FFA-A-610a-V008-20240926_141444_120597_6923a",
-                tee_v: "10018",
-                fp_n: "FPC",
-                fp_v: "6516",
-            }
-        } else {
             Platform {
                 cpu_prefix: "00000000",
                 device_id_ascii: false,
@@ -1445,6 +1550,18 @@ fn platform() -> &'static Platform {
                 tee_v: "5",
                 fp_n: "Stargate",
                 fp_v: "1",
+            }
+        } else {
+            Platform {
+                cpu_prefix: "09000000",
+                device_id_ascii: true,
+                declares_salt: true,
+                salt_len: MTK_SALT_LEN,
+                generate_rotates: false,
+                tee_n: "Kinibi-FFA-A-610a-V008-20240926_141444_120597_6923a",
+                tee_v: "10018",
+                fp_n: "FPC",
+                fp_v: "6516",
             }
         }
     })
@@ -1868,21 +1985,20 @@ mod tests {
     }
 
     #[test]
-    fn finish_sign_with_an_unknown_session_falls_through() {
+    fn finish_sign_with_an_unknown_session_answers_the_platform_code() {
         let mut c = call(4, None, None);
         c.session = Some(1);
-        if is_kinibi() {
-            // 天玑真机对不存在的会话直接回 -204。
-            match answer(&c) {
-                Some(Answer::Buffer { code, data }) => {
-                    assert_eq!(code, KINIBI_SESSION_UNKNOWN);
-                    assert!(data.is_none(), "不存在的会话不该带数据");
-                }
-                other => panic!("天玑未知会话期望 -204，拿到 {other:?}"),
-            }
+        let expected = if is_kinibi() {
+            KINIBI_SESSION_UNKNOWN
         } else {
-            // 高通那边这个号归托管端（-1000），本地不能硬回。
-            assert!(answer(&c).is_none());
+            QCOM_SESSION_UNKNOWN
+        };
+        match answer(&c) {
+            Some(Answer::Buffer { code, data }) => {
+                assert_eq!(code, expected);
+                assert!(data.is_none(), "不存在的会话不该带数据");
+            }
+            other => panic!("未知会话期望 {expected}，拿到 {other:?}"),
         }
     }
 

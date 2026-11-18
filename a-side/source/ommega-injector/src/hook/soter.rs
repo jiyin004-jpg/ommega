@@ -861,7 +861,7 @@ fn untokened_starts(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-/// 解出来的参数像不像真的。uid 落在应用号段、alias 可打印、challenge 是十六进制。
+/// 解出来的参数像不像真的。uid 落在应用号段、alias / challenge 可打印。
 fn plausible_untokened(uid: Option<i32>, alias: Option<&str>, challenge: Option<&str>) -> bool {
     if let Some(uid) = uid {
         if !(AID_APP_START..2_000_000).contains(&uid) {
@@ -883,10 +883,12 @@ fn plausible_untokened(uid: Option<i32>, alias: Option<&str>, challenge: Option<
         }
     }
     if let Some(challenge) = challenge {
-        if challenge.is_empty() || challenge.len() > 128 || challenge.len() % 2 != 0 {
+        // challenge 只是宿主转给 TA 的一段原文：真机微信给的是十六进制，检测器会给
+        // 别的可打印串（例如 `sotercheck-chal-...`）。只要不像读歪的二进制就收。
+        if challenge.is_empty() || challenge.len() > 256 {
             return false;
         }
-        if !challenge.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !challenge.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
             return false;
         }
     }
@@ -1411,18 +1413,13 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
         caller_uid: (caller_uid >= 0).then_some(caller_uid),
         data_size: call.data_size,
     };
-    // finishSign 的会话要是本进程开的（init 那笔本地答的），这一笔也必须本地答：
-    // 问远程就是 B 端不认识这个句柄，直接 -204。
-    let local_session = hal_code == 4 && hal_call.session.is_some_and(soter_local::has_session);
-    let answer = if local_session {
-        soter_local::answer(&hal_call)
-    } else {
-        crate::hook::soter_relay::answer(&hal_call)
-    };
+    // hook 只做转发/透传，不在本进程本地答：本地模式一律交给软件 TA（另一个进程里
+    // 统一处理 initSign/finishSign），远程模式交给服务端。这样会话和计数器不会分裂。
+    let answer = crate::hook::soter_relay::answer(&hal_call, false);
     let Some(answer) = answer else {
         // 宿主里文件日志是哑的；答不出来这件事只能顺 RPC 让 daemon 记下来。
         crate::ipc::report_event(format!(
-            "event=soter app answer none code={} hal_code={hal_code} caller_uid={caller_uid} local_session={local_session}",
+            "event=soter app answer none code={} hal_code={hal_code} caller_uid={caller_uid}",
             call.code
         ));
         return None;
@@ -1484,7 +1481,7 @@ fn build_app_answer(pending: &PendingApp) -> Option<OwnedReply> {
 /// `data.ptr.buffer` 指的是第二个返回值的 parcel，所以**调用方得把这块 parcel 留到宿主把
 /// `BC_FREE_BUFFER` 交回来为止** —— 两个返回值是一个整体。
 pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> {
-    let answer = crate::hook::soter_relay::answer(call)?;
+    let answer = crate::hook::soter_relay::answer(call, false)?;
     note_sign_success(call, &answer);
     frame_br_reply(call, answer)
 }

@@ -151,16 +151,29 @@ fn serial() -> Option<String> {
     None
 }
 
+/// 测试口：与 payload 的 `soter_local::platform_override` 同一份文件，写 `mtk`/`qcom`
+/// 就强制平台（骁龙机上验证天玑形状用）。
+fn platform_override() -> Option<bool> {
+    let text = std::fs::read_to_string("/data/misc/ommega/soter_platform").ok()?;
+    match text.trim().to_ascii_lowercase().as_str() {
+        "qcom" | "qualcomm" | "qti" => Some(true),
+        "mtk" | "mediatek" | "kinibi" => Some(false),
+        _ => None,
+    }
+}
+
 /// 平台前缀，跟 payload 的 `soter_local::platform()` 同一套判据：明确是高通才报
 /// `00000000`，其余（天玑、展锐、三星这类认不出来的）一律按天玑的 `09000000`。
 /// 派生号的号头必须和本地兜底那条路一致，不然同一台机器两边报两个号。
 fn platform_prefix() -> &'static str {
     let soc = rsproperties::get_or("ro.soc.manufacturer", String::new()).to_lowercase();
     let board = rsproperties::get_or("ro.board.platform", String::new()).to_lowercase();
-    let qcom = soc.contains("qcom")
-        || soc.contains("qualcomm")
-        || soc.contains("qti")
-        || board.starts_with("qcom");
+    let qcom = platform_override().unwrap_or_else(|| {
+        soc.contains("qcom")
+            || soc.contains("qualcomm")
+            || soc.contains("qti")
+            || board.starts_with("qcom")
+    });
     if qcom {
         QCOM_PREFIX
     } else {

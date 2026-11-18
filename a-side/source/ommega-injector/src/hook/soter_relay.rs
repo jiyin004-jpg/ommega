@@ -15,7 +15,7 @@ use crate::hook::soter_local::{self, Answer};
 /// 这笔 HAL 调用该由谁答。`None` = 我们别答，放它去真 HAL。
 ///
 /// 返回 `None` 时调用方 `intercept_soter_call` 会照老路透传，宿主不会卡住。
-pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
+pub(crate) fn answer(call: &SoterCall, answer_local: bool) -> Option<Answer> {
     if !call.hal {
         return None;
     }
@@ -23,8 +23,15 @@ pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
         Outcome::Code(code) => Some(Answer::Code(code)),
         Outcome::Buffer { code, data } => Some(Answer::Buffer { code, data }),
         Outcome::Init { status, session } => Some(Answer::Init { status, session }),
-        // daemon 说用本地那套：本地也答不了（参数不够之类）就顺势透传。
-        Outcome::Local => soter_local::answer(call),
+        // daemon 说用本地那套：软件 TA 自己答（answer_local=true）；hook（soterserver）
+        // 一律透传给 HAL（也就是软件 TA），本地事务全部落在同一个进程，会话/计数器不分裂。
+        Outcome::Local => {
+            if answer_local {
+                soter_local::answer(call)
+            } else {
+                None
+            }
+        }
         Outcome::Passthrough => None,
     }
 }

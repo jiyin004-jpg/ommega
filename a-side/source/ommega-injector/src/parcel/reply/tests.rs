@@ -191,15 +191,15 @@ fn soter_buffer_return_pads_short_data_to_four() {
 
 #[test]
 fn a_missing_payload_still_comes_back_as_a_present_parcelable() {
-    // 真 HAL 在「没数据但有错误码」时给的是非空 parcelable（长度那两格是 0），
-    // 不是 null 标记 —— 写成 0 标记的话宿主直接当没答过。
+    // parcelable 本身仍是非空（标记=1），里面那格 byte[] 按 null 写（长度 -1）：
+    // 宿主 `createByteArray()` 只有看到 -1 才回 null，看到 0 是长度为 0 的数组。
     let mut reply = build_soter_buffer_reply(-5, None, false).unwrap();
     let bytes = soter_bytes(&mut reply);
     assert_eq!(bytes.len(), 24, "got {bytes:02x?}");
     assert_eq!(le_i32(&bytes, 4), 1, "非空标记");
     assert_eq!(le_i32(&bytes, 8), 16, "总长还是 16");
     assert_eq!(le_i32(&bytes, 12), -5, "错误码");
-    assert_eq!(le_i32(&bytes, 16), 0, "空数据的 byte[] 长度");
+    assert_eq!(le_i32(&bytes, 16), -1, "空数据按 null 数组写（-1）");
     assert_eq!(le_i32(&bytes, 20), 0, "dataLength");
 }
 

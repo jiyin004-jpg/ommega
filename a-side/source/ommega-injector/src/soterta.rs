@@ -234,17 +234,20 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// `int xxx(out SoterBufferReturn)` 那一类：按调用方选形状。
-fn write_bytes_reply(reply: &mut Parcel, data: &[u8], code: i32) -> BinderResult<()> {
+fn write_bytes_reply(reply: &mut Parcel, data: Option<&[u8]>, code: i32) -> BinderResult<()> {
     let parcelable = caller_wants_parcelable();
     let has_return_code = has_return_code();
     log::info!(
         "event=soterta shape parcelable={parcelable} code={code} data={} return_code={has_return_code}",
-        data.len()
+        data.map(|bytes| bytes.len()).unwrap_or(0)
     );
     if !parcelable {
         // 原生形状：返回值 + 原始字节。
         reply.write_i32(code)?;
-        reply.write(&data.to_vec())?;
+        match data {
+            Some(bytes) => reply.write(&bytes.to_vec())?,
+            None => reply.write(&(-1i32))?,
+        }
         return Ok(());
     }
     // AIDL 的 parcelable 只有 `[非空标记][总长][(错误码)][byte[]][dataLength]`：
@@ -254,14 +257,22 @@ fn write_bytes_reply(reply: &mut Parcel, data: &[u8], code: i32) -> BinderResult
         reply.write_i32(code)?;
     }
     reply.write_i32(1)?;
-    let padded = (data.len() + 3) & !3;
+    let padded = data.map(|bytes| (bytes.len() + 3) & !3).unwrap_or(0);
     let header = if has_return_code { 12 } else { 16 };
     reply.write_i32((header + padded) as i32)?;
     if !has_return_code {
         reply.write_i32(code)?;
     }
-    reply.write(&data.to_vec())?;
-    reply.write_i32(data.len() as i32)?;
+    match data {
+        Some(bytes) => {
+            reply.write(&bytes.to_vec())?;
+            reply.write_i32(bytes.len() as i32)?;
+        }
+        None => {
+            reply.write(&(-1i32))?;
+            reply.write_i32(0)?;
+        }
+    }
     Ok(())
 }
 
@@ -349,7 +360,7 @@ impl Remotable for SoterTa {
             EXPORT_ATTK_PUBLIC_KEY => {
                 // ATTK 用我们自己的 ASK 顶：软件 TA 里 ASK 兼 ATTK，公钥就是那一把。
                 let document = soter_local::ask_public_document(uid.unwrap_or(-1));
-                write_bytes_reply(reply, &document, 0)?;
+                write_bytes_reply(reply, Some(document.as_slice()), 0)?;
                 return Ok(());
             }
             _ => {}
@@ -385,7 +396,7 @@ impl Remotable for SoterTa {
         let answer = if local_session {
             soter_local::answer(&call)
         } else {
-            soter_relay::answer(&call)
+            soter_relay::answer(&call, true)
         };
         match answer {
             Some(Answer::Code(code)) => {
@@ -397,7 +408,7 @@ impl Remotable for SoterTa {
                     "event=soterta reply code={code} data={}",
                     data.as_ref().map(|d| d.len()).unwrap_or(0)
                 );
-                write_bytes_reply(reply, data.as_deref().unwrap_or(&[]), code)?;
+                write_bytes_reply(reply, data.as_deref(), code)?;
             }
             Some(Answer::Init { status, session }) => {
                 log::info!("event=soterta reply init status={status} session={session}");
@@ -412,7 +423,7 @@ impl Remotable for SoterTa {
                     code,
                     EXPORT_ASK_PUBLIC_KEY | EXPORT_AUTH_KEY_PUBLIC_KEY | FINISH_SIGN
                 ) {
-                    write_bytes_reply(reply, &[], -4)?;
+                    write_bytes_reply(reply, Some(&[]), -4)?;
                 } else {
                     reply.write_i32(-4)?;
                 }
