@@ -639,7 +639,12 @@ impl KmKeyParameter {
                 }
                 _ => return Err(ValueNotRecognized::DateTime),
             },
-            keymint::Tag::MinSecondsBetweenOps => return Err(ValueNotRecognized::Tag),
+            keymint::Tag::MinSecondsBetweenOps => match value {
+                // 软件 TA 没有这个字段，但真实 KeyMint 接受它；限速在包装层做，
+                // 这里只做参数校验并丢弃，别再让 generateKey 以 -38 挂掉。
+                KeyParameterValue::Integer(_) => None,
+                _ => return Err(ValueNotRecognized::Integer),
+            },
             keymint::Tag::MaxUsesPerBoot => match value {
                 KeyParameterValue::Integer(v) => Some(KeyParam::MaxUsesPerBoot(v as u32)),
                 _ => return Err(ValueNotRecognized::Integer),

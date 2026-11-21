@@ -14,10 +14,12 @@
 
 //! Provide the [`KeyMintDevice`] wrapper for operating directly on a KeyMint device.
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock, RwLock,
 };
+use std::time::Instant;
 
 use crate::android::hardware::security::keymint::IKeyMintOperation::BnKeyMintOperation;
 use crate::android::hardware::security::keymint::{
@@ -564,14 +566,60 @@ pub struct KeyMintWrapper {
     inner: Arc<KeyMintWrapperInner>,
 }
 
+struct RateLimitEntry {
+    min_seconds: u32,
+    last_op: Option<Instant>,
+}
+
 struct KeyMintWrapperInner {
     keymint: Mutex<KeyMintTa>,
+    /// 只在包装层生效的 `MIN_SECONDS_BETWEEN_OPS`：软件 TA 没有这个字段，
+    /// 但真实 KeyMint 会按 key blob 限制操作频率。
+    rate_limits: Mutex<HashMap<Vec<u8>, RateLimitEntry>>,
 }
 
 impl Interface for KeyMintWrapper {}
 
 fn key_parameter_conversion_status(error: ValueNotRecognized) -> Status {
     map_ks_error(Error::Km(key_parameter_conversion_error_code(error)))
+}
+
+fn min_seconds_between_ops(params: &[KeyParameter]) -> Option<u32> {
+    params.iter().find_map(|param| {
+        if param.r#tag != Tag::MIN_SECONDS_BETWEEN_OPS {
+            return None;
+        }
+        match &param.r#value {
+            KeyParameterValue::Integer(value) if *value > 0 => Some(*value as u32),
+            _ => None,
+        }
+    })
+}
+
+/// AOSP 把 `MIN_SECONDS_BETWEEN_OPS` 放在 key 的 authorizations 里一起返回；
+/// 软件 TA 没有这个字段，这里在包装层补回 key characteristics。
+fn add_min_seconds_characteristic(
+    characteristics: &mut [KeyCharacteristics],
+    security_level: i32,
+    min_seconds: u32,
+) {
+    let Some(entry) = characteristics
+        .iter_mut()
+        .find(|entry| entry.securityLevel.0 == security_level)
+    else {
+        return;
+    };
+    if entry
+        .authorizations
+        .iter()
+        .any(|param| param.tag == Tag::MIN_SECONDS_BETWEEN_OPS)
+    {
+        return;
+    }
+    entry.authorizations.push(KeyParameter {
+        tag: Tag::MIN_SECONDS_BETWEEN_OPS,
+        value: KeyParameterValue::Integer(min_seconds as i32),
+    });
 }
 
 fn begin_key_parameters_to_km(
@@ -616,6 +664,24 @@ impl IKeyMintDevice for KeyMintWrapper {
         let version_number = resolve_hardware_profile(self.security_level).version_number;
         let km_params = begin_key_parameters_to_km(params, version_number)
             .map_err(key_parameter_conversion_status)?;
+
+        let now = Instant::now();
+        {
+            let mut limits = self.inner.rate_limits.lock().unwrap();
+            if let Some(entry) = limits.get_mut(key_blob) {
+                // AOSP KeymasterEnforcement::AuthorizeBegin：窗口未过直接 -54；
+                // 通过后立刻记下这次访问时间，不等 TA 的 begin 成功。
+                if let Some(last_op) = entry.last_op {
+                    if now.duration_since(last_op).as_secs() < u64::from(entry.min_seconds) {
+                        return Err(Status::new_service_specific_error(
+                            ErrorCode::KEY_RATE_LIMIT_EXCEEDED.0,
+                            None,
+                        ));
+                    }
+                }
+                entry.last_op = Some(now);
+            }
+        }
 
         let req = PerformOpReq::DeviceBegin(BeginRequest {
             purpose: kmr_wire::keymint::KeyPurpose::try_from(purpose.0)
@@ -699,6 +765,7 @@ impl IKeyMintDevice for KeyMintWrapper {
         crate::android::hardware::security::keymint::KeyCreationResult::KeyCreationResult,
     > {
         let version_number = resolve_hardware_profile(self.security_level).version_number;
+        let min_seconds = min_seconds_between_ops(keyParams);
         let key_parameters = key_parameters_to_km(keyParams, version_number)
             .map_err(key_parameter_conversion_status)?;
         let attestation_key = if let Some(ak) = attestation_key {
@@ -724,7 +791,22 @@ impl IKeyMintDevice for KeyMintWrapper {
             None => return Err(Status::new_service_specific_error(result.error_code, None)),
         };
 
-        key_creation_result_to_aidl(result, version_number)
+        let mut result = key_creation_result_to_aidl(result, version_number)?;
+        if let Some(min_seconds) = min_seconds {
+            self.inner.rate_limits.lock().unwrap().insert(
+                result.keyBlob.clone(),
+                RateLimitEntry {
+                    min_seconds,
+                    last_op: None,
+                },
+            );
+            add_min_seconds_characteristic(
+                &mut result.keyCharacteristics,
+                self.security_level.0,
+                min_seconds,
+            );
+        }
+        Ok(result)
     }
 
     fn importKey(
@@ -739,6 +821,7 @@ impl IKeyMintDevice for KeyMintWrapper {
         crate::android::hardware::security::keymint::KeyCreationResult::KeyCreationResult,
     > {
         let version_number = resolve_hardware_profile(self.security_level).version_number;
+        let min_seconds = min_seconds_between_ops(key_params);
         let key_parameters = key_parameters_to_km(key_params, version_number)
             .map_err(key_parameter_conversion_status)?;
         let attestation_key = if let Some(ak) = attestation_key {
@@ -769,7 +852,22 @@ impl IKeyMintDevice for KeyMintWrapper {
             None => return Err(Status::new_service_specific_error(result.error_code, None)),
         };
 
-        key_creation_result_to_aidl(result, version_number)
+        let mut result = key_creation_result_to_aidl(result, version_number)?;
+        if let Some(min_seconds) = min_seconds {
+            self.inner.rate_limits.lock().unwrap().insert(
+                result.keyBlob.clone(),
+                RateLimitEntry {
+                    min_seconds,
+                    last_op: None,
+                },
+            );
+            add_min_seconds_characteristic(
+                &mut result.keyCharacteristics,
+                self.security_level.0,
+                min_seconds,
+            );
+        }
+        Ok(result)
     }
 
     fn importWrappedKey(
@@ -841,12 +939,20 @@ impl IKeyMintDevice for KeyMintWrapper {
     }
 
     fn deleteKey(&self, key_blob: &[u8]) -> rsbinder::status::Result<()> {
-        self.delete_Key(key_blob).map_err(map_ks_error)
+        let result = self.delete_Key(key_blob).map_err(map_ks_error);
+        if result.is_ok() {
+            self.inner.rate_limits.lock().unwrap().remove(key_blob);
+        }
+        result
     }
 
     fn deleteAllKeys(&self) -> rsbinder::status::Result<()> {
         let req = PerformOpReq::DeviceDeleteAllKeys(DeleteAllKeysRequest {});
-        self.process_status_only(req).map_err(map_ks_error)
+        let result = self.process_status_only(req).map_err(map_ks_error);
+        if result.is_ok() {
+            self.inner.rate_limits.lock().unwrap().clear();
+        }
+        result
     }
 
     fn destroyAttestationIds(&self) -> rsbinder::status::Result<()> {
@@ -911,16 +1017,38 @@ impl IKeyMintDevice for KeyMintWrapper {
         };
 
         let version_number = resolve_hardware_profile(self.security_level).version_number;
-        result.iter().map(|kc| {
-            let params = key_params_to_aidl(&kc.authorizations, version_number)
-                .map_err(|_| Error::Km(ErrorCode::INVALID_ARGUMENT))
-                .map_err(map_ks_error)?;
+        let min_seconds = self
+            .inner
+            .rate_limits
+            .lock()
+            .unwrap()
+            .get(key_blob)
+            .map(|entry| entry.min_seconds);
+        let mut characteristics: Vec<
+            crate::android::hardware::security::keymint::KeyCharacteristics::KeyCharacteristics,
+        > = result
+            .iter()
+            .map(|kc| {
+                let params = key_params_to_aidl(&kc.authorizations, version_number)
+                    .map_err(|_| Error::Km(ErrorCode::INVALID_ARGUMENT))
+                    .map_err(map_ks_error)?;
 
-            Ok(crate::android::hardware::security::keymint::KeyCharacteristics::KeyCharacteristics {
-                authorizations: params,
-                securityLevel: SecurityLevel(kc.security_level as i32),
+                Ok(
+                    crate::android::hardware::security::keymint::KeyCharacteristics::KeyCharacteristics {
+                        authorizations: params,
+                        securityLevel: SecurityLevel(kc.security_level as i32),
+                    },
+                )
             })
-        }).collect()
+            .collect::<rsbinder::status::Result<Vec<_>>>()?;
+        if let Some(min_seconds) = min_seconds {
+            add_min_seconds_characteristic(
+                &mut characteristics,
+                self.security_level.0,
+                min_seconds,
+            );
+        }
+        Ok(characteristics)
     }
 
     fn getRootOfTrustChallenge(&self) -> rsbinder::status::Result<[u8; 16]> {
@@ -1620,6 +1748,7 @@ fn shared_keymint_wrapper_inner(security_level: SecurityLevel) -> Result<Arc<Key
     once_lock_get_or_try_init(wrapper, || {
         Ok(Arc::new(KeyMintWrapperInner {
             keymint: Mutex::new(init_keymint_ta(security_level, &snapshot)?),
+            rate_limits: Mutex::new(HashMap::new()),
         }))
     })
     .map(Arc::clone)
