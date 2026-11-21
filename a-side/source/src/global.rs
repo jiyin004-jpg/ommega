@@ -136,9 +136,46 @@ pub(crate) const BOOT_DONE_PATH: &str = "/data/misc/keystore/ommega/boot_done";
 /// 开机是否已经完成：标记在，或者属性已经看到 1。
 ///
 /// 以标记为主：属性在 payload 里不一定读得到（静态链接，读属性要 exec resetprop）。
+///
+/// 但标记得是本次开机落下的。正常情况下 `post-fs-data` 每次都先删一遍；没删掉就说明
+/// 这次开机没有按标准流程加载模块（手动解压、post-fs-data 被跳），那份是上一次的残留。
+/// 拿它的 mtime 对一下开机时长：比开机时刻还早就当它不存在，否则会提前重放
+/// earlyBootEnded，把整段早期启动的 EARLY_BOOT_ONLY 限制白白放开。
 pub(crate) fn boot_done_present() -> bool {
-    boot_completed() || std::path::Path::new(BOOT_DONE_PATH).exists()
+    if boot_completed() {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(BOOT_DONE_PATH) else {
+        return false;
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok());
+    let (Some(age), Some(uptime)) = (age, boot_uptime()) else {
+        // 拿不到开机时长就算了（总比不认标记强）。
+        return true;
+    };
+    if age.as_secs() > uptime.as_secs() + BOOT_DONE_SLACK_SECS {
+        log::warn!(
+            "ignoring a boot_done left by a previous boot (age {}s > uptime {}s)",
+            age.as_secs(),
+            uptime.as_secs()
+        );
+        return false;
+    }
+    true
 }
+
+/// `/proc/uptime` 的第一列（秒）。
+fn boot_uptime() -> Option<std::time::Duration> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+    Some(std::time::Duration::from_secs(secs as u64))
+}
+
+/// 标记比开机时刻早多少秒还算“本次开机”。留一点余量给开机早期的那几秒。
+const BOOT_DONE_SLACK_SECS: u64 = 5;
 
 pub fn await_boot_completed() {
     let _wp = wd::watch_millis("await_boot_completed", 300_000);
