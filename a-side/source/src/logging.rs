@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use log::LevelFilter;
 
-const DEFAULT_LOG_PATH: &str = "/data/misc/ommega/logs/keymint.log";
+const DEFAULT_LOG_PATH: &str = "/data/misc/keystore/ommega/logs/keymint.log";
 const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
 /// 开关多久看一次。面板改完开关，下一笔日志最迟这么久之后就按新值走。
 const SWITCH_TICK: Duration = Duration::from_secs(5);

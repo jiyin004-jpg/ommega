@@ -4,7 +4,7 @@
 //! `fexecve`，进程名换成名字表里挑好的系统 HAL 名。这样注入器哪怕只跑半秒，
 //! `ps` 里也不会出现 `/data/adb/modules/ommega/libs/arm64-v8a/ommega-inject`。
 //!
-//! 名字表由 keymint 守护开机时生成（`/data/misc/ommega/conf/stealth.names`），
+//! 名字表由 keymint 守护开机时生成（`/data/misc/keystore/ommega/conf/stealth.names`），
 //! 这里只读不写 —— 注入器可能同时有好几个在跑，别去抢那个文件。
 //!
 //! 失败静默降级：藏不住可以，注入不了不行。
@@ -13,7 +13,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 
-const NAMES_FILE: &str = "/data/misc/ommega/conf/stealth.names";
+const NAMES_FILE: &str = "/data/misc/keystore/ommega/conf/stealth.names";
 
 fn name_for(role: &str) -> Option<String> {
     let text = fs::read_to_string(NAMES_FILE).ok()?;

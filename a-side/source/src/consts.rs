@@ -23,7 +23,7 @@ pub const RPC_PEER_STATE: &str = "/data/misc/keystore/ommega/rpc.peers";
 
 /// 远端链里声明的设备身份落盘到这个文件，root 侧 `daemon` 读走并用 resetprop 对齐本机。
 /// 文件写在 keystore 状态目录（0700 keystore）。
-pub const REMOTE_IDENTITY_STATE: &str = "/data/misc/ommega/remote_identity";
+pub const REMOTE_IDENTITY_STATE: &str = "/data/misc/keystore/ommega/remote_identity";
 
 /// Second RPC rendezvous point, on the abstract unix namespace.
 ///

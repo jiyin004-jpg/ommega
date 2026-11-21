@@ -14,6 +14,7 @@ pub mod ipc;
 pub mod logging;
 pub mod parcel;
 pub mod soterta;
+pub mod state;
 pub mod sys;
 pub mod tracker;
 pub mod utils;
@@ -93,10 +94,10 @@ fn in_keystore2_host() -> bool {
         .unwrap_or(false)
 }
 
-/// 进程内 KeyMint 的开关：默认开，`/data/misc/ommega/inproc` 写 `0` 才关，回退到
+/// 进程内 KeyMint 的开关：默认开，`/data/misc/keystore/ommega/inproc` 写 `0` 才关，回退到
 /// 独立 HAL 进程走 RPC 的旧路径。
 fn inproc_keymint_enabled() -> bool {
-    match std::fs::read_to_string("/data/misc/ommega/inproc") {
+    match std::fs::read_to_string("/data/misc/keystore/ommega/inproc") {
         Ok(text) => text.trim() != "0",
         Err(_) => true,
     }
@@ -542,7 +543,7 @@ fn install_payload_panic_hook() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/data/misc/ommega/logs/panic.log")
+                .open("/data/misc/keystore/ommega/logs/panic.log")
             {
                 use std::io::Write;
                 let _ = writeln!(f, "[{}] {location}: {msg}", std::process::id());

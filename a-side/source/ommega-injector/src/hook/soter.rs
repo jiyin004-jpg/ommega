@@ -985,12 +985,12 @@ pub(crate) fn interceptable(call: &SoterCall) -> bool {
 // 比抢入站事务自己拼 BC_REPLY 安全（后者要跟 transaction_stack 与 BC_FREE_BUFFER 对账）。
 
 /// 面板/手工留的开关：`1` 强制接、`0` 强制不接。文件不在就是自动判。
-const APP_SERVE_SWITCH: &str = "/data/misc/ommega/soter_app_serve";
+const APP_SERVE_SWITCH: &str = "/data/misc/keystore/ommega/soter_app_serve";
 
 /// root 侧（`daemon-injector` 的 `sync_soter_host_state`）写下的宿主体检结论：
 /// `stub` = 宿主不发 HAL 请求，`real` = 正常宿主。这件事得由能跑 `pm path` 的 root 侧做
 /// （进程里按 `/proc/self/maps` 猜 APK 会猜错）。
-const HOST_STATE: &str = "/data/misc/ommega/soter_host_state";
+const HOST_STATE: &str = "/data/misc/keystore/ommega/soter_host_state";
 
 /// 真看见宿主回 -200 之后也当它是壳（root 侧那份没写出来时的退路）。
 static HOST_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1030,9 +1030,10 @@ fn switch_state_text(text: &str) -> Option<bool> {
     }
 }
 
-/// 读一个开关文件。
+/// 读一个开关文件。app 域进不去数据根，`crate::state` 会替它走 RPC。
 fn switch_state(path: &str) -> Option<bool> {
-    switch_state_text(&std::fs::read_to_string(path).ok()?)
+    let name = std::path::Path::new(path).file_name()?.to_string_lossy().into_owned();
+    switch_state_text(&crate::state::read(&name)?)
 }
 
 /// `manual_switch` 的进程内缓存：开关只读一次。
@@ -1490,10 +1491,10 @@ pub(crate) fn build_br_reply(call: &SoterCall) -> Option<(Vec<u8>, OwnedReply)> 
 }
 
 /// 「这台机器的 SOTER 能签」的记录文件。daemon 会预先建好、改成 0666，宿主侧只追加一行。
-const SIGN_OK_PATH: &str = "/data/misc/ommega/soter_ok";
+const SIGN_OK_PATH: &str = "/data/misc/keystore/ommega/soter_ok";
 
 /// 签名成功就落一条记录，面板据此显示「SOTER 可用」，重启后不用等新调用。
-/// 哪一层答的都算。只写本地文件：不碰网络、不碰 TEE、不阻塞，写失败就算了。
+/// 哪一层答的都算。写不进去（app 域自己写不了这份文件）就走 daemon 代写。
 fn note_sign_success(call: &SoterCall, answer: &Answer) {
     // 只认真正出签名的那两笔（4 = finishSign，11 = init_sign）。
     if call.code != 4 && call.code != 11 {
@@ -1507,27 +1508,28 @@ fn note_sign_success(call: &SoterCall, answer: &Answer) {
     if code != 0 {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(SIGN_OK_PATH)
-    else {
-        return;
-    };
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let _ = std::io::Write::write_all(
-        &mut file,
-        format!(
-            "{epoch}\t{}\t{}\t{}\n",
-            call.op,
-            call.uid.unwrap_or(0),
-            call.alias.as_deref().unwrap_or("")
-        )
-        .as_bytes(),
+    let line = format!(
+        "{epoch}\t{}\t{}\t{}\n",
+        call.op,
+        call.uid.unwrap_or(0),
+        call.alias.as_deref().unwrap_or("")
     );
+    // 本地能追加就追加（daemon / 软件 TA 那几家），写不进去就整份读回来接上再交给 daemon 写。
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(SIGN_OK_PATH)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+        return;
+    }
+    let mut text = crate::state::read("soter_ok").unwrap_or_default();
+    text.push_str(&line);
+    crate::state::write("soter_ok", &text);
 }
 
 /// Frame an already resolved answer without contacting the daemon or local key state.

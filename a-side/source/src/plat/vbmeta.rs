@@ -684,9 +684,9 @@ fn find_bootloader_digest(text: &str) -> Option<String> {
 
 /// 归一后的 boot 补丁值落盘位置（daemon 写、keymint 读）。
 ///
-/// 放在 `/data/misc/ommega`：keystore 域读不了 `/data/adb`，这里是 TA 自己的目录。
+/// 放在 `/data/misc/keystore/ommega`：keystore 域读不了 `/data/adb`，这里是 TA 自己的目录。
 /// 伪装与真值的优先级只在 daemon 里判一次并落进这个文件，出链只认它。
-const PATCH_STATE_PATH: &str = "/data/misc/ommega/patch.state";
+const PATCH_STATE_PATH: &str = "/data/misc/keystore/ommega/patch.state";
 
 /// 读 daemon 算好的 boot 补丁值。
 fn read_boot_patchlevel_state() -> Option<String> {

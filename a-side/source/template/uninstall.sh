@@ -4,16 +4,16 @@
 # Runs automatically when the module is removed via a root manager
 # (KernelSU / Magisk / APatch). Removes every runtime artifact the A-side
 # creates so an uninstall leaves no residue: daemon processes, the whole
-# /data/misc/ommega tree, the key material and Keymaster DB that stay in
+# /data/misc/keystore/ommega tree, the key material and Keymaster DB that stay in
 # /data/misc/keystore/ommega, A-side files under the shared
 # /data/adb/ommega state dir, and WebUI temp files.
 
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
 RUN_DIR=$STATE_DIR/run
-OMMEGA_DIR=/data/misc/ommega
+OMMEGA_DIR=/data/misc/keystore/ommega
 # 密钥材料（keybox）、Keymaster 数据库、RPC socket 还留在 keystore 目录里 ——
-# 数据根搬到 /data/misc/ommega 之后，这里只剩这几样。
+# 数据根搬到 /data/misc/keystore/ommega 之后，这里只剩这几样。
 KS_DIR=/data/misc/keystore/ommega
 
 # ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ pkill -9 -f "$MODDIR/soterta.sh" 2>/dev/null
 pkill -9 -f "$MODDIR/kmod-loader.sh" 2>/dev/null
 # 自举之后 keymint / 软件 TA 的路径和名字都换过了，上面那些 pkill 一个都匹配不上，
 # 得按名字表（伪装路径）+「exe 指向 memfd」再清一遍，否则卸了模块进程还在跑。
-for _n in $(awk -F= '{print $2}' /data/misc/ommega/conf/stealth.names 2>/dev/null); do
+for _n in $(awk -F= '{print $2}' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null); do
   for _d in /proc/[0-9]*; do
     [ -r "$_d/cmdline" ] || continue
     _c=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null)
@@ -133,7 +133,7 @@ rmdir "$KS_DIR" 2>/dev/null
 #    /data/adb/ommega is shared with the B-side module (ommega-b), so we
 #    only touch A-side-owned entries and leave relay/relay.conf/logs intact.
 # ---------------------------------------------------------------------------
-rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/ommega
+rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/keystore/ommega
 rm -f "$STATE_DIR/keymint"             # hot-update binary
 rm -f "$STATE_DIR/ommega-inject"       # hot-update binary
 rm -f "$STATE_DIR/injector"            # legacy hot-update binary

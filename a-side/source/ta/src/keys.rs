@@ -1398,8 +1398,8 @@ fn boot_state_rank(state: keymint::VerifiedBootState) -> i32 {
 /// 读 `remote_identity` 的文本内容并缓存 5 秒：每笔本地铸证都要读它对齐 RootOfTrust，
 /// 文件仅一百多字节；5 秒已能挡掉绝大多数重复读，又能跟上 B 侧的 boot 状态变化。
 fn remote_identity_text() -> Option<String> {
-    // 单一数据根：daemon 与 TA 都读写 /data/misc/ommega。
-    const PATH: &str = "/data/misc/ommega/remote_identity";
+    // 单一数据根：daemon 与 TA 都读写 /data/misc/keystore/ommega。
+    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
         std::sync::OnceLock::new();
     const TTL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1421,7 +1421,7 @@ fn remote_identity_text() -> Option<String> {
 /// 把远端叶子里的设备身份写到 state 文件，内容没变就不重写。
 /// TA 只写文件，resetprop 和重启 zygote 由 root 侧 daemon 负责。
 fn persist_remote_identity(leaf_der: &[u8]) {
-    const PATH: &str = "/data/misc/ommega/remote_identity";
+    const PATH: &str = "/data/misc/keystore/ommega/remote_identity";
     let Some(identity) = crate::cert::parse_remote_device_identity(leaf_der) else {
         return;
     };

@@ -27,7 +27,7 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
 /// 名字表：`role=路径`，一行一个。
-const NAMES_FILE: &str = "/data/misc/ommega/conf/stealth.names";
+const NAMES_FILE: &str = "/data/misc/keystore/ommega/conf/stealth.names";
 /// daemon 模式标记。名字故意取得通用 —— root 看 environ 时 `OMMEGA_*` 那种前缀
 /// 等于自报家门。
 const DAEMON_ENV: &str = "DAEMON_MODE";
@@ -130,7 +130,7 @@ fn note(msg: &str) {
         if let Ok(mut file) = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/data/misc/ommega/logs/stealth.log")
+            .open("/data/misc/keystore/ommega/logs/stealth.log")
         {
             let _ = writeln!(file, "{msg}");
         }

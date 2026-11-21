@@ -198,7 +198,7 @@ fi
 # 跟着消失；漏挂或内容不合法时 system_server 读 /odm/etc/permissions 直接失败，
 # 设备开不了机（2026-10-28 在 peridot 上实测过）。
 STRONGBOX_HIDDEN=false
-CLIENTA_CONF=/data/misc/ommega/config
+CLIENTA_CONF=/data/misc/keystore/ommega/config
 # 装的时候判断一次，把结论写成面板配置里的初值，之后就只由面板改：
 #
 #   - 系统声明了 StrongBox、模块也带着 keybox_strongbox.xml（包内必带）→ 我们服务得了，
@@ -268,7 +268,7 @@ RUN_DIR=$CONFIG_DIR/run
 DB_DIR=$CONFIG_DIR/db
 # 只建真用得上的：conf（app 域读的副本）、run（pid/lock）。
 # db 和 logs 不再预建：A 端早就没有写 sessions.db 了，模块目录下这份 logs 也搬去了
-# /data/misc/ommega/logs（见 service.sh 里那段注释），以前装完就留两个空目录在那儿。
+# /data/misc/keystore/ommega/logs（见 service.sh 里那段注释），以前装完就留两个空目录在那儿。
 mkdir -p "$CONFIG_DIR" "$CONF_DIR" "$RUN_DIR"
 # 只支持新路径，不做旧布局搬运：运行文件在模块 `libs/<abi>/`，状态在 conf/run/db/logs。
 for f in props.conf injector.payload pathmask.state pathmask.owned \
@@ -290,14 +290,14 @@ rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.a
 rm -f "$CONFIG_DIR/injector" "$CONFIG_DIR/keymint" "$CONFIG_DIR/ommega-inject" 2>/dev/null
 
 if [ ! -e "$CONFIG_DIR/ommegadata" ] && [ ! -L "$CONFIG_DIR/ommegadata" ]; then
-  ln -s /data/misc/ommega "$CONFIG_DIR/ommegadata"
+  ln -s /data/misc/keystore/ommega "$CONFIG_DIR/ommegadata"
 fi
 
 # 数据根搬家：以前 keystore 域和 app 域各存一份（config、remote_identity、日志、
-# soter_*、uid_packages、foreground…），现在统一到 /data/misc/ommega（system_data_file，
+# soter_*、uid_packages、foreground…），现在统一到 /data/misc/keystore/ommega（system_data_file，
 # 两边都读得到）。这里把旧位置的数据搬过来一次，keystore 目录只留密钥材料和 rpc.sock。
 KS_ROOT=/data/misc/keystore/ommega
-DATA_ROOT=/data/misc/ommega
+DATA_ROOT=/data/misc/keystore/ommega
 mkdir -p "$DATA_ROOT/logs" 2>/dev/null
 # 目录 0771：owner（keystore）可读写建文件，group/other 留 x，app 域能按已知路径
 # 进目录读文件（列不了目录，也不需要列）。
@@ -356,7 +356,7 @@ chmod 0644 "$DATA_ROOT/config" 2>/dev/null
 
 # injector.toml 必须 0644：注入到 SOTER 宿主（uid 1000 / system_app）的 payload 要读它。
 # 它是 0600 keystore:keystore 的时候，keystore2 那边读得到、SOTER 宿主读不到，
-# 普通认证就不出链（以前靠 /data/misc/ommega 那份 fallback 副本搭着，那份副本已经不存在了）。
+# 普通认证就不出链（以前靠 /data/misc/keystore/ommega 那份 fallback 副本搭着，那份副本已经不存在了）。
 if [ -f "$DATA_ROOT/injector.toml" ]; then
   chmod 0644 "$DATA_ROOT/injector.toml" 2>/dev/null
 fi

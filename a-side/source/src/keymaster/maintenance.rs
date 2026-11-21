@@ -543,4 +543,39 @@ impl IMaintenanceService for MaintenanceManager {
         let _wp = wd::watch("IMaintenanceService::writeSoterStore");
         Ok(crate::soter_store::write(text))
     }
+
+    /// 料库那半边的读。写走 `writeSoterStore`、读走这里，两边必须成对：调用方读不到就会
+    /// 把料库当成空的，接着一次读-改-写就把里面已有的 ASK / AuthKey 整段铲掉。
+    fn readSoterStore(&self) -> rsbinder::status::Result<Option<String>> {
+        let _wp = wd::watch("IMaintenanceService::readSoterStore");
+        Ok(crate::soter_store::read())
+    }
+
+    /// 数据根里其它小件的按名读。app 域的宿主进不去那个 0770 目录，开关和状态只能这么读。
+    fn readState(&self, name: &str) -> rsbinder::status::Result<Option<String>> {
+        let _wp = wd::watch("IMaintenanceService::readState");
+        Ok(crate::soter_store::read_named(name))
+    }
+
+    /// 按名写数据根里的小件（文件名白名单式的单层名字，越界的在 `named_path` 那里就拒了）。
+    fn writeState(&self, name: &str, data: &str) -> rsbinder::status::Result<bool> {
+        let _wp = wd::watch("IMaintenanceService::writeState");
+        // 配置和身份材料不接 app 域的写：那几份是面板和 TA 的活，放开了会让宿主
+        // 一笔调用就能改掉远程开关或身份簿。
+        for reserved in [
+            "config",
+            "config.toml",
+            "injector.toml",
+            "remote_identity",
+            "keybox_tee.xml",
+            "keybox_strongbox.xml",
+            "soter_attk.pem",
+        ] {
+            if name == reserved {
+                log::warn!("writeState: refusing {name} from an injected app-domain caller");
+                return Ok(false);
+            }
+        }
+        Ok(crate::soter_store::write_named(name, data))
+    }
 }

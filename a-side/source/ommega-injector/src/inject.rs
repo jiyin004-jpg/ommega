@@ -109,9 +109,9 @@ fn persist_remote_payload_state(pid: Pid, payload_identifier: &str) -> Result<()
     Ok(())
 }
 
-/// KeyMint 服务是不是跑在 keystore2 进程里（`/data/misc/ommega/inproc`，默认开）。
+/// KeyMint 服务是不是跑在 keystore2 进程里（`/data/misc/keystore/ommega/inproc`，默认开）。
 fn inproc_mode() -> bool {
-    match std::fs::read_to_string("/data/misc/ommega/inproc") {
+    match std::fs::read_to_string("/data/misc/keystore/ommega/inproc") {
         Ok(text) => text.trim() != "0",
         Err(_) => true,
     }

@@ -9,7 +9,7 @@
 #   soterta.sh             converge 一次（service.sh 每轮调）
 #   soterta.sh status      打一行状态
 #
-# 开关在 /data/misc/ommega/config 的 `soter_inject`（1/0），WebUI 写。
+# 开关在 /data/misc/keystore/ommega/config 的 `soter_inject`（1/0），WebUI 写。
 # 关掉就是「原厂 HAL 回来」：杀我们的守护、ctl.start vendor.soter。
 #
 # 为什么这里只顶服务名、不注入：HAL 侧由本脚本接管服务名；App 面向的
@@ -31,13 +31,13 @@ CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-CONF=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
+CONF=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
 PIDFILE=$RUN_DIR/soterta.pid
 KICKED_FILE=$RUN_DIR/soterta.host.kicked
 # 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。
 TAKEOVER_PID=$RUN_DIR/soterta.takeover.pid
 # 日志统一写 daemon.log（跟 service.sh / daemon-injector / adbr 共用一份）。
-LOG=/data/misc/ommega/logs/daemon.log
+LOG=/data/misc/keystore/ommega/logs/daemon.log
 # 解析结果缓存 + 静默开关。service.sh 的 keep-alive 和 daemon-injector 的
 # `soterta.sh hidl` 都是 5 秒一轮、每轮新起一个进程，resolve_hal 无条件 log 会把
 # 这个文件刷满「resolved hal=...」（实测每 2~5 秒一条），真正有用的事件全被埋掉。
@@ -314,7 +314,7 @@ daemon_pid() {
 
 # 伪装名字（daemon 开机时挑好写进名字表）。读不到就返回 1。
 stealth_name() {
-  sed -n 's/^soterta=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1
+  sed -n 's/^soterta=//p' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null | head -n 1
 }
 
 # 残留的守护：按 `--soterta-serve` 认人，不按名字。

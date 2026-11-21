@@ -21,15 +21,15 @@ const STATE_DIR: &str = "/data/adb/ommega";
 const RUN_DIR: &str = "/data/adb/ommega/run";
 const MODDIR: &str = "/data/adb/modules/ommega";
 
-const CONF_PATH: &str = "/data/misc/ommega/config";
-const LOG_FILE: &str = "/data/misc/ommega/logs/daemon.log";
+const CONF_PATH: &str = "/data/misc/keystore/ommega/config";
+const LOG_FILE: &str = "/data/misc/keystore/ommega/logs/daemon.log";
 /// 系统自己的 uid→包名 表，只有 root（本守护）读得到。
 const PACKAGES_LIST: &str = "/data/system/packages.list";
 /// 抄给 keystore 域看的 AAID 表：`packages.list` 是 `0640 system:package_info` +
 /// `packages_list_file`，DAC 与 SELinux 两头都拦，只有本守护（root）读得到。
-const AAID_TABLE: &str = "/data/misc/ommega/aaid_table";
-const REMOTE_IDENTITY: &str = "/data/misc/ommega/remote_identity";
-const CONFIG_TOML: &str = "/data/misc/ommega/config.toml";
+const AAID_TABLE: &str = "/data/misc/keystore/ommega/aaid_table";
+const REMOTE_IDENTITY: &str = "/data/misc/keystore/ommega/remote_identity";
+const CONFIG_TOML: &str = "/data/misc/keystore/ommega/config.toml";
 const REMOTE_IDENTITY_APPLIED: &str = "/data/adb/ommega/conf/remote_identity.applied";
 const REMOTE_IDENTITY_UPDATED: &str = "/data/adb/ommega/conf/remote_identity.updated";
 const PROPS_CONF: &str = "/data/adb/ommega/conf/props.conf";
@@ -185,19 +185,19 @@ pub fn run(extra: Vec<String>) -> ! {
 // ---------------------------------------------------------------------------
 
 /// 进程内服务的「活着」凭据：payload 每 30 秒刷一次，带 pid / 时间戳 / RPC 是否已绑。
-const HEARTBEAT_PATH: &str = "/data/misc/ommega/inproc.heartbeat";
+const HEARTBEAT_PATH: &str = "/data/misc/keystore/ommega/inproc.heartbeat";
 /// payload 起服务失败时落的标记（理由写在里面）。存在即说明这台机器上进程内那条路
 /// 跑不了，不用等心跳超时，直接拉独立 HAL。
-const INPROC_FAILED_PATH: &str = "/data/misc/ommega/inproc.failed";
+const INPROC_FAILED_PATH: &str = "/data/misc/keystore/ommega/inproc.failed";
 /// 开机之后这么长时间内不算「没起来」——keystore2 注入 + 起服务本来就慢一点。
 const INPROC_GRACE: Duration = Duration::from_secs(90);
 /// 心跳超过这么久没刷就当作进程内已经不在了。
 const HEARTBEAT_TTL: u64 = 90;
 
-/// KeyMint 主体是不是跑在 keystore2 里（`/data/misc/ommega/inproc`，默认开）。
+/// KeyMint 主体是不是跑在 keystore2 里（`/data/misc/keystore/ommega/inproc`，默认开）。
 /// 写 `0` 就改用独立的 HAL 进程。
 fn inproc_keymint_enabled() -> bool {
-    match fs::read_to_string("/data/misc/ommega/inproc") {
+    match fs::read_to_string("/data/misc/keystore/ommega/inproc") {
         Ok(text) => text.trim() != "0",
         Err(_) => true,
     }
@@ -1161,10 +1161,10 @@ fn props_conf_explicit_boot_patch() -> Option<String> {
         .find_map(|key| props_conf_value(key))
 }
 
-/// 把最终值告诉 keymint：`/data/misc/ommega/patch.state`。
+/// 把最终值告诉 keymint：`/data/misc/keystore/ommega/patch.state`。
 fn write_patch_state(value: &str, source: &str) {
     let body = format!("boot_patchlevel={value}\nsource={source}\n");
-    let path = "/data/misc/ommega/patch.state";
+    let path = "/data/misc/keystore/ommega/patch.state";
     if fs::read_to_string(path).ok().as_deref() == Some(body.as_str()) {
         return;
     }

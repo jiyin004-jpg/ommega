@@ -1,11 +1,11 @@
 MODDIR=${0%/*}
-TARGET_DIR=/data/misc/ommega
+TARGET_DIR=/data/misc/keystore/ommega
 LOG_DIR=$TARGET_DIR/logs
 LOG_FILE=$LOG_DIR/daemon.log
 mkdir -p "$LOG_DIR" 2>/dev/null
 # app 域（SOTER 宿主 uid 1000）进不去 keystore 那个 0770 目录，payload 的日志
 # 得有个它写得动的位置：权限开到 system 组。
-APP_LOG_DIR=/data/misc/ommega/logs
+APP_LOG_DIR=/data/misc/keystore/ommega/logs
 # keybox 跟面板（webroot）写的是同一份，都在数据根。以前放 keystore 目录，面板没有
 # 那里的写权限，导致面板里换 keybox 永远不生效。旧位置那份第一次开机时搬过来。
 TARGET_KEYBOX=$TARGET_DIR/keybox_tee.xml
@@ -23,7 +23,7 @@ DB_DIR=$STATE_DIR/db
 rm -f "$TARGET_DIR/boot_done" 2>/dev/null
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 
-# keystore 域要读 /data/misc/ommega，规则得在 keystore2 起来之前就在内核里。
+# keystore 域要读 /data/misc/keystore/ommega，规则得在 keystore2 起来之前就在内核里。
 # 这里是能抢在 keystore2 之前跑的最早时机，所以同步应用（带超时）。
 #
 # 各家管理器的重放行为不一样：KernelSU 系开机根本不重放 sepolicy.rule，Magisk 会自己
@@ -34,7 +34,7 @@ rm -f "$TARGET_DIR/boot_done" 2>/dev/null
 # 以前落在 /data/local/tmp —— 那是 shell 的公共目录，不该有我们常驻的文件，卸载也清不干净。
 # 之前它静默失败，avc 一直在刷，但没有任何地方能看到到底跑没跑、失败在哪、用的是哪个工具。
 if [ -f "$MODDIR/sepolicy.rule" ]; then
-  _apply_log="${DATA_ROOT:-/data/misc/ommega}/logs/sepolicy-apply.log"
+  _apply_log="${DATA_ROOT:-/data/misc/keystore/ommega}/logs/sepolicy-apply.log"
   : > "$_apply_log" 2>/dev/null
   [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
   if command -v ommega_apply_sepolicy >/dev/null 2>&1; then
@@ -92,12 +92,12 @@ resetprop -p persist.logd.size.system ""
 resetprop -p persist.logd.size.main ""
 # boot 锁定状态：走远程时证书是 B 端真机出的，RootOfTrust 里写的是 B 的说法。
 # 本机属性必须跟它一致，否则 A09（cert locked/state vs prop locked/green）一查就中。
-# 远程身份的落盘由 TA 写（/data/misc/ommega/remote_identity），这里读它。
+# 远程身份的落盘由 TA 写（/data/misc/keystore/ommega/remote_identity），这里读它。
 #
 # 只在 remote 开启时才跟：本地模式下没有 RKP 路径，证书说的是本机自己
 # （locked / green），属性也得说本机；否则切回本地后还会被上次远程留在
 # remote_identity 里的 false/2 污染。
-_OMMEGA_RI=/data/misc/ommega/remote_identity
+_OMMEGA_RI=/data/misc/keystore/ommega/remote_identity
 _ri_remote=$(grep -iE '^[[:space:]]*remote[[:space:]]*:' "$TARGET_CONF" 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
 case "$_ri_remote" in
   1|true|yes|on) _ri_apply=1 ;;
@@ -141,7 +141,7 @@ resetprop ro.secureboot.devicelock 1
 # 开机时就把 B 真机声明的身份对齐到本机（文件由 TA 在远程出链时写入）：
 # 链是真机出的，本机属性必须说同一台机器，否则检测器报 device_properties /
 # VBMeta 摘要不一致。daemon 运行期也会再同步一次（带 zygote 软重启）。
-_OMMEGA_IDENTITY=/data/misc/ommega/remote_identity
+_OMMEGA_IDENTITY=/data/misc/keystore/ommega/remote_identity
 if [ -f "$_OMMEGA_IDENTITY" ]; then
   _id_set() {
     [ -n "$1" ] && [ -n "$2" ] && resetprop "$1" "$2"
@@ -399,7 +399,7 @@ mask_state_file=$STATE_DIR/conf/mask.state
 
 # mask_enabled <配置键> [其它等价键...]
 # 判开关：flat config 里有这个键就以它为准；没有就看调用方给的 OMMEGA_MASK_DEFAULT。
-# post-fs-data 阶段 /data/misc/ommega/config 可能还没就绪，那时退回上次开机
+# post-fs-data 阶段 /data/misc/keystore/ommega/config 可能还没就绪，那时退回上次开机
 # 缓存的结果（/data/adb 这个阶段一定读得到）。
 mask_enabled() {
   me_name=$1
@@ -592,7 +592,7 @@ start_daemon_early() {
   case "$script" in
     *.sh|*/daemon-injector)
       # 启动器把目标 ELF 读进 memfd 再换成伪装名执行，和 --exec-script 两回事。
-      fake=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+      fake=$(sed -n 's/^injector=//p' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null | head -n 1)
       km_bin=$MODDIR/libs/$pf_abi/ommega-inject
       if [ -n "$fake" ] && [ -x "$km_bin" ]; then
         if command -v setsid >/dev/null 2>&1; then

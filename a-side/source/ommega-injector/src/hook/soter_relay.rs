@@ -200,7 +200,7 @@ fn request_with_table(call: &SoterCall, table: Option<&str>) -> Option<String> {
 }
 
 /// root 侧（`daemon-injector`）写的世界可读副本：一行 `<uid> <包名>`。
-const UID_TABLE_FALLBACK: &str = "/data/misc/ommega/uid_packages";
+const UID_TABLE_FALLBACK: &str = "/data/misc/keystore/ommega/uid_packages";
 /// 表只在装/卸应用时变，缓存一分钟；前台那份短一点，别拿刚才那个应用去顶现在这笔。
 const UID_TABLE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 

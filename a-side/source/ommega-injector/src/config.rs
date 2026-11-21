@@ -13,20 +13,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/ommega/injector.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "/data/misc/keystore/ommega/injector.toml";
 /// Legacy A-side per-app interception list.  Each non-comment line is a package
 /// name (optional `!`/`?` suffix) or a `[keybox]` scope header; the listed
 /// packages become the effective scoop.  Single data location, no copy: the
 /// webroot UI writes via `/data/adb/ommega/ommegadata`, uid 1017 payload reads it.
-const CLIENTA_TARGET_PATH: &str = "/data/misc/ommega/target.txt";
+const CLIENTA_TARGET_PATH: &str = "/data/misc/keystore/ommega/target.txt";
 /// Legacy A-side flat config (same directory as `target.txt`), written by the
 /// webroot UI and read by the keymint daemon.  The injector reads only its
 /// `global_scope` key; the rest belongs to the daemon's own parser.
-const CLIENTA_CONFIG_PATH: &str = "/data/misc/ommega/config";
+const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
 /// 日志开关副本，由 daemon-injector 按真配置写入：`log_flag: 1` / `log_flag: 0`。
 /// 必须落在 `/data/misc` 下：SOTER 宿主是 uid 1000 的 system_app，进不去
-/// `/data/adb`（0700 root）；`/data/misc/ommega` 是 system_data_file，读得动。
-const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/ommega/log_flag";
+/// `/data/adb`（0700 root）；`/data/misc/keystore/ommega` 是 system_data_file，读得动。
+const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/keystore/ommega/log_flag";
 /// 同一份开关的另一个副本，给 root / `su` 域用。
 /// 两份都写、两份都读，取先读到的那份。
 const CLIENTA_LOG_FLAG_FALLBACK_PATH: &str = "/data/adb/ommega/conf/log_flag";
@@ -333,8 +333,21 @@ fn read_clienta_target() -> Option<Vec<String>> {
     read_target_file(Path::new(CLIENTA_TARGET_PATH))
 }
 
+/// 读数据根里的一份配置/开关文件。
+///
+/// 数据根现在是 `/data/misc/keystore/ommega`（自身 0770，父目录 0700），SOTER 宿主那种
+/// app 域根本进不去 —— 本地读失败就按文件名走 daemon 的 `readState`，否则宿主永远
+/// 只能看到「文件不存在」，日志开关和全局范围全都跟着丢。
+fn read_config_file(path: &Path) -> Option<String> {
+    if let Ok(text) = fs::read_to_string(path) {
+        return Some(text);
+    }
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    crate::state::read(&name)
+}
+
 fn read_target_file(path: &Path) -> Option<Vec<String>> {
-    let contents = fs::read_to_string(path).ok()?;
+    let contents = read_config_file(path)?;
     let mut extras: Vec<String> = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -384,7 +397,7 @@ pub fn clienta_debug_logging() -> Option<bool> {
 /// has to be spelled out to turn something off.  Same format as `parse_flat_config`
 /// on the keymint side, so change both.
 fn clienta_config_bool(path: &Path, keys: &[&str]) -> Option<bool> {
-    let contents = fs::read_to_string(path).ok()?;
+    let contents = read_config_file(path)?;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -420,7 +433,7 @@ fn config_path() -> PathBuf {
     if let Some(path) = std::env::var_os("OMMEGA_INJECTOR_CONFIG_PATH") {
         return PathBuf::from(path);
     }
-    // 只有一份：keystore 域和 SOTER 宿主域读同一个路径（/data/misc/ommega 是
+    // 只有一份：keystore 域和 SOTER 宿主域读同一个路径（/data/misc/keystore/ommega 是
     // system_data_file，两边的 sepolicy 都放行了）。
     PathBuf::from(DEFAULT_CONFIG_PATH)
 }

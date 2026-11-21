@@ -86,13 +86,13 @@ pub fn answers_with_session(op: &str) -> bool {
 // 下面这份，payload 读它，本地自签那套就报跟真机一模一样的号 —— 两边各答一个号的话
 // 检测器两次一对比就报「不一致」。
 //
-// 位置定在 `/data/misc/ommega/`：SOTER 宿主是 uid 1000，进不去 0770 的 keystore 目录。
+// 位置定在 `/data/misc/keystore/ommega/`：SOTER 宿主是 uid 1000，进不去 0770 的 keystore 目录。
 
 /// 副本文件按顺序找，先读到的算（现在只有一个位置）。
-pub const CPU_ID_PATHS: [&str; 1] = ["/data/misc/ommega/soter_cpu_id"];
+pub const CPU_ID_PATHS: [&str; 1] = ["/data/misc/keystore/ommega/soter_cpu_id"];
 
-/// daemon 写的那一份（数据根统一在 `/data/misc/ommega`）。
-pub const CPU_ID_WRITE_PATH: &str = "/data/misc/ommega/soter_cpu_id";
+/// daemon 写的那一份（数据根统一在 `/data/misc/keystore/ommega`）。
+pub const CPU_ID_WRITE_PATH: &str = "/data/misc/keystore/ommega/soter_cpu_id";
 
 /// 环境变量覆盖（测试、临时探针用）。
 pub const CPU_ID_ENV: &str = "OMMEGA_SOTER_CPU_ID";

@@ -7,11 +7,11 @@ use log::LevelFilter;
 
 /// 唯一的日志位置。
 ///
-/// 必须落在 `/data/misc/ommega/logs/`：注入后的 payload 跟 SOTER 宿主（uid 1000，
+/// 必须落在 `/data/misc/keystore/ommega/logs/`：注入后的 payload 跟 SOTER 宿主（uid 1000，
 /// system_app）和 HAL 进程跑在同一个地址空间里，只有这个目录的 `system_app_data_file`
 /// 标签它们写得进去。`/data/adb` 是 `adb_data_file`（只有 root 能开），
 /// `/data/misc/keystore` 是 0700 keystore，宿主和 HAL 都开不了。
-const LOG_PATH: &str = "/data/misc/ommega/logs/injector.log";
+const LOG_PATH: &str = "/data/misc/keystore/ommega/logs/injector.log";
 /// 保留两个旧名字，指向同一个位置：`init_logger_inner` 的循环和
 /// `loosen_app_domain_path` 的判断都还按「两个候选」写，路径一致后第一个就成、直接返回。
 const DEFAULT_LOG_PATH: &str = LOG_PATH;
@@ -140,6 +140,73 @@ pub fn init_logger_fallback(level: LevelFilter) {
     });
 }
 
+/// 落不了盘时的退路：把日志行串到 daemon 那边写。
+///
+/// app 域的 payload（SOTER 宿主）处在 `/data/misc/keystore/ommega/logs` 外面，那个目录
+/// 0770 且父目录 0700，它连打开都不行。RPC 是它唯一能把话带出去的通道。
+///
+/// 只接 Info 以上，并且限速：日志一旦变成跨进程调用，刷屏就不是刷盘那么便宜了。
+struct RpcLogger;
+
+static RPC_LOGGER: RpcLogger = RpcLogger;
+/// 重入闸：`report_event` 自己在失败时会 `debug!`，不挡住就无限递归。
+static IN_RPC_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 每秒最多往 daemon 塞这么多行。
+const RPC_LOG_PER_SECOND: u32 = 32;
+static RPC_LOG_BUDGET: Mutex<Option<(std::time::Instant, u32)>> = Mutex::new(None);
+
+fn rpc_log_budget_left() -> bool {
+    let Ok(mut guard) = RPC_LOG_BUDGET.lock() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    let slot = guard.get_or_insert((now, RPC_LOG_PER_SECOND));
+    if now.duration_since(slot.0) >= std::time::Duration::from_secs(1) {
+        *slot = (now, RPC_LOG_PER_SECOND);
+    }
+    if slot.1 == 0 {
+        return false;
+    }
+    slot.1 -= 1;
+    true
+}
+
+impl log::Log for RpcLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        enabled() && metadata.level() <= log::max_level() && metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) || !rpc_log_budget_left() {
+            return;
+        }
+        if IN_RPC_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        crate::ipc::report_event(format!(
+            "[payload] {} {} - {}",
+            record.level(),
+            record.target(),
+            record.args()
+        ));
+        IN_RPC_LOG.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn flush(&self) {}
+}
+
+/// 装上 RPC 日志；装不上（已经有 logger）就回 false。
+fn try_install_rpc_logger(configured_level: LevelFilter) -> bool {
+    if log::set_logger(&RPC_LOGGER).is_err() {
+        return false;
+    }
+    log::set_max_level(configured_level);
+    if let Ok(mut guard) = ACTIVE_PATH.lock() {
+        *guard = Some("rpc".to_string());
+    }
+    true
+}
+
 fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
     // 只落文件，不用 logcat。两个候选指向同一个位置（见 [`LOG_PATH`]），第一个就成了。
     //
@@ -194,7 +261,15 @@ fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
         return Ok(());
     }
 
-    // 两个位置都写不进去：没地方落就不写，不装 logger，也不退回 logcat。
+    // 两个位置都写不进去：数据根在 0770 的 keystore 目录底下，app 域的宿主进不去。
+    // 那半边改用 RPC 把行交给 daemon 写进它自己的日志——一行都看不见的时候，
+    // SOTER 出问题就真成瞎子了。
+    if try_install_rpc_logger(configured_level) {
+        if let Ok(mut guard) = PROBES.lock() {
+            *guard = Some(format!("{} rpc=on", probes.join(", ")));
+        }
+        return Ok(());
+    }
     log::set_max_level(LevelFilter::Off);
     if let Ok(mut guard) = INIT_ERROR.lock() {
         let reason = match &last_error {

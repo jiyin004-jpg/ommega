@@ -25,9 +25,9 @@ use crate::top::jiyin004::ommega::IKeymintService::BnKeymintService;
 
 /// 心跳文件：告诉 daemon「进程内这套还活着、RPC 也挂上了」。
 /// 判定在 daemon 侧（`src/daemon.rs:inproc_healthy`），这里只负责刷。
-const HEARTBEAT_PATH: &str = "/data/misc/ommega/inproc.heartbeat";
+const HEARTBEAT_PATH: &str = "/data/misc/keystore/ommega/inproc.heartbeat";
 /// 起服务失败的原因。存在它就说明这条路在这台机器上跑不了，daemon 直接退到独立 HAL。
-const FAILED_PATH: &str = "/data/misc/ommega/inproc.failed";
+const FAILED_PATH: &str = "/data/misc/keystore/ommega/inproc.failed";
 /// 抽象 socket 是否已经绑上（心跳里的 `rpc=` 字段）。
 static RPC_READY: AtomicBool = AtomicBool::new(false);
 
@@ -136,7 +136,7 @@ pub fn wait_ready(timeout: Duration) -> bool {
 }
 
 /// 根侧落的「开机已完成」标记。
-const BOOT_DONE_PATH: &str = "/data/misc/ommega/boot_done";
+const BOOT_DONE_PATH: &str = "/data/misc/keystore/ommega/boot_done";
 
 /// 从开始到必须有结论的宽限期。
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -153,7 +153,7 @@ fn replay_early_boot_ended() {
     }
 }
 
-/// 播种 config.toml：走临时文件 + rename，要求 `/data/misc/ommega` 可写。目录还没被
+/// 播种 config.toml：走临时文件 + rename，要求 `/data/misc/keystore/ommega` 可写。目录还没被
 /// chown 给 keystore 时最多等 5 秒，等不到就把错误交回调用方。
 fn seed_config_with_retry() -> Result<crate::config::ConfigFile> {
     let deadline = Instant::now() + Duration::from_secs(5);

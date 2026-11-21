@@ -431,11 +431,11 @@ impl Remotable for SoterTa {
 /// `driver` 决定注册到哪个 servicemanager：vendor 的 AIDL HAL 落在 `/dev/vndbinder`
 /// （vndservicemanager），应用侧的 Java 客户端只看 `/dev/binder`。
 ///
-/// App 自测端点只在开关（环境变量或 `/data/misc/ommega/soter_app_selftest`）打开时注册；
+/// App 自测端点只在开关（环境变量或 `/data/misc/keystore/ommega/soter_app_selftest`）打开时注册；
 /// 它的描述符就是 `com.tencent.soter.soterserver.ISoterService`，所以
 /// `service call ommega.soter.app/default <code> i32 <uid>` 发出的字节跟宿主收到的一样。
 const APP_SELFTEST_ENV: &str = "OMMEGA_SOTER_APP_SELFTEST";
-const APP_SELFTEST_SWITCH: &str = "/data/misc/ommega/soter_app_selftest";
+const APP_SELFTEST_SWITCH: &str = "/data/misc/keystore/ommega/soter_app_selftest";
 const APP_SELFTEST_SERVICE: &str = "ommega.soter.app/default";
 
 struct AppFace;

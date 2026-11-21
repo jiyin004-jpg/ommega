@@ -38,7 +38,7 @@ fn get_pm() -> anyhow::Result<rsbinder::Strong<dyn IKeyAttestationApplicationIdP
 /// 系统那份 uid→包名 表（root 域读得到）。
 const PACKAGES_LIST: &str = "/data/system/packages.list";
 /// keymint 守护抄出来的那份（keystore 域读得到），见 `daemon::aaid_sync_loop`。
-const AAID_TABLE: &str = "/data/misc/ommega/aaid_table";
+const AAID_TABLE: &str = "/data/misc/keystore/ommega/aaid_table";
 
 const ERROR_GET_ATTESTATION_APPLICATION_ID_FAILED: i32 = 1;
 const KEY_ATTESTATION_APPLICATION_ID_MAX_SIZE: usize = 1024;
@@ -86,7 +86,7 @@ pub fn get_aaid(uid: u32) -> anyhow::Result<Vec<u8>> {
 ///
 /// 1. `/data/system/packages.list`：`0640 system:package_info` + `packages_list_file`，
 ///    只有以 root 跑时读得到，在 keystore 域（uid 1017）读会 EACCES。
-/// 2. `/data/misc/ommega/aaid_table`：keymint 守护（root）抄出来的副本，0644，
+/// 2. `/data/misc/keystore/ommega/aaid_table`：keymint 守护（root）抄出来的副本，0644，
 ///    system_data_file，keystore 域读得到，且不改系统文件。
 fn aaid_from_packages_list(uid: u32) -> anyhow::Result<KeyAttestationApplicationId> {
     let mut direct_error: Option<String> = None;
@@ -242,7 +242,7 @@ pub fn package_names_for_uid(uid: u32) -> anyhow::Result<Vec<String>> {
 ///
 /// AAID 服务在分身/空间/多用户 uid 上会回空或报错；这张表由 root 直接抄系统
 /// `packages.list`（分身那些 999xxxxx 本来就有行），不依赖那个服务。
-const UID_PACKAGES_PATH: &str = "/data/misc/ommega/uid_packages";
+const UID_PACKAGES_PATH: &str = "/data/misc/keystore/ommega/uid_packages";
 
 /// 表的内容 + 什么时候读的。文件不大（几百行），一分钟重读一次就够。
 static UID_PACKAGES: std::sync::Mutex<
@@ -288,7 +288,7 @@ fn parse_uid_packages(text: &str) -> std::collections::HashMap<u32, String> {
 /// root 侧（`daemon-injector`）周期性写出来的「当前前台应用」：一行 `<epoch 秒> <包名>`。
 ///
 /// 最后一道兜底，过新鲜度阀（见 `FOREGROUND_TTL_SECS`），文件不存在等于没数据。
-const FOREGROUND_PATH: &str = "/data/misc/ommega/foreground";
+const FOREGROUND_PATH: &str = "/data/misc/keystore/ommega/foreground";
 
 /// 前台信息算多新鲜才能用。写侧开机阶段每 3 秒、之后每 5 秒采一次，
 /// 留一倍余量；再旧就不能代表「现在是谁在调」。

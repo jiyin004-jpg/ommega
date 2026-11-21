@@ -25,11 +25,11 @@ use regex::Regex;
 use x509_cert::der as x509_der;
 use x509_cert::Certificate;
 
-pub const KEYBOX_PATH: &str = "/data/misc/ommega/keybox_tee.xml";
+pub const KEYBOX_PATH: &str = "/data/misc/keystore/ommega/keybox_tee.xml";
 
 /// StrongBox 级别单独的一份。文件不存在或解析不了就用内置的 StrongBox 那份，
 /// **不会**回落到 TEE 那份 —— 回落就是「StrongBox 请求拿 TEE 链」。
-pub const STRONGBOX_KEYBOX_PATH: &str = "/data/misc/ommega/keybox_strongbox.xml";
+pub const STRONGBOX_KEYBOX_PATH: &str = "/data/misc/keystore/ommega/keybox_strongbox.xml";
 
 const BUNDLED_KEYBOX_XML: &str = include_str!("../template/keybox_tee.xml");
 /// 内置的 StrongBox 级 keybox。文件丢了或读坏了就用它，不再退回 TEE 那份 ——

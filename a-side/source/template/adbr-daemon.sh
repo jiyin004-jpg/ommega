@@ -2,7 +2,7 @@
 
 # adbrd 监管脚本 —— A / B 两端共用同一份，用参数选读哪份配置：
 #
-#   sh adbr-daemon.sh --a   A 端：/data/misc/ommega/config 里的 `adbr:`
+#   sh adbr-daemon.sh --a   A 端：/data/misc/keystore/ommega/config 里的 `adbr:`
 #
 # 设备被公网远控这件事必须由用户显式点头，所以这里只认配置里的开关，不开就不跑：
 #   开关开着 → 保证有一个 adbr 在跑（掉了 2 秒后重拉）
@@ -25,7 +25,7 @@ esac
 MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 
 # 同 injector：把自己 comm 改成伪装名，守护靠 comm 就能判断「我已经在跑」。
-_adbr_tag=$(sed -n 's/^adbr=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+_adbr_tag=$(sed -n 's/^adbr=//p' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null | head -n 1)
 if [ -n "$_adbr_tag" ]; then
   # 用 echo -n：echo 会把换行一起写进 comm，名字短于 15 字符时换行不会被截掉，
   # /proc/<pid>/stat 就会被撑成两行，后面算 starttime 全错，锁里写出坏格式。
@@ -38,11 +38,11 @@ CONF_DIR=$STATE_DIR/conf
 RUN_DIR=$STATE_DIR/run
 DB_DIR=$STATE_DIR/db
 [ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
-LOG=/data/misc/ommega/logs/daemon.log
+LOG=/data/misc/keystore/ommega/logs/daemon.log
 mkdir -p "${LOG%/*}" 2>/dev/null
 LOCK_DIR="$RUN_DIR/adbr-daemon.lock"
 
-CONF=/data/misc/ommega/config
+CONF=/data/misc/keystore/ommega/config
 
 mkdir -p "${LOG%/*}" 2>/dev/null
 

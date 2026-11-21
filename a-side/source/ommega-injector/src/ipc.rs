@@ -650,10 +650,10 @@ pub fn forward_soter(request: &str) -> Result<Vec<u8>> {
 
 /// 把整份 SOTER 料库文本交给 daemon 代写。
 ///
-/// app 域的进程（SOTER 宿主是 platform_app、带 MLS 类别）读得到
-/// `/data/misc/ommega/soter_asks.json` 却写不动它：MLS 的写约束要求主体和客体级别
-/// 相等，SELinux 的类型规则放行了也没用。宿主里那份料因此只能顺着这条 RPC 落到
-/// daemon（跑在 ksu/keystore 域，级别是 s0）手里。
+/// app 域的进程（SOTER 宿主是 platform_app、带 MLS 类别）读不到也写不动
+/// `/data/misc/keystore/ommega/soter_asks.json`：数据根在 0700 的 keystore 目录底下，
+/// DAC 就先把它挡住了。宿主里那份料因此只能顺着这条 RPC 落到 daemon（跑在 keystore
+/// 域，能进那个目录）手里。
 ///
 /// 同步等结果：调用方正在建料/签名的路上，写不进去它要退到「只在内存里」。
 pub fn write_soter_store(text: &str) -> Result<bool> {
@@ -662,6 +662,35 @@ pub fn write_soter_store(text: &str) -> Result<bool> {
         maintenance
             .writeSoterStore(text)
             .context("writeSoterStore failed")
+    })
+}
+
+/// 读整份料库（daemon 代读）。写走 [`write_soter_store`]，读走这里——两边必须成对，
+/// 否则调用方会把「读不到」当成「料库是空的」。
+pub fn read_soter_store() -> Result<Option<String>> {
+    ensure_process_state();
+    with_ommega_maintenance_once(|maintenance| {
+        maintenance
+            .readSoterStore()
+            .context("readSoterStore failed")
+    })
+}
+
+/// 按名读数据根里的小件（log_flag / config / soter_ok / cpu_id 之类）。
+pub fn read_state(name: &str) -> Result<Option<String>> {
+    ensure_process_state();
+    with_ommega_maintenance_once(|maintenance| {
+        maintenance.readState(name).context("readState failed")
+    })
+}
+
+/// 按名写数据根里的小件。daemon 那边对 config / 身份材料这类名字是不接的。
+pub fn write_state(name: &str, data: &str) -> Result<bool> {
+    ensure_process_state();
+    with_ommega_maintenance_once(|maintenance| {
+        maintenance
+            .writeState(name, data)
+            .context("writeState failed")
     })
 }
 

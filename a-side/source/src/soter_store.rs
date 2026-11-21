@@ -11,7 +11,43 @@
 use std::sync::Mutex;
 
 /// 跟 `hook::soter_local::ASK_STORE_PATH` 是同一个地方。
-pub const STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
+pub const STORE_PATH: &str = "/data/misc/keystore/ommega/soter_asks.json";
+
+/// 数据根：料库和那几份小件都在这个目录里。
+pub const DATA_ROOT: &str = "/data/misc/keystore/ommega";
+
+/// 按名取数据根里的文件路径。只认单层文件名（字母数字和 `. _ -`），`/`、`..` 一律拒。
+pub fn named_path(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() || name.len() > 64 || name == "." || name == ".." {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(std::path::Path::new(DATA_ROOT).join(name))
+}
+
+/// 读数据根里的一份文件。不存在、读不动都是 `None`。
+pub fn read_named(name: &str) -> Option<String> {
+    let path = named_path(name)?;
+    std::fs::read_to_string(path).ok()
+}
+
+/// 写数据根里的一份文件：临时文件 + rename，落盘统一 0666。
+pub fn write_named(name: &str, text: &str) -> bool {
+    match named_path(name) {
+        Some(path) => write_at(&path.to_string_lossy(), text),
+        None => false,
+    }
+}
+
+/// 整份料库读出来；没有这个文件就是 `None`。
+pub fn read() -> Option<String> {
+    std::fs::read_to_string(STORE_PATH).ok()
+}
 
 /// 读-改-写在调用方那边，这里只保证「写」是串行的。
 static WRITE_LOCK: Mutex<()> = Mutex::new(());

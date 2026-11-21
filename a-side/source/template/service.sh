@@ -23,7 +23,7 @@ mkdir -p "$STATE_DIR"
 # 以前这里的 `>> $STATE_DIR/logs/xxx.log` 会先把文件建出来（内容是空的），
 # 用户看到的就是「没开日志却多了一堆空 log」。关着时一概重定向到 /dev/null。
 debug_logging_enabled() {
-  val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$val" in
     1|true|yes|on) return 0 ;;
   esac
@@ -32,7 +32,7 @@ debug_logging_enabled() {
 
 # adbr 默认关。关着时不起监管进程：Rust 守护每 5 秒看这个开关，开了会自己拉起。
 adbr_enabled() {
-  val=$(grep -iE '^[[:space:]]*adbr[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  val=$(grep -iE '^[[:space:]]*adbr[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$val" in
     1|true|yes|on) return 0 ;;
   esac
@@ -40,8 +40,8 @@ adbr_enabled() {
 }
 
 if debug_logging_enabled; then
-  mkdir -p /data/misc/ommega/logs
-  LOG_DIR=/data/misc/ommega/logs
+  mkdir -p /data/misc/keystore/ommega/logs
+  LOG_DIR=/data/misc/keystore/ommega/logs
 else
   LOG_DIR=/dev/null
 fi
@@ -110,7 +110,7 @@ keymint_alive() {
 
 # 从名字表里取某个角色的伪装路径（daemon 开机时挑好写进去的）。
 stealth_name() {
-  sed -n "s/^$1=//p" /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1
+  sed -n "s/^$1=//p" /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null | head -n 1
 }
 
 # 启动一个守护（脚本或 ELF）并按 pidfile 守着。
@@ -157,7 +157,7 @@ SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
 # apply 过 —— 症状是开机后 20 秒（service 阶段）规则失效，payload 读 injector.toml
 # 吃 EACCES，keymint 一条链都出不来，而面板看着一切正常。
 # 结果跟其它日志一起落数据根的 logs，不再用 /data/local/tmp（那是 shell 的公共目录）。
-SEPOLICY_LOG=${DATA_ROOT:-/data/misc/ommega}/logs/sepolicy-apply.log
+SEPOLICY_LOG=${DATA_ROOT:-/data/misc/keystore/ommega}/logs/sepolicy-apply.log
 [ -f "$MODDIR/sepolicy_apply.sh" ] && . "$MODDIR/sepolicy_apply.sh"
 ensure_sepolicy() {
   [ -f "$MODDIR/sepolicy.rule" ] || return 0
@@ -196,7 +196,7 @@ ensure_sepolicy() {
 # 先按 exe / comm 快速筛，只对可能属于我们的那几个读 cmdline（加 timeout）：
 # 读一个卡在 D 状态的目标的 /proc/pid/cmdline 会把调用方一起卡死（实测过）。
 kill_all() {
-  all_names=$(awk -F= '{print $2}' /data/misc/ommega/conf/stealth.names 2>/dev/null)
+  all_names=$(awk -F= '{print $2}' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null)
   for p in $(ls /proc | grep -E '^[0-9]+$'); do
     [ "$p" = "$$" ] && continue
     exe=$(readlink "/proc/$p/exe" 2>/dev/null)
@@ -322,7 +322,7 @@ fi
 if [ -f "$MODDIR/kmod-loader.sh" ]; then
   # 调试日志关着时连这个日志文件都不建（它也是「日志」，开关开了才有）。
   kmod_log=/dev/null
-  kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$kmod_val" in
     1|true|yes|on) kmod_log="$LOG_DIR/daemon.log" ;;
   esac

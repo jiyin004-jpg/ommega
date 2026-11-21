@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # 开机幂等补一件事：`/data/adb/ommega/ommegadata` 软链。
 #
-# 面板「保存并生效」要把配置写进 /data/misc/ommega/，写的是这个软链；
+# 面板「保存并生效」要把配置写进 /data/misc/keystore/ommega/，写的是这个软链；
 # 它只在 customize.sh 里建过，而手动解压 / 热更新 / 直接把新文件盖进老模块目录
 # 都不会跑 customize.sh，缺了它面板一保存就 No such file or directory。
 #
@@ -9,9 +9,9 @@
 # `libs/<abi>/`，`bin/` 那套热更新布局已废弃。
 
 STATE_DIR=/data/adb/ommega
-DATA_ROOT=/data/misc/ommega
+DATA_ROOT=/data/misc/keystore/ommega
 
-# 软链目标必须就是数据根。老版本建过指向 /data/misc/keystore/ommega 的软链，
+# 软链目标必须就是数据根。老版本建过指向 /data/misc/ommega 的软链，
 # 那种不会报错，只会让面板写的配置落到程序不读的地方（远程模式永远开不起来），
 # 所以这里不光补缺，指向不对也直接重建。
 mkdir -p "$DATA_ROOT" 2>/dev/null
@@ -20,20 +20,29 @@ if [ ! -L "$STATE_DIR/ommegadata" ] || [ "$(readlink "$STATE_DIR/ommegadata" 2>/
   ln -s "$DATA_ROOT" "$STATE_DIR/ommegadata" 2>/dev/null
 fi
 
-# 组 system 可写（keystore 域要写 remote_identity / config），other 留 x 让 app 域读。
-# 目录可能是别人建的，所以每次开机都正一次。
-#
-# owner 必须是 keystore：keystore2 里的 TA 要往这里落 remote_identity、keymint 要
-# atomic replace config.toml，两者都是「在目录里建临时文件再 rename」，光有文件
-# 写权限不够，得目录可写。这个目录是 root 脚本建的，main.rs 降权后那次 chown
-# 改不动它，所以只能在 root 这边做。
+# 属主 root、组 keystore：keystore 域（keystore2 里的 TA）靠组写落 remote_identity、
+# atomic replace config.toml，root 侧的 daemon 和软件 TA 靠属主写。
+# 组的 other 一律无：app 域不直接碰这条路径——它缺的东西全走 RPC（读、写、日志），
+# 主目录才能收成 0770。以前留 other 的 x 是为了让 app 域读，代价是任何普通应用
+# stat 一下就知道 /data/misc/keystore/ommega 存在。
 mkdir -p "$DATA_ROOT/logs" 2>/dev/null
-chown keystore:keystore "$DATA_ROOT" 2>/dev/null
+# 老位置 `/data/misc/ommega` 的数据搬一次（保留旧的当备份，不删）。
+# 新位置为空才搬，避免把已经被新版本写过的配置盖回旧值。
+OLD_ROOT=/data/misc/ommega
+if [ -d "$OLD_ROOT" ] && [ ! -f "$DATA_ROOT/config" ]; then
+  cp -a "$OLD_ROOT/." "$DATA_ROOT/" 2>/dev/null
+fi
+chown root:keystore "$DATA_ROOT" 2>/dev/null
 chown keystore:keystore "$DATA_ROOT/logs" 2>/dev/null
-chmod 0771 "$DATA_ROOT" 2>/dev/null
-# logs 用 sticky：app 域（SOTER 宿主不是 keystore uid）的 payload 要往这里写日志，
-# 不开 other 写它就落不下档；sticky 位拦住删掉 / 改名别人的文件。
+chmod 0770 "$DATA_ROOT" 2>/dev/null
+# logs 用 sticky：owner 是 keystore，root 侧靠属主写；app 域一律走 RPC 落日志，
+# 不靠这个目录的 other 位（父目录 0770，它根本到不了这层）。
 chmod 1777 "$DATA_ROOT/logs" 2>/dev/null
+# 标签保持 system_data_file / system_app_data_file：现在的 sepolicy.rule 都是按这两个
+# 类型写的。隐藏靠的是父目录 `/data/misc/keystore` 本身 0700 keystore_data_file，
+# 外层就挡住了。
+chcon u:object_r:system_data_file:s0 "$DATA_ROOT" 2>/dev/null
+chcon u:object_r:system_app_data_file:s0 "$DATA_ROOT/logs" 2>/dev/null
 # SOTER 料库（ASK / AuthKey / 墓碑）是几个域一起写的：keystore 域的 payload、
 # hal_soter、system_app 宿主。这个文件一旦被写成 0644，不属同一 uid 的那几家就
 # 只能读不能写，ASK/AuthKey 于是只活在内存里、重启即丢（导出 AuthKey 恒 -6）。

@@ -45,8 +45,8 @@ const SALT_LEN: i32 = 32;
 const ATTK_PEM: &[u8] = include_bytes!("../../assets/soter_attk.pem");
 /// 换本地兜底 ATTK 用的文件（PKCS#8 或 PKCS#1 PEM）：存在且解析得过就用它。
 ///
-/// 唯一位置是 `/data/misc/ommega/`（`system_data_file`）：app 域和 keystore 域都读得到。
-const ATTK_FILE_PATH: &str = "/data/misc/ommega/soter_attk.pem";
+/// 唯一位置是 `/data/misc/keystore/ommega/`（`system_data_file`）：app 域和 keystore 域都读得到。
+const ATTK_FILE_PATH: &str = "/data/misc/keystore/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
@@ -55,7 +55,7 @@ const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 const COUNTER_BASE: u64 = 1;
 
 /// 强制覆盖 cpu_id 的文件；daemon 不写这个文件。
-const CPU_ID_OVERRIDE: &str = "/data/misc/ommega/soter_cpu_id.force";
+const CPU_ID_OVERRIDE: &str = "/data/misc/keystore/ommega/soter_cpu_id.force";
 /// `fid` 在序列号读不到时的兜底种子。`cpu_id` **不用**它（读不到就不报，绝不编一个）。
 const FALLBACK_SEED: &str = "ommega-a-side-local";
 
@@ -217,7 +217,13 @@ fn load_attk_key_with(override_path: Option<std::path::PathBuf>) -> Option<(Key,
     candidates.extend([std::path::PathBuf::from(ATTK_FILE_PATH)]);
 
     for path in candidates {
-        let Ok(pem) = std::fs::read_to_string(&path) else {
+        let is_default = path.as_path() == std::path::Path::new(ATTK_FILE_PATH);
+        let pem = if is_default {
+            crate::state::read("soter_attk.pem")
+        } else {
+            std::fs::read_to_string(&path).ok()
+        };
+        let Some(pem) = pem else {
             continue;
         };
         match Key::from_pem(&pem) {
@@ -240,7 +246,7 @@ fn load_attk_key() -> Option<(Key, String)> {
 
 /// 按 uid 散落的 ASK 文件，读到就迁进 store 并删掉。
 fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
-    [format!("/data/misc/ommega/soter_ask_{uid}.pem")]
+    [format!("/data/misc/keystore/ommega/soter_ask_{uid}.pem")]
 }
 
 /// 所有 uid 的 ASK 和 AuthKey 存在这一个文件里，不要按 uid/alias 散成一堆 pem。
@@ -249,8 +255,8 @@ fn legacy_ask_file_paths(uid: i32) -> [String; 1] {
 /// { "asks": { "10496": "<pem>" }, "authkeys": { "10496|SoterAuthKey": "<pem>" } }
 /// ```
 ///
-/// 位置唯一：`/data/misc/ommega/`（`system_data_file`，app 域和 keystore 域都读得到）。
-const ASK_STORE_PATH: &str = "/data/misc/ommega/soter_asks.json";
+/// 位置唯一：`/data/misc/keystore/ommega/`（`system_data_file`，app 域和 keystore 域都读得到）。
+const ASK_STORE_PATH: &str = "/data/misc/keystore/ommega/soter_asks.json";
 
 /// store 路径。`OMMEGA_SOTER_ASK_STORE` 是真机单测的隔离口（测试与线上模块共用同一个
 /// 文件会互相踩），跑测试时指到 /data/local/tmp 下的临时文件。
@@ -282,8 +288,18 @@ static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new
 
 fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
     let path = ask_store_path();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return serde_json::Map::new();
+    // app 域进不去数据根：那条路只能让 daemon 代读。本地直读失败就当成「料库是空的」
+    // 是致命错——调用方接着一次读-改-写就把别人建好的 ASK / AuthKey 整段铲掉了。
+    let text = if path == ASK_STORE_PATH {
+        match crate::state::read("soter_asks.json") {
+            Some(text) => text,
+            None => return serde_json::Map::new(),
+        }
+    } else {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return serde_json::Map::new();
+        };
+        text
     };
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(serde_json::Value::Object(mut map)) => {
@@ -660,10 +676,10 @@ pub(crate) fn device_id() -> String {
 /// 1. `soter_cpu_id.force`：这份 ATTK 自带的号；
 /// 2. 本机序列号派生（本地 ATTK 是现造的，身份就是这台机器）。
 ///
-/// 不读 `/data/misc/ommega/soter_cpu_id`（那是转发链路学来的 B 端号）；序列号在部分域
+/// 不读 `/data/misc/keystore/ommega/soter_cpu_id`（那是转发链路学来的 B 端号）；序列号在部分域
 /// 读不到时用 [`LOCAL_CPU_ID_PATH`] 那份缓存。都拿不到就报空串，不编造。
 fn cpu_id() -> String {
-    let forced = std::fs::read_to_string(CPU_ID_OVERRIDE).ok();
+    let forced = crate::state::read("soter_cpu_id.force");
     let derived = device_info().derived_cpu_id.as_deref();
     match local_cpu_id(forced.as_deref(), derived) {
         (value, "forced") => {
@@ -680,7 +696,7 @@ fn cpu_id() -> String {
 }
 
 /// 本机派生 cpu_id 的落盘位置。`system_data_file`，宿主那份 payload 读得到。
-const LOCAL_CPU_ID_PATH: &str = "/data/misc/ommega/soter_local_cpu_id";
+const LOCAL_CPU_ID_PATH: &str = "/data/misc/keystore/ommega/soter_local_cpu_id";
 
 /// 把算出来的派生号落盘给 app 域的 payload 用（best effort，内容没变就不写）。
 pub(crate) fn publish_local_cpu_id(value: &str) {
@@ -688,13 +704,13 @@ pub(crate) fn publish_local_cpu_id(value: &str) {
         return;
     }
     let line = format!("soter_cpu_id: {value}\n");
-    if std::fs::write(LOCAL_CPU_ID_PATH, line).is_ok() {
+    if crate::state::write("soter_local_cpu_id", &line) {
         log::info!("event=soter published local cpu_id to {LOCAL_CPU_ID_PATH}");
     }
 }
 
 fn read_local_cpu_id() -> Option<String> {
-    let text = std::fs::read_to_string(LOCAL_CPU_ID_PATH).ok()?;
+    let text = crate::state::read("soter_local_cpu_id")?;
     kmr_common::soter_relay::parse_cpu_id(&text)
 }
 
@@ -1245,7 +1261,7 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
 fn bump_counter(state: &State, uid: i32) -> u64 {
     // counter 必须单调递增、重启不能回退：App 记着上次看到的值，小回去就当重放删钥匙。
     // 所有 App 共用一个文件（每行 `uid=counter`），读-改-写放在文件锁里（几个进程共用）。
-    const PATH: &str = "/data/misc/ommega/soter_counter";
+    const PATH: &str = "/data/misc/keystore/ommega/soter_counter";
 
     let mem = state
         .counters
@@ -1279,8 +1295,21 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             }
             next
         }
-        // 开不了文件（权限异常）：拿内存值兜一下，至少不回退。
-        Err(_) => mem.max(COUNTER_BASE) + 1,
+        // 开不了文件（app 域进不去数据根）：也走 RPC 读一次、写回一次，运算规则跟本地
+        // 那条一模一样——不回退、不回退是因为 App 拿小回去的号当重放，直接删钥匙。
+        Err(_) => {
+            let text = crate::state::read("soter_counter").unwrap_or_default();
+            // 文件里没这个 uid 就从 1 开始（换 ATTK = 新身份），不接内存里的旧值。
+            let next = match counter_for(&text, uid) {
+                Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
+                None => COUNTER_BASE,
+            };
+            let updated = set_counter(&text, uid, next);
+            if !crate::state::write("soter_counter", &updated) {
+                log::warn!("event=soter counter could not be persisted; keeping it in memory");
+            }
+            next
+        }
     };
 
     if let Ok(mut map) = state.counters.lock() {
@@ -1485,7 +1514,7 @@ fn json_string(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 测试一律把 store 指到临时文件：默认位置在 /data/misc/ommega，
+    /// 测试一律把 store 指到临时文件：默认位置在 /data/misc/keystore/ommega，
     /// 属主是 keystore，测试进程写不进去（删了也白删，删完还能导出）。
     /// 已经由外部指定就不覆盖。
     fn use_temp_store() {
