@@ -11,9 +11,8 @@
 STATE_DIR=/data/adb/ommega
 DATA_ROOT=/data/misc/keystore/ommega
 
-# 软链目标必须就是数据根。老版本建过指向 /data/misc/ommega 的软链，
-# 那种不会报错，只会让面板写的配置落到程序不读的地方（远程模式永远开不起来），
-# 所以这里不光补缺，指向不对也直接重建。
+# 软链目标必须就是数据根。指向不对的软链不会报错，只会让面板写的配置落到程序
+# 不读的地方（远程模式永远开不起来），所以这里不光补缺，指向不对也直接重建。
 mkdir -p "$DATA_ROOT" 2>/dev/null
 if [ ! -L "$STATE_DIR/ommegadata" ] || [ "$(readlink "$STATE_DIR/ommegadata" 2>/dev/null)" != "$DATA_ROOT" ]; then
   rm -f "$STATE_DIR/ommegadata" 2>/dev/null
@@ -26,12 +25,6 @@ fi
 # 主目录才能收成 0770。以前留 other 的 x 是为了让 app 域读，代价是任何普通应用
 # stat 一下就知道 /data/misc/keystore/ommega 存在。
 mkdir -p "$DATA_ROOT/logs" 2>/dev/null
-# 老位置 `/data/misc/ommega` 的数据搬一次（保留旧的当备份，不删）。
-# 新位置为空才搬，避免把已经被新版本写过的配置盖回旧值。
-OLD_ROOT=/data/misc/ommega
-if [ -d "$OLD_ROOT" ] && [ ! -f "$DATA_ROOT/config" ]; then
-  cp -a "$OLD_ROOT/." "$DATA_ROOT/" 2>/dev/null
-fi
 chown root:keystore "$DATA_ROOT" 2>/dev/null
 chown keystore:keystore "$DATA_ROOT/logs" 2>/dev/null
 chmod 0770 "$DATA_ROOT" 2>/dev/null

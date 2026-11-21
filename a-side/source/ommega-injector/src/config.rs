@@ -23,13 +23,10 @@ const CLIENTA_TARGET_PATH: &str = "/data/misc/keystore/ommega/target.txt";
 /// webroot UI and read by the keymint daemon.  The injector reads only its
 /// `global_scope` key; the rest belongs to the daemon's own parser.
 const CLIENTA_CONFIG_PATH: &str = "/data/misc/keystore/ommega/config";
-/// 日志开关副本，由 daemon-injector 按真配置写入：`log_flag: 1` / `log_flag: 0`。
+/// 日志开关，由 daemon-injector 按真配置写入：`log_flag: 1` / `log_flag: 0`。
 /// 必须落在 `/data/misc` 下：SOTER 宿主是 uid 1000 的 system_app，进不去
 /// `/data/adb`（0700 root）；`/data/misc/keystore/ommega` 是 system_data_file，读得动。
 const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/keystore/ommega/log_flag";
-/// 同一份开关的另一个副本，给 root / `su` 域用。
-/// 两份都写、两份都读，取先读到的那份。
-const CLIENTA_LOG_FLAG_FALLBACK_PATH: &str = "/data/adb/ommega/conf/log_flag";
 const CURRENT_CONFIG_VERSION: u32 = 1;
 const REPLACE_SAVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REPLACE_SAVE_RETRY_LIMIT: usize = 10;
@@ -385,13 +382,10 @@ fn clienta_global_scope_override() -> Option<bool> {
 /// initialised before the config, and a target that cannot open the flat file
 /// (SOTER host, uid 1000) keeps logging off.
 pub fn clienta_debug_logging() -> Option<bool> {
-    // 先看启动器（daemon-injector，root）读完之后写下的两份副本：`/data/misc` 那份
-    // system_app 读得到（SOTER 宿主走它），`/data/adb` 那份 root/su 域读得到。
-    // 两份都没有或都读不到才回落到真配置本身。
-    for path in [CLIENTA_LOG_FLAG_PATH, CLIENTA_LOG_FLAG_FALLBACK_PATH] {
-        if let Some(value) = clienta_config_bool(Path::new(path), &["log_flag"]) {
-            return Some(value);
-        }
+    // 开关只有一份（daemon-injector 写的 log_flag），没有第二份副本；读不到才回落到
+    // 真配置本身的 debug 键。
+    if let Some(value) = clienta_config_bool(Path::new(CLIENTA_LOG_FLAG_PATH), &["log_flag"]) {
+        return Some(value);
     }
     clienta_config_bool(
         Path::new(CLIENTA_CONFIG_PATH),

@@ -135,12 +135,9 @@ pub(crate) const BOOT_DONE_PATH: &str = "/data/misc/keystore/ommega/boot_done";
 
 /// 开机是否已经完成：标记在，或者属性已经看到 1。
 ///
-/// 标记两边都看：root 侧的老版本还往 `/data/misc/ommega` 写，新版本写数据根里那份。
+/// 以标记为主：属性在 payload 里不一定读得到（静态链接，读属性要 exec resetprop）。
 pub(crate) fn boot_done_present() -> bool {
-    const LEGACY: &str = "/data/misc/ommega/boot_done";
-    boot_completed()
-        || std::path::Path::new(BOOT_DONE_PATH).exists()
-        || std::path::Path::new(LEGACY).exists()
+    boot_completed() || std::path::Path::new(BOOT_DONE_PATH).exists()
 }
 
 pub fn await_boot_completed() {
