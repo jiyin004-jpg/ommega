@@ -1032,7 +1032,10 @@ fn switch_state_text(text: &str) -> Option<bool> {
 
 /// 读一个开关文件。app 域进不去数据根，`crate::state` 会替它走 RPC。
 fn switch_state(path: &str) -> Option<bool> {
-    let name = std::path::Path::new(path).file_name()?.to_string_lossy().into_owned();
+    let name = std::path::Path::new(path)
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
     switch_state_text(&crate::state::read(&name)?)
 }
 
@@ -1345,6 +1348,10 @@ pub(crate) enum AppAnswer {
 const APP_ERR_EMPTY_ALIAS: i32 = -202;
 const APP_ERR_EMPTY_CHALLENGE: i32 = -203;
 
+/// 未知会话号。原厂 SOTER TA 回这个（-1000）；宿主自己那份对同一件事的说法是 -204
+/// （`OPERATEID_NULL`），两个码在 App 眼里不是一回事，检测器也是按 -1000 判的。
+pub(crate) const SESSION_NOT_FOUND: i32 = -1000;
+
 /// 算出一笔 App 面向调用的答复。`caller_uid` 是拿谁的 uid 去建/查料：
 /// 宿主里是内核填的 `sender_euid`，自测端点里是命令行给的 uid。
 pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAnswer> {
@@ -1426,6 +1433,15 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
             "event=soter app answer none code={} hal_code={hal_code} caller_uid={caller_uid} local_session={local_session}",
             call.code
         ));
+        // finishSign 谁都不认识这张会话：按原厂 TA 的词汇回 -1000。透传下去 App 拿到的是
+        // 宿主的 -204（OPERATEID_NULL），那是另一种说法，跟真机对不上；而且这本来就是个
+        // 拒绝，不该把错误码换成宿主的。
+        if call.code == 10 {
+            return Some(AppAnswer::Export {
+                code: SESSION_NOT_FOUND,
+                data: None,
+            });
+        }
         return None;
     };
     Some(match (call.code, answer) {
@@ -2355,6 +2371,34 @@ mod tests {
         match answer_app_call(&call(8, "", None), 10373) {
             Some(AppAnswer::Int(rc)) => assert_eq!(rc, 0, "hasAuthKey 空别名就是 false"),
             other => panic!("app 8: 期望 0，拿到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_finish_session_answers_the_vendors_session_not_found() {
+        // 原厂 TA 对未知会话号回 -1000；透传下去 App 拿到的是宿主的 -204
+        // （OPERATEID_NULL），两个码对不上，检测器的 T6 就是按 -1000 判的。
+        let call = SoterCall {
+            hal: false,
+            hidl: false,
+            has_return_code: true,
+            code: 10,
+            wire_code: 10,
+            op: "finishSign",
+            uid: Some(10373),
+            alias: None,
+            challenge: None,
+            session: Some(424242),
+            key: None,
+            caller_uid: Some(10373),
+            data_size: 0,
+        };
+        match answer_app_call(&call, 10373) {
+            Some(AppAnswer::Export { code, data }) => {
+                assert_eq!(code, SESSION_NOT_FOUND);
+                assert!(data.is_none(), "拒绝不该带导出数据");
+            }
+            other => panic!("未知会话：期望 {SESSION_NOT_FOUND}，拿到 {other:?}"),
         }
     }
 

@@ -407,11 +407,11 @@ impl Remotable for SoterTa {
             None => {
                 log::warn!("event=soterta reply none (no answer for this call)");
                 // 没有真身份可报、或参数不够：回一个明确的错误码，别回 0 让调用方
-                // 拿着空数据继续跑。NOT_FOUND 跟真机一样。
-                if matches!(
-                    code,
-                    EXPORT_ASK_PUBLIC_KEY | EXPORT_AUTH_KEY_PUBLIC_KEY | FINISH_SIGN
-                ) {
+                // 拿着空数据继续跑。
+                if code == FINISH_SIGN {
+                    // 会话号谁都不认识：原厂 TA 回 -1000，宿主拿到后原样转给 App。
+                    write_bytes_reply(reply, &[], crate::hook::soter::SESSION_NOT_FOUND)?;
+                } else if matches!(code, EXPORT_ASK_PUBLIC_KEY | EXPORT_AUTH_KEY_PUBLIC_KEY) {
                     write_bytes_reply(reply, &[], -4)?;
                 } else {
                     reply.write_i32(-4)?;
