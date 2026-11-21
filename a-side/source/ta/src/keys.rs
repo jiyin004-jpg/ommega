@@ -37,6 +37,9 @@ use x509_cert::ext::pkix::KeyUsages;
 /// Maximum size of an attestation challenge value.
 const MAX_ATTESTATION_CHALLENGE_LEN: usize = 128;
 
+/// 判「未来生效」时容忍的时间偏差（毫秒）。调用方常把 ACTIVE_DATETIME 设成当前时间。
+const TIME_SKEW_MS: i64 = 2_000;
+
 /// 本地出证返回前等待的时长。
 const LOCAL_ATTEST_DELAY: core::time::Duration = core::time::Duration::from_millis(5);
 
@@ -392,6 +395,7 @@ impl crate::KeyMintTa {
         params: &[KeyParam],
         attestation_key: Option<AttestationKey>,
     ) -> Result<KeyCreationResult, Error> {
+        self.check_creation_time_auths(params)?;
         // Remote mode: when a remote backend is enabled and attestation is
         // requested, mint the key on the B-side real TEE instead of locally.
         // A caller-supplied attestation key is delegated to B's native KeyMint
@@ -753,6 +757,39 @@ impl crate::KeyMintTa {
         Ok((key_material, chars))
     }
 
+    /// 创建时的时间授权：还没生效、或已经过期的时间参数直接拒。
+    ///
+    /// 钥匙建出来就是为了用，带着一个未来生效时间或已过期的期限进来，等于让调用方
+    /// 提前拿一份用不了的料；真机 TA 在创建时就回 KeyNotYetValid / KeyExpired。
+    ///
+    /// 「未来生效」留一点余量：调用方常用 `ACTIVE_DATETIME = 当前时间`，两边取时间的
+    /// 时机不同，毫秒级偏差就能把它判成未来。
+    fn check_creation_time_auths(&self, params: &[KeyParam]) -> Result<(), Error> {
+        let Some(now) = self.now_ms() else {
+            return Ok(());
+        };
+        let now = now as i64;
+        if let Some(active) = get_opt_tag_value!(params, ActiveDatetime)? {
+            if active.ms_since_epoch > now + TIME_SKEW_MS {
+                return Err(km_err!(KeyNotYetValid, "ACTIVE_DATETIME is in the future"));
+            }
+        }
+        if let Some(expire) = get_opt_tag_value!(params, OriginationExpireDatetime)? {
+            if expire.ms_since_epoch <= now {
+                return Err(km_err!(
+                    KeyExpired,
+                    "ORIGINATION_EXPIRE_DATETIME is in the past"
+                ));
+            }
+        }
+        if let Some(expire) = get_opt_tag_value!(params, UsageExpireDatetime)? {
+            if expire.ms_since_epoch <= now {
+                return Err(km_err!(KeyExpired, "USAGE_EXPIRE_DATETIME is in the past"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn import_key(
         &mut self,
         params: &[KeyParam],
@@ -767,6 +804,7 @@ impl crate::KeyMintTa {
                 "attempt to use EARLY_BOOT key after early boot"
             ));
         }
+        self.check_creation_time_auths(params)?;
 
         let (mut chars, key_material) = tag::extract_key_import_characteristics(
             &self.imp,
