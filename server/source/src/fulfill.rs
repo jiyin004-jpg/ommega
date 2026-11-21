@@ -739,6 +739,11 @@ impl Fulfill {
         p.active_datetime_ms = ctx.get("active_datetime_ms").and_then(Value::as_i64);
         p.origination_expire_ms = ctx.get("origination_expire_ms").and_then(Value::as_i64);
         p.usage_expire_ms = ctx.get("usage_expire_ms").and_then(Value::as_i64);
+        // A 端补的 challenge 不算「调用方要证明」，证书不挂证明扩展。
+        p.synthetic_challenge = ctx
+            .get("synthetic_challenge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         tracing::info!(
             "parse_ctx: time auths active={:?} orig={:?} usage={:?}",
             p.active_datetime_ms,

@@ -88,6 +88,8 @@ pub struct AttestationParams {
     pub active_datetime_ms: Option<i64>,
     pub origination_expire_ms: Option<i64>,
     pub usage_expire_ms: Option<i64>,
+    /// challenge 是 A 端替调用方补的：不挂证明扩展（没 challenge 就没证明）。
+    pub synthetic_challenge: bool,
     /// Leaf certificate subject (DER Name) requested by the caller; defaults to
     /// "CN=Android Keystore Key" when absent.
     pub subject_name: Option<Vec<u8>>,
@@ -158,6 +160,7 @@ impl Default for AttestationParams {
             active_datetime_ms: None,
             origination_expire_ms: None,
             usage_expire_ms: None,
+            synthetic_challenge: false,
             subject_name: None,
             attestation_ids: Vec::new(),
             user_auth: Vec::new(),
@@ -1279,7 +1282,7 @@ fn build_chain_signed_by(
     // 里写证明扩展（`No attestation challenge, so no attestation`）。硬写一个带
     // TEE 安全级别的扩展，就是「无 challenge 却拿到了硬件证明」——检测器判
     // ATTEST_PURPOSE_CONSTRAINT。（KeyUsage 留着，它说的是钥匙自己的能力。）
-    if !p.challenge.is_empty() {
+    if !p.challenge.is_empty() && !p.synthetic_challenge {
         exts_content
             .0
             .extend(ext_entry(ATTESTATION_OID, false, &ext_value));

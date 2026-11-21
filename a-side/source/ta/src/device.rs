@@ -202,6 +202,10 @@ pub struct RemoteAttestParams {
     pub active_datetime_ms: Option<i64>,
     pub origination_expire_ms: Option<i64>,
     pub usage_expire_ms: Option<i64>,
+    /// challenge 是本端替调用方补的（调用方没给 ATTESTATION_CHALLENGE）。
+    /// 中继据此决定不往叶子里写证明扩展：没有 challenge 就没有证明，
+    /// 真 TA 在这种情况下也只发 KeyUsage。
+    pub synthetic_challenge: bool,
     /// Requesting KeyMint security level (raw `SecurityLevel` enum value:
     /// 1 = TEE, 2 = StrongBox). Forwarded so the relay tags the attestation
     /// extension (`attestationSecurityLevel`/`keymasterSecurityLevel`) with the

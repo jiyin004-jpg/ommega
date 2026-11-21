@@ -931,6 +931,10 @@ impl RemoteRelay {
             params.origination_expire_ms,
         );
         put(&mut ctx, "usage_expire_ms", params.usage_expire_ms);
+        // challenge 是本端替调用方补的：中继不能拿它去写证明扩展。
+        if params.synthetic_challenge {
+            ctx.insert("synthetic_challenge".to_string(), Value::Bool(true));
+        }
         put(
             &mut ctx,
             "certificate_serial",

@@ -471,7 +471,9 @@ impl crate::KeyMintTa {
             };
             // `Ok(None)` from the remote backend means it was unavailable; fall
             // back to the local software keybox when `fallback_local` allows.
-            if let Some(result) = self.generate_key_remote(params, remote_issuer.as_ref())? {
+            if let Some(result) =
+                self.generate_key_remote(params, remote_issuer.as_ref(), auto_challenge)?
+            {
                 return Ok(result);
             }
             // 远程不可用时按 fallback_local 决定：开着就用本地 keybox 出证，忽略那把私钥
@@ -527,6 +529,7 @@ impl crate::KeyMintTa {
         &mut self,
         params: &[KeyParam],
         attestation_key: Option<&device::RemoteAttestationKey>,
+        synthetic_challenge: bool,
     ) -> Result<Option<KeyCreationResult>, Error> {
         let challenge = get_opt_tag_value!(params, AttestationChallenge)?
             .ok_or_else(|| km_err!(AttestationChallengeMissing, "remote attest needs challenge"))?;
@@ -556,6 +559,7 @@ impl crate::KeyMintTa {
             _ => derived_serial.as_ref(),
         };
         let mut remote_params = extract_remote_attest_params(params);
+        remote_params.synthetic_challenge = synthetic_challenge;
         // 显式委派：告诉 B「用这把已有的证明密钥签发子证书」。
         remote_params.attestation_key = attestation_key.cloned();
         // Tag the relay-minted chain with the requesting security level so a
