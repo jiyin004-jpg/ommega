@@ -62,9 +62,13 @@ now_ms() {
   s=$(date +%s 2>/dev/null) || s=0
   n=$(date +%N 2>/dev/null)
   case "$n" in
-    ''|*[!0-9]*) echo $((s * 1000)) ;;
-    *) echo $((s * 1000 + n / 1000000)) ;;
+    ''|*[!0-9]*) n=0 ;;
   esac
+  # `date +%N` 会带前导零（如 093456789），直接丢给 $(( )) 会被当八进制，遇上 08/09
+  # 就是一句 `arithmetic syntax error`，整个取时间戳失败。先去掉前导零。
+  n=$(printf '%s' "$n" | sed 's/^0*//')
+  [ -n "$n" ] || n=0
+  echo $((s * 1000 + n / 1000000))
 }
 
 conf_get() {
