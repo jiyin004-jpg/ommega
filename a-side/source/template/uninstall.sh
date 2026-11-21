@@ -118,43 +118,23 @@ rm -rf "$OMMEGA_DIR"
 # 3. Remove A-side files under the shared state dir
 #    /data/adb/ommega is shared with the B-side module (ommega-b), so we
 #    only touch A-side-owned entries and leave relay/relay.conf/logs intact.
+#    只清本版本自己会创建的东西；别的版本留下的不归这里管。
 # ---------------------------------------------------------------------------
 rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/keystore/ommega
-rm -f "$STATE_DIR/keymint"             # hot-update binary
-rm -f "$STATE_DIR/ommega-inject"       # hot-update binary
-rm -f "$STATE_DIR/injector"            # 旧版热更新二进制
-rm -f "$STATE_DIR/resetprop"           # 模块自带的 resetprop（安装时从 libs/<abi> 拷过来那份）
-# 迁移时把老数据根整体搬到这里的备份（里面是旧的 ASK 私钥和 token），不能留。
-rm -rf "$STATE_DIR"/legacy-*
-rm -f "$RUN_DIR/restart.keymint"
-rm -f "$RUN_DIR/restart.injector"
-rm -f "$RUN_DIR/restart.all"
-rm -f "$RUN_DIR/keymint-daemon.pid"
-rm -f "$RUN_DIR/injector-daemon.pid"
-rm -f "$RUN_DIR/spl_daemon.retry" 2>/dev/null
-rmdir "$RUN_DIR" 2>/dev/null
-# A 端自己的配置副本（伪装项、mask、身份镜像、注入器状态）：卸载后没人再读，
-# 特别是 props.conf 里的启动哈希/补丁值和 remote_identity 镜像，不能留在机器上。
+rm -f "$STATE_DIR/boot-debug.log"
+rm -rf "$STATE_DIR/perm-stage"
+# run/ 整个目录都是本版本写的：重启标记、pid、锁、sepolicy 缓存
+rm -rf "$RUN_DIR"
+# conf/ 下本版本会写的那几份（伪装项、mask、身份镜像、注入器状态、平台缓存）
 rm -f "$STATE_DIR/conf/props.conf" "$STATE_DIR/conf/mask.state" "$STATE_DIR/conf/mask.binds" \
+      "$STATE_DIR/conf/pathmask.state" "$STATE_DIR/conf/pathmask.owned" \
       "$STATE_DIR/conf/remote_identity.applied" "$STATE_DIR/conf/remote_identity.updated" \
-      "$STATE_DIR/conf/injector.payload" "$STATE_DIR/conf/soter_hal.cache" 2>/dev/null
-# HIDL 平台缓存（soterta.sh 算完落的那份）：换机器/重装时不该沿用上一次的结论。
-rm -f "$STATE_DIR/conf/soter_hidl_platform" 2>/dev/null
-# 以前一个脚本一个日志文件，现在统一成 daemon.log；把旧的散件也收掉。
-rm -f "$STATE_DIR/boot-debug.log" 2>/dev/null
-rm -f "$STATE_DIR"/logs/adbr.log "$STATE_DIR"/logs/adbr-daemon.log \
-      "$STATE_DIR"/logs/soterta.log "$STATE_DIR"/logs/kmod-loader.log \
-      "$STATE_DIR"/logs/watchdog.log 2>/dev/null
+      "$STATE_DIR/conf/injector.payload" "$STATE_DIR/conf/soter_hal.cache" \
+      "$STATE_DIR/conf/soter_hidl_platform" 2>/dev/null
+rmdir "$STATE_DIR/conf" 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# 4. /data/local/tmp 里的遗留文件
-# ---------------------------------------------------------------------------
-# 1.7.14 及以前这些东西落在 shell 的公共目录，新版本已经不写了，卸载时把老装机上的残留清掉。
-rm -f /data/local/tmp/ommega_save.log /data/local/tmp/ommega_*.log /data/local/tmp/ommega-*.log \
-      /data/local/tmp/adbr.log 2>/dev/null
-
-# ---------------------------------------------------------------------------
-# 5. Drop the shared state dir only if it is now completely empty (i.e. the
+# 4. Drop the shared state dir only if it is now completely empty (i.e. the
 #    B-side module is not installed either).
 # ---------------------------------------------------------------------------
 [ -z "$(ls -A "$STATE_DIR" 2>/dev/null)" ] && rmdir "$STATE_DIR" 2>/dev/null
