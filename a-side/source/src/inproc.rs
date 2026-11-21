@@ -231,19 +231,25 @@ fn start() -> Result<HashMap<&'static str, SIBinder>> {
     // 只看根侧的 boot_done 标记，不读属性（payload 静态链接，读属性会退到 exec resetprop）。
     if boot_done_present() {
         replay_early_boot_ended();
+        crate::global::mark_boot_completed();
     } else {
         // 宿主常比注入器守护先起，这一刻 boot_done 还没落。等它出现再重放。
         let spawned = std::thread::Builder::new()
             .name("inproc-boot-wait".to_string())
             .spawn(|| {
                 for _ in 0..300 {
-                    std::thread::sleep(Duration::from_secs(2));
                     if boot_done_present() {
                         replay_early_boot_ended();
+                        crate::global::mark_boot_completed();
                         return;
                     }
+                    std::thread::sleep(Duration::from_secs(2));
                 }
-                warn!("boot_done never appeared; skipping early boot ended replay");
+                // 标记一直没落（daemon-injector 没起、或被卡在开机动画）：退到属性监听，
+                // 再拿不到就把这条限制丢掉也不能让进程空等——反正不能静默当作已结束。
+                warn!("boot_done never appeared; falling back to the boot property");
+                crate::global::await_boot_completed();
+                replay_early_boot_ended();
             });
         if let Err(error) = spawned {
             warn!("failed to spawn in-process boot wait: {error}");

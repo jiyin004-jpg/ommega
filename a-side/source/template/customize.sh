@@ -270,69 +270,28 @@ DB_DIR=$CONFIG_DIR/db
 # db 和 logs 不再预建：A 端早就没有写 sessions.db 了，模块目录下这份 logs 也搬去了
 # /data/misc/keystore/ommega/logs（见 service.sh 里那段注释），以前装完就留两个空目录在那儿。
 mkdir -p "$CONFIG_DIR" "$CONF_DIR" "$RUN_DIR"
-# 只支持新路径，不做旧布局搬运：运行文件在模块 `libs/<abi>/`，状态在 conf/run/db/logs。
-for f in props.conf injector.payload pathmask.state pathmask.owned \
-         remote_identity.applied remote_identity.updated empty_permissions.xml \
-         relay.conf log_flag; do
-  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$CONF_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$CONF_DIR/$f"
-done
-# 老版把会话库放在 CONFIG_DIR 下，遇到过才建 db/ 把它搬进去；平时不建。
-for f in sessions.db sessions.db-wal sessions.db-shm; do
-  [ -f "$CONFIG_DIR/$f" ] || continue
-  [ -e "$DB_DIR/$f" ] && continue
-  mkdir -p "$DB_DIR" 2>/dev/null
-  mv -f "$CONFIG_DIR/$f" "$DB_DIR/$f"
-done
 if [ -f "$BINDIR/resetprop" ]; then
   ui_print "- Bundled resetprop installed (no longer depends on the root manager)"
 fi
 rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.all"
-rm -f "$CONFIG_DIR/injector" "$CONFIG_DIR/keymint" "$CONFIG_DIR/ommega-inject" 2>/dev/null
 
 if [ ! -e "$CONFIG_DIR/ommegadata" ] && [ ! -L "$CONFIG_DIR/ommegadata" ]; then
   ln -s /data/misc/keystore/ommega "$CONFIG_DIR/ommegadata"
 fi
 
-# 数据根搬家：以前 keystore 域和 app 域各存一份（config、remote_identity、日志、
-# soter_*、uid_packages、foreground…），现在统一到 /data/misc/keystore/ommega（system_data_file，
-# 两边都读得到）。这里把旧位置的数据搬过来一次，keystore 目录只留密钥材料和 rpc.sock。
-KS_ROOT=/data/misc/keystore/ommega
+# 数据根：/data/misc/keystore/ommega。这里只做权限和默认值，不碰已有内容 ——
+# 装/升级都不能动用户已经配好的东西。
 DATA_ROOT=/data/misc/keystore/ommega
 mkdir -p "$DATA_ROOT/logs" 2>/dev/null
-# 目录 0771：owner（keystore）可读写建文件，group/other 留 x，app 域能按已知路径
-# 进目录读文件（列不了目录，也不需要列）。
-chmod 0771 "$DATA_ROOT" 2>/dev/null
+# 目录 0770：owner（keystore）可读写建文件，别人进不来。app 域不直接读这条路径，
+# 它要的开关和状态全走 maintenance RPC。
+chmod 0770 "$DATA_ROOT" 2>/dev/null
 # owner 必须是 keystore：TA 要在这里落 remote_identity、keymint 要 atomic replace
 # config.toml，都得目录可写（main.rs 降权后改不动 owner，只能在 root 这边做）。
-chown keystore:keystore "$DATA_ROOT" 2>/dev/null
+chown root:keystore "$DATA_ROOT" 2>/dev/null
 chown keystore:keystore "$DATA_ROOT/logs" 2>/dev/null
-# logs 用 sticky：app 域的 payload 要写日志，sticky 拦住删改别人的文件。
+# logs 用 sticky：owner 是 keystore，root 侧靠属主写。
 chmod 1777 "$DATA_ROOT/logs" 2>/dev/null
-for f in config.toml config remote_identity soter_cpu_id uid_packages foreground \
-         soter_attk.pem soter_asks.json injector.toml target.txt unlock.state; do
-  [ -f "$KS_ROOT/$f" ] || continue
-  if [ -e "$DATA_ROOT/$f" ]; then
-    # 新位置已有（已经是权威副本），旧的那份直接删掉。
-    rm -f "$KS_ROOT/$f" 2>/dev/null
-  elif cp -f "$KS_ROOT/$f" "$DATA_ROOT/$f" 2>/dev/null; then
-    # 先复制、确认落地了再删源。直接 mv + rm 会在跨目录权限不够时丢掉数据。
-    rm -f "$KS_ROOT/$f" 2>/dev/null
-  fi
-done
-# 搬过来的文件最终归 keystore：keymint 要原子替换 config.toml、TA 要写 remote_identity，
-# cp 出来的 owner 是 root 时，降权后的 keymint 自己 chown 不了。
-for f in config.toml config soter_cpu_id uid_packages foreground soter_attk.pem \
-         soter_asks.json injector.toml target.txt unlock.state; do
-  [ -f "$DATA_ROOT/$f" ] && chown keystore:keystore "$DATA_ROOT/$f" 2>/dev/null
-done
-for f in "$KS_ROOT"/logs/*; do
-  [ -f "$f" ] || continue
-  if [ -e "$DATA_ROOT/logs/${f##*/}" ]; then
-    rm -f "$f" 2>/dev/null
-  elif cp -f "$f" "$DATA_ROOT/logs/" 2>/dev/null; then
-    rm -f "$f" 2>/dev/null
-  fi
-done
 # 面板保存的平铺配置。装完就该有一份默认值：没有它 injector 只能用内置默认，
 # 面板打开也是空的。只在缺的时候写，不覆盖用户改过。
 # token 不写默认值：这份文件是 0644、app 域读得到的，往里面塞一个真实

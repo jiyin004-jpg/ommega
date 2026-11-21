@@ -148,8 +148,18 @@ pub fn await_boot_completed() {
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
 
-    BOOT_COMPLETED.store(true, Ordering::Release);
-    log::info!("wait_for_boot_completed done, triggering GC");
+    mark_boot_completed();
+}
+
+/// 开机已完成：放开 GC 闸门。
+///
+/// 标记文件（`boot_done`）比属性靠谱，看到标记的路径也得能置位，否则 GC 永远在
+/// 「boot not completed」上打转（`gc.rs` 里那句 skip）。
+pub(crate) fn mark_boot_completed() {
+    if BOOT_COMPLETED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    log::info!("boot completed; triggering GC");
     GC.notify_gc();
 }
 

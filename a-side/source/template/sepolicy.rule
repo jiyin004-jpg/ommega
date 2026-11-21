@@ -41,9 +41,13 @@ allow crash_dump keystore process *
 # payload 跑在 keystore 域里，要读写 /data/misc/keystore/ommega 下的配置、心跳、日志。
 # 这一块以前完全靠上面的 permissive 兜着，每笔访都在内核里记一条 denied 审计；
 # 写清楚之后审计不再刷，将来真收紧也不会炸。
-allow keystore system_data_file file { read open getattr write create }
+#
+# keymaster.db 在数据根里，SQLite 会自己开 journal、加锁、删 journal，少了 lock/unlink/rename
+# 就是每写一笔刷三条 denied（实测）。injector.log 的轮转要 append/setattr。
+allow keystore system_data_file file { read open getattr write create lock unlink rename setattr }
+allow keystore system_data_file dir { read open search getattr write add_name remove_name }
 allow keystore system_app_data_file dir { read open search getattr lock write add_name }
-allow keystore system_app_data_file file { read open getattr write create }
+allow keystore system_app_data_file file { read open getattr write create append setattr }
 # 远程出证的连接收尾（reqwest 关闭 tcp）。
 allow keystore self tcp_socket { shutdown }
 

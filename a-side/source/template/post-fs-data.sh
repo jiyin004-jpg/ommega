@@ -260,14 +260,6 @@ chown 1017:1017 "$TARGET_CONF" "$TARGET_TARGET_LIST" 2>/dev/null || true
 
 # Keybox 就在数据根里，跟面板（webroot）写的是一份 —— 面板没有 keystore 目录的写权限，
 # 放那边就是面板改了永远不生效。TEE 和 StrongBox 两份各自独立，各用各的级别。
-# 一次性迁移：老版本把 keybox 放在 keystore 目录，那份还存在的话搬过来。
-for pair in "keybox_tee.xml" "keybox_strongbox.xml"; do
-  old=/data/misc/keystore/ommega/$pair
-  new=$TARGET_DIR/$pair
-  if [ ! -f "$new" ] && [ -f "$old" ]; then
-    cp "$old" "$new" 2>/dev/null || true
-  fi
-done
 if [ ! -f "$TARGET_KEYBOX" ] && [ -f "$MODDIR/keybox_tee.xml" ]; then
   cp "$MODDIR/keybox_tee.xml" "$TARGET_KEYBOX"
 fi

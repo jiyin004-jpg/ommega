@@ -572,10 +572,16 @@ fn run() -> Result<()> {
     // 只读属性在 payload 里不一定能成（静态链接，读属性要 exec resetprop，热重启后
     // 那个 exec 可能被拒）；读不到就等于「还没开机完」，earlyBootEnded 永远不会重放，
     // TA 就一直停在 in_early_boot——EARLY_BOOT_ONLY 的导入限制整个失效。
+    //
+    // 重放是 best-effort：它会去建 StrongBox 那一路的包装器，个别机型（VINTF 声明了
+    // StrongBox 但服务拉不起来）会回 UNKNOWN_ERROR。那种情况下把它当致命错误就让守护
+    // 起不来了（watchdog 会一直重拉），比丢掉一次重放严重得多。
     if crate::global::boot_done_present() {
-        crate::keymaster::maintenance::replay_early_boot_ended()
-            .context("failed to replay earlyBootEnded to KeyMint wrappers")?;
-        info!("early boot ended replayed at startup");
+        match crate::keymaster::maintenance::replay_early_boot_ended() {
+            Ok(()) => info!("early boot ended replayed at startup"),
+            Err(error) => warn!("failed to replay earlyBootEnded at startup: {error:#}"),
+        }
+        crate::global::mark_boot_completed();
     } else {
         // 开机那会儿我们可能比 root 侧早：等标记出现再重放，等不到再退到属性监听。
         std::thread::spawn(move || {
@@ -584,9 +590,10 @@ fn run() -> Result<()> {
                     match crate::keymaster::maintenance::replay_early_boot_ended() {
                         Ok(()) => info!("early boot ended replayed after boot_done"),
                         Err(error) => {
-                            error!("failed to replay earlyBootEnded after boot_done: {error:#}")
+                            warn!("failed to replay earlyBootEnded after boot_done: {error:#}")
                         }
                     }
+                    crate::global::mark_boot_completed();
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -594,7 +601,7 @@ fn run() -> Result<()> {
             // 标记一直没出现：退到属性监听，仍然拿不到就算了（下一笔请求不受影响）。
             global::await_boot_completed();
             if let Err(error) = crate::keymaster::maintenance::replay_early_boot_ended() {
-                error!("failed to replay earlyBootEnded after boot completed: {error:#}");
+                warn!("failed to replay earlyBootEnded after boot completed: {error:#}");
             }
         });
     }
