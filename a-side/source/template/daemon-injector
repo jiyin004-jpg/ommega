@@ -67,6 +67,8 @@ SOTER_STUCK_FILE=/data/misc/ommega/soter_host_stuck
 HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
 # root 侧判出来的宿主体检结论（stub / real），见 sync_soter_host_state。
 SOTER_HOST_STATE_OUT=/data/misc/ommega/soter_host_state
+# 手工接管开关（payload 读它决定要不要替宿主答 App）。写了真值就明确要求注宿主。
+SOTER_APP_SERVE=/data/misc/ommega/soter_app_serve
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
@@ -158,13 +160,17 @@ soter_hidl_platform() {
   return 1
 }
 
-# 要不要把载荷注进 SOTER 宿主。只有两种机器需要：
+# 要不要把载荷注进 SOTER 宿主。三种机器需要：
+#   * 手工/面板要求接管（`soter_app_serve` 写了真值）：App 面向的答复由我们顶；
 #   * HIDL 平台：客户端走 hwservicemanager，那个名字我们顶不了，只能注进宿主截它发往
 #     HAL 的调用；
 #   * 宿主是壳：它压根不发 HAL 请求，得在它进程里替它答 App（见 sync_soter_host_state）。
 # 正常宿主的 AIDL 机器不注 —— 跟以前一样，省一次 ptrace，也不给宿主添每秒一次 HAL 自检
 # 的流量（那个自检会把原厂懒加载 HAL 叫起来抢服务名）。
 soter_host_needs_payload() {
+  case "$(cat "$SOTER_APP_SERVE" 2>/dev/null | tr -d ' \r\n' | tr 'A-Z' 'a-z')" in
+    1|true|on|stub) return 0 ;;
+  esac
   soter_hidl_platform && return 0
   case "$(cat "$SOTER_HOST_STATE_OUT" 2>/dev/null | tr -d ' \r\n')" in
     stub) return 0 ;;
@@ -529,7 +535,9 @@ pending_restart=0
 last_attempt_pid=
 last_attempt_at=0
 retry_cooldown=15
-soter_start_attempted=0
+# 开关的当前意图。只在“开/关切换”时做一次完整的接管/释放，之后按意图维持。
+soter_was_enabled=0
+soter_inject_enabled && soter_was_enabled=1
 # 宿主保活用的节流：宿主不在时最多每 30 秒拉起一次，别每拍都去 am start-service。
 last_soter_start_at=0
 # SOTER 的 HIDL 客户端（cryptoeng 这种）多久点一次注入。
@@ -743,6 +751,25 @@ while true; do
 
   LOG_ON=0
   debug_logging_enabled && LOG_ON=1
+
+  # 开关每拍只读一次。开/关切换时立刻做完整动作，之后按这个意图维持：
+  # 开着就一直维持 HAL 接管 + 宿主注入；关掉就归还原厂 HAL，并把已注入的宿主换掉。
+  soter_on=0
+  soter_inject_enabled && soter_on=1
+  if [ "$soter_on" = "0" ] && [ "$soter_was_enabled" = "1" ]; then
+    log "[injector-daemon] soter_inject off; releasing the takeover and dropping the injected host"
+    [ -f "$MODDIR/soterta.sh" ] && sh "$MODDIR/soterta.sh" disable >>"$LOG_FILE" 2>&1
+    restart_soter_host "soter_inject turned off"
+  elif [ "$soter_on" = "1" ] && [ "$soter_was_enabled" = "0" ]; then
+    log "[injector-daemon] soter_inject on; taking over and starting the host"
+    [ -f "$MODDIR/soterta.sh" ] && sh "$MODDIR/soterta.sh" enable >>"$LOG_FILE" 2>&1
+    last_soter_start_at=0
+    last_soter_hidl_at=0
+    last_soter_pid=
+    last_soter_attempt_at=0
+  fi
+  soter_was_enabled=$soter_on
+
   sync_log_flag
   sync_uid_packages
   if [ $((tick % FOREGROUND_EVERY)) -eq 0 ]; then
@@ -805,14 +832,17 @@ while true; do
     restart_soter_host "it stopped forwarding to the HAL"
   fi
 
-  # 宿主是 bind-only：没人喊就没人起。开了接管但宿主还没起来的，替客户端先喊一声；
-  # 只试一次，不成就靠下一拍的巡检报出来，不在这里循环重试。
-  if soter_inject_enabled && [ "$soter_start_attempted" = "0" ] && [ -z "$(soter_pid)" ]; then
-    soter_start_attempted=1
-    start_soter_service
+  # 宿主是 bind-only：没人喊就没人起。开着接管但宿主不在的，替客户端喊一声；
+  # 30 秒节流，拉起失败下一轮继续，不能只在开机试一次。
+  if [ "$soter_on" = "1" ] && [ -z "$(soter_pid)" ]; then
+    now_start=$(date +%s 2>/dev/null || echo 0)
+    if [ "$now_start" -gt 0 ] && [ $((now_start - last_soter_start_at)) -ge 30 ]; then
+      last_soter_start_at=$now_start
+      start_soter_service
+    fi
   fi
 
-  if soter_inject_enabled; then
+  if [ "$soter_on" = "1" ]; then
     now_hidl=$(date +%s 2>/dev/null || echo 0)
     if [ "$now_hidl" -gt 0 ] && [ $((now_hidl - last_soter_hidl_at)) -ge 60 ]; then
       last_soter_hidl_at=$now_hidl
@@ -837,7 +867,7 @@ while true; do
   # SoterService.apk 17 KB，压根不发 HAL 请求），那种机器只能靠宿主里的载荷把 App 那笔答复
   # 顶掉（`hook/soter.rs` 的 `take_app_answer`）。壳与否由载荷自己判（壳的 APK 里没有 HAL
   # 服务名），真宿主上不会动它。
-  if soter_inject_enabled && soter_host_needs_payload; then
+  if [ "$soter_on" = "1" ] && soter_host_needs_payload; then
     inject_targets=keystore2,soter
   else
     inject_targets=keystore2
