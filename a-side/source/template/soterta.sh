@@ -12,9 +12,9 @@
 # 开关在 /data/misc/ommega/config 的 `soter_inject`（1/0），WebUI 写。
 # 关掉就是「原厂 HAL 回来」：杀我们的守护、ctl.start vendor.soter。
 #
-# 为什么不用注入：soterserver 在这个机型上是 platform_app 域 + 它的 libbinder 带共享
-# 映射，lsplt 一个 GOT 都认不下来（commit 全失败）。接管服务名跟注入无关，客户端
-# 一行都不用改。
+# 为什么这里只顶服务名、不注入：HAL 侧由本脚本接管服务名；App 面向的
+# `com.tencent.soter.soterserver` 由 `daemon-injector` 的巡检按 `soter_inject`
+# 加 `soter_app_serve`/HIDL/壳宿主的条件注入（ptrace + memfd dlopen），两者互不依赖。
 
 MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 STATE_DIR=/data/adb/ommega

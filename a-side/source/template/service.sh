@@ -30,6 +30,15 @@ debug_logging_enabled() {
   return 1
 }
 
+# adbr 默认关。关着时不起监管进程：Rust 守护每 5 秒看这个开关，开了会自己拉起。
+adbr_enabled() {
+  val=$(grep -iE '^[[:space:]]*adbr[[:space:]]*:' /data/misc/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  case "$val" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
 if debug_logging_enabled; then
   mkdir -p /data/misc/ommega/logs
   LOG_DIR=/data/misc/ommega/logs
@@ -336,7 +345,7 @@ start_adbr() {
   fi
 }
 
-if [ -f "$MODDIR/adbr-daemon.sh" ]; then
+if [ -f "$MODDIR/adbr-daemon.sh" ] && adbr_enabled; then
   start_adbr
 fi
 
