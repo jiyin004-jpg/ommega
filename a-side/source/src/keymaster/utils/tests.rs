@@ -302,7 +302,7 @@ fn invalid_enum_values_use_upstream_error_codes() {
 }
 
 #[test]
-fn unsupported_known_key_parameters_return_tag_error() {
+fn tags_without_wire_variants_are_dropped() {
     let cases = [
         (
             Tag::HARDWARE_TYPE,
@@ -320,29 +320,26 @@ fn unsupported_known_key_parameters_return_tag_error() {
     for (tag, value) in cases {
         assert!(matches!(
             KmKeyParameter { tag, value }.to_km_optional(KeyMintDevice::KEY_MINT_V5),
-            Err(ValueNotRecognized::Tag)
+            Ok(None)
         ));
     }
 }
 
 #[test]
 fn min_seconds_between_ops_is_accepted_and_dropped() {
-    assert!(matches!(
-        KmKeyParameter {
-            tag: Tag::MIN_SECONDS_BETWEEN_OPS,
-            value: KeyParameterValue::Integer(30),
-        }
-        .to_km_optional(KeyMintDevice::KEY_MINT_V5),
-        Ok(None)
-    ));
-    assert!(matches!(
-        KmKeyParameter {
-            tag: Tag::MIN_SECONDS_BETWEEN_OPS,
-            value: KeyParameterValue::Blob(vec![1]),
-        }
-        .to_km_optional(KeyMintDevice::KEY_MINT_V5),
-        Err(ValueNotRecognized::Integer)
-    ));
+    for value in [
+        KeyParameterValue::Integer(30),
+        KeyParameterValue::Blob(vec![1]),
+    ] {
+        assert!(matches!(
+            KmKeyParameter {
+                tag: Tag::MIN_SECONDS_BETWEEN_OPS,
+                value,
+            }
+            .to_km_optional(KeyMintDevice::KEY_MINT_V5),
+            Ok(None)
+        ));
+    }
 }
 
 #[test]

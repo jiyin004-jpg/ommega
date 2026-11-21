@@ -610,7 +610,7 @@ impl KmKeyParameter {
                 check_bool!(value)?;
                 Some(KeyParam::RollbackResistance)
             }
-            keymint::Tag::HardwareType => return Err(ValueNotRecognized::Tag),
+            keymint::Tag::HardwareType => None,
             keymint::Tag::EarlyBootOnly => {
                 check_bool!(value)?;
                 Some(KeyParam::EarlyBootOnly)
@@ -639,12 +639,11 @@ impl KmKeyParameter {
                 }
                 _ => return Err(ValueNotRecognized::DateTime),
             },
-            keymint::Tag::MinSecondsBetweenOps => match value {
-                // 软件 TA 没有这个字段，但真实 KeyMint 接受它；限速在包装层做，
-                // 这里只做参数校验并丢弃，别再让 generateKey 以 -38 挂掉。
-                KeyParameterValue::Integer(_) => None,
-                _ => return Err(ValueNotRecognized::Integer),
-            },
+            keymint::Tag::MinSecondsBetweenOps => {
+                // 软件 TA 没有这个字段，但真实 KeyMint 接受它；限速在包装层做。
+                // 与 AOSP HAL 的 filter_map 一致：没有 wire 变体的 tag 直接丢弃。
+                None
+            }
             keymint::Tag::MaxUsesPerBoot => match value {
                 KeyParameterValue::Integer(v) => Some(KeyParam::MaxUsesPerBoot(v as u32)),
                 _ => return Err(ValueNotRecognized::Integer),
@@ -725,7 +724,7 @@ impl KmKeyParameter {
                 KeyParameterValue::Integer(v) => Some(KeyParam::OsPatchlevel(v as u32)),
                 _ => return Err(ValueNotRecognized::Integer),
             },
-            keymint::Tag::UniqueId => return Err(ValueNotRecognized::Tag),
+            keymint::Tag::UniqueId => None,
             keymint::Tag::AttestationChallenge => {
                 blob_param(value, KeyParam::AttestationChallenge)?
             }
@@ -756,7 +755,7 @@ impl KmKeyParameter {
                 check_bool!(value)?;
                 Some(KeyParam::DeviceUniqueAttestation)
             }
-            keymint::Tag::IdentityCredentialKey => return Err(ValueNotRecognized::Tag),
+            keymint::Tag::IdentityCredentialKey => None,
             keymint::Tag::StorageKey => {
                 check_bool!(value)?;
                 Some(KeyParam::StorageKey)
@@ -769,7 +768,7 @@ impl KmKeyParameter {
             keymint::Tag::AttestationIdSecondImei => {
                 blob_param(value, KeyParam::AttestationIdSecondImei)?
             }
-            keymint::Tag::AssociatedData => return Err(ValueNotRecognized::Tag),
+            keymint::Tag::AssociatedData => None,
             keymint::Tag::Nonce => blob_param(value, KeyParam::Nonce)?,
             keymint::Tag::MacLength => match value {
                 KeyParameterValue::Integer(v) => Some(KeyParam::MacLength(v as u32)),
@@ -779,7 +778,7 @@ impl KmKeyParameter {
                 check_bool!(value)?;
                 Some(KeyParam::ResetSinceIdRotation)
             }
-            keymint::Tag::ConfirmationToken => return Err(ValueNotRecognized::Tag),
+            keymint::Tag::ConfirmationToken => None,
             keymint::Tag::CertificateSerial => blob_param(value, KeyParam::CertificateSerial)?,
             keymint::Tag::CertificateSubject => blob_param(value, KeyParam::CertificateSubject)?,
             keymint::Tag::CertificateNotBefore => match value {

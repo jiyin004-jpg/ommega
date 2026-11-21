@@ -622,36 +622,6 @@ fn add_min_seconds_characteristic(
     });
 }
 
-fn begin_key_parameters_to_km(
-    params: &[KeyParameter],
-    version_number: i32,
-) -> std::result::Result<Vec<KeyParam>, ValueNotRecognized> {
-    let mut filtered = Vec::with_capacity(params.len());
-    for param in params {
-        match param.r#tag {
-            Tag::ASSOCIATED_DATA | Tag::CONFIRMATION_TOKEN | Tag::UNIQUE_ID => match &param.r#value
-            {
-                KeyParameterValue::Blob(_) => continue,
-                _ => return Err(ValueNotRecognized::Blob),
-            },
-            Tag::MIN_SECONDS_BETWEEN_OPS => match &param.r#value {
-                KeyParameterValue::Integer(_) => continue,
-                _ => return Err(ValueNotRecognized::Integer),
-            },
-            Tag::HARDWARE_TYPE => match &param.r#value {
-                KeyParameterValue::SecurityLevel(_) => continue,
-                _ => return Err(ValueNotRecognized::SecurityLevel),
-            },
-            Tag::IDENTITY_CREDENTIAL_KEY => match &param.r#value {
-                KeyParameterValue::BoolValue(true) => continue,
-                _ => return Err(ValueNotRecognized::Bool),
-            },
-            _ => filtered.push(param.clone()),
-        }
-    }
-    key_parameters_to_km(&filtered, version_number)
-}
-
 #[allow(non_snake_case)]
 impl IKeyMintDevice for KeyMintWrapper {
     fn begin(
@@ -662,7 +632,7 @@ impl IKeyMintDevice for KeyMintWrapper {
         auth_token: Option<&HardwareAuthToken>,
     ) -> Result<crate::android::hardware::security::keymint::BeginResult::BeginResult, Status> {
         let version_number = resolve_hardware_profile(self.security_level).version_number;
-        let km_params = begin_key_parameters_to_km(params, version_number)
+        let km_params = key_parameters_to_km(params, version_number)
             .map_err(key_parameter_conversion_status)?;
 
         let now = Instant::now();
@@ -1867,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_conversion_skips_plain_accepted_metadata_tags() {
+    fn conversion_drops_tags_without_wire_variants() {
         let params = vec![
             param(
                 Tag::PURPOSE,
@@ -1888,30 +1858,31 @@ mod tests {
         ];
 
         assert_eq!(
-            begin_key_parameters_to_km(&params, KeyMintDevice::KEY_MINT_V5).unwrap(),
+            key_parameters_to_km(&params, KeyMintDevice::KEY_MINT_V5).unwrap(),
             vec![KeyParam::Purpose(kmr_wire::keymint::KeyPurpose::Sign)]
         );
     }
 
     #[test]
-    fn begin_conversion_keeps_malformed_begin_params_rejected() {
+    fn conversion_keeps_malformed_supported_params_rejected() {
         assert!(matches!(
-            begin_key_parameters_to_km(
+            key_parameters_to_km(
                 &[param(Tag::USER_AUTH_TYPE, KeyParameterValue::Integer(2))],
                 KeyMintDevice::KEY_MINT_V5
             ),
             Err(ValueNotRecognized::HardwareAuthenticatorType)
         ));
-        assert!(matches!(
-            begin_key_parameters_to_km(
+        assert_eq!(
+            key_parameters_to_km(
                 &[param(
                     Tag::IDENTITY_CREDENTIAL_KEY,
                     KeyParameterValue::BoolValue(false),
                 )],
                 KeyMintDevice::KEY_MINT_V5
-            ),
-            Err(ValueNotRecognized::Bool)
-        ));
+            )
+            .unwrap(),
+            vec![]
+        );
     }
 
     fn test_crypto() -> kmr_common::crypto::Implementation {
