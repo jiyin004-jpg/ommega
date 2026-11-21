@@ -1353,6 +1353,34 @@ const APP_ERR_EMPTY_CHALLENGE: i32 = -203;
 /// （`OPERATEID_NULL`），两个码在 App 眼里不是一回事，检测器也是按 -1000 判的。
 pub(crate) const SESSION_NOT_FOUND: i32 = -1000;
 
+/// 不是本进程开的那批会话号（TA 腿透传后由 TA 落号）。finishSign 遇到它们要放行，
+/// 不能因为本进程不认识就断言「不存在」。60 秒过期，跟签名会话的寿命一致。
+static REMOTE_SESSIONS: Mutex<Option<std::collections::HashMap<i64, std::time::Instant>>> =
+    Mutex::new(None);
+const REMOTE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn note_remote_session(session: i64) {
+    let Ok(mut guard) = REMOTE_SESSIONS.lock() else {
+        return;
+    };
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|_, at| at.elapsed() <= REMOTE_SESSION_TTL);
+    if map.len() > 256 {
+        map.clear();
+    }
+    map.insert(session, std::time::Instant::now());
+}
+
+fn is_remote_session(session: i64) -> bool {
+    let Ok(guard) = REMOTE_SESSIONS.lock() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .and_then(|map| map.get(&session))
+        .is_some_and(|at| at.elapsed() <= REMOTE_SESSION_TTL)
+}
+
 /// 算出一笔 App 面向调用的答复。`caller_uid` 是拿谁的 uid 去建/查料：
 /// 宿主里是内核填的 `sender_euid`，自测端点里是命令行给的 uid。
 pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAnswer> {
@@ -1444,7 +1472,13 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
             ));
             // finishSign 我们说了算但又确实没这张会话：按原厂 TA 的词汇回 -1000。
             // 透传下去 App 拿到的是宿主的 -204（OPERATEID_NULL），那是另一种说法。
+            //
+            // 例外：这张会话是别处（TA 那边走透传）开的，就不归我们断言「不存在」——
+            // 得放它去问开它的那一边，否则真会话会被我们答成 -1000。
             if call.code == 10 {
+                if call.session.is_some_and(is_remote_session) {
+                    return None;
+                }
                 return Some(AppAnswer::Export {
                     code: SESSION_NOT_FOUND,
                     data: None,
@@ -1453,6 +1487,15 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
             return None;
         }
     };
+    // initSign 要不是本地答的，就把这个会话号记下来：后面的 finishSign 遇到它要放行，
+    // 不能因为「本进程不认识」就说它不存在。
+    if call.code == 9 && !local_session {
+        if let Answer::Init { session, .. } = answer {
+            if session > 0 {
+                note_remote_session(session);
+            }
+        }
+    }
     Some(match (call.code, answer) {
         (1 | 4 | 5 | 7, Answer::Code(code)) => AppAnswer::Int(code),
         // App 那边的 `has*` 是布尔：语义是「我们答成功了吗」。
