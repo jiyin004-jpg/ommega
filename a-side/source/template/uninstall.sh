@@ -4,17 +4,14 @@
 # Runs automatically when the module is removed via a root manager
 # (KernelSU / Magisk / APatch). Removes every runtime artifact the A-side
 # creates so an uninstall leaves no residue: daemon processes, the whole
-# /data/misc/keystore/ommega tree, the key material and Keymaster DB that stay in
-# /data/misc/keystore/ommega, A-side files under the shared
-# /data/adb/ommega state dir, and WebUI temp files.
+# /data/misc/keystore/ommega tree (config, logs, keybox, Keymaster DB, RPC
+# socket), A-side files under the shared /data/adb/ommega state dir, and
+# WebUI temp files.
 
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
 RUN_DIR=$STATE_DIR/run
 OMMEGA_DIR=/data/misc/keystore/ommega
-# 密钥材料（keybox）、Keymaster 数据库、RPC socket 还留在 keystore 目录里 ——
-# 数据根搬到 /data/misc/keystore/ommega 之后，这里只剩这几样。
-KS_DIR=/data/misc/keystore/ommega
 
 # ---------------------------------------------------------------------------
 # 1. Stop runtime processes
@@ -109,24 +106,13 @@ rm -f "$STATE_DIR/conf/pathmask.state" "$STATE_DIR/kmod-loader.log"
 
 # ---------------------------------------------------------------------------
 # 2. Remove the A-side data tree
-#    config, logs, crash counter, webroot cache, and the standing-unlock
-#    mirror (unlock.state) — that last one holds the LSKF material the framework
-#    handed to keystore2, so it must not outlive the module. This is A-side-only,
-#    so deleting it wholesale is safe.
+#    一份树同时装着两边的活：配置、日志、崩溃计数、面板缓存、
+#    unlock.state（框架交给 keystore2 的 LSKF 材料，不能活过卸载）、
+#    keybox_tee.xml / keybox_strongbox.xml、data/ 下的 Keymaster DB、rpc.sock 与 rpc.peers。
+#    密钥材料不能活过卸载，旧的 DB 也不能留给下一次重装。整棵删。
 # ---------------------------------------------------------------------------
-rm -f "$OMMEGA_DIR/unlock.state"
+rm -f "$OMMEGA_DIR/unlock.state" 2>/dev/null
 rm -rf "$OMMEGA_DIR"
-
-# ---------------------------------------------------------------------------
-# 2b. Remove the keystore-side tree
-#     keybox_tee.xml / keybox_strongbox.xml, the Keymaster DB under data/, and the
-#     RPC socket + peer table live here.  Key material must not survive an
-#     uninstall, and a leftover DB would be picked up again by a later reinstall.
-# ---------------------------------------------------------------------------
-rm -f "$KS_DIR/keybox_tee.xml" "$KS_DIR/keybox_strongbox.xml" 2>/dev/null
-rm -rf "$KS_DIR/data" "$KS_DIR/backups" 2>/dev/null
-rm -f "$KS_DIR/rpc.sock" "$KS_DIR/rpc.peers" 2>/dev/null
-rmdir "$KS_DIR" 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # 3. Remove A-side files under the shared state dir
@@ -136,8 +122,10 @@ rmdir "$KS_DIR" 2>/dev/null
 rm -f "$STATE_DIR/ommegadata"          # symlink -> /data/misc/keystore/ommega
 rm -f "$STATE_DIR/keymint"             # hot-update binary
 rm -f "$STATE_DIR/ommega-inject"       # hot-update binary
-rm -f "$STATE_DIR/injector"            # legacy hot-update binary
+rm -f "$STATE_DIR/injector"            # 旧版热更新二进制
 rm -f "$STATE_DIR/resetprop"           # 模块自带的 resetprop（安装时从 libs/<abi> 拷过来那份）
+# 迁移时把老数据根整体搬到这里的备份（里面是旧的 ASK 私钥和 token），不能留。
+rm -rf "$STATE_DIR"/legacy-*
 rm -f "$RUN_DIR/restart.keymint"
 rm -f "$RUN_DIR/restart.injector"
 rm -f "$RUN_DIR/restart.all"
@@ -145,6 +133,11 @@ rm -f "$RUN_DIR/keymint-daemon.pid"
 rm -f "$RUN_DIR/injector-daemon.pid"
 rm -f "$RUN_DIR/spl_daemon.retry" 2>/dev/null
 rmdir "$RUN_DIR" 2>/dev/null
+# A 端自己的配置副本（伪装项、mask、身份镜像、注入器状态）：卸载后没人再读，
+# 特别是 props.conf 里的启动哈希/补丁值和 remote_identity 镜像，不能留在机器上。
+rm -f "$STATE_DIR/conf/props.conf" "$STATE_DIR/conf/mask.state" "$STATE_DIR/conf/mask.binds" \
+      "$STATE_DIR/conf/remote_identity.applied" "$STATE_DIR/conf/remote_identity.updated" \
+      "$STATE_DIR/conf/injector.payload" "$STATE_DIR/conf/soter_hal.cache" 2>/dev/null
 # HIDL 平台缓存（soterta.sh 算完落的那份）：换机器/重装时不该沿用上一次的结论。
 rm -f "$STATE_DIR/conf/soter_hidl_platform" 2>/dev/null
 # 以前一个脚本一个日志文件，现在统一成 daemon.log；把旧的散件也收掉。
