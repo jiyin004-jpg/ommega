@@ -308,7 +308,6 @@ fn unsupported_known_key_parameters_return_tag_error() {
             Tag::HARDWARE_TYPE,
             KeyParameterValue::SecurityLevel(SecurityLevel::TRUSTED_ENVIRONMENT),
         ),
-        (Tag::MIN_SECONDS_BETWEEN_OPS, KeyParameterValue::Integer(30)),
         (Tag::UNIQUE_ID, KeyParameterValue::Blob(vec![1])),
         (
             Tag::IDENTITY_CREDENTIAL_KEY,
@@ -324,6 +323,26 @@ fn unsupported_known_key_parameters_return_tag_error() {
             Err(ValueNotRecognized::Tag)
         ));
     }
+}
+
+#[test]
+fn min_seconds_between_ops_is_accepted_and_dropped() {
+    assert!(matches!(
+        KmKeyParameter {
+            tag: Tag::MIN_SECONDS_BETWEEN_OPS,
+            value: KeyParameterValue::Integer(30),
+        }
+        .to_km_optional(KeyMintDevice::KEY_MINT_V5),
+        Ok(None)
+    ));
+    assert!(matches!(
+        KmKeyParameter {
+            tag: Tag::MIN_SECONDS_BETWEEN_OPS,
+            value: KeyParameterValue::Blob(vec![1]),
+        }
+        .to_km_optional(KeyMintDevice::KEY_MINT_V5),
+        Err(ValueNotRecognized::Integer)
+    ));
 }
 
 #[test]
