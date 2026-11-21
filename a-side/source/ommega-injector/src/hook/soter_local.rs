@@ -1347,6 +1347,7 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
 
 /// 把某个 uid 的计数写回去（已有就替换、没有就追加），其它行原样保留。
 /// 文本格式跟 daemon 共用一份，这里只是转发。
+#[cfg(test)]
 fn set_counter(text: &str, uid: i32, value: u64) -> String {
     kmr_common::soter_counter::set_counter(text, uid, value)
 }
