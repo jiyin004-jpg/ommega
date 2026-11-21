@@ -2,11 +2,9 @@
 
 [中文](CHANGELOG.md)
 
-## 1.7.17
+## 1.7.18
 
-- Fixed the module showing a startup failure on some devices (payload could not be injected).
-- Fixed key operations in apps waiting 15 seconds each when the local key service takes long to initialize (a detector run is now an order of magnitude faster).
-- Fixed occasional long stalls in the local SOTER service.
-- Fixed deleted key material being regenerated in some cases.
+- Key attributes reported to apps now match the attestation certificate, so the key security level no longer conflicts in some cases.
+- Key access rate limiting follows the system standard.
+- Toggling the local SOTER service now takes over or releases it completely, applying immediately without a restart.
 - Stability and compatibility improvements.
-- General usability polish.
