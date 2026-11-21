@@ -82,6 +82,12 @@ pub struct AttestationParams {
     pub boot_patch_level: Option<i64>,
     pub app_id: Option<Vec<u8>>,
     pub creation_datetime_ms: u64,
+    /// 时间授权（ms since epoch）：ACTIVE_DATETIME(400) / ORIGINATION_EXPIRE(401) /
+    /// USAGE_EXPIRE(402)。AOSP 的 KeyDescription 允许这几项；不写的话链上就声明不出
+    /// 「钥匙什么时候生效、什么时候过期」。
+    pub active_datetime_ms: Option<i64>,
+    pub origination_expire_ms: Option<i64>,
+    pub usage_expire_ms: Option<i64>,
     /// Leaf certificate subject (DER Name) requested by the caller; defaults to
     /// "CN=Android Keystore Key" when absent.
     pub subject_name: Option<Vec<u8>>,
@@ -149,6 +155,9 @@ impl Default for AttestationParams {
             boot_patch_level: None,
             app_id: None,
             creation_datetime_ms: 0,
+            active_datetime_ms: None,
+            origination_expire_ms: None,
+            usage_expire_ms: None,
             subject_name: None,
             attestation_ids: Vec::new(),
             user_auth: Vec::new(),
@@ -237,6 +246,16 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
     }
     if p.rsa_public_exponent.is_some() {
         tags.push(200);
+    }
+    // 时间授权 400/401/402：整型毫秒。tags 最后会排序，这里只登记。
+    if p.active_datetime_ms.is_some() {
+        tags.push(400);
+    }
+    if p.origination_expire_ms.is_some() {
+        tags.push(401);
+    }
+    if p.usage_expire_ms.is_some() {
+        tags.push(402);
     }
     if !p.mgf_digest.is_empty() {
         tags.push(203);
@@ -356,6 +375,26 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                             }
                         })
                     });
+                }
+                // ACTIVE_DATETIME / ORIGINATION_EXPIRE_DATETIME / USAGE_EXPIRE_DATETIME：
+                // AOSP 的 AuthorizationList 里是 EXPLICIT INTEGER（毫秒）。
+                400 => {
+                    if let Some(v) = p.active_datetime_ms {
+                        w.next()
+                            .write_tagged(yasna::Tag::context(400), |w| w.write_i64(v));
+                    }
+                }
+                401 => {
+                    if let Some(v) = p.origination_expire_ms {
+                        w.next()
+                            .write_tagged(yasna::Tag::context(401), |w| w.write_i64(v));
+                    }
+                }
+                402 => {
+                    if let Some(v) = p.usage_expire_ms {
+                        w.next()
+                            .write_tagged(yasna::Tag::context(402), |w| w.write_i64(v));
+                    }
                 }
                 503 | 506 | 507 | 508 | 509 => {
                     w.next().write_tagged(yasna::Tag::context(tag), |w| {
@@ -1236,9 +1275,15 @@ fn build_chain_signed_by(
     exts_content
         .0
         .extend(ext_entry(OID_KEY_USAGE, true, &ku_der));
-    exts_content
-        .0
-        .extend(ext_entry(ATTESTATION_OID, false, &ext_value));
+    // 没有 attestation challenge 就没有证明：AOSP 的 TA 在这种情况下不往叶子
+    // 里写证明扩展（`No attestation challenge, so no attestation`）。硬写一个带
+    // TEE 安全级别的扩展，就是「无 challenge 却拿到了硬件证明」——检测器判
+    // ATTEST_PURPOSE_CONSTRAINT。（KeyUsage 留着，它说的是钥匙自己的能力。）
+    if !p.challenge.is_empty() {
+        exts_content
+            .0
+            .extend(ext_entry(ATTESTATION_OID, false, &ext_value));
+    }
     let mut exts = Der::new();
     exts.seq(&exts_content.into_vec());
     t.explicit(3, &exts.into_vec());

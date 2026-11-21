@@ -922,6 +922,15 @@ impl RemoteRelay {
             "certificate_not_after_ms",
             params.certificate_not_after_ms,
         );
+        // 时间授权：不转出去的话，服务端铸出来的链授权集里没有 400/401/402，
+        // 检测器会判「密钥生效时间授权缺失」。
+        put(&mut ctx, "active_datetime_ms", params.active_datetime_ms);
+        put(
+            &mut ctx,
+            "origination_expire_ms",
+            params.origination_expire_ms,
+        );
+        put(&mut ctx, "usage_expire_ms", params.usage_expire_ms);
         put(
             &mut ctx,
             "certificate_serial",

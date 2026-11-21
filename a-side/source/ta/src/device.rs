@@ -196,6 +196,12 @@ pub struct RemoteAttestParams {
     /// Certificate validity bounds (ms since epoch).
     pub certificate_not_before_ms: Option<i64>,
     pub certificate_not_after_ms: Option<i64>,
+    /// 时间授权（ms since epoch）：ACTIVE_DATETIME(400) / ORIGINATION_EXPIRE(401) /
+    /// USAGE_EXPIRE(402)。它们必须随请求转给中继并写进证书授权集，否则链上声明
+    /// 不出「生效/过期时间」，检测器会判密钥生效时间授权缺失。
+    pub active_datetime_ms: Option<i64>,
+    pub origination_expire_ms: Option<i64>,
+    pub usage_expire_ms: Option<i64>,
     /// Requesting KeyMint security level (raw `SecurityLevel` enum value:
     /// 1 = TEE, 2 = StrongBox). Forwarded so the relay tags the attestation
     /// extension (`attestationSecurityLevel`/`keymasterSecurityLevel`) with the

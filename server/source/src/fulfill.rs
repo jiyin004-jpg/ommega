@@ -735,6 +735,10 @@ impl Fulfill {
             }
         }
         p.app_id = b64("attestation_application_id");
+        // 时间授权：A 端把 ACTIVE/ORIGINATION_EXPIRE/USAGE_EXPIRE 转过来，这里写回证书。
+        p.active_datetime_ms = ctx.get("active_datetime_ms").and_then(Value::as_i64);
+        p.origination_expire_ms = ctx.get("origination_expire_ms").and_then(Value::as_i64);
+        p.usage_expire_ms = ctx.get("usage_expire_ms").and_then(Value::as_i64);
         // creation_datetime_ms: from context or default to current time (matches Django)
         p.creation_datetime_ms = ctx
             .get("creation_datetime_ms")

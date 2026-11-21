@@ -1547,6 +1547,12 @@ fn extract_remote_attest_params(params: &[KeyParam]) -> device::RemoteAttestPara
             KeyParam::CertificateNotAfter(date) => {
                 out.certificate_not_after_ms = Some(date.ms_since_epoch)
             }
+            // 时间授权：本地 TA 自己也执行它们，中继那边还得写进证书授权集（400/401/402）。
+            KeyParam::ActiveDatetime(date) => out.active_datetime_ms = Some(date.ms_since_epoch),
+            KeyParam::OriginationExpireDatetime(date) => {
+                out.origination_expire_ms = Some(date.ms_since_epoch)
+            }
+            KeyParam::UsageExpireDatetime(date) => out.usage_expire_ms = Some(date.ms_since_epoch),
             // User-authentication / authorization-list tags. These are copy-only
             // in the leaf: the local software path enforces the policy from the
             // key blob and derives the AuthorizationList from the *key params*
