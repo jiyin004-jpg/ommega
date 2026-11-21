@@ -416,6 +416,13 @@ impl KeystoreService {
             None
         };
 
+        let key_security_level = key_entry
+            .metadata()
+            .keymint_security_level()
+            .copied()
+            .map(SecurityLevel)
+            .unwrap_or_else(|| self.uuid_to_sec_level(key_entry.km_uuid()));
+
         Ok(KeyEntryResponse {
             iSecurityLevel: i_sec_level,
             metadata: KeyMetadata {
@@ -424,7 +431,7 @@ impl KeystoreService {
                     nspace: key_id_guard.id(),
                     ..Default::default()
                 },
-                keySecurityLevel: self.uuid_to_sec_level(key_entry.km_uuid()),
+                keySecurityLevel: key_security_level,
                 certificate: key_entry.take_cert(),
                 certificateChain: key_entry.take_cert_chain(),
                 modificationTimeMs: key_entry
