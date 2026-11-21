@@ -48,8 +48,12 @@ allow keystore system_data_file file { read open getattr write create lock unlin
 allow keystore system_data_file dir { read open search getattr write add_name remove_name }
 allow keystore system_app_data_file dir { read open search getattr lock write add_name }
 allow keystore system_app_data_file file { read open getattr write create append setattr }
-# 远程出证的连接收尾（reqwest 关闭 tcp）。
-allow keystore self tcp_socket { shutdown }
+# 远程出证的连接：reqwest 要建 socket、连、读写、收尾（之前只放了 shutdown，其余全靠
+# permissive 兜，每笔连接都在内核里刷几条 denied）。链路上会去读网卡状态、查权限服务，
+# 一并写清。
+allow keystore self tcp_socket { create connect read write getattr shutdown }
+allow keystore sysfs_net { dir { read open getattr search } file { read open getattr } }
+allow keystore permissionmgr_service service_manager find
 
 # 工程模式建 ID attestation 钥匙时检查调用方的 gen_unique_id。
 allow engineermode_app keystore keystore2_key { gen_unique_id }
