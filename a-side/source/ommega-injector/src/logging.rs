@@ -77,7 +77,11 @@ pub fn enabled() -> bool {
 /// 这里必须真去读文件：payload 落进读不到 keystore 目录的域时，开关只能从
 /// daemon-injector 写下的副本里看，那个副本是会变的。
 pub fn refresh_switch() -> bool {
-    let now_enabled = crate::config::clienta_debug_logging().unwrap_or(false);
+    // 读不到（daemon 未就绪 / 保留名单 / 闸门）时**不要**当成「关着」："
+    // 面板明明开着，撞上一次 RPC 抖动就把日志静音了。没信号就保持原状。
+    let Some(now_enabled) = crate::config::clienta_debug_logging() else {
+        return false;
+    };
     if now_enabled == ENABLED.load(Ordering::Relaxed) {
         return false;
     }
@@ -180,6 +184,15 @@ impl log::Log for RpcLogger {
         if !self.enabled(record.metadata()) || !rpc_log_budget_left() {
             return;
         }
+        // 两种不转：
+        // 1. `event=soter` 这几行本来就已经走 `report_event` 送过一遍，再转一次会
+        //    把 `soter_host_health` 的观测双计（判据会被带偏）。
+        // 2. daemon 收到 reportHookEvent 后又用 info 记一遍，而它自己可能正好是装了
+        //    这个桥的进程——不挡就成了跨线程自持回环。
+        let text = record.args().to_string();
+        if text.contains("event=soter") || record.target().starts_with("ommega::keymaster") {
+            return;
+        }
         if IN_RPC_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -187,7 +200,7 @@ impl log::Log for RpcLogger {
             "[payload] {} {} - {}",
             record.level(),
             record.target(),
-            record.args()
+            text
         ));
         IN_RPC_LOG.store(false, std::sync::atomic::Ordering::Relaxed);
     }

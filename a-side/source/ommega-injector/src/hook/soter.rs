@@ -23,6 +23,7 @@ use crate::hook::binder::{
     BR_TRANSACTION_COMPLETE_CMD, TF_ONE_WAY,
 };
 use crate::hook::soter_local::{self, Answer};
+use crate::hook::soter_relay::Verdict;
 use crate::parcel::{
     build_app_export_reply, build_app_extra_param_reply, build_app_int_reply,
     build_app_session_reply, build_hidl_soter_buffer_reply, build_hidl_soter_init_reply,
@@ -1422,27 +1423,35 @@ pub(crate) fn answer_app_call(call: &SoterCall, caller_uid: i32) -> Option<AppAn
     // finishSign 的会话要是本进程开的（init 那笔本地答的），这一笔也必须本地答：
     // 问远程就是 B 端不认识这个句柄，直接 -204。
     let local_session = hal_code == 4 && hal_call.session.is_some_and(soter_local::has_session);
-    let answer = if local_session {
-        soter_local::answer(&hal_call)
-    } else {
-        crate::hook::soter_relay::answer(&hal_call)
-    };
-    let Some(answer) = answer else {
-        // 宿主里文件日志是哑的；答不出来这件事只能顺 RPC 让 daemon 记下来。
-        crate::ipc::report_event(format!(
-            "event=soter app answer none code={} hal_code={hal_code} caller_uid={caller_uid} local_session={local_session}",
-            call.code
-        ));
-        // finishSign 谁都不认识这张会话：按原厂 TA 的词汇回 -1000。透传下去 App 拿到的是
-        // 宿主的 -204（OPERATEID_NULL），那是另一种说法，跟真机对不上；而且这本来就是个
-        // 拒绝，不该把错误码换成宿主的。
-        if call.code == 10 {
-            return Some(AppAnswer::Export {
-                code: SESSION_NOT_FOUND,
-                data: None,
-            });
+    let verdict = if local_session {
+        match soter_local::answer(&hal_call) {
+            Some(answer) => Verdict::Answered(answer),
+            None => Verdict::Unknown,
         }
-        return None;
+    } else {
+        crate::hook::soter_relay::verdict(&hal_call)
+    };
+    let answer = match verdict {
+        Verdict::Answered(answer) => answer,
+        // 这笔不归我们答（配置要透传 / 问不到 daemon）：宿主自己那份答复照旧过去，
+        // 不能把真 HAL 刚签成功的答复换成错误码。
+        Verdict::Passthrough => return None,
+        Verdict::Unknown => {
+            // 宿主里文件日志是哑的；答不出来这件事只能顺 RPC 让 daemon 记下来。
+            crate::ipc::report_event(format!(
+                "event=soter app answer none code={} hal_code={hal_code} caller_uid={caller_uid} local_session={local_session}",
+                call.code
+            ));
+            // finishSign 我们说了算但又确实没这张会话：按原厂 TA 的词汇回 -1000。
+            // 透传下去 App 拿到的是宿主的 -204（OPERATEID_NULL），那是另一种说法。
+            if call.code == 10 {
+                return Some(AppAnswer::Export {
+                    code: SESSION_NOT_FOUND,
+                    data: None,
+                });
+            }
+            return None;
+        }
     };
     Some(match (call.code, answer) {
         (1 | 4 | 5 | 7, Answer::Code(code)) => AppAnswer::Int(code),
@@ -1534,7 +1543,8 @@ fn note_sign_success(call: &SoterCall, answer: &Answer) {
         call.uid.unwrap_or(0),
         call.alias.as_deref().unwrap_or("")
     );
-    // 本地能追加就追加（daemon / 软件 TA 那几家），写不进去就整份读回来接上再交给 daemon 写。
+    // 本地能追加就追加（daemon / 软件 TA 那几家）。写不进去就把现有内容读回来接上再
+    // 交给 daemon 写；连读都读不动就别写——整份覆盖掉历史比不记这一行更糟。
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1543,7 +1553,11 @@ fn note_sign_success(call: &SoterCall, answer: &Answer) {
         let _ = std::io::Write::write_all(&mut file, line.as_bytes());
         return;
     }
-    let mut text = crate::state::read("soter_ok").unwrap_or_default();
+    let mut text = match crate::state::read_checked("soter_ok") {
+        crate::state::Read::Got(text) => text,
+        crate::state::Read::Missing => String::new(),
+        crate::state::Read::Unreadable => return,
+    };
     text.push_str(&line);
     crate::state::write("soter_ok", &text);
 }

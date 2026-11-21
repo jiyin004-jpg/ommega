@@ -12,6 +12,7 @@ use rsbinder::{
 use crate::hook::soter;
 use crate::hook::soter_local::{self, Answer};
 use crate::hook::soter_relay;
+use crate::hook::soter_relay::Verdict;
 
 pub const DEFAULT_SERVICE_NAME: &str = "vendor.qti.hardware.soter.ISoter/default";
 const DEFAULT_DESCRIPTOR: &str = "vendor.qti.hardware.soter.ISoter";
@@ -382,10 +383,20 @@ impl Remotable for SoterTa {
         if local_session {
             log::info!("event=soterta finishSign session is local; answering without the relay");
         }
-        let answer = if local_session {
-            soter_local::answer(&call)
+        let verdict = if local_session {
+            match soter_local::answer(&call) {
+                Some(answer) => Verdict::Answered(answer),
+                None => Verdict::Unknown,
+            }
         } else {
-            soter_relay::answer(&call)
+            soter_relay::verdict(&call)
+        };
+        // 「本地说了算但没有这张会话」跟「问不到 daemon」必须分开：前者对 finishSign
+        // 要回原厂那个 -1000，后者回一般的错误码。
+        let unknown = matches!(verdict, Verdict::Unknown);
+        let answer = match verdict {
+            Verdict::Answered(answer) => Some(answer),
+            Verdict::Unknown | Verdict::Passthrough => None,
         };
         match answer {
             Some(Answer::Code(code)) => {
@@ -408,10 +419,13 @@ impl Remotable for SoterTa {
                 log::warn!("event=soterta reply none (no answer for this call)");
                 // 没有真身份可报、或参数不够：回一个明确的错误码，别回 0 让调用方
                 // 拿着空数据继续跑。
-                if code == FINISH_SIGN {
-                    // 会话号谁都不认识：原厂 TA 回 -1000，宿主拿到后原样转给 App。
+                if code == FINISH_SIGN && unknown {
+                    // 会话号确实不存在：原厂 TA 回 -1000，宿主拿到后原样转给 App。
                     write_bytes_reply(reply, &[], crate::hook::soter::SESSION_NOT_FOUND)?;
-                } else if matches!(code, EXPORT_ASK_PUBLIC_KEY | EXPORT_AUTH_KEY_PUBLIC_KEY) {
+                } else if matches!(
+                    code,
+                    EXPORT_ASK_PUBLIC_KEY | EXPORT_AUTH_KEY_PUBLIC_KEY | FINISH_SIGN
+                ) {
                     write_bytes_reply(reply, &[], -4)?;
                 } else {
                     reply.write_i32(-4)?;

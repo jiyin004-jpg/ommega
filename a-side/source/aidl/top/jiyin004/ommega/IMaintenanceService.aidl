@@ -51,4 +51,8 @@ interface IMaintenanceService {
     // app 域的那半边全靠这一对活着：它连目录都进不去。
     @nullable String readState(in String name);
     boolean writeState(in String name, in String data);
+
+    // app 域加不了 counter（它进不去数据根，而这个号必须单调递增）。这边拿与注入器
+    // 那一份相同的 flock 和文本格式去加，算完把新值带回去；回 -1 = 没落盘，调用方只留内存。
+    long bumpCounter(in int uid, in long memoryFloor);
 }

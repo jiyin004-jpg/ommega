@@ -12,20 +12,45 @@ use log::debug;
 use crate::hook::soter::SoterCall;
 use crate::hook::soter_local::{self, Answer};
 
+/// 一笔 HAL 调用的归属结论。
+///
+/// `Unknown` 和 `Passthrough` 必须分开：前者是「我们这边说了算、但没有这张会话」，
+/// 后者是「这笔不归我们答」（配置要透传 / 问不到 daemon）。把后一种当成前一种，
+/// 会把真 HAL 刚签成功的答复换成错误码。
+pub(crate) enum Verdict {
+    /// 有人答了。
+    Answered(Answer),
+    /// 我们这边说了算，但确实没这张会话。
+    Unknown,
+    /// 这笔不归我们答，把答复留给宿主 / 真 HAL。
+    Passthrough,
+}
+
 /// 这笔 HAL 调用该由谁答。`None` = 我们别答，放它去真 HAL。
 ///
 /// 返回 `None` 时调用方 `intercept_soter_call` 会照老路透传，宿主不会卡住。
 pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
+    match verdict(call) {
+        Verdict::Answered(answer) => Some(answer),
+        Verdict::Unknown | Verdict::Passthrough => None,
+    }
+}
+
+/// 跟 [`answer`] 一样，但把「我们没这张会话」和「不归我们答」分开报。
+pub(crate) fn verdict(call: &SoterCall) -> Verdict {
     if !call.hal {
-        return None;
+        return Verdict::Passthrough;
     }
     match resolve(call) {
-        Outcome::Code(code) => Some(Answer::Code(code)),
-        Outcome::Buffer { code, data } => Some(Answer::Buffer { code, data }),
-        Outcome::Init { status, session } => Some(Answer::Init { status, session }),
-        // daemon 说用本地那套：本地也答不了（参数不够之类）就顺势透传。
-        Outcome::Local => soter_local::answer(call),
-        Outcome::Passthrough => None,
+        Outcome::Code(code) => Verdict::Answered(Answer::Code(code)),
+        Outcome::Buffer { code, data } => Verdict::Answered(Answer::Buffer { code, data }),
+        Outcome::Init { status, session } => Verdict::Answered(Answer::Init { status, session }),
+        // daemon 说用本地那套：本地也没有这张会话，就是我们说了算但没有。
+        Outcome::Local => match soter_local::answer(call) {
+            Some(answer) => Verdict::Answered(answer),
+            None => Verdict::Unknown,
+        },
+        Outcome::Passthrough => Verdict::Passthrough,
     }
 }
 

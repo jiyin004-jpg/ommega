@@ -554,28 +554,81 @@ impl IMaintenanceService for MaintenanceManager {
     /// 数据根里其它小件的按名读。app 域的宿主进不去那个 0770 目录，开关和状态只能这么读。
     fn readState(&self, name: &str) -> rsbinder::status::Result<Option<String>> {
         let _wp = wd::watch("IMaintenanceService::readState");
+        if secret(name) {
+            log::warn!("readState: refusing {name} for an app-domain caller");
+            return Ok(None);
+        }
+        if name == "config" {
+            // 平铺 config 里的开关（global_scope / debug）payload 要读，token 不需要。
+            return Ok(crate::soter_store::read_named(name).map(strip_secrets));
+        }
         Ok(crate::soter_store::read_named(name))
     }
 
-    /// 按名写数据根里的小件（文件名白名单式的单层名字，越界的在 `named_path` 那里就拒了）。
+    /// 按名写数据根里的小件（单层名字，越界的在 `named_path` 那里就拒了）。
     fn writeState(&self, name: &str, data: &str) -> rsbinder::status::Result<bool> {
         let _wp = wd::watch("IMaintenanceService::writeState");
-        // 配置和身份材料不接 app 域的写：那几份是面板和 TA 的活，放开了会让宿主
-        // 一笔调用就能改掉远程开关或身份簿。
-        for reserved in [
-            "config",
-            "config.toml",
-            "injector.toml",
-            "remote_identity",
-            "keybox_tee.xml",
-            "keybox_strongbox.xml",
-            "soter_attk.pem",
-        ] {
-            if name == reserved {
-                log::warn!("writeState: refusing {name} from an injected app-domain caller");
-                return Ok(false);
-            }
+        if secret(name) || read_only(name) {
+            log::warn!("writeState: refusing {name} for an app-domain caller");
+            return Ok(false);
         }
         Ok(crate::soter_store::write_named(name, data))
     }
+
+    /// 替 app 域加 counter：那边开不了文件，而号必须单调递增。回 -1 表示没落盘。
+    fn bumpCounter(&self, uid: i32, memory_floor: i64) -> rsbinder::status::Result<i64> {
+        let _wp = wd::watch("IMaintenanceService::bumpCounter");
+        let floor = u64::try_from(memory_floor).unwrap_or(0);
+        match crate::soter_store::bump_counter(uid, floor) {
+            Some(next) => Ok(i64::try_from(next).unwrap_or(i64::MAX)),
+            None => Ok(-1),
+        }
+    }
+}
+
+/// 读都不给的那几份：钥匙库、身份簿、连接凭据。放开了，宿主里一笔 RPC 就能拷走。
+fn secret(name: &str) -> bool {
+    matches!(
+        name,
+        "remote_identity" | "rpc.peers" | "keymaster.db" | "unlock.state" | "injector.toml"
+    ) || name.starts_with("keybox_")
+        || name.ends_with(".bak")
+}
+
+/// 能给 app 域读、但只能由面板 / root 写的那些：它们决定行为（注入范围、接管开关、
+/// 上报的身份号、调用者归属），让宿主能写就能把自己冒充成别人或把接管翻掉。
+fn read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "config.toml"
+            | "config"
+            | "target.txt"
+            | "uid_packages"
+            | "soter_app_serve"
+            | "soter_host_state"
+            | "soter_cpu_id.force"
+            | "soter_attk.pem"
+            | "soter_platform"
+            | "patch.state"
+            | "foreground"
+            | "inproc"
+            | "crash_count"
+            | "aaid_table"
+            | "boot_done"
+    )
+}
+
+/// 交给 app 域之前把那几行敏感键抹掉（token 就是远程登录凭据，payload 用不着）。
+fn strip_secrets(text: String) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let key = line.split(':').next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("token") || key.eq_ignore_ascii_case("password") {
+            out.push_str(&format!("{key}: ***\n"));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }

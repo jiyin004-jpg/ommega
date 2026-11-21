@@ -50,10 +50,6 @@ const ATTK_FILE_PATH: &str = "/data/misc/keystore/ommega/soter_attk.pem";
 /// 环境变量覆盖 ATTK，写测试和临时探针用。
 const ATTK_FILE_ENV: &str = "OMMEGA_SOTER_ATTK_PEM";
 
-/// counter 起点：换 ATTK 时会连同 ASK/authkey/App 开通状态一起清掉，之后每个 App
-/// 第一次请求现造 ASK，counter 从 1 开始严格 +1（新身份、腾讯那边也是新记录）。
-const COUNTER_BASE: u64 = 1;
-
 /// 强制覆盖 cpu_id 的文件；daemon 不写这个文件。
 const CPU_ID_OVERRIDE: &str = "/data/misc/keystore/ommega/soter_cpu_id.force";
 /// `fid` 在序列号读不到时的兜底种子。`cpu_id` **不用**它（读不到就不报，绝不编一个）。
@@ -286,20 +282,25 @@ fn attk_fingerprint() -> Option<String> {
 /// 落盘那一瞬间的互斥：读改写不是原子操作，两个 uid 同时进来会互相盖掉。
 static ASK_STORE_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
-fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
+/// 整份料库读回来。`None` = 读不动（不知道该不该当成空），调用方一律不得在这个
+/// 状态下回写 —— 把「读不动」当成「空」正是把 ASK / AuthKey 覆盖掉的入口。
+fn read_ask_store() -> Option<serde_json::Map<String, serde_json::Value>> {
     let path = ask_store_path();
-    // app 域进不去数据根：那条路只能让 daemon 代读。本地直读失败就当成「料库是空的」
-    // 是致命错——调用方接着一次读-改-写就把别人建好的 ASK / AuthKey 整段铲掉了。
+    // app 域进不去数据根：那条路只能让 daemon 代读。
     let text = if path == ASK_STORE_PATH {
-        match crate::state::read("soter_asks.json") {
-            Some(text) => text,
-            None => return serde_json::Map::new(),
+        match crate::state::read_checked("soter_asks.json") {
+            crate::state::Read::Got(text) => text,
+            crate::state::Read::Missing => return Some(serde_json::Map::new()),
+            crate::state::Read::Unreadable => return None,
         }
     } else {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return serde_json::Map::new();
-        };
-        text
+        match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Some(serde_json::Map::new())
+            }
+            Err(_) => return None,
+        }
     };
     match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(serde_json::Value::Object(mut map)) => {
@@ -308,7 +309,7 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
             if flat {
                 let mut wrapped = serde_json::Map::new();
                 wrapped.insert(ASK_SECTION.to_string(), serde_json::Value::Object(map));
-                return wrapped;
+                return Some(wrapped);
             }
             map.retain(|key, _| {
                 key == ASK_SECTION
@@ -324,13 +325,13 @@ fn read_ask_store() -> serde_json::Map<String, serde_json::Value> {
                 log::info!(
                     "soter local ask store was not minted by the current ATTK; discarding it"
                 );
-                return serde_json::Map::new();
+                return Some(serde_json::Map::new());
             }
-            map
+            Some(map)
         }
         _ => {
             log::warn!("soter local ask store at {path} is not a json object; ignoring it");
-            serde_json::Map::new()
+            Some(serde_json::Map::new())
         }
     }
 }
@@ -350,7 +351,13 @@ fn write_ask_store(map: &serde_json::Map<String, serde_json::Value>) -> Option<S
     }
     // 写临时文件再 rename：中途掉电不会留个半个 json。落盘统一 0666：这份 store 是几个域
     // 一起写的，谁把 tmp 用默认 0644 rename 上去，另外几家就写不动了。
-    let tmp = format!("{path}.tmp");
+    // 临时名带 pid + 序号：几个域并发写同一个文件时，固定的 `.tmp` 会被踩。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = format!(
+        "{path}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     if std::fs::write(&tmp, text.as_bytes()).is_ok() {
         let _ = std::fs::set_permissions(
             &tmp,
@@ -395,7 +402,7 @@ fn section_of<'a>(
 }
 
 fn read_store_pem(section: &str, key: &str) -> Option<String> {
-    let map = read_ask_store();
+    let map = read_ask_store()?;
     let table = map.get(section)?.as_object()?;
     match table.get(key)? {
         serde_json::Value::String(pem) => Some(pem.clone()),
@@ -416,7 +423,7 @@ const MAX_AUTH_CACHE: usize = MAX_AUTH_KEYS;
 
 fn store_pem(section: &str, key: &str, pem: &str) -> Option<String> {
     let _guard = ASK_STORE_LOCK.lock().ok()?;
-    let mut map = read_ask_store();
+    let mut map = read_ask_store()?;
     let entries = section_of(&mut map, section);
     entries.insert(key.to_string(), serde_json::Value::String(pem.to_string()));
     if section == AUTH_SECTION && entries.len() > MAX_AUTH_KEYS {
@@ -439,7 +446,9 @@ fn forget_pem(section: &str, key: &str) {
     let Ok(_guard) = ASK_STORE_LOCK.lock() else {
         return;
     };
-    let mut map = read_ask_store();
+    let Some(mut map) = read_ask_store() else {
+        return;
+    };
     let removed = section_of(&mut map, section).remove(key).is_some();
     if removed {
         write_ask_store(&map);
@@ -476,7 +485,9 @@ fn forget_uid_keys(uid: i32) {
     let Ok(_guard) = ASK_STORE_LOCK.lock() else {
         return;
     };
-    let mut map = read_ask_store();
+    let Some(mut map) = read_ask_store() else {
+        return;
+    };
     section_of(&mut map, ASK_SECTION).remove(&uid.to_string());
     let prefix = format!("{uid}|");
     section_of(&mut map, AUTH_SECTION).retain(|key, _| !key.starts_with(&prefix));
@@ -679,6 +690,26 @@ pub(crate) fn device_id() -> String {
 /// 不读 `/data/misc/keystore/ommega/soter_cpu_id`（那是转发链路学来的 B 端号）；序列号在部分域
 /// 读不到时用 [`LOCAL_CPU_ID_PATH`] 那份缓存。都拿不到就报空串，不编造。
 fn cpu_id() -> String {
+    // 这笔被问得很频（每次导出/签名都要），而它要读两个文件；app 域那两个读还是 RPC。
+    // 缓存几秒：强制的 cpu_id 是人手工改的，不需要毫秒级生效。
+    const CPU_ID_TTL: Duration = Duration::from_secs(10);
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((at, value)) = guard.as_ref() {
+            if at.elapsed() <= CPU_ID_TTL {
+                return value.clone();
+            }
+        }
+    }
+    let value = cpu_id_uncached();
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((Instant::now(), value.clone()));
+    }
+    value
+}
+
+fn cpu_id_uncached() -> String {
     let forced = crate::state::read("soter_cpu_id.force");
     let derived = device_info().derived_cpu_id.as_deref();
     match local_cpu_id(forced.as_deref(), derived) {
@@ -1259,6 +1290,8 @@ fn auth_key(state: &State, uid: i32, alias: &str) -> Option<Key> {
 }
 
 fn bump_counter(state: &State, uid: i32) -> u64 {
+    use kmr_common::soter_counter::{counter_for, next_counter, set_counter};
+
     // counter 必须单调递增、重启不能回退：App 记着上次看到的值，小回去就当重放删钥匙。
     // 所有 App 共用一个文件（每行 `uid=counter`），读-改-写放在文件锁里（几个进程共用）。
     const PATH: &str = "/data/misc/keystore/ommega/soter_counter";
@@ -1281,11 +1314,7 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
-            // 文件里没这个 uid 就从 1 开始（换 ATTK = 新身份），不接内存里的旧值。
-            let next = match counter_for(&text, uid) {
-                Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
-                None => COUNTER_BASE,
-            };
+            let next = next_counter(counter_for(&text, uid), mem);
             let updated = set_counter(&text, uid, next);
             let _ = file.seek(SeekFrom::Start(0));
             // 先写后截：反过来一旦 write_all 失败（ENOSPC/EDQUOT）文件就空了，
@@ -1295,21 +1324,19 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
             }
             next
         }
-        // 开不了文件（app 域进不去数据根）：也走 RPC 读一次、写回一次，运算规则跟本地
-        // 那条一模一样——不回退、不回退是因为 App 拿小回去的号当重放，直接删钥匙。
-        Err(_) => {
-            let text = crate::state::read("soter_counter").unwrap_or_default();
-            // 文件里没这个 uid 就从 1 开始（换 ATTK = 新身份），不接内存里的旧值。
-            let next = match counter_for(&text, uid) {
-                Some(stored) => stored.max(mem).max(COUNTER_BASE) + 1,
-                None => COUNTER_BASE,
-            };
-            let updated = set_counter(&text, uid, next);
-            if !crate::state::write("soter_counter", &updated) {
-                log::warn!("event=soter counter could not be persisted; keeping it in memory");
+        // 开不了文件（app 域进不去数据根）：让 daemon 在它那边加。它拿的是同一把 flock、
+        // 同一份格式，所以两边不会互相盖；RPC 也不通就只留内存，**绝不**拿读不动的文本
+        // 写回——那会把别的 uid 的计数整份抹掉。
+        Err(_) => match crate::ipc::bump_counter(uid, mem) {
+            Ok(next) => next,
+            Err(error) => {
+                log::warn!(
+                    "event=soter counter rpc failed ({error:#}); keeping the value in memory"
+                );
+                mem.saturating_add(1)
+                    .max(kmr_common::soter_counter::COUNTER_BASE)
             }
-            next
-        }
+        },
     };
 
     if let Ok(mut map) = state.counters.lock() {
@@ -1318,39 +1345,11 @@ fn bump_counter(state: &State, uid: i32) -> u64 {
     next
 }
 
-/// 从 `uid=counter` 行里取某个 uid 的计数。
-fn counter_for(text: &str, uid: i32) -> Option<u64> {
-    text.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        if key.trim().parse::<i32>().ok()? != uid {
-            return None;
-        }
-        value.trim().parse::<u64>().ok()
-    })
-}
-
 /// 把某个 uid 的计数写回去（已有就替换、没有就追加），其它行原样保留。
+/// 文本格式跟 daemon 共用一份，这里只是转发。
 fn set_counter(text: &str, uid: i32, value: u64) -> String {
-    let mut out = String::with_capacity(text.len() + 16);
-    let mut replaced = false;
-    for line in text.lines() {
-        let Some((key, _)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim().parse::<i32>().ok() == Some(uid) {
-            out.push_str(&format!("{uid}={value}\n"));
-            replaced = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !replaced {
-        out.push_str(&format!("{uid}={value}\n"));
-    }
-    out
+    kmr_common::soter_counter::set_counter(text, uid, value)
 }
-
 /// 包 SOTER 的信封：`[i32 le JSON 长度][JSON][签名]`（小端，跟真机一致）。
 fn envelope(document: &[u8], signature: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + document.len() + signature.len());
@@ -2190,6 +2189,9 @@ mod tests {
 
     #[test]
     fn counter_file_keeps_every_uid_on_its_own_line() {
+        // 文本格式与递增规则在 `kmr_common::soter_counter`（daemon 那份也用同一个），
+        // 这里只确认注入器转出去的那一层没走偏。
+        use kmr_common::soter_counter::counter_for;
         let text = "10491=100\n10494=200\n";
         assert_eq!(counter_for(text, 10491), Some(100));
         assert_eq!(counter_for(text, 10494), Some(200));
@@ -2202,14 +2204,5 @@ mod tests {
         // 新 uid：追加到末尾
         let appended = set_counter(text, 55555, 7);
         assert_eq!(appended, "10491=100\n10494=200\n55555=7\n");
-    }
-
-    #[test]
-    fn counter_file_ignores_junk_lines() {
-        let text = "# 注释\nbroken\n10491=42\n\n";
-        assert_eq!(counter_for(text, 10491), Some(42));
-        // 垃圾行会被丢掉，但有效行仍然是有效的
-        let updated = set_counter(text, 10491, 43);
-        assert_eq!(counter_for(&updated, 10491), Some(43));
     }
 }

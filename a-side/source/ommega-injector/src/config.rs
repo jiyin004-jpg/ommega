@@ -338,9 +338,16 @@ fn read_clienta_target() -> Option<Vec<String>> {
 /// 数据根现在是 `/data/misc/keystore/ommega`（自身 0770，父目录 0700），SOTER 宿主那种
 /// app 域根本进不去 —— 本地读失败就按文件名走 daemon 的 `readState`，否则宿主永远
 /// 只能看到「文件不存在」，日志开关和全局范围全都跟着丢。
+///
+/// 只有真在数据根里的才走 RPC：`/data/adb/ommega/conf/log_flag` 这类另一处路径的同名文件
+/// 不能被悄悄换成数据根里那份。
 fn read_config_file(path: &Path) -> Option<String> {
     if let Ok(text) = fs::read_to_string(path) {
         return Some(text);
+    }
+    let parent = path.parent()?.to_string_lossy();
+    if parent != crate::state::ROOT {
+        return None;
     }
     let name = path.file_name()?.to_string_lossy().into_owned();
     crate::state::read(&name)

@@ -694,6 +694,19 @@ pub fn write_state(name: &str, data: &str) -> Result<bool> {
     })
 }
 
+/// 让 daemon 替这个 uid 把 counter 加一，回新的那个值。
+///
+/// 两边算的是同一份文本、拿的是同一把 flock，所以 app 域和 HAL 域一起加也不会互相盖。
+pub fn bump_counter(uid: i32, memory_floor: u64) -> Result<u64> {
+    ensure_process_state();
+    let value = with_ommega_maintenance_once(|maintenance| {
+        maintenance
+            .bumpCounter(uid, memory_floor as i64)
+            .context("bumpCounter failed")
+    })?;
+    u64::try_from(value).map_err(|_| anyhow::anyhow!("the daemon could not persist the counter"))
+}
+
 /// uid -> 包名解析结果的缓存时长。这层映射只在装/卸应用时变，而每笔 keystore
 /// 请求都要问一次「这个 uid 是谁」（一次跨进程 binder 往返，还占着调用方正
 /// 等着的那条 binder 线程），缓存一分钟能省掉绝大多数 RPC。

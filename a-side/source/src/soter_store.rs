@@ -49,6 +49,41 @@ pub fn read() -> Option<String> {
     std::fs::read_to_string(STORE_PATH).ok()
 }
 
+/// 某个 uid 的下一个 counter。
+///
+/// app 域（进不去数据根）自己开不了这个文件，但 counter 必须单调递增 —— 两边都写同一份
+/// 文本、都得拿同一把 flock，所以加减在这里做，注入器那边只负责把结果报给 App。
+///
+/// 返回 `None` = 文件开不了/锁不上，调用方应当只留内存，**不要**回写。
+pub fn bump_counter(uid: i32, memory_floor: u64) -> Option<u64> {
+    use kmr_common::soter_counter::{counter_for, next_counter, set_counter};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = named_path("soter_counter")?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    let _guard = WRITE_LOCK.lock().ok()?;
+    let _lock = file.lock(); // 锁跟着 fd，文件关闭（drop）时自动释放
+    let mut text = String::new();
+    let _ = file.read_to_string(&mut text);
+    let next = next_counter(counter_for(&text, uid), memory_floor);
+    let updated = set_counter(&text, uid, next);
+    let _ = file.seek(SeekFrom::Start(0));
+    // 先写后截：反过来一旦 write_all 失败（ENOSPC/EDQUOT）文件就空了，所有 uid 的
+    // 计数一起丢，下轮全部从 1 开始。
+    if file.write_all(updated.as_bytes()).is_ok() {
+        let _ = file.set_len(updated.len() as u64);
+    }
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+    Some(next)
+}
+
 /// 读-改-写在调用方那边，这里只保证「写」是串行的。
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -66,8 +101,14 @@ fn write_at(path: &str, text: &str) -> bool {
     if let Some(dir) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // 这个文件由几个域一起写，落盘完统一 0666。
-    let tmp = format!("{path}.rpc.tmp");
+    // 这个文件由几个域一起写，落盘完统一 0666。临时名带 pid + 序号：几个域并发写同一个
+    // 文件时，固定的 `.tmp` 会被下一个写者踩掉。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = format!(
+        "{path}.rpc.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut fail = None;
     match std::fs::write(&tmp, text.as_bytes()) {
         Ok(()) => {
