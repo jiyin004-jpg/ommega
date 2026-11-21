@@ -78,6 +78,7 @@ use crate::keymaster::utils::{
     log_security_safe_params, upgrade_keyblob_if_required_with, AndroidUserId, AppUid, Challenge,
     UNDEFINED_NOT_AFTER,
 };
+use crate::plat::attestation::{parse_key_description_info, KeyDescriptionInfo};
 use crate::plat::utils as plat_utils;
 use crate::top::jiyin004::ommega::{
     CallerInfo::CallerInfo,
@@ -100,6 +101,39 @@ const DEFAULT_PER_UID_KEY_LIMIT: i32 = 200_000;
 
 /// The limit on the number of keys per app for apps with a target SDK level of 37+.
 const API_37_PER_UID_KEY_LIMIT: i32 = 50_000;
+
+/// Replace `ORIGIN` and `ALLOW_WHILE_ON_BODY` with the values and lists the attestation
+/// certificate carries, so the authorizations `KeyInfo` reports match the leaf certificate.
+/// Parameters the certificate does not carry are left untouched.
+fn apply_attestation_authorizations(
+    key_parameters: &mut Vec<KsKeyParam>,
+    info: &KeyDescriptionInfo,
+) {
+    if let Some((origin, security_level)) = info.origin {
+        key_parameters.retain(|parameter| {
+            !matches!(
+                parameter.key_parameter_value(),
+                KsKeyParamValue::KeyOrigin(_)
+            )
+        });
+        key_parameters.push(KsKeyParam::new(
+            KsKeyParamValue::KeyOrigin(KeyOrigin(origin)),
+            SecurityLevel(security_level),
+        ));
+    }
+    if let Some(security_level) = info.allow_while_on_body {
+        key_parameters.retain(|parameter| {
+            !matches!(
+                parameter.key_parameter_value(),
+                KsKeyParamValue::AllowWhileOnBody
+            )
+        });
+        key_parameters.push(KsKeyParam::new(
+            KsKeyParamValue::AllowWhileOnBody,
+            SecurityLevel(security_level),
+        ));
+    }
+}
 
 /// Implementation of the IKeystoreSecurityLevel Interface.
 pub struct KeystoreSecurityLevel {
@@ -211,6 +245,19 @@ impl KeystoreSecurityLevel {
             certificateChain: mut certificate_chain,
         } = creation_result;
 
+        // A relayed backend can report characteristics at another level than the certificate names,
+        // and clients compare `KeyInfo` against the certificate.  Take both the security level and
+        // the authorization lists from the leaf certificate.
+        let key_description = certificate_chain.first().and_then(|certificate| {
+            match parse_key_description_info(&certificate.encodedCertificate) {
+                Ok(info) => info,
+                Err(error) => {
+                    log::debug!("leaf KeyDescription not used for KeyInfo: {error:#}");
+                    None
+                }
+            }
+        });
+
         // Unify the possible contents of the certificate chain.  The first entry in the `Vec` is
         // always the leaf certificate (if present), but the rest of the chain may be present as
         // either:
@@ -240,6 +287,10 @@ impl KeystoreSecurityLevel {
         );
 
         let mut key_parameters = key_characteristics_to_internal(key_characteristics);
+
+        if let Some(info) = key_description.as_ref() {
+            apply_attestation_authorizations(&mut key_parameters, info);
+        }
 
         key_parameters.push(KsKeyParam::new(
             KsKeyParamValue::UserID(user.0),
@@ -274,6 +325,11 @@ impl KeystoreSecurityLevel {
                     let km_uuid = Uuid::from(self.security_level);
                     let mut key_metadata = KeyMetaData::new();
                     key_metadata.add(KeyMetaEntry::CreationDate(creation_date));
+                    if let Some(info) = key_description.as_ref() {
+                        key_metadata.add(KeyMetaEntry::KeymintSecurityLevel(
+                            info.keymint_security_level,
+                        ));
+                    }
                     if keybox_attested && km_uuid.is_keybox_bound() {
                         key_metadata.add(KeyMetaEntry::KeyboxAttestationUuidPrefix(
                             km_uuid.get_digest().to_vec(),
@@ -303,7 +359,10 @@ impl KeystoreSecurityLevel {
 
         Ok(KeyMetadata {
             key,
-            keySecurityLevel: self.security_level,
+            keySecurityLevel: key_description
+                .as_ref()
+                .map(|info| SecurityLevel(info.keymint_security_level))
+                .unwrap_or(self.security_level),
             certificate: cert_info.take_cert(),
             certificateChain: cert_info.take_cert_chain(),
             authorizations: key_parameters_to_authorizations(key_parameters),
