@@ -8,4 +8,6 @@
 - Key access rate limiting follows the system standard.
 - Toggling the local SOTER service now takes over or releases it completely, applying immediately without a restart.
 - Fixed SOTER key preparation failing on Qualcomm platforms.
+- Upgrading the module no longer clears the saved server address, token or managed app list.
+- SOTER signing and key attestation compatibility fixes; TEE verdicts in some checks are no longer off.
 - Stability and compatibility improvements.
