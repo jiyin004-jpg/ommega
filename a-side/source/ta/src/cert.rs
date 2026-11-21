@@ -479,7 +479,17 @@ pub(crate) fn validate_remote_delegation(
     {
         return Err(invalid());
     }
-    validate_native_attestation_issuer(&chain[1])?;
+    let parent_has_attestation = parent
+        .tbs_certificate()
+        .extensions()
+        .map(|exts| {
+            exts.iter()
+                .any(|e| e.extn_id == X509_ATTESTATION_EXTENSION_OID)
+        })
+        .unwrap_or(false);
+    if parent_has_attestation {
+        validate_native_attestation_issuer(&chain[1])?;
+    }
     let key_oid = spki.algorithm.oid.to_string();
     let signature_oid = leaf.signature_algorithm().oid.to_string();
     let curve_oid = spki

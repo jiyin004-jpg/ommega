@@ -617,9 +617,11 @@ impl crate::KeyMintTa {
             crate::cert::validate_remote_delegation(&chain, issuer)?;
         }
         // 请求了 ATTEST_KEY 就核对叶子是不是真机的硬件证明密钥（不发 SIGN 冒充）。
-        if params
-            .iter()
-            .any(|p| matches!(p, KeyParam::Purpose(KeyPurpose::AttestKey)))
+        // 补出来的 challenge 不会在叶子里留下证明扩展，那时没有东西可核。
+        if !synthetic_challenge
+            && params
+                .iter()
+                .any(|p| matches!(p, KeyParam::Purpose(KeyPurpose::AttestKey)))
         {
             crate::cert::validate_native_attestation_issuer(&chain[0])?;
         }
