@@ -135,14 +135,12 @@ pub fn wait_ready(timeout: Duration) -> bool {
     state.services.is_some()
 }
 
-/// 根侧落的「开机已完成」标记。
-const BOOT_DONE_PATH: &str = "/data/misc/keystore/ommega/boot_done";
-
+/// 根侧落的「开机已完成」标记（路径定义在 `global::BOOT_DONE_PATH`）。
 /// 从开始到必须有结论的宽限期。
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn boot_done_present() -> bool {
-    crate::global::boot_completed() || std::path::Path::new(BOOT_DONE_PATH).exists()
+    crate::global::boot_done_present()
 }
 
 /// 把 early boot 结束重放给 KeyMint，幂等。

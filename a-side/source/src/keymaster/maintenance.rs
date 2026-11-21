@@ -25,6 +25,13 @@ use crate::top::jiyin004::ommega::{
     IMaintenanceService::{BnMaintenanceService, IMaintenanceService},
 };
 use crate::watchdog as wd;
+use std::sync::atomic::Ordering;
+
+/// 这个进程里「早期启动已经结束」。
+///
+/// 不能只靠包装器自己那个标志：包装器是惰性建的，而「早期已结束」这条事实得熬到
+/// 它们迟到的创建之后。KEARLY_BOOT_ENDED 就是为此存在的。
+static EARLY_BOOT_KNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct MaintenanceManager;
 
@@ -284,7 +291,17 @@ fn normalize_migration_destination(
 }
 
 pub(crate) fn replay_early_boot_ended() -> Result<()> {
+    // 先落下「早期启动已结束」这件事实，再去通知已经建好的包装器。
+    //
+    // 包装器是惰性建的，而这一步在一批初始化路径里跑在它们之前；事实存在这里，
+    // `create_ta` 建完 TA 会自己补发那次 earlyBootEnded。
+    EARLY_BOOT_KNOWN.store(true, Ordering::Release);
     call_keymint_wrappers("earlyBootEnded", |keymint| keymint.earlyBootEnded())
+}
+
+/// 这个进程里「早期启动已经结束」。跟包装器在不在无关。
+pub(crate) fn early_boot_ended_known() -> bool {
+    EARLY_BOOT_KNOWN.load(Ordering::Acquire)
 }
 
 fn call_keymint_wrappers<F>(label: &'static str, mut call: F) -> Result<()>

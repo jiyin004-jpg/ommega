@@ -567,21 +567,37 @@ fn run() -> Result<()> {
         }
         return Err(error).context("failed to initialize boot-level key cache");
     }
-    let boot_completed =
-        crate::plat::resetprop::read_string_property("sys.boot_completed").as_deref() == Some("1");
-    if boot_completed {
+    // 开机是否已经完成：先看 root 侧落下的 `boot_done` 标记，再看属性。
+    //
+    // 只读属性在 payload 里不一定能成（静态链接，读属性要 exec resetprop，热重启后
+    // 那个 exec 可能被拒）；读不到就等于「还没开机完」，earlyBootEnded 永远不会重放，
+    // TA 就一直停在 in_early_boot——EARLY_BOOT_ONLY 的导入限制整个失效。
+    if crate::global::boot_done_present() {
         crate::keymaster::maintenance::replay_early_boot_ended()
             .context("failed to replay earlyBootEnded to KeyMint wrappers")?;
+        info!("early boot ended replayed at startup");
+    } else {
+        // 开机那会儿我们可能比 root 侧早：等标记出现再重放，等不到再退到属性监听。
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                if crate::global::boot_done_present() {
+                    match crate::keymaster::maintenance::replay_early_boot_ended() {
+                        Ok(()) => info!("early boot ended replayed after boot_done"),
+                        Err(error) => {
+                            error!("failed to replay earlyBootEnded after boot_done: {error:#}")
+                        }
+                    }
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            // 标记一直没出现：退到属性监听，仍然拿不到就算了（下一笔请求不受影响）。
+            global::await_boot_completed();
+            if let Err(error) = crate::keymaster::maintenance::replay_early_boot_ended() {
+                error!("failed to replay earlyBootEnded after boot completed: {error:#}");
+            }
+        });
     }
-    std::thread::spawn(move || {
-        global::await_boot_completed();
-        if boot_completed {
-            return;
-        }
-        if let Err(error) = crate::keymaster::maintenance::replay_early_boot_ended() {
-            error!("failed to replay earlyBootEnded after boot completed: {error:#}");
-        }
-    });
     repair_ommega_data_files();
 
     keybox::initialize().context("failed to initialize keybox runtime")?;

@@ -5,7 +5,7 @@ MODDIR=${OMMEGA_MODDIR:-/data/adb/modules/ommega}
 # 把自己 comm 改成伪装名：injector 的 exe 是系统 sh，comm 默认也是 sh，跟系统里
 # 几百个 sh 混在一起没法认 —— 守护就没办法靠 comm 判断「我已经在跑了」，
 # 结果每 5 秒又拉一个（实测摞到五个，两个各烧了几十秒 CPU）。改完 ps 里也好看了。
-_inj_tag=$(sed -n 's/^injector=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+_inj_tag=$(sed -n 's/^injector=//p' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null | head -n 1)
 if [ -n "$_inj_tag" ]; then
   # 只能用内建 echo：printf / dd 往 /proc/$$/comm 写会回 EINVAL（实测），
   # comm 改不了，守护按 comm 认人就认不出来，会反复重拉。
@@ -26,49 +26,49 @@ RESTART_ALL_FILE=$RUN_DIR/restart.all
 # A 端平铺 config（WebUI 写的），只有 soter_inject 这个键是本脚本读的：
 # 关着（键不在、或写了 0/false）就完全不碰 SOTER 宿主——不起服务、不注入；
 # 开着才 `am start-service` 把它拉起来再注进去。
-CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/ommega/config}
+CONF_PATH=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
 # 日志开关的副本：payload 有可能落进读不到上面那个配置的域（SOTER 宿主是 uid 1000），
 # 它按这个文件决定写不写日志。内容只有 `log_flag: 0|1` 一行，别往里放别的。
 # 放 /data/misc 下面是因为宿主（system_app）连 /data/adb（0700 root）都进不去，
 # 而这里的 context 是 system_data_file，它读得到。
-LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/ommega/log_flag}
+LOG_FLAG=${OMMEGA_LOG_FLAG_PATH:-/data/misc/keystore/ommega/log_flag}
 # root 侧写给 daemon 的「uid → 包名」表（它就从系统自己的 packages.list 抄）。
 # daemon 跑在 keystore uid，这文件在共享数据根里，它和宿主的 payload 读的是一份。
-UID_PACKAGES_OUT=/data/misc/ommega/uid_packages
+UID_PACKAGES_OUT=/data/misc/keystore/ommega/uid_packages
 PACKAGES_LIST=/data/system/packages.list
 # daemon 拿去做最后一道兜底的「当前前台应用」。
-FOREGROUND_OUT=/data/misc/ommega/foreground
-# 载荷读的配置。数据根已经统一到 /data/misc/ommega，keystore 域和 SOTER 宿主域
+FOREGROUND_OUT=/data/misc/keystore/ommega/foreground
+# 载荷读的配置。数据根已经统一到 /data/misc/keystore/ommega，keystore 域和 SOTER 宿主域
 # 读的是同一个文件，不再有「抄一份给宿主」的副本和那轮 cp。
-INJECTOR_TOML=/data/misc/ommega/injector.toml
+INJECTOR_TOML=/data/misc/keystore/ommega/injector.toml
 LOG_FLAG_DIR=$(dirname "$LOG_FLAG")
 # 本脚本自己的日志，只落文件（以前是 echo，会进管理器的 service 日志）。
-LOG_DIR=/data/misc/ommega/logs
+LOG_DIR=/data/misc/keystore/ommega/logs
 LOG_FILE=$LOG_DIR/daemon.log
 # app 域里那份 payload（SOTER 宿主 uid 1000）写不进上面那个 keystore 目录，
 # 得给它一个自己写得动的位置，权限开到 system 组。
 APP_LOG_DIR=$LOG_FLAG_DIR/logs
 # 换本地兜底 ATTK 的通道：往真配置目录里放一份 soter_attk.pem（PKCS#8 PEM），
 # 这里抄到 app 域读得到的位置，再把 SOTER 宿主踢一次让新 key 生效。
-SOTER_ATTK_DST=/data/misc/ommega/soter_attk.pem
+SOTER_ATTK_DST=/data/misc/keystore/ommega/soter_attk.pem
 # daemon 学到的真机 cpu_id：它自己那份写在 keystore 域（它跑在 keystore uid 里，别处
 # 写不动），这里抄到 app 域给宿主里那份 payload 读。内容就一行 `soter_cpu_id: <32 hex>`。
-SOTER_CPU_ID_DST=/data/misc/ommega/soter_cpu_id
+SOTER_CPU_ID_DST=/data/misc/keystore/ommega/soter_cpu_id
 # ATTK 文件里可以带一行 `cpu_id: 09000000…`：导入时顺手写这里，
 # 免得 ATTK 换了、cpu_id 还是上一台的，腾讯一对不上就拒。
-SOTER_CPU_FORCE_DST=/data/misc/ommega/soter_cpu_id.force
+SOTER_CPU_FORCE_DST=/data/misc/keystore/ommega/soter_cpu_id.force
 SOTER_PKG=com.tencent.soter.soterserver
 SOTER_ACTION=$SOTER_PKG.ISoterService
 # daemon 判出「SOTER 宿主哑了」时写的标记（`src/soter_host_health.rs`）：写一行原因，
 # 这里读走、删掉，再把宿主换成新实例。daemon 跑在 keystore uid，能写这个目录靠的是
 # sepolicy.rule 里给 keystore 域的 system_data_file 写权限。
-SOTER_STUCK_FILE=/data/misc/ommega/soter_host_stuck
+SOTER_STUCK_FILE=/data/misc/keystore/ommega/soter_host_stuck
 # soterta.sh 算完落盘的「这台是不是 HIDL 平台」（0/1）。
 HIDL_CACHE=$STATE_DIR/conf/soter_hidl_platform
 # root 侧判出来的宿主体检结论（stub / real），见 sync_soter_host_state。
-SOTER_HOST_STATE_OUT=/data/misc/ommega/soter_host_state
+SOTER_HOST_STATE_OUT=/data/misc/keystore/ommega/soter_host_state
 # 手工接管开关（payload 读它决定要不要替宿主答 App）。写了真值就明确要求注宿主。
-SOTER_APP_SERVE=/data/misc/ommega/soter_app_serve
+SOTER_APP_SERVE=/data/misc/keystore/ommega/soter_app_serve
 
 # Resolve the device ABI.  One module zip now carries every ABI at once, so
 # libs/<abi> has to be picked by what this device actually runs; falling back
@@ -299,7 +299,7 @@ sync_soter_attk() {
     return 0
   fi
 
-  # 数据根合并之后 src 和 dst 常常是**同一个文件**（都是 /data/misc/ommega/soter_attk.pem），
+  # 数据根合并之后 src 和 dst 常常是**同一个文件**（都是 /data/misc/keystore/ommega/soter_attk.pem），
   # 这时 `-nt` 恒为 false，ATTK 换了也检测不出来 —— WebUI 导入新私钥不生效就是这么来的。
   # 改成记住上次处理时的「大小:mtime」，变了才算变化。
   stamp=$CONF_DIR/soter_attk.stamp
@@ -684,7 +684,7 @@ ensure_keymint_daemon() {
   # pidfile 可能被清理脚本删了：再按名字表里的 comm 找一遍（exe 必须是 memfd，
   # 否则可能是同名的真系统进程）。不然每 5 秒重拉一个守护，每个都要把 8MB
   # 二进制读进 memfd，白白烧 CPU。
-  ekd_name=$(sed -n 's/^daemon=//p' /data/misc/ommega/conf/stealth.names 2>/dev/null | head -n 1)
+  ekd_name=$(sed -n 's/^daemon=//p' /data/misc/keystore/ommega/conf/stealth.names 2>/dev/null | head -n 1)
   if [ -n "$ekd_name" ]; then
     ekd_comm=$(echo "$ekd_name" | sed 's|.*/||' | cut -c1-15)
     for ekd_d in /proc/[0-9]*; do
@@ -733,13 +733,13 @@ trap 'release_lock' EXIT INT TERM HUP
 # （`read_string_property` 会退到 exec 模块里的 resetprop，而在注入过 payload 的
 # keystore2 里 fork/exec 会把进程内启动卡死）。所以这件事由这里（root，exec
 # getprop 没问题）落成文件，包那侧只 stat。post-fs-data 每次开机先删掉。
-BOOT_DONE_OUT=/data/misc/ommega/boot_done
+BOOT_DONE_OUT=/data/misc/keystore/ommega/boot_done
 boot_done_written=0
 
 sync_soter_host_state
 while true; do
   # Config and target list live in the single data location
-  # (/data/misc/ommega/); the webroot UI writes them through the
+  # (/data/misc/keystore/ommega/); the webroot UI writes them through the
   # ommegadata symlink, so no copy/sync is needed here.
 
   # 先确保 keymint 守护在（它挂了的话，下面所有注入都白做）。
@@ -791,7 +791,7 @@ while true; do
     # 换了 ATTK = 新身份：ASK/AuthKey 作废，counter 也从 1 重新开始。
     # 关键是要**连 App 自己那份开通状态一起清**（见下面几行）——只清 counter
     # 不清 App，它会记着旧号、看到 1 就当回退，得连按好几次才追上来。
-    rm -f /data/misc/ommega/soter_asks.json /data/misc/ommega/soter_counter 2>/dev/null
+    rm -f /data/misc/keystore/ommega/soter_asks.json /data/misc/keystore/ommega/soter_counter 2>/dev/null
     log "[injector-daemon] ATTK changed; cleared ASK/authkey/counter"
     # App 自己那份「已开通」也得作废：微信这类把 WechatASK=1 记在
     # shared_prefs/soter_status.xml 里，不清它就不会重走开通，继续拿旧链签名 ——

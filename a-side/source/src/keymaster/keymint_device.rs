@@ -1583,7 +1583,10 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
         warn!("moduleHash attestation bootstrap skipped because APEX module info bundle is unavailable");
     }
 
-    if EARLY_BOOT_ENDED.load(Ordering::Acquire) {
+    // 早期启动已经结束：这个进程里一确认过就补发一次，不管当时包装器建没建。
+    if EARLY_BOOT_ENDED.load(Ordering::Acquire)
+        || crate::keymaster::maintenance::early_boot_ended_known()
+    {
         let resp = ta.process_req(PerformOpReq::DeviceEarlyBootEnded(EarlyBootEndedRequest {}));
         if resp.error_code != 0 {
             return Err(Error::Km(ErrorCode::UNKNOWN_ERROR))

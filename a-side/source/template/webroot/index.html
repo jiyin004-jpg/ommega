@@ -2051,7 +2051,7 @@ async function loadApps(){
 
 /* --------------------------------- 状态 --------------------------------- */
 /* 状态条：pidof 三件套（很快）+ SOTER。
-   SOTER 先看**本机记录**（/data/misc/ommega/soter_ok）：只要本机出过任何一笔成功的
+   SOTER 先看**本机记录**（/data/misc/keystore/ommega/soter_ok）：只要本机出过任何一笔成功的
    签名（远程真机 TEE / 本地自签 / 服务器自签都算），那里就有一行 —— 这是加载立刻
    就有结论的那一条，不用等新调用。本机没记录才退回看跟随设备上报的能力。 */
 var soterState = "unknown";
@@ -2061,7 +2061,7 @@ var soterRecord = null;
 var attkCustom = false;
 
 async function readSoterRecord(){
-  var r = await exec("tail -n 1 /data/misc/ommega/soter_ok 2>/dev/null");
+  var r = await exec("tail -n 1 /data/misc/keystore/ommega/soter_ok 2>/dev/null");
   soterRecord = null;
   var line = (r.stdout || "").trim();
   if (!line) return;
@@ -2287,9 +2287,9 @@ async function fpPick(path){
     var line = ((g && g.stdout) || "").trim();
     var cpu = line ? line.replace(/^[^:]*:[[:space:]]*/, "").trim() : "";
     if (cpu) {
-      await exec("mkdir -p /data/misc/ommega && printf '%s\\n' 'cpu_id: " + cpu.replace(/'/g, "'\\''") + "' > /data/misc/ommega/soter_cpu_id.force");
+      await exec("mkdir -p /data/misc/keystore/ommega && printf '%s\\n' 'cpu_id: " + cpu.replace(/'/g, "'\\''") + "' > /data/misc/keystore/ommega/soter_cpu_id.force");
     } else {
-      await exec("rm -f /data/misc/ommega/soter_cpu_id.force");
+      await exec("rm -f /data/misc/keystore/ommega/soter_cpu_id.force");
     }
   }
   fpClose();

@@ -127,6 +127,22 @@ pub fn boot_completed() -> bool {
     BOOT_COMPLETED.load(Ordering::Acquire)
 }
 
+/// root 侧在开机完成后落下的标记（`post-fs-data` 开机早期会删掉它）。
+///
+/// 属性 `sys.boot_completed` 在 payload 里不一定读得到（静态链接，读属性会退到 exec
+/// resetprop，换域以后可能被拒），而这个标记只要写出来就一直在，所以以它为准。
+pub(crate) const BOOT_DONE_PATH: &str = "/data/misc/keystore/ommega/boot_done";
+
+/// 开机是否已经完成：标记在，或者属性已经看到 1。
+///
+/// 标记两边都看：root 侧的老版本还往 `/data/misc/ommega` 写，新版本写数据根里那份。
+pub(crate) fn boot_done_present() -> bool {
+    const LEGACY: &str = "/data/misc/ommega/boot_done";
+    boot_completed()
+        || std::path::Path::new(BOOT_DONE_PATH).exists()
+        || std::path::Path::new(LEGACY).exists()
+}
+
 pub fn await_boot_completed() {
     let _wp = wd::watch_millis("await_boot_completed", 300_000);
     log::info!("monitoring for sys.boot_completed=1");

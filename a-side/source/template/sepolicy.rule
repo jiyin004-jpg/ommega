@@ -38,7 +38,7 @@ allow servicemanager shell dir { search getattr }
 # keystore2 崩溃时 crash_dump 读它的进程。
 allow crash_dump keystore process *
 
-# payload 跑在 keystore 域里，要读写 /data/misc/ommega 下的配置、心跳、日志。
+# payload 跑在 keystore 域里，要读写 /data/misc/keystore/ommega 下的配置、心跳、日志。
 # 这一块以前完全靠上面的 permissive 兜着，每笔访都在内核里记一条 denied 审计；
 # 写清楚之后审计不再刷，将来真收紧也不会炸。
 allow keystore system_data_file file { read open getattr write create }
