@@ -360,6 +360,16 @@ fn extract_key_characteristics(
         }
 
         match param {
+            // 时间授权这几条以前只归 Keystore 执行，所以只写进「Keystore 级」特性、
+            // 不进 TEE 授权集——证书扩展里于是没有 400/401/402，检测器会判「密钥生效
+            // 时间授权缺失」。我们的 TA 现在创建与 begin 时也自己执行它们，所以两边都
+            // 写：证书里有声明，Keystore 那边看到也仍然会查。
+            KeyParam::ActiveDatetime(_)
+            | KeyParam::OriginationExpireDatetime(_)
+            | KeyParam::UsageExpireDatetime(_) => {
+                chars.try_push(param.clone())?;
+                keystore_chars.try_push(param.clone())?;
+            }
             // ML-DSA keys should not have key size parameter since it's not
             // used and should not appear as a key authorization.
             KeyParam::KeySize(_) => {
