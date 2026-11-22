@@ -162,13 +162,11 @@ SEPOLICY_LOG=${DATA_ROOT:-/data/misc/keystore/ommega}/logs/sepolicy-apply.log
 ensure_sepolicy() {
   [ -f "$MODDIR/sepolicy.rule" ] || return 0
   command -v ommega_apply_sepolicy >/dev/null 2>&1 || return 0
-  now=$(date +%s 2>/dev/null || echo 0)
-  last=$(cat "$SEPOLICY_STAMP" 2>/dev/null || echo 0)
-  case "$now" in ''|*[!0-9]*) now=0 ;; esac
-  case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
-    return 0
-  fi
+  # 不再看 stamp 节流。之前用 5 分钟窗口避开「失败后反复重试」，但它会把
+  # service 阶段自己的应用一起挡掉：post-fs-data 刚跑完（或上一次 service
+  # 刚跑完）就重启的话，差不到 300 秒，这里直接 return，bundled 一次也不跑。
+  # 而 service.sh 只在开机跑一次，本来就不存在反复重试的问题。
+  #
   # 运行中（service 阶段）我们自己的工具优先：**无条件**跑一次，不再先做
   # 「规则都在就跳过」的优化。
   #
@@ -181,9 +179,6 @@ ensure_sepolicy() {
   # 完整重写，不依赖管理器）；它不行才落到 ksud / magiskpolicy。重写是把整份
   # policy 重新 load 一遍，语义不变，只在启动时做一次。
   OMMEGA_POLICY_RUNTIME=1 ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
-  # 成败都落时间戳：失败时每 5 秒重试一遍只会刷爆日志，5 分钟后再说。
-  mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
-  printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
   return 0
 }
 
