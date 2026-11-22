@@ -72,6 +72,7 @@ pub const KEYMINT_ENFORCED_CHARACTERISTICS: &[Tag] = &[
     Tag::RsaOaepMgfDigest,
     Tag::KeySize,
     Tag::MinMacLength,
+    Tag::MinSecondsBetweenOps,
     Tag::MaxUsesPerBoot,
     Tag::AuthTimeout,
     Tag::OsVersion,
@@ -213,7 +214,7 @@ pub struct Info {
 /// Global "map" of tags to information about their behaviour.
 /// Encoded as an array to avoid allocation; lookup should only be slightly slower
 /// for this few entries.
-const INFO: [(Tag, Info); 62] = [
+const INFO: [(Tag, Info); 63] = [
     (
         Tag::Purpose,
         Info {
@@ -482,6 +483,21 @@ const INFO: [(Tag, Info); 62] = [
             lifetime: ValueLifetime::Variable,
             cert_gen: CertGenParam::NotRequired,
             bit_index: 17,
+        },
+    ),
+    (
+        Tag::MinSecondsBetweenOps,
+        Info {
+            name: "MIN_SECONDS_BETWEEN_OPS",
+            tt: TagType::Uint,
+            ext_asn1_type: None,
+            user_can_specify: UserSpecifiable(true),
+            characteristic: Characteristic::KeyMintEnforced,
+            op_param: OperationParam::NotOperationParam,
+            keymint_auto_adds: AutoAddedCharacteristic(false),
+            lifetime: ValueLifetime::Variable,
+            cert_gen: CertGenParam::NotRequired,
+            bit_index: 62,
         },
     ),
     (

@@ -189,6 +189,7 @@ pub fn serialize(params: &[KeyParam]) -> Result<Vec<u8>, Error> {
             // `u32`-holding variants.
             KeyParam::KeySize(v) => result.try_extend_from_slice(&(v.0).to_ne_bytes())?,
             KeyParam::MinMacLength(v)
+            | KeyParam::MinSecondsBetweenOps(v)
             | KeyParam::MaxUsesPerBoot(v)
             | KeyParam::UsageCountLimit(v)
             | KeyParam::UserId(v)
@@ -369,6 +370,7 @@ pub fn deserialize(data: &mut &[u8]) -> Result<Vec<KeyParam>, Error> {
             // `u32`-holding variants.
             Tag::KeySize => KeyParam::KeySize(KeySizeInBits(consume_u32(data)?)),
             Tag::MinMacLength => KeyParam::MinMacLength(consume_u32(data)?),
+            Tag::MinSecondsBetweenOps => KeyParam::MinSecondsBetweenOps(consume_u32(data)?),
             Tag::MaxUsesPerBoot => KeyParam::MaxUsesPerBoot(consume_u32(data)?),
             Tag::UsageCountLimit => KeyParam::UsageCountLimit(consume_u32(data)?),
             Tag::UserId => KeyParam::UserId(consume_u32(data)?),
@@ -525,7 +527,6 @@ pub fn deserialize(data: &mut &[u8]) -> Result<Vec<KeyParam>, Error> {
             // Invalid variants.
             Tag::Invalid
             | Tag::HardwareType
-            | Tag::MinSecondsBetweenOps
             | Tag::UniqueId
             | Tag::IdentityCredentialKey
             | Tag::AssociatedData
@@ -562,6 +563,7 @@ pub fn param_compare(left: &KeyParam, right: &KeyParam) -> Ordering {
             l.cmp(r)
         }
         (KeyParam::UsageExpireDatetime(l), KeyParam::UsageExpireDatetime(r)) => l.cmp(r),
+        (KeyParam::MinSecondsBetweenOps(l), KeyParam::MinSecondsBetweenOps(r)) => l.cmp(r),
         (KeyParam::MaxUsesPerBoot(l), KeyParam::MaxUsesPerBoot(r)) => l.cmp(r),
         (KeyParam::UsageCountLimit(l), KeyParam::UsageCountLimit(r)) => l.cmp(r),
         (KeyParam::UserId(l), KeyParam::UserId(r)) => l.cmp(r),

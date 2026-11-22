@@ -41,6 +41,7 @@ mod tests;
 pub const UNPOLICED_COPYABLE_TAGS: &[Tag] = &[
     Tag::RollbackResistance,
     Tag::EarlyBootOnly,
+    Tag::MinSecondsBetweenOps,
     Tag::MaxUsesPerBoot,
     Tag::UserSecureId, // repeatable
     Tag::NoAuthRequired,
@@ -349,7 +350,12 @@ fn extract_key_characteristics(
         }
 
         if sec_level == SecurityLevel::Strongbox
-            && [Tag::MaxUsesPerBoot, Tag::RollbackResistance].contains(&tag)
+            && [
+                Tag::MaxUsesPerBoot,
+                Tag::MinSecondsBetweenOps,
+                Tag::RollbackResistance,
+            ]
+            .contains(&tag)
         {
             // StrongBox does not support tags that require per-key storage.
             return Err(km_err!(

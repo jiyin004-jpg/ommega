@@ -450,6 +450,18 @@ impl crate::KeyMintTa {
             let key_id = self.key_id(key_blob)?;
             self.update_use_count(key_id, *max_uses)?;
         }
+        // AOSP `AuthorizeBegin`：先查距上次 begin 是否够久，通过了才把这次记下来。
+        if let Some(min_seconds) = get_opt_tag_value!(key_chars, MinSecondsBetweenOps)? {
+            let key_id = self.key_id(key_blob)?;
+            if !self.min_time_between_ops_passed(*min_seconds, &key_id) {
+                return Err(km_err!(
+                    KeyRateLimitExceeded,
+                    "operations on this key are rate limited ({}s)",
+                    min_seconds
+                ));
+            }
+            self.register_access_time(key_id);
+        }
         Ok(())
     }
 }

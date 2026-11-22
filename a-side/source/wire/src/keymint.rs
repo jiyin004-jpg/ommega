@@ -379,6 +379,7 @@ pub enum KeyParam {
     ActiveDatetime(DateTime),
     OriginationExpireDatetime(DateTime),
     UsageExpireDatetime(DateTime),
+    MinSecondsBetweenOps(u32),
     MaxUsesPerBoot(u32),
     UsageCountLimit(u32),
     UserId(u32),
@@ -446,6 +447,7 @@ impl KeyParam {
             KeyParam::ActiveDatetime(_) => Tag::ActiveDatetime,
             KeyParam::OriginationExpireDatetime(_) => Tag::OriginationExpireDatetime,
             KeyParam::UsageExpireDatetime(_) => Tag::UsageExpireDatetime,
+            KeyParam::MinSecondsBetweenOps(_) => Tag::MinSecondsBetweenOps,
             KeyParam::MaxUsesPerBoot(_) => Tag::MaxUsesPerBoot,
             KeyParam::UsageCountLimit(_) => Tag::UsageCountLimit,
             KeyParam::UserId(_) => Tag::UserId,
@@ -554,6 +556,9 @@ impl crate::AsCborValue for KeyParam {
             }
             Tag::UsageExpireDatetime => {
                 KeyParam::UsageExpireDatetime(<DateTime>::from_cbor_value(raw)?)
+            }
+            Tag::MinSecondsBetweenOps => {
+                KeyParam::MinSecondsBetweenOps(<u32>::from_cbor_value(raw)?)
             }
             Tag::MaxUsesPerBoot => KeyParam::MaxUsesPerBoot(<u32>::from_cbor_value(raw)?),
             Tag::UsageCountLimit => KeyParam::UsageCountLimit(<u32>::from_cbor_value(raw)?),
@@ -666,6 +671,7 @@ impl crate::AsCborValue for KeyParam {
                 (Tag::OriginationExpireDatetime, v.to_cbor_value()?)
             }
             KeyParam::UsageExpireDatetime(v) => (Tag::UsageExpireDatetime, v.to_cbor_value()?),
+            KeyParam::MinSecondsBetweenOps(v) => (Tag::MinSecondsBetweenOps, v.to_cbor_value()?),
             KeyParam::MaxUsesPerBoot(v) => (Tag::MaxUsesPerBoot, v.to_cbor_value()?),
             KeyParam::UsageCountLimit(v) => (Tag::UsageCountLimit, v.to_cbor_value()?),
             KeyParam::UserId(v) => (Tag::UserId, v.to_cbor_value()?),

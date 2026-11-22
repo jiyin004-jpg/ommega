@@ -96,6 +96,7 @@ KeyParam = &(
     [1610613136, DateTime], ; Tag_ActiveDatetime
     [1610613137, DateTime], ; Tag_OriginationExpireDatetime
     [1610613138, DateTime], ; Tag_UsageExpireDatetime
+    [805306771, int], ; Tag_MinSecondsBetweenOps
     [805306772, int], ; Tag_MaxUsesPerBoot
     [805306773, int], ; Tag_UsageCountLimit
     [805306869, int], ; Tag_UserId

@@ -893,6 +893,7 @@ pub fn key_param_to_aidl(kp: KeyParam, km_dev_version: i32) -> Result<KmKeyParam
         ),
         KeyParam::CallerNonce => KeyParameterValue::BoolValue(true),
         KeyParam::MinMacLength(v) => KeyParameterValue::Integer(v as i32),
+        KeyParam::MinSecondsBetweenOps(v) => KeyParameterValue::Integer(v as i32),
         KeyParam::EcCurve(v) => KeyParameterValue::EcCurve(
             crate::android::hardware::security::keymint::EcCurve::EcCurve(v as i32),
         ),

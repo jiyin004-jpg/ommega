@@ -95,6 +95,14 @@ struct UseCount {
     count: u64,
 }
 
+/// Last begin time for a key, used by `MIN_SECONDS_BETWEEN_OPS`.
+struct AccessTime {
+    key_id: KeyId,
+    at_ms: u64,
+}
+
+const MAX_RATE_LIMITED_KEYS: usize = 32;
+
 /// Attestation chain information.
 struct AttestationChainInfo {
     /// Chain of certificates from intermediate to root.
@@ -181,6 +189,9 @@ pub struct KeyMintTa {
 
     /// Use counts for keys where this is tracked.
     use_count: [Option<UseCount>; MAX_USE_COUNTED_KEYS],
+
+    /// Last begin time for keys that declare `MIN_SECONDS_BETWEEN_OPS`.
+    access_time: [Option<AccessTime>; MAX_RATE_LIMITED_KEYS],
 
     /// Operation handle of the (single) in-flight operation that requires trusted user presence.
     presence_required_op: Option<OpHandle>,
@@ -348,6 +359,7 @@ impl KeyMintTa {
             // Work around Rust limitation that `vec![None; n]` doesn't work.
             operations: (0..max_operations).map(|_| None).collect(),
             use_count: Default::default(),
+            access_time: Default::default(),
             presence_required_op: None,
             shared_secret_params: None,
             hw_info,
@@ -600,6 +612,46 @@ impl KeyMintTa {
                 TooManyOperations,
                 "too many use-counted keys already in play"
             ))
+        }
+    }
+
+    /// AOSP `KeymasterEnforcement::MinTimeBetweenOpsPassed`：没记录过就是通过。
+    fn min_time_between_ops_passed(&self, min_seconds: u32, key_id: &KeyId) -> bool {
+        let Some(now) = self.now_ms() else {
+            return true;
+        };
+        for entry in self.access_time.iter().flatten() {
+            if entry.key_id == *key_id {
+                return now >= entry.at_ms.saturating_add(u64::from(min_seconds) * 1000);
+            }
+        }
+        true
+    }
+
+    /// AOSP `KeymasterEnforcement::RegisterAccessTime`。
+    fn register_access_time(&mut self, key_id: KeyId) {
+        let Some(now) = self.now_ms() else {
+            return;
+        };
+        let mut free = None;
+        let mut oldest: Option<(usize, u64)> = None;
+        for (idx, entry) in self.access_time.iter().enumerate() {
+            match entry {
+                Some(e) if e.key_id == key_id => {
+                    self.access_time[idx] = Some(AccessTime { key_id, at_ms: now });
+                    return;
+                }
+                Some(e) => {
+                    if oldest.map(|(_, at)| e.at_ms < at).unwrap_or(true) {
+                        oldest = Some((idx, e.at_ms));
+                    }
+                }
+                None if free.is_none() => free = Some(idx),
+                None => {}
+            }
+        }
+        if let Some(idx) = free.or(oldest.map(|(idx, _)| idx)) {
+            self.access_time[idx] = Some(AccessTime { key_id, at_ms: now });
         }
     }
 
