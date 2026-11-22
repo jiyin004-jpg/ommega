@@ -107,7 +107,7 @@ pub fn init_logger() {
             //
             // 这是 unsafe：别的线程可能正在用旧 logger。但走到这里已经是“日志反正
             // 记不下来”的局面，换掉比空写强。
-            unsafe { log::set_logger_racy(&PLAIN_LOGGER) };
+            unsafe { let _ = log::set_logger_racy(&PLAIN_LOGGER); };
             log::set_max_level(level);
             eprintln!("keymint logging failed to initialize, fell back to plain file logger: {error:#}");
         }
