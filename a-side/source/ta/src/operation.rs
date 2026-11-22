@@ -243,7 +243,7 @@ impl crate::KeyMintTa {
             match &mut op.crypto_op {
                 CryptoOperation::AesGcm(op) => op.update_aad(data),
                 _ => Err(km_err!(
-                    InvalidOperation,
+                    InvalidOperationHandle,
                     "operation does not support update_aad"
                 )),
             }
@@ -721,7 +721,12 @@ impl crate::KeyMintTa {
                 Some(_op) => false,
                 None => false,
             })
-            .ok_or_else(|| km_err!(InvalidOperation, "operation handle {op_handle:?} not found"))
+            .ok_or_else(|| {
+                km_err!(
+                    InvalidOperationHandle,
+                    "operation handle {op_handle:?} not found"
+                )
+            })
     }
 
     /// Execute the provided lambda over the associated [`Operation`], handling
