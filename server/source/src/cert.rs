@@ -1237,9 +1237,19 @@ fn build_chain_signed_by(
     t.explicit(0, &wrap_int(2)); // version [0] EXPLICIT INTEGER 2
     t.int(&serial_bytes);
     // The SignatureAlgorithm in TBSCertificate uses the ISSUER key's algorithm.
-    let sig_alg_tbs = sig_alg_for_key(&issuer_key);
+    let signing_key = if p.synthetic_challenge {
+        &leaf_key
+    } else {
+        &issuer_key
+    };
+    let sig_alg_tbs = sig_alg_for_key(signing_key);
     t.0.extend(sig_alg_tbs);
-    t.0.extend(&issuer_name);
+    // 无 challenge 的叶子是自签的（AOSP 的 generate_self_signed_cert）：issuer = subject。
+    if p.synthetic_challenge {
+        t.0.extend(&subject_name);
+    } else {
+        t.0.extend(&issuer_name);
+    }
     let mut validity = Der::new();
     if not_before_is_generalized {
         validity.generalized_time(&not_before);
@@ -1264,16 +1274,15 @@ fn build_chain_signed_by(
     // AIDL 里写得很死：「keyCertSignBit: iff the attested key has
     // KeyPurpose::ATTEST_KEY」。没带的话它就不像一张能签发子证书的证明密钥。
     let is_attest_key = p.purposes.contains(&7);
-    let ku_der = {
-        let mut d = Der::new();
-        if is_attest_key {
-            // bit0 digitalSignature + bit5 keyCertSign
-            d.bit_string(&[0x84, 0x00]);
-        } else {
-            d.bit_string(&[0x80, 0x00]); // digitalSignature
-        }
-        d.into_vec()
-    };
+    let mut ku_der = Der::new();
+    if is_attest_key && !p.synthetic_challenge {
+        // bit0 digitalSignature + bit5 keyCertSign
+        ku_der.bit_string(&[0x84, 0x00]);
+    } else {
+        // AOSP 的自签占位只给 digitalSignature，不给 keyCertSign。
+        ku_der.bit_string(&[0x80, 0x00]);
+    }
+    let ku_der = ku_der.into_vec();
     let mut exts_content = Der::new();
     exts_content
         .0
@@ -1299,8 +1308,8 @@ fn build_chain_signed_by(
     tbs_tlv.raw(0x30, &tbs_content);
     let tbs_full = tbs_tlv.into_vec();
 
-    // Sign with the ISSUER key (stored private key), not the leaf key.
-    let (sig_alg_final, signature) = sign_tbs(&issuer_key, &tbs_full)?;
+    // 有 challenge 时用签发者的私钥签；无 challenge 的叶子是自签。
+    let (sig_alg_final, signature) = sign_tbs(signing_key, &tbs_full)?;
 
     let mut cert = Der::new();
     let mut inner = Der::new();
@@ -1314,12 +1323,15 @@ fn build_chain_signed_by(
 
     // 5) Assemble chain: [new_leaf, issuer_cert, ...CA_certs]
     //    Match Django's `full_chain = [leaf_cert] + issuer_certs`.
+    //    无 challenge 时 AOSP 只回一张自签占位（generate_self_signed_cert）。
     let mut chain = String::new();
     chain.push_str(&pem_leaf);
     chain.push('\n');
-    for der in &ders {
-        chain.push_str(&pem::encode(&pem::Pem::new("CERTIFICATE", der.clone())));
-        chain.push('\n');
+    if !p.synthetic_challenge {
+        for der in &ders {
+            chain.push_str(&pem::encode(&pem::Pem::new("CERTIFICATE", der.clone())));
+            chain.push('\n');
+        }
     }
 
     Ok((chain, leaf_key_pem))

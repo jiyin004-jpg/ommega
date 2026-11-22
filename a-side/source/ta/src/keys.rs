@@ -407,6 +407,14 @@ impl crate::KeyMintTa {
         // tagged. The device's own `/strongbox` HAL is not wired in: it may be
         // declared but not servable from the keystore context (Unknown error -1000).
         let wants_attest_challenge = get_opt_tag_value!(params, AttestationChallenge)?.is_some();
+        // AOSP 的 EcKeyFactory/RsaKeyFactory：给了证明密钥却没给 challenge，直接报
+        // ATTESTATION_CHALLENGE_MISSING，不往下签发。
+        if attestation_key.is_some() && !wants_attest_challenge {
+            return Err(km_err!(
+                AttestationChallengeMissing,
+                "attestation key given without a challenge"
+            ));
+        }
         // 证明密钥（`PURPOSE_ATTEST_KEY`）生成时通常不带 challenge，而远程出证必须有：
         // 远程开启时补一个 32 字节随机 challenge 一并送出，本地模式仍用本地对应级别的
         // keybox 出证。
