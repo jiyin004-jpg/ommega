@@ -68,7 +68,7 @@ impl crate::KeyMintTa {
         // Validate parameters.
         let key_chars = characteristics_at(&characteristics, self.hw_info.security_level)?;
         check_begin_params(key_chars, purpose, &params)?;
-        self.check_begin_auths(key_chars, key_blob, purpose)?;
+        self.check_begin_auths(key_chars, key_blob)?;
 
         let trusted_conf_data = if purpose == KeyPurpose::Sign
             && get_bool_tag_value!(key_chars, TrustedConfirmationRequired)?
@@ -394,12 +394,7 @@ impl crate::KeyMintTa {
     }
 
     /// Check TA-specific key authorizations on `begin()`.
-    fn check_begin_auths(
-        &mut self,
-        key_chars: &[KeyParam],
-        key_blob: &[u8],
-        purpose: KeyPurpose,
-    ) -> Result<(), Error> {
+    fn check_begin_auths(&mut self, key_chars: &[KeyParam], key_blob: &[u8]) -> Result<(), Error> {
         if self.dev.bootloader.done() && get_bool_tag_value!(key_chars, BootloaderOnly)? {
             return Err(km_err!(
                 InvalidKeyBlob,
@@ -412,38 +407,11 @@ impl crate::KeyMintTa {
                 "attempt to use EARLY_BOOT key after early boot"
             ));
         }
-        // 时间授权：还没到生效时间、或已经过了使用期限的钥匙不能开工。
-        // 加密/签名这类「产生新数据」的操作另外受 ORIGINATION_EXPIRE 约束。
-        if let Some(now) = self.now_ms() {
-            if let Some(active) = get_opt_tag_value!(key_chars, ActiveDatetime)? {
-                if (now as i64) < active.ms_since_epoch {
-                    return Err(km_err!(
-                        KeyNotYetValid,
-                        "attempt to use a key before its active time"
-                    ));
-                }
-            }
-            if matches!(purpose, KeyPurpose::Decrypt | KeyPurpose::Verify) {
-                if let Some(expire) = get_opt_tag_value!(key_chars, UsageExpireDatetime)? {
-                    if (now as i64) >= expire.ms_since_epoch {
-                        return Err(km_err!(
-                            KeyExpired,
-                            "attempt to use a key after its usage expiry"
-                        ));
-                    }
-                }
-            }
-            if matches!(purpose, KeyPurpose::Encrypt | KeyPurpose::Sign) {
-                if let Some(expire) = get_opt_tag_value!(key_chars, OriginationExpireDatetime)? {
-                    if (now as i64) >= expire.ms_since_epoch {
-                        return Err(km_err!(
-                            KeyExpired,
-                            "attempt to originate data with a key past its origination expiry"
-                        ));
-                    }
-                }
-            }
-        }
+        // 时间授权（ACTIVE/ORIGINATION_EXPIRE/USAGE_EXPIRE）不在这里查：
+        // 它们归 Keystore 组，不进 TEE 组的 key characteristics，begin 读不到。
+        // AOSP 的时间授权本来就是 keystore2 那一层按 `ENFORCEMENTS` 查的。
+        // 以前为了在 TA 里也查一份，把这些 tag 往 TEE 组塞，结果证书的
+        // hardwareEnforced 里多出一组 AOSP 不会有的时间授权，已经拆了。
 
         if let Some(max_uses) = get_opt_tag_value!(key_chars, MaxUsesPerBoot)? {
             // Track the use count for this key.

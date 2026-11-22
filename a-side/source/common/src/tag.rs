@@ -367,21 +367,13 @@ fn extract_key_characteristics(
 
         match param {
             // 时间授权这几条（ACTIVE_DATETIME / ORIGINATION_EXPIRE / USAGE_EXPIRE）
-            // 两边都要，但各只能一份：
-            //   - `chars`（TEE 组）：我们的 TA 在 begin 时自己执行它们，begin 读的
-            //     就是这一组；证书的 hardwareEnforced 也从这组来。
-            //   - `keystore_chars`（Keystore 组）：AOSP 认为它们归 KeystoreEnforced，
-            //     证书的 softwareEnforced 就靠这份声明。
+            // 不在这里碰。AOSP 把它们归 `KEYSTORE_ENFORCED_CHARACTERISTICS`，
+            // 走下面那个 `else if` 只进 Keystore 组，证书里只出现在
+            // softwareEnforced —— 保持这个形态，别往 TEE 组硬塞。
             //
-            // push 完必须 `continue`：下面那个 `else if` 还会把同一项再放进
-            // Keystore 组一次，不跳就是同一个 tag 出现两遍。
-            KeyParam::ActiveDatetime(_)
-            | KeyParam::OriginationExpireDatetime(_)
-            | KeyParam::UsageExpireDatetime(_) => {
-                chars.try_push(param.clone())?;
-                keystore_chars.try_push(param.clone())?;
-                continue;
-            }
+            // （之前试过两边各放一份，好让 TA 的 begin 也能自己查；代价是
+            // hardwareEnforced 里多出一组 AOSP 不会有的时间授权。begin 那边的
+            // 检查已经拆掉了，keystore2 层的 ENFORCEMENTS 仍然会查。）
             // ML-DSA keys should not have key size parameter since it's not
             // used and should not appear as a key authorization.
             KeyParam::KeySize(_) => {
