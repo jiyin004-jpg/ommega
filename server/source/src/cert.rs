@@ -193,17 +193,48 @@ fn key_description_der(p: &AttestationParams) -> Vec<u8> {
             w.next().write_bytes(&p.challenge);
             // uniqueId: always empty bytes (matches Django's `_octet(b"")`)
             w.next().write_bytes(b"");
-            // softwareEnforced — CREATION_DATETIME (tag 701) and
-            // ATTESTATION_APPLICATION_ID (tag 709), sorted by tag.
+            // softwareEnforced —— CREATION_DATETIME (701)、ATTESTATION_APPLICATION_ID (709)，
+            // 以及时间授权 400/401/402。
+            //
+            // 时间授权在 AOSP 里是 KeystoreEnforced，证书里应该出现在这一侧；
+            // 写进 teeEnforced 会让 hardwareEnforced 多出一组系统实现不会有的
+            // 授权（Peridot 实测对比过两侧的证书形态）。
             w.next().write_sequence(|w| {
                 let mut sw_tags: Vec<u64> = Vec::new();
                 sw_tags.push(701); // CREATION_DATETIME — always present
                 if p.app_id.is_some() {
                     sw_tags.push(709); // ATTESTATION_APPLICATION_ID
                 }
+                if p.active_datetime_ms.is_some() {
+                    sw_tags.push(400);
+                }
+                if p.origination_expire_ms.is_some() {
+                    sw_tags.push(401);
+                }
+                if p.usage_expire_ms.is_some() {
+                    sw_tags.push(402);
+                }
                 sw_tags.sort();
                 for &tag in &sw_tags {
                     match tag {
+                        400 => {
+                            if let Some(v) = p.active_datetime_ms {
+                                w.next()
+                                    .write_tagged(yasna::Tag::context(400), |w| w.write_i64(v));
+                            }
+                        }
+                        401 => {
+                            if let Some(v) = p.origination_expire_ms {
+                                w.next()
+                                    .write_tagged(yasna::Tag::context(401), |w| w.write_i64(v));
+                            }
+                        }
+                        402 => {
+                            if let Some(v) = p.usage_expire_ms {
+                                w.next()
+                                    .write_tagged(yasna::Tag::context(402), |w| w.write_i64(v));
+                            }
+                        }
                         701 => {
                             w.next().write_tagged(yasna::Tag::context(701), |w| {
                                 w.write_u64(p.creation_datetime_ms);
@@ -250,16 +281,9 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
     if p.rsa_public_exponent.is_some() {
         tags.push(200);
     }
-    // 时间授权 400/401/402：整型毫秒。tags 最后会排序，这里只登记。
-    if p.active_datetime_ms.is_some() {
-        tags.push(400);
-    }
-    if p.origination_expire_ms.is_some() {
-        tags.push(401);
-    }
-    if p.usage_expire_ms.is_some() {
-        tags.push(402);
-    }
+    // ACTIVE / ORIGINATION_EXPIRE / USAGE_EXPIRE 不再登记：它们归
+    // softwareEnforced（见 key_description_der），AOSP 的 KeystoreEnforced
+    // 语义就是那一侧。
     if !p.mgf_digest.is_empty() {
         tags.push(203);
     } // RSA_OAEP_MGF_DIGEST (RSA only)
@@ -379,27 +403,8 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                         })
                     });
                 }
-                // ACTIVE_DATETIME / ORIGINATION_EXPIRE_DATETIME / USAGE_EXPIRE_DATETIME：
-                // AOSP 的 AuthorizationList 里是 EXPLICIT INTEGER（毫秒）。
-                400 => {
-                    if let Some(v) = p.active_datetime_ms {
-                        w.next()
-                            .write_tagged(yasna::Tag::context(400), |w| w.write_i64(v));
-                    }
-                }
-                401 => {
-                    if let Some(v) = p.origination_expire_ms {
-                        w.next()
-                            .write_tagged(yasna::Tag::context(401), |w| w.write_i64(v));
-                    }
-                }
-                402 => {
-                    if let Some(v) = p.usage_expire_ms {
-                        w.next()
-                            .write_tagged(yasna::Tag::context(402), |w| w.write_i64(v));
-                    }
-                }
-                503 | 506 | 507 | 508 | 509 => {
+                // 时间授权不在这里写：已搬到 softwareEnforced。
+                 503 | 506 | 507 | 508 | 509 => {
                     w.next().write_tagged(yasna::Tag::context(tag), |w| {
                         w.write_null();
                     });
