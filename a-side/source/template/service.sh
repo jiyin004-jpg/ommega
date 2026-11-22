@@ -169,13 +169,18 @@ ensure_sepolicy() {
   if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
     return 0
   fi
-  # 先在内存里比一下：规则都在就不碰内核。只有真缺了才写一次 —— 重写会把整份
-  # policy 重新加载，语义不变，但 policy 文件的字节会换一种排序。
-  if ! ommega_sepolicy_rules_present "$MODDIR/sepolicy.rule"; then
-    # 运行中（service 阶段）才允许自带工具兜底写 load；开机早期写会把基础域
-    # 权限写没（见 sepolicy_apply.sh 第 3 步的说明）。
-    OMMEGA_POLICY_RUNTIME=1 ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
-  fi
+  # 运行中（service 阶段）我们自己的工具优先：**无条件**跑一次，不再先做
+  # 「规则都在就跳过」的优化。
+  #
+  # 那个优化会把「我们的优先」变成空话：post-fs-data 阶段不能碰自带那份（写
+  # load 会把基础域权限写没），只能交给 ksud；等 service 阶段轮到这里时，ksud
+  # 往往已经把规则弄进去了，--check 一过就跳过了自带那份。结果是正常开机
+  # 路径里永远走 ksud，我们的只在 ksud 失败时才兜底。
+  #
+  # 现在改成无条件调一次：自带先试，成功就 return（policy 由我们这份规则
+  # 完整重写，不依赖管理器）；它不行才落到 ksud / magiskpolicy。重写是把整份
+  # policy 重新 load 一遍，语义不变，只在启动时做一次。
+  OMMEGA_POLICY_RUNTIME=1 ommega_apply_sepolicy "$MODDIR/sepolicy.rule" "$SEPOLICY_LOG" >/dev/null 2>&1
   # 成败都落时间戳：失败时每 5 秒重试一遍只会刷爆日志，5 分钟后再说。
   mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
   printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
