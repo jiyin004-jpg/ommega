@@ -12,20 +12,22 @@
 | `libsepol/` | AOSP `external/selinux` 的 libsepol（只放 `src/` 和 `include/`，CIL 不用） |
 | `build.py` | 用 NDK 交叉编四个 ABI，产物在 `out/<abi>/ommega-policy`（不进 git） |
 
-## 为什么只在最后一级用
+## 顺序：自带优先，但只在运行中
 
-管理器原生工具跟系统 policy 是同一代编出来的，兼容性最好；我们自己这份是「谁都没给
-工具」时的保底。顺序写在 `sepolicy_apply.sh` 里：ksud → magiskpolicy → 自带。
+`sepolicy_apply.sh` 的顺序是 **自带 → ksud → magiskpolicy**。
 
-**2026-11-22 实测：它写 `/sys/fs/selinux/load` 会把 policy 写坏，所以默认不再自动用。**
+自带这份不依赖管理器，是最稳的一条路，所以放第一。但它直接重写整份 policy，
+只能在**运行中**（service 阶段，传 `OMMEGA_POLICY_RUNTIME=1`）用。
 
-在 peridot（小米 24069RA21C / Android 16）上 `--live --apply` 之后：规则本身确实进去了，
-但同时丢了基础域的权限 —— `zygote → device:file { read write }`（也就是 `/dev/null`）
+**2026-11-22 实测：`post-fs-data` 阶段写 `/sys/fs/selinux/load` 会把 policy 写坏。**
+
+在 peridot（小米 24069RA21C / Android 16）上`--live --apply`之后：规则本身确实进去了，
+但同时丢了基础域的权限 —— `zygote → device:file { read write }`（也就是`/dev/null`）
 一次开机就刷出几百条 avc denied，app 进程 fork 完一开 `/dev/null` 就 SIGABRT，
 `system_server`、`keystore`、`dex2oat` 也跟着缺权限。现象是「规则生效了，但整台机器崩」。
 
-所以现在只有显式给 `OMMEGA_BUNDLED_POLICY=1` 才会用它。真要启用，先有一份能回滚的
-policy（`cat /sys/fs/selinux/policy > backup.bin`，出事再写回去），并准备重启。
+同一个工具、同一份规则，**运行中再写就没问题**（policy 149843 → 149844 条、
+zygote 零新增 denied、注入正常）。所以开机早期跳过它、交给管理器，service 阶段再用它。
 
 ## 编译
 
@@ -61,9 +63,9 @@ allow <类型>{集合} <类型>{集合} <类> <权限>{集合}|*
 没验证的：真机上写 `/sys/fs/selinux/load` 那一下（要设备在线才能试）。这一层
 magiskpolicy 走的是同样的路径，风险不高，但没实测就是没实测。
 
-2026-11-22 补上了这个实测：**在 peridot 上写完，基础域对 `/dev/null` 的权限丢了**
-（zygote / system_server / keystore 全中），app 进程一起就崩。所以默认不再自动用，
-见上面「为什么只在最后一级用」。
+2026-11-22 补上了这个实测：**在 peridot 上，`post-fs-data` 阶段写完，基础域对 `/dev/null`
+的权限丢了**（zygote / system_server / keystore 全中），app 进程一起就崩；同一个工具
+在 service 阶段写则一切正常。见上面「顺序：自带优先，但只在运行中」。
 
 ## 授权
 

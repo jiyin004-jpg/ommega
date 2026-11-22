@@ -183,15 +183,28 @@ ommega_apply_sepolicy() {
   fi
   _OMMEGA_POLICY_RULE=$(_ommega_policy_filtered_rule "$_OMMEGA_POLICY_RULE")
 
-  # 0) 自带那份不在开机早期自动用了。它直接写 /sys/fs/selinux/load，真机上实测
-  #    （PKG110 / Android 16）：libsepol 重新序列化整份 policy 后，zygote、system_server、
-  #    keystore 这些基础域对 device:file（/dev/null）的权限会丢。post-fs-data 阶段
-  #    边上还有管理器在打补丁，两次写交错更容错。
+  # 0) 先用自带工具（我们的优先）。它直接写 /sys/fs/selinux/load，不依赖管理器。
   #
-  #    但 ksud 也有不靠谱的时候（PKG110 上 KernelSU 1.4.5：apply 返回 0，policy
-  #    一个字节都没变）。所以先交给管理器，全都失败时，**只在运行中**（service
-  #    阶段，OMMEGA_POLICY_RUNTIME=1）才拿自带那份兜底 —— 运行中写 load 实测安全，
-  #    开机早期不安全。
+  #    限制：只在**运行中**用（service 阶段会传 OMMEGA_POLICY_RUNTIME=1）。
+  #    post-fs-data 阶段写 load 实测（PKG110 / Android 16）会把基础域权限写没：
+  #    zygote 对 device:file（/dev/null）的读写权限丢失，app 进程一 fork 就 SIGABRT。
+  #    那个阶段边上还有管理器在打补丁，两次写交错也容易出事。所以开机早期跳过它，
+  #    交给管理器工具；等 service 阶段到了再用我们自己的。
+  if [ "${OMMEGA_POLICY_RUNTIME:-}" = "1" ] || [ "${OMMEGA_BUNDLED_POLICY:-}" = "1" ]; then
+    for _ommega_cand in $(_ommega_policy_bundled_candidates); do
+      _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
+      if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
+        if [ "$(ommega_sepolicy_rule_state "$_OMMEGA_POLICY_RULE")" != "missing" ]; then
+          _ommega_policy_log "ok $_ommega_tool --live --apply (bundled)"
+          printf '%s\n' "$_ommega_tool --live --apply"
+          return 0
+        fi
+        _ommega_policy_log "bundled applied but rules still missing; falling through"
+      else
+        _ommega_policy_log "fail $_ommega_tool --live --apply (bundled)"
+      fi
+    done
+  fi
 
 
   # 1) KernelSU 系：整份文件一次 apply（ksud 自己的解析器按行读，列表长度有上限，
@@ -224,30 +237,7 @@ ommega_apply_sepolicy() {
     _ommega_policy_log "fail $_ommega_tool --live --apply"
   done
 
-  # 3) 管理器的两种工具都没把规则弄进去。只有**运行中**才拿自带那份兜底：
-  #    service 阶段写 load 实测安全（规则进去、基础域权限不丢）；post-fs-data
-  #    阶段写会把基础域权限写没。
-  if [ "${OMMEGA_BUNDLED_POLICY:-}" = "1" ] || [ "${OMMEGA_POLICY_RUNTIME:-}" = "1" ]; then
-    for _ommega_cand in $(_ommega_policy_bundled_candidates); do
-      _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
-      if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
-        if [ "$(ommega_sepolicy_rule_state "$_OMMEGA_POLICY_RULE")" != "missing" ]; then
-          _ommega_policy_log "ok $_ommega_tool --live --apply (bundled, runtime fallback)"
-          printf '%s\n' "$_ommega_tool --live --apply"
-          return 0
-        fi
-        _ommega_policy_log "bundled applied but rules still missing; falling through"
-      else
-        _ommega_policy_log "fail $_ommega_tool --live --apply (bundled, runtime fallback)"
-      fi
-    done
-  fi
-
-  # 4) 到这儿说明真的没有能用的工具（或者不在运行中、不允许动 load）。
-  #    一个能用的工具都没有的情况：管理器既不在 KernelSU 那条路上，也没给
-  #    magiskpolicy 的入口（改过二进制名、或者压根不带工具）。
-  #    规则这时只能靠管理器自己开机重放 —— Magisk / APatch 会，KernelSU 不会。
-  #    这行日志就是为这种情况留的。
-  _ommega_policy_report_candidates
+  # 3) 到这儿说明自带的和管理器的都没把规则弄进去。不再重复写 load。
+  #  _ommega_policy_report_candidates
   return 1
 }
