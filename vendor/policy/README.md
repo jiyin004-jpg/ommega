@@ -14,8 +14,18 @@
 
 ## 为什么只在最后一级用
 
-管理器原生工具跟系统 policy 是同一代编出来的，兼容性最好；我们这份是「谁都没给
-工具」时的保底。三级顺序写在 `sepolicy_apply.sh` 里：ksud → magiskpolicy → 自带。
+管理器原生工具跟系统 policy 是同一代编出来的，兼容性最好；我们自己这份是「谁都没给
+工具」时的保底。顺序写在 `sepolicy_apply.sh` 里：ksud → magiskpolicy → 自带。
+
+**2026-11-22 实测：它写 `/sys/fs/selinux/load` 会把 policy 写坏，所以默认不再自动用。**
+
+在 peridot（小米 24069RA21C / Android 16）上 `--live --apply` 之后：规则本身确实进去了，
+但同时丢了基础域的权限 —— `zygote → device:file { read write }`（也就是 `/dev/null`）
+一次开机就刷出几百条 avc denied，app 进程 fork 完一开 `/dev/null` 就 SIGABRT，
+`system_server`、`keystore`、`dex2oat` 也跟着缺权限。现象是「规则生效了，但整台机器崩」。
+
+所以现在只有显式给 `OMMEGA_BUNDLED_POLICY=1` 才会用它。真要启用，先有一份能回滚的
+policy（`cat /sys/fs/selinux/policy > backup.bin`，出事再写回去），并准备重启。
 
 ## 编译
 
@@ -50,6 +60,10 @@ allow <类型>{集合} <类型>{集合} <类> <权限>{集合}|*
 
 没验证的：真机上写 `/sys/fs/selinux/load` 那一下（要设备在线才能试）。这一层
 magiskpolicy 走的是同样的路径，风险不高，但没实测就是没实测。
+
+2026-11-22 补上了这个实测：**在 peridot 上写完，基础域对 `/dev/null` 的权限丢了**
+（zygote / system_server / keystore 全中），app 进程一起就崩。所以默认不再自动用，
+见上面「为什么只在最后一级用」。
 
 ## 授权
 
