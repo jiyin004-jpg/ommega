@@ -11,6 +11,65 @@ const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
 const SWITCH_TICK: Duration = Duration::from_secs(5);
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
+
+/// 最简的文件 logger：直写 keymint.log，不参与 log4rs 那套轮转。
+///
+/// 只在一个地方用：log4rs 装不上（进程里已经有人占了 `log` 的全局 logger）。
+struct PlainFileLogger {
+    state: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+impl log::Log for PlainFileLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        if guard.is_none() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(DEFAULT_LOG_PATH)
+            {
+                Ok(file) => *guard = Some(file),
+                Err(error) => {
+                    eprintln!("keymint logging cannot open {DEFAULT_LOG_PATH}: {error:#}");
+                    return;
+                }
+            }
+        }
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        use std::io::Write;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(
+            file,
+            "{secs} [{:?}] {} - {}",
+            record.level(),
+            record.target(),
+            record.args()
+        );
+    }
+
+    fn flush(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = std::io::Write::flush(file);
+            }
+        }
+    }
+}
+
+static PLAIN_LOGGER: PlainFileLogger = PlainFileLogger {
+    state: std::sync::Mutex::new(None),
+};
 /// The WebUI log switch, decided once during [`init_logger`].  Kept around so
 /// the `eprintln!` fallbacks (which are not part of the `log` crate) can honour
 /// the same switch instead of leaking into the root manager's service log.
@@ -42,7 +101,15 @@ pub fn init_logger() {
         }
         let level = crate::config::flat_log_level();
         if let Err(error) = init_logger_inner(level) {
-            eprintln!("keymint logging failed to initialize: {error:#}");
+            // 这个进程里 `log` 的全局 logger 已经被别人抢先装上了（keystore2 里就是：
+            // log4rs 报 already initialized）。文件 appender 装不上就一个字也捞不到，
+            // 所以这里直接用 racy 版本把它换成一个只写文件的最简 logger。
+            //
+            // 这是 unsafe：别的线程可能正在用旧 logger。但走到这里已经是“日志反正
+            // 记不下来”的局面，换掉比空写强。
+            unsafe { log::set_logger_racy(&PLAIN_LOGGER) };
+            log::set_max_level(level);
+            eprintln!("keymint logging failed to initialize, fell back to plain file logger: {error:#}");
         }
     });
     spawn_switch_watcher();

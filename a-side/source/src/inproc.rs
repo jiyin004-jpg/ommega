@@ -169,10 +169,13 @@ fn seed_config_with_retry() -> Result<crate::config::ConfigFile> {
 }
 
 fn start() -> Result<HashMap<&'static str, SIBinder>> {
+    // 这一份跑在 keystore2 进程里，走的不是 cli_main，所以 `cli_main` 里那次
+    // `logging::init_logger()` 从来没执行过 —— 不在这里补一下，`log::info!` 全是
+    // 空写，keymint.log 里只有独立进程那几行启动日志，请求期的报错一条都留不下。
+    crate::logging::init_logger();
     let config_file = seed_config_with_retry().context("bootstrap config")?;
 
-    // 日志归宿主：payload 已装自己的 logger，`log` 的 max_level 是全局的，
-    // 这里再调一次会把 payload 自己的日志一起关掉。
+    // 上面的 logger 只装一次：`init_logger` 内部是 OnceLock，重复调用是空操作。
     info!("starting in-process ommega KeyMint");
     crate::keymaster::permission::initialize_runtime_service_context();
     // 目录/权限只打日志不挡启动：这里已是 keystore uid，chown 别人的会 EPERM。

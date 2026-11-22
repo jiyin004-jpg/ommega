@@ -520,6 +520,19 @@ fn main() {
     }
 }
 
+/// 目标进程是不是 keystore2（也就是 KeyMint payload 的宿主）。
+/// 这个函数在目标进程里跑，直接看自己的 exe。
+fn target_is_keystore2() -> bool {
+    std::fs::read_link("/proc/self/exe")
+        .ok()
+        .map(|path| {
+            path.file_name()
+                .map(|name| name == "keystore2")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 /// 诊断用：payload 里 panic 一律 abort，消息默认写 stderr（app 进程下是 /dev/null），
 /// 事后只剩 SIGABRT。这里把 panic 原文写进日志和 panic.log。
 fn install_payload_panic_hook() {
@@ -557,7 +570,15 @@ fn install_payload_panic_hook() {
 pub extern "C" fn entry(handle: *const c_void) -> bool {
     // This runs inside the target process, so we must initialize logging again
     // for that process. On Android this enables both logcat and stdout logging.
-    logging::init_logger_fallback(LevelFilter::Debug);
+    //
+    // keystore2 例外：那里的 KeyMint payload 会自己装 keymint.log 的 appender
+    // (`ommega::logging::init_logger`)。`log` 的全局 logger 只能装一次，这里先装了
+    // injector 的，payload 就报 "already initialized"，请求期日志全丢 ——
+    // 排查 attestation 这类问题正好卡在看不到 TA 报错上。所以只给非 keystore2
+    // 目标（SOTER 宿主、cryptoeng HAL）装。
+    if !target_is_keystore2() {
+        logging::init_logger_fallback(LevelFilter::Debug);
+    }
     install_payload_panic_hook();
     // 必须放在最前面：下面的 `config::get()` 会起 `injector-config` 线程，而那正是
     // 「已经注过了」的判据，放在后面查会把自己当成前一份而跳过 hook。
