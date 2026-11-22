@@ -183,28 +183,16 @@ ommega_apply_sepolicy() {
   fi
   _OMMEGA_POLICY_RULE=$(_ommega_policy_filtered_rule "$_OMMEGA_POLICY_RULE")
 
-  # 0) 自带那份不自动用了。它直接写 /sys/fs/selinux/load，而真机上实测（PKG110
-  #    / Android 16）：libsepol 重新序列化整份 policy 后，zygote、system_server、
-  #    keystore 这些基础域对 device:file（/dev/null）的权限会丢，日志里成百上千条
-  #    avc denied，app 进程一 fork 就 SIGABRT。规则本身进去了，但代价是整台机器。
+  # 0) 自带那份不在开机早期自动用了。它直接写 /sys/fs/selinux/load，真机上实测
+  #    （PKG110 / Android 16）：libsepol 重新序列化整份 policy 后，zygote、system_server、
+  #    keystore 这些基础域对 device:file（/dev/null）的权限会丢。post-fs-data 阶段
+  #    边上还有管理器在打补丁，两次写交错更容错。
   #
-  #    所以先交给管理器（ksud / magiskpolicy），它们只打补丁、不重写整份 policy。
-  #    确实一个都没有、又必须用它时，显式给 OMMEGA_BUNDLED_POLICY=1，风险自负。
-  if [ "${OMMEGA_BUNDLED_POLICY:-}" = "1" ]; then
-    for _ommega_cand in $(_ommega_policy_bundled_candidates); do
-      _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
-      if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
-        if [ "$(ommega_sepolicy_rule_state "$_OMMEGA_POLICY_RULE")" != "missing" ]; then
-          _ommega_policy_log "ok $_ommega_tool --live --apply (bundled, forced)"
-          printf '%s\n' "$_ommega_tool --live --apply"
-          return 0
-        fi
-        _ommega_policy_log "bundled applied but rules still missing; falling through"
-      else
-        _ommega_policy_log "fail $_ommega_tool --live --apply (bundled, forced)"
-      fi
-    done
-  fi
+  #    但 ksud 也有不靠谱的时候（PKG110 上 KernelSU 1.4.5：apply 返回 0，policy
+  #    一个字节都没变）。所以先交给管理器，全都失败时，**只在运行中**（service
+  #    阶段，OMMEGA_POLICY_RUNTIME=1）才拿自带那份兜底 —— 运行中写 load 实测安全，
+  #    开机早期不安全。
+
 
   # 1) KernelSU 系：整份文件一次 apply（ksud 自己的解析器按行读，列表长度有上限，
   #    sepolicy.rule 里已经按它的上限拆好了）。
@@ -236,11 +224,28 @@ ommega_apply_sepolicy() {
     _ommega_policy_log "fail $_ommega_tool --live --apply"
   done
 
-  # 3) 到这儿说明管理器的两种工具都没把规则弄进去。不再拿自带那份重试一遍 ——
-  #    它会把整份 policy 重写坏（见第 0 步的说明）。
-  #
+  # 3) 管理器的两种工具都没把规则弄进去。只有**运行中**才拿自带那份兜底：
+  #    service 阶段写 load 实测安全（规则进去、基础域权限不丢）；post-fs-data
+  #    阶段写会把基础域权限写没。
+  if [ "${OMMEGA_BUNDLED_POLICY:-}" = "1" ] || [ "${OMMEGA_POLICY_RUNTIME:-}" = "1" ]; then
+    for _ommega_cand in $(_ommega_policy_bundled_candidates); do
+      _ommega_tool=$(_ommega_policy_resolve "$_ommega_cand") || continue
+      if _ommega_policy_exec_logged "$_ommega_tool" --live --apply "$_OMMEGA_POLICY_RULE"; then
+        if [ "$(ommega_sepolicy_rule_state "$_OMMEGA_POLICY_RULE")" != "missing" ]; then
+          _ommega_policy_log "ok $_ommega_tool --live --apply (bundled, runtime fallback)"
+          printf '%s\n' "$_ommega_tool --live --apply"
+          return 0
+        fi
+        _ommega_policy_log "bundled applied but rules still missing; falling through"
+      else
+        _ommega_policy_log "fail $_ommega_tool --live --apply (bundled, runtime fallback)"
+      fi
+    done
+  fi
+
+  # 4) 到这儿说明真的没有能用的工具（或者不在运行中、不允许动 load）。
   #    一个能用的工具都没有的情况：管理器既不在 KernelSU 那条路上，也没给
-  #    magiskpolicy 的入口（改过二进制名、或者压根不带工具），自带那份也没拷进来。
+  #    magiskpolicy 的入口（改过二进制名、或者压根不带工具）。
   #    规则这时只能靠管理器自己开机重放 —— Magisk / APatch 会，KernelSU 不会。
   #    这行日志就是为这种情况留的。
   _ommega_policy_report_candidates
