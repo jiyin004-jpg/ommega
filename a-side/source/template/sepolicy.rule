@@ -51,7 +51,11 @@ allow keystore system_app_data_file file { read open getattr write create append
 # 远程出证的连接：reqwest 要建 socket、连、读写、收尾（之前只放了 shutdown，其余全靠
 # permissive 兜，每笔连接都在内核里刷几条 denied）。链路上会去读网卡状态、查权限服务，
 # 一并写清。
-allow keystore self tcp_socket { create connect read write getattr shutdown }
+#
+# 这里写 `keystore keystore` 而不是 `keystore self`：KernelSU 的 ksud 解析器不认
+# `self`（当成普通类型名发给内核，内核查不到就 -EINVAL），我们的 ommega-policy
+# 两种都支持。写开之后两条路都能应用。
+allow keystore keystore tcp_socket { create connect read write getattr shutdown }
 allow keystore sysfs_net { dir { read open getattr search } file { read open getattr } }
 allow keystore permissionmgr_service service_manager find
 
