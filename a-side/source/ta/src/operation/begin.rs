@@ -423,18 +423,17 @@ impl crate::KeyMintTa {
                     ));
                 }
             }
-            if let Some(expire) = get_opt_tag_value!(key_chars, UsageExpireDatetime)? {
-                if (now as i64) >= expire.ms_since_epoch {
-                    return Err(km_err!(
-                        KeyExpired,
-                        "attempt to use a key after its usage expiry"
-                    ));
+            if matches!(purpose, KeyPurpose::Decrypt | KeyPurpose::Verify) {
+                if let Some(expire) = get_opt_tag_value!(key_chars, UsageExpireDatetime)? {
+                    if (now as i64) >= expire.ms_since_epoch {
+                        return Err(km_err!(
+                            KeyExpired,
+                            "attempt to use a key after its usage expiry"
+                        ));
+                    }
                 }
             }
-            if matches!(
-                purpose,
-                KeyPurpose::Encrypt | KeyPurpose::Sign | KeyPurpose::AttestKey
-            ) {
+            if matches!(purpose, KeyPurpose::Encrypt | KeyPurpose::Sign) {
                 if let Some(expire) = get_opt_tag_value!(key_chars, OriginationExpireDatetime)? {
                     if (now as i64) >= expire.ms_since_epoch {
                         return Err(km_err!(
