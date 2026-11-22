@@ -10,4 +10,5 @@
 - Fixed SOTER key preparation failing on Qualcomm platforms.
 - Upgrading the module no longer clears the saved server address, token or managed app list.
 - Attestation data is completed and made consistent; TEE verdicts in some checks are no longer off.
+- Key time authorizations are now enforced at the standard point of the key lifecycle.
 - Stability and compatibility improvements.
