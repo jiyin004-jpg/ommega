@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::plat::resetprop;
 
@@ -1350,17 +1350,6 @@ fn sync_remote_identity() {
         log(&format!("remote identity applied: {brand}/{model}"));
         // 只落标记，不自动重启 zygote。
         let _ = fs::write(REMOTE_IDENTITY_UPDATED, format!("{brand}/{model}\n"));
-        touch_config_file();
-    }
-}
-
-/// 只改 mtime，让 keymint 那边重读 config.toml（内容不动）。
-fn touch_config_file() {
-    let Ok(file) = fs::OpenOptions::new().write(true).open(CONFIG_TOML) else {
-        return;
-    };
-    if let Err(error) = file.set_modified(SystemTime::now()) {
-        log(&format!("failed to touch config.toml: {error}"));
     }
 }
 

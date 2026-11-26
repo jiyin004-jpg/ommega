@@ -10,6 +10,33 @@ pub struct AttestationIdMgr;
 
 static ATTESTATION_IDS: Mutex<Option<AttestationIdInfo>> = Mutex::new(None);
 
+/// 身份项按属性取。厂商给 attestation 单独准备了 `*_for_attestation` 时优先用它，
+/// 没有这个属性（AOSP、大部分机型）就退回普通的那项。
+fn identity_property(prop: &str) -> Option<Vec<u8>> {
+    let read = |name: &str| -> Option<Vec<u8>> {
+        rsproperties::get::<String>(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(String::into_bytes)
+    };
+    read(&format!("{prop}_for_attestation")).or_else(|| read(prop))
+}
+
+/// 身份六项按当前属性取：伪装参数和远端身份改的就是这些属性，改了就认改后的值。
+fn with_current_identity(mut ids: AttestationIdInfo) -> AttestationIdInfo {
+    let current = |prop: &str, fallback: Vec<u8>| -> Vec<u8> {
+        identity_property(prop).unwrap_or(fallback)
+    };
+    ids.brand = current("ro.product.brand", ids.brand);
+    ids.device = current("ro.product.device", ids.device);
+    ids.product = current("ro.product.name", ids.product);
+    ids.serial = current("ro.serialno", ids.serial);
+    ids.manufacturer = current("ro.product.manufacturer", ids.manufacturer);
+    ids.model = current("ro.product.model", ids.model);
+    ids
+}
+
 impl RetrieveAttestationIds for AttestationIdMgr {
     fn get(&self) -> Result<AttestationIdInfo, kmr_common::Error> {
         self.get_ids()?
@@ -21,7 +48,7 @@ impl RetrieveAttestationIds for AttestationIdMgr {
             .lock()
             .map_err(|_| km_err!(UnknownError, "attestation ID cache lock poisoned"))?;
         if let Some(ids) = cached.as_ref() {
-            return Ok(Some(ids.clone()));
+            return Ok(Some(with_current_identity(ids.clone())));
         }
 
         let needs_resolution = |device: &crate::config::DeviceProperty| {
@@ -59,19 +86,11 @@ impl RetrieveAttestationIds for AttestationIdMgr {
             model: device.model.into_bytes(),
         };
         *cached = Some(ids.clone());
-        Ok(Some(ids))
+        Ok(Some(with_current_identity(ids)))
     }
 
     fn destroy_all(&mut self) -> Result<(), kmr_common::Error> {
         // ignore this
         Ok(())
-    }
-}
-
-/// 丢掉进程内的 ID 快照，下次取 ID 时按当前配置重新解析。
-pub fn clear_cached_ids() {
-    match ATTESTATION_IDS.lock() {
-        Ok(mut cached) => *cached = None,
-        Err(_) => log::warn!("attestation ID cache lock poisoned while clearing"),
     }
 }
