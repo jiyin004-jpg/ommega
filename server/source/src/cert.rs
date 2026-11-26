@@ -1203,11 +1203,9 @@ fn build_chain_signed_by(
     let subject_name = p.subject_name.clone().unwrap_or_else(default_name);
 
     // notBefore: honour the caller-requested time when provided, else the
-    // precise creation timestamp (matches Django).
-    let not_before_ms = p
-        .not_before_ms
-        .filter(|&v| v > 0)
-        .unwrap_or(p.creation_datetime_ms);
+    // precise creation timestamp (matches Django). 0 算给了：1970-01-01 是
+    // AOSP KeyGenParameterSpec 的默认 startDate，客户端确实会送 0 上来。
+    let not_before_ms = p.not_before_ms.unwrap_or(p.creation_datetime_ms);
     let not_before_ts = chrono::DateTime::from_timestamp_millis(not_before_ms as i64)
         .unwrap_or_else(chrono::Utc::now);
     // 2050 及以后的日期用 GeneralizedTime：两位年 UTCTime 会回旋到 1950-1999。
@@ -3334,6 +3332,33 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         assert_eq!(info.os_version, Some(160_000));
         assert_eq!(info.patch_system, Some(202_606));
         assert!(info.knox.is_none());
+    }
+
+    /// AOSP 的 KeyGenParameterSpec 默认 startDate 是 1970-01-01，客户端会送 0 上来；
+    /// 显式给了 0 就得照用，不能退成出证时刻，否则叶子跟 keystore2 默认模板对不上。
+    #[test]
+    fn leaf_not_before_honours_epoch_zero() {
+        let identity = generate_self_signed("ec", 1).unwrap();
+        let device = DeviceIdentity {
+            device_id: "test-device".to_string(),
+            algorithm: "ec".to_string(),
+            certificate_chain_pem: identity.certificate_chain_pem,
+            private_key_pem_cipher: identity.private_key_pem,
+            active: true,
+            machine_id: "test".to_string(),
+            created_at: String::new(),
+        };
+        let params = AttestationParams {
+            creation_datetime_ms: 1_795_684_663_000,
+            not_before_ms: Some(0),
+            ..Default::default()
+        };
+        let (chain, _) = build_attested_chain(&device, &params).unwrap();
+        let leaf = parse_chain_pem(&chain).unwrap().remove(0);
+        assert!(
+            leaf.windows(13).any(|w| w == b"700101000000Z"),
+            "leaf notBefore should be 1970-01-01"
+        );
     }
 
     /// Device properties / ID attestation: the minted leaf must carry the

@@ -724,10 +724,11 @@ impl Fulfill {
                 .collect();
         }
         // certificate_not_before_ms / certificate_not_after_ms: leaf validity.
+        // 0 是合法值：AOSP 的 KeyGenParameterSpec 默认 startDate 就是 1970-01-01，
+        // 客户端会把 0 原样送上来。要是当成「没指定」丢掉，叶证书的开始时间就退成
+        // 出证那一刻，和 keystore2 的默认模板对不上。
         if let Some(v) = ctx.get("certificate_not_before_ms").and_then(Value::as_u64) {
-            if v > 0 {
-                p.not_before_ms = Some(v);
-            }
+            p.not_before_ms = Some(v);
         }
         if let Some(v) = ctx.get("certificate_not_after_ms").and_then(Value::as_u64) {
             if v > 0 {
