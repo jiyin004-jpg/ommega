@@ -803,11 +803,13 @@ var PATCH_KEYS = ["ro.boot.vbmeta.digest", "ro.build.version.security_patch",
                  .concat(BOOT_PATCH_EXTRA_KEYS);
 var IDENT_ROOT_KEYS = ["ro.product.brand", "ro.product.device", "ro.product.name",
                        "ro.product.manufacturer", "ro.product.model"];
+/* 厂商给 ID attestation 单独准备的那组属性（HyperOS 等机型有）：设备上真存在才跟着写。 */
+var IDENT_ATTEST_KEYS = IDENT_ROOT_KEYS.map(function(k){ return k + "_for_attestation"; });
 var IDENT_PART_KEYS = [];
 ["system", "vendor", "odm", "product", "system_ext"].forEach(function(part){
   ["brand", "device", "model"].forEach(function(field){ IDENT_PART_KEYS.push("ro.product." + part + "." + field); });
 });
-var IDENT_KEYS = IDENT_ROOT_KEYS.concat(["ro.build.fingerprint", "ro.build.version.release"], IDENT_PART_KEYS);
+var IDENT_KEYS = IDENT_ROOT_KEYS.concat(["ro.build.fingerprint", "ro.build.version.release"], IDENT_PART_KEYS, IDENT_ATTEST_KEYS);
 var PROP_KEYS = PATCH_KEYS.concat(IDENT_KEYS);
 /* 最近一次「从服务器同步」挑中的那台 B：boot（哈希/三处补丁/os_version）和 identity
    （品牌/型号/指纹那几项）。syncPatch 拿它拼 props.conf。 */
@@ -823,6 +825,19 @@ async function loadOwnPatch(){
   var l = (r.stdout || "").split("\n");
   A_PATCH.os = (l[0] || "").trim();
   A_PATCH.vendor = (l[1] || "").trim();
+}
+/* 探一下设备上有哪些 `ro.product.<x>_for_attestation`：保存伪装时这几项一起写，没有就跳。 */
+var ATTEST_PROPS = [];
+async function loadAttestationProps(){
+  var keys = ["brand", "device", "name", "manufacturer", "model"];
+  var cmd = keys.map(function(k){ return "getprop ro.product." + k + "_for_attestation"; }).join("; ");
+  try {
+    var r = await exec(cmd);
+    var l = (r.stdout || "").split("\n");
+    var out = [];
+    keys.forEach(function(k, i){ if ((l[i] || "").trim()) out.push("ro.product." + k + "_for_attestation"); });
+    ATTEST_PROPS = out;
+  } catch (e){ ATTEST_PROPS = []; }
 }
 /* StrongBox 级别单独一份 keybox 的文案。没配就沿用「本地密钥」那份，行为跟以前一致。 */
 var SBKB_TEXT = {
@@ -2591,6 +2606,10 @@ async function savePatch(){
     var v = e ? String(e.value || "").trim() : "";
     if (!v || !pair[1]) return;
     kv[pair[1]] = v;
+    /* 厂商有 attestation 专用属性时一起写，值跟主体项一致；没有这项就跳过。 */
+    if (ATTEST_PROPS.indexOf(pair[1] + "_for_attestation") >= 0) {
+      kv[pair[1] + "_for_attestation"] = v;
+    }
   });
   if (boot){
     var bootEpoch = patchDateToEpoch(boot);
@@ -2759,6 +2778,7 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     var ver = await readFromDisk();
     A_VER = ver;
     try { await loadOwnPatch(); } catch (e){}
+    try { await loadAttestationProps(); } catch (e){}
 
     var langBtn = document.getElementById("lang");
     langBtn.onclick = openLangMenu;
