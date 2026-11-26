@@ -43,3 +43,10 @@ chcon u:object_r:system_app_data_file:s0 "$DATA_ROOT/logs" 2>/dev/null
 if [ -f "$DATA_ROOT/soter_asks.json" ]; then
   chmod 0666 "$DATA_ROOT/soter_asks.json" 2>/dev/null
 fi
+# remote_identity 由 keystore 域（TA）写。主目录的组/other 都不给写，
+# 所以这里预建好文件、属主给 keystore（1017），TA 只改内容不需要目录写权限。
+if [ ! -f "$DATA_ROOT/remote_identity" ]; then
+  : > "$DATA_ROOT/remote_identity" 2>/dev/null
+fi
+chown 1017:1017 "$DATA_ROOT/remote_identity" 2>/dev/null
+chmod 0644 "$DATA_ROOT/remote_identity" 2>/dev/null
