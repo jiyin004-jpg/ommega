@@ -2395,10 +2395,18 @@ function refreshPatchSummary(){
   if (props["ro.build.version.release"]) rows.push([t("patch.release"), props["ro.build.version.release"]]);
   if (props["ro.build.fingerprint"]) rows.push([t("patch.fingerprint"), props["ro.build.fingerprint"].slice(0, 32) + "…"]);
   if (v("patch-boot")) rows.push([t("patch.short.boot"), v("patch-boot")]);
-  /* 设备身份：品牌/型号/序列号，有哪几项列哪几项；型号只这一行，就是伪装里填的值。 */
-  var model = v("ident-model"), brand = v("ident-brand"), serial = v("ident-serial");
-  if (brand || model) rows.push([t("patch.model"), (brand ? brand + " / " : "") + (model || "—")]);
-  if (serial) rows.push([t("patch.serial"), serial]);
+  /* 设备身份：每一项单独一行，有哪几项列哪几项（品牌不再和型号挤一行）。 */
+  [
+    ["patch.ident.brand", v("ident-brand")],
+    ["patch.ident.device", v("ident-device")],
+    ["patch.ident.name", v("ident-name")],
+    ["patch.ident.manufacturer", v("ident-manufacturer")],
+    ["patch.model", v("ident-model")],
+    ["patch.serial", v("ident-serial")]
+  ].forEach(function(pair){
+    var val = String(pair[1] || "").trim();
+    if (val) rows.push([t(pair[0]), val]);
+  });
   var hash = v("boot-hash");
   if (hash) rows.push([t("patch.short.hash"), hash.slice(0, 12) + "…"]);
   /* 搭配的 B 端和它的版本号也列一行：这台到底接的是哪一版 relay，一眼可见。 */
