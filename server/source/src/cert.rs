@@ -404,7 +404,7 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
                     });
                 }
                 // 时间授权不在这里写：已搬到 softwareEnforced。
-                 503 | 506 | 507 | 508 | 509 => {
+                503 | 506 | 507 | 508 | 509 => {
                     w.next().write_tagged(yasna::Tag::context(tag), |w| {
                         w.write_null();
                     });

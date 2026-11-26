@@ -25,9 +25,8 @@ fn identity_property(prop: &str) -> Option<Vec<u8>> {
 
 /// 身份六项按当前属性取：伪装参数和远端身份改的就是这些属性，改了就认改后的值。
 fn with_current_identity(mut ids: AttestationIdInfo) -> AttestationIdInfo {
-    let current = |prop: &str, fallback: Vec<u8>| -> Vec<u8> {
-        identity_property(prop).unwrap_or(fallback)
-    };
+    let current =
+        |prop: &str, fallback: Vec<u8>| -> Vec<u8> { identity_property(prop).unwrap_or(fallback) };
     ids.brand = current("ro.product.brand", ids.brand);
     ids.device = current("ro.product.device", ids.device);
     ids.product = current("ro.product.name", ids.product);
