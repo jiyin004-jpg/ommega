@@ -2378,10 +2378,9 @@ function refreshPatchSummary(){
   if (props["ro.build.version.security_patch"]) rows.push([t("patch.short.system"), props["ro.build.version.security_patch"]]);
   if (props["ro.vendor.build.security_patch"]) rows.push([t("patch.short.vendor"), props["ro.vendor.build.security_patch"]]);
   if (props["ro.build.version.release"]) rows.push([t("patch.release"), props["ro.build.version.release"]]);
-  if (props["ro.product.model"]) rows.push([t("patch.model"), (props["ro.product.brand"] ? props["ro.product.brand"] + " / " : "") + props["ro.product.model"]]);
   if (props["ro.build.fingerprint"]) rows.push([t("patch.fingerprint"), props["ro.build.fingerprint"].slice(0, 32) + "…"]);
   if (v("patch-boot")) rows.push([t("patch.short.boot"), v("patch-boot")]);
-  /* 设备身份：品牌/型号/序列号，有哪几项列哪几项。 */
+  /* 设备身份：品牌/型号/序列号，有哪几项列哪几项；型号只这一行，就是伪装里填的值。 */
   var model = v("ident-model"), brand = v("ident-brand"), serial = v("ident-serial");
   if (brand || model) rows.push([t("patch.model"), (brand ? brand + " / " : "") + (model || "—")]);
   if (serial) rows.push([t("patch.serial"), serial]);
