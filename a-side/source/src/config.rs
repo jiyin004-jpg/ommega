@@ -158,6 +158,7 @@ fn bootstrap_config_file_to_path(path: &Path) -> Result<ConfigFile> {
     let mut merged = parsed.table;
     merged.remove("trust_record");
     merge_config_table(&mut merged, updated);
+    align_device_identity(&mut merged);
     let needs_write = contents.is_none() || migrated || merged != original_table;
     let serialized =
         toml::to_string_pretty(&merged).context("failed to serialize merged config.toml")?;
@@ -553,12 +554,19 @@ fn reload_runtime_config(trigger: WatchTrigger) {
     let mut updated = Config::from_file(&new_config_file, applied_trust);
     updated.trust_intent = applied_trust_intent;
     updated.crypto = applied_crypto;
+    let device_changed = runtime_snapshot.device != updated.device;
     match crate::keymaster::keymint_device::apply_runtime_config_update(
         updated,
         update_patchlevels,
         security_patch_update,
     ) {
-        Ok(()) => log::info!("config updated via {}", trigger.label()),
+        Ok(()) => {
+            log::info!("config updated via {}", trigger.label());
+            if device_changed {
+                crate::att_mgr::clear_cached_ids();
+                log::info!("device identity changed; dropped the attestation ID snapshot");
+            }
+        }
         Err(error) => log::error!(
             "failed to apply config update via {}; keeping previous runtime: {error:#}",
             trigger.label()
@@ -606,6 +614,53 @@ pub fn is_security_patch_date(value: &str) -> bool {
     regex::Regex::new(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$")
         .expect("security patch regex must compile")
         .is_match(value)
+}
+
+/// `[device]` 里这六项跟系统属性一一对应，属性是最终生效值。
+const IDENTITY_PROPERTIES: [(&str, &str); 6] = [
+    ("brand", "ro.product.brand"),
+    ("device", "ro.product.device"),
+    ("product", "ro.product.name"),
+    ("manufacturer", "ro.product.manufacturer"),
+    ("model", "ro.product.model"),
+    ("serial", "ro.serialno"),
+];
+
+/// 按当前系统属性回填 `[device]` 的六项身份，属性读不到或为空的那项不动。
+fn align_device_identity(table: &mut toml::Table) -> bool {
+    align_device_identity_with(table, |prop| {
+        rsproperties::get::<String>(prop)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn align_device_identity_with(
+    table: &mut toml::Table,
+    read: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some(toml::Value::Table(device)) = table.get_mut("device") else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, prop) in IDENTITY_PROPERTIES {
+        let Some(value) = read(prop) else { continue };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let current = device
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        if current == value {
+            continue;
+        }
+        log::info!("device {key}: {current} -> {value} (from {prop})");
+        device.insert(key.to_string(), toml::Value::String(value.to_string()));
+        changed = true;
+    }
+    changed
 }
 
 fn trust_changed_beyond_patchlevels(old: &RawTrustConfig, new: &RawTrustConfig) -> bool {
@@ -1199,6 +1254,52 @@ impl Default for DeviceProperty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_identity_follows_properties() {
+        let mut table: toml::Table = toml::from_str(
+            r#"
+[device]
+brand = "oneplus"
+device = "OP60EBL1"
+imei = ""
+manufacturer = "oneplus"
+model = "PYB110"
+product = "PKR110"
+serial = "97c325b7"
+
+[main]
+backend = "injector"
+"#,
+        )
+        .unwrap();
+
+        let read = |prop: &str| match prop {
+            "ro.product.brand" | "ro.product.manufacturer" => Some("OnePlus".to_string()),
+            "ro.product.model" => Some("PKR110".to_string()),
+            "ro.serialno" => Some("   ".to_string()),
+            _ => None,
+        };
+        assert!(align_device_identity_with(&mut table, read));
+
+        let device = table["device"].as_table().unwrap();
+        assert_eq!(device["brand"].as_str(), Some("OnePlus"));
+        assert_eq!(device["manufacturer"].as_str(), Some("OnePlus"));
+        assert_eq!(device["model"].as_str(), Some("PKR110"));
+        // 属性读不到或读成空白的项保持原值。
+        assert_eq!(device["serial"].as_str(), Some("97c325b7"));
+        assert_eq!(device["device"].as_str(), Some("OP60EBL1"));
+        // 其它段不动。
+        assert_eq!(table["main"]["backend"].as_str(), Some("injector"));
+
+        // 已经对齐时不再改动。
+        let read = |prop: &str| match prop {
+            "ro.product.brand" | "ro.product.manufacturer" => Some("OnePlus".to_string()),
+            "ro.product.model" | "ro.product.name" => Some("PKR110".to_string()),
+            _ => None,
+        };
+        assert!(!align_device_identity_with(&mut table, read));
+    }
 
     #[test]
     fn os_version_spec_accepts_auto_or_fixed_integer() {

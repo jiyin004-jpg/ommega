@@ -67,3 +67,11 @@ impl RetrieveAttestationIds for AttestationIdMgr {
         Ok(())
     }
 }
+
+/// 丢掉进程内的 ID 快照，下次取 ID 时按当前配置重新解析。
+pub fn clear_cached_ids() {
+    match ATTESTATION_IDS.lock() {
+        Ok(mut cached) => *cached = None,
+        Err(_) => log::warn!("attestation ID cache lock poisoned while clearing"),
+    }
+}
