@@ -4,6 +4,7 @@
 
 ## 1.7.18
 
+- The panel supports a light theme with a one-tap switch in the header.
 - The panel is reorganised into Overview, Apps and Settings pages.
 - Fixed intermittent key operation failures caused by the key service restarting on its own; debug logs are no longer cleared repeatedly.
 - Device information used for device ID attestation is now read from the live system values, so device ID attestation no longer fails after changing the model or after the remote identity changes.
