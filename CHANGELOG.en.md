@@ -4,6 +4,7 @@
 
 ## 1.7.18
 
+- Fixed intermittent key operation failures caused by the key service restarting on its own; debug logs are no longer cleared repeatedly.
 - Device information used for device ID attestation is now read from the live system values, so device ID attestation no longer fails after changing the model or after the remote identity changes.
 - The device identity declared by the remote side is now written to this device correctly.
 - Fixed the display of model entries on the spoofing settings page.
