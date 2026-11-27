@@ -147,9 +147,6 @@ impl_metadata!(
         Sec1PublicKey(Vec<u8>) with accessor sec1_public_key,
         /// Keybox identity prefix used to produce this entry's device attestation chain.
         KeyboxAttestationUuidPrefix(Vec<u8>) with accessor keybox_attestation_uuid_prefix,
-        /// KeyMint security level recorded in the leaf attestation certificate.  This can differ
-        /// from the wrapper's level when the remote backend falls back from StrongBox to TEE.
-        KeymintSecurityLevel(i32) with accessor keymint_security_level,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
