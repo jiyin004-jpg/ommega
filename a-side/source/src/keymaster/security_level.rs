@@ -102,36 +102,39 @@ const DEFAULT_PER_UID_KEY_LIMIT: i32 = 200_000;
 /// The limit on the number of keys per app for apps with a target SDK level of 37+.
 const API_37_PER_UID_KEY_LIMIT: i32 = 50_000;
 
-/// Replace `ORIGIN` and `ALLOW_WHILE_ON_BODY` with the values and lists the attestation
-/// certificate carries, so the authorizations `KeyInfo` reports match the leaf certificate.
-/// Parameters the certificate does not carry are left untouched.
-fn apply_attestation_authorizations(
-    key_parameters: &mut Vec<KsKeyParam>,
-    info: &KeyDescriptionInfo,
-) {
+/// Reconcile `ORIGIN` / `ALLOW_WHILE_ON_BODY` with the values the attestation certificate
+/// carries, so the authorizations `KeyInfo` reports match the leaf certificate.
+///
+/// Entries are replaced **in place**: KeyMint returns authorizations in tag order, and
+/// removing an entry to append it at the end is observable to detectors that compare the
+/// `KeyInfo` list against the certificate. Parameters the certificate does not carry, or
+/// that KeyMint did not return, stay absent.
+fn apply_attestation_authorizations(key_parameters: &mut [KsKeyParam], info: &KeyDescriptionInfo) {
     if let Some((origin, security_level)) = info.origin {
-        key_parameters.retain(|parameter| {
-            !matches!(
+        if let Some(parameter) = key_parameters.iter_mut().find(|parameter| {
+            matches!(
                 parameter.key_parameter_value(),
                 KsKeyParamValue::KeyOrigin(_)
             )
-        });
-        key_parameters.push(KsKeyParam::new(
-            KsKeyParamValue::KeyOrigin(KeyOrigin(origin)),
-            SecurityLevel(security_level),
-        ));
+        }) {
+            *parameter = KsKeyParam::new(
+                KsKeyParamValue::KeyOrigin(KeyOrigin(origin)),
+                SecurityLevel(security_level),
+            );
+        }
     }
     if let Some(security_level) = info.allow_while_on_body {
-        key_parameters.retain(|parameter| {
-            !matches!(
+        if let Some(parameter) = key_parameters.iter_mut().find(|parameter| {
+            matches!(
                 parameter.key_parameter_value(),
                 KsKeyParamValue::AllowWhileOnBody
             )
-        });
-        key_parameters.push(KsKeyParam::new(
-            KsKeyParamValue::AllowWhileOnBody,
-            SecurityLevel(security_level),
-        ));
+        }) {
+            *parameter = KsKeyParam::new(
+                KsKeyParamValue::AllowWhileOnBody,
+                SecurityLevel(security_level),
+            );
+        }
     }
 }
 
@@ -1646,6 +1649,47 @@ mod tests {
     use crate::config::{ConfigFile, ResolvedTrust};
     use std::sync::Once;
     use tempfile::TempDir;
+
+    /// KeyMint 按 tag 序返回授权列表；把 ORIGIN 删掉再追加到末尾会被检测器看出来
+    /// （1.7.18 就是这样，Luna 的 native 探针读 KeyInfo 时识破）。这里断言原位替换：
+    /// 长度和位置都不变，只更新值和级别。
+    #[test]
+    fn attestation_authorizations_replace_in_place() {
+        let mut parameters = vec![
+            KsKeyParam::new(KsKeyParamValue::NoAuthRequired, SecurityLevel::SOFTWARE),
+            KsKeyParam::new(
+                KsKeyParamValue::KeyOrigin(KeyOrigin(2)),
+                SecurityLevel::TRUSTED_ENVIRONMENT,
+            ),
+            KsKeyParam::new(
+                KsKeyParamValue::RollbackResistance,
+                SecurityLevel::TRUSTED_ENVIRONMENT,
+            ),
+        ];
+        let info = KeyDescriptionInfo {
+            keymint_security_level: 1,
+            origin: Some((0, 1)),
+            allow_while_on_body: None,
+        };
+
+        apply_attestation_authorizations(&mut parameters, &info);
+
+        assert_eq!(parameters.len(), 3);
+        assert!(matches!(
+            parameters[0].key_parameter_value(),
+            KsKeyParamValue::NoAuthRequired
+        ));
+        assert!(matches!(
+            parameters[2].key_parameter_value(),
+            KsKeyParamValue::RollbackResistance
+        ));
+        let KsKeyParamValue::KeyOrigin(KeyOrigin(origin)) = parameters[1].key_parameter_value()
+        else {
+            panic!("ORIGIN must stay at its original position");
+        };
+        assert_eq!(*origin, 0);
+        assert_eq!(parameters[1].security_level(), &SecurityLevel(1));
+    }
 
     static CONFIG_INIT: Once = Once::new();
 
