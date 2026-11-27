@@ -1,16 +1,38 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
-<meta name="theme-color" content="#15151d">
+<meta name="theme-color" content="#f4f1fa">
 <title>Ommega</title>
+<script id="theme-init">
+  try {
+    if (localStorage.getItem("ommega.theme") === "dark") document.documentElement.dataset.theme = "dark";
+  } catch (e){}
+</script>
 <style>
   /* 管理器提供 window.ksu。面板随模块打包，样式、图标和脚本在本地加载。 */
   :root{
     color-scheme:dark;
     --bg:#15151d;--card:#292735;--surface:#24232f;--fg:#f6f3fd;--dim:#c2bdd2;
     --line:#454153;--accent:#d2ccff;--accent-ink:#24204b;--ok:#a3e3bf;--bad:#ffa5ab;--warn:#ffcd96;
+    --page-glow:#211e2d;--scroll-thumb:#62596e;--primary-bg:var(--accent);--neutral-dot:#d9d1ed;
+    --btn-bg:#393547;--btn-line:#655e76;--selected-bg:#514866;--selected-line:#76688d;--app-selected:#35314b;
+    --switch-track:#514c60;--switch-line:#81798f;--switch-thumb:#f0e9fb;
+    --switch-on:var(--primary-bg);--switch-thumb-on:var(--accent-ink);
+    --material-bg:linear-gradient(120deg,#302c41,#3a3348);
+    --hero-bg:linear-gradient(125deg,#44468f,#334e9b 68%,#3f4e91);--hero-line:#747dd4;
+    --hero-orbit:linear-gradient(155deg,#6388e468,#5492eb4d 66%,#838df231);--hero-orbit-line:#b8c8ff21;
+    --hero-copy:#efeaff;--hero-divider:#d4d6ff54;--emblem-bg:#b5a4d359;--emblem-line:#e3d9ff52;--emblem-ink:#fff5ff;
+    --metric-label:#e0d9ed;--card-kicker:#f4effe;--badge-bg:#211f3a63;--badge-ink:#faf5ff;
+    --card-link-bg:#ffffff0b;--card-link-line:#635a74;--card-link-ink:#f3eaff;--sticky-shadow:#15151d80;
+    --nav-bg:#353243;--nav-line:#e3d9fc85;
+    --nav-glass:linear-gradient(158deg,#b0a5d035 -5%,#49435c29 56%,#a39ac153),#1615234c;
+    --nav-filter:blur(9px) saturate(155%);
+    --nav-shadow:0 9px 26px #0b0a1270,inset 0 1px 1px #fff9,inset 0 -1px 1px #e5d7ff40;
+    --pill-bg:linear-gradient(152deg,#eee7ffc9,#a7a0c299 78%);--pill-line:#eee5ffb3;
+    --pill-shadow:inset 0 1px 1px #fffd,inset 0 -2px 4px #c9bef34d;
+    --nav-ink:#f9f5ff;--nav-active-ink:#fdf8ff;--nav-text-shadow:0 1px 3px #110e21bf;--nav-active-shadow:0 1px 3px #292039;
     --gutter:clamp(14px,4.6vw,28px);--content:656px;
     --safe-top:var(--safe-area-inset-top,env(safe-area-inset-top,0px));
     --safe-bottom:var(--safe-area-inset-bottom,env(safe-area-inset-bottom,0px));
@@ -18,18 +40,34 @@
     --safe-right:var(--safe-area-inset-right,env(safe-area-inset-right,0px));
     --nav-space:calc(88px + var(--safe-bottom));
   }
+  :root[data-theme="light"]{
+    color-scheme:light;
+    --bg:#f4f1fa;--card:#fcfaff;--surface:#eeeaf6;--fg:#211c32;--dim:#554e66;
+    --line:#d7cfe5;--accent:#5543ab;--accent-ink:#292254;--ok:#286447;--bad:#a03651;--warn:#805008;
+    --page-glow:#eae2f8;--scroll-thumb:#aa9ebd;--primary-bg:#ddd4ff;--neutral-dot:#76678d;
+    --btn-bg:#eee8fa;--btn-line:#cabde2;--selected-bg:#e8defb;--selected-line:#c2b1e7;--app-selected:#ece5fc;
+    --switch-track:#ddd7e8;--switch-line:#8c829f;--switch-thumb:#665e77;
+    --switch-on:#6f5abf;--switch-thumb-on:#fff;
+    --material-bg:linear-gradient(120deg,#eee5fa,#f6eefa);
+    --hero-bg:linear-gradient(125deg,#e2daff,#d6e5ff 68%,#d4dcff);--hero-line:#bcc4ed;
+    --hero-orbit:linear-gradient(155deg,#abc3ff8f,#a7bfff50 66%,#bfb9fc48);--hero-orbit-line:#899de238;
+    --hero-copy:#434875;--hero-divider:#5968ae40;--emblem-bg:#fff9;--emblem-line:#fff;--emblem-ink:#51469a;
+    --metric-label:#554e6b;--card-kicker:#423565;--badge-bg:#fbf8ffac;--badge-ink:#3c3157;
+    --card-link-bg:#ffffff66;--card-link-line:#cbbce2;--card-link-ink:#4e3d75;--sticky-shadow:#5747751a;
+    --nav-bg:#f1ebfb;--nav-line:#a99bc88f;
+    --nav-glass:linear-gradient(157deg,#fff9 -8%,#fcf9ff26 29%,#ede3f90d 64%,#c4b0ef70),#ece4f83a;
+    --nav-filter:blur(7px) saturate(165%);
+    --nav-shadow:0 8px 23px #594a7039,inset 0 1px 1px #fffffff2,inset 0 -1px 1px #ffffffc7,inset 0 -5px 11px #a789dd26;
+    --pill-bg:linear-gradient(155deg,#fffefbed -12%,#fbf3ff67 44%,#c9b5f18c);--pill-line:#fffdfde3;
+    --pill-shadow:inset 0 1px 1px #fff,inset 0 -1px 2px #fff8,0 2px 7px #715c9940;
+    --nav-ink:#3b314e;--nav-active-ink:#302344;--nav-text-shadow:0 1px 2px #fffb;--nav-active-shadow:0 1px 2px #fffb;
+  }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{height:100%}
   body{margin:0;color:var(--fg);display:flex;flex-direction:column;
        padding-inline:var(--safe-left) var(--safe-right);
        background:var(--bg);
        overflow:hidden;font:15px/1.55 system-ui,"Noto Sans SC","Microsoft YaHei",sans-serif}
-  /* 状态栏和页面共用底色，只在安全区下沿淡入滚动内容。 */
-  body::before{content:"";position:fixed;inset:0 0 auto;z-index:80;pointer-events:none;
-      height:calc(var(--safe-top) + min(14px,var(--safe-top)));
-      background:var(--bg);
-      -webkit-mask-image:linear-gradient(#000 var(--safe-top),transparent);
-      mask-image:linear-gradient(#000 var(--safe-top),transparent)}
   button,input,select{font-family:inherit}
   button{cursor:pointer}
   button:disabled{cursor:default}
@@ -41,30 +79,29 @@
       bottom:calc(10px + var(--safe-bottom));transform:translateX(-50%);
       width:calc(100% - var(--gutter) * 2 - var(--safe-left) - var(--safe-right));max-width:490px;
       --tab-gap:3px;--tab-inset:4px;
-      display:flex;gap:var(--tab-gap);padding:var(--tab-inset);border:1px solid #e3d9fc85;border-radius:36px;background:#353243;
-      box-shadow:0 9px 26px #0b0a1270,inset 0 1px 1px #fff9,inset 0 -1px 1px #e5d7ff40}
+      display:flex;gap:var(--tab-gap);padding:var(--tab-inset);border:1px solid var(--nav-line);border-radius:36px;
+      background:var(--nav-bg);box-shadow:var(--nav-shadow)}
   @supports ((backdrop-filter:blur(9px)) or (-webkit-backdrop-filter:blur(9px))){
-    .tabs{background:linear-gradient(158deg,#b0a5d035 -5%,#49435c29 56%,#a39ac153),#1615234c;
-      -webkit-backdrop-filter:blur(9px) saturate(155%);backdrop-filter:blur(9px) saturate(155%)}
+    .tabs{background:var(--nav-glass);
+      -webkit-backdrop-filter:var(--nav-filter);backdrop-filter:var(--nav-filter)}
   }
   .tab-pill{position:absolute;left:var(--tab-inset);top:var(--tab-inset);bottom:var(--tab-inset);border-radius:30px;
       width:calc((100% - 2 * (var(--tab-inset) + var(--tab-gap))) / 3);
-      background:linear-gradient(152deg,#eee7ffc9,#a7a0c299 78%);
-      border:1px solid #eee5ffb3;box-shadow:inset 0 1px 1px #fffd,inset 0 -2px 4px #c9bef34d;
+      background:var(--pill-bg);border:1px solid var(--pill-line);box-shadow:var(--pill-shadow);
       pointer-events:none;will-change:transform;
       transform:translate3d(calc((100% + var(--tab-gap)) * var(--tab-position,0)),0,0)}
   .tab{flex:1;min-width:0;min-height:55px;display:grid;justify-items:center;align-content:center;gap:3px;
       padding:5px 3px;border-radius:30px;border:0;background:transparent;position:relative;
-      color:#f9f5ff;font-size:12px;font-weight:700;line-height:1.2;text-shadow:0 1px 3px #110e21bf}
+      color:var(--nav-ink);font-size:12px;font-weight:700;line-height:1.2;text-shadow:var(--nav-text-shadow)}
   .tab .icon{width:22px;height:22px}
-  .tab.on{color:#fdf8ff;text-shadow:0 1px 3px #292039}
+  .tab.on{color:var(--nav-active-ink);text-shadow:var(--nav-active-shadow)}
   /* 分页 */
   .pages{flex:1;position:relative;overflow:hidden;overflow:clip;min-width:0;touch-action:pan-y}
   .page-track{position:absolute;inset:0;display:flex;transform:translate3d(0,0,0)}
   .page{position:relative;flex:0 0 100%;min-width:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;
       padding:0 var(--gutter) calc(var(--nav-space) + 12px);
-      scroll-padding:var(--safe-top) 0 var(--nav-space);scrollbar-width:thin;scrollbar-color:#62596e transparent;
-      background:radial-gradient(ellipse 550px 240px at 70% 0%,#211e2d,transparent),var(--bg);
+      scroll-padding:var(--safe-top) 0 var(--nav-space);scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) transparent;
+      background:radial-gradient(ellipse 550px 240px at 70% 0%,var(--page-glow),transparent),var(--bg);
       contain:layout paint}
   .page[inert]{pointer-events:none}
   .page-content{max-width:var(--content);margin:0 auto}
@@ -72,44 +109,53 @@
   .page-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0 15px}
   .page-heading h1{margin:0;font-size:clamp(30px,9vw,42px);font-weight:800;line-height:1.15;letter-spacing:-.04em}
   .page-heading p{margin:8px 0 0;color:var(--dim);font-size:14px}
+  .heading-actions{display:flex;flex:none;align-items:center;gap:8px}
   .icon-btn{flex:none;display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--line);
       border-radius:16px;background:var(--surface);color:var(--accent)}
   .icon-btn:disabled{opacity:.55}
+  #theme-toggle{border-radius:50%}
+  #theme-toggle[aria-pressed=true]{background:var(--selected-bg);border-color:var(--selected-line)}
+  #theme-toggle .icon{grid-area:1/1;transition:transform .32s cubic-bezier(.2,.75,.25,1),opacity .22s ease}
+  #theme-toggle .theme-sun{opacity:0;transform:rotate(-55deg) scale(.7)}
+  #theme-toggle[aria-pressed=true] .theme-moon{opacity:0;transform:rotate(55deg) scale(.7)}
+  #theme-toggle[aria-pressed=true] .theme-sun{opacity:1;transform:none}
+  ::view-transition-old(root),::view-transition-new(root){animation-duration:.24s}
+  ::view-transition{pointer-events:none}
   .card{background:var(--card);border:1px solid var(--line);border-radius:25px;
       padding:clamp(15px,4.3vw,24px);margin-bottom:12px}
   .card h2{margin:0 0 10px;font-size:19px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
   .overview-hero,.overview-material{padding:clamp(16px,4.6vw,26px);border-radius:28px}
-  .overview-hero{position:relative;isolation:isolate;overflow:hidden;border-color:#747dd4;
-      background:linear-gradient(125deg,#44468f,#334e9b 68%,#3f4e91)}
+  .overview-hero{position:relative;isolation:isolate;overflow:hidden;border-color:var(--hero-line);
+      background:var(--hero-bg)}
   .overview-hero::before{content:"";position:absolute;z-index:-1;pointer-events:none;
       width:86%;height:125%;left:43%;bottom:28%;border-radius:48% 0 42% 52%;transform:rotate(19deg);
-      background:linear-gradient(155deg,#6388e468,#5492eb4d 66%,#838df231);border:1px solid #b8c8ff21}
-  .overview-material{background:linear-gradient(120deg,#302c41,#3a3348)}
+      background:var(--hero-orbit);border:1px solid var(--hero-orbit-line)}
+  .overview-material{background:var(--material-bg)}
   .card-top,.card-kicker,.hero-main{display:flex;align-items:center;gap:8px}
   .card-top,.hero-main{justify-content:space-between}
   .card-top{align-items:flex-start}
-  .card-kicker{min-width:0;color:#f4effe;font-size:13px;font-weight:700;line-height:1.3}
+  .card-kicker{min-width:0;color:var(--card-kicker);font-size:13px;font-weight:700;line-height:1.3}
   .card-kicker .icon{width:17px;height:17px}
   .badge{display:inline-flex;align-items:center;gap:6px;max-width:53%;padding:5px 9px;border-radius:999px;
-      background:#211f3a63;color:#faf5ff;font-size:11px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
-  .badge::before,.dot{content:"";width:6px;height:6px;border-radius:50%;background:#d9d1ed;flex:none}
+      background:var(--badge-bg);color:var(--badge-ink);font-size:11px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
+  .badge::before,.dot{content:"";width:6px;height:6px;border-radius:50%;background:var(--neutral-dot);flex:none}
   .badge.enabled::before,.dot.on{background:var(--ok)}
   .dot.off{background:var(--bad)} .dot.warn{background:var(--warn)}
   .hero-main{margin:16px 0 12px;gap:12px}
   .overview-hero h2,.overview-material h2{font-size:clamp(23px,6.4vw,32px);margin:0;letter-spacing:-.03em}
-  .overview-hero p{margin:7px 0 0;color:#efeaff;font-size:13px;line-height:1.52}
+  .overview-hero p{margin:7px 0 0;color:var(--hero-copy);font-size:13px;line-height:1.52}
   .hero-emblem{flex:none;display:grid;place-items:center;width:56px;height:56px;border-radius:20px;
-      border:1px solid #e3d9ff52;background:#b5a4d359;color:#fff5ff}
+      border:1px solid var(--emblem-line);background:var(--emblem-bg);color:var(--emblem-ink)}
   .hero-emblem .icon{width:32px;height:32px}
   .overview-material h2{margin:11px 0 13px}
   .metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px;margin:0}
-  .overview-hero .metrics{border-top:1px solid #d4d6ff54;padding-top:12px}
-  .metrics dt{color:#e0d9ed;font-size:12px;line-height:1.3}
+  .overview-hero .metrics{border-top:1px solid var(--hero-divider);padding-top:12px}
+  .metrics dt{color:var(--metric-label);font-size:12px;line-height:1.3}
   .metrics dd{margin:4px 0 0;font-size:14px;font-weight:750;line-height:1.35;overflow-wrap:anywhere;
       font-variant-numeric:tabular-nums}
   .card-link{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:41px;
-      margin-top:15px;padding:7px 11px;border:1px solid #635a74;border-radius:13px;background:#ffffff0b;
-      color:#f3eaff;text-align:start;font-size:13px;font-weight:700}
+      margin-top:15px;padding:7px 11px;border:1px solid var(--card-link-line);border-radius:13px;
+      background:var(--card-link-bg);color:var(--card-link-ink);text-align:start;font-size:13px;font-weight:700}
   .card-link .icon{width:17px;height:17px}
   .runtime-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
   .runtime-card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:21px;padding:12px 14px}
@@ -118,10 +164,10 @@
   .runtime-state span{min-width:0;overflow-wrap:anywhere}
   .settings-tabs{position:sticky;z-index:1;top:var(--safe-top);display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;padding:4px;
       margin-bottom:12px;border:1px solid var(--line);border-radius:17px;background:var(--surface);
-      box-shadow:0 4px 10px #15151d80}
+      box-shadow:0 4px 10px var(--sticky-shadow)}
   .settings-tabs button{min-height:43px;border:1px solid transparent;border-radius:13px;padding:5px 4px;
       background:transparent;color:var(--dim);font-size:12px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}
-  .settings-tabs button[aria-pressed=true]{background:#514866;border-color:#76688d;color:var(--fg)}
+  .settings-tabs button[aria-pressed=true]{background:var(--selected-bg);border-color:var(--selected-line);color:var(--fg)}
   .row{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .row:first-of-type{border-top:0}
   .row .name{flex:1;min-width:0}
@@ -175,16 +221,16 @@
   .pw-eye svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;
       stroke-linecap:round;stroke-linejoin:round}
   .pw-eye[aria-pressed="true"]{color:var(--fg)}
-  .sw{position:relative;flex:0 0 48px;height:28px;border-radius:16px;background:#514c60;
-      transition:background .15s;border:1px solid #81798f;padding:0}
+  .sw{position:relative;flex:0 0 48px;height:28px;border-radius:16px;background:var(--switch-track);
+      transition:background .15s;border:1px solid var(--switch-line);padding:0}
   .sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
-      background:#f0e9fb;transition:transform .15s}
-  .sw[aria-checked=true]{background:var(--accent)}
-  .sw[aria-checked=true]::after{transform:translateX(20px);background:var(--accent-ink)}
+      background:var(--switch-thumb);transition:transform .15s}
+  .sw[aria-checked=true]{background:var(--switch-on)}
+  .sw[aria-checked=true]::after{transform:translateX(20px);background:var(--switch-thumb-on)}
   .acts{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
-  button.btn{flex:1;min-width:96px;min-height:42px;padding:8px 12px;border-radius:13px;border:1px solid #655e76;
-      background:#393547;color:var(--fg);font-size:14px;font-weight:650;overflow-wrap:anywhere}
-  button.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:750}
+  button.btn{flex:1;min-width:96px;min-height:42px;padding:8px 12px;border-radius:13px;border:1px solid var(--btn-line);
+      background:var(--btn-bg);color:var(--fg);font-size:14px;font-weight:650;overflow-wrap:anywhere}
+  button.btn.primary{background:var(--primary-bg);border-color:var(--primary-bg);color:var(--accent-ink);font-weight:750}
   button.btn.sm{flex:0 1 auto;min-width:0;min-height:36px;padding:6px 10px;font-size:12px;border-radius:11px}
   button.btn[disabled]{opacity:.5}
   .kv{display:flex;gap:10px;font-size:13px;padding:6px 0;border-top:1px solid var(--line)}
@@ -218,7 +264,7 @@
   .apps-heading .btn{flex:0 0 auto;max-width:53%}
   .apps-scroll{position:relative;flex:1;min-height:0;overflow-y:auto;overscroll-behavior-y:contain;
       padding:0 var(--gutter) calc(var(--nav-space) + 12px);scroll-padding-bottom:var(--nav-space);
-      scrollbar-width:thin;scrollbar-color:#62596e transparent}
+      scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) transparent}
   .apps-list-count{display:flex;align-items:baseline;gap:8px;padding:6px 0;color:var(--dim);font-size:13px}
   .apps-list-count strong{color:var(--fg);font-weight:750;font-variant-numeric:tabular-nums}
   /* 行高固定：列表按窗口渲染，靠这个常量算滚动位置；行里两行文字也钉死行高，
@@ -248,8 +294,8 @@
       display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 28px rgba(0,0,0,.22)}
   .apick-item{display:block;width:100%;text-align:left;padding:9px 10px;border:0;border-radius:8px;
       background:transparent;color:var(--fg);font-size:13px;font-family:inherit}
-  .apick-item.on{background:#514866;color:var(--accent);font-weight:650}
-  .app.on{background:#35314b}
+  .apick-item.on{background:var(--selected-bg);color:var(--accent);font-weight:650}
+  .app.on{background:var(--app-selected)}
   .app.off .pick{color:var(--dim)}
   /* 悬浮窗（关于 / 选文件） */
   .modal{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;
@@ -282,15 +328,17 @@
       padding:calc(var(--safe-top) + 16px) var(--gutter) 16px}
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   input:focus,select:focus{border-color:var(--accent)}
+  :root[data-theme="light"] input::placeholder{color:var(--dim);opacity:.85}
   .pw-field input:focus-visible{outline-offset:-2px}
   body.keyboard-open{height:var(--editing-height,100%);--safe-bottom:0px;--nav-space:12px}
   body.keyboard-open .tabs{display:none}
   body.keyboard-open .settings-tabs{position:static}
   [hidden],.hidden{display:none}
   @media (prefers-reduced-motion:reduce){
-    .sw,.sw::after,#toast{transition:none}
+    #theme-toggle .icon,.sw,.sw::after,#toast{transition:none}
   }
   @media (max-width:360px){
+    .heading-actions{gap:5px}
     .hero-emblem{width:46px;height:46px;border-radius:16px}
     .hero-emblem .icon{width:26px;height:26px}
     .overview-hero .metrics{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
@@ -309,6 +357,8 @@
   <symbol id="icon-shield" viewBox="0 0 24 24"><path d="m12 2.5 7.5 3v5.4c0 5-2.9 8.2-7.5 10.6C7.4 19.1 4.5 15.9 4.5 10.9V5.5z"/><path d="m9 11.8 2 2 4-4"/></symbol>
   <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
   <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 5v5h-5M4 19v-5h5m10.7-4A8 8 0 0 0 6 6m-1.7 8A8 8 0 0 0 18 18"/></symbol>
+  <symbol id="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M19 5l-1.4 1.4M6.4 17.6 5 19"/></symbol>
+  <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M20.5 15.1A8.8 8.8 0 0 1 8.9 3.5 8.8 8.8 0 1 0 20.5 15.1Z"/></symbol>
 </svg>
 
 <div id="boot" data-i18n="boot" role="status"></div>
@@ -319,9 +369,15 @@
     <div class="page-content">
       <header class="page-heading">
         <div><h1 id="overview-heading" data-i18n="nav.overview"></h1><p data-i18n="overview.description"></p></div>
-        <button class="icon-btn" id="overview-refresh" type="button" data-i18n-title="overview.refresh">
-          <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
-        </button>
+        <div class="heading-actions">
+          <button class="icon-btn" id="theme-toggle" type="button" aria-pressed="false" data-i18n-title="theme.light">
+            <svg class="icon theme-sun" aria-hidden="true"><use href="#icon-sun"/></svg>
+            <svg class="icon theme-moon" aria-hidden="true"><use href="#icon-moon"/></svg>
+          </button>
+          <button class="icon-btn" id="overview-refresh" type="button" data-i18n-title="overview.refresh">
+            <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+          </button>
+        </div>
       </header>
 
       <article class="card overview-hero">
@@ -655,7 +711,7 @@ var SHELL_TEXT = {
     "overview.relayOn": "中继已启用", "overview.relayOff": "中继未启用",
     "overview.teeFile": "TEE 文件", "overview.sbFile": "StrongBox 文件", "overview.fileSet": "文件已存在", "overview.fileMissing": "未发现文件",
     "overview.scope": "应用作用域", "overview.global": "全局", "overview.listOnly": "按名单", "overview.listed": "名单应用", "overview.manageKeys": "管理本地密钥",
-    "settings.connection": "运行配置"
+    "settings.connection": "运行配置", "theme.light": "浅色模式"
   },
   "zh-TW": {
     "nav.main": "主導覽", "nav.overview": "總覽", "nav.apps": "應用程式", "nav.settings": "設定",
@@ -666,7 +722,7 @@ var SHELL_TEXT = {
     "overview.relayOn": "中繼已啟用", "overview.relayOff": "中繼未啟用",
     "overview.teeFile": "TEE 檔案", "overview.sbFile": "StrongBox 檔案", "overview.fileSet": "檔案已存在", "overview.fileMissing": "未找到檔案",
     "overview.scope": "應用程式範圍", "overview.global": "全域", "overview.listOnly": "依名單", "overview.listed": "名單內的應用程式", "overview.manageKeys": "管理本機金鑰",
-    "settings.connection": "執行設定"
+    "settings.connection": "執行設定", "theme.light": "淺色模式"
   },
   "en": {
     "nav.main": "Main navigation", "nav.overview": "Overview", "nav.apps": "Apps", "nav.settings": "Settings",
@@ -677,7 +733,7 @@ var SHELL_TEXT = {
     "overview.relayOn": "Relay enabled", "overview.relayOff": "Relay disabled",
     "overview.teeFile": "TEE file", "overview.sbFile": "StrongBox file", "overview.fileSet": "File present", "overview.fileMissing": "File missing",
     "overview.scope": "App scope", "overview.global": "Global", "overview.listOnly": "Listed apps only", "overview.listed": "Listed apps", "overview.manageKeys": "Manage local keys",
-    "settings.connection": "Runtime"
+    "settings.connection": "Runtime", "theme.light": "Light mode"
   },
   "ja": {
     "nav.main": "メインナビゲーション", "nav.overview": "概要", "nav.apps": "アプリ", "nav.settings": "設定",
@@ -688,7 +744,7 @@ var SHELL_TEXT = {
     "overview.relayOn": "中継有効", "overview.relayOff": "中継無効",
     "overview.teeFile": "TEE ファイル", "overview.sbFile": "StrongBox ファイル", "overview.fileSet": "ファイルあり", "overview.fileMissing": "ファイルなし",
     "overview.scope": "対象範囲", "overview.global": "すべて", "overview.listOnly": "リストのみ", "overview.listed": "リスト内のアプリ", "overview.manageKeys": "ローカルキーを管理",
-    "settings.connection": "動作設定"
+    "settings.connection": "動作設定", "theme.light": "ライトモード"
   },
   "ko": {
     "nav.main": "기본 탐색", "nav.overview": "개요", "nav.apps": "앱", "nav.settings": "설정",
@@ -699,7 +755,7 @@ var SHELL_TEXT = {
     "overview.relayOn": "릴레이 켜짐", "overview.relayOff": "릴레이 꺼짐",
     "overview.teeFile": "TEE 파일", "overview.sbFile": "StrongBox 파일", "overview.fileSet": "파일 있음", "overview.fileMissing": "파일 없음",
     "overview.scope": "앱 범위", "overview.global": "전역", "overview.listOnly": "목록만", "overview.listed": "목록의 앱", "overview.manageKeys": "로컬 키 관리",
-    "settings.connection": "동작 설정"
+    "settings.connection": "동작 설정", "theme.light": "라이트 모드"
   },
   "ru": {
     "nav.main": "Главная навигация", "nav.overview": "Обзор", "nav.apps": "Приложения", "nav.settings": "Настройки",
@@ -710,7 +766,7 @@ var SHELL_TEXT = {
     "overview.relayOn": "Ретрансляция включена", "overview.relayOff": "Ретрансляция отключена",
     "overview.teeFile": "Файл TEE", "overview.sbFile": "Файл StrongBox", "overview.fileSet": "Файл есть", "overview.fileMissing": "Файл отсутствует",
     "overview.scope": "Область действия", "overview.global": "Глобально", "overview.listOnly": "Только по списку", "overview.listed": "Приложений в списке", "overview.manageKeys": "Локальные ключи",
-    "settings.connection": "Параметры работы"
+    "settings.connection": "Параметры работы", "theme.light": "Светлая тема"
   }
 };
 Object.keys(SHELL_TEXT).forEach(function(code){ Object.assign(I18N[code], SHELL_TEXT[code]); });
@@ -1449,6 +1505,30 @@ function relayoutActivePage(){
 }
 function relayoutSoon(){
   requestAnimationFrame(relayoutActivePage);
+}
+
+function wireThemeToggle(){
+  var root = document.documentElement;
+  var button = document.getElementById("theme-toggle");
+  var meta = document.querySelector('meta[name="theme-color"]');
+  function paint(){
+    button.setAttribute("aria-pressed", String(root.dataset.theme === "light"));
+    meta.content = getComputedStyle(root).getPropertyValue("--bg").trim();
+  }
+  function toggle(){
+    var theme = root.dataset.theme === "light" ? "dark" : "light";
+    root.dataset.theme = theme;
+    try { localStorage.setItem("ommega.theme", theme); } catch (e){}
+    paint();
+  }
+  paint();
+  button.onclick = function(){
+    if (!reducedMotion.matches && typeof document.startViewTransition === "function"){
+      document.startViewTransition(toggle);
+    } else {
+      toggle();
+    }
+  };
 }
 
 /* WebUI 宿主可能只缩小可视区域，也可能直接调整 WebView 高度。 */
@@ -3003,8 +3083,12 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     }
     if (!I18N[LANG]) LANG = "zh-CN";
     applyI18n();
+    wireThemeToggle();
     try {
-      if (typeof ksu !== "undefined" && typeof ksu.enableEdgeToEdge === "function") ksu.enableEdgeToEdge(true);
+      if (typeof ksu !== "undefined"){
+        if (typeof ksu.fullScreen === "function") ksu.fullScreen(true);
+        else if (typeof ksu.enableEdgeToEdge === "function") ksu.enableEdgeToEdge(true);
+      }
     } catch (e){}
 
     var ver = await readFromDisk();
@@ -3053,9 +3137,24 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
 
     document.getElementById("overview-refresh").onclick = async function(){
       this.disabled = true;
+      this.setAttribute("aria-busy", "true");
+      var icon = this.querySelector(".icon");
+      var turnMs = 600;
+      var spin = !reducedMotion.matches && typeof icon.animate === "function"
+        ? icon.animate([{transform:"rotate(0deg)"}, {transform:"rotate(360deg)"}], {duration:turnMs, iterations:Infinity})
+        : null;
       try { await refreshOverview(); }
       catch (e){ toast(t("overview.refreshFail", {msg: e.message}), true); }
-      finally { this.disabled = false; }
+      finally {
+        if (spin){
+          /* 即使状态很快返回也转满一圈。请求较慢时，在下一整圈自然停下。 */
+          var elapsed = spin.currentTime || 0;
+          spin.effect.updateTiming({iterations:Math.max(1, Math.ceil(elapsed / turnMs))});
+          await spin.finished.catch(function(){});
+        }
+        this.removeAttribute("aria-busy");
+        this.disabled = false;
+      }
     };
 
     /* 远控页 */
