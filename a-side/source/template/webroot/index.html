@@ -2,70 +2,133 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta name="theme-color" content="#15151d">
 <title>Ommega</title>
 <style>
-  /* 自包含单文件：样式与脚本都内联，不依赖外部资源。管理器把 webroot/ 当静态目录
-     serve 并注入 window.ksu。
-     布局：顶栏（标题 + 关于）／状态条（keymint/keystore2/adbr/SOTER）／标签栏／
-     四页内容。分页用 scroll-snap 做横向滑动，比手写 touch 事件稳。 */
+  /* 管理器提供 window.ksu。面板随模块打包，样式、图标和脚本在本地加载。 */
   :root{
-    --bg:#f5f6f8; --card:#fff; --fg:#1b1c1f; --dim:#6b6f76;
-    --line:#e3e5e9; --accent:#3867d6; --ok:#1e9e5a; --bad:#d64545; --warn:#b8860b;
-  }
-  @media (prefers-color-scheme: dark){
-    :root{--bg:#141518;--card:#1e2024;--fg:#eceef2;--dim:#9aa0a8;--line:#2c2f35;--accent:#7aa2f7;--ok:#4ec97b;--bad:#f0736f;--warn:#e0b341;}
+    color-scheme:dark;
+    --bg:#15151d;--card:#292735;--surface:#24232f;--fg:#f6f3fd;--dim:#c2bdd2;
+    --line:#454153;--accent:#d2ccff;--accent-ink:#24204b;--ok:#a3e3bf;--bad:#ffa5ab;--warn:#ffcd96;
+    --gutter:clamp(14px,4.6vw,28px);--content:656px;
+    --safe-top:var(--safe-area-inset-top,env(safe-area-inset-top,0px));
+    --safe-bottom:var(--safe-area-inset-bottom,env(safe-area-inset-bottom,0px));
+    --safe-left:var(--safe-area-inset-left,env(safe-area-inset-left,0px));
+    --safe-right:var(--safe-area-inset-right,env(safe-area-inset-right,0px));
+    --nav-space:calc(88px + var(--safe-bottom));
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;
-       overflow:hidden;
-       font:15px/1.6 -apple-system,"Noto Sans SC","Segoe UI",Roboto,sans-serif}
-  /* 顶栏 */
-  .topbar{display:flex;align-items:center;gap:8px;padding:12px 14px 8px}
-  .tb-title{flex:1;font-size:18px;font-weight:600}
-  .tb-title small{font-size:12px;font-weight:400;color:var(--dim);margin-left:8px}
-  .tb-btn{padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:var(--card);
-      color:var(--fg);font-size:13px;font-family:inherit}
-  /* 状态条 */
-  .strip{display:flex;gap:6px;padding:0 14px 10px;flex-wrap:wrap}
-  .chip{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
-      background:var(--card);border:1px solid var(--line);font-size:12px;color:var(--dim)}
-  .chip b{font-weight:500;color:var(--fg);font-size:12px}
-  .dot{width:8px;height:8px;border-radius:50%;background:#c9ccd2;flex:0 0 8px}
-  .dot.on{background:var(--ok)} .dot.off{background:var(--bad)} .dot.warn{background:var(--warn)}
-  /* 标签栏 */
-  .tabs{display:flex;gap:4px;padding:0 14px 10px;position:relative}
-  .tab-pill{position:absolute;left:0;top:0;border-radius:10px;background:var(--card);
-      border:1px solid var(--line);pointer-events:none;will-change:transform;
-      transition:transform .26s cubic-bezier(.22,.61,.36,1),width .26s cubic-bezier(.22,.61,.36,1)}
-  .tabs.dragging .tab-pill{transition:none}
-  .tab{flex:1;padding:8px 4px;border-radius:10px;border:1px solid transparent;background:transparent;
-      position:relative;z-index:1;
-      color:var(--dim);font-size:13px;font-family:inherit}
-  .tab.on{background:transparent;border-color:transparent;color:var(--fg);font-weight:600}
-  /* 分页 */
-  .pages{flex:1;position:relative;overflow:hidden;min-width:0;touch-action:pan-y}
-  /* 拖动和翻页动画期间的 will-change / 关过渡改成用内联样式写在页面上（见 wireTabs / applyPage）。
-     以前是 .pages.dragging .page 这种后代选择器：给 #pages 加一个 class 会让整棵页面子树
-     重新匹配样式（四个页面、几百个节点），正好卡在动画的第一帧上。 */
-  .page{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding:0 14px 28px;
+  body{margin:0;color:var(--fg);display:flex;flex-direction:column;
+       padding-inline:var(--safe-left) var(--safe-right);
+       background:var(--bg);
+       overflow:hidden;font:15px/1.55 system-ui,"Noto Sans SC","Microsoft YaHei",sans-serif}
+  /* 状态栏和页面共用底色，只在安全区下沿淡入滚动内容。 */
+  body::before{content:"";position:fixed;inset:0 0 auto;z-index:80;pointer-events:none;
+      height:calc(var(--safe-top) + min(14px,var(--safe-top)));
       background:var(--bg);
-      opacity:0;pointer-events:none;transform:translateX(12%);
-      contain:layout paint;
-      /* 只给 transform 做过渡：整页平移本来就能盖住旧页，再叠一层 opacity 透明混合
-         等于让两张大图层每帧多算一遍混合，低端 GPU 上最容易掉帧。 */
-      transition:transform .22s cubic-bezier(.22,.61,.36,1)}
-  .page.on{opacity:1;pointer-events:auto;transform:translateX(0)}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:12px}
-  .card h2{margin:0 0 10px;font-size:14px;font-weight:600;color:var(--dim)}
-  .row{display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--line)}
+      -webkit-mask-image:linear-gradient(#000 var(--safe-top),transparent);
+      mask-image:linear-gradient(#000 var(--safe-top),transparent)}
+  button,input,select{font-family:inherit}
+  button{cursor:pointer}
+  button:disabled{cursor:default}
+  .icon{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;
+      stroke-linecap:round;stroke-linejoin:round}
+  .quiet-btn{min-height:38px;padding:6px 13px;border-radius:999px;border:1px solid var(--line);
+      background:var(--surface);color:var(--dim);font-size:12px;font-weight:650}
+  .tabs{position:fixed;z-index:10;left:calc((100% + var(--safe-left) - var(--safe-right)) / 2);
+      bottom:calc(10px + var(--safe-bottom));transform:translateX(-50%);
+      width:calc(100% - var(--gutter) * 2 - var(--safe-left) - var(--safe-right));max-width:490px;
+      --tab-gap:3px;--tab-inset:4px;
+      display:flex;gap:var(--tab-gap);padding:var(--tab-inset);border:1px solid #e3d9fc85;border-radius:36px;background:#353243;
+      box-shadow:0 9px 26px #0b0a1270,inset 0 1px 1px #fff9,inset 0 -1px 1px #e5d7ff40}
+  @supports ((backdrop-filter:blur(9px)) or (-webkit-backdrop-filter:blur(9px))){
+    .tabs{background:linear-gradient(158deg,#b0a5d035 -5%,#49435c29 56%,#a39ac153),#1615234c;
+      -webkit-backdrop-filter:blur(9px) saturate(155%);backdrop-filter:blur(9px) saturate(155%)}
+  }
+  .tab-pill{position:absolute;left:var(--tab-inset);top:var(--tab-inset);bottom:var(--tab-inset);border-radius:30px;
+      width:calc((100% - 2 * (var(--tab-inset) + var(--tab-gap))) / 3);
+      background:linear-gradient(152deg,#eee7ffc9,#a7a0c299 78%);
+      border:1px solid #eee5ffb3;box-shadow:inset 0 1px 1px #fffd,inset 0 -2px 4px #c9bef34d;
+      pointer-events:none;will-change:transform;
+      transform:translate3d(calc((100% + var(--tab-gap)) * var(--tab-position,0)),0,0)}
+  .tab{flex:1;min-width:0;min-height:55px;display:grid;justify-items:center;align-content:center;gap:3px;
+      padding:5px 3px;border-radius:30px;border:0;background:transparent;position:relative;
+      color:#f9f5ff;font-size:12px;font-weight:700;line-height:1.2;text-shadow:0 1px 3px #110e21bf}
+  .tab .icon{width:22px;height:22px}
+  .tab.on{color:#fdf8ff;text-shadow:0 1px 3px #292039}
+  /* 分页 */
+  .pages{flex:1;position:relative;overflow:hidden;overflow:clip;min-width:0;touch-action:pan-y}
+  .page-track{position:absolute;inset:0;display:flex;transform:translate3d(0,0,0)}
+  .page{position:relative;flex:0 0 100%;min-width:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;
+      padding:0 var(--gutter) calc(var(--nav-space) + 12px);
+      scroll-padding:var(--safe-top) 0 var(--nav-space);scrollbar-width:thin;scrollbar-color:#62596e transparent;
+      background:radial-gradient(ellipse 550px 240px at 70% 0%,#211e2d,transparent),var(--bg);
+      contain:layout paint}
+  .page[inert]{pointer-events:none}
+  .page-content{max-width:var(--content);margin:0 auto}
+  .page>.page-content{padding-top:var(--safe-top)}
+  .page-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0 15px}
+  .page-heading h1{margin:0;font-size:clamp(30px,9vw,42px);font-weight:800;line-height:1.15;letter-spacing:-.04em}
+  .page-heading p{margin:8px 0 0;color:var(--dim);font-size:14px}
+  .icon-btn{flex:none;display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--line);
+      border-radius:16px;background:var(--surface);color:var(--accent)}
+  .icon-btn:disabled{opacity:.55}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:25px;
+      padding:clamp(15px,4.3vw,24px);margin-bottom:12px}
+  .card h2{margin:0 0 10px;font-size:19px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
+  .overview-hero,.overview-material{padding:clamp(16px,4.6vw,26px);border-radius:28px}
+  .overview-hero{position:relative;isolation:isolate;overflow:hidden;border-color:#747dd4;
+      background:linear-gradient(125deg,#44468f,#334e9b 68%,#3f4e91)}
+  .overview-hero::before{content:"";position:absolute;z-index:-1;pointer-events:none;
+      width:86%;height:125%;left:43%;bottom:28%;border-radius:48% 0 42% 52%;transform:rotate(19deg);
+      background:linear-gradient(155deg,#6388e468,#5492eb4d 66%,#838df231);border:1px solid #b8c8ff21}
+  .overview-material{background:linear-gradient(120deg,#302c41,#3a3348)}
+  .card-top,.card-kicker,.hero-main{display:flex;align-items:center;gap:8px}
+  .card-top,.hero-main{justify-content:space-between}
+  .card-top{align-items:flex-start}
+  .card-kicker{min-width:0;color:#f4effe;font-size:13px;font-weight:700;line-height:1.3}
+  .card-kicker .icon{width:17px;height:17px}
+  .badge{display:inline-flex;align-items:center;gap:6px;max-width:53%;padding:5px 9px;border-radius:999px;
+      background:#211f3a63;color:#faf5ff;font-size:11px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
+  .badge::before,.dot{content:"";width:6px;height:6px;border-radius:50%;background:#d9d1ed;flex:none}
+  .badge.enabled::before,.dot.on{background:var(--ok)}
+  .dot.off{background:var(--bad)} .dot.warn{background:var(--warn)}
+  .hero-main{margin:16px 0 12px;gap:12px}
+  .overview-hero h2,.overview-material h2{font-size:clamp(23px,6.4vw,32px);margin:0;letter-spacing:-.03em}
+  .overview-hero p{margin:7px 0 0;color:#efeaff;font-size:13px;line-height:1.52}
+  .hero-emblem{flex:none;display:grid;place-items:center;width:56px;height:56px;border-radius:20px;
+      border:1px solid #e3d9ff52;background:#b5a4d359;color:#fff5ff}
+  .hero-emblem .icon{width:32px;height:32px}
+  .overview-material h2{margin:11px 0 13px}
+  .metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px;margin:0}
+  .overview-hero .metrics{border-top:1px solid #d4d6ff54;padding-top:12px}
+  .metrics dt{color:#e0d9ed;font-size:12px;line-height:1.3}
+  .metrics dd{margin:4px 0 0;font-size:14px;font-weight:750;line-height:1.35;overflow-wrap:anywhere;
+      font-variant-numeric:tabular-nums}
+  .card-link{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:41px;
+      margin-top:15px;padding:7px 11px;border:1px solid #635a74;border-radius:13px;background:#ffffff0b;
+      color:#f3eaff;text-align:start;font-size:13px;font-weight:700}
+  .card-link .icon{width:17px;height:17px}
+  .runtime-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .runtime-card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:21px;padding:12px 14px}
+  .runtime-card b{display:block;font-size:14px;overflow-wrap:anywhere}
+  .runtime-state{display:flex;align-items:center;gap:7px;margin:4px 0 0;color:var(--dim);font-size:12px;line-height:1.4}
+  .runtime-state span{min-width:0;overflow-wrap:anywhere}
+  .settings-tabs{position:sticky;z-index:1;top:var(--safe-top);display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;padding:4px;
+      margin-bottom:12px;border:1px solid var(--line);border-radius:17px;background:var(--surface);
+      box-shadow:0 4px 10px #15151d80}
+  .settings-tabs button{min-height:43px;border:1px solid transparent;border-radius:13px;padding:5px 4px;
+      background:transparent;color:var(--dim);font-size:12px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}
+  .settings-tabs button[aria-pressed=true]{background:#514866;border-color:#76688d;color:var(--fg)}
+  .row{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .row:first-of-type{border-top:0}
   .row .name{flex:1;min-width:0}
-  .row .name b{display:block;font-weight:500;font-size:14px}
+  .row .name b{display:block;font-weight:650;font-size:14px}
   .row .name small{display:block;color:var(--dim);font-size:12px;line-height:1.45}
-  .row input[type=text],.row select{flex:0 0 46%;min-width:0;padding:7px 9px;border:1px solid var(--line);
-      border-radius:8px;background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit}
+  .row input[type=text],.row select{flex:0 0 46%;min-width:0;min-height:42px;padding:7px 9px;border:1px solid var(--line);
+      border-radius:10px;background:var(--bg);color:var(--fg);font-size:14px;font-family:inherit}
   /* 令牌 / 服务器地址这类长值：标签占一行、输入框占满下一行。
      原来 46%（约 144px）装不下 32 位 token，需要横向滚动 120px，聚焦全选时
      内容会整个跳到末尾，看着像「框变了」。 */
@@ -106,23 +169,23 @@
   /* 露出真值拖动期间把镜像层露出来，显示的是真值而不是星号。
      用 opacity 而不是 display:none：文字布局和图层一直热着，起拖时不用现场重排/建层。 */
   .pw-field input.panning ~ .pw-stars{opacity:1}
-  .pw-eye{flex:0 0 36px;height:34px;display:flex;align-items:center;justify-content:center;
+  .pw-eye{flex:0 0 42px;height:42px;display:flex;align-items:center;justify-content:center;
       padding:0;border:1px solid var(--line);border-radius:8px;background:var(--bg);
       color:var(--dim);cursor:pointer}
   .pw-eye svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;
       stroke-linecap:round;stroke-linejoin:round}
   .pw-eye[aria-pressed="true"]{color:var(--fg)}
-  .sw{position:relative;flex:0 0 46px;height:26px;border-radius:13px;background:#c9ccd2;
-      cursor:pointer;transition:background .15s;border:0;padding:0}
+  .sw{position:relative;flex:0 0 48px;height:28px;border-radius:16px;background:#514c60;
+      transition:background .15s;border:1px solid #81798f;padding:0}
   .sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
-      background:#fff;transition:left .15s;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+      background:#f0e9fb;transition:transform .15s}
   .sw[aria-checked=true]{background:var(--accent)}
-  .sw[aria-checked=true]::after{left:23px}
+  .sw[aria-checked=true]::after{transform:translateX(20px);background:var(--accent-ink)}
   .acts{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
-  button.btn{flex:1;min-width:96px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);
-      background:var(--card);color:var(--fg);font-size:14px;font-family:inherit}
-  button.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
-  button.btn.sm{flex:0 0 auto;min-width:0;padding:6px 10px;font-size:13px;border-radius:8px}
+  button.btn{flex:1;min-width:96px;min-height:42px;padding:8px 12px;border-radius:13px;border:1px solid #655e76;
+      background:#393547;color:var(--fg);font-size:14px;font-weight:650;overflow-wrap:anywhere}
+  button.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:750}
+  button.btn.sm{flex:0 1 auto;min-width:0;min-height:36px;padding:6px 10px;font-size:12px;border-radius:11px}
   button.btn[disabled]{opacity:.5}
   .kv{display:flex;gap:10px;font-size:13px;padding:6px 0;border-top:1px solid var(--line)}
   .kv:first-of-type{border-top:0}
@@ -139,19 +202,31 @@
   .lang-pick::after{content:"";flex:0 0 auto;width:0;height:0;
       border-left:3px solid transparent;border-right:3px solid transparent;
       border-top:4px solid currentColor;opacity:.6}
-  .row button.btn{flex:0 0 84px;min-width:0;padding:8px 0;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row button.btn{flex:0 0 28%;max-width:100px;min-height:40px;padding:5px;text-align:center}
   .hint{color:var(--dim);font-size:12px;line-height:1.5;margin:6px 0 0}
   /* 应用列表 */
-  .toolbar{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 8px}
-  .search{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;
-      background:var(--card);color:var(--fg);font-size:13px;font-family:inherit;margin-bottom:8px}
-  #applist{background:var(--card);border:1px solid var(--line);border-radius:10px}
+  .toolbar{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 10px}
+  .search{width:100%;min-height:44px;padding:8px 12px;border:1px solid var(--line);border-radius:13px;
+      background:var(--bg);color:var(--fg);font-size:14px;margin:6px 0}
+  #applist{background:var(--surface);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  #applist>.hint{margin:0;padding:12px}
+  #page-apps{display:flex;flex-direction:column;overflow:hidden;padding:var(--safe-top) 0 0}
+  .apps-heading{flex:none;width:100%;max-width:calc(var(--content) + var(--gutter) * 2);margin:0 auto;
+      padding-inline:var(--gutter)}
+  .apps-heading>div{min-width:0}
+  .apps-heading p{margin-top:4px;font-size:12px}
+  .apps-heading .btn{flex:0 0 auto;max-width:53%}
+  .apps-scroll{position:relative;flex:1;min-height:0;overflow-y:auto;overscroll-behavior-y:contain;
+      padding:0 var(--gutter) calc(var(--nav-space) + 12px);scroll-padding-bottom:var(--nav-space);
+      scrollbar-width:thin;scrollbar-color:#62596e transparent}
+  .apps-list-count{display:flex;align-items:baseline;gap:8px;padding:6px 0;color:var(--dim);font-size:13px}
+  .apps-list-count strong{color:var(--fg);font-weight:750;font-variant-numeric:tabular-nums}
   /* 行高固定：列表按窗口渲染，靠这个常量算滚动位置；行里两行文字也钉死行高，
      免得系统字号/换行把高度撑变，窗口就对不上了。 */
   .app{display:flex;align-items:center;gap:10px;padding:7px 9px;border-top:1px solid var(--line);
       min-height:54px;overflow:hidden}
-  .app:first-child{border-top:0}
-  .app img{width:28px;height:28px;border-radius:6px;flex:0 0 28px;background:var(--line)}
+  .app:first-child{border-top-color:transparent}
+  .app-icon{width:28px;height:28px;border-radius:7px;flex:0 0 28px;background:var(--line)}
   .app .meta{flex:1;min-width:0}
   .app .meta b{display:block;font-weight:500;font-size:13.5px;line-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .app .meta small{display:block;color:var(--dim);font-size:11.5px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -159,9 +234,9 @@
      原生 <select> 每行都要画一遍控件、还带 4 个 option 子节点，行数一多单页绘制就重；
      自绘按钮只有一行字，菜单只有一个、关着时 display:none，不参与光栅化。 */
   .app .pick{display:inline-flex;align-items:center;justify-content:center;gap:4px;
-      flex:0 0 auto;padding:4px 9px;border:1px solid var(--line);border-radius:8px;
+      flex:0 0 auto;min-height:32px;padding:4px 9px;border:1px solid var(--line);border-radius:9px;
       background:var(--bg);color:var(--fg);font-size:12px;font-family:inherit;font-weight:400;
-      line-height:1.35;white-space:nowrap;max-width:100%}
+      line-height:1.2;max-width:48%;overflow-wrap:anywhere}
   /* 小三角用边框画，作为按钮里的一个 flex 项：宽度只按「文字 + 间隙 + 三角 + 内边距」来，
      不再为固定宽度留空；右侧内边距留一点呼吸感。 */
   .app .pick::after{content:"";flex:0 0 auto;width:0;height:0;
@@ -173,14 +248,14 @@
       display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 28px rgba(0,0,0,.22)}
   .apick-item{display:block;width:100%;text-align:left;padding:9px 10px;border:0;border-radius:8px;
       background:transparent;color:var(--fg);font-size:13px;font-family:inherit}
-  .apick-item.on{background:rgba(56,103,214,.12);color:var(--accent);font-weight:600}
-  .app.on{background:rgba(56,103,214,.07)}
-  .app.off .meta,.app.off .pick{opacity:.45}
+  .apick-item.on{background:#514866;color:var(--accent);font-weight:650}
+  .app.on{background:#35314b}
+  .app.off .pick{color:var(--dim)}
   /* 悬浮窗（关于 / 选文件） */
   .modal{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;
       align-items:center;justify-content:center;padding:20px}
   .modal.hidden{display:none}
-  .sheet{background:var(--card);border-radius:14px;width:100%;max-width:520px;max-height:84vh;
+  .sheet{background:var(--card);border-radius:25px;width:100%;max-width:520px;max-height:84vh;
       display:flex;flex-direction:column;border:1px solid var(--line)}
   .sheet-head{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line)}
   .sheet-head b{flex:1;font-size:15px}
@@ -198,179 +273,256 @@
   .fp-item:first-child{border-top:0}
   .fp-item.dir{font-weight:600}
   .fp-item span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(70px);
-      background:#20232a;color:#fff;padding:10px 16px;border-radius:10px;font-size:13px;
-      max-width:86vw;opacity:0;transition:.22s;pointer-events:none;z-index:99}
+  #toast{position:fixed;left:50%;bottom:var(--nav-space);transform:translateX(-50%) translateY(12px);
+      background:#39344c;color:#fff;padding:10px 16px;border-radius:15px;font-size:13px;
+      width:max-content;max-width:86vw;opacity:0;transition:.22s;pointer-events:none;z-index:99}
   #toast.show{opacity:1;transform:translateX(-50%)}
   #toast.err{background:#8d2b2b}
-  #boot{color:var(--dim);font-size:13px;padding:8px 14px}
-  /* 点按钮时浏览器会画一圈方框焦点框（有时还带点按高亮），手机上看很突兀 —— 去掉；
-     输入框/下拉保留一圈柔和高亮，不然点进去看不出焦点在哪。 */
-  button, .sw, .btn, .tb-btn { -webkit-tap-highlight-color: transparent; }
-  button:focus, button:focus-visible, .sw:focus, .sw:focus-visible { outline: none; }
-  input:focus, select:focus { outline: none; border-color: var(--accent); }
-  .hidden{display:none}
+  #boot{color:var(--dim);font-size:13px;width:100%;max-width:var(--content);margin:0 auto;
+      padding:calc(var(--safe-top) + 16px) var(--gutter) 16px}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  input:focus,select:focus{border-color:var(--accent)}
+  .pw-field input:focus-visible{outline-offset:-2px}
+  body.keyboard-open{height:var(--editing-height,100%);--safe-bottom:0px;--nav-space:12px}
+  body.keyboard-open .tabs{display:none}
+  body.keyboard-open .settings-tabs{position:static}
+  [hidden],.hidden{display:none}
+  @media (prefers-reduced-motion:reduce){
+    .sw,.sw::after,#toast{transition:none}
+  }
+  @media (max-width:360px){
+    .hero-emblem{width:46px;height:46px;border-radius:16px}
+    .hero-emblem .icon{width:26px;height:26px}
+    .overview-hero .metrics{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
+  }
   /* 可点的外跳项（QQ 群 / GitHub）：面板是个 WebView，里面的 <a> 跳不出去，统一走系统意图。 */
   .link{color:var(--accent);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
 </style>
 </head>
 <body>
 
-<div class="topbar">
-  <div class="tb-title">Ommega<small id="tb-ver"></small></div>
-  <button class="tb-btn" id="about-btn" data-i18n="about.open"></button>
-</div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="icon-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M3 10h18m-8 0v11"/></symbol>
+  <symbol id="icon-apps" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+  <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M3 7h11m5 0h2M3 17h2m5 0h11"/><circle cx="16.5" cy="7" r="2.5"/><circle cx="7.5" cy="17" r="2.5"/></symbol>
+  <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="icon-shield" viewBox="0 0 24 24"><path d="m12 2.5 7.5 3v5.4c0 5-2.9 8.2-7.5 10.6C7.4 19.1 4.5 15.9 4.5 10.9V5.5z"/><path d="m9 11.8 2 2 4-4"/></symbol>
+  <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+  <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 5v5h-5M4 19v-5h5m10.7-4A8 8 0 0 0 6 6m-1.7 8A8 8 0 0 0 18 18"/></symbol>
+</svg>
 
-<div class="strip">
-  <div class="chip"><i class="dot" id="dot-keymint"></i><b>keymint</b><span id="st-keymint"></span></div>
-  <div class="chip"><i class="dot" id="dot-keystore"></i><b>keystore2</b><span id="st-keystore"></span></div>
-  <div class="chip"><i class="dot" id="dot-adbr"></i><b>adbr</b><span id="st-adbr"></span></div>
-  <div class="chip"><i class="dot" id="dot-soter"></i><b>SOTER</b><span id="st-soter"></span></div>
-</div>
+<div id="boot" data-i18n="boot" role="status"></div>
 
-<div class="tabs" id="tabs">
-  <span class="tab-pill" id="tabPill"></span>
-  <button class="tab on" data-tab="0" data-i18n="tab.remote"></button>
-  <button class="tab" data-tab="1" data-i18n="tab.scope"></button>
-  <button class="tab" data-tab="2" data-i18n="tab.keys"></button>
-  <button class="tab" data-tab="3" data-i18n="tab.patch"></button>
-</div>
+<main class="pages hidden" id="pages">
+  <div class="page-track" id="page-track">
+  <section class="page" id="page-overview" aria-labelledby="overview-heading">
+    <div class="page-content">
+      <header class="page-heading">
+        <div><h1 id="overview-heading" data-i18n="nav.overview"></h1><p data-i18n="overview.description"></p></div>
+        <button class="icon-btn" id="overview-refresh" type="button" data-i18n-title="overview.refresh">
+          <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+        </button>
+      </header>
 
-<div id="boot" data-i18n="boot"></div>
-
-<div class="pages hidden" id="pages">
-
-  <!-- ------------------------------- 1 远控 ------------------------------- -->
-  <section class="page">
-    <div class="card">
-      <h2 data-i18n="remote.title"></h2>
-      <div id="grp-remote"></div>
-      <div class="acts">
-        <button class="btn primary" id="save-remote" data-i18n="remote.save"></button>
-        <button class="btn" id="open-status" data-i18n="status.open"></button>
-      </div>
-      <p class="hint" data-i18n="remote.hint"></p>
-    </div>
-  </section>
-
-  <!-- ------------------------------ 2 作用域 ------------------------------ -->
-  <section class="page">
-    <div class="card">
-      <h2 data-i18n="apps.title"></h2>
-      <div class="kv"><span data-i18n="apps.count"></span><span id="app-count">-</span></div>
-      <input type="text" id="app-search" class="search" data-i18n-ph="apps.search">
-      <div class="toolbar">
-        <button class="btn sm" id="app-reload" data-i18n="apps.refresh"></button>
-        <button class="btn sm" id="toggle-system"></button>
-        <button class="btn sm" id="pick-all" data-i18n="apps.all"></button>
-        <button class="btn sm" id="pick-none" data-i18n="apps.unall"></button>
-      </div>
-      <div id="applist"><p class="hint" id="applist-hint"></p></div>
-      <div class="acts">
-        <button class="btn primary" id="save-apps" data-i18n="apps.save"></button>
-        <span class="hint" id="app-count2" style="align-self:center"></span>
-      </div>
-      <p class="hint" data-i18n="apps.list.hint"></p>
-    </div>
-  </section>
-
-  <!-- ----------------------------- 3 本地密钥 ----------------------------- -->
-  <section class="page">
-    <div class="card">
-      <h2 data-i18n="kb.title"></h2>
-      <div class="row"><div class="name"><b data-i18n="kb.auto"></b><small data-i18n="kb.auto.hint"></small></div>
-        <button class="btn sm" id="kb-auto" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="kb.fromFile"></b><small data-i18n="kb.fromFile.hint"></small></div>
-        <button class="btn sm" id="kb-file" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="kb.self"></b><small data-i18n="kb.self.hint"></small></div>
-        <button class="btn sm" id="kb-self" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="kb.aosp"></b><small data-i18n="kb.aosp.hint"></small></div>
-        <button class="btn sm" id="kb-aosp" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="kb.yuri"></b><small data-i18n="kb.yuri.hint"></small></div>
-        <button class="btn sm" id="kb-yuri" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="kb.ommega"></b><small data-i18n="kb.ommega.hint"></small></div>
-        <button class="btn sm" id="kb-ommega" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="kb.rkp"></b><small data-i18n="kb.rkp.hint"></small></div>
-        <button class="btn sm" id="rkp-fix" data-i18n="kb.rkp.btn"></button></div>
-    </div>
-
-    <!-- StrongBox 级别单独的一份 keybox（可选）；不配就沿用上面那份 -->
-    <div class="card">
-      <h2 data-i18n="sbkb.title"></h2>
-      <div class="kv"><span data-i18n="sbkb.current"></span><span id="sbkb-state">-</span></div>
-      <div class="row"><div class="name"><b data-i18n="sbkb.fromFile"></b><small data-i18n="sbkb.fromFile.hint"></small></div>
-        <button class="btn sm" id="sbkb-file" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="sbkb.clear"></b><small data-i18n="sbkb.clear.hint"></small></div>
-        <button class="btn sm" id="sbkb-clear" data-i18n="act.clear"></button></div>
-      <p class="hint" data-i18n="sbkb.hint"></p>
-    </div>
-
-    <div class="card">
-      <h2 data-i18n="sk.title"></h2>
-      <div class="kv"><span data-i18n="soter.record"></span><span id="soter-record">-</span></div>
-      <div class="kv"><span data-i18n="sk.current"></span><span id="sk-state">-</span></div>
-      <div class="row"><div class="name"><b data-i18n="sk.fromFile"></b><small data-i18n="sk.fromFile.hint"></small></div>
-        <button class="btn sm" id="sk-file" data-i18n="act.use"></button></div>
-      <div class="row"><div class="name"><b data-i18n="sk.clear"></b><small data-i18n="sk.clear.hint"></small></div>
-        <button class="btn sm" id="sk-clear" data-i18n="act.clear"></button></div>
-      <p class="hint" data-i18n="sk.hint"></p>
-      <p class="hint" data-i18n="sk.format.hint"></p>
-    </div>
-  </section>
-
-  <!-- ----------------------------- 4 伪装参数 ----------------------------- -->
-  <section class="page">
-    <div class="card">
-      <h2 data-i18n="patch.title"></h2>
-      <div id="grp-patch"></div>
-      <p class="hint" data-i18n="patch.current"></p>
-      <div id="patch-summary"></div>
-      <div class="acts">
-        <button class="btn primary" id="patch-sync" data-i18n="patch.sync"></button>
-        <button class="btn sm" id="patch-edit" data-i18n="patch.manual"></button>
-      </div>
-      <p class="hint" data-i18n="patch.sync.hint"></p>
-      <p class="hint" data-i18n="patch.store.hint"></p>
-      <div id="patch-manual" class="hidden">
-        <div class="row"><div class="name"><b data-i18n="patch.hash"></b><small data-i18n="patch.hash.hint"></small></div>
-          <input type="text" id="boot-hash" autocapitalize="none"></div>
-        <div class="row"><div class="name"><b data-i18n="patch.boot"></b><small data-i18n="patch.boot.hint"></small></div>
-          <input type="text" id="patch-boot" autocapitalize="none" placeholder="2025-01-01"></div>
-        <div class="row"><div class="name"><b data-i18n="patch.system"></b><small data-i18n="patch.system.hint"></small></div>
-          <input type="text" id="patch-system" autocapitalize="none" placeholder="2025-01-01"></div>
-        <div class="row"><div class="name"><b data-i18n="patch.vendor"></b><small data-i18n="patch.vendor.hint"></small></div>
-          <input type="text" id="patch-vendor" autocapitalize="none" placeholder="2025-01-01"></div>
-        <div id="patch-identity">
-          <div class="row"><div class="name"><b data-i18n="patch.release"></b><small data-i18n="patch.release.hint"></small></div>
-            <input type="text" id="ident-release" autocapitalize="none" placeholder="16"></div>
-          <div class="row"><div class="name"><b data-i18n="patch.ident.brand"></b><small data-i18n="patch.ident.brand.hint"></small></div>
-            <input type="text" id="ident-brand" autocapitalize="none"></div>
-          <div class="row"><div class="name"><b data-i18n="patch.ident.device"></b><small data-i18n="patch.ident.device.hint"></small></div>
-            <input type="text" id="ident-device" autocapitalize="none"></div>
-          <div class="row"><div class="name"><b data-i18n="patch.ident.name"></b><small data-i18n="patch.ident.name.hint"></small></div>
-            <input type="text" id="ident-name" autocapitalize="none"></div>
-          <div class="row"><div class="name"><b data-i18n="patch.ident.manufacturer"></b><small data-i18n="patch.ident.manufacturer.hint"></small></div>
-            <input type="text" id="ident-manufacturer" autocapitalize="none"></div>
-          <div class="row"><div class="name"><b data-i18n="patch.model"></b><small data-i18n="patch.ident.model.hint"></small></div>
-            <input type="text" id="ident-model" autocapitalize="none"></div>
-          <div class="row"><div class="name"><b data-i18n="patch.fingerprint"></b><small data-i18n="patch.fingerprint.hint"></small></div>
-            <input type="text" id="ident-fingerprint" autocapitalize="none"></div>
+      <article class="card overview-hero">
+        <div class="card-top">
+          <div class="card-kicker"><svg class="icon" aria-hidden="true"><use href="#icon-clock"/></svg><span data-i18n="overview.activity"></span></div>
+          <span class="badge" id="overview-age">—</span>
         </div>
-        <div class="acts">
-          <button class="btn primary" id="save-patch" data-i18n="patch.save"></button>
-          <button class="btn sm" id="patch-clear" data-i18n="patch.clear"></button>
+        <div class="hero-main">
+          <div><h2 data-i18n="overview.signing"></h2><p data-i18n="overview.signingHint"></p></div>
+          <span class="hero-emblem"><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg></span>
         </div>
-        <p class="hint" data-i18n="patch.save.hint"></p>
+        <dl class="metrics">
+          <div><dt data-i18n="overview.signTime"></dt><dd><time id="overview-sign-time">—</time></dd></div>
+          <div><dt data-i18n="overview.operation"></dt><dd id="overview-sign-op">—</dd></div>
+        </dl>
+      </article>
+
+      <article class="card overview-material">
+        <div class="card-top">
+          <div class="card-kicker"><svg class="icon" aria-hidden="true"><use href="#icon-shield"/></svg><span data-i18n="overview.material"></span></div>
+          <span class="badge" id="overview-relay">—</span>
+        </div>
+        <h2 id="overview-mode" data-i18n="status.unknown"></h2>
+        <dl class="metrics">
+          <div><dt data-i18n="overview.teeFile"></dt><dd id="overview-tee" data-i18n="status.unknown"></dd></div>
+          <div><dt data-i18n="overview.sbFile"></dt><dd id="overview-sb" data-i18n="status.unknown"></dd></div>
+          <div><dt data-i18n="overview.scope"></dt><dd id="overview-scope" data-i18n="status.unknown"></dd></div>
+          <div><dt data-i18n="overview.listed"></dt><dd id="overview-count">—</dd></div>
+        </dl>
+        <button class="card-link" type="button" data-open-settings="keys" aria-controls="settings-keys">
+          <span data-i18n="overview.manageKeys"></span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg>
+        </button>
+      </article>
+
+      <div class="runtime-grid">
+        <div class="runtime-card"><b>KeyMint</b><div class="runtime-state"><i class="dot" id="dot-keymint"></i><span id="st-keymint" data-i18n="status.unknown"></span></div></div>
+        <div class="runtime-card"><b>keystore2</b><div class="runtime-state"><i class="dot" id="dot-keystore"></i><span id="st-keystore" data-i18n="status.unknown"></span></div></div>
+        <div class="runtime-card"><b>adbr</b><div class="runtime-state"><i class="dot" id="dot-adbr"></i><span id="st-adbr" data-i18n="status.unknown"></span></div></div>
+        <div class="runtime-card"><b>SOTER</b><div class="runtime-state"><i class="dot" id="dot-soter"></i><span id="st-soter" data-i18n="status.unknown"></span></div></div>
       </div>
     </div>
   </section>
-</div>
+
+  <section class="page" id="page-apps" aria-labelledby="apps-heading" inert>
+    <header class="page-heading apps-heading">
+      <div><h1 id="apps-heading" data-i18n="nav.apps"></h1><p id="app-count2"></p></div>
+      <button class="btn primary" id="save-apps" data-i18n="apps.save"></button>
+    </header>
+    <div class="apps-scroll" id="apps-scroll">
+      <div class="page-content">
+        <div class="card">
+          <div class="apps-list-count"><span data-i18n="overview.listed"></span><strong id="app-count">—</strong></div>
+          <input type="search" id="app-search" class="search" autocomplete="off" spellcheck="false" data-i18n-ph="apps.search" data-i18n-label="apps.search">
+          <div class="toolbar">
+            <button class="btn sm" id="app-reload" data-i18n="apps.refresh"></button>
+            <button class="btn sm" id="toggle-system"></button>
+            <button class="btn sm" id="pick-all" data-i18n="apps.all"></button>
+            <button class="btn sm" id="pick-none" data-i18n="apps.unall"></button>
+          </div>
+          <p class="hint" data-i18n="apps.list.hint"></p>
+        </div>
+        <div class="card">
+          <div id="applist"><p class="hint" id="applist-hint"></p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="page" id="page-settings" aria-labelledby="settings-heading" inert>
+    <div class="page-content">
+      <header class="page-heading">
+        <h1 id="settings-heading" data-i18n="nav.settings"></h1>
+        <button class="quiet-btn" id="about-btn" type="button" data-i18n="about.open" disabled></button>
+      </header>
+      <div class="settings-tabs" role="group" data-i18n-label="nav.settings">
+        <button type="button" data-open-settings="remote" aria-pressed="true" aria-controls="settings-remote" data-i18n="settings.connection"></button>
+        <button type="button" data-open-settings="keys" aria-pressed="false" aria-controls="settings-keys" data-i18n="tab.keys"></button>
+        <button type="button" data-open-settings="patch" aria-pressed="false" aria-controls="settings-patch" data-i18n="tab.patch"></button>
+      </div>
+
+      <div id="settings-remote" data-settings-pane>
+        <div class="card">
+          <div id="grp-remote"></div>
+          <div class="acts">
+            <button class="btn primary" id="save-remote" data-i18n="remote.save"></button>
+            <button class="btn" id="open-status" data-i18n="status.open"></button>
+          </div>
+          <p class="hint" data-i18n="remote.hint"></p>
+        </div>
+      </div>
+
+      <div id="settings-keys" data-settings-pane hidden>
+        <div class="card">
+          <h2 data-i18n="kb.title"></h2>
+          <div class="row"><div class="name"><b data-i18n="kb.auto"></b><small data-i18n="kb.auto.hint"></small></div>
+            <button class="btn sm" id="kb-auto" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="kb.fromFile"></b><small data-i18n="kb.fromFile.hint"></small></div>
+            <button class="btn sm" id="kb-file" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="kb.self"></b><small data-i18n="kb.self.hint"></small></div>
+            <button class="btn sm" id="kb-self" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="kb.aosp"></b><small data-i18n="kb.aosp.hint"></small></div>
+            <button class="btn sm" id="kb-aosp" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="kb.yuri"></b><small data-i18n="kb.yuri.hint"></small></div>
+            <button class="btn sm" id="kb-yuri" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="kb.ommega"></b><small data-i18n="kb.ommega.hint"></small></div>
+            <button class="btn sm" id="kb-ommega" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="kb.rkp"></b><small data-i18n="kb.rkp.hint"></small></div>
+            <button class="btn sm" id="rkp-fix" data-i18n="kb.rkp.btn"></button></div>
+        </div>
+
+        <div class="card">
+          <h2 data-i18n="sbkb.title"></h2>
+          <div class="kv"><span data-i18n="sbkb.current"></span><span id="sbkb-state">-</span></div>
+          <div class="row"><div class="name"><b data-i18n="sbkb.fromFile"></b><small data-i18n="sbkb.fromFile.hint"></small></div>
+            <button class="btn sm" id="sbkb-file" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="sbkb.clear"></b><small data-i18n="sbkb.clear.hint"></small></div>
+            <button class="btn sm" id="sbkb-clear" data-i18n="act.clear"></button></div>
+          <p class="hint" data-i18n="sbkb.hint"></p>
+        </div>
+
+        <div class="card">
+          <h2 data-i18n="sk.title"></h2>
+          <div class="kv"><span data-i18n="soter.record"></span><span id="soter-record">-</span></div>
+          <div class="kv"><span data-i18n="sk.current"></span><span id="sk-state">-</span></div>
+          <div class="row"><div class="name"><b data-i18n="sk.fromFile"></b><small data-i18n="sk.fromFile.hint"></small></div>
+            <button class="btn sm" id="sk-file" data-i18n="act.use"></button></div>
+          <div class="row"><div class="name"><b data-i18n="sk.clear"></b><small data-i18n="sk.clear.hint"></small></div>
+            <button class="btn sm" id="sk-clear" data-i18n="act.clear"></button></div>
+          <p class="hint" data-i18n="sk.hint"></p>
+          <p class="hint" data-i18n="sk.format.hint"></p>
+        </div>
+      </div>
+
+      <div id="settings-patch" data-settings-pane hidden>
+        <div class="card">
+          <h2 data-i18n="patch.title"></h2>
+          <div id="grp-patch"></div>
+          <p class="hint" data-i18n="patch.current"></p>
+          <div id="patch-summary"></div>
+          <div class="acts">
+            <button class="btn primary" id="patch-sync" data-i18n="patch.sync"></button>
+            <button class="btn sm" id="patch-edit" aria-expanded="false" aria-controls="patch-manual" data-i18n="patch.manual"></button>
+          </div>
+          <p class="hint" data-i18n="patch.sync.hint"></p>
+          <p class="hint" data-i18n="patch.store.hint"></p>
+          <div id="patch-manual" class="hidden">
+            <div class="row stacked"><div class="name"><b data-i18n="patch.hash"></b><small data-i18n="patch.hash.hint"></small></div>
+              <input type="text" id="boot-hash" autocapitalize="none"></div>
+            <div class="row stacked"><div class="name"><b data-i18n="patch.boot"></b><small data-i18n="patch.boot.hint"></small></div>
+              <input type="text" id="patch-boot" autocapitalize="none" placeholder="2025-01-01"></div>
+            <div class="row stacked"><div class="name"><b data-i18n="patch.system"></b><small data-i18n="patch.system.hint"></small></div>
+              <input type="text" id="patch-system" autocapitalize="none" placeholder="2025-01-01"></div>
+            <div class="row stacked"><div class="name"><b data-i18n="patch.vendor"></b><small data-i18n="patch.vendor.hint"></small></div>
+              <input type="text" id="patch-vendor" autocapitalize="none" placeholder="2025-01-01"></div>
+            <div id="patch-identity">
+              <div class="row stacked"><div class="name"><b data-i18n="patch.release"></b><small data-i18n="patch.release.hint"></small></div>
+                <input type="text" id="ident-release" autocapitalize="none" placeholder="16"></div>
+              <div class="row stacked"><div class="name"><b data-i18n="patch.ident.brand"></b><small data-i18n="patch.ident.brand.hint"></small></div>
+                <input type="text" id="ident-brand" autocapitalize="none"></div>
+              <div class="row stacked"><div class="name"><b data-i18n="patch.ident.device"></b><small data-i18n="patch.ident.device.hint"></small></div>
+                <input type="text" id="ident-device" autocapitalize="none"></div>
+              <div class="row stacked"><div class="name"><b data-i18n="patch.ident.name"></b><small data-i18n="patch.ident.name.hint"></small></div>
+                <input type="text" id="ident-name" autocapitalize="none"></div>
+              <div class="row stacked"><div class="name"><b data-i18n="patch.ident.manufacturer"></b><small data-i18n="patch.ident.manufacturer.hint"></small></div>
+                <input type="text" id="ident-manufacturer" autocapitalize="none"></div>
+              <div class="row stacked"><div class="name"><b data-i18n="patch.model"></b><small data-i18n="patch.ident.model.hint"></small></div>
+                <input type="text" id="ident-model" autocapitalize="none"></div>
+              <div class="row stacked"><div class="name"><b data-i18n="patch.fingerprint"></b><small data-i18n="patch.fingerprint.hint"></small></div>
+                <input type="text" id="ident-fingerprint" autocapitalize="none"></div>
+            </div>
+            <div class="acts">
+              <button class="btn primary" id="save-patch" data-i18n="patch.save"></button>
+              <button class="btn sm" id="patch-clear" data-i18n="patch.clear"></button>
+            </div>
+            <p class="hint" data-i18n="patch.save.hint"></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+</main>
+
+<nav class="tabs hidden" id="tabs" data-i18n-label="nav.main">
+  <span class="tab-pill" id="tabPill" aria-hidden="true"></span>
+  <button class="tab on" type="button" data-tab="0" aria-controls="page-overview" aria-current="page">
+    <svg class="icon" aria-hidden="true"><use href="#icon-overview"/></svg><span data-i18n="nav.overview"></span>
+  </button>
+  <button class="tab" type="button" data-tab="1" aria-controls="page-apps">
+    <svg class="icon" aria-hidden="true"><use href="#icon-apps"/></svg><span data-i18n="nav.apps"></span>
+  </button>
+  <button class="tab" type="button" data-tab="2" aria-controls="page-settings">
+    <svg class="icon" aria-hidden="true"><use href="#icon-settings"/></svg><span data-i18n="nav.settings"></span>
+  </button>
+</nav>
 
 <!-- 关于（悬浮窗，可关闭） -->
-<div class="modal hidden" id="about-modal">
+<div class="modal hidden" id="about-modal" role="dialog" aria-modal="true" aria-labelledby="about-heading">
   <div class="sheet">
-    <div class="sheet-head"><b data-i18n="about.title"></b>
-      <button class="tb-btn" id="about-close" data-i18n="common.close"></button></div>
+    <div class="sheet-head"><b id="about-heading" data-i18n="about.title"></b>
+      <button class="quiet-btn" id="about-close" data-i18n="common.close"></button></div>
     <div class="sheet-body">
       <div class="kv"><span data-i18n="about.version"></span><span id="about-ver">-</span></div>
       <div class="kv"><span data-i18n="about.lang"></span>
@@ -383,10 +535,10 @@
 </div>
 
 <!-- 选文件（悬浮窗，可关闭） -->
-<div class="modal hidden" id="fp-modal">
+<div class="modal hidden" id="fp-modal" role="dialog" aria-modal="true" aria-labelledby="fp-title">
   <div class="sheet">
     <div class="sheet-head"><b id="fp-title" data-i18n="fp.title"></b>
-      <button class="tb-btn" id="fp-close" data-i18n="common.close"></button></div>
+      <button class="quiet-btn" id="fp-close" data-i18n="common.close"></button></div>
     <div class="sheet-body">
       <div class="fp-bar">
         <input type="text" id="fp-path" class="fp-input" autocapitalize="none" spellcheck="false">
@@ -404,7 +556,7 @@
   </div>
 </div>
 
-<div id="toast"></div>
+<div id="toast" role="status"></div>
 <!-- 应用行「接管方式」的共用浮层菜单 -->
 <div id="apick" class="apick hidden"><div id="apick-menu" class="apick-menu"></div></div>
 
@@ -493,6 +645,76 @@ var LANG = "zh-CN";
   });
 })();
 
+var SHELL_TEXT = {
+  "zh-CN": {
+    "nav.main": "主导航", "nav.overview": "概览", "nav.apps": "应用", "nav.settings": "设置",
+    "overview.description": "查看请求端最近的运行记录。", "overview.refresh": "刷新概览", "overview.refreshFail": "刷新失败：{msg}",
+    "overview.activity": "最近活动", "overview.signing": "SOTER 签名", "overview.signingHint": "记录设备最近一次成功的签名，也包含在本机运行的自检。",
+    "overview.signTime": "记录时间", "overview.operation": "操作", "overview.noRecord": "暂无记录",
+    "overview.material": "本机证明材料", "overview.local": "本地模式", "overview.remote": "中继模式",
+    "overview.relayOn": "中继已启用", "overview.relayOff": "中继未启用",
+    "overview.teeFile": "TEE 文件", "overview.sbFile": "StrongBox 文件", "overview.fileSet": "文件已存在", "overview.fileMissing": "未发现文件",
+    "overview.scope": "应用作用域", "overview.global": "全局", "overview.listOnly": "按名单", "overview.listed": "名单应用", "overview.manageKeys": "管理本地密钥",
+    "settings.connection": "运行配置"
+  },
+  "zh-TW": {
+    "nav.main": "主導覽", "nav.overview": "總覽", "nav.apps": "應用程式", "nav.settings": "設定",
+    "overview.description": "查看請求端最近的執行記錄。", "overview.refresh": "重新整理總覽", "overview.refreshFail": "重新整理失敗：{msg}",
+    "overview.activity": "最近活動", "overview.signing": "SOTER 簽章", "overview.signingHint": "記錄裝置最近一次成功的簽章，也包含在本機執行的自我檢查。",
+    "overview.signTime": "記錄時間", "overview.operation": "操作", "overview.noRecord": "尚無記錄",
+    "overview.material": "本機證明資料", "overview.local": "本機模式", "overview.remote": "中繼模式",
+    "overview.relayOn": "中繼已啟用", "overview.relayOff": "中繼未啟用",
+    "overview.teeFile": "TEE 檔案", "overview.sbFile": "StrongBox 檔案", "overview.fileSet": "檔案已存在", "overview.fileMissing": "未找到檔案",
+    "overview.scope": "應用程式範圍", "overview.global": "全域", "overview.listOnly": "依名單", "overview.listed": "名單內的應用程式", "overview.manageKeys": "管理本機金鑰",
+    "settings.connection": "執行設定"
+  },
+  "en": {
+    "nav.main": "Main navigation", "nav.overview": "Overview", "nav.apps": "Apps", "nav.settings": "Settings",
+    "overview.description": "See recent activity on the requesting device.", "overview.refresh": "Refresh overview", "overview.refreshFail": "Refresh failed: {msg}",
+    "overview.activity": "Recent activity", "overview.signing": "SOTER signing", "overview.signingHint": "The latest successful signature or local self-test recorded on this device.",
+    "overview.signTime": "Recorded at", "overview.operation": "Operation", "overview.noRecord": "No record yet",
+    "overview.material": "Local attestation material", "overview.local": "Local mode", "overview.remote": "Relay mode",
+    "overview.relayOn": "Relay enabled", "overview.relayOff": "Relay disabled",
+    "overview.teeFile": "TEE file", "overview.sbFile": "StrongBox file", "overview.fileSet": "File present", "overview.fileMissing": "File missing",
+    "overview.scope": "App scope", "overview.global": "Global", "overview.listOnly": "Listed apps only", "overview.listed": "Listed apps", "overview.manageKeys": "Manage local keys",
+    "settings.connection": "Runtime"
+  },
+  "ja": {
+    "nav.main": "メインナビゲーション", "nav.overview": "概要", "nav.apps": "アプリ", "nav.settings": "設定",
+    "overview.description": "リクエスト端末の最近の動作を確認できます。", "overview.refresh": "概要を更新", "overview.refreshFail": "更新に失敗しました：{msg}",
+    "overview.activity": "最近の動作", "overview.signing": "SOTER 署名", "overview.signingHint": "最後に成功した署名または端末のセルフテストの記録です。",
+    "overview.signTime": "記録日時", "overview.operation": "操作", "overview.noRecord": "記録なし",
+    "overview.material": "ローカル認証素材", "overview.local": "ローカルモード", "overview.remote": "中継モード",
+    "overview.relayOn": "中継有効", "overview.relayOff": "中継無効",
+    "overview.teeFile": "TEE ファイル", "overview.sbFile": "StrongBox ファイル", "overview.fileSet": "ファイルあり", "overview.fileMissing": "ファイルなし",
+    "overview.scope": "対象範囲", "overview.global": "すべて", "overview.listOnly": "リストのみ", "overview.listed": "リスト内のアプリ", "overview.manageKeys": "ローカルキーを管理",
+    "settings.connection": "動作設定"
+  },
+  "ko": {
+    "nav.main": "기본 탐색", "nav.overview": "개요", "nav.apps": "앱", "nav.settings": "설정",
+    "overview.description": "요청 기기의 최근 동작을 확인합니다.", "overview.refresh": "개요 새로고침", "overview.refreshFail": "새로고침 실패: {msg}",
+    "overview.activity": "최근 활동", "overview.signing": "SOTER 서명", "overview.signingHint": "가장 최근에 성공한 서명 또는 기기 자체 테스트 기록입니다.",
+    "overview.signTime": "기록 시간", "overview.operation": "작업", "overview.noRecord": "기록 없음",
+    "overview.material": "로컬 증명 자료", "overview.local": "로컬 모드", "overview.remote": "릴레이 모드",
+    "overview.relayOn": "릴레이 켜짐", "overview.relayOff": "릴레이 꺼짐",
+    "overview.teeFile": "TEE 파일", "overview.sbFile": "StrongBox 파일", "overview.fileSet": "파일 있음", "overview.fileMissing": "파일 없음",
+    "overview.scope": "앱 범위", "overview.global": "전역", "overview.listOnly": "목록만", "overview.listed": "목록의 앱", "overview.manageKeys": "로컬 키 관리",
+    "settings.connection": "동작 설정"
+  },
+  "ru": {
+    "nav.main": "Главная навигация", "nav.overview": "Обзор", "nav.apps": "Приложения", "nav.settings": "Настройки",
+    "overview.description": "Последние события на запрашивающем устройстве.", "overview.refresh": "Обновить обзор", "overview.refreshFail": "Не удалось обновить: {msg}",
+    "overview.activity": "Последние события", "overview.signing": "Подпись SOTER", "overview.signingHint": "Запись последней успешной подписи или локальной самопроверки.",
+    "overview.signTime": "Время записи", "overview.operation": "Операция", "overview.noRecord": "Записей пока нет",
+    "overview.material": "Локальные материалы аттестации", "overview.local": "Локальный режим", "overview.remote": "Режим ретрансляции",
+    "overview.relayOn": "Ретрансляция включена", "overview.relayOff": "Ретрансляция отключена",
+    "overview.teeFile": "Файл TEE", "overview.sbFile": "Файл StrongBox", "overview.fileSet": "Файл есть", "overview.fileMissing": "Файл отсутствует",
+    "overview.scope": "Область действия", "overview.global": "Глобально", "overview.listOnly": "Только по списку", "overview.listed": "Приложений в списке", "overview.manageKeys": "Локальные ключи",
+    "settings.connection": "Параметры работы"
+  }
+};
+Object.keys(SHELL_TEXT).forEach(function(code){ Object.assign(I18N[code], SHELL_TEXT[code]); });
+
 function t(key, vars){
   var table = I18N[LANG] || I18N["zh-CN"];
   var s = (key in table) ? table[key] : (I18N["zh-CN"][key] || key);
@@ -512,6 +734,7 @@ function applyI18n(scope){
     var s = t(e.dataset.i18nPh);
     if (e.placeholder !== s) e.placeholder = s;
   });
+  root.querySelectorAll("[data-i18n-label]").forEach(function(e){ e.setAttribute("aria-label", t(e.dataset.i18nLabel)); });
   /* 只有图标、没有文字的控件（比如令牌的眼睛）靠 title / aria-label 说话。 */
   root.querySelectorAll("[data-i18n-title]").forEach(function(e){
     var s = t(e.dataset.i18nTitle);
@@ -948,18 +1171,24 @@ Object.keys(TEEKB_TEXT).forEach(function(code){
   I18N[code]["kb.path.hint"] = s.pathHint;
 });
 
-/* 看一眼那份 StrongBox keybox 在不在，顺手把 DeviceID 读出来。 */
-async function refreshStrongboxKeybox(){
-  var el = document.getElementById("sbkb-state");
-  if (!el) return;
-  var r = await exec("[ -f " + KEYBOX_SB + " ] && { echo SET; grep -o 'DeviceID=\"[^\"]*\"' " + KEYBOX_SB +
+/* 概览只显示磁盘上的文件状态；StrongBox 详情沿用 DeviceID。 */
+async function refreshKeyboxStatus(){
+  var r = await exec("[ -f " + KEYBOX + " ] && echo SET || echo UNSET; " +
+                     "[ -f " + KEYBOX_SB + " ] && { echo SET; grep -o 'DeviceID=\"[^\"]*\"' " + KEYBOX_SB +
                      " 2>/dev/null | head -1; } || echo UNSET");
-  var out = String(r.stdout || "");
-  if (out.indexOf("SET") < 0){ setT(el, "sbkb.unset"); return; }
-  var m = /DeviceID="([^"]+)"/.exec(out);
-  /* 用 setT 记下「键 + 变量」，切语言时 applyI18n 会按新语言重算；直接写 textContent 会停在旧语言。 */
-  if (m) setT(el, "sbkb.setId", { id: m[1] });
-  else setT(el, "sbkb.set");
+  var lines = r.stdout.trim().split(/\r?\n/);
+  [["overview-tee", lines[0]], ["overview-sb", lines[1]]].forEach(function(pair){
+    var key = pair[1] === "SET" ? "overview.fileSet" : pair[1] === "UNSET" ? "overview.fileMissing" : "status.unknown";
+    setT(document.getElementById(pair[0]), key);
+  });
+  var detail = document.getElementById("sbkb-state");
+  if (lines[1] !== "SET"){
+    setT(detail, lines[1] === "UNSET" ? "overview.fileMissing" : "status.unknown");
+    return;
+  }
+  var m = /DeviceID="([^"]+)"/.exec(lines[2] || "");
+  if (m) setT(detail, "sbkb.setId", {id: m[1]});
+  else setT(detail, "sbkb.set");
 }
 
 /* 最近一次 /api/status/ 的响应：设备信息那块用它显示配对的 B 端与版本。 */
@@ -1132,200 +1361,153 @@ function mergeKV(original, vals, managed, dropEmpty){
 }
 function quoteShell(v){ return v === "" ? '""' : '"' + String(v).replace(/(["\\$`])/g, "\\$1") + '"'; }
 
-/* ---------------------------- 分页（横向滑动） ---------------------------- */
-/* 不用 CSS 的 scroll-snap：在安卓 WebView 上轻扫一下会被惯性带着连跳好几页，
-   用户反馈「滑动一点能飘三里地」。改成下标 + 绝对定位的手写分页：拖动时当前页和
-   相邻页跟着手指走，松手后一页一页吸附。 */
-var activeTab = 0;
-function pageEls(){ return document.querySelectorAll(".page"); }
-function pageCount(){ return pageEls().length || 4; }
+/* 底栏点击和手势共用一条横向轨道，三页保留各自的滚动位置。 */
+var pageTrack = document.getElementById("page-track");
+var tabPill = document.getElementById("tabPill");
+var tabButtons = document.querySelectorAll(".tab");
+var activeTab = 0, pagePosition = 0, pageVelocity = 0, pageAnimation = 0;
+var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
-/* dx：拖动位移（px）；dragMode：拖动中（相邻页也要露出来）。
-   每帧只动当前页和左右各一页，其余页的 transform/opacity/pointer-events 不动 ——
-   以前一帧要给 4 个页面各写 4 个样式，还顺带在 pillFollow 里读 4 次 offset*，
-   等于每帧强制一次同步布局，滑到应用列表那页就明显掉帧。 */
-function layoutPages(dx, dragMode){
-  var ps = pageEls();
-  if (!ps.length) return;
-  for (var k = 0; k < ps.length; k++){
-    var rel = k - activeTab;
-    var show = dragMode ? Math.abs(rel) <= 1 : rel === 0;
-    var node = ps[k];
-    if (node._show !== show){
-      node._show = show;
-      node.classList.toggle("on", show);
-      node.style.opacity = show ? "1" : "0";
-    }
-    var pe = (rel === 0) ? "auto" : "none";
-    if (node._pe !== pe){ node._pe = pe; node.style.pointerEvents = pe; }
-    if (Math.abs(rel) > 1) continue;            /* 看不见的邻居不用每帧摆 */
-    var tf = dx ? "translateX(calc(" + (rel * 100) + "% + " + dx + "px))"
-                : "translateX(" + (rel * 100) + "%)";
-    if (node._tf !== tf){ node._tf = tf; node.style.transform = tf; }
-  }
+/* QQ 音乐项目 TabMotion.PageSpring 的刚度、阻尼比和物理像素收敛阈值。 */
+var PAGE_STIFFNESS = 322.2;
+var PAGE_DAMPING_RATIO = 0.9000035;
+var PAGE_VISIBILITY_PX = 0.5;
+var PAGE_DECAY = Math.sqrt(PAGE_STIFFNESS) * PAGE_DAMPING_RATIO;
+var PAGE_FREQUENCY = Math.sqrt(PAGE_STIFFNESS - PAGE_DECAY * PAGE_DECAY);
+
+function paintPage(position){
+  pagePosition = position;
+  pageTrack.style.transform = "translate3d(" + (-position * 100) + "%,0,0)";
+  var marker = Math.max(0, Math.min(tabButtons.length - 1, position));
+  tabPill.style.setProperty("--tab-position", marker);
 }
 
-function applyPage(i, animate){
-  var ps = pageEls();
-  if (!ps.length) return;
-  closePick();                       /* 换页时把浮层菜单收起来，别让它飘在别的页上面 */
-  var next = Math.max(0, Math.min(ps.length - 1, i));
-  var prevTab = activeTab;
-  var host = document.getElementById("pages");
-  /* 动画开始前还露着的页（拖动中的邻居页、上一页）先记下来，等动画走完再收。 */
-  var keep = [];
-  if (animate){
-    for (var k = 0; k < ps.length; k++){
-      if (k !== next && ps[k].classList.contains("on")) keep.push(ps[k]);
-    }
-  }
-  if (host) host.classList.toggle("dragging", !animate);
+function stopPageMotion(){
+  if (pageAnimation) cancelAnimationFrame(pageAnimation);
+  pageAnimation = 0;
+  pageVelocity = 0;
+}
+
+function selectPage(index, animate, speed){
+  var last = pageTrack.childElementCount - 1;
+  var next = Math.max(0, Math.min(last, index));
+  if (animate && next === activeTab && speed === undefined) return;
+
+  closePick();
   setActiveTab(next);
-  activeTab = next;
-  /* 把参与动画的页面留在合成层里，过渡结束（320ms）再撤；过渡本身恢复成 CSS 的 .22s。 */
-  var fxEnd = 0;
-  for (var f = 0; f < ps.length; f++){
-    ps[f].style.transition = "";
-    if (f === next || keep.indexOf(ps[f]) >= 0){
-      ps[f].style.willChange = "transform";
-      fxEnd = 1;
-    } else {
-      ps[f].style.willChange = "";
-      ps[f].style.zIndex = "";
+  Array.from(pageTrack.children).forEach(function(page, i){ page.toggleAttribute("inert", i !== next); });
+  if (next === 1) paintAppsWindow(false);
+
+  /* 连点时保留当前帧的位置和速度，旧动画的剩余帧由新目标接管。 */
+  var velocity = speed === undefined ? pageVelocity : speed;
+  stopPageMotion();
+  if (!animate || reducedMotion.matches){
+    paintPage(next);
+    return;
+  }
+
+  var from = pagePosition;
+  var delta = from - next;
+  var sineWeight = (velocity + PAGE_DECAY * delta) / PAGE_FREQUENCY;
+  var pageWidthPx = pageTrack.clientWidth * (window.devicePixelRatio || 1);
+  var amplitudePx = Math.hypot(delta, sineWeight) * pageWidthPx;
+  if (amplitudePx <= PAGE_VISIBILITY_PX){
+    paintPage(next);
+    return;
+  }
+
+  /* 用弹簧位移的包络决定停止时间，跨两页自然会多滑一小段时间。 */
+  var duration = Math.log(amplitudePx / PAGE_VISIBILITY_PX) / PAGE_DECAY;
+  var min = Math.min(0, from), max = Math.max(last, from);
+  var started = performance.now();
+  pageVelocity = velocity;
+  function step(now){
+    var elapsed = Math.max(0, (now - started) / 1000);
+    if (elapsed >= duration){
+      stopPageMotion();
+      paintPage(next);
+      return;
     }
+    var decay = Math.exp(-PAGE_DECAY * elapsed);
+    var cos = Math.cos(PAGE_FREQUENCY * elapsed);
+    var sin = Math.sin(PAGE_FREQUENCY * elapsed);
+    var wave = delta * cos + sineWeight * sin;
+    var position = next + decay * wave;
+    var clipped = Math.max(min, Math.min(max, position));
+    pageVelocity = position === clipped
+      ? decay * (PAGE_FREQUENCY * (sineWeight * cos - delta * sin) - PAGE_DECAY * wave)
+      : 0;
+    paintPage(clipped);
+    pageAnimation = requestAnimationFrame(step);
   }
-  clearTimeout(applyPage._t);
-  if (fxEnd){
-    applyPage._t = setTimeout(function(){
-      if (host && host.classList.contains("dragging")) return;
-      pageEls().forEach(function(node){ node.style.willChange = ""; });
-    }, 320);
-  }
-  layoutPages(0, false);
-  /* 相邻页是并肩平移的、互相不会盖住，正常滑动没必要改 z-index（改层叠顺序会惊动合成器）。
-     只有跨页跳转（比如点第 4 个标签）才需要把新页压在上面。 */
-  var far = Math.abs(next - prevTab) > 1;
-  if (far && ps[next]) ps[next].style.zIndex = "2";
-  /* 页面是整屏平移的，旧页要是一直留到滑出屏幕外再隐藏，否则它一消失就露出底色闪一下。
-     （opacity 过渡去掉了，这里用定时器代替：动画走完再把非当前页统一收起来。） */
-  if (animate && keep.length){
-    keep.forEach(function(node){
-      node.classList.add("on");
-      node.style.opacity = "1";
-      if (far) node.style.zIndex = "1";
-      node._show = true;
-    });
-    clearTimeout(applyPage._o);
-    applyPage._o = setTimeout(function(){
-      if (host && host.classList.contains("dragging")) return;   /* 又开始拖了，交给拖动流程 */
-      pageEls().forEach(function(node, idx){
-        if (idx === activeTab || !node.classList.contains("on")) return;
-        node.classList.remove("on");
-        node.style.opacity = "0";
-        node.style.zIndex = "";
-        node._show = false;
-      });
-    }, 240);
-  }
-  pillTo(next, animate);
-}
-/* 外部跳转（比如保存后回到某页）用这个 */
-function gotoPage(i){ applyPage(i, true); }
-/* 顶部那块高亮做成一根单独的元素，切页 / 拖动时跟着位移，而不是直接跳过去。
-   标签的几何值只在布局真的变了（切语言、转屏、字体大小）时量一次，拖动中直接用缓存：
-   以前每帧都读 offsetLeft/offsetWidth/offsetTop/offsetHeight，这几下读会强制同步布局。 */
-var TAB_RECTS = null;
-function measureTabs(){
-  var tb = document.querySelectorAll(".tab");
-  TAB_RECTS = [];
-  for (var i = 0; i < tb.length; i++){
-    TAB_RECTS.push({x: tb[i].offsetLeft, w: tb[i].offsetWidth, y: tb[i].offsetTop, h: tb[i].offsetHeight});
-  }
-  return TAB_RECTS;
-}
-function tabRect(i){
-  var r = TAB_RECTS || measureTabs();
-  return r[i] || null;
-}
-function movePill(x, w, y, h, animate){
-  var p = document.getElementById("tabPill");
-  if (!p) return;
-  var tabs = document.getElementById("tabs");
-  if (tabs) tabs.classList.toggle("dragging", !animate);
-  if (w && p._w !== w){ p._w = w; p.style.width = w + "px"; }
-  if (h && p._h !== h){ p._h = h; p.style.height = h + "px"; }
-  if ((y || y === 0) && p._y !== y){ p._y = y; p.style.top = y + "px"; }
-  if (p._x !== x){ p._x = x; p.style.transform = "translate3d(" + x + "px,0,0)"; }
-}
-function pillTo(i, animate){
-  var r = tabRect(i);
-  if (r) movePill(r.x, r.w, r.y, r.h, animate);
-}
-/* frac：拖动位移占一页的比例，-1..1；高亮块按这个比例插到相邻那个标签上。
-   注意方向是反的：手指左滑（frac<0）页面往左走，翻到的是右边那个标签。 */
-function pillFollow(frac){
-  var a = tabRect(activeTab);
-  if (!a) return;
-  var t = Math.max(-1, Math.min(1, -frac));
-  var b = tabRect(activeTab + (t > 0 ? 1 : -1));
-  if (!b){ movePill(a.x, a.w, a.y, a.h, false); return; }
-  var k = Math.abs(t);
-  movePill(a.x + (b.x - a.x) * k, a.w + (b.w - a.w) * k, a.y, a.h, false);
+  pageAnimation = requestAnimationFrame(step);
 }
 
-/* 切语言（或系统字体大小变化）之后，标签文字的行数、宽度都会变，页面内容也会重排。
-   高亮块是按测量值摆的、页面是 transform 定位的，WebView 又不一定马上重绘那块合成层，
-   于是会出现「上面的高亮/位置和文字对不上，手动滑一下才恢复」。
-   这里在下一帧把当前页重新摆一遍，等于替用户滑了那一下。 */
+/* 轨道和高亮按容器宽度定位，尺寸变化时只需重算应用列表的可见窗口。 */
 function relayoutActivePage(){
-  var ps = pageEls();
-  if (!ps.length) return;
-  var host = document.getElementById("pages");
-  if (host && host.classList.contains("dragging")) return;   /* 正在拖动就别插手 */
-  TAB_RECTS = null;                                          /* 尺寸可能变了，下次重新量 */
-  layoutPages(0, false);
-  pillTo(activeTab, true);
+  if (activeTab === 1) paintAppsWindow(false);
 }
 function relayoutSoon(){
-  var host = document.getElementById("pages");
-  if (host && host.classList.contains("dragging")) return;   /* 正在拖动就别插手 */
-  relayoutActivePage();
-  /* 再故意偏 1px 摆一次、下一帧摆回来：让 WebView 重新合成这一层。
-     切语言后文字重排，合成层有时还留着旧位图，表现就是「内容整体偏了一点，滑一下才回来」。 */
-  layoutPages(1, false);
-  requestAnimationFrame(function(){
-    if (host && host.classList.contains("dragging")) return;
-    layoutPages(0, false);
-    pillTo(activeTab, true);
-  });
-  /* 慢设备上文字重排会晚一点（字体/换行），再补一次。 */
-  setTimeout(relayoutActivePage, 220);
+  requestAnimationFrame(relayoutActivePage);
+}
+
+/* WebUI 宿主可能只缩小可视区域，也可能直接调整 WebView 高度。 */
+function wireKeyboardLayout(){
+  var view = window.visualViewport;
+  var width = window.innerWidth;
+  var fullHeight = window.innerHeight;
+  var frame = 0;
+  function update(){
+    frame = 0;
+    var height = view && view.scale === 1 ? view.height : window.innerHeight;
+    var field = document.activeElement;
+    var editing = field && field.matches('input[type="text"],input[type="search"],textarea');
+    if (!editing || width !== window.innerWidth || height > fullHeight){
+      width = window.innerWidth;
+      fullHeight = height;
+    }
+    var open = editing && fullHeight - height > 100;
+    document.body.classList.toggle("keyboard-open", open);
+    if (open) document.body.style.setProperty("--editing-height", height + "px");
+    else document.body.style.removeProperty("--editing-height");
+  }
+  function schedule(){ if (!frame) frame = requestAnimationFrame(update); }
+  window.addEventListener("resize", schedule);
+  if (view) view.addEventListener("resize", schedule);
+  document.addEventListener("focusin", schedule);
+  document.addEventListener("focusout", schedule);
 }
 
 function wireTabs(){
   var pages = document.getElementById("pages");
-  if (!pages) return;
-  /* 这里用 animate=true：只借用一次「摆到当前页」的流程，别把 dragging 类留在页面上
-     （那个类现在还会给 .page.on 提升合成层，留着等于一直多一层）。 */
-  applyPage(activeTab, true);
-  pillTo(activeTab, false);
-  requestAnimationFrame(function(){ pillTo(activeTab, false); });
-
-  /* 标签栏尺寸一变（切语言换行、系统字体大小、横竖屏），高亮块就重新量一次；
-     顺便把当前页的定位也重摆，省得停在半路。 */
-  var tabsEl = document.getElementById("tabs");
-  if (tabsEl && typeof ResizeObserver === "function"){
-    try { new ResizeObserver(function(){ relayoutActivePage(); }).observe(tabsEl); } catch (e){}
-  }
+  selectPage(activeTab, false);
   window.addEventListener("resize", relayoutActivePage);
-  window.addEventListener("orientationchange", function(){ setTimeout(relayoutActivePage, 250); });
 
-  document.querySelectorAll(".tab").forEach(function(tb){
-    tb.onclick = function(){ applyPage(parseInt(tb.dataset.tab, 10) || 0, true); };
+  tabButtons.forEach(function(tb){
+    tb.onclick = function(){
+      var speed = horizontal ? 0 : undefined;
+      resetDrag();
+      selectPage(Number(tb.dataset.tab), true, speed);
+    };
+  });
+  document.querySelectorAll("[data-open-settings]").forEach(function(btn){
+    btn.onclick = function(){
+      var pane = document.getElementById("settings-" + btn.dataset.openSettings);
+      document.querySelectorAll("[data-settings-pane]").forEach(function(node){ node.hidden = node !== pane; });
+      document.querySelectorAll(".settings-tabs button").forEach(function(tab){
+        tab.setAttribute("aria-pressed", String(tab.dataset.openSettings === btn.dataset.openSettings));
+      });
+      document.getElementById("page-settings").scrollTop = 0;
+      if (activeTab !== 2){
+        resetDrag();
+        selectPage(2, true);
+        document.querySelector('.settings-tabs button[aria-pressed="true"]').focus({preventScroll:true});
+      }
+    };
   });
 
   /* 作用域页滚动时换窗口，合并到每帧一次；行数一多也不会整页重排。 */
-  var scopePage = pageEls()[1];
+  var scopePage = document.getElementById("apps-scroll");
   if (scopePage && !scopePage._appScrollWired){
     scopePage._appScrollWired = 1;
     scopePage.addEventListener("scroll", function(){
@@ -1334,124 +1516,100 @@ function wireTabs(){
     }, {passive: true});
   }
 
-  /* 手势：拖动时跟手，松手时两种情形都翻页——
-     慢慢拖要拖过一页的 1/5（至少 48px）；轻轻一甩只要 24px 往上、而且松手那一刻够快就算，
-     不用非拖到一半。纵向优先时不拦触摸，页面内上下滚动照常。 */
-  var x0 = null, y0 = null, dx = 0, raw = 0, axis = 0;   /* axis: 0 未定 / 1 横向 / 2 纵向 */
-  var samples = [];                                      /* 最近几百毫秒的位移采样，用来算松手速度 */
-  /* 兜底：touchend 被系统手势吞掉时（快速滑动常见），endDrag 不执行，
-     layoutPages 留下的 translateX 就一直挂着 —— 表现就是「高亮在作用域，内容却
-     整体偏左、只露出卡片右边」。这里定个时，700ms 没新位移就复位。 */
+  /* 保留原来的单页手势阈值，横向拖动接管弹簧当前的位置。 */
+  var x0 = null, y0 = null, dx = 0, horizontal = false;
+  var samples = [];
   var idleTimer = null;
-  /* touchmove 在 120Hz 屏上可能一帧来两次；这里把「摆位置 + 追高亮」合并成每帧一次，
-     手指移动再快也只写一遍样式。 */
-  var frame = 0;
-  var pageW = 1;                 /* 拖动开始时量一次，move 里不再读 clientWidth */
-  var lastPage = 0;              /* 同理，页数也缓存，避免每个 touchmove 都 querySelectorAll */
+  var frame = 0, lastMove = 0;
+  var pageW = 1, dragFrom = 0;
+  var lastPage = pageTrack.childElementCount - 1;
   function paintDrag(){
     frame = 0;
-    layoutPages(dx, true);
-    pillFollow(dx / pageW);
+    var position = dragFrom - dx / pageW;
+    if (position < 0) position /= 3;
+    if (position > lastPage) position = lastPage + (position - lastPage) / 3;
+    paintPage(position);
   }
-  function queueDrag(){ if (!frame) frame = requestAnimationFrame(paintDrag); }
-  function stopFrame(){ if (frame){ cancelAnimationFrame(frame); frame = 0; } }
-  /* 兜底用的 700ms 空闲检测：以前每个 touchmove 都 clearTimeout+setTimeout 一次，
-     120Hz 屏上等于每秒建上百个定时器；现在只在拖开始时挂一个，检查时再按需续。 */
-  var lastMove = 0;
-  function armIdle(){
-    lastMove = Date.now();
-    if (!idleTimer) idleTimer = setTimeout(idleCheck, 700);
-  }
+  /* 系统手势吞掉 touchend 时，空闲后把轨道吸附回选中页。 */
   function idleCheck(){
     idleTimer = null;
-    if (x0 === null) return;
     var wait = 700 - (Date.now() - lastMove);
     if (wait > 0){ idleTimer = setTimeout(idleCheck, wait); return; }
     settleDrag();
   }
+  function resetDrag(){
+    clearTimeout(idleTimer);
+    if (frame) cancelAnimationFrame(frame);
+    idleTimer = null;
+    frame = 0;
+    x0 = null;
+    horizontal = false;
+    samples = [];
+  }
   function settleDrag(){
-    if (idleTimer){ clearTimeout(idleTimer); idleTimer = null; }
-    stopFrame();
-    x0 = null; dx = 0; raw = 0; axis = 0; samples = [];
-    pages.classList.remove("dragging");
-    applyPage(activeTab, true);
+    var moved = horizontal;
+    resetDrag();
+    if (moved) selectPage(activeTab, true, 0);
   }
   pages.addEventListener("touchstart", function(e){
-    if (e.touches.length !== 1) return;
-    if (idleTimer){ clearTimeout(idleTimer); idleTimer = null; }
-    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; dx = 0; raw = 0; axis = 0;
+    if (e.touches.length !== 1 || e.target.closest("input,textarea,select")) return;
+    settleDrag();
+    x0 = e.touches[0].clientX;
+    y0 = e.touches[0].clientY;
     pageW = pages.clientWidth || 1;
-    lastPage = pageCount() - 1;
     samples = [{t: Date.now(), x: 0}];
   }, {passive: true});
   pages.addEventListener("touchmove", function(e){
     if (x0 === null || e.touches.length !== 1) return;
     var nx = e.touches[0].clientX - x0;
     var ny = e.touches[0].clientY - y0;
-    if (!axis){
+    if (!horizontal){
       if (Math.abs(nx) < 8 && Math.abs(ny) < 8) return;
-      axis = Math.abs(nx) > Math.abs(ny) ? 1 : 2;
-      if (axis === 2){ x0 = null; return; }
-      /* 确定是横向滑动才关过渡、提合成层；纵向滚页面时完全不动这些。
-         只用内联样式动这几页，不给祖先加 class —— 后代选择器会让四个页面的子树全部重算样式。 */
-      pages.classList.add("dragging");
-      var fxs = pageEls();
-      for (var fi = 0; fi < fxs.length; fi++){
-        if (Math.abs(fi - activeTab) <= 1){
-          fxs[fi].style.transition = "none";
-          fxs[fi].style.willChange = "transform";
-        }
-      }
+      if (Math.abs(nx) <= Math.abs(ny)){ resetDrag(); return; }
+      horizontal = true;
+      dragFrom = pagePosition;
+      stopPageMotion();
     }
-    raw = nx;
-    var now = Date.now();
-    samples.push({t: now, x: raw});
-    while (samples.length > 2 && now - samples[0].t > 220) samples.shift();
     dx = nx;
-    /* 到头的方向阻尼一下，避免拉出去一屏空白 */
-    if ((activeTab === 0 && dx > 0) || (activeTab === lastPage && dx < 0)) dx = dx / 3;
-    queueDrag();
-    armIdle();
+    lastMove = Date.now();
+    samples.push({t: lastMove, x: dx});
+    while (samples.length > 2 && lastMove - samples[0].t > 220) samples.shift();
+    if (!frame) frame = requestAnimationFrame(paintDrag);
+    if (!idleTimer) idleTimer = setTimeout(idleCheck, 700);
     if (e.cancelable) e.preventDefault();
   }, {passive: false});
   function endDrag(e){
-    if (idleTimer){ clearTimeout(idleTimer); idleTimer = null; }
-    if (x0 === null) return;
-    /* 松手那一瞬的位置也算进来，不然最后一下的位移和速度会漏掉 */
-    if (e && e.changedTouches && e.changedTouches.length){
-      raw = e.changedTouches[0].clientX - x0;
-      samples.push({t: Date.now(), x: raw});
-    }
-    var w = pages.clientWidth || 1;
+    if (!horizontal){ resetDrag(); return; }
+    if (e.changedTouches.length) dx = e.changedTouches[0].clientX - x0;
     var now = Date.now();
     /* 取 90ms 往前的那个采样点算平均速度（px/ms，正数=往右滑），太近的点抖动大 */
-    var ref = samples.length ? samples[0] : {t: now, x: raw};
+    var ref = samples[0];
     for (var i = samples.length - 1; i >= 0; i--){
       if (now - samples[i].t >= 90){ ref = samples[i]; break; }
     }
     var dt = Math.max(16, now - ref.t);
-    var v = (raw - ref.x) / dt;
-    var th = Math.max(40, w / 6);       /* 慢拖的阈值 */
-    var flick = Math.max(20, w / 16);   /* 快甩的最小位移 */
-    var next = activeTab;
-    if (dx <= -th || (v <= -0.18 && raw <= -flick)) next = activeTab + 1;
-    else if (dx >= th || (v >= 0.18 && raw >= flick)) next = activeTab - 1;
-    /* 把还没画出去的那一帧补上，翻页动画才能从手指松开时的真实位置接着走。 */
-    if (frame){ cancelAnimationFrame(frame); frame = 0; layoutPages(dx, true); }
-    pages.classList.remove("dragging");
-    x0 = null; dx = 0; raw = 0; axis = 0; samples = [];
-    applyPage(next, true);
+    var v = (dx - ref.x) / dt;
+    var th = Math.max(40, pageW / 6);
+    var flick = Math.max(20, pageW / 16);
+    var next = Math.round(dragFrom);
+    if (dx <= -th || (v <= -0.18 && dx <= -flick)) next += 1;
+    else if (dx >= th || (v >= 0.18 && dx >= flick)) next -= 1;
+    var speed = Math.max(-6, Math.min(6, -v * 1000 / pageW));
+    resetDrag();
+    paintDrag();
+    selectPage(next, true, speed);
   }
   pages.addEventListener("touchend", endDrag, {passive: true});
-  pages.addEventListener("touchcancel", endDrag, {passive: true});
+  pages.addEventListener("touchcancel", settleDrag, {passive: true});
 }
 function setActiveTab(i){
   if (i === activeTab) return;      // 同一个就别重写 class，免得闪
   activeTab = i;
-  /* 这里故意不清 TAB_RECTS：四个标签是 flex:1 等宽的，加粗只换字重，宽度/行高都不变。
-     以前每次都清掉，切页时 pillTo 又要重新量一遍 offset*，等于在动画第一帧强制一次同步布局。 */
-  document.querySelectorAll(".tab").forEach(function(tb, idx){
-    tb.className = "tab" + (idx === i ? " on" : "");
+  tabButtons.forEach(function(tb, idx){
+    var selected = idx === i;
+    tb.classList.toggle("on", selected);
+    if (selected) tb.setAttribute("aria-current", "page");
+    else tb.removeAttribute("aria-current");
   });
 }
 
@@ -1459,7 +1617,9 @@ function setActiveTab(i){
 function buildBoolRow(f, value, host){
   var row = el("div", "row");
   var name = el("div", "name");
-  name.appendChild(setT(el("b"), "f." + f.key));
+  var label = setT(el("b"), "f." + f.key);
+  label.id = "label-" + f.key;
+  name.appendChild(label);
   name.appendChild(setT(el("small"), "f." + f.key + ".hint"));
   /* 系统现在到底还报不报这个能力，直接问 PackageManager 一句，免得以为勾了就已经生效
      （声明要重启才换，管理器不给挂载时永远不会生效）。 */
@@ -1470,23 +1630,33 @@ function buildBoolRow(f, value, host){
   var sw = el("button", "sw");
   sw.type = "button";
   sw.dataset.key = f.key;
+  sw.setAttribute("role", "switch");
+  sw.setAttribute("aria-labelledby", label.id);
   sw.setAttribute("aria-checked", value ? "true" : "false");
-  sw.onclick = function(){ sw.setAttribute("aria-checked", sw.getAttribute("aria-checked") === "true" ? "false" : "true"); };
+  sw.onclick = function(){
+    sw.setAttribute("aria-checked", sw.getAttribute("aria-checked") === "true" ? "false" : "true");
+    aDirty = true;
+  };
   row.appendChild(sw);
   (host || document.getElementById("grp-remote")).appendChild(row);
 }
 function buildTextRow(f, value, host){
-  var row = el("div", "row");
-  if (f.key === "token" || f.key === "url") row.classList.add("stacked");
+  var row = el("div", "row stacked");
   var name = el("div", "name");
-  name.appendChild(setT(el("b"), "f." + f.key));
+  var label = setT(el("b"), "f." + f.key);
+  label.id = "label-" + f.key;
+  name.appendChild(label);
   name.appendChild(setT(el("small"), "f." + f.key + ".hint"));
   row.appendChild(name);
   var inp = document.createElement("input");
   inp.type = "text";
   inp.value = String(value);
   inp.autocapitalize = "none";
+  inp.autocomplete = "off";
+  inp.spellcheck = false;
+  if (f.key === "url") inp.inputMode = "url";
   inp.dataset.key = f.key;
+  inp.setAttribute("aria-labelledby", label.id);
   /* Android WebView 聚焦 input 时默认会把内容全选（不是我们加的代码）。
      这里把光标塔到末尾，点一下不再全选。 */
   if (f.key === "token" || f.key === "url"){
@@ -1717,6 +1887,7 @@ function renderRemote(conf){
     ids.addEventListener("change", applyIdentityVisibility);
   }
   applyIdentityVisibility();
+  paintOverviewConfig(conf);
 }
 function collectRemote(){
   var vals = {};
@@ -1763,25 +1934,25 @@ function paintAppHint(){
    改成 eager：建行时就加载，滑进来时位图已经在缓存里。 */
 function appRowEl(a){
   var row = el("div", "app" + (a.checked ? " on" : " off"));
-  var img = document.createElement("img");
+  var img = el(a.icon ? "img" : "span", "app-icon");
   if (a.icon){
     img.src = a.icon;
     img.loading = "eager";
+    img.decoding = "async";
+    img.alt = "";
   }
-  img.decoding = "async";
-  img.alt = "";
   row.appendChild(img);
   var meta = el("div", "meta");
   meta.appendChild(el("b", null, a.label || a.pkg));
   /* 「系统」两个字也交给 setT：切语言时 applyI18n 直接换，不用为它重建整行。 */
-  var sub = el("small");
-  if (a.system){
-    sub.appendChild(document.createTextNode(a.pkg + " · "));
-    sub.appendChild(setT(el("span"), "apps.sysTag"));
-  } else {
-    sub.textContent = a.pkg;
+  if (a.label || a.system){
+    var sub = el("small", null, a.pkg);
+    if (a.system){
+      sub.appendChild(document.createTextNode(" · "));
+      sub.appendChild(setT(el("span"), "apps.sysTag"));
+    }
+    meta.appendChild(sub);
   }
-  meta.appendChild(sub);
   row.appendChild(meta);
   var pick = document.createElement("button");
   pick.type = "button";
@@ -1888,7 +2059,7 @@ window.addEventListener("resize", function(){
 });
 /* 按滚动位置算「该渲染哪一段」。visStart/visEnd 是视口里的行，start/end 多带一圈缓冲。 */
 function appWindowRange(){
-  var page = pageEls()[1];
+  var page = document.getElementById("apps-scroll");
   var box = document.getElementById("applist");
   var total = appShown.length;
   var r = {start: 0, end: total, visStart: 0, visEnd: total};
@@ -1963,9 +2134,22 @@ function updateCount(){
   if (e) setT(e, n ? "apps.selected" : "apps.none", n ? {n: n} : null);
 }
 async function refreshCount(){
+  var count = document.getElementById("app-count");
+  var overview = document.getElementById("overview-count");
   var r = await exec("cat " + TARGET + " 2>/dev/null");
-  var n = (r.stdout || "").split("\n").filter(function(l){ return l.trim(); }).length;
-  setT(document.getElementById("app-count"), n ? "apps.n" : "apps.none", n ? {n: n} : null);
+  var lines = r.stdout.split("\n");
+  if (Number(r.errno) !== 0){
+    if (await targetExists()){
+      count.textContent = overview.textContent = "—";
+      return;
+    }
+    lines = await defaultScopePackages();
+  }
+  var listed = new Set(lines.map(function(line){
+    var value = line.trim();
+    return /^[#\[]/.test(value) ? "" : value.replace(/[!?]+$/, "").trim();
+  }).filter(Boolean));
+  count.textContent = overview.textContent = String(listed.size);
 }
 var __pkgCache = null, __pkgAt = 0;
 function loadPackages(){
@@ -2065,7 +2249,7 @@ async function loadApps(){
 }
 
 /* --------------------------------- 状态 --------------------------------- */
-/* 状态条：pidof 三件套（很快）+ SOTER。
+/* 运行状态：三个进程加 SOTER。
    SOTER 先看**本机记录**（/data/misc/keystore/ommega/soter_ok）：只要本机出过任何一笔成功的
    签名（远程真机 TEE / 本地自签 / 服务器自签都算），那里就有一行 —— 这是加载立刻
    就有结论的那一条，不用等新调用。本机没记录才退回看跟随设备上报的能力。 */
@@ -2085,16 +2269,45 @@ async function readSoterRecord(){
   if (!isFinite(epoch) || epoch <= 0) return;
   soterRecord = { epoch: epoch, op: p[1] || "", uid: p[2] || "", alias: p[3] || "" };
 }
+function paintOverviewConfig(conf){
+  var relayEnabled = truthy(conf.remote);
+  var globalScope = !("global_scope" in conf) || truthy(conf.global_scope);
+  var badge = document.getElementById("overview-relay");
+  setT(badge, relayEnabled ? "overview.relayOn" : "overview.relayOff");
+  badge.classList.toggle("enabled", relayEnabled);
+  setT(document.getElementById("overview-mode"), relayEnabled ? "overview.remote" : "overview.local");
+  setT(document.getElementById("overview-scope"), globalScope ? "overview.global" : "overview.listOnly");
+}
+
 function paintSoterRecord(){
-  var e = document.getElementById("soter-record");
-  if (!e) return;
-  if (!soterRecord){ setT(e, "soter.record.none"); return; }
+  var detail = document.getElementById("soter-record");
+  var age = document.getElementById("overview-age");
+  var time = document.getElementById("overview-sign-time");
+  var op = document.getElementById("overview-sign-op");
+  if (!soterRecord){
+    setT(detail, "soter.record.none");
+    age.textContent = t("overview.noRecord");
+    time.textContent = op.textContent = "—";
+    time.removeAttribute("datetime");
+    return;
+  }
   var d = new Date(soterRecord.epoch * 1000);
   function pad(n){ return (n < 10 ? "0" : "") + n; }
   var when = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
              " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
   /* 变量里放原样 op（selftest），显示文本由 paintT 按当前语言翻，切语言才跟得上。 */
-  setT(e, "soter.record.last", {time: when, op: soterRecord.op});
+  setT(detail, "soter.record.last", {time: when, op: soterRecord.op});
+  var minutes = Math.round((d.getTime() - Date.now()) / 60000);
+  var unit = Math.abs(minutes) >= 1440 ? "day" : Math.abs(minutes) >= 60 ? "hour" : "minute";
+  var divisor = {day: 1440, hour: 60, minute: 1}[unit];
+  var value = Math.sign(minutes) * Math.floor(Math.abs(minutes) / divisor);
+  var relative = new Intl.RelativeTimeFormat(LANG, {numeric: "auto"});
+  age.textContent = relative.format(value, value === 0 ? "second" : unit);
+  time.dateTime = d.toISOString();
+  time.textContent = d.toLocaleString(LANG, {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false
+  });
+  op.textContent = soterRecord.op === "selftest" ? t("soter.record.selftest") : soterRecord.op || "—";
 }
 
 async function refreshStatus(){
@@ -2145,6 +2358,10 @@ async function refreshSoter(){
     else { soterState = "unknown"; }
   } catch (e){ soterState = "unknown"; }
   paintSoter();
+}
+
+function refreshOverview(){
+  return Promise.all([refreshStatus(), refreshSoter(), refreshCount(), refreshKeyboxStatus()]);
 }
 /* 面板要 GET 一小段文本（状态接口、同步 B 端等）。设备上不一定有 curl：有的 ROM
    只带 toybox，没有 curl applet（NX809J 实测），而 KernelSU / Magisk / APatch 都自带
@@ -2198,6 +2415,7 @@ async function writeKeybox(xml, src){
   var r = await writeFile(KEYBOX, xml, "0644");
   if (r.errno !== 0){ toast(t("toast.saveFail", {msg: r.stderr || r.errno}), true); return; }
   toast(src ? t("toast.kbFetched", {src: src}) : t("toast.kbWritten"));
+  refreshKeyboxStatus().catch(function(){});
 }
 /* 拿到的东西可能不是裸 XML：服务器那个公开库、yurikey 都是 base64 的（Rust 侧
    autokeybox.rs 一直认 base64/hex，面板这边早先没认，于是那两路永远判无效）。 */
@@ -2308,8 +2526,10 @@ async function fpPick(path){
     }
   }
   fpClose();
-  if (fpTarget === "keybox"){ toast(t("toast.kbFile")); }
-  else if (fpTarget === "sbkeybox"){ toast(t("sbkb.written")); refreshStrongboxKeybox(); }
+  if (fpTarget === "keybox" || fpTarget === "sbkeybox"){
+    toast(t(fpTarget === "keybox" ? "toast.kbFile" : "sbkb.written"));
+    refreshKeyboxStatus().catch(function(){});
+  }
   else { toast(t("toast.skWritten")); refreshAttk(); }
 }
 
@@ -2339,6 +2559,7 @@ async function saveRemote(){
   if (r.errno !== 0){ toast(t("toast.saveFail", {msg: r.stderr || r.errno}), true); return; }
   curConfText = text;
   aDirty = false;
+  paintOverviewConfig(vals);
   var masked = await syncCapabilityMask(truthy(vals.hide_strongbox), truthy(vals.hide_device_ids));
   if (!masked){ toast(t("toast.maskFail", {msg: "capability-mask.xml"}), true); return; }
   var note = (truthy(vals.hide_strongbox) || truthy(vals.hide_device_ids)) ? " " + t("toast.maskReboot") : "";
@@ -2704,6 +2925,7 @@ function langPassNow(){
   langPassPending = false;
   /* 任何一块出错都不该把后面的重绘一起带走。 */
   try { applyI18n(); } catch (e){}
+  try { paintSoterRecord(); } catch (e){}
   try { refreshPatchSummary(); } catch (e){}
   try { setT(document.getElementById("toggle-system"), showSystem ? "apps.hideSys" : "apps.showSys"); } catch (e){}
   /* 状态条的「运行中/已停止」、计数、SOTER 记录都由 setT 记着键，上面这一遍已经换好了，
@@ -2760,9 +2982,7 @@ async function refreshFromDisk(){
     await readFromDisk();
     renderRemote(parseKV(curConfText, true));
     propsToPatchFields();
-    refreshStatus().catch(function(){});
-    refreshSoter().catch(function(){});
-    refreshCount().catch(function(){});
+    refreshOverview().catch(function(){});
     refreshAttk().catch(function(){});
   } catch (e){}
 }
@@ -2782,6 +3002,10 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
       LANG = (short === "zh") ? "zh-CN" : (I18N[short] ? short : "en");
     }
     if (!I18N[LANG]) LANG = "zh-CN";
+    applyI18n();
+    try {
+      if (typeof ksu !== "undefined" && typeof ksu.enableEdgeToEdge === "function") ksu.enableEdgeToEdge(true);
+    } catch (e){}
 
     var ver = await readFromDisk();
     A_VER = ver;
@@ -2792,9 +3016,7 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     langBtn.onclick = openLangMenu;
     paintLang();
 
-    applyI18n();
     setT(document.getElementById("toggle-system"), showSystem ? "apps.hideSys" : "apps.showSys");
-    document.getElementById("tb-ver").textContent = ver;
     document.getElementById("about-ver").textContent = ver;
 
     await loadStrongboxLive();
@@ -2802,7 +3024,7 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
 
     propsToPatchFields();
 
-    /* 顶栏 / 悬浮窗 */
+    /* 关于 / 文件选择器 */
     document.getElementById("about-btn").onclick = function(){ document.getElementById("about-modal").className = "modal"; };
     document.querySelectorAll("[data-open]").forEach(function(n){
       n.onclick = function(){ openExternal(n.dataset.open, n.dataset.openFallback); };
@@ -2829,7 +3051,12 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
       b.onclick = function(){ fpDir = b.dataset.fpJump; fpList(); };
     });
 
-    wireTabs();
+    document.getElementById("overview-refresh").onclick = async function(){
+      this.disabled = true;
+      try { await refreshOverview(); }
+      catch (e){ toast(t("overview.refreshFail", {msg: e.message}), true); }
+      finally { this.disabled = false; }
+    };
 
     /* 远控页 */
     document.getElementById("save-remote").onclick = function(){
@@ -2842,7 +3069,7 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     document.getElementById("app-search").oninput = function(ev){
       appFilter = ev.target.value || "";
       /* 列表变短后旧滚动位置会落到内容外，先回顶部再按窗口重画。 */
-      var sp = pageEls()[1];
+      var sp = document.getElementById("apps-scroll");
       if (sp) sp.scrollTop = 0;
       appWinStart = appWinEnd = -1;
       renderApps();
@@ -2864,7 +3091,7 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
         .then(function(r){
           if (r && r.errno !== 0){ toast(t("toast.saveFail", {msg: r.stderr || r.errno}), true); return; }
           toast(t("sbkb.cleared"));
-          refreshStrongboxKeybox();
+          refreshKeyboxStatus().catch(function(){});
         })
         .catch(function(e){ toast(String(e.message), true); });
     };
@@ -2916,7 +3143,8 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     /* 伪装参数页 */
     document.getElementById("patch-edit").onclick = function(){
       var box = document.getElementById("patch-manual");
-      box.className = box.className === "hidden" ? "" : "hidden";
+      var shown = !box.classList.toggle("hidden");
+      this.setAttribute("aria-expanded", String(shown));
     };
     document.getElementById("patch-sync").onclick = function(){
       capturePatchInputs();
@@ -2949,15 +3177,15 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
 
     /* 首屏先出来，状态/密钥信息在后台补 */
     document.getElementById("boot").className = "hidden";
-    document.getElementById("pages").className = "pages";
+    document.getElementById("pages").classList.remove("hidden");
+    document.getElementById("tabs").classList.remove("hidden");
+    document.getElementById("about-btn").disabled = false;
+    wireTabs();
+    wireKeyboardLayout();
     /* 应用列表在 loadApps 里渲染，这时 pages 已经可见，量到的是真实高度，
        不需要额外重算窗口。 */
-    refreshStatus().catch(function(){});
-    refreshSoter().catch(function(){});
-    refreshCount().catch(function(){});
+    refreshOverview().catch(function(){});
     refreshAttk().catch(function(){});
-    refreshStrongboxKeybox().catch(function(){});
-    paintSoterRecord();
     loadApps().catch(function(){});
   } catch (e){
     document.getElementById("boot").textContent = t("toast.initFail", {msg: e.message});
