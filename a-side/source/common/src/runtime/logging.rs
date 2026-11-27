@@ -109,6 +109,30 @@ impl LockedRotatingFileAppender {
     }
 }
 
+/// 启动时的轮转：文件刚被别的 host 写过就别动它。
+///
+/// 同一个 keymint.log 有两个写者（进程内 payload 和独立 HAL，两边都拿 flock 追加），
+/// 回退 HAL 反复重启时如果每次都轮转，正在写的那份历史会被反复腰斩（`.1` 里只剩最后
+/// 一次尝试的几行）。两分钟内有写入就当作「这边还活着」，继续追加。
+fn rotate_existing_log_file_at_startup(path: &Path) -> io::Result<()> {
+    const LIVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let live = metadata
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age < LIVE_WINDOW);
+            if live {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    rotate_existing_log_file(path)
+}
+
 fn rotate_existing_log_file(path: &Path) -> io::Result<()> {
     match fs::metadata(path) {
         Ok(_) => {}
@@ -236,7 +260,9 @@ pub fn build_file_config<P: AsRef<Path>>(
     let mut root = Root::builder();
     let path = file_path.as_ref();
 
-    match FileLockGuard::lock_path(path).and_then(|_guard| rotate_existing_log_file(path)) {
+    match FileLockGuard::lock_path(path)
+        .and_then(|_guard| rotate_existing_log_file_at_startup(path))
+    {
         Ok(()) => {}
         Err(error) => eprintln!(
             "{} startup log refresh skipped for {}: {}",

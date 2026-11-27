@@ -89,6 +89,8 @@ pub fn run(extra: Vec<String>) -> ! {
     let started = std::time::Instant::now();
     // 心跳一直不新鲜就计数，连着 20 拍就认为进程内没起来。
     let mut missing_ticks = 0u32;
+    // 独立 HAL 起不来时的退避：它要是每次都在启动阶段就死，别每 100 秒重拉一次。
+    let mut hal_backoff = Duration::ZERO;
     loop {
         let inproc_wanted = inproc_keymint_enabled();
         let healthy = inproc_wanted && inproc_healthy();
@@ -146,6 +148,7 @@ pub fn run(extra: Vec<String>) -> ! {
         };
         log(&format!("keymint started (pid {})", child.id()));
 
+        let spawned = std::time::Instant::now();
         last_sync = std::time::Instant::now();
         loop {
             if take_restart_request() {
@@ -167,7 +170,35 @@ pub fn run(extra: Vec<String>) -> ! {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    log(&format!("keymint exited ({status})"));
+                    let lived = spawned.elapsed();
+                    log(&format!("keymint exited ({status}) after {lived:?}"));
+                    if status.code() == Some(crate::consts::EXIT_RENDEZVOUS_HELD) {
+                        // HAL 自己说的：抽象会合点在进程内那份手上，它没抢 rpc.sock 就退了。
+                        // 这不是故障，只是心跳没跟上；隔一段时间再试就够，别当成崩溃来回拉。
+                        hal_backoff = if hal_backoff.is_zero() {
+                            RENDEZVOUS_HELD_BACKOFF
+                        } else {
+                            (hal_backoff * 2).min(HAL_BACKOFF_MAX)
+                        };
+                        log(&format!(
+                            "in-process KeyMint already holds the rendezvous; next attempt in {hal_backoff:?}"
+                        ));
+                        sleep_restartable(hal_backoff);
+                    } else if !status.success() && lived < Duration::from_secs(30) {
+                        // 启动阶段（30 秒内）就死的，基本都是同一类原因（域名/权限不对），
+                        // 重拉一次还是一样。逐次拉长间隔，不把 keymint.log 一遍遍刷掉。
+                        hal_backoff = if hal_backoff.is_zero() {
+                            Duration::from_secs(60)
+                        } else {
+                            (hal_backoff * 2).min(HAL_BACKOFF_MAX)
+                        };
+                        log(&format!(
+                            "standalone HAL dies during startup; next attempt in {hal_backoff:?}"
+                        ));
+                        sleep_restartable(hal_backoff);
+                    } else {
+                        hal_backoff = Duration::ZERO;
+                    }
                     break;
                 }
                 Ok(None) => sleep(TICK),
@@ -246,6 +277,25 @@ fn idle_tick(last_sync: &mut std::time::Instant) {
         sync_remote_identity();
     }
     sleep(TICK);
+}
+
+/// 独立 HAL 在启动阶段反复失败时，两次尝试中间最长停多久。
+const HAL_BACKOFF_MAX: Duration = Duration::from_secs(600);
+/// 会合点被进程内那份占着时的首次退避：这不算故障，只是个信号不对的情况。
+const RENDEZVOUS_HELD_BACKOFF: Duration = Duration::from_secs(120);
+
+/// 退避期间照样响应面板的「重启」：分片睡，中间来了标记就当已经重启过（下次循环会重拉）。
+fn sleep_restartable(total: Duration) {
+    const SLICE: Duration = Duration::from_secs(5);
+    let mut left = total;
+    while left > Duration::ZERO {
+        if take_restart_request() {
+            return;
+        }
+        let step = left.min(SLICE);
+        sleep(step);
+        left -= step;
+    }
 }
 
 /// 只有面板开了「调试日志」时才落文件；开关每轮现读。

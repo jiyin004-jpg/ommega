@@ -34,6 +34,10 @@ pub const REMOTE_IDENTITY_STATE: &str = "/data/misc/keystore/ommega/remote_ident
 /// `ommega-injector`'s `ipc.rs`: the two crates share no code.
 pub const RPC_ABSTRACT_NAME: &[u8] = b"ommega.soter.rpc";
 
+/// 独立 HAL 发现抽象会合点已经被进程内那份占着时的退出码。
+/// 这不代表出错：说明这台机器上已经有我们在服务，守护看到它就别再拉 HAL 了。
+pub const EXIT_RENDEZVOUS_HELD: i32 = 3;
+
 pub fn sid_features() -> BinderFeatures {
     let mut features = BinderFeatures::default();
     features.set_requesting_sid = true;

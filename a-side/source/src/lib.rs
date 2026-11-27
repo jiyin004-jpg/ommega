@@ -270,7 +270,8 @@ fn peer_is_injected(pid: i32) -> bool {
 }
 
 /// 这个错误是不是「会合点已经有人在服务了」（`EADDRINUSE`）。
-/// 绑定失败报的是 `rsbinder::StatusCode::Errno`，也可能在底下包一层 `io::Error`。
+/// 绑定失败报的是 `rsbinder::StatusCode::Errno`，也可能在底下包一层 `io::Error`；
+/// 这条链上真正能拿到的常常只剩 `Display`（`Errno(-98)`，注意是负数），所以文本也认。
 fn is_addr_in_use(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if let Some(rsbinder::StatusCode::Errno(errno)) =
@@ -278,9 +279,37 @@ fn is_addr_in_use(error: &anyhow::Error) -> bool {
         {
             return *errno == libc::EADDRINUSE;
         }
-        cause
+        if cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+        {
+            return true;
+        }
+        let text = cause.to_string();
+        text.contains("Errno(-98)") || text.contains("Address already in use")
+    })
+}
+
+/// 抽象会合点现在是不是已经有人在 listen。
+/// 直接看 `/proc/net/unix`：名字对得上、状态是 LISTEN（`01`）就算被人占着。比从错误
+/// 里认 `EADDRINUSE` 可靠 —— 那条链上只剩 `Display` 的字符串时很容易漏。
+fn abstract_rendezvous_held() -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+        return false;
+    };
+    let wanted = format!("@{}", String::from_utf8_lossy(consts::RPC_ABSTRACT_NAME));
+    table.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let (_num, _ref_count, _protocol, _flags, _kind) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        );
+        let state = fields.next().unwrap_or_default();
+        let _inode = fields.next();
+        state == "01" && fields.next() == Some(wanted.as_str())
     })
 }
 
@@ -302,7 +331,7 @@ fn create_app_rpc_server() -> Result<Option<Arc<RpcServer>>> {
                 }
                 return Ok(Some(server));
             }
-            Err(error) if is_addr_in_use(&error) => {
+            Err(error) if is_addr_in_use(&error) || abstract_rendezvous_held() => {
                 if !waited {
                     info!(
                         "ommega RPC abstract socket is held by someone else; waiting up to {} ms",
@@ -610,15 +639,27 @@ fn run() -> Result<()> {
     keybox::initialize().context("failed to initialize keybox runtime")?;
 
     info!("setting uid/gid={} role=keystore", KEYSTORE_UID);
-    // 顺序很重要（SKRoot 下）：
-    //  - rpc.sock 要在还是 root-like 时建：SKRoot 的 avc 只对 root-like 放行
-    //    `create`，先降权再建会被 `avc: denied { create } unix_stream_socket` 拒；
-    //  - 取 AAID 必须在降权到 keystore 之后：系统的
-    //    KeyAttestationApplicationIdProvider 只认 Keystore/Credstore uid。
+    // 顺序很重要（SKRoot 下）：两个会合点都要在还是 root-like 时建（SKRoot 的 avc 只对
+    // root-like 放行 `create`，先降权再建会被 `avc: denied { create } unix_stream_socket`
+    // 拒）；而取 AAID 必须在降权到 keystore 之后——系统的
+    // KeyAttestationApplicationIdProvider 只认 Keystore/Credstore uid。
+    //
+    // 抽象会合点先抢，而且抢不到就直接退：它是「这台机器上是不是已经有另一个我们在
+    // 服务」的唯一判据。rpc.sock 绑之前会先 unlink 别人那份，抢了就等于把正在服务的
+    // 进程踢掉；独立 HAL 抢完再死，keymint 那边就会有一段时间接不上。
+    let app_server = match create_app_rpc_server()? {
+        Some(server) => server,
+        None => {
+            info!(
+                "ommega RPC abstract socket is held by the in-process payload; \
+                 not starting the standalone HAL"
+            );
+            std::process::exit(consts::EXIT_RENDEZVOUS_HELD);
+        }
+    };
+    // rpc.sock 要在还是 root-like 时建：SKRoot 的 avc 只对 root-like 放行 create，
+    // 先降权再建会被 `avc: denied { create } unix_stream_socket` 拒。
     let injector_rpc_server = create_rpc_server(RpcBind::FileSocket)?;
-    // 抽象 socket（ommega.soter.rpc）同样要在降权前绑：SKRoot 的 avc 只对 root-like
-    // 放行 create。add_service 仍在降权后做，这里只先占住 listen 端。
-    let app_server = create_app_rpc_server()?;
     if std::env::var("OMMEGA_KEEP_ROOT").as_deref() != Ok("1") {
         set_keystore_identity()?;
     } else {
@@ -669,25 +710,22 @@ fn run() -> Result<()> {
 
     // 第二个会合点，给 app 域调用方：SOTER 宿主进不去 file socket（keystore 目录 0700）。
     // 独立的 accept 循环，同样的 wire 版本和同一组服务，但准入更窄。
-    // 绑定已在降权前完成（见上面 app_server）；抽象会合点已被 keystore2 里的 payload
-    // 占住时这里就是 None，那些服务它已经挂上了。
-    if let Some(app_server) = app_server.as_ref() {
-        for (name, binder) in &services {
-            app_server
-                .add_service(name, binder.clone())
-                .with_context(|| format!("failed to add ommega app RPC service {name}"))?;
-        }
-        let app_runner = Arc::clone(app_server);
-        std::thread::spawn(move || {
-            if let Err(error) = app_runner.run() {
-                error!("ommega app RPC server stopped: {error:#}");
-            }
-        });
-        info!(
-            "serving ommega app RPC abstract socket={}",
-            String::from_utf8_lossy(consts::RPC_ABSTRACT_NAME)
-        );
+    // 绑定已在降权前完成；抢不到抽象名字的那条路在降权前就退出了，这里拿到的必然是自己那份。
+    for (name, binder) in &services {
+        app_server
+            .add_service(name, binder.clone())
+            .with_context(|| format!("failed to add ommega app RPC service {name}"))?;
     }
+    let app_runner = Arc::clone(&app_server);
+    std::thread::spawn(move || {
+        if let Err(error) = app_runner.run() {
+            error!("ommega app RPC server stopped: {error:#}");
+        }
+    });
+    info!(
+        "serving ommega app RPC abstract socket={}",
+        String::from_utf8_lossy(consts::RPC_ABSTRACT_NAME)
+    );
 
     info!("serving ommega RPC socket={}", rpc::SOCKET);
     server.run().context("ommega RPC server stopped")?;
