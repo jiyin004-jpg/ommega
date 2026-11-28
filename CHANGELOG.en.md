@@ -4,6 +4,8 @@
 
 ## 1.7.18
 
+- Panel colours and copy polished; keybox repair text now covers Traditional Chinese, Japanese, Korean and Russian.
+- SOTER records with an abnormal timestamp show "time unavailable" instead of 1971.
 - The panel supports a light theme with a one-tap switch in the header.
 - The panel is reorganised into Overview, Apps and Settings pages.
 - Fixed intermittent key operation failures caused by the key service restarting on its own; debug logs are no longer cleared repeatedly.
