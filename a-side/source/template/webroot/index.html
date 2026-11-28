@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
-<meta name="theme-color" content="#f4f1fa">
+<meta name="theme-color" content="#f5f3f8">
 <title>Ommega</title>
 <script id="theme-init">
   try {
@@ -14,167 +14,203 @@
   /* 管理器提供 window.ksu。面板随模块打包，样式、图标和脚本在本地加载。 */
   :root{
     color-scheme:dark;
-    --bg:#15151d;--card:#292735;--surface:#24232f;--fg:#f6f3fd;--dim:#c2bdd2;
-    --line:#454153;--accent:#d2ccff;--accent-ink:#24204b;--ok:#a3e3bf;--bad:#ffa5ab;--warn:#ffcd96;
-    --page-glow:#211e2d;--scroll-thumb:#62596e;--primary-bg:var(--accent);--neutral-dot:#d9d1ed;
-    --btn-bg:#393547;--btn-line:#655e76;--selected-bg:#514866;--selected-line:#76688d;--app-selected:#35314b;
-    --switch-track:#514c60;--switch-line:#81798f;--switch-thumb:#f0e9fb;
-    --switch-on:var(--primary-bg);--switch-thumb-on:var(--accent-ink);
-    --material-bg:linear-gradient(120deg,#302c41,#3a3348);
-    --hero-bg:linear-gradient(125deg,#44468f,#334e9b 68%,#3f4e91);--hero-line:#747dd4;
-    --hero-orbit:linear-gradient(155deg,#6388e468,#5492eb4d 66%,#838df231);--hero-orbit-line:#b8c8ff21;
-    --hero-copy:#efeaff;--hero-divider:#d4d6ff54;--emblem-bg:#b5a4d359;--emblem-line:#e3d9ff52;--emblem-ink:#fff5ff;
-    --metric-label:#e0d9ed;--card-kicker:#f4effe;--badge-bg:#211f3a63;--badge-ink:#faf5ff;
-    --card-link-bg:#ffffff0b;--card-link-line:#635a74;--card-link-ink:#f3eaff;--sticky-shadow:#15151d80;
-    --nav-bg:#353243;--nav-line:#e3d9fc85;
-    --nav-glass:linear-gradient(158deg,#b0a5d035 -5%,#49435c29 56%,#a39ac153),#1615234c;
-    --nav-filter:blur(9px) saturate(155%);
-    --nav-shadow:0 9px 26px #0b0a1270,inset 0 1px 1px #fff9,inset 0 -1px 1px #e5d7ff40;
-    --pill-bg:linear-gradient(152deg,#eee7ffc9,#a7a0c299 78%);--pill-line:#eee5ffb3;
-    --pill-shadow:inset 0 1px 1px #fffd,inset 0 -2px 4px #c9bef34d;
-    --nav-ink:#f9f5ff;--nav-active-ink:#fdf8ff;--nav-text-shadow:0 1px 3px #110e21bf;--nav-active-shadow:0 1px 3px #292039;
+    --bg:#15151e;--card:#1d1d1f;--surface:#292537;--fg:#f4f1fc;--dim:#b0b0b7;
+    --line:#ffffff17;--accent:#ccc2ff;--accent-ink:#f2e9ff;--ok:#63d98a;--bad:#ff817a;--warn:#ffbb62;
+    --scroll-thumb:#737378;--primary-bg:#52416fa8;--primary-hover:#5c4a77c7;--primary-shadow:#0c081964;--neutral-dot:#a2a2aa;
+    --btn-bg:linear-gradient(145deg,#3d3152dc,#2b3953d4);--btn-line:#cab6f84d;--selected-bg:#332c49;--selected-line:#c5b6ff38;--app-selected:#8b72b332;
+    --switch-track:var(--btn-bg);--switch-line:var(--btn-line);--switch-thumb:#dfd5ee;
+    --switch-on:var(--selected-glass);--switch-thumb-on:var(--accent-ink);
+    --badge-bg:#ffffff12;--card-shadow:0 4px 12px #0002;--sticky-shadow:#0004;
+    --card-bg:linear-gradient(212deg,#2b243cdb,#242e46cc);
+    --runtime-card-bg:linear-gradient(212deg,#2a2336,#222a3c);
+    --hero-bg:linear-gradient(212deg,#35274fe0,#263655ce);--hero-emblem-bg:#3b315b;
+    --material-bg:linear-gradient(212deg,#302738d6,#272f3fd1);--material-ink:#d6cde1;--material-muted:#ad9fb9;--material-control:#373041;
+    --page-glow-top:#322544;--page-glow-bottom:#232d50;--apps-edge-tint:#2a233973;
+    --card-rim:linear-gradient(142deg,#e4d4ff8c,#a389ce40 48%,#1a162f9c 73%,#b4a5ef70);
+    --card-rim-highlight:#fff2;
+    --toolbar-glass:linear-gradient(145deg,#312840c9,#232f49ad);--panel-glass:linear-gradient(145deg,#342b43ec,#2a374ce5);--modal-scrim:#0006;
+    --about-glass:linear-gradient(145deg,#3c3153cf,#2b3b57c4);--about-scrim:#120d2050;
+    --panel-shadow:0 1px 0 #fff1 inset,0 12px 28px #0006;
+    --nav-bg:#302a3e;--nav-line:#e3d9fc66;
+    --nav-glass:radial-gradient(ellipse 82% 50% at 16% 0%,#e9deff20,transparent),
+      linear-gradient(173deg,#cabcff0f,transparent 40%,#120e2238 78%,#b7a6ec20),#1b172b59;
+    --nav-filter:blur(6px) saturate(140%);
+    --nav-shadow:0 10px 24px #08071075,inset 0 1px 1px #fff9,inset 0 -1px 1px #c2b2f27a,inset 0 -5px 8px #a491dc24;
+    --pill-bg:linear-gradient(155deg,#d8ccff28,#8a78bf22 53%,#bca9f526);--pill-line:#e3d9fc6b;
+    --pill-shadow:inset 0 1px 1px #ffffff96,inset 0 -1px 1px #d8c8ff45,0 2px 6px #0004;
+    --nav-ink:#f3f3f5;--nav-active-ink:#e4dcff;--nav-label-shadow:0 1px 2px #0d091bcc;
+    --radius-card:24px;--radius-input:12px;--radius-pill:999px;
+    --action-ease:.5s cubic-bezier(.25,.1,.25,1);
     --gutter:clamp(14px,4.6vw,28px);--content:656px;
     --safe-top:var(--safe-area-inset-top,env(safe-area-inset-top,0px));
     --safe-bottom:var(--safe-area-inset-bottom,env(safe-area-inset-bottom,0px));
     --safe-left:var(--safe-area-inset-left,env(safe-area-inset-left,0px));
     --safe-right:var(--safe-area-inset-right,env(safe-area-inset-right,0px));
-    --nav-space:calc(88px + var(--safe-bottom));
+    --nav-bottom:max(20px,calc(10px + var(--safe-bottom)));
+    --nav-space:calc(78px + var(--nav-bottom));
+    --field-bg:linear-gradient(145deg,#30253fe3,#233048dc);--selected-glass:linear-gradient(145deg,#594778d9,#3c5274dd);
+    --primary-sheen:linear-gradient(145deg,#deccff28,#91bbff15);
   }
+  /* 沉浸窗口的系统手势栏可能延迟收起，底栏间距使用稳定的安全区。 */
+  :root[data-immersive]{--nav-bottom:max(20px,env(safe-area-max-inset-bottom,0px))}
   :root[data-theme="light"]{
     color-scheme:light;
-    --bg:#f4f1fa;--card:#fcfaff;--surface:#eeeaf6;--fg:#211c32;--dim:#554e66;
-    --line:#d7cfe5;--accent:#5543ab;--accent-ink:#292254;--ok:#286447;--bad:#a03651;--warn:#805008;
-    --page-glow:#eae2f8;--scroll-thumb:#aa9ebd;--primary-bg:#ddd4ff;--neutral-dot:#76678d;
-    --btn-bg:#eee8fa;--btn-line:#cabde2;--selected-bg:#e8defb;--selected-line:#c2b1e7;--app-selected:#ece5fc;
-    --switch-track:#ddd7e8;--switch-line:#8c829f;--switch-thumb:#665e77;
-    --switch-on:#6f5abf;--switch-thumb-on:#fff;
-    --material-bg:linear-gradient(120deg,#eee5fa,#f6eefa);
-    --hero-bg:linear-gradient(125deg,#e2daff,#d6e5ff 68%,#d4dcff);--hero-line:#bcc4ed;
-    --hero-orbit:linear-gradient(155deg,#abc3ff8f,#a7bfff50 66%,#bfb9fc48);--hero-orbit-line:#899de238;
-    --hero-copy:#434875;--hero-divider:#5968ae40;--emblem-bg:#fff9;--emblem-line:#fff;--emblem-ink:#51469a;
-    --metric-label:#554e6b;--card-kicker:#423565;--badge-bg:#fbf8ffac;--badge-ink:#3c3157;
-    --card-link-bg:#ffffff66;--card-link-line:#cbbce2;--card-link-ink:#4e3d75;--sticky-shadow:#5747751a;
-    --nav-bg:#f1ebfb;--nav-line:#a99bc88f;
-    --nav-glass:linear-gradient(157deg,#fff9 -8%,#fcf9ff26 29%,#ede3f90d 64%,#c4b0ef70),#ece4f83a;
-    --nav-filter:blur(7px) saturate(165%);
-    --nav-shadow:0 8px 23px #594a7039,inset 0 1px 1px #fffffff2,inset 0 -1px 1px #ffffffc7,inset 0 -5px 11px #a789dd26;
-    --pill-bg:linear-gradient(155deg,#fffefbed -12%,#fbf3ff67 44%,#c9b5f18c);--pill-line:#fffdfde3;
-    --pill-shadow:inset 0 1px 1px #fff,inset 0 -1px 2px #fff8,0 2px 7px #715c9940;
-    --nav-ink:#3b314e;--nav-active-ink:#302344;--nav-text-shadow:0 1px 2px #fffb;--nav-active-shadow:0 1px 2px #fffb;
+    --bg:#f5f3f8;--card:#fff;--surface:#eee8f5;--fg:#241e38;--dim:#626269;
+    --line:#15151d14;--accent:#5642a5;--accent-ink:#453362;--ok:#23734b;--bad:#b33636;--warn:#85570a;
+    --scroll-thumb:#a6a6ad;--primary-bg:#d9c5efa8;--primary-hover:#d1baeac9;--primary-shadow:#59417b2b;--neutral-dot:#77777f;
+    --btn-bg:linear-gradient(145deg,#f3eafbd4,#e5effbd0);--btn-line:#694f9c47;--selected-bg:#eee8fa;--selected-line:#5642a52b;--app-selected:#aa93cb26;
+    --switch-track:var(--btn-bg);--switch-line:var(--btn-line);--switch-thumb:#6a5c7c;
+    --badge-bg:#f1f1f4;--card-shadow:0 4px 12px #0000000a;--sticky-shadow:#1717221a;
+    --card-bg:linear-gradient(212deg,#fbf6ffe0,#edf4ffcc);
+    --runtime-card-bg:linear-gradient(212deg,#f7f1fc,#ecf3fc);
+    --hero-bg:linear-gradient(212deg,#eee4fbe0,#e0eafbcc);--hero-emblem-bg:#e0d7f7;
+    --material-bg:linear-gradient(212deg,#f4edf8d9,#e8eff9cc);--material-ink:#4d435c;--material-muted:#6c6079;--material-control:#e8e1f0;
+    --page-glow-top:#e8dcf7;--page-glow-bottom:#dce7fa;--apps-edge-tint:#f1ecf8a3;
+    --card-rim:linear-gradient(142deg,#fff 12%,#c1b0e5aa 52%,#b7b8da80 75%,#fff);
+    --card-rim-highlight:#fffc;
+    --toolbar-glass:linear-gradient(145deg,#f7f1fcc8,#e1ecf9b8);--panel-glass:linear-gradient(145deg,#f7f0fbec,#eaf2fbe6);--modal-scrim:#14141c40;
+    --about-glass:linear-gradient(145deg,#f5ebf9d9,#e5effbcb);--about-scrim:#251c392c;
+    --panel-shadow:0 1px 0 #fffe inset,0 12px 28px #16162024;
+    --nav-bg:#f3eff8;--nav-line:#fffdfdec;
+    --nav-glass:radial-gradient(ellipse 82% 50% at 16% 0%,#fff9,transparent),
+      linear-gradient(173deg,#fff6,transparent 40%,#c4b5e620 78%,#fff8),#f8f4ff42;
+    --nav-shadow:0 9px 24px #42355738,inset 0 1px 1px #fff,inset 0 -1px 1px #fffc,inset 0 -5px 9px #bda6e234;
+    --pill-bg:linear-gradient(155deg,#fff9,#eee5fa2e 53%,#d9c9f36b);--pill-line:#fffd;
+    --pill-shadow:inset 0 1px 1px #fff,inset 0 -1px 1px #fff9,0 2px 7px #5642a52b;
+    --nav-ink:#362d49;--nav-active-ink:var(--accent);--nav-label-shadow:0 1px 2px #fffc;
+    --field-bg:linear-gradient(145deg,#eee6f7da,#e4edf9d1);--selected-glass:linear-gradient(145deg,#e7d7f7e0,#d8e5fade);
+    --primary-sheen:linear-gradient(145deg,#fff6,#acbaf220);
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{height:100%}
   body{margin:0;color:var(--fg);display:flex;flex-direction:column;
        padding-inline:var(--safe-left) var(--safe-right);
-       background:var(--bg);
-       overflow:hidden;font:15px/1.55 system-ui,"Noto Sans SC","Microsoft YaHei",sans-serif}
+       background:radial-gradient(ellipse at 95% 0%,var(--page-glow-top),transparent 68%),
+         radial-gradient(ellipse at 0% 100%,var(--page-glow-bottom),transparent 72%),var(--bg);
+       overflow:hidden;font:15px/1.55 -apple-system,BlinkMacSystemFont,system-ui,"Noto Sans SC","Microsoft YaHei",sans-serif}
   button,input,select{font-family:inherit}
   button{cursor:pointer}
   button:disabled{cursor:default}
   .icon{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;
       stroke-linecap:round;stroke-linejoin:round}
-  .quiet-btn{min-height:38px;padding:6px 13px;border-radius:999px;border:1px solid var(--line);
-      background:var(--surface);color:var(--dim);font-size:12px;font-weight:650}
+  .quiet-btn{min-height:40px;padding:7px 15px;border-radius:var(--radius-pill);border:1px solid var(--btn-line);
+      background:var(--btn-bg);color:var(--accent);font-size:12px;font-weight:650;box-shadow:inset 0 1px 0 var(--card-rim-highlight)}
   .tabs{position:fixed;z-index:10;left:calc((100% + var(--safe-left) - var(--safe-right)) / 2);
-      bottom:calc(10px + var(--safe-bottom));transform:translateX(-50%);
+      bottom:var(--nav-bottom);transform:translateX(-50%);
       width:calc(100% - var(--gutter) * 2 - var(--safe-left) - var(--safe-right));max-width:490px;
       --tab-gap:3px;--tab-inset:4px;
-      display:flex;gap:var(--tab-gap);padding:var(--tab-inset);border:1px solid var(--nav-line);border-radius:36px;
+      display:flex;gap:var(--tab-gap);padding:var(--tab-inset);border:1px solid var(--nav-line);border-radius:var(--radius-pill);
       background:var(--nav-bg);box-shadow:var(--nav-shadow)}
   @supports ((backdrop-filter:blur(9px)) or (-webkit-backdrop-filter:blur(9px))){
     .tabs{background:var(--nav-glass);
       -webkit-backdrop-filter:var(--nav-filter);backdrop-filter:var(--nav-filter)}
   }
-  .tab-pill{position:absolute;left:var(--tab-inset);top:var(--tab-inset);bottom:var(--tab-inset);border-radius:30px;
+  .tab-pill{position:absolute;left:var(--tab-inset);top:var(--tab-inset);bottom:var(--tab-inset);border-radius:var(--radius-pill);
       width:calc((100% - 2 * (var(--tab-inset) + var(--tab-gap))) / 3);
       background:var(--pill-bg);border:1px solid var(--pill-line);box-shadow:var(--pill-shadow);
       pointer-events:none;will-change:transform;
       transform:translate3d(calc((100% + var(--tab-gap)) * var(--tab-position,0)),0,0)}
   .tab{flex:1;min-width:0;min-height:55px;display:grid;justify-items:center;align-content:center;gap:3px;
-      padding:5px 3px;border-radius:30px;border:0;background:transparent;position:relative;
-      color:var(--nav-ink);font-size:12px;font-weight:700;line-height:1.2;text-shadow:var(--nav-text-shadow)}
+      padding:5px 3px;border-radius:var(--radius-pill);border:0;background:transparent;position:relative;
+      color:var(--nav-ink);font-size:12px;font-weight:650;line-height:1.2;text-shadow:var(--nav-label-shadow)}
   .tab .icon{width:22px;height:22px}
-  .tab.on{color:var(--nav-active-ink);text-shadow:var(--nav-active-shadow)}
+  .tab.on{color:var(--nav-active-ink)}
   /* 分页 */
   .pages{flex:1;position:relative;overflow:hidden;overflow:clip;min-width:0;touch-action:pan-y}
   .page-track{position:absolute;inset:0;display:flex;transform:translate3d(0,0,0)}
   .page{position:relative;flex:0 0 100%;min-width:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;
       padding:0 var(--gutter) calc(var(--nav-space) + 12px);
       scroll-padding:var(--safe-top) 0 var(--nav-space);scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) transparent;
-      background:radial-gradient(ellipse 550px 240px at 70% 0%,var(--page-glow),transparent),var(--bg);
       contain:layout paint}
   .page[inert]{pointer-events:none}
   .page-content{max-width:var(--content);margin:0 auto}
   .page>.page-content{padding-top:var(--safe-top)}
-  .page-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0 15px}
-  .page-heading h1{margin:0;font-size:clamp(30px,9vw,42px);font-weight:800;line-height:1.15;letter-spacing:-.04em}
+  .overview-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 0 14px}
+  .overview-brand{display:flex;min-width:0;align-items:center;gap:10px}
+  .overview-brand-icon{display:grid;flex:none;place-items:center;width:44px;height:44px;
+      border:1px solid var(--selected-line);border-radius:14px;color:var(--accent);
+      background:linear-gradient(145deg,var(--hero-emblem-bg),var(--selected-bg));
+      box-shadow:inset 0 1px 0 var(--card-rim-highlight),var(--card-shadow)}
+  .overview-brand-icon .icon{width:22px;height:22px}
+  .overview-brand-copy{min-width:0}
+  .overview-brand-name{display:block;font-size:clamp(17px,5.2vw,22px);font-weight:750;line-height:1.2;white-space:nowrap}
+  .overview-brand-role{display:block;margin-top:3px;color:var(--dim);font-size:12px;line-height:1.3;overflow-wrap:anywhere}
+  .page-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 0 20px}
+  .page-heading h1{margin:0;font-size:clamp(31px,9.6vw,40px);font-weight:650;line-height:1.12;letter-spacing:-.025em}
   .page-heading p{margin:8px 0 0;color:var(--dim);font-size:14px}
   .heading-actions{display:flex;flex:none;align-items:center;gap:8px}
-  .icon-btn{flex:none;display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--line);
-      border-radius:16px;background:var(--surface);color:var(--accent)}
+  .icon-btn{flex:none;display:grid;place-items:center;width:44px;height:44px;border:1px solid var(--btn-line);
+      border-radius:var(--radius-pill);background:var(--btn-bg);color:var(--fg);box-shadow:inset 0 1px 0 var(--card-rim-highlight)}
   .icon-btn:disabled{opacity:.55}
-  #theme-toggle{border-radius:50%}
-  #theme-toggle[aria-pressed=true]{background:var(--selected-bg);border-color:var(--selected-line)}
+  #theme-toggle[aria-pressed=true]{background:var(--selected-glass)}
   #theme-toggle .icon{grid-area:1/1;transition:transform .32s cubic-bezier(.2,.75,.25,1),opacity .22s ease}
   #theme-toggle .theme-sun{opacity:0;transform:rotate(-55deg) scale(.7)}
   #theme-toggle[aria-pressed=true] .theme-moon{opacity:0;transform:rotate(55deg) scale(.7)}
   #theme-toggle[aria-pressed=true] .theme-sun{opacity:1;transform:none}
   ::view-transition-old(root),::view-transition-new(root){animation-duration:.24s}
   ::view-transition{pointer-events:none}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:25px;
-      padding:clamp(15px,4.3vw,24px);margin-bottom:12px}
-  .card h2{margin:0 0 10px;font-size:19px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
-  .overview-hero,.overview-material{padding:clamp(16px,4.6vw,26px);border-radius:28px}
-  .overview-hero{position:relative;isolation:isolate;overflow:hidden;border-color:var(--hero-line);
-      background:var(--hero-bg)}
-  .overview-hero::before{content:"";position:absolute;z-index:-1;pointer-events:none;
-      width:86%;height:125%;left:43%;bottom:28%;border-radius:48% 0 42% 52%;transform:rotate(19deg);
-      background:var(--hero-orbit);border:1px solid var(--hero-orbit-line)}
-  .overview-material{background:var(--material-bg)}
+  .card,.runtime-card{--card-fill:var(--card-bg);border:1px solid var(--line);
+      background:var(--card-fill) padding-box;
+      box-shadow:var(--card-shadow),inset 0 1px 0 var(--card-rim-highlight)}
+  @supports (mask-composite:exclude){
+    .card,.runtime-card{position:relative;border-color:transparent}
+    .card::before,.runtime-card::before{content:"";position:absolute;inset:-1px;
+      padding:1px;border-radius:inherit;pointer-events:none;background:var(--card-rim);
+      mask:linear-gradient(#000,#000) content-box,linear-gradient(#000,#000);mask-composite:exclude}
+  }
+  .card{border-radius:var(--radius-card);
+      padding:clamp(16px,5.1vw,26px);margin-bottom:16px}
+  .card h2{margin:0 0 12px;font-size:18px;font-weight:650;line-height:1.3;overflow-wrap:anywhere}
+  .overview-hero,.overview-material{padding:clamp(18px,5.8vw,32px)}
+  .overview-hero{--card-fill:var(--hero-bg)}
+  .overview-material{--card-fill:var(--material-bg);color:var(--material-ink)}
+  .overview-material .card-kicker,.overview-material .metrics dt{color:var(--material-muted)}
+  .overview-material .badge{background:var(--material-control);color:inherit}
+  .overview-material .card-link{background:var(--material-control);color:var(--material-muted);font-weight:500}
   .card-top,.card-kicker,.hero-main{display:flex;align-items:center;gap:8px}
   .card-top,.hero-main{justify-content:space-between}
   .card-top{align-items:flex-start}
-  .card-kicker{min-width:0;color:var(--card-kicker);font-size:13px;font-weight:700;line-height:1.3}
+  .card-kicker{min-width:0;color:var(--dim);font-size:13px;font-weight:600;line-height:1.3}
   .card-kicker .icon{width:17px;height:17px}
   .badge{display:inline-flex;align-items:center;gap:6px;max-width:53%;padding:5px 9px;border-radius:999px;
-      background:var(--badge-bg);color:var(--badge-ink);font-size:11px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
+      background:var(--badge-bg);color:var(--fg);font-size:11px;font-weight:650;line-height:1.25;overflow-wrap:anywhere}
   .badge::before,.dot{content:"";width:6px;height:6px;border-radius:50%;background:var(--neutral-dot);flex:none}
   .badge.enabled::before,.dot.on{background:var(--ok)}
   .dot.off{background:var(--bad)} .dot.warn{background:var(--warn)}
-  .hero-main{margin:16px 0 12px;gap:12px}
-  .overview-hero h2,.overview-material h2{font-size:clamp(23px,6.4vw,32px);margin:0;letter-spacing:-.03em}
-  .overview-hero p{margin:7px 0 0;color:var(--hero-copy);font-size:13px;line-height:1.52}
-  .hero-emblem{flex:none;display:grid;place-items:center;width:56px;height:56px;border-radius:20px;
-      border:1px solid var(--emblem-line);background:var(--emblem-bg);color:var(--emblem-ink)}
+  .hero-main{margin:22px 0 18px;gap:14px}
+  .overview-hero h2,.overview-material h2{margin:0;font-size:clamp(24px,7vw,32px);font-weight:650;line-height:1.15;letter-spacing:-.02em}
+  .overview-hero p{margin:8px 0 0;color:var(--dim);font-size:14px;line-height:1.55}
+  .hero-emblem{flex:none;display:grid;place-items:center;width:62px;height:62px;border-radius:var(--radius-pill);
+      background:var(--hero-emblem-bg);color:var(--accent)}
   .hero-emblem .icon{width:32px;height:32px}
-  .overview-material h2{margin:11px 0 13px}
-  .metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px;margin:0}
-  .overview-hero .metrics{border-top:1px solid var(--hero-divider);padding-top:12px}
-  .metrics dt{color:var(--metric-label);font-size:12px;line-height:1.3}
-  .metrics dd{margin:4px 0 0;font-size:14px;font-weight:750;line-height:1.35;overflow-wrap:anywhere;
+  .overview-material h2{margin:15px 0 17px}
+  .metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 16px;margin:0}
+  .overview-hero .metrics{border-top:1px solid var(--selected-line);padding-top:15px}
+  .metrics dt{color:var(--dim);font-size:12px;line-height:1.3}
+  .metrics dd{margin:5px 0 0;font-size:14px;font-weight:650;line-height:1.35;overflow-wrap:anywhere;
       font-variant-numeric:tabular-nums}
-  .card-link{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:41px;
-      margin-top:15px;padding:7px 11px;border:1px solid var(--card-link-line);border-radius:13px;
-      background:var(--card-link-bg);color:var(--card-link-ink);text-align:start;font-size:13px;font-weight:700}
+  .card-link{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:44px;
+      margin-top:18px;padding:8px 14px;border:0;border-radius:var(--radius-pill);
+      background:var(--btn-bg);color:var(--accent);text-align:start;font-size:14px;font-weight:650}
   .card-link .icon{width:17px;height:17px}
-  .runtime-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-  .runtime-card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:21px;padding:12px 14px}
+  .runtime-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .runtime-card{--card-fill:var(--runtime-card-bg);min-width:0;border-radius:var(--radius-card);padding:14px 15px}
   .runtime-card b{display:block;font-size:14px;overflow-wrap:anywhere}
   .runtime-state{display:flex;align-items:center;gap:7px;margin:4px 0 0;color:var(--dim);font-size:12px;line-height:1.4}
   .runtime-state span{min-width:0;overflow-wrap:anywhere}
   .settings-tabs{position:sticky;z-index:1;top:var(--safe-top);display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;padding:4px;
-      margin-bottom:12px;border:1px solid var(--line);border-radius:17px;background:var(--surface);
-      box-shadow:0 4px 10px var(--sticky-shadow)}
-  .settings-tabs button{min-height:43px;border:1px solid transparent;border-radius:13px;padding:5px 4px;
+      margin-bottom:16px;border:1px solid var(--btn-line);border-radius:var(--radius-pill);background:var(--surface);
+      box-shadow:0 4px 10px var(--sticky-shadow),inset 0 1px 0 var(--card-rim-highlight)}
+  .settings-tabs button{min-height:42px;border:1px solid transparent;border-radius:var(--radius-pill);padding:6px 4px;
       background:transparent;color:var(--dim);font-size:12px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}
-  .settings-tabs button[aria-pressed=true]{background:var(--selected-bg);border-color:var(--selected-line);color:var(--fg)}
-  .row{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
+  .settings-tabs button[aria-pressed=true]{background:var(--selected-glass);border-color:var(--btn-line);color:var(--accent-ink);box-shadow:inset 0 1px 0 var(--card-rim-highlight)}
+  .row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
   .row:first-of-type{border-top:0}
   .row .name{flex:1;min-width:0}
   .row .name b{display:block;font-weight:650;font-size:14px}
   .row .name small{display:block;color:var(--dim);font-size:12px;line-height:1.45}
-  .row input[type=text],.row select{flex:0 0 46%;min-width:0;min-height:42px;padding:7px 9px;border:1px solid var(--line);
-      border-radius:10px;background:var(--bg);color:var(--fg);font-size:14px;font-family:inherit}
+  .row input[type=text],.row select{flex:0 0 46%;min-width:0;min-height:44px;padding:8px 12px;border:1px solid var(--btn-line);
+      border-radius:var(--radius-input);background:var(--field-bg);color:var(--fg);font-size:14px;font-family:inherit}
   /* 令牌 / 服务器地址这类长值：标签占一行、输入框占满下一行。
      原来 46%（约 144px）装不下 32 位 token，需要横向滚动 120px，聚焦全选时
      内容会整个跳到末尾，看着像「框变了」。 */
@@ -187,10 +223,10 @@
      以前 .pw-stars 写死 right:44px（眼睛按钮的宽度），按钮尺寸/语言一变就错位；
      现在宽度交给 flex 分配，星号位置自动跟着输入框走。 */
   .pw-field{position:relative;flex:1 1 auto;min-width:0;display:flex;
-      border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+      border:1px solid var(--btn-line);border-radius:var(--radius-input);background:var(--field-bg)}
   .pw-field:focus-within{border-color:var(--accent)}
   .row .pw-wrap input[type=text]{flex:1 1 auto;min-width:0;margin:0;padding:7px 9px;
-      border:0;border-radius:8px;background:transparent;color:var(--fg);
+      border:0;border-radius:var(--radius-input);background:transparent;color:var(--fg);
       /* 等宽字体：一个 * 的步进 = 一个被藏起来的字符，星号层横向滚动才对得齐。 */
       font-size:13px;line-height:1.6;font-family:ui-monospace,monospace;
       touch-action:pan-y}
@@ -216,22 +252,22 @@
      用 opacity 而不是 display:none：文字布局和图层一直热着，起拖时不用现场重排/建层。 */
   .pw-field input.panning ~ .pw-stars{opacity:1}
   .pw-eye{flex:0 0 42px;height:42px;display:flex;align-items:center;justify-content:center;
-      padding:0;border:1px solid var(--line);border-radius:8px;background:var(--bg);
+      padding:0;border:1px solid var(--btn-line);border-radius:var(--radius-input);background:var(--field-bg);
       color:var(--dim);cursor:pointer}
   .pw-eye svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;
       stroke-linecap:round;stroke-linejoin:round}
   .pw-eye[aria-pressed="true"]{color:var(--fg)}
-  .sw{position:relative;flex:0 0 48px;height:28px;border-radius:16px;background:var(--switch-track);
+  .sw{position:relative;flex:0 0 48px;height:28px;border-radius:var(--radius-pill);background:var(--switch-track);
       transition:background .15s;border:1px solid var(--switch-line);padding:0}
   .sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
       background:var(--switch-thumb);transition:transform .15s}
   .sw[aria-checked=true]{background:var(--switch-on)}
   .sw[aria-checked=true]::after{transform:translateX(20px);background:var(--switch-thumb-on)}
-  .acts{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 4px}
-  button.btn{flex:1;min-width:96px;min-height:42px;padding:8px 12px;border-radius:13px;border:1px solid var(--btn-line);
+  .acts{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 4px}
+  button.btn{flex:1;min-width:96px;min-height:44px;padding:8px 14px;border-radius:var(--radius-pill);border:1px solid var(--btn-line);
       background:var(--btn-bg);color:var(--fg);font-size:14px;font-weight:650;overflow-wrap:anywhere}
-  button.btn.primary{background:var(--primary-bg);border-color:var(--primary-bg);color:var(--accent-ink);font-weight:750}
-  button.btn.sm{flex:0 1 auto;min-width:0;min-height:36px;padding:6px 10px;font-size:12px;border-radius:11px}
+  button.btn.primary{background:var(--primary-sheen) var(--primary-bg);border-color:var(--btn-line);color:var(--accent-ink);box-shadow:0 4px 12px var(--primary-shadow),inset 0 1px 0 var(--card-rim-highlight)}
+  button.btn.sm{flex:0 1 auto;min-width:0;min-height:36px;padding:6px 11px;font-size:12px}
   button.btn[disabled]{opacity:.5}
   .kv{display:flex;gap:10px;font-size:13px;padding:6px 0;border-top:1px solid var(--line)}
   .kv:first-of-type{border-top:0}
@@ -242,8 +278,8 @@
   /* 关于里的界面语言：自绘按钮 + 共用浮层菜单。原生 select 的弹层样式由系统控制，
      在 WebView 里字体/配色都跟面板对不上，换语言时还会闪一下原生列表。 */
   .lang-pick{display:inline-flex;align-items:center;justify-content:space-between;gap:8px;
-      width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
-      background:var(--bg);color:var(--fg);font-size:13px;font-family:inherit;
+      width:100%;padding:7px 10px;border:1px solid var(--btn-line);border-radius:var(--radius-input);
+      background:var(--field-bg);color:var(--fg);font-size:13px;font-family:inherit;
       line-height:1.35;text-align:left;white-space:nowrap;overflow:hidden}
   .lang-pick::after{content:"";flex:0 0 auto;width:0;height:0;
       border-left:3px solid transparent;border-right:3px solid transparent;
@@ -251,14 +287,24 @@
   .row button.btn{flex:0 0 28%;max-width:100px;min-height:40px;padding:5px;text-align:center}
   .hint{color:var(--dim);font-size:12px;line-height:1.5;margin:6px 0 0}
   /* 应用列表 */
-  .toolbar{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 10px}
-  .search{width:100%;min-height:44px;padding:8px 12px;border:1px solid var(--line);border-radius:13px;
-      background:var(--bg);color:var(--fg);font-size:14px;margin:6px 0}
-  #applist{background:var(--surface);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 12px}
+  .search{width:100%;min-height:46px;padding:9px 13px;border:1px solid var(--btn-line);border-radius:var(--radius-input);
+      background:var(--field-bg);color:var(--fg);font-size:15px;margin:8px 0}
+  #applist{background:var(--card-bg);border:1px solid var(--line);border-radius:var(--radius-input);overflow:hidden}
   #applist>.hint{margin:0;padding:12px}
   #page-apps{display:flex;flex-direction:column;overflow:hidden;padding:var(--safe-top) 0 0}
-  .apps-heading{flex:none;width:100%;max-width:calc(var(--content) + var(--gutter) * 2);margin:0 auto;
+  .apps-heading{position:relative;z-index:1;flex:none;width:100%;max-width:calc(var(--content) + var(--gutter) * 2);margin:0 auto;
       padding-inline:var(--gutter)}
+  .apps-heading::after{content:"";position:absolute;top:calc(100% - 5px);inset-inline:0;height:26px;
+      pointer-events:none;opacity:0;transition:opacity .16s ease-out;
+      background:linear-gradient(to bottom,transparent,var(--apps-edge-tint) 28%,transparent)}
+  .apps-scrolled .apps-heading::after{opacity:1}
+  @supports ((backdrop-filter:blur(7px)) or (-webkit-backdrop-filter:blur(7px))){
+    .apps-heading::after{-webkit-backdrop-filter:blur(7px);backdrop-filter:blur(7px);
+      -webkit-mask-image:linear-gradient(to bottom,transparent,#000 20%,#000 38%,transparent);
+      mask-image:linear-gradient(to bottom,transparent,#000 20%,#000 38%,transparent)}
+  }
+  @media (prefers-reduced-motion:reduce){.apps-heading::after{transition:none}}
   .apps-heading>div{min-width:0}
   .apps-heading p{margin-top:4px;font-size:12px}
   .apps-heading .btn{flex:0 0 auto;max-width:53%}
@@ -272,7 +318,7 @@
   .app{display:flex;align-items:center;gap:10px;padding:7px 9px;border-top:1px solid var(--line);
       min-height:54px;overflow:hidden}
   .app:first-child{border-top-color:transparent}
-  .app-icon{width:28px;height:28px;border-radius:7px;flex:0 0 28px;background:var(--line)}
+  .app-icon{width:28px;height:28px;border-radius:var(--radius-input);flex:0 0 28px;background:var(--line)}
   .app .meta{flex:1;min-width:0}
   .app .meta b{display:block;font-weight:500;font-size:13.5px;line-height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .app .meta small{display:block;color:var(--dim);font-size:11.5px;line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -280,8 +326,8 @@
      原生 <select> 每行都要画一遍控件、还带 4 个 option 子节点，行数一多单页绘制就重；
      自绘按钮只有一行字，菜单只有一个、关着时 display:none，不参与光栅化。 */
   .app .pick{display:inline-flex;align-items:center;justify-content:center;gap:4px;
-      flex:0 0 auto;min-height:32px;padding:4px 9px;border:1px solid var(--line);border-radius:9px;
-      background:var(--bg);color:var(--fg);font-size:12px;font-family:inherit;font-weight:400;
+      flex:0 0 auto;min-height:32px;padding:4px 9px;border:1px solid var(--btn-line);border-radius:var(--radius-pill);
+      background:var(--btn-bg);color:var(--fg);font-size:12px;font-family:inherit;font-weight:400;
       line-height:1.2;max-width:48%;overflow-wrap:anywhere}
   /* 小三角用边框画，作为按钮里的一个 flex 项：宽度只按「文字 + 间隙 + 三角 + 内边距」来，
      不再为固定宽度留空；右侧内边距留一点呼吸感。 */
@@ -290,37 +336,47 @@
       border-top:3.5px solid currentColor;opacity:.6}
   .apick{position:fixed;inset:0;z-index:70}
   .apick-menu{position:fixed;min-width:158px;max-width:70vw;background:var(--card);
-      border:1px solid var(--line);border-radius:12px;padding:6px;
-      display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 28px rgba(0,0,0,.22)}
-  .apick-item{display:block;width:100%;text-align:left;padding:9px 10px;border:0;border-radius:8px;
+      border:1px solid var(--line);border-radius:var(--radius-input);padding:6px;
+      display:flex;flex-direction:column;gap:2px;box-shadow:var(--panel-shadow)}
+  .apick-item{display:block;width:100%;text-align:left;padding:9px 10px;border:0;border-radius:var(--radius-input);
       background:transparent;color:var(--fg);font-size:13px;font-family:inherit}
-  .apick-item.on{background:var(--selected-bg);color:var(--accent);font-weight:650}
+  .apick-item.on{background:var(--selected-glass);color:var(--accent-ink);font-weight:650}
   .app.on{background:var(--app-selected)}
+  .app.on .pick{background:var(--selected-glass);color:var(--accent-ink)}
   .app.off .pick{color:var(--dim)}
   /* 悬浮窗（关于 / 选文件） */
-  .modal{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.45);display:flex;
+  .modal{position:fixed;inset:0;z-index:60;background:var(--modal-scrim);display:flex;
       align-items:center;justify-content:center;padding:20px}
   .modal.hidden{display:none}
-  .sheet{background:var(--card);border-radius:25px;width:100%;max-width:520px;max-height:84vh;
-      display:flex;flex-direction:column;border:1px solid var(--line)}
-  .sheet-head{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  #about-modal{--modal-scrim:var(--about-scrim);--sheet-bg:var(--runtime-card-bg);--panel-glass:var(--about-glass)}
+  #about-modal .sheet{border-color:var(--nav-line);
+      box-shadow:var(--panel-shadow),inset 0 1px 1px var(--card-rim-highlight)}
+  .sheet{background:var(--sheet-bg,var(--card));border-radius:var(--radius-card);width:100%;max-width:520px;max-height:84vh;
+      display:flex;flex-direction:column;border:1px solid var(--line);box-shadow:var(--panel-shadow)}
+  @supports ((backdrop-filter:blur(20px)) or (-webkit-backdrop-filter:blur(20px))){
+    .settings-tabs,.apick-menu,.sheet{
+      -webkit-backdrop-filter:blur(12px) saturate(135%);backdrop-filter:blur(12px) saturate(135%)}
+    .settings-tabs{background:var(--toolbar-glass)}
+    .apick-menu,.sheet{background:var(--panel-glass)}
+  }
+  .sheet-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line)}
   .sheet-head b{flex:1;font-size:15px}
-  .sheet-body{padding:12px 14px;overflow:auto}
+  .sheet-body{padding:14px 16px;overflow:auto}
   .sheet-foot{padding:10px 14px;border-top:1px solid var(--line)}
   /* 选文件 */
   .fp-bar{display:flex;gap:6px;align-items:center;margin-bottom:8px}
   .fp-input{flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:12px;
-      padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+      padding:7px 9px;border:1px solid var(--btn-line);border-radius:var(--radius-input);background:var(--field-bg);color:var(--fg)}
   .fp-quick{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
   .fp-quick button.btn{flex:0 0 auto;max-width:100%;font-size:12px;overflow:hidden;
       text-overflow:ellipsis;white-space:nowrap}
-  .fp-list{border:1px solid var(--line);border-radius:10px;max-height:44vh;overflow:auto}
+  .fp-list{border:1px solid var(--line);border-radius:var(--radius-input);max-height:44vh;overflow:auto}
   .fp-item{padding:8px 10px;font-size:13px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center}
   .fp-item:first-child{border-top:0}
   .fp-item.dir{font-weight:600}
   .fp-item span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #toast{position:fixed;left:50%;bottom:var(--nav-space);transform:translateX(-50%) translateY(12px);
-      background:#39344c;color:#fff;padding:10px 16px;border-radius:15px;font-size:13px;
+      background:#252528;color:#fff;padding:10px 16px;border-radius:var(--radius-input);font-size:13px;
       width:max-content;max-width:86vw;opacity:0;transition:.22s;pointer-events:none;z-index:99}
   #toast.show{opacity:1;transform:translateX(-50%)}
   #toast.err{background:#8d2b2b}
@@ -328,18 +384,34 @@
       padding:calc(var(--safe-top) + 16px) var(--gutter) 16px}
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   input:focus,select:focus{border-color:var(--accent)}
-  :root[data-theme="light"] input::placeholder{color:var(--dim);opacity:.85}
+  input::placeholder{color:var(--dim);opacity:1}
   .pw-field input:focus-visible{outline-offset:-2px}
   body.keyboard-open{height:var(--editing-height,100%);--safe-bottom:0px;--nav-space:12px}
   body.keyboard-open .tabs{display:none}
   body.keyboard-open .settings-tabs{position:static}
   [hidden],.hidden{display:none}
+  button.btn,.quiet-btn,.icon-btn,.settings-tabs button,.apick-item{
+    transition:background-color .18s ease-out,border-color .18s ease-out,color .18s ease-out}
+  button.btn.primary,.card-link{
+    transition:background-color var(--action-ease),box-shadow var(--action-ease),transform var(--action-ease)}
+  @media (hover:hover){
+    .settings-tabs button[aria-pressed=false]:hover,.apick-item:not(.on):hover{background:var(--btn-bg)}
+    button.btn.primary:not(:disabled):hover{background-color:var(--primary-hover)}
+    .card-link:hover{background:var(--surface)}
+  }
+  @media (hover:hover) and (prefers-reduced-motion:no-preference){
+    button.btn.primary:not(:disabled):hover{transform:translateY(-2px);box-shadow:0 7px 16px var(--primary-shadow),inset 0 1px 0 var(--card-rim-highlight)}
+  }
+  @media (prefers-reduced-motion:no-preference){
+    button.btn.primary:not(:disabled):active,.card-link:active{transform:scale(.97)}
+  }
   @media (prefers-reduced-motion:reduce){
-    #theme-toggle .icon,.sw,.sw::after,#toast{transition:none}
+    #theme-toggle .icon,.sw,.sw::after,#toast,button.btn,button.btn.primary,.card-link,.quiet-btn,.icon-btn,
+    .settings-tabs button,.apick-item{transition:none}
   }
   @media (max-width:360px){
     .heading-actions{gap:5px}
-    .hero-emblem{width:46px;height:46px;border-radius:16px}
+    .hero-emblem{width:46px;height:46px}
     .hero-emblem .icon{width:26px;height:26px}
     .overview-hero .metrics{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)}
   }
@@ -367,17 +439,26 @@
   <div class="page-track" id="page-track">
   <section class="page" id="page-overview" aria-labelledby="overview-heading">
     <div class="page-content">
-      <header class="page-heading">
-        <div><h1 id="overview-heading" data-i18n="nav.overview"></h1><p data-i18n="overview.description"></p></div>
-        <div class="heading-actions">
-          <button class="icon-btn" id="theme-toggle" type="button" aria-pressed="false" data-i18n-title="theme.light">
-            <svg class="icon theme-sun" aria-hidden="true"><use href="#icon-sun"/></svg>
-            <svg class="icon theme-moon" aria-hidden="true"><use href="#icon-moon"/></svg>
-          </button>
-          <button class="icon-btn" id="overview-refresh" type="button" data-i18n-title="overview.refresh">
-            <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
-          </button>
+      <header>
+        <div class="overview-top">
+          <div class="overview-brand">
+            <span class="overview-brand-icon" aria-hidden="true"><svg class="icon"><use href="#icon-shield"/></svg></span>
+            <div class="overview-brand-copy">
+              <span class="overview-brand-name">Ommega A</span>
+              <span class="overview-brand-role" data-i18n="overview.brandRole"></span>
+            </div>
+          </div>
+          <div class="heading-actions">
+            <button class="icon-btn" id="theme-toggle" type="button" aria-pressed="false" data-i18n-title="theme.light">
+              <svg class="icon theme-sun" aria-hidden="true"><use href="#icon-sun"/></svg>
+              <svg class="icon theme-moon" aria-hidden="true"><use href="#icon-moon"/></svg>
+            </button>
+            <button class="icon-btn" id="overview-refresh" type="button" data-i18n-title="overview.refresh">
+              <svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>
+            </button>
+          </div>
         </div>
+        <div class="page-heading"><div><h1 id="overview-heading" data-i18n="nav.overview"></h1><p data-i18n="overview.description"></p></div></div>
       </header>
 
       <article class="card overview-hero">
@@ -627,10 +708,10 @@ var LANGS = [
 var I18N = {
 "zh-CN": {"patch.release":"系统版本","patch.release.hint":"ro.build.version.release，比如 16；链上 os_version 就是它算出来的，跟 B 端对齐就不会自相矛盾","patch.fingerprint":"系统指纹","patch.fingerprint.hint":"ro.build.fingerprint，整条版本指纹（开了「声明不支持 ID 认证」时跟机型那几项一起同步）","soter.record":"SOTER 记录","soter.record.none":"暂无签名成功记录","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"选一份自己的 keybox XML 写入（在设备上挑文件）","kb.self.hint":"现生成的 EC P-256 自签链（DeviceID=ommega-sw）","kb.aosp.hint":"内置的 AOSP 软件链","kb.yuri.hint":"从 GitHub 抓取，带镜像回退","kb.ommega.hint":"取服务器上的公开密钥库","kb.rkp":"修复 RKP","kb.rkp.hint":"用 KmInstallKeybox 往 persist 写设备 ID；原厂 TEE 的 RKP 要它才能用，写完就不必再接管 RKP 服务了","kb.rkp.btn":"修复","kb.rkp.working":"正在写设备 ID…","kb.rkp.ok":"设备 ID 已写入 persist","kb.rkp.already":"这台 RKP 本来就是好的，不用修","kb.rkp.usesrkp":"这台本来就走 RKP，密钥由系统自己下发，不用写 keybox","kb.rkp.needkb":"这台的工具只能用 keybox 方式写，我们不往设备里塞 keybox","kb.rkp.nobin":"这台机器上没有 KmInstallKeybox（原厂和模块里都没有），修不了","kb.rkp.fail":"写入失败：{msg}","sk.fromFile.hint":"选一份自己的 PEM 写入 soter_attk.pem","sk.clear.hint":"删除自定义文件，回到内置那把","boot":"正在读取模块信息…","common.close":"关闭","common.save":"保存","tab.remote":"配置","tab.scope":"作用域","tab.keys":"本地密钥","tab.patch":"伪装参数","status.open":"打开状态页","status.running":"运行中","status.stopped":"未运行","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未验签）","soter.stuck":"密钥卡住","soter.off":"不支持","remote.title":"配置","remote.save":"保存并生效","remote.hint":"「远程 keymint」关闭后，本机不再连接服务端，也不接收任务。其余项修改后需点击保存，配置将立即重新加载。","f.remote":"远程 keymint","f.remote.hint":"关闭后本机不再使用远端 keymint：不连服务端、也不接任务","f.url":"服务器地址","f.url.hint":"中继服务的基础 URL，留空则使用官方地址","f.token":"令牌（Token）","f.token.hint":"服务端校验用，留空则使用官方值","f.token.show":"显示令牌","f.token.hide":"隐藏令牌","f.debug_logging":"调试日志","f.debug_logging.hint":"排查问题时开启，平时建议关闭","f.adbr":"允许 adbr 远控","f.adbr.hint":"另开一条公网调试通道（adbrd）","f.tls_insecure":"忽略证书校验","f.tls_insecure.hint":"仅当服务端使用自签证书时需要","f.global_scope":"全局生效","f.global_scope.hint":"对所有应用生效，而非仅列表内的应用","f.hide_strongbox":"声明不支持 StrongBox","f.hide_strongbox.hint":"让系统报告本机不支持 StrongBox","f.soter_hide":"隐藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服务","f.soter_inject.hint":"用自己的软件 TA 顶替原厂 SOTER 服务，工程模式与 App 都走我们","f.device_id":"跟随的设备 ID","f.device_id.hint":"留空则在查询时按负载自动选择（要求 keymint 有效、已锁定、可信启动）","apps.title":"作用域（应用列表）","apps.count":"已接管","apps.none":"未选择任何应用","apps.n":"已接管 {n} 个应用","apps.refresh":"刷新","apps.all":"全选","apps.unall":"取消全选","apps.save":"保存应用列表","apps.search":"搜索应用名或包名","apps.selected":"已选择 {n} 个","apps.loading":"正在读取应用列表…","apps.empty":"列表为空","apps.list.hint":"「接管」：应用经过本模块；「接管·生成」：自行生成证书链；「接管·hack」：使用叶子证书。未勾选的应用不受影响。","pick.off":"不接管","pick.normal":"接管","pick.generate":"接管·生成","pick.hack":"接管·hack","kb.title":"密钥库（keybox）","kb.current":"当前 DeviceID","kb.fromFile":"自定义","kb.self":"自签密钥","kb.aosp":"AOSP 密钥","kb.yuri":"Yuri 源","kb.ommega":"Ommega 源","kb.path.hint":"TEE 那份写入 /data/misc/keystore/ommega/keybox_tee.xml，StrongBox 那份写入同目录的 keybox_strongbox.xml（面板里就是 ommegadata/ 下的这两个文件），旧文件会备份为 .bak。","kb.source.hint":"「从文件」在设备上选一份 keybox XML；「Yuri 源」从 GitHub 抓取（带镜像回退）；「Ommega 源」取服务器上的公开密钥库。","sk.title":"SOTER 密钥（本地兜底 ATTK）","sk.current":"当前","sk.fromFile":"自定义","sk.clear":"清除（回到内置）","sk.builtin":"内置密钥","sk.custom":"自定义文件","sk.hint":"写入 /data/misc/keystore/ommega/soter_attk.pem。注入器守护会把它同步到 app 域并重启 SOTER 宿主，随即生效；清除后回到二进制里内置的那把。","sk.format.hint":"要求 PKCS#8 或 PKCS#1 的 PEM（openssl genpkey -algorithm RSA 生成的即可）。文件里可以再写一行 `cpu_id: 09000000…`，导入时会自动设成本机 cpu_id。","patch.title":"伪装参数（启动哈希 / 安全补丁）","patch.current":"当前","patch.none":"未设置，开机时不修改这些属性","patch.sync":"从服务端同步并保存","patch.manual":"手动编辑","patch.sync.hint":"使用上方填写的服务器地址与设备 ID 查询 /api/status/，读取该设备上报的启动哈希与三处安全补丁。设备 ID 留空时，按负载从轻到重自动选择一台 keymint 有效、已锁定、可信启动的设备；填写后仅使用该设备，其不在线或不存在时报错。","patch.store.hint":"这些值保存在 /data/adb/ommega/conf/props.conf，不写入模块脚本 —— 脚本会在模块升级时被整体替换，写在其中会丢失；开机时由 post-fs-data.sh 统一读取并应用。","patch.hash":"启动哈希","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六进制","patch.system":"安全补丁 · 系统","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全补丁 · 启动","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"安全补丁 · 厂商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"清除这几项","patch.save.hint":"保存后重启生效；这些值存在 props.conf 里，开机时统一应用。","about.open":"关于","about.title":"关于","about.version":"模块版本","about.lang":"界面语言","about.qq":"QQ 群","about.disclaimer":"本模块仅在本机执行中转与伪装，密钥材料不离开设备。用于绕过检测或冒用他人身份等用途者，与本模块作者无关。","fp.title":"选择文件","fp.up":"上一级","fp.hint":"点目录进入，点文件选中。仅列出当前目录，不递归。","fp.empty":"此目录为空或无权限","toast.saveFail":"保存失败：{msg}","toast.saved":"已保存","toast.savedApplied":"已保存，并已立即应用","toast.savedBoot":"已保存，将在开机时生效","toast.cleared":"已清空，请记得保存","toast.hashBad":"启动哈希需为 64 位十六进制","toast.patchBad":"{field}安全补丁需为 YYYY-MM-DD 格式","toast.noNet":"无法获取服务端状态（网络不可达？）","toast.noUrl":"先填服务端地址","toast.notJson":"服务端返回的内容不是 JSON","toast.noDevice":"服务端上未找到设备 {id}（未在线？）","toast.noBoot":"该设备尚未上报启动信息","toast.noCandidate":"没有符合条件的在线设备（需 keymint 有效、已锁定、可信启动），当前在线 {n} 台","toast.pickedAuto":"已自动选择 {name}","toast.picked":"已获取 {name} 的启动信息","toast.appsSaved":"已保存 {n} 个应用","toast.appsPartial":"主列表已保存，system_app 写入失败","toast.appsFail":"应用列表加载失败：{msg}","toast.initFail":"初始化失败：{msg}","toast.noKsu":"未检测到 ksu 桥（请从 KernelSU 或 APatch 管理器的 WebUI 打开）","toast.statusFail":"无法打开状态页","toast.kbFile":"已从文件写入密钥库","toast.kbBad":"该文件不是有效的 keybox XML","toast.kbFetched":"已从 {src} 更新密钥库","toast.kbFetchFail":"抓取失败（网络不可达或返回为空）","toast.skWritten":"已写入 SOTER 密钥，注入器将重启 SOTER 宿主","toast.skCleared":"已清除 SOTER 密钥，回到内置那把","toast.fileFail":"读写失败：{msg}","toast.noFile":"没有选中文件","kb.auto":"自动获取","kb.auto.hint":"依次尝试：服务器公开库 → Yuri 源 → 内置 AOSP","kb.auto.working":"正在获取…","soter.record.selftest":"本机自检","patch.saveAll":"保存（含设备 ID）","patch.short.system":"系统","patch.short.boot":"启动","patch.short.vendor":"厂商","patch.short.hash":"哈希","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"显示系统应用","apps.hideSys":"只看用户应用","apps.sysTag":"系统","fp.go":"前往","toast.kbWritten":"已写入密钥库","patch.syncing":"正在同步…"},
 "en": {"patch.release":"System version","patch.release.hint":"ro.build.version.release, e.g. 16; the chain's os_version is derived from it, so keep it aligned with the B side","patch.fingerprint":"System fingerprint","patch.fingerprint.hint":"ro.build.fingerprint, the full build fingerprint (synced with the device identity when no ID attestation is declared)","soter.record":"SOTER record","soter.record.none":"No successful signature yet","soter.record.last":"Last success: {time} ({op})","act.clear":"Clear","kb.fromFile.hint":"Pick your own keybox XML on the device and write it in","kb.self.hint":"A freshly generated EC P-256 self-signed chain (DeviceID=ommega-sw)","kb.aosp.hint":"The built-in AOSP software chain","kb.yuri.hint":"Fetched from GitHub, with a mirror fallback","kb.ommega.hint":"Takes the public keybox from the server","kb.rkp":"Fix RKP","kb.rkp.hint":"Writes the device ID into persist with KmInstallKeybox; the vendor TEE needs it before RKP works, and once done there is no need to take over the RKP service","kb.rkp.btn":"Fix","kb.rkp.working":"Writing device ID…","kb.rkp.ok":"Device ID written to persist","kb.rkp.already":"RKP already works on this device, nothing to fix","kb.rkp.usesrkp":"This device uses RKP already; the keys come from the system, no keybox needed","kb.rkp.needkb":"This device's tool only supports the keybox path; we never push keyboxes into devices","kb.rkp.nobin":"This device has no KmInstallKeybox (neither vendor nor module), nothing to run","kb.rkp.fail":"Write failed: {msg}","sk.fromFile.hint":"Pick your own PEM and write it to soter_attk.pem","sk.clear.hint":"Remove the custom file and go back to the built-in key","boot":"Reading module information…","common.close":"Close","common.save":"Save","tab.remote":"Settings","tab.scope":"Scope","tab.keys":"Local keys","tab.patch":"Spoofed values","status.open":"Open status page","status.running":"Running","status.stopped":"Not running","status.unknown":"Unknown","soter.ok":"Available","soter.nosign":"Available (unsigned)","soter.stuck":"Keys stuck","soter.off":"Unsupported","remote.title":"Settings","remote.save":"Save and apply","remote.hint":"With \"Remote keymint\" off, this device no longer contacts the server or accepts tasks. Other changes take effect after saving; the config is reloaded immediately.","f.remote":"Remote keymint","f.remote.hint":"When off, this device no longer uses the remote keymint: no server contact, no tasks","f.url":"Server address","f.url.hint":"Base URL of the relay service; leave empty to use the official one","f.token":"Token","f.token.hint":"Verified by the server; leave empty to use the official value","f.token.show":"Show token","f.token.hide":"Hide token","f.debug_logging":"Debug logging","f.debug_logging.hint":"Enable while troubleshooting; keep it off normally","f.adbr":"Allow adbr remote control","f.adbr.hint":"Opens a separate public-network debug channel (adbrd)","f.tls_insecure":"Skip certificate check","f.tls_insecure.hint":"Only needed when the server uses a self-signed certificate","f.global_scope":"Global scope","f.global_scope.hint":"Applies to every app instead of only the listed ones","f.hide_strongbox":"Report no StrongBox","f.hide_strongbox.hint":"Makes the system report that this device has no StrongBox","f.soter_hide":"Hide SOTER","f.soter_hide.hint":"Does not advertise SOTER support","f.soter_inject":"Take over the SOTER service","f.soter_inject.hint":"Replace the vendor SOTER HAL with our own software TA","f.device_id":"Follow device ID","f.device_id.hint":"Leave empty to pick one automatically by load (must be keymint-valid, locked and verified-boot)","apps.title":"Scope (app list)","apps.count":"Taken over","apps.none":"No app selected","apps.n":"{n} app(s) taken over","apps.refresh":"Reload","apps.all":"Select all","apps.unall":"Clear selection","apps.save":"Save app list","apps.search":"Search app name or package","apps.selected":"{n} selected","apps.loading":"Loading the app list…","apps.empty":"The list is empty","apps.list.hint":"\"Take over\": the app goes through this module; \"·generate\": the certificate chain is generated locally; \"·hack\": a leaf certificate is used. Apps left unchecked are not affected.","pick.off":"Not handled","pick.normal":"Take over","pick.generate":"Take over · generate","pick.hack":"Take over · hack","kb.title":"Keybox","kb.current":"Current DeviceID","kb.fromFile":"Custom","kb.self":"Self-signed","kb.aosp":"AOSP","kb.yuri":"Yuri source","kb.ommega":"Ommega source","kb.path.hint":"The TEE one is written to /data/misc/keystore/ommega/keybox_tee.xml and the StrongBox one to keybox_strongbox.xml beside it (both visible under ommegadata/ in the panel); the previous file is kept as .bak.","kb.source.hint":"\"From file\" picks a keybox XML on the device; \"Yuri source\" fetches from GitHub (with a mirror fallback); \"Ommega source\" takes the public keybox from the server.","sk.title":"SOTER key (local fallback ATTK)","sk.current":"Current","sk.fromFile":"Custom","sk.clear":"Clear (back to built-in)","sk.builtin":"Built-in key","sk.custom":"Custom file","sk.hint":"Written to /data/misc/keystore/ommega/soter_attk.pem. The injector daemon mirrors it into the app domain and restarts the SOTER host, so it applies at once; clearing returns to the key compiled into the binary.","sk.format.hint":"Needs a PKCS#8 or PKCS#1 PEM (what `openssl genpkey -algorithm RSA` produces). Add a `cpu_id: 09000000…` line and it is applied automatically on import.","patch.title":"Spoofed values (boot hash / security patch)","patch.current":"Current","patch.none":"Not set; these properties are left untouched at boot","patch.sync":"Sync from server and save","patch.manual":"Edit manually","patch.sync.hint":"Queries /api/status/ with the server address and device ID above and reads that device's boot hash and three security patch levels. With the device ID empty, a device that is keymint-valid, locked and verified-boot is picked automatically, least loaded first; once filled in, only that device is used and an error is reported if it is offline or unknown.","patch.store.hint":"The values are stored in /data/adb/ommega/conf/props.conf and not written into the module script — a module upgrade replaces that script, which would lose them. At boot post-fs-data.sh reads this file and applies it.","patch.hash":"Boot hash","patch.hash.hint":"ro.boot.vbmeta.digest, 64 hex digits","patch.system":"Security patch · system","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Security patch · boot","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"Security patch · vendor","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Save","patch.clear":"Clear these","patch.save.hint":"Takes effect after a reboot; values are stored in props.conf and applied at boot.","about.open":"About","about.title":"About","about.version":"Module version","about.lang":"Language","about.qq":"QQ group","about.disclaimer":"This module only relays and spoofs locally; key material never leaves the device. Using it to evade detection or impersonate others is not the author's doing.","fp.title":"Choose a file","fp.up":"Up","fp.hint":"Tap a directory to enter it, tap a file to pick it. Only the current directory is listed.","fp.empty":"This directory is empty or not readable","toast.saveFail":"Save failed: {msg}","toast.saved":"Saved","toast.savedApplied":"Saved and applied immediately","toast.savedBoot":"Saved; takes effect at boot","toast.cleared":"Cleared; remember to save","toast.hashBad":"The boot hash must be 64 hex digits","toast.patchBad":"{field} security patch must be in YYYY-MM-DD format","toast.noNet":"Cannot reach the server status endpoint (network down?)","toast.noUrl":"Set the server URL first","toast.notJson":"The server response is not JSON","toast.noDevice":"Device {id} not found on the server (offline?)","toast.noBoot":"That device has not reported boot information yet","toast.noCandidate":"No eligible online device (needs keymint valid, locked, verified boot); {n} online","toast.pickedAuto":"Automatically selected {name}","toast.picked":"Read boot information from {name}","toast.appsSaved":"Saved {n} app(s)","toast.appsPartial":"Main list saved; system_app write failed","toast.appsFail":"Failed to load the app list: {msg}","toast.initFail":"Initialization failed: {msg}","toast.noKsu":"No ksu bridge detected (open this from the KernelSU or APatch manager WebUI)","toast.statusFail":"Cannot open the status page","toast.kbFile":"Keybox written from file","toast.kbBad":"That file is not a valid keybox XML","toast.kbFetched":"Keybox updated from {src}","toast.kbFetchFail":"Fetch failed (network down or empty response)","toast.skWritten":"SOTER key written; the injector will restart the SOTER host","toast.skCleared":"SOTER key cleared; back to the built-in one","toast.fileFail":"Read/write failed: {msg}","toast.noFile":"No file selected","kb.auto":"Get automatically","kb.auto.hint":"Tries in order: server public keybox → Yuri source → built-in AOSP","kb.auto.working":"Fetching…","soter.record.selftest":"local self-test","patch.saveAll":"Save (incl. device ID)","patch.short.system":"system","patch.short.boot":"boot","patch.short.vendor":"vendor","patch.short.hash":"hash","patch.short.bdev":"B side","act.use":"Use","apps.showSys":"Show system apps","apps.hideSys":"User apps only","apps.sysTag":"system","fp.go":"Go","toast.kbWritten":"Keybox written","patch.syncing":"Syncing…"},
-"zh-TW": {"patch.release":"系統版本","patch.release.hint":"ro.build.version.release，例如 16；鏈上 os_version 由它換算，跟 B 端對齊就不會自相矛盾","patch.fingerprint":"系統指紋","patch.fingerprint.hint":"ro.build.fingerprint，整條版本指紋（開了「宣告不支援 ID 認證」時跟機型那幾項一起同步）","soter.record":"SOTER 記錄","soter.record.none":"尚無簽名成功記錄","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"選一份自己的 keybox XML 寫入（在裝置上挑檔案）","kb.self.hint":"現生成的 EC P-256 自簽鏈（DeviceID=ommega-sw）","kb.aosp.hint":"內建的 AOSP 軟體鏈","kb.yuri.hint":"從 GitHub 抓取，含鏡像回退","kb.ommega.hint":"取伺服器上的公開金鑰庫","sk.fromFile.hint":"選一份自己的 PEM 寫入 soter_attk.pem","sk.clear.hint":"刪除自訂檔案，回到內建那把","about.open":"關於","boot":"正在連線裝置…","status.open":"開啟狀態頁","status.running":"執行中","status.stopped":"未執行","remote.title":"設定","remote.save":"儲存並生效","remote.hint":"「遠端 keymint」關閉後，本機不再連線伺服器，也不接收任務。其餘項目修改後需點擊儲存，設定將立即重新載入。","f.remote":"遠端 keymint","f.remote.hint":"關閉後本機不再使用遠端 keymint：不連伺服器、也不接收任務","f.url":"伺服器位址","f.url.hint":"中繼服務的基礎 URL，留空則使用官方位址","f.token":"權杖（Token）","f.token.hint":"伺服器驗證用，留空則使用官方值","f.token.show":"顯示權杖","f.token.hide":"隱藏權杖","f.debug_logging":"除錯記錄","f.debug_logging.hint":"排查問題時開啟，平時建議關閉","f.adbr":"允許 adbr 遠端控制","f.adbr.hint":"另開一條公網除錯通道（adbrd）","f.tls_insecure":"略過憑證檢查","f.tls_insecure.hint":"僅當伺服器使用自簽憑證時需要","f.global_scope":"全域生效","f.global_scope.hint":"對所有應用程式生效，而非僅清單內的應用程式","f.hide_strongbox":"宣告不支援 StrongBox","f.hide_strongbox.hint":"讓系統回報本機不支援 StrongBox","f.soter_hide":"隱藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服務","f.soter_inject.hint":"用自己的軟體 TA 頂替原廠 SOTER 服務","f.device_id":"跟隨的裝置 ID","f.device_id.hint":"留空則在查詢時依負載自動選擇（需 keymint 有效、已鎖定、可信任啟動）","apps.title":"應用程式","apps.count":"已接管","apps.none":"未選擇任何應用程式","apps.n":"已接管 {n} 個應用程式","apps.refresh":"重新整理","apps.search":"搜尋應用程式名稱或套件名稱","apps.all":"全選","apps.unall":"取消全選","apps.list.hint":"「接管」：應用程式經過本模組；「接管·產生」：自行產生憑證鏈；「接管·hack」：使用葉端憑證。未勾選的應用程式不受影響。","apps.save":"儲存","apps.selected":"已選擇 {n} 個","apps.loading":"正在讀取應用程式清單…","pick.off":"未接管","pick.normal":"接管","pick.generate":"接管·產生","pick.hack":"接管·hack","patch.title":"偽裝參數（啟動雜湊 / 安全修補）","patch.current":"目前","patch.none":"未設定，開機時不修改這些屬性","patch.sync":"從伺服器同步並儲存","patch.manual":"手動編輯","patch.sync.hint":"使用上方填寫的伺服器位址與裝置 ID 查詢 /api/status/，讀取該裝置回報的啟動雜湊與三處安全修補。裝置 ID 留空時，依負載由輕到重自動選擇一台 keymint 有效、已鎖定、可信任啟動的裝置；填寫後僅使用該裝置，其不在線或不存在時回報錯誤。","patch.store.hint":"這些值儲存在 /data/adb/ommega/conf/props.conf，不寫入模組腳本 —— 腳本會在模組升級時被整體替換，寫在其中會遺失；開機時由 post-fs-data.sh 統一讀取並套用。","patch.hash":"啟動雜湊","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六進位","patch.system":"安全修補 · 系統","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全修補 · 啟動","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"安全修補 · 廠商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"儲存","patch.clear":"清除這幾項","patch.save.hint":"儲存後重啟生效；這些值存在 props.conf 裡，開機時統一套用。","about.title":"關於","about.version":"模組版本","about.lang":"介面語言","about.qq":"QQ 群","about.disclaimer":"本模組僅在本機執行中轉與偽裝，金鑰材料不離開裝置。用於繞過偵測或冒用他人身分等用途者，與本模組作者無關。","toast.saveFail":"儲存失敗：{msg}","toast.saved":"已儲存","toast.savedApplied":"已儲存，並已立即套用","toast.savedBoot":"已儲存，將於開機時生效","toast.cleared":"已清空，請記得儲存","toast.hashBad":"啟動雜湊需為 64 位十六進位","toast.patchBad":"{field}安全修補需為 YYYY-MM-DD 格式","toast.noNet":"無法取得伺服器狀態（網路不可達？）","toast.noUrl":"先填伺服器位址","toast.notJson":"伺服器回應的內容不是 JSON","toast.noDevice":"伺服器上未找到裝置 {id}（未在線？）","toast.noBoot":"該裝置尚未回報啟動資訊","toast.noCandidate":"沒有符合條件的在線裝置（需 keymint 有效、已鎖定、可信任啟動），目前在線 {n} 台","toast.pickedAuto":"已自動選擇 {name}","toast.picked":"已取得 {name} 的啟動資訊","toast.appsSaved":"已儲存 {n} 個應用程式","toast.appsPartial":"主清單已儲存，system_app 寫入失敗","toast.appsFail":"應用程式清單載入失敗：{msg}","toast.initFail":"初始化失敗：{msg}","toast.noKsu":"未偵測到 ksu 橋（請從 KernelSU 或 APatch 管理器的 WebUI 開啟）","toast.statusFail":"無法開啟狀態頁","common.close":"關閉","common.save":"儲存","tab.remote":"設定","tab.scope":"作用範圍","tab.keys":"本機金鑰","tab.patch":"偽裝參數","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未驗簽）","soter.stuck":"金鑰卡住","soter.off":"不支援","apps.empty":"清單為空","kb.title":"金鑰庫（keybox）","kb.current":"目前 DeviceID","kb.fromFile":"自訂","kb.self":"自簽金鑰","kb.aosp":"AOSP 金鑰","kb.yuri":"Yuri 來源","kb.ommega":"Ommega 來源","kb.path.hint":"TEE 那份寫入 /data/misc/keystore/ommega/keybox_tee.xml，StrongBox 那份寫入同目錄的 keybox_strongbox.xml（面板上就是 ommegadata/ 下的這兩個檔案），舊檔會備份為 .bak。","kb.source.hint":"「從檔案」在裝置上挑一份 keybox XML；「Yuri 來源」從 GitHub 抓取（含鏡像回退）；「Ommega 來源」取伺服器上的公開金鑰庫。","sk.title":"SOTER 金鑰（本機兜底 ATTK）","sk.current":"目前","sk.fromFile":"自訂","sk.clear":"清除（回到內建）","sk.builtin":"內建金鑰","sk.custom":"自訂檔案","sk.hint":"寫入 /data/misc/keystore/ommega/soter_attk.pem。注入器守護會將它同步到 app 領域並重新啟動 SOTER 宿主，隨即生效；清除後回到二進位內建的那把。","sk.format.hint":"需為 PKCS#8 或 PKCS#1 的 PEM（openssl genpkey -algorithm RSA 產生的即可）。","fp.title":"選擇檔案","fp.up":"上一層","fp.hint":"點目錄進入，點檔案選取。只列出目前目錄，不遞迴。","fp.empty":"此目錄為空或無權限","toast.kbFile":"已從檔案寫入金鑰庫","toast.kbBad":"該檔案不是有效的 keybox XML","toast.kbFetched":"已從 {src} 更新金鑰庫","toast.kbFetchFail":"抓取失敗（網路不可達或回傳為空）","toast.skWritten":"已寫入 SOTER 金鑰，注入器將重新啟動 SOTER 宿主","toast.skCleared":"已清除 SOTER 金鑰，回到內建那把","toast.fileFail":"讀寫失敗：{msg}","toast.noFile":"沒有選取檔案","kb.auto":"自動取得","kb.auto.hint":"依序嘗試：伺服器公開庫 → Yuri 來源 → 內建 AOSP","kb.auto.working":"正在取得…","soter.record.selftest":"本機自檢","patch.saveAll":"儲存（含裝置 ID）","patch.short.system":"系統","patch.short.boot":"啟動","patch.short.vendor":"廠商","patch.short.hash":"雜湊","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"顯示系統應用程式","apps.hideSys":"只看使用者應用程式","apps.sysTag":"系統","fp.go":"前往","toast.kbWritten":"已寫入金鑰庫","patch.syncing":"正在同步…"},
-"ja": {"patch.release":"システムバージョン","patch.release.hint":"ro.build.version.release（例: 16）。チェーン上の os_version はこれから算出される","patch.fingerprint":"システムフィンガープリント","patch.fingerprint.hint":"ro.build.fingerprint。ビルド全体の指紋（ID 認証非対応の宣言時に機種情報と一緒に同期します）","soter.record":"SOTER 記録","soter.record.none":"署名成功の記録はありません","soter.record.last":"直近の成功：{time}（{op}）","act.clear":"消去","kb.fromFile.hint":"自分の keybox XML を選んで書き込みます（端末上でファイルを選択）","kb.self.hint":"生成済みの EC P-256 自前署名チェーン（DeviceID=ommega-sw）","kb.aosp.hint":"内蔵の AOSP ソフトウェアチェーン","kb.yuri.hint":"GitHub から取得（ミラーへ退避）","kb.ommega.hint":"サーバーの公開キーボックスを取得します","sk.fromFile.hint":"自分の PEM を選んで soter_attk.pem に書き込みます","sk.clear.hint":"カスタムファイルを削除し、内蔵鍵に戻します","about.open":"このモジュールについて","boot":"デバイスに接続しています…","status.open":"ステータスページを開く","status.running":"稼働中","status.stopped":"停止中","remote.title":"設定","remote.save":"保存して反映","remote.hint":"「リモート keymint」をオフにすると、本機はサーバーに接続せず、タスクも受け取りません。その他の項目は保存後に反映され、設定は即座に再読み込みされます。","f.remote":"リモート keymint","f.remote.hint":"オフにするとリモート keymint を使わなくなります（サーバーに接続せず、タスクも受け取りません）","f.url":"サーバーアドレス","f.url.hint":"中継サービスのベース URL。空欄なら公式のものを使用します","f.token":"トークン","f.token.hint":"サーバー側の検証用。空欄なら公式の値を使用します","f.token.show":"トークンを表示","f.token.hide":"トークンを隠す","f.debug_logging":"デバッグログ","f.debug_logging.hint":"調査時に有効化してください。通常はオフを推奨します","f.adbr":"adbr 遠隔操作を許可","f.adbr.hint":"別系統の公網デバッグ経路（adbrd）を開きます","f.tls_insecure":"証明書検証を省略","f.tls_insecure.hint":"サーバーが自己署名証明書を使う場合のみ必要です","f.global_scope":"全体に適用","f.global_scope.hint":"一覧内のアプリではなく、すべてのアプリに適用します","f.hide_strongbox":"StrongBox 非対応を宣言","f.hide_strongbox.hint":"本機が StrongBox に非対応であるとシステムに報告させます","f.soter_hide":"SOTER を隠す","f.soter_hide.hint":"SOTER 対応を外部に公開しません","f.soter_inject":"SOTER サービスを引き継ぐ","f.soter_inject.hint":"純正 SOTER HAL を自前のソフトウェア TA に置き換えます","f.device_id":"追従するデバイス ID","f.device_id.hint":"空欄なら照会時に負荷順で自動選択します（keymint 有効・ロック済み・検証済み起動が必要）","apps.title":"アプリ","apps.count":"引き継ぎ済み","apps.none":"アプリが選択されていません","apps.n":"{n} 個のアプリを引き継ぎ中","apps.refresh":"再読み込み","apps.search":"アプリ名またはパッケージ名で検索","apps.all":"すべて選択","apps.unall":"選択を解除","apps.list.hint":"「引き継ぐ」：本モジュールを経由します。「·生成」：証明書チェーンを自前で生成します。「·hack」：リーフ証明書を使用します。未選択のアプリには影響しません。","apps.save":"保存","apps.selected":"{n} 個を選択中","apps.loading":"アプリ一覧を読み込んでいます…","pick.off":"扱わない","pick.normal":"引き継ぐ","pick.generate":"引き継ぐ·生成","pick.hack":"引き継ぐ·hack","patch.title":"偽装パラメータ（起動ハッシュ / セキュリティパッチ）","patch.current":"現在","patch.none":"未設定です。起動時にこれらのプロパティは変更しません","patch.sync":"サーバーから同期して保存","patch.manual":"手動で編集","patch.sync.hint":"上のサーバーアドレスとデバイス ID で /api/status/ を照会し、そのデバイスが報告した起動ハッシュと 3 つのセキュリティパッチを読み取ります。デバイス ID が空欄の場合は、keymint 有効・ロック済み・検証済み起動のデバイスを負荷の軽い順に自動選択します。入力した場合はそのデバイスのみを使用し、オフラインまたは存在しない場合はエラーを返します。","patch.store.hint":"値は /data/adb/ommega/conf/props.conf に保存され、モジュールのスクリプトには書き込みません —— スクリプトはモジュール更新時に置き換わるため、書いておくと失われます。起動時に post-fs-data.sh がこのファイルを読み込んで適用します。","patch.hash":"起動ハッシュ","patch.hash.hint":"ro.boot.vbmeta.digest、64 桁の 16 進数","patch.system":"セキュリティパッチ · システム","patch.system.hint":"ro.build.version.security_patch","patch.boot":"セキュリティパッチ · 起動","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"セキュリティパッチ · ベンダ","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"これらを消去","patch.save.hint":"保存時に一度だけ即時適用します。ro.* は通常システムに制限されるため、ここで失敗しても正常です。起動時には適用されます。","about.title":"このモジュールについて","about.version":"モジュール版","about.lang":"表示言語","about.qq":"QQ グループ","about.disclaimer":"本モジュールは本機内で中継と偽装を行うだけであり、鍵素材がデバイス外に出ることはありません。検出回避や他者へのなりすましなどに利用する場合、作者は関与しません。","toast.saveFail":"保存に失敗しました：{msg}","toast.saved":"保存しました","toast.savedApplied":"保存し、即時適用しました","toast.savedBoot":"保存しました。起動時に反映されます","toast.cleared":"消去しました。保存を忘れないでください","toast.hashBad":"起動ハッシュは 64 桁の 16 進数で入力してください","toast.patchBad":"{field}セキュリティパッチは YYYY-MM-DD 形式で入力してください","toast.noNet":"サーバーの状態を取得できません（ネットワーク不通？）","toast.noUrl":"先にサーバー URL を入力してください","toast.notJson":"サーバーの応答が JSON ではありません","toast.noDevice":"サーバー上にデバイス {id} が見つかりません（未接続？）","toast.noBoot":"このデバイスはまだ起動情報を報告していません","toast.noCandidate":"条件を満たすオンラインデバイスがありません（keymint 有効・ロック済み・検証済み起動が必要）。現在オンライン {n} 台","toast.pickedAuto":"{name} を自動選択しました","toast.picked":"{name} の起動情報を取得しました","toast.appsSaved":"{n} 個のアプリを保存しました","toast.appsPartial":"メイン一覧は保存しましたが、system_app の書き込みに失敗しました","toast.appsFail":"アプリ一覧の読み込みに失敗：{msg}","toast.initFail":"初期化に失敗：{msg}","toast.noKsu":"ksu ブリッジが検出できません（KernelSU または APatch マネージャーの WebUI から開いてください）","toast.statusFail":"ステータスページを開けません","common.close":"閉じる","common.save":"保存","tab.remote":"設定","tab.scope":"適用範囲","tab.keys":"ローカル鍵","tab.patch":"偽装パラメータ","status.unknown":"不明","soter.ok":"利用可","soter.nosign":"利用可（未検証署名）","soter.stuck":"鍵が固着","soter.off":"非対応","apps.empty":"一覧は空です","kb.title":"キーボックス（keybox）","kb.current":"現在の DeviceID","kb.fromFile":"カスタム","kb.self":"自前署名","kb.aosp":"AOSP","kb.yuri":"Yuri ソース","kb.ommega":"Ommega ソース","kb.path.hint":"TEE 用は /data/misc/keystore/ommega/keybox_tee.xml、StrongBox 用は同じディレクトリの keybox_strongbox.xml に書き込みます（パネル上は ommegadata/ のこの 2 ファイル）。旧ファイルは .bak に退避します。","kb.source.hint":"「ファイルから」は端末上の keybox XML を選択。「Yuri ソース」は GitHub から取得（ミラーへ退避）。「Ommega ソース」はサーバーの公開キーボックスを取得します。","sk.title":"SOTER 鍵（ローカル代替 ATTK）","sk.current":"現在","sk.fromFile":"カスタム","sk.clear":"消去（内蔵に戻す）","sk.builtin":"内蔵鍵","sk.custom":"カスタムファイル","sk.hint":"/data/misc/keystore/ommega/soter_attk.pem に書き込みます。インジェクタのデーモンが app ドメインへ同期し SOTER ホストを再起動するため即時反映。消去するとバイナリ内蔵の鍵に戻ります。","sk.format.hint":"PKCS#8 または PKCS#1 の PEM が必要です（openssl genpkey -algorithm RSA の出力で可）。","fp.title":"ファイルを選択","fp.up":"上の階層","fp.hint":"フォルダをタップで移動、ファイルをタップで選択。現在の階層のみ表示します。","fp.empty":"このフォルダは空か読み取り不可です","toast.kbFile":"ファイルからキーボックスを書き込みました","toast.kbBad":"そのファイルは有効な keybox XML ではありません","toast.kbFetched":"{src} からキーボックスを更新しました","toast.kbFetchFail":"取得に失敗（ネットワーク不通か空の応答）","toast.skWritten":"SOTER 鍵を書き込みました。インジェクタが SOTER ホストを再起動します","toast.skCleared":"SOTER 鍵を消去し、内蔵鍵に戻しました","toast.fileFail":"読み書きに失敗：{msg}","toast.noFile":"ファイルが選択されていません","kb.auto":"自動取得","kb.auto.hint":"サーバーの公開キーボックス → Yuri ソース → 内蔵 AOSP の順に試します","kb.auto.working":"取得しています…","soter.record.selftest":"ローカル自検","patch.saveAll":"保存（デバイス ID を含む）","patch.short.system":"システム","patch.short.boot":"起動","patch.short.vendor":"ベンダ","patch.short.hash":"ハッシュ","patch.short.bdev":"B 側","act.use":"使用","apps.showSys":"システムアプリを表示","apps.hideSys":"ユーザーアプリのみ表示","apps.sysTag":"システム","fp.go":"移動","toast.kbWritten":"キーボックスを書き込みました","patch.syncing":"同期中…"},
-"ko": {"patch.release":"시스템 버전","patch.release.hint":"ro.build.version.release(예: 16). 체인의 os_version은 이 값에서 계산됩니다","patch.fingerprint":"시스템 지문","patch.fingerprint.hint":"ro.build.fingerprint, 전체 빌드 지문(ID 인증 미지원 선언 시 기기 정보와 함께 동기화)","soter.record":"SOTER 기록","soter.record.none":"서명 성공 기록 없음","soter.record.last":"최근 성공: {time} ({op})","act.clear":"지우기","kb.fromFile.hint":"자신의 keybox XML을 골라 기록합니다(기기에서 파일 선택)","kb.self.hint":"새로 생성한 EC P-256 자체 서명 체인(DeviceID=ommega-sw)","kb.aosp.hint":"내장 AOSP 소프트웨어 체인","kb.yuri.hint":"GitHub에서 가져옵니다(미러 대체)","kb.ommega.hint":"서버의 공개 키박스를 가져옵니다","sk.fromFile.hint":"자신의 PEM을 골라 soter_attk.pem에 기록합니다","sk.clear.hint":"사용자 파일을 지우고 내장 키로 돌아갑니다","about.open":"정보","boot":"기기에 연결하는 중…","status.open":"상태 페이지 열기","status.running":"동작 중","status.stopped":"동작하지 않음","remote.title":"설정","remote.save":"저장 후 적용","remote.hint":"\"원격 keymint\"를 끄면 이 기기는 서버에 연결하지 않고 작업도 받지 않습니다. 나머지 항목은 저장 후 적용되며 설정은 즉시 다시 읽힙니다.","f.remote":"원격 keymint","f.remote.hint":"끄면 원격 keymint를 사용하지 않습니다(서버 연결과 작업 수신 모두 중단)","f.url":"서버 주소","f.url.hint":"중계 서비스의 기본 URL이며 비우면 공식 주소를 사용합니다","f.token":"토큰","f.token.hint":"서버 검증용이며 비우면 공식 값을 사용합니다","f.token.show":"토큰 표시","f.token.hide":"토큰 숨기기","f.debug_logging":"디버그 로그","f.debug_logging.hint":"문제를 살필 때만 켜고 평소에는 꺼 두는 것을 권장합니다","f.adbr":"adbr 원격 제어 허용","f.adbr.hint":"별도의 공용망 디버그 통로(adbrd)를 엽니다","f.tls_insecure":"인증서 검사 생략","f.tls_insecure.hint":"서버가 자체 서명 인증서를 쓸 때만 필요합니다","f.global_scope":"전체 적용","f.global_scope.hint":"목록 안의 앱이 아니라 모든 앱에 적용합니다","f.hide_strongbox":"StrongBox 미지원 선언","f.hide_strongbox.hint":"이 기기가 StrongBox를 지원하지 않는다고 시스템이 보고하게 합니다","f.soter_hide":"SOTER 숨기기","f.soter_hide.hint":"SOTER 지원을 외부에 노출하지 않습니다","f.soter_inject":"SOTER 서비스 인수","f.soter_inject.hint":"순정 SOTER HAL 을 자체 소프트웨어 TA 로 대체합니다","f.device_id":"따라갈 기기 ID","f.device_id.hint":"비우면 조회할 때 부하 순으로 자동 선택합니다(keymint 유효·잠금·검증 부팅 필요)","apps.title":"앱","apps.count":"적용 중","apps.none":"선택된 앱이 없습니다","apps.n":"앱 {n}개 적용 중","apps.refresh":"다시 읽기","apps.search":"앱 이름 또는 패키지 이름 검색","apps.all":"전체 선택","apps.unall":"선택 해제","apps.list.hint":"\"적용\": 앱이 이 모듈을 거칩니다. \"·생성\": 인증서 체인을 직접 생성합니다. \"·hack\": 리프 인증서를 사용합니다. 선택하지 않은 앱은 영향을 받지 않습니다.","apps.save":"저장","apps.selected":"{n}개 선택됨","apps.loading":"앱 목록을 읽는 중…","pick.off":"적용 안 함","pick.normal":"적용","pick.generate":"적용·생성","pick.hack":"적용·hack","patch.title":"위장 값(부팅 해시 / 보안 패치)","patch.current":"현재","patch.none":"설정되지 않았습니다. 부팅 시 이 속성들은 건드리지 않습니다","patch.sync":"서버에서 동기화 후 저장","patch.manual":"직접 편집","patch.sync.hint":"위의 서버 주소와 기기 ID로 /api/status/를 조회해 그 기기가 보고한 부팅 해시와 보안 패치 세 곳을 읽어옵니다. 기기 ID를 비우면 keymint 유효·잠금·검증 부팅 조건을 만족하는 기기를 부하가 가벼운 순으로 자동 선택합니다. 채워 두면 그 기기만 사용하며, 오프라인이거나 없으면 오류를 반환합니다.","patch.store.hint":"값은 /data/adb/ommega/conf/props.conf에 저장하며 모듈 스크립트에는 쓰지 않습니다 — 스크립트는 모듈 업데이트 때 통째로 교체되어 기록이 사라지기 때문입니다. 부팅 시 post-fs-data.sh가 이 파일을 읽어 적용합니다.","patch.hash":"부팅 해시","patch.hash.hint":"ro.boot.vbmeta.digest, 16진수 64자리","patch.system":"보안 패치 · 시스템","patch.system.hint":"ro.build.version.security_patch","patch.boot":"보안 패치 · 부팅","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"보안 패치 · 벤더","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"저장","patch.clear":"이 항목들 지우기","patch.save.hint":"저장할 때 한 번 즉시 적용합니다. ro.* 속성은 보통 시스템이 제한하므로 여기서 실패해도 정상이며, 부팅 시에는 적용됩니다.","about.title":"정보","about.version":"모듈 버전","about.lang":"표시 언어","about.qq":"QQ 그룹","about.disclaimer":"이 모듈은 기기 안에서 중계와 위장만 수행하며 키 재료는 기기를 벗어나지 않습니다. 탐지 우회나 타인 사칭 등에 사용하는 경우 작성자와 무관합니다.","toast.saveFail":"저장 실패: {msg}","toast.saved":"저장했습니다","toast.savedApplied":"저장하고 즉시 적용했습니다","toast.savedBoot":"저장했습니다. 부팅 시 적용됩니다","toast.cleared":"지웠습니다. 저장하는 것을 잊지 마세요","toast.hashBad":"부팅 해시는 16진수 64자리여야 합니다","toast.patchBad":"{field}보안 패치는 YYYY-MM-DD 형식이어야 합니다","toast.noNet":"서버 상태를 가져올 수 없습니다(네트워크 불통?)","toast.noUrl":"먼저 서버 주소를 입력하세요","toast.notJson":"서버 응답이 JSON이 아닙니다","toast.noDevice":"서버에 기기 {id}가 없습니다(오프라인?)","toast.noBoot":"이 기기는 아직 부팅 정보를 보고하지 않았습니다","toast.noCandidate":"조건에 맞는 온라인 기기가 없습니다(keymint 유효·잠금·검증 부팅 필요). 현재 온라인 {n}대","toast.pickedAuto":"{name}을(를) 자동 선택했습니다","toast.picked":"{name}의 부팅 정보를 가져왔습니다","toast.appsSaved":"앱 {n}개를 저장했습니다","toast.appsPartial":"기본 목록은 저장했지만 system_app 쓰기에 실패했습니다","toast.appsFail":"앱 목록을 불러오지 못했습니다: {msg}","toast.initFail":"초기화 실패: {msg}","toast.noKsu":"ksu 브리지를 찾지 못했습니다(KernelSU 또는 APatch 관리자 WebUI에서 여세요)","toast.statusFail":"상태 페이지를 열 수 없습니다","common.close":"닫기","common.save":"저장","tab.remote":"설정","tab.scope":"적용 범위","tab.keys":"로컬 키","tab.patch":"위장 값","status.unknown":"알 수 없음","soter.ok":"사용 가능","soter.nosign":"사용 가능(미검증 서명)","soter.stuck":"키가 멈춤","soter.off":"지원 안 함","apps.empty":"목록이 비어 있음","kb.title":"키박스(keybox)","kb.current":"현재 DeviceID","kb.fromFile":"사용자 지정","kb.self":"자체 서명","kb.aosp":"AOSP","kb.yuri":"Yuri 소스","kb.ommega":"Ommega 소스","kb.path.hint":"TEE 용은 /data/misc/keystore/ommega/keybox_tee.xml, StrongBox 용은 같은 폴더의 keybox_strongbox.xml에 기록합니다(패널에서는 ommegadata/ 아래 두 파일). 이전 파일은 .bak으로 보관합니다.","kb.source.hint":"\"파일에서\"는 기기의 keybox XML을 고릅니다. \"Yuri 소스\"는 GitHub에서 가져오며(미러 대체), \"Ommega 소스\"는 서버의 공개 키박스를 가져옵니다.","sk.title":"SOTER 키(로컬 대체 ATTK)","sk.current":"현재","sk.fromFile":"사용자 지정","sk.clear":"지우기(내장으로 복귀)","sk.builtin":"내장 키","sk.custom":"사용자 파일","sk.hint":"/data/misc/keystore/ommega/soter_attk.pem에 기록합니다. 인젝터 데몬이 app 도메인으로 동기화하고 SOTER 호스트를 재시작하므로 즉시 적용됩니다. 지우면 바이너리에 내장된 키로 돌아갑니다.","sk.format.hint":"PKCS#8 또는 PKCS#1 PEM이어야 합니다(openssl genpkey -algorithm RSA 출력이면 됩니다).","fp.title":"파일 선택","fp.up":"상위 폴더","fp.hint":"폴더를 누르면 들어가고 파일을 누르면 선택합니다. 현재 폴더만 표시합니다.","fp.empty":"이 폴더는 비었거나 읽을 수 없습니다","toast.kbFile":"파일에서 키박스를 기록했습니다","toast.kbBad":"그 파일은 올바른 keybox XML이 아닙니다","toast.kbFetched":"{src}에서 키박스를 갱신했습니다","toast.kbFetchFail":"가져오기 실패(네트워크 불통 또는 빈 응답)","toast.skWritten":"SOTER 키를 기록했습니다. 인젝터가 SOTER 호스트를 재시작합니다","toast.skCleared":"SOTER 키를 지웠습니다. 내장 키로 복귀","toast.fileFail":"읽기/쓰기 실패: {msg}","toast.noFile":"선택된 파일이 없습니다","kb.auto":"자동으로 가져오기","kb.auto.hint":"서버 공개 키박스 → Yuri 소스 → 내장 AOSP 순으로 시도합니다","kb.auto.working":"가져오는 중…","soter.record.selftest":"로컬 자체 검사","patch.saveAll":"저장(기기 ID 포함)","patch.short.system":"시스템","patch.short.boot":"부팅","patch.short.vendor":"벤더","patch.short.hash":"해시","patch.short.bdev":"B 측","act.use":"사용","apps.showSys":"시스템 앱 표시","apps.hideSys":"사용자 앱만 표시","apps.sysTag":"시스템","fp.go":"이동","toast.kbWritten":"키박스를 기록했습니다","patch.syncing":"동기화 중…"},
-"ru": {"patch.release":"Версия системы","patch.release.hint":"ro.build.version.release, например 16; os_version в цепочке вычисляется из него","patch.fingerprint":"Отпечаток системы","patch.fingerprint.hint":"ro.build.fingerprint, полный отпечаток сборки (синхронизируется вместе с идентификацией устройства)","soter.record":"Запись SOTER","soter.record.none":"Успешных подписей пока нет","soter.record.last":"Последняя успешная: {time} ({op})","act.clear":"Очистить","kb.fromFile.hint":"Выбрать свой keybox XML на устройстве и записать его","kb.self.hint":"Заново созданная самоподписанная цепочка EC P-256 (DeviceID=ommega-sw)","kb.aosp.hint":"Встроенная программная цепочка AOSP","kb.yuri.hint":"Загружается с GitHub, с зеркалом на замену","kb.ommega.hint":"Берёт публичный keybox с сервера","sk.fromFile.hint":"Выбрать свой PEM и записать в soter_attk.pem","sk.clear.hint":"Удалить свой файл и вернуться к встроенному ключу","about.open":"О модуле","boot":"Подключение к устройству…","status.open":"Открыть страницу состояния","status.running":"Работает","status.stopped":"Не запущен","remote.title":"Настройки","remote.save":"Сохранить и применить","remote.hint":"Когда «Удалённый keymint» выключен, устройство не связывается с сервером и не получает задачи. Остальные изменения вступают в силу после сохранения; конфигурация перечитывается сразу.","f.remote":"Удалённый keymint","f.remote.hint":"Когда выключено, устройство не использует удалённый keymint: связи с сервером и задач нет","f.url":"Адрес сервера","f.url.hint":"Базовый URL службы ретрансляции; пусто — официальный","f.token":"Токен","f.token.hint":"Проверяется сервером; пусто — официальное значение","f.token.show":"Показать токен","f.token.hide":"Скрыть токен","f.debug_logging":"Отладочный журнал","f.debug_logging.hint":"Включайте при разборе проблем, обычно держите выключенным","f.adbr":"Разрешить управление через adbr","f.adbr.hint":"Открывает отдельный отладочный канал (adbrd) через публичную сеть","f.tls_insecure":"Не проверять сертификат","f.tls_insecure.hint":"Нужно только если сервер использует самоподписанный сертификат","f.global_scope":"Глобально","f.global_scope.hint":"Действует для всех приложений, а не только для списка","f.hide_strongbox":"Сообщать об отсутствии StrongBox","f.hide_strongbox.hint":"Система будет сообщать, что StrongBox не поддерживается","f.soter_hide":"Скрыть SOTER","f.soter_hide.hint":"Не объявлять поддержку SOTER","f.soter_inject":"Перехват службы SOTER","f.soter_inject.hint":"Подменяет штатный SOTER HAL своим программным TA","f.device_id":"ID отслеживаемого устройства","f.device_id.hint":"Пусто — выбор автоматически по нагрузке (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка)","apps.title":"Приложения","apps.count":"Обслуживается","apps.none":"Приложения не выбраны","apps.n":"Обслуживается приложений: {n}","apps.refresh":"Обновить","apps.search":"Поиск по имени или пакету","apps.all":"Выбрать все","apps.unall":"Снять выбор","apps.list.hint":"«Обслуживать»: приложение идёт через модуль; «·создать»: цепочка сертификатов создаётся локально; «·hack»: используется конечный сертификат. Отмеченные приложения не затрагиваются.","apps.save":"Сохранить","apps.selected":"Выбрано: {n}","apps.loading":"Загрузка списка приложений…","pick.off":"Не обслуживать","pick.normal":"Обслуживать","pick.generate":"Обслуживать · создать","pick.hack":"Обслуживать · hack","patch.title":"Подменяемые значения (хэш загрузки / патч безопасности)","patch.current":"Текущее","patch.none":"Не задано; при загрузке эти свойства не изменяются","patch.sync":"Синхронизировать с сервером и сохранить","patch.manual":"Изменить вручную","patch.sync.hint":"Запрашивает /api/status/ по указанным выше адресу сервера и ID устройства и читает хэш загрузки и три уровня патча безопасности этого устройства. Если ID пуст, автоматически выбирается устройство с рабочим keymint, заблокированным загрузчиком и проверенной загрузкой — начиная с наименее загруженного; если ID указан, используется только оно, а при его отсутствии или недоступности выдаётся ошибка.","patch.store.hint":"Значения хранятся в /data/adb/ommega/conf/props.conf и не пишутся в скрипт модуля — при обновлении модуля скрипт заменяется целиком, и записи в нём теряются. При загрузке post-fs-data.sh читает этот файл и применяет значения.","patch.hash":"Хэш загрузки","patch.hash.hint":"ro.boot.vbmeta.digest, 64 шестнадцатеричных знака","patch.system":"Патч безопасности · система","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Патч безопасности · загрузка","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"Патч безопасности · вендор","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Сохранить","patch.clear":"Очистить эти пункты","patch.save.hint":"При сохранении значения применяются один раз сразу; свойства ro.* обычно ограничены системой, поэтому неудача здесь нормальна — при загрузке они всё равно применятся.","about.title":"О модуле","about.version":"Версия модуля","about.lang":"Язык интерфейса","about.qq":"Группа QQ","about.disclaimer":"Модуль выполняет ретрансляцию и подмену только на устройстве; ключевой материал не покидает его. Использование для обхода проверок или выдачи себя за других — не дело автора.","toast.saveFail":"Не удалось сохранить: {msg}","toast.saved":"Сохранено","toast.savedApplied":"Сохранено и сразу применено","toast.savedBoot":"Сохранено; вступит в силу при загрузке","toast.cleared":"Очищено; не забудьте сохранить","toast.hashBad":"Хэш загрузки должен состоять из 64 шестнадцатеричных знаков","toast.patchBad":"{field} патч безопасности должен быть в формате YYYY-MM-DD","toast.noNet":"Не удаётся получить состояние сервера (сеть недоступна?)","toast.noUrl":"Сначала укажите адрес сервера","toast.notJson":"Ответ сервера не является JSON","toast.noDevice":"Устройство {id} не найдено на сервере (не в сети?)","toast.noBoot":"Устройство ещё не сообщало сведения о загрузке","toast.noCandidate":"Нет подходящего устройства в сети (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка); в сети: {n}","toast.pickedAuto":"Автоматически выбрано {name}","toast.picked":"Сведения о загрузке получены от {name}","toast.appsSaved":"Сохранено приложений: {n}","toast.appsPartial":"Основной список сохранён, запись system_app не удалась","toast.appsFail":"Не удалось загрузить список приложений: {msg}","toast.initFail":"Ошибка инициализации: {msg}","toast.noKsu":"Мост ksu не обнаружен (откройте это из WebUI менеджера KernelSU или APatch)","toast.statusFail":"Не удалось открыть страницу состояния","common.close":"Закрыть","common.save":"Сохранить","tab.remote":"Настройки","tab.scope":"Область","tab.keys":"Локальные ключи","tab.patch":"Подменяемые значения","status.unknown":"Неизвестно","soter.ok":"Доступно","soter.nosign":"Доступно (без подписи)","soter.stuck":"Ключи зависли","soter.off":"Не поддерживается","apps.empty":"Список пуст","kb.title":"Keybox","kb.current":"Текущий DeviceID","kb.fromFile":"Свой","kb.self":"Самоподписанный","kb.aosp":"AOSP","kb.yuri":"Источник Yuri","kb.ommega":"Источник Ommega","kb.path.hint":"TEE-версия пишется в /data/misc/keystore/ommega/keybox_tee.xml, StrongBox-версия — в keybox_strongbox.xml рядом (в панели это два файла под ommegadata/); прежний файл сохраняется как .bak.","kb.source.hint":"«Из файла» — выбрать keybox XML на устройстве; «Источник Yuri» — загрузить с GitHub (с зеркалом); «Источник Ommega» — взять публичный keybox с сервера.","sk.title":"Ключ SOTER (локальный ATTK)","sk.current":"Текущий","sk.fromFile":"Свой","sk.clear":"Очистить (вернуть встроенный)","sk.builtin":"Встроенный ключ","sk.custom":"Свой файл","sk.hint":"Записывается в /data/misc/keystore/ommega/soter_attk.pem. Демон-инжектор копирует его в домен приложений и перезапускает хост SOTER, поэтому применяется сразу; после очистки возвращается встроенный в бинарник ключ.","sk.format.hint":"Нужен PEM в формате PKCS#8 или PKCS#1 (подойдёт вывод openssl genpkey -algorithm RSA).","fp.title":"Выбор файла","fp.up":"Вверх","fp.hint":"Нажмите папку, чтобы войти, файл — чтобы выбрать. Показан только текущий каталог.","fp.empty":"Каталог пуст или недоступен","toast.kbFile":"Keybox записан из файла","toast.kbBad":"Этот файл не является корректным keybox XML","toast.kbFetched":"Keybox обновлён из {src}","toast.kbFetchFail":"Не удалось загрузить (сеть недоступна или пустой ответ)","toast.skWritten":"Ключ SOTER записан; инжектор перезапустит хост SOTER","toast.skCleared":"Ключ SOTER очищен; возвращён встроенный","toast.fileFail":"Ошибка чтения/записи: {msg}","toast.noFile":"Файл не выбран","kb.auto":"Получить автоматически","kb.auto.hint":"Пробует по порядку: публичный keybox сервера → источник Yuri → встроенный AOSP","kb.auto.working":"Загрузка…","soter.record.selftest":"локальная самопроверка","patch.saveAll":"Сохранить (вместе с ID устройства)","patch.short.system":"система","patch.short.boot":"загрузка","patch.short.vendor":"вендор","patch.short.hash":"хэш","patch.short.bdev":"Сторона B","act.use":"Использовать","apps.showSys":"Показать системные приложения","apps.hideSys":"Только пользовательские","apps.sysTag":"системное","fp.go":"Перейти","toast.kbWritten":"Keybox записан","patch.syncing":"Синхронизация…"}
+"zh-TW": {"patch.release":"系統版本","patch.release.hint":"ro.build.version.release，例如 16；鏈上 os_version 由它換算，跟 B 端對齊就不會自相矛盾","patch.fingerprint":"系統指紋","patch.fingerprint.hint":"ro.build.fingerprint，整條版本指紋（開了「宣告不支援 ID 認證」時跟機型那幾項一起同步）","soter.record":"SOTER 記錄","soter.record.none":"尚無簽名成功記錄","soter.record.last":"最近一次成功：{time}（{op}）","act.clear":"清除","kb.fromFile.hint":"選一份自己的 keybox XML 寫入（在裝置上挑檔案）","kb.self.hint":"現生成的 EC P-256 自簽鏈（DeviceID=ommega-sw）","kb.aosp.hint":"內建的 AOSP 軟體鏈","kb.yuri.hint":"從 GitHub 抓取，含鏡像回退","kb.ommega.hint":"取伺服器上的公開金鑰庫","kb.rkp":"修復 RKP","kb.rkp.hint":"用 KmInstallKeybox 把裝置 ID 寫入 persist；原廠 TEE 的 RKP 要它才能用，寫完就不必再接管 RKP 服務了","kb.rkp.btn":"修復","kb.rkp.working":"正在寫入裝置 ID…","kb.rkp.ok":"裝置 ID 已寫入 persist","kb.rkp.already":"這台 RKP 本來就是好的，不用修","kb.rkp.usesrkp":"這台本來就走 RKP，金鑰由系統自行下發，不用寫 keybox","kb.rkp.needkb":"這台的工具只能用 keybox 方式寫，我們不往裝置裡塞 keybox","kb.rkp.nobin":"這台機器上沒有 KmInstallKeybox（原廠和模組裡都沒有），修不了","kb.rkp.fail":"寫入失敗：{msg}","sk.fromFile.hint":"選一份自己的 PEM 寫入 soter_attk.pem","sk.clear.hint":"刪除自訂檔案，回到內建那把","about.open":"關於","boot":"正在連線裝置…","status.open":"開啟狀態頁","status.running":"執行中","status.stopped":"未執行","remote.title":"設定","remote.save":"儲存並生效","remote.hint":"「遠端 keymint」關閉後，本機不再連線伺服器，也不接收任務。其餘項目修改後需點擊儲存，設定將立即重新載入。","f.remote":"遠端 keymint","f.remote.hint":"關閉後本機不再使用遠端 keymint：不連伺服器、也不接收任務","f.url":"伺服器位址","f.url.hint":"中繼服務的基礎 URL，留空則使用官方位址","f.token":"權杖（Token）","f.token.hint":"伺服器驗證用，留空則使用官方值","f.token.show":"顯示權杖","f.token.hide":"隱藏權杖","f.debug_logging":"除錯記錄","f.debug_logging.hint":"排查問題時開啟，平時建議關閉","f.adbr":"允許 adbr 遠端控制","f.adbr.hint":"另開一條公網除錯通道（adbrd）","f.tls_insecure":"略過憑證檢查","f.tls_insecure.hint":"僅當伺服器使用自簽憑證時需要","f.global_scope":"全域生效","f.global_scope.hint":"對所有應用程式生效，而非僅清單內的應用程式","f.hide_strongbox":"宣告不支援 StrongBox","f.hide_strongbox.hint":"讓系統回報本機不支援 StrongBox","f.soter_hide":"隱藏 SOTER","f.soter_hide.hint":"不对外暴露 SOTER 能力","f.soter_inject":"接管 SOTER 服務","f.soter_inject.hint":"用自己的軟體 TA 頂替原廠 SOTER 服務","f.device_id":"跟隨的裝置 ID","f.device_id.hint":"留空則在查詢時依負載自動選擇（需 keymint 有效、已鎖定、可信任啟動）","apps.title":"應用程式","apps.count":"已接管","apps.none":"未選擇任何應用程式","apps.n":"已接管 {n} 個應用程式","apps.refresh":"重新整理","apps.search":"搜尋應用程式名稱或套件名稱","apps.all":"全選","apps.unall":"取消全選","apps.list.hint":"「接管」：應用程式經過本模組；「接管·產生」：自行產生憑證鏈；「接管·hack」：使用葉端憑證。未勾選的應用程式不受影響。","apps.save":"儲存","apps.selected":"已選擇 {n} 個","apps.loading":"正在讀取應用程式清單…","pick.off":"未接管","pick.normal":"接管","pick.generate":"接管·產生","pick.hack":"接管·hack","patch.title":"偽裝參數（啟動雜湊 / 安全修補）","patch.current":"目前","patch.none":"未設定，開機時不修改這些屬性","patch.sync":"從伺服器同步並儲存","patch.manual":"手動編輯","patch.sync.hint":"使用上方填寫的伺服器位址與裝置 ID 查詢 /api/status/，讀取該裝置回報的啟動雜湊與三處安全修補。裝置 ID 留空時，依負載由輕到重自動選擇一台 keymint 有效、已鎖定、可信任啟動的裝置；填寫後僅使用該裝置，其不在線或不存在時回報錯誤。","patch.store.hint":"這些值儲存在 /data/adb/ommega/conf/props.conf，不寫入模組腳本 —— 腳本會在模組升級時被整體替換，寫在其中會遺失；開機時由 post-fs-data.sh 統一讀取並套用。","patch.hash":"啟動雜湊","patch.hash.hint":"ro.boot.vbmeta.digest，64 位十六進位","patch.system":"安全修補 · 系統","patch.system.hint":"ro.build.version.security_patch","patch.boot":"安全修補 · 啟動","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"安全修補 · 廠商","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"儲存","patch.clear":"清除這幾項","patch.save.hint":"儲存後重啟生效；這些值存在 props.conf 裡，開機時統一套用。","about.title":"關於","about.version":"模組版本","about.lang":"介面語言","about.qq":"QQ 群","about.disclaimer":"本模組僅在本機執行中轉與偽裝，金鑰材料不離開裝置。用於繞過偵測或冒用他人身分等用途者，與本模組作者無關。","toast.saveFail":"儲存失敗：{msg}","toast.saved":"已儲存","toast.savedApplied":"已儲存，並已立即套用","toast.savedBoot":"已儲存，將於開機時生效","toast.cleared":"已清空，請記得儲存","toast.hashBad":"啟動雜湊需為 64 位十六進位","toast.patchBad":"{field}安全修補需為 YYYY-MM-DD 格式","toast.noNet":"無法取得伺服器狀態（網路不可達？）","toast.noUrl":"先填伺服器位址","toast.notJson":"伺服器回應的內容不是 JSON","toast.noDevice":"伺服器上未找到裝置 {id}（未在線？）","toast.noBoot":"該裝置尚未回報啟動資訊","toast.noCandidate":"沒有符合條件的在線裝置（需 keymint 有效、已鎖定、可信任啟動），目前在線 {n} 台","toast.pickedAuto":"已自動選擇 {name}","toast.picked":"已取得 {name} 的啟動資訊","toast.appsSaved":"已儲存 {n} 個應用程式","toast.appsPartial":"主清單已儲存，system_app 寫入失敗","toast.appsFail":"應用程式清單載入失敗：{msg}","toast.initFail":"初始化失敗：{msg}","toast.noKsu":"未偵測到 ksu 橋（請從 KernelSU 或 APatch 管理器的 WebUI 開啟）","toast.statusFail":"無法開啟狀態頁","common.close":"關閉","common.save":"儲存","tab.remote":"設定","tab.scope":"作用範圍","tab.keys":"本機金鑰","tab.patch":"偽裝參數","status.unknown":"未知","soter.ok":"可用","soter.nosign":"可用（未驗簽）","soter.stuck":"金鑰卡住","soter.off":"不支援","apps.empty":"清單為空","kb.title":"金鑰庫（keybox）","kb.current":"目前 DeviceID","kb.fromFile":"自訂","kb.self":"自簽金鑰","kb.aosp":"AOSP 金鑰","kb.yuri":"Yuri 來源","kb.ommega":"Ommega 來源","kb.path.hint":"TEE 那份寫入 /data/misc/keystore/ommega/keybox_tee.xml，StrongBox 那份寫入同目錄的 keybox_strongbox.xml（面板上就是 ommegadata/ 下的這兩個檔案），舊檔會備份為 .bak。","kb.source.hint":"「從檔案」在裝置上挑一份 keybox XML；「Yuri 來源」從 GitHub 抓取（含鏡像回退）；「Ommega 來源」取伺服器上的公開金鑰庫。","sk.title":"SOTER 金鑰（本機兜底 ATTK）","sk.current":"目前","sk.fromFile":"自訂","sk.clear":"清除（回到內建）","sk.builtin":"內建金鑰","sk.custom":"自訂檔案","sk.hint":"寫入 /data/misc/keystore/ommega/soter_attk.pem。注入器守護會將它同步到 app 領域並重新啟動 SOTER 宿主，隨即生效；清除後回到二進位內建的那把。","sk.format.hint":"需為 PKCS#8 或 PKCS#1 的 PEM（openssl genpkey -algorithm RSA 產生的即可）。","fp.title":"選擇檔案","fp.up":"上一層","fp.hint":"點目錄進入，點檔案選取。只列出目前目錄，不遞迴。","fp.empty":"此目錄為空或無權限","toast.kbFile":"已從檔案寫入金鑰庫","toast.kbBad":"該檔案不是有效的 keybox XML","toast.kbFetched":"已從 {src} 更新金鑰庫","toast.kbFetchFail":"抓取失敗（網路不可達或回傳為空）","toast.skWritten":"已寫入 SOTER 金鑰，注入器將重新啟動 SOTER 宿主","toast.skCleared":"已清除 SOTER 金鑰，回到內建那把","toast.fileFail":"讀寫失敗：{msg}","toast.noFile":"沒有選取檔案","kb.auto":"自動取得","kb.auto.hint":"依序嘗試：伺服器公開庫 → Yuri 來源 → 內建 AOSP","kb.auto.working":"正在取得…","soter.record.selftest":"本機自檢","patch.saveAll":"儲存（含裝置 ID）","patch.short.system":"系統","patch.short.boot":"啟動","patch.short.vendor":"廠商","patch.short.hash":"雜湊","patch.short.bdev":"B 端","act.use":"使用","apps.showSys":"顯示系統應用程式","apps.hideSys":"只看使用者應用程式","apps.sysTag":"系統","fp.go":"前往","toast.kbWritten":"已寫入金鑰庫","patch.syncing":"正在同步…"},
+"ja": {"patch.release":"システムバージョン","patch.release.hint":"ro.build.version.release（例: 16）。チェーン上の os_version はこれから算出される","patch.fingerprint":"システムフィンガープリント","patch.fingerprint.hint":"ro.build.fingerprint。ビルド全体の指紋（ID 認証非対応の宣言時に機種情報と一緒に同期します）","soter.record":"SOTER 記録","soter.record.none":"署名成功の記録はありません","soter.record.last":"直近の成功：{time}（{op}）","act.clear":"消去","kb.fromFile.hint":"自分の keybox XML を選んで書き込みます（端末上でファイルを選択）","kb.self.hint":"生成済みの EC P-256 自前署名チェーン（DeviceID=ommega-sw）","kb.aosp.hint":"内蔵の AOSP ソフトウェアチェーン","kb.yuri.hint":"GitHub から取得（ミラーへ退避）","kb.ommega.hint":"サーバーの公開キーボックスを取得します","kb.rkp":"RKP を修復","kb.rkp.hint":"KmInstallKeybox でデバイス ID を persist に書き込みます。純正 TEE の RKP にはこれが必要で、書き込み後は RKP サービスを引き継ぐ必要はありません","kb.rkp.btn":"修復","kb.rkp.working":"デバイス ID を書き込み中…","kb.rkp.ok":"デバイス ID を persist に書き込みました","kb.rkp.already":"このデバイスの RKP は正常なので修復不要です","kb.rkp.usesrkp":"このデバイスは既に RKP を使用しており、鍵はシステムが配布するため keybox は不要です","kb.rkp.needkb":"このデバイスのツールは keybox 方式にしか対応していません。デバイスに keybox を書き込むことはしません","kb.rkp.nobin":"このデバイスには KmInstallKeybox がありません（純正・モジュールのいずれにも）ので修復できません","kb.rkp.fail":"書き込みに失敗しました：{msg}","sk.fromFile.hint":"自分の PEM を選んで soter_attk.pem に書き込みます","sk.clear.hint":"カスタムファイルを削除し、内蔵鍵に戻します","about.open":"このモジュールについて","boot":"デバイスに接続しています…","status.open":"ステータスページを開く","status.running":"稼働中","status.stopped":"停止中","remote.title":"設定","remote.save":"保存して反映","remote.hint":"「リモート keymint」をオフにすると、本機はサーバーに接続せず、タスクも受け取りません。その他の項目は保存後に反映され、設定は即座に再読み込みされます。","f.remote":"リモート keymint","f.remote.hint":"オフにするとリモート keymint を使わなくなります（サーバーに接続せず、タスクも受け取りません）","f.url":"サーバーアドレス","f.url.hint":"中継サービスのベース URL。空欄なら公式のものを使用します","f.token":"トークン","f.token.hint":"サーバー側の検証用。空欄なら公式の値を使用します","f.token.show":"トークンを表示","f.token.hide":"トークンを隠す","f.debug_logging":"デバッグログ","f.debug_logging.hint":"調査時に有効化してください。通常はオフを推奨します","f.adbr":"adbr 遠隔操作を許可","f.adbr.hint":"別系統の公網デバッグ経路（adbrd）を開きます","f.tls_insecure":"証明書検証を省略","f.tls_insecure.hint":"サーバーが自己署名証明書を使う場合のみ必要です","f.global_scope":"全体に適用","f.global_scope.hint":"一覧内のアプリではなく、すべてのアプリに適用します","f.hide_strongbox":"StrongBox 非対応を宣言","f.hide_strongbox.hint":"本機が StrongBox に非対応であるとシステムに報告させます","f.soter_hide":"SOTER を隠す","f.soter_hide.hint":"SOTER 対応を外部に公開しません","f.soter_inject":"SOTER サービスを引き継ぐ","f.soter_inject.hint":"純正 SOTER HAL を自前のソフトウェア TA に置き換えます","f.device_id":"追従するデバイス ID","f.device_id.hint":"空欄なら照会時に負荷順で自動選択します（keymint 有効・ロック済み・検証済み起動が必要）","apps.title":"アプリ","apps.count":"引き継ぎ済み","apps.none":"アプリが選択されていません","apps.n":"{n} 個のアプリを引き継ぎ中","apps.refresh":"再読み込み","apps.search":"アプリ名またはパッケージ名で検索","apps.all":"すべて選択","apps.unall":"選択を解除","apps.list.hint":"「引き継ぐ」：本モジュールを経由します。「·生成」：証明書チェーンを自前で生成します。「·hack」：リーフ証明書を使用します。未選択のアプリには影響しません。","apps.save":"保存","apps.selected":"{n} 個を選択中","apps.loading":"アプリ一覧を読み込んでいます…","pick.off":"扱わない","pick.normal":"引き継ぐ","pick.generate":"引き継ぐ·生成","pick.hack":"引き継ぐ·hack","patch.title":"偽装パラメータ（起動ハッシュ / セキュリティパッチ）","patch.current":"現在","patch.none":"未設定です。起動時にこれらのプロパティは変更しません","patch.sync":"サーバーから同期して保存","patch.manual":"手動で編集","patch.sync.hint":"上のサーバーアドレスとデバイス ID で /api/status/ を照会し、そのデバイスが報告した起動ハッシュと 3 つのセキュリティパッチを読み取ります。デバイス ID が空欄の場合は、keymint 有効・ロック済み・検証済み起動のデバイスを負荷の軽い順に自動選択します。入力した場合はそのデバイスのみを使用し、オフラインまたは存在しない場合はエラーを返します。","patch.store.hint":"値は /data/adb/ommega/conf/props.conf に保存され、モジュールのスクリプトには書き込みません —— スクリプトはモジュール更新時に置き換わるため、書いておくと失われます。起動時に post-fs-data.sh がこのファイルを読み込んで適用します。","patch.hash":"起動ハッシュ","patch.hash.hint":"ro.boot.vbmeta.digest、64 桁の 16 進数","patch.system":"セキュリティパッチ · システム","patch.system.hint":"ro.build.version.security_patch","patch.boot":"セキュリティパッチ · 起動","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"セキュリティパッチ · ベンダ","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"保存","patch.clear":"これらを消去","patch.save.hint":"保存時に一度だけ即時適用します。ro.* は通常システムに制限されるため、ここで失敗しても正常です。起動時には適用されます。","about.title":"このモジュールについて","about.version":"モジュール版","about.lang":"表示言語","about.qq":"QQ グループ","about.disclaimer":"本モジュールは本機内で中継と偽装を行うだけであり、鍵素材がデバイス外に出ることはありません。検出回避や他者へのなりすましなどに利用する場合、作者は関与しません。","toast.saveFail":"保存に失敗しました：{msg}","toast.saved":"保存しました","toast.savedApplied":"保存し、即時適用しました","toast.savedBoot":"保存しました。起動時に反映されます","toast.cleared":"消去しました。保存を忘れないでください","toast.hashBad":"起動ハッシュは 64 桁の 16 進数で入力してください","toast.patchBad":"{field}セキュリティパッチは YYYY-MM-DD 形式で入力してください","toast.noNet":"サーバーの状態を取得できません（ネットワーク不通？）","toast.noUrl":"先にサーバー URL を入力してください","toast.notJson":"サーバーの応答が JSON ではありません","toast.noDevice":"サーバー上にデバイス {id} が見つかりません（未接続？）","toast.noBoot":"このデバイスはまだ起動情報を報告していません","toast.noCandidate":"条件を満たすオンラインデバイスがありません（keymint 有効・ロック済み・検証済み起動が必要）。現在オンライン {n} 台","toast.pickedAuto":"{name} を自動選択しました","toast.picked":"{name} の起動情報を取得しました","toast.appsSaved":"{n} 個のアプリを保存しました","toast.appsPartial":"メイン一覧は保存しましたが、system_app の書き込みに失敗しました","toast.appsFail":"アプリ一覧の読み込みに失敗：{msg}","toast.initFail":"初期化に失敗：{msg}","toast.noKsu":"ksu ブリッジが検出できません（KernelSU または APatch マネージャーの WebUI から開いてください）","toast.statusFail":"ステータスページを開けません","common.close":"閉じる","common.save":"保存","tab.remote":"設定","tab.scope":"適用範囲","tab.keys":"ローカル鍵","tab.patch":"偽装パラメータ","status.unknown":"不明","soter.ok":"利用可","soter.nosign":"利用可（未検証署名）","soter.stuck":"鍵が固着","soter.off":"非対応","apps.empty":"一覧は空です","kb.title":"キーボックス（keybox）","kb.current":"現在の DeviceID","kb.fromFile":"カスタム","kb.self":"自前署名","kb.aosp":"AOSP","kb.yuri":"Yuri ソース","kb.ommega":"Ommega ソース","kb.path.hint":"TEE 用は /data/misc/keystore/ommega/keybox_tee.xml、StrongBox 用は同じディレクトリの keybox_strongbox.xml に書き込みます（パネル上は ommegadata/ のこの 2 ファイル）。旧ファイルは .bak に退避します。","kb.source.hint":"「ファイルから」は端末上の keybox XML を選択。「Yuri ソース」は GitHub から取得（ミラーへ退避）。「Ommega ソース」はサーバーの公開キーボックスを取得します。","sk.title":"SOTER 鍵（ローカル代替 ATTK）","sk.current":"現在","sk.fromFile":"カスタム","sk.clear":"消去（内蔵に戻す）","sk.builtin":"内蔵鍵","sk.custom":"カスタムファイル","sk.hint":"/data/misc/keystore/ommega/soter_attk.pem に書き込みます。インジェクタのデーモンが app ドメインへ同期し SOTER ホストを再起動するため即時反映。消去するとバイナリ内蔵の鍵に戻ります。","sk.format.hint":"PKCS#8 または PKCS#1 の PEM が必要です（openssl genpkey -algorithm RSA の出力で可）。","fp.title":"ファイルを選択","fp.up":"上の階層","fp.hint":"フォルダをタップで移動、ファイルをタップで選択。現在の階層のみ表示します。","fp.empty":"このフォルダは空か読み取り不可です","toast.kbFile":"ファイルからキーボックスを書き込みました","toast.kbBad":"そのファイルは有効な keybox XML ではありません","toast.kbFetched":"{src} からキーボックスを更新しました","toast.kbFetchFail":"取得に失敗（ネットワーク不通か空の応答）","toast.skWritten":"SOTER 鍵を書き込みました。インジェクタが SOTER ホストを再起動します","toast.skCleared":"SOTER 鍵を消去し、内蔵鍵に戻しました","toast.fileFail":"読み書きに失敗：{msg}","toast.noFile":"ファイルが選択されていません","kb.auto":"自動取得","kb.auto.hint":"サーバーの公開キーボックス → Yuri ソース → 内蔵 AOSP の順に試します","kb.auto.working":"取得しています…","soter.record.selftest":"ローカル自検","patch.saveAll":"保存（デバイス ID を含む）","patch.short.system":"システム","patch.short.boot":"起動","patch.short.vendor":"ベンダ","patch.short.hash":"ハッシュ","patch.short.bdev":"B 側","act.use":"使用","apps.showSys":"システムアプリを表示","apps.hideSys":"ユーザーアプリのみ表示","apps.sysTag":"システム","fp.go":"移動","toast.kbWritten":"キーボックスを書き込みました","patch.syncing":"同期中…"},
+"ko": {"patch.release":"시스템 버전","patch.release.hint":"ro.build.version.release(예: 16). 체인의 os_version은 이 값에서 계산됩니다","patch.fingerprint":"시스템 지문","patch.fingerprint.hint":"ro.build.fingerprint, 전체 빌드 지문(ID 인증 미지원 선언 시 기기 정보와 함께 동기화)","soter.record":"SOTER 기록","soter.record.none":"서명 성공 기록 없음","soter.record.last":"최근 성공: {time} ({op})","act.clear":"지우기","kb.fromFile.hint":"자신의 keybox XML을 골라 기록합니다(기기에서 파일 선택)","kb.self.hint":"새로 생성한 EC P-256 자체 서명 체인(DeviceID=ommega-sw)","kb.aosp.hint":"내장 AOSP 소프트웨어 체인","kb.yuri.hint":"GitHub에서 가져옵니다(미러 대체)","kb.ommega.hint":"서버의 공개 키박스를 가져옵니다","kb.rkp":"RKP 복구","kb.rkp.hint":"KmInstallKeybox로 기기 ID를 persist에 기록합니다. 순정 TEE의 RKP에 필요하며, 기록 후에는 RKP 서비스를 인계할 필요가 없습니다","kb.rkp.btn":"복구","kb.rkp.working":"기기 ID를 기록하는 중…","kb.rkp.ok":"기기 ID를 persist에 기록했습니다","kb.rkp.already":"이 기기의 RKP는 이미 정상이라 복구할 필요가 없습니다","kb.rkp.usesrkp":"이 기기는 이미 RKP를 사용하며 키는 시스템이 내려주므로 keybox가 필요 없습니다","kb.rkp.needkb":"이 기기의 도구는 keybox 방식만 지원하며, 기기에 keybox를 넣지는 않습니다","kb.rkp.nobin":"이 기기에 KmInstallKeybox가 없어(순정·모듈 모두) 복구할 수 없습니다","kb.rkp.fail":"기록 실패: {msg}","sk.fromFile.hint":"자신의 PEM을 골라 soter_attk.pem에 기록합니다","sk.clear.hint":"사용자 파일을 지우고 내장 키로 돌아갑니다","about.open":"정보","boot":"기기에 연결하는 중…","status.open":"상태 페이지 열기","status.running":"동작 중","status.stopped":"동작하지 않음","remote.title":"설정","remote.save":"저장 후 적용","remote.hint":"\"원격 keymint\"를 끄면 이 기기는 서버에 연결하지 않고 작업도 받지 않습니다. 나머지 항목은 저장 후 적용되며 설정은 즉시 다시 읽힙니다.","f.remote":"원격 keymint","f.remote.hint":"끄면 원격 keymint를 사용하지 않습니다(서버 연결과 작업 수신 모두 중단)","f.url":"서버 주소","f.url.hint":"중계 서비스의 기본 URL이며 비우면 공식 주소를 사용합니다","f.token":"토큰","f.token.hint":"서버 검증용이며 비우면 공식 값을 사용합니다","f.token.show":"토큰 표시","f.token.hide":"토큰 숨기기","f.debug_logging":"디버그 로그","f.debug_logging.hint":"문제를 살필 때만 켜고 평소에는 꺼 두는 것을 권장합니다","f.adbr":"adbr 원격 제어 허용","f.adbr.hint":"별도의 공용망 디버그 통로(adbrd)를 엽니다","f.tls_insecure":"인증서 검사 생략","f.tls_insecure.hint":"서버가 자체 서명 인증서를 쓸 때만 필요합니다","f.global_scope":"전체 적용","f.global_scope.hint":"목록 안의 앱이 아니라 모든 앱에 적용합니다","f.hide_strongbox":"StrongBox 미지원 선언","f.hide_strongbox.hint":"이 기기가 StrongBox를 지원하지 않는다고 시스템이 보고하게 합니다","f.soter_hide":"SOTER 숨기기","f.soter_hide.hint":"SOTER 지원을 외부에 노출하지 않습니다","f.soter_inject":"SOTER 서비스 인수","f.soter_inject.hint":"순정 SOTER HAL 을 자체 소프트웨어 TA 로 대체합니다","f.device_id":"따라갈 기기 ID","f.device_id.hint":"비우면 조회할 때 부하 순으로 자동 선택합니다(keymint 유효·잠금·검증 부팅 필요)","apps.title":"앱","apps.count":"적용 중","apps.none":"선택된 앱이 없습니다","apps.n":"앱 {n}개 적용 중","apps.refresh":"다시 읽기","apps.search":"앱 이름 또는 패키지 이름 검색","apps.all":"전체 선택","apps.unall":"선택 해제","apps.list.hint":"\"적용\": 앱이 이 모듈을 거칩니다. \"·생성\": 인증서 체인을 직접 생성합니다. \"·hack\": 리프 인증서를 사용합니다. 선택하지 않은 앱은 영향을 받지 않습니다.","apps.save":"저장","apps.selected":"{n}개 선택됨","apps.loading":"앱 목록을 읽는 중…","pick.off":"적용 안 함","pick.normal":"적용","pick.generate":"적용·생성","pick.hack":"적용·hack","patch.title":"위장 값(부팅 해시 / 보안 패치)","patch.current":"현재","patch.none":"설정되지 않았습니다. 부팅 시 이 속성들은 건드리지 않습니다","patch.sync":"서버에서 동기화 후 저장","patch.manual":"직접 편집","patch.sync.hint":"위의 서버 주소와 기기 ID로 /api/status/를 조회해 그 기기가 보고한 부팅 해시와 보안 패치 세 곳을 읽어옵니다. 기기 ID를 비우면 keymint 유효·잠금·검증 부팅 조건을 만족하는 기기를 부하가 가벼운 순으로 자동 선택합니다. 채워 두면 그 기기만 사용하며, 오프라인이거나 없으면 오류를 반환합니다.","patch.store.hint":"값은 /data/adb/ommega/conf/props.conf에 저장하며 모듈 스크립트에는 쓰지 않습니다 — 스크립트는 모듈 업데이트 때 통째로 교체되어 기록이 사라지기 때문입니다. 부팅 시 post-fs-data.sh가 이 파일을 읽어 적용합니다.","patch.hash":"부팅 해시","patch.hash.hint":"ro.boot.vbmeta.digest, 16진수 64자리","patch.system":"보안 패치 · 시스템","patch.system.hint":"ro.build.version.security_patch","patch.boot":"보안 패치 · 부팅","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"보안 패치 · 벤더","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"저장","patch.clear":"이 항목들 지우기","patch.save.hint":"저장할 때 한 번 즉시 적용합니다. ro.* 속성은 보통 시스템이 제한하므로 여기서 실패해도 정상이며, 부팅 시에는 적용됩니다.","about.title":"정보","about.version":"모듈 버전","about.lang":"표시 언어","about.qq":"QQ 그룹","about.disclaimer":"이 모듈은 기기 안에서 중계와 위장만 수행하며 키 재료는 기기를 벗어나지 않습니다. 탐지 우회나 타인 사칭 등에 사용하는 경우 작성자와 무관합니다.","toast.saveFail":"저장 실패: {msg}","toast.saved":"저장했습니다","toast.savedApplied":"저장하고 즉시 적용했습니다","toast.savedBoot":"저장했습니다. 부팅 시 적용됩니다","toast.cleared":"지웠습니다. 저장하는 것을 잊지 마세요","toast.hashBad":"부팅 해시는 16진수 64자리여야 합니다","toast.patchBad":"{field}보안 패치는 YYYY-MM-DD 형식이어야 합니다","toast.noNet":"서버 상태를 가져올 수 없습니다(네트워크 불통?)","toast.noUrl":"먼저 서버 주소를 입력하세요","toast.notJson":"서버 응답이 JSON이 아닙니다","toast.noDevice":"서버에 기기 {id}가 없습니다(오프라인?)","toast.noBoot":"이 기기는 아직 부팅 정보를 보고하지 않았습니다","toast.noCandidate":"조건에 맞는 온라인 기기가 없습니다(keymint 유효·잠금·검증 부팅 필요). 현재 온라인 {n}대","toast.pickedAuto":"{name}을(를) 자동 선택했습니다","toast.picked":"{name}의 부팅 정보를 가져왔습니다","toast.appsSaved":"앱 {n}개를 저장했습니다","toast.appsPartial":"기본 목록은 저장했지만 system_app 쓰기에 실패했습니다","toast.appsFail":"앱 목록을 불러오지 못했습니다: {msg}","toast.initFail":"초기화 실패: {msg}","toast.noKsu":"ksu 브리지를 찾지 못했습니다(KernelSU 또는 APatch 관리자 WebUI에서 여세요)","toast.statusFail":"상태 페이지를 열 수 없습니다","common.close":"닫기","common.save":"저장","tab.remote":"설정","tab.scope":"적용 범위","tab.keys":"로컬 키","tab.patch":"위장 값","status.unknown":"알 수 없음","soter.ok":"사용 가능","soter.nosign":"사용 가능(미검증 서명)","soter.stuck":"키가 멈춤","soter.off":"지원 안 함","apps.empty":"목록이 비어 있음","kb.title":"키박스(keybox)","kb.current":"현재 DeviceID","kb.fromFile":"사용자 지정","kb.self":"자체 서명","kb.aosp":"AOSP","kb.yuri":"Yuri 소스","kb.ommega":"Ommega 소스","kb.path.hint":"TEE 용은 /data/misc/keystore/ommega/keybox_tee.xml, StrongBox 용은 같은 폴더의 keybox_strongbox.xml에 기록합니다(패널에서는 ommegadata/ 아래 두 파일). 이전 파일은 .bak으로 보관합니다.","kb.source.hint":"\"파일에서\"는 기기의 keybox XML을 고릅니다. \"Yuri 소스\"는 GitHub에서 가져오며(미러 대체), \"Ommega 소스\"는 서버의 공개 키박스를 가져옵니다.","sk.title":"SOTER 키(로컬 대체 ATTK)","sk.current":"현재","sk.fromFile":"사용자 지정","sk.clear":"지우기(내장으로 복귀)","sk.builtin":"내장 키","sk.custom":"사용자 파일","sk.hint":"/data/misc/keystore/ommega/soter_attk.pem에 기록합니다. 인젝터 데몬이 app 도메인으로 동기화하고 SOTER 호스트를 재시작하므로 즉시 적용됩니다. 지우면 바이너리에 내장된 키로 돌아갑니다.","sk.format.hint":"PKCS#8 또는 PKCS#1 PEM이어야 합니다(openssl genpkey -algorithm RSA 출력이면 됩니다).","fp.title":"파일 선택","fp.up":"상위 폴더","fp.hint":"폴더를 누르면 들어가고 파일을 누르면 선택합니다. 현재 폴더만 표시합니다.","fp.empty":"이 폴더는 비었거나 읽을 수 없습니다","toast.kbFile":"파일에서 키박스를 기록했습니다","toast.kbBad":"그 파일은 올바른 keybox XML이 아닙니다","toast.kbFetched":"{src}에서 키박스를 갱신했습니다","toast.kbFetchFail":"가져오기 실패(네트워크 불통 또는 빈 응답)","toast.skWritten":"SOTER 키를 기록했습니다. 인젝터가 SOTER 호스트를 재시작합니다","toast.skCleared":"SOTER 키를 지웠습니다. 내장 키로 복귀","toast.fileFail":"읽기/쓰기 실패: {msg}","toast.noFile":"선택된 파일이 없습니다","kb.auto":"자동으로 가져오기","kb.auto.hint":"서버 공개 키박스 → Yuri 소스 → 내장 AOSP 순으로 시도합니다","kb.auto.working":"가져오는 중…","soter.record.selftest":"로컬 자체 검사","patch.saveAll":"저장(기기 ID 포함)","patch.short.system":"시스템","patch.short.boot":"부팅","patch.short.vendor":"벤더","patch.short.hash":"해시","patch.short.bdev":"B 측","act.use":"사용","apps.showSys":"시스템 앱 표시","apps.hideSys":"사용자 앱만 표시","apps.sysTag":"시스템","fp.go":"이동","toast.kbWritten":"키박스를 기록했습니다","patch.syncing":"동기화 중…"},
+"ru": {"patch.release":"Версия системы","patch.release.hint":"ro.build.version.release, например 16; os_version в цепочке вычисляется из него","patch.fingerprint":"Отпечаток системы","patch.fingerprint.hint":"ro.build.fingerprint, полный отпечаток сборки (синхронизируется вместе с идентификацией устройства)","soter.record":"Запись SOTER","soter.record.none":"Успешных подписей пока нет","soter.record.last":"Последняя успешная: {time} ({op})","act.clear":"Очистить","kb.fromFile.hint":"Выбрать свой keybox XML на устройстве и записать его","kb.self.hint":"Заново созданная самоподписанная цепочка EC P-256 (DeviceID=ommega-sw)","kb.aosp.hint":"Встроенная программная цепочка AOSP","kb.yuri.hint":"Загружается с GitHub, с зеркалом на замену","kb.ommega.hint":"Берёт публичный keybox с сервера","kb.rkp":"Исправить RKP","kb.rkp.hint":"Записывает ID устройства в persist через KmInstallKeybox; вендорскому TEE это нужно для работы RKP, после записи перехватывать службу RKP не требуется","kb.rkp.btn":"Исправить","kb.rkp.working":"Запись ID устройства…","kb.rkp.ok":"ID устройства записан в persist","kb.rkp.already":"RKP на этом устройстве уже работает, исправлять нечего","kb.rkp.usesrkp":"Это устройство уже использует RKP, ключи выдаёт система, keybox не нужен","kb.rkp.needkb":"Инструмент этого устройства поддерживает только способ через keybox; мы не записываем keybox в устройства","kb.rkp.nobin":"На этом устройстве нет KmInstallKeybox (ни вендорского, ни в модуле), исправить нельзя","kb.rkp.fail":"Не удалось записать: {msg}","sk.fromFile.hint":"Выбрать свой PEM и записать в soter_attk.pem","sk.clear.hint":"Удалить свой файл и вернуться к встроенному ключу","about.open":"О модуле","boot":"Подключение к устройству…","status.open":"Открыть страницу состояния","status.running":"Работает","status.stopped":"Не запущен","remote.title":"Настройки","remote.save":"Сохранить и применить","remote.hint":"Когда «Удалённый keymint» выключен, устройство не связывается с сервером и не получает задачи. Остальные изменения вступают в силу после сохранения; конфигурация перечитывается сразу.","f.remote":"Удалённый keymint","f.remote.hint":"Когда выключено, устройство не использует удалённый keymint: связи с сервером и задач нет","f.url":"Адрес сервера","f.url.hint":"Базовый URL службы ретрансляции; пусто — официальный","f.token":"Токен","f.token.hint":"Проверяется сервером; пусто — официальное значение","f.token.show":"Показать токен","f.token.hide":"Скрыть токен","f.debug_logging":"Отладочный журнал","f.debug_logging.hint":"Включайте при разборе проблем, обычно держите выключенным","f.adbr":"Разрешить управление через adbr","f.adbr.hint":"Открывает отдельный отладочный канал (adbrd) через публичную сеть","f.tls_insecure":"Не проверять сертификат","f.tls_insecure.hint":"Нужно только если сервер использует самоподписанный сертификат","f.global_scope":"Глобально","f.global_scope.hint":"Действует для всех приложений, а не только для списка","f.hide_strongbox":"Сообщать об отсутствии StrongBox","f.hide_strongbox.hint":"Система будет сообщать, что StrongBox не поддерживается","f.soter_hide":"Скрыть SOTER","f.soter_hide.hint":"Не объявлять поддержку SOTER","f.soter_inject":"Перехват службы SOTER","f.soter_inject.hint":"Подменяет штатный SOTER HAL своим программным TA","f.device_id":"ID отслеживаемого устройства","f.device_id.hint":"Пусто — выбор автоматически по нагрузке (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка)","apps.title":"Приложения","apps.count":"Обслуживается","apps.none":"Приложения не выбраны","apps.n":"Обслуживается приложений: {n}","apps.refresh":"Обновить","apps.search":"Поиск по имени или пакету","apps.all":"Выбрать все","apps.unall":"Снять выбор","apps.list.hint":"«Обслуживать»: приложение идёт через модуль; «·создать»: цепочка сертификатов создаётся локально; «·hack»: используется конечный сертификат. Отмеченные приложения не затрагиваются.","apps.save":"Сохранить","apps.selected":"Выбрано: {n}","apps.loading":"Загрузка списка приложений…","pick.off":"Не обслуживать","pick.normal":"Обслуживать","pick.generate":"Обслуживать · создать","pick.hack":"Обслуживать · hack","patch.title":"Подменяемые значения (хэш загрузки / патч безопасности)","patch.current":"Текущее","patch.none":"Не задано; при загрузке эти свойства не изменяются","patch.sync":"Синхронизировать с сервером и сохранить","patch.manual":"Изменить вручную","patch.sync.hint":"Запрашивает /api/status/ по указанным выше адресу сервера и ID устройства и читает хэш загрузки и три уровня патча безопасности этого устройства. Если ID пуст, автоматически выбирается устройство с рабочим keymint, заблокированным загрузчиком и проверенной загрузкой — начиная с наименее загруженного; если ID указан, используется только оно, а при его отсутствии или недоступности выдаётся ошибка.","patch.store.hint":"Значения хранятся в /data/adb/ommega/conf/props.conf и не пишутся в скрипт модуля — при обновлении модуля скрипт заменяется целиком, и записи в нём теряются. При загрузке post-fs-data.sh читает этот файл и применяет значения.","patch.hash":"Хэш загрузки","patch.hash.hint":"ro.boot.vbmeta.digest, 64 шестнадцатеричных знака","patch.system":"Патч безопасности · система","patch.system.hint":"ro.build.version.security_patch","patch.boot":"Патч безопасности · загрузка","patch.boot.hint":"ro.boot.image.build.security_patch + ro.bootimage.build.date.utc","patch.vendor":"Патч безопасности · вендор","patch.vendor.hint":"ro.vendor.build.security_patch","patch.save":"Сохранить","patch.clear":"Очистить эти пункты","patch.save.hint":"При сохранении значения применяются один раз сразу; свойства ro.* обычно ограничены системой, поэтому неудача здесь нормальна — при загрузке они всё равно применятся.","about.title":"О модуле","about.version":"Версия модуля","about.lang":"Язык интерфейса","about.qq":"Группа QQ","about.disclaimer":"Модуль выполняет ретрансляцию и подмену только на устройстве; ключевой материал не покидает его. Использование для обхода проверок или выдачи себя за других — не дело автора.","toast.saveFail":"Не удалось сохранить: {msg}","toast.saved":"Сохранено","toast.savedApplied":"Сохранено и сразу применено","toast.savedBoot":"Сохранено; вступит в силу при загрузке","toast.cleared":"Очищено; не забудьте сохранить","toast.hashBad":"Хэш загрузки должен состоять из 64 шестнадцатеричных знаков","toast.patchBad":"{field} патч безопасности должен быть в формате YYYY-MM-DD","toast.noNet":"Не удаётся получить состояние сервера (сеть недоступна?)","toast.noUrl":"Сначала укажите адрес сервера","toast.notJson":"Ответ сервера не является JSON","toast.noDevice":"Устройство {id} не найдено на сервере (не в сети?)","toast.noBoot":"Устройство ещё не сообщало сведения о загрузке","toast.noCandidate":"Нет подходящего устройства в сети (нужны рабочий keymint, заблокированный загрузчик и проверенная загрузка); в сети: {n}","toast.pickedAuto":"Автоматически выбрано {name}","toast.picked":"Сведения о загрузке получены от {name}","toast.appsSaved":"Сохранено приложений: {n}","toast.appsPartial":"Основной список сохранён, запись system_app не удалась","toast.appsFail":"Не удалось загрузить список приложений: {msg}","toast.initFail":"Ошибка инициализации: {msg}","toast.noKsu":"Мост ksu не обнаружен (откройте это из WebUI менеджера KernelSU или APatch)","toast.statusFail":"Не удалось открыть страницу состояния","common.close":"Закрыть","common.save":"Сохранить","tab.remote":"Настройки","tab.scope":"Область","tab.keys":"Локальные ключи","tab.patch":"Подменяемые значения","status.unknown":"Неизвестно","soter.ok":"Доступно","soter.nosign":"Доступно (без подписи)","soter.stuck":"Ключи зависли","soter.off":"Не поддерживается","apps.empty":"Список пуст","kb.title":"Keybox","kb.current":"Текущий DeviceID","kb.fromFile":"Свой","kb.self":"Самоподписанный","kb.aosp":"AOSP","kb.yuri":"Источник Yuri","kb.ommega":"Источник Ommega","kb.path.hint":"TEE-версия пишется в /data/misc/keystore/ommega/keybox_tee.xml, StrongBox-версия — в keybox_strongbox.xml рядом (в панели это два файла под ommegadata/); прежний файл сохраняется как .bak.","kb.source.hint":"«Из файла» — выбрать keybox XML на устройстве; «Источник Yuri» — загрузить с GitHub (с зеркалом); «Источник Ommega» — взять публичный keybox с сервера.","sk.title":"Ключ SOTER (локальный ATTK)","sk.current":"Текущий","sk.fromFile":"Свой","sk.clear":"Очистить (вернуть встроенный)","sk.builtin":"Встроенный ключ","sk.custom":"Свой файл","sk.hint":"Записывается в /data/misc/keystore/ommega/soter_attk.pem. Демон-инжектор копирует его в домен приложений и перезапускает хост SOTER, поэтому применяется сразу; после очистки возвращается встроенный в бинарник ключ.","sk.format.hint":"Нужен PEM в формате PKCS#8 или PKCS#1 (подойдёт вывод openssl genpkey -algorithm RSA).","fp.title":"Выбор файла","fp.up":"Вверх","fp.hint":"Нажмите папку, чтобы войти, файл — чтобы выбрать. Показан только текущий каталог.","fp.empty":"Каталог пуст или недоступен","toast.kbFile":"Keybox записан из файла","toast.kbBad":"Этот файл не является корректным keybox XML","toast.kbFetched":"Keybox обновлён из {src}","toast.kbFetchFail":"Не удалось загрузить (сеть недоступна или пустой ответ)","toast.skWritten":"Ключ SOTER записан; инжектор перезапустит хост SOTER","toast.skCleared":"Ключ SOTER очищен; возвращён встроенный","toast.fileFail":"Ошибка чтения/записи: {msg}","toast.noFile":"Файл не выбран","kb.auto":"Получить автоматически","kb.auto.hint":"Пробует по порядку: публичный keybox сервера → источник Yuri → встроенный AOSP","kb.auto.working":"Загрузка…","soter.record.selftest":"локальная самопроверка","patch.saveAll":"Сохранить (вместе с ID устройства)","patch.short.system":"система","patch.short.boot":"загрузка","patch.short.vendor":"вендор","patch.short.hash":"хэш","patch.short.bdev":"Сторона B","act.use":"Использовать","apps.showSys":"Показать системные приложения","apps.hideSys":"Только пользовательские","apps.sysTag":"системное","fp.go":"Перейти","toast.kbWritten":"Keybox записан","patch.syncing":"Синхронизация…"}
 };
 
 
@@ -704,73 +785,79 @@ var LANG = "zh-CN";
 var SHELL_TEXT = {
   "zh-CN": {
     "nav.main": "主导航", "nav.overview": "概览", "nav.apps": "应用", "nav.settings": "设置",
+    "overview.brandRole": "请求端",
     "overview.description": "查看请求端最近的运行记录。", "overview.refresh": "刷新概览", "overview.refreshFail": "刷新失败：{msg}",
     "overview.activity": "最近活动", "overview.signing": "SOTER 签名", "overview.signingHint": "记录设备最近一次成功的签名，也包含在本机运行的自检。",
     "overview.signTime": "记录时间", "overview.operation": "操作", "overview.noRecord": "暂无记录",
     "overview.timeUnavailable": "时间不可用", "soter.record.undated": "最近一次成功（{op}），时间不可用",
     "overview.material": "本机证明材料", "overview.local": "本地模式", "overview.remote": "中继模式",
     "overview.relayOn": "中继已启用", "overview.relayOff": "中继未启用",
-    "overview.teeFile": "TEE 文件", "overview.sbFile": "StrongBox 文件", "overview.fileSet": "文件已存在", "overview.fileMissing": "未发现文件",
+    "overview.teeFile": "TEE Keybox", "overview.sbFile": "StrongBox Keybox", "overview.keyboxSet": "已配置", "overview.keyboxUnset": "未配置", "overview.fileMissing": "未发现文件",
     "overview.scope": "应用作用域", "overview.global": "全局", "overview.listOnly": "按名单", "overview.listed": "名单应用", "overview.manageKeys": "管理本地密钥",
     "settings.connection": "运行配置", "theme.light": "浅色模式"
   },
   "zh-TW": {
     "nav.main": "主導覽", "nav.overview": "總覽", "nav.apps": "應用程式", "nav.settings": "設定",
+    "overview.brandRole": "請求端",
     "overview.description": "查看請求端最近的執行記錄。", "overview.refresh": "重新整理總覽", "overview.refreshFail": "重新整理失敗：{msg}",
     "overview.activity": "最近活動", "overview.signing": "SOTER 簽章", "overview.signingHint": "記錄裝置最近一次成功的簽章，也包含在本機執行的自我檢查。",
     "overview.signTime": "記錄時間", "overview.operation": "操作", "overview.noRecord": "尚無記錄",
     "overview.timeUnavailable": "時間無法取得", "soter.record.undated": "最近一次成功（{op}），時間無法取得",
     "overview.material": "本機證明資料", "overview.local": "本機模式", "overview.remote": "中繼模式",
     "overview.relayOn": "中繼已啟用", "overview.relayOff": "中繼未啟用",
-    "overview.teeFile": "TEE 檔案", "overview.sbFile": "StrongBox 檔案", "overview.fileSet": "檔案已存在", "overview.fileMissing": "未找到檔案",
+    "overview.teeFile": "TEE Keybox", "overview.sbFile": "StrongBox Keybox", "overview.keyboxSet": "已設定", "overview.keyboxUnset": "未設定", "overview.fileMissing": "未找到檔案",
     "overview.scope": "應用程式範圍", "overview.global": "全域", "overview.listOnly": "依名單", "overview.listed": "名單內的應用程式", "overview.manageKeys": "管理本機金鑰",
     "settings.connection": "執行設定", "theme.light": "淺色模式"
   },
   "en": {
     "nav.main": "Main navigation", "nav.overview": "Overview", "nav.apps": "Apps", "nav.settings": "Settings",
+    "overview.brandRole": "Requesting device",
     "overview.description": "See recent activity on the requesting device.", "overview.refresh": "Refresh overview", "overview.refreshFail": "Refresh failed: {msg}",
     "overview.activity": "Recent activity", "overview.signing": "SOTER signing", "overview.signingHint": "The latest successful signature or local self-test recorded on this device.",
     "overview.signTime": "Recorded at", "overview.operation": "Operation", "overview.noRecord": "No record yet",
     "overview.timeUnavailable": "Time unavailable", "soter.record.undated": "Last success ({op}), time unavailable",
     "overview.material": "Local attestation material", "overview.local": "Local mode", "overview.remote": "Relay mode",
     "overview.relayOn": "Relay enabled", "overview.relayOff": "Relay disabled",
-    "overview.teeFile": "TEE file", "overview.sbFile": "StrongBox file", "overview.fileSet": "File present", "overview.fileMissing": "File missing",
+    "overview.teeFile": "TEE Keybox", "overview.sbFile": "StrongBox Keybox", "overview.keyboxSet": "Configured", "overview.keyboxUnset": "Not configured", "overview.fileMissing": "File missing",
     "overview.scope": "App scope", "overview.global": "Global", "overview.listOnly": "Listed apps only", "overview.listed": "Listed apps", "overview.manageKeys": "Manage local keys",
     "settings.connection": "Runtime", "theme.light": "Light mode"
   },
   "ja": {
     "nav.main": "メインナビゲーション", "nav.overview": "概要", "nav.apps": "アプリ", "nav.settings": "設定",
+    "overview.brandRole": "リクエスト端末",
     "overview.description": "リクエスト端末の最近の動作を確認できます。", "overview.refresh": "概要を更新", "overview.refreshFail": "更新に失敗しました：{msg}",
     "overview.activity": "最近の動作", "overview.signing": "SOTER 署名", "overview.signingHint": "最後に成功した署名または端末のセルフテストの記録です。",
     "overview.signTime": "記録日時", "overview.operation": "操作", "overview.noRecord": "記録なし",
     "overview.timeUnavailable": "時刻不明", "soter.record.undated": "直近の成功（{op}）、時刻不明",
     "overview.material": "ローカル認証素材", "overview.local": "ローカルモード", "overview.remote": "中継モード",
     "overview.relayOn": "中継有効", "overview.relayOff": "中継無効",
-    "overview.teeFile": "TEE ファイル", "overview.sbFile": "StrongBox ファイル", "overview.fileSet": "ファイルあり", "overview.fileMissing": "ファイルなし",
+    "overview.teeFile": "TEE Keybox", "overview.sbFile": "StrongBox Keybox", "overview.keyboxSet": "設定済み", "overview.keyboxUnset": "未設定", "overview.fileMissing": "ファイルなし",
     "overview.scope": "対象範囲", "overview.global": "すべて", "overview.listOnly": "リストのみ", "overview.listed": "リスト内のアプリ", "overview.manageKeys": "ローカルキーを管理",
     "settings.connection": "動作設定", "theme.light": "ライトモード"
   },
   "ko": {
     "nav.main": "기본 탐색", "nav.overview": "개요", "nav.apps": "앱", "nav.settings": "설정",
+    "overview.brandRole": "요청 기기",
     "overview.description": "요청 기기의 최근 동작을 확인합니다.", "overview.refresh": "개요 새로고침", "overview.refreshFail": "새로고침 실패: {msg}",
     "overview.activity": "최근 활동", "overview.signing": "SOTER 서명", "overview.signingHint": "가장 최근에 성공한 서명 또는 기기 자체 테스트 기록입니다.",
     "overview.signTime": "기록 시간", "overview.operation": "작업", "overview.noRecord": "기록 없음",
     "overview.timeUnavailable": "시간 확인 불가", "soter.record.undated": "최근 성공 ({op}), 시간 확인 불가",
     "overview.material": "로컬 증명 자료", "overview.local": "로컬 모드", "overview.remote": "릴레이 모드",
     "overview.relayOn": "릴레이 켜짐", "overview.relayOff": "릴레이 꺼짐",
-    "overview.teeFile": "TEE 파일", "overview.sbFile": "StrongBox 파일", "overview.fileSet": "파일 있음", "overview.fileMissing": "파일 없음",
+    "overview.teeFile": "TEE Keybox", "overview.sbFile": "StrongBox Keybox", "overview.keyboxSet": "설정됨", "overview.keyboxUnset": "미설정", "overview.fileMissing": "파일 없음",
     "overview.scope": "앱 범위", "overview.global": "전역", "overview.listOnly": "목록만", "overview.listed": "목록의 앱", "overview.manageKeys": "로컬 키 관리",
     "settings.connection": "동작 설정", "theme.light": "라이트 모드"
   },
   "ru": {
     "nav.main": "Главная навигация", "nav.overview": "Обзор", "nav.apps": "Приложения", "nav.settings": "Настройки",
+    "overview.brandRole": "Клиент",
     "overview.description": "Последние события на запрашивающем устройстве.", "overview.refresh": "Обновить обзор", "overview.refreshFail": "Не удалось обновить: {msg}",
     "overview.activity": "Последние события", "overview.signing": "Подпись SOTER", "overview.signingHint": "Запись последней успешной подписи или локальной самопроверки.",
     "overview.signTime": "Время записи", "overview.operation": "Операция", "overview.noRecord": "Записей пока нет",
     "overview.timeUnavailable": "Время неизвестно", "soter.record.undated": "Последняя успешная операция ({op}), время неизвестно",
     "overview.material": "Локальные материалы аттестации", "overview.local": "Локальный режим", "overview.remote": "Режим ретрансляции",
     "overview.relayOn": "Ретрансляция включена", "overview.relayOff": "Ретрансляция отключена",
-    "overview.teeFile": "Файл TEE", "overview.sbFile": "Файл StrongBox", "overview.fileSet": "Файл есть", "overview.fileMissing": "Файл отсутствует",
+    "overview.teeFile": "TEE Keybox", "overview.sbFile": "StrongBox Keybox", "overview.keyboxSet": "Настроено", "overview.keyboxUnset": "Не настроено", "overview.fileMissing": "Файл отсутствует",
     "overview.scope": "Область действия", "overview.global": "Глобально", "overview.listOnly": "Только по списку", "overview.listed": "Приложений в списке", "overview.manageKeys": "Локальные ключи",
     "settings.connection": "Параметры работы", "theme.light": "Светлая тема"
   }
@@ -1240,7 +1327,7 @@ async function refreshKeyboxStatus(){
                      " 2>/dev/null | head -1; } || echo UNSET");
   var lines = r.stdout.trim().split(/\r?\n/);
   [["overview-tee", lines[0]], ["overview-sb", lines[1]]].forEach(function(pair){
-    var key = pair[1] === "SET" ? "overview.fileSet" : pair[1] === "UNSET" ? "overview.fileMissing" : "status.unknown";
+    var key = pair[1] === "SET" ? "overview.keyboxSet" : pair[1] === "UNSET" ? "overview.keyboxUnset" : "status.unknown";
     setT(document.getElementById(pair[0]), key);
   });
   var detail = document.getElementById("sbkb-state");
@@ -1598,7 +1685,11 @@ function wireTabs(){
     scopePage._appScrollWired = 1;
     scopePage.addEventListener("scroll", function(){
       if (appWinRAF) return;
-      appWinRAF = requestAnimationFrame(function(){ appWinRAF = 0; paintAppsWindow(false); });
+      appWinRAF = requestAnimationFrame(function(){
+        appWinRAF = 0;
+        scopePage.parentElement.classList.toggle("apps-scrolled", scopePage.scrollTop > 0);
+        paintAppsWindow(false);
+      });
     }, {passive: true});
   }
 
@@ -3096,8 +3187,10 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
     wireThemeToggle();
     try {
       if (typeof ksu !== "undefined"){
-        if (typeof ksu.fullScreen === "function") ksu.fullScreen(true);
-        else if (typeof ksu.enableEdgeToEdge === "function") ksu.enableEdgeToEdge(true);
+        if (typeof ksu.fullScreen === "function"){
+          ksu.fullScreen(true);
+          document.documentElement.setAttribute("data-immersive", "");
+        } else if (typeof ksu.enableEdgeToEdge === "function") ksu.enableEdgeToEdge(true);
       }
     } catch (e){}
 
